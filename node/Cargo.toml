@@ -62,6 +62,10 @@ satd-auth = { path = "../satd-auth" }
 # Transaction-filtering policy engine (the DSL). The mempool admission path
 # compiles a ruleset at startup and evaluates it once per transaction (§7).
 satd-policy = { path = "../satd-policy" }
+# PSBT version 2 (BIP 370) and silent payment (BIP 375) carriage. The
+# `bitcoin` crate rejects any PSBT above version 0, so the PSBT RPCs reach
+# this crate for anything a silent payment sender produces.
+satd-psbt = { path = "../satd-psbt" }
 
 [features]
 default = ["block-filter-index", "stratum-v2"]
@@ -85,6 +89,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The vendored BIP 370 / 375 vectors, so the PSBT surface tests referee
+# themselves against the BIPs' own bytes rather than satd's idea of them.
+satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

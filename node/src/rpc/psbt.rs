@@ -5,8 +5,11 @@ use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::{json, Value};
 
+use satd_psbt::raw::{PsbtVersion, RawPsbt};
+
 use crate::chain::state::ChainState;
 use crate::rpc::amounts::{default_unit, format_amount};
+use crate::rpc::psbt_v2;
 
 fn psbt_to_base64(psbt: &Psbt) -> String {
     let mut buf = Vec::new();
@@ -14,9 +17,46 @@ fn psbt_to_base64(psbt: &Psbt) -> String {
     B64.encode(&buf)
 }
 
-fn psbt_from_base64(b64: &str) -> Result<Psbt, (i32, String)> {
+/// A PSBT of either version.
+pub(crate) enum Parsed {
+    V0(Psbt),
+    V2(RawPsbt),
+}
+
+impl Parsed {
+    pub(crate) fn version(&self) -> PsbtVersion {
+        match self {
+            Parsed::V0(_) => PsbtVersion::V0,
+            Parsed::V2(_) => PsbtVersion::V2,
+        }
+    }
+}
+
+/// Decode a PSBT, dispatching on the version it declares.
+///
+/// The sniff reads only the global map. Anything it cannot read — including a
+/// PSBT that is simply corrupt — goes to the version 0 parser, so that a
+/// version 0 caller keeps getting the version 0 verdict and the version 0
+/// message. Nothing this crate says about version 2 may change what an
+/// existing client sees.
+pub(crate) fn parse_any(b64: &str) -> Result<Parsed, (i32, String)> {
     let raw = B64.decode(b64).map_err(|_| (-22, "PSBT base64 decode failed".to_string()))?;
-    Psbt::deserialize(&raw).map_err(|_| (-22, "PSBT decode failed".to_string()))
+    match satd_psbt::version_of_bytes(&raw) {
+        Ok(PsbtVersion::V2) => RawPsbt::parse(&raw)
+            .map(Parsed::V2)
+            .map_err(|e| (-22, format!("PSBT decode failed: {e}"))),
+        _ => Psbt::deserialize(&raw)
+            .map(Parsed::V0)
+            .map_err(|_| (-22, "PSBT decode failed".to_string())),
+    }
+}
+
+fn parse_all(b64s: &[String]) -> Result<Vec<Parsed>, (i32, String)> {
+    b64s.iter().map(|b| parse_any(b)).collect()
+}
+
+fn raw_to_base64(raw: &RawPsbt) -> String {
+    B64.encode(raw.serialize())
 }
 
 /// `createpsbt` — create a PSBT from inputs and outputs.
@@ -75,8 +115,13 @@ pub fn create_psbt(
 
 /// `decodepsbt` — decode a base64-encoded PSBT to JSON.
 pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
-    let psbt = psbt_from_base64(psbt_b64)?;
+    match parse_any(psbt_b64)? {
+        Parsed::V0(psbt) => decode_psbt_v0(&psbt),
+        Parsed::V2(raw) => psbt_v2::decode(&raw),
+    }
+}
 
+fn decode_psbt_v0(psbt: &Psbt) -> Result<Value, (i32, String)> {
     let tx = &psbt.unsigned_tx;
     let tx_hex = hex::encode(bitcoin::consensus::serialize(tx));
 
@@ -157,7 +202,7 @@ pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
         // otherwise. This was an unconditional `null`, so a fully-populated
         // PSBT still reported no fee — the number a signer most wants before
         // committing.
-        "fee": match psbt_fee(&psbt) {
+        "fee": match psbt_fee(psbt) {
             Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
             None => Value::Null,
         },
@@ -226,7 +271,13 @@ fn psbt_fee(psbt: &Psbt) -> Option<Amount> {
 
 /// `analyzepsbt` — analyze PSBT completeness.
 pub fn analyze_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
-    let psbt = psbt_from_base64(psbt_b64)?;
+    match parse_any(psbt_b64)? {
+        Parsed::V0(psbt) => analyze_psbt_v0(&psbt),
+        Parsed::V2(raw) => psbt_v2::analyze(&raw),
+    }
+}
+
+fn analyze_psbt_v0(psbt: &Psbt) -> Result<Value, (i32, String)> {
 
     let inputs: Vec<Value> = psbt
         .inputs
@@ -270,7 +321,7 @@ pub fn analyze_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
     };
 
     let estimated_vsize = psbt.unsigned_tx.weight().to_wu() / 4;
-    let fee = psbt_fee(&psbt);
+    let fee = psbt_fee(psbt);
     Ok(json!({
         "inputs": inputs,
         "estimated_vsize": estimated_vsize,
@@ -310,22 +361,95 @@ pub fn combine_psbt(psbt_b64s: &[String]) -> Result<Value, (i32, String)> {
     if psbt_b64s.is_empty() {
         return Err((-8, "Missing PSBTs".to_string()));
     }
-
-    let mut combined = psbt_from_base64(&psbt_b64s[0])?;
-
-    for b64 in &psbt_b64s[1..] {
-        let other = psbt_from_base64(b64)?;
-        combined
-            .combine(other)
-            .map_err(|e| (-22, format!("PSBT combine failed: {}", e)))?;
+    let parsed = parse_all(psbt_b64s)?;
+    match split_versions(&parsed, "combinepsbt")? {
+        PsbtVersion::V0 => {
+            let mut combined = as_v0(&parsed[0]);
+            for other in &parsed[1..] {
+                combined
+                    .combine(as_v0(other))
+                    .map_err(|e| (-22, format!("PSBT combine failed: {}", e)))?;
+            }
+            Ok(Value::String(psbt_to_base64(&combined)))
+        }
+        PsbtVersion::V2 => {
+            let raws: Vec<RawPsbt> = parsed.iter().map(as_v2).collect();
+            let combined = psbt_v2::combine(&raws)?;
+            Ok(Value::String(raw_to_base64(&combined)))
+        }
     }
+}
 
-    Ok(Value::String(psbt_to_base64(&combined)))
+/// The version every PSBT in a list shares, or a refusal naming the first one
+/// that differs. Mixing versions is not a merge, it is two different
+/// documents; Core has no version 2 at all, so there is no precedent to
+/// follow and guessing is the wrong answer.
+fn split_versions(parsed: &[Parsed], method: &str) -> Result<PsbtVersion, (i32, String)> {
+    let first = parsed[0].version();
+    for (n, p) in parsed.iter().enumerate().skip(1) {
+        if p.version() != first {
+            return Err((
+                -22,
+                format!(
+                    "{method} needs every PSBT to be the same version; PSBT 0 is version {} \
+                     and PSBT {n} is version {}",
+                    psbt_v2::version_label(first),
+                    psbt_v2::version_label(p.version())
+                ),
+            ));
+        }
+    }
+    Ok(first)
+}
+
+fn as_v0(parsed: &Parsed) -> Psbt {
+    match parsed {
+        Parsed::V0(psbt) => psbt.clone(),
+        Parsed::V2(_) => unreachable!("split_versions established every PSBT is version 0"),
+    }
+}
+
+fn as_v2(parsed: &Parsed) -> RawPsbt {
+    match parsed {
+        Parsed::V2(raw) => raw.clone(),
+        Parsed::V0(_) => unreachable!("split_versions established every PSBT is version 2"),
+    }
 }
 
 /// `finalizepsbt` — finalize a fully-signed PSBT into a network transaction.
 pub fn finalize_psbt(psbt_b64: &str, extract: bool) -> Result<Value, (i32, String)> {
-    let mut psbt = psbt_from_base64(psbt_b64)?;
+    match parse_any(psbt_b64)? {
+        Parsed::V0(psbt) => finalize_psbt_v0(psbt, extract),
+        Parsed::V2(raw) => {
+            // BIP 375 gives the Transaction Extractor the duty of recomputing
+            // every silent payment output script and checking it before a
+            // transaction leaves the PSBT. satd cannot do that yet, so it
+            // refuses rather than extract a transaction whose outputs it has
+            // not verified. Lifted in the change that adds the verifier.
+            if psbt_v2::has_silent_payments(&raw) {
+                return Err((
+                    -22,
+                    "silent payment outputs cannot be finalized by this version".to_string(),
+                ));
+            }
+            let (finalized, complete) = psbt_v2::finalize(&raw)?;
+            if extract && complete {
+                let tx = psbt_v2::extract(&finalized)?;
+                Ok(json!({
+                    "hex": hex::encode(bitcoin::consensus::serialize(&tx)),
+                    "complete": true,
+                }))
+            } else {
+                Ok(json!({
+                    "psbt": raw_to_base64(&finalized),
+                    "complete": complete,
+                }))
+            }
+        }
+    }
+}
+
+fn finalize_psbt_v0(mut psbt: Psbt, extract: bool) -> Result<Value, (i32, String)> {
 
     // Attempt to finalize each input from partial_sigs / tap_key_sig
     for input in &mut psbt.inputs {
@@ -353,7 +477,7 @@ pub fn finalize_psbt(psbt_b64: &str, extract: bool) -> Result<Value, (i32, Strin
 
 /// Attempt to finalize a PSBT input by constructing final_script_sig or
 /// final_script_witness from partial signatures and UTXO information.
-fn try_finalize_input(input: &mut bitcoin::psbt::Input) {
+pub(crate) fn try_finalize_input(input: &mut bitcoin::psbt::Input) {
     // Already finalized
     if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
         return;
@@ -476,20 +600,26 @@ pub fn join_psbts(psbt_b64s: &[String]) -> Result<Value, (i32, String)> {
     if psbt_b64s.is_empty() {
         return Err((-8, "Missing PSBTs".to_string()));
     }
-
-    // Merge all inputs and outputs into a single PSBT
-    let mut merged = psbt_from_base64(&psbt_b64s[0])?;
-
-    for b64 in &psbt_b64s[1..] {
-        let other = psbt_from_base64(b64)?;
-
-        merged.unsigned_tx.input.extend(other.unsigned_tx.input);
-        merged.unsigned_tx.output.extend(other.unsigned_tx.output);
-        merged.inputs.extend(other.inputs);
-        merged.outputs.extend(other.outputs);
+    let parsed = parse_all(psbt_b64s)?;
+    match split_versions(&parsed, "joinpsbts")? {
+        PsbtVersion::V0 => {
+            // Merge all inputs and outputs into a single PSBT
+            let mut merged = as_v0(&parsed[0]);
+            for other in &parsed[1..] {
+                let other = as_v0(other);
+                merged.unsigned_tx.input.extend(other.unsigned_tx.input);
+                merged.unsigned_tx.output.extend(other.unsigned_tx.output);
+                merged.inputs.extend(other.inputs);
+                merged.outputs.extend(other.outputs);
+            }
+            Ok(Value::String(psbt_to_base64(&merged)))
+        }
+        PsbtVersion::V2 => {
+            let raws: Vec<RawPsbt> = parsed.iter().map(as_v2).collect();
+            let joined = psbt_v2::join(&raws)?;
+            Ok(Value::String(raw_to_base64(&joined)))
+        }
     }
-
-    Ok(Value::String(psbt_to_base64(&merged)))
 }
 
 /// `utxoupdatepsbt` — update PSBT with UTXO data from the node's chain state.
@@ -497,7 +627,13 @@ pub fn utxo_update_psbt(
     chain_state: &ChainState,
     psbt_b64: &str,
 ) -> Result<Value, (i32, String)> {
-    let mut psbt = psbt_from_base64(psbt_b64)?;
+    let mut psbt = match parse_any(psbt_b64)? {
+        Parsed::V0(psbt) => psbt,
+        Parsed::V2(raw) => {
+            let updated = psbt_v2::utxo_update(chain_state, &raw)?;
+            return Ok(Value::String(raw_to_base64(&updated)));
+        }
+    };
 
     // For each input without UTXO info, look up the coin from chain state
     // We need to collect the outpoints first since we can't borrow psbt mutably

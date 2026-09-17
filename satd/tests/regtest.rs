@@ -19532,3 +19532,250 @@ fn getmempoolsummary_top_n_is_bounded() {
 
     node.stop();
 }
+
+// ---------------------------------------------------------------------------
+// PSBT version 2 (BIP 370) and silent payments (BIP 375)
+// ---------------------------------------------------------------------------
+
+/// A BIP 375 vector, by the prefix of its description.
+fn bip375_vector(prefix: &str) -> satd_psbt::RawPsbt {
+    use base64::Engine as _;
+    let doc: serde_json::Value =
+        serde_json::from_str(satd_psbt::testing::BIP375_VECTORS).expect("vectors parse");
+    let b64 = doc["valid"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|v| {
+            v["description"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(prefix)
+        })
+        .unwrap_or_else(|| panic!("no vector starting {prefix:?}"))["psbt"]
+        .as_str()
+        .expect("base64")
+        .to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .expect("base64");
+    satd_psbt::RawPsbt::parse(&bytes).expect("the vector parses")
+}
+
+/// Every pair `before` has that `after` should still have: same bytes, same
+/// relative order. Returns a description of each loss.
+fn psbt_losses(
+    before: &satd_psbt::RawPsbt,
+    after: &satd_psbt::RawPsbt,
+    may_change: &[(usize, u64)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let check = |label: String, map_index: usize,
+                     b: &satd_psbt::RawMap,
+                     a: &satd_psbt::RawMap,
+                     out: &mut Vec<String>| {
+        let kept: Vec<_> = b
+            .pairs()
+            .iter()
+            .filter(|p| !may_change.contains(&(map_index, p.key_type)))
+            .collect();
+        for p in &kept {
+            match a.get(p.key_type, &p.key_data) {
+                Some(v) if v == p.value.as_slice() => {}
+                Some(_) => out.push(format!("{label}: the value of {:#x} changed", p.key_type)),
+                None => out.push(format!("{label}: {:#x} was dropped", p.key_type)),
+            }
+        }
+        let positions: Vec<usize> = kept
+            .iter()
+            .filter_map(|p| {
+                a.pairs()
+                    .iter()
+                    .position(|q| q.key_type == p.key_type && q.key_data == p.key_data)
+            })
+            .collect();
+        if positions.windows(2).any(|w| w[0] >= w[1]) {
+            out.push(format!("{label}: the relative order of its pairs changed"));
+        }
+    };
+
+    check("global map".to_string(), usize::MAX, &before.global, &after.global, &mut out);
+    for (i, map) in before.inputs.iter().enumerate() {
+        match after.inputs.get(i) {
+            Some(a) => check(format!("input {i}"), i, map, a, &mut out),
+            None => out.push(format!("input {i}: gone entirely")),
+        }
+    }
+    for (i, map) in before.outputs.iter().enumerate() {
+        match after.outputs.get(i) {
+            Some(a) => check(format!("output {i}"), usize::MAX, map, a, &mut out),
+            None => out.push(format!("output {i}: gone entirely")),
+        }
+    }
+    out
+}
+
+/// `utxoupdatepsbt` is the one PSBT surface whose passthrough proof needs a
+/// UTXO set, so it lives here rather than with the rest in `node`'s tests.
+///
+/// It fills in the previous output an input is missing and touches nothing
+/// else: every other pair, the BIP 375 shares and proofs included, comes back
+/// with the same bytes in the same place.
+#[test]
+fn bip375_survives_utxoupdatepsbt() {
+    use base64::Engine as _;
+    use serde_json::json;
+    use satd_psbt::raw::RawPair;
+    use satd_psbt::keys;
+    use std::str::FromStr;
+
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.mine_blocks(1, addr);
+
+    let cb_txid = {
+        let hash = node.rpc_ok("getblockhash", vec![json!(1)])
+            .as_str()
+            .expect("a hash")
+            .to_string();
+        node.rpc_ok("getblock", vec![json!(hash), json!(1)])["tx"][0]
+            .as_str()
+            .expect("a coinbase txid")
+            .to_string()
+    };
+    let txout = node.rpc_ok("gettxout", vec![json!(cb_txid), json!(0)]);
+    let value_btc = txout["value"].as_f64().expect("a value");
+    let spk = txout["scriptPubKey"]["hex"]
+        .as_str()
+        .expect("a scriptPubKey")
+        .to_string();
+
+    // A real BIP 375 PSBT, repointed at a UTXO this node actually has, with
+    // input 0's previous output removed so there is something to fill in.
+    let mut psbt = bip375_vector("can finalize: two inputs single-signer using per-input");
+    let txid = bitcoin::Txid::from_str(&cb_txid).expect("a txid");
+    psbt.inputs[0].set(RawPair::new(
+        keys::input::PREVIOUS_TXID,
+        Vec::new(),
+        bitcoin::consensus::serialize(&txid),
+    ));
+    psbt.inputs[0].set(RawPair::new(
+        keys::input::OUTPUT_INDEX,
+        Vec::new(),
+        0u32.to_le_bytes().to_vec(),
+    ));
+    psbt.inputs[0].remove_type(keys::input::WITNESS_UTXO);
+    psbt.inputs[0].remove_type(keys::input::NON_WITNESS_UTXO);
+    // An unknown pair in each map, to prove the surface carries what it does
+    // not understand.
+    psbt.global
+        .set(RawPair::new(0x7au64, b"g".to_vec(), b"global".to_vec()));
+    psbt.inputs[0].set(RawPair::new(0x7au64, b"i".to_vec(), b"input".to_vec()));
+    psbt.outputs[0].set(RawPair::new(0x7au64, b"o".to_vec(), b"output".to_vec()));
+
+    let before = psbt.clone();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64)])
+        .as_str()
+        .expect("a base64 PSBT")
+        .to_string();
+    let after = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&updated)
+            .expect("base64"),
+    )
+    .expect("the answer parses");
+
+    // The previous output it went to fetch.
+    let filled = after.inputs[0]
+        .get_single(keys::input::WITNESS_UTXO)
+        .expect("input 0 should have been filled in");
+    let filled: bitcoin::TxOut = bitcoin::consensus::deserialize(filled).expect("a TxOut");
+    assert_eq!(filled.value.to_btc(), value_btc);
+    assert_eq!(hex::encode(filled.script_pubkey.as_bytes()), spk);
+
+    // Input 1 already had one, so it must be untouched, and nothing else in
+    // the PSBT may have moved.
+    let losses = psbt_losses(&before, &after, &[(0, keys::input::WITNESS_UTXO)]);
+    assert!(losses.is_empty(), "utxoupdatepsbt lost something: {losses:?}");
+
+    // And the BIP 375 fields specifically, named rather than merely counted.
+    for (i, map) in before.inputs.iter().enumerate() {
+        for (scan_key, share) in map.get_all(keys::input::SP_ECDH_SHARE) {
+            assert_eq!(
+                after.inputs[i].get(keys::input::SP_ECDH_SHARE, scan_key),
+                Some(share),
+                "input {i} lost an ECDH share"
+            );
+            assert_eq!(
+                after.inputs[i].get(keys::input::SP_DLEQ, scan_key),
+                map.get(keys::input::SP_DLEQ, scan_key),
+                "input {i} lost a DLEQ proof"
+            );
+        }
+    }
+
+    node.stop();
+}
+
+/// A version 2 PSBT with no UTXOs to add comes back byte for byte, not
+/// re-encoded. A surface that rebuilds a PSBT it had no work to do on is a
+/// surface that can silently normalise away a field.
+#[test]
+fn utxoupdatepsbt_is_a_byte_exact_noop_when_there_is_nothing_to_add() {
+    use base64::Engine as _;
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let psbt = bip375_vector("can finalize: two inputs single-signer using global");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64.clone())])
+        .as_str()
+        .expect("a base64 PSBT")
+        .to_string();
+    assert_eq!(updated, b64, "a no-op must return the PSBT unchanged");
+    node.stop();
+}
+
+/// The version 2 surfaces answer over JSON-RPC, not only in process.
+#[test]
+fn bip375_psbt_decodes_and_analyzes_over_rpc() {
+    use base64::Engine as _;
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let psbt = bip375_vector("in progress: one P2TR input / one sp output");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+
+    let decoded = node.rpc_ok("decodepsbt", vec![json!(b64.clone())]);
+    assert_eq!(decoded["psbt_version"], 2, "{decoded}");
+    // The output script has not been computed, so there is no transaction to
+    // show and the field must be absent rather than empty.
+    assert!(decoded["tx"].is_null(), "{decoded}");
+    assert!(
+        decoded["outputs"][0]["script"].is_null(),
+        "an uncomputed script must not be shown as an empty one: {decoded}"
+    );
+    assert!(
+        decoded["outputs"][0]["silent_payment"]["scan_key"].is_string(),
+        "{decoded}"
+    );
+
+    let analyzed = node.rpc_ok("analyzepsbt", vec![json!(b64.clone())]);
+    assert_eq!(analyzed["silent_payments"]["verified"], false, "{analyzed}");
+    assert_eq!(analyzed["next"], "signer", "{analyzed}");
+
+    // And `finalizepsbt` refuses it by name until satd can verify it.
+    let err = node
+        .rpc_call_with_params("finalizepsbt", vec![json!(b64)])
+        .expect("a response");
+    assert_eq!(err["error"]["code"], -22, "{err}");
+    assert_eq!(
+        err["error"]["message"],
+        "silent payment outputs cannot be finalized by this version",
+        "{err}"
+    );
+    node.stop();
+}

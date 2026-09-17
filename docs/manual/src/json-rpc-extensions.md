@@ -231,6 +231,107 @@ unconditionally.
         [Verifying a miner](stratum.md#verifying-a-miner)).
 *   The top-level `hashrate` is the sum over `miners`.
 
+## PSBT version 2 (BIP 370) and BIP 375
+
+Every PSBT method — `decodepsbt`, `analyzepsbt`, `combinepsbt`,
+`joinpsbts`, `utxoupdatepsbt`, `finalizepsbt` — accepts a version 2 PSBT
+and answers with a version 2 PSBT. Bitcoin Core does not: it rejects any
+PSBT whose `PSBT_GLOBAL_VERSION` is above zero. Version 0 behaviour is
+unchanged, so nothing you already do moves.
+
+Version 2 matters because BIP 375, which is how a wallet sends to a
+silent payment address through a PSBT, is version 2 only. Its fields are
+carried losslessly: anything satd does not understand comes back with
+the same bytes in the same place, which is what lets a PSBT pass through
+this node on its way between two wallets that do understand it.
+
+> BIP 375 is a draft. satd is refereed against the vectors the BIP
+> publishes, and its field set has not changed since 0.1.0, but a draft
+> can still change.
+
+### What `decodepsbt` returns
+
+A version 2 PSBT decodes to a different shape from a version 0 one.
+Field names follow Bitcoin Core's own version 2 pull request wherever it
+has one.
+
+```jsonc
+{
+  "psbt_version": 2,
+  "tx_version": 2,
+  "fallback_locktime": 0,
+  "locktime": 0,
+  "input_count": 2,
+  "output_count": 2,
+  "inputs_modifiable": false,
+  "outputs_modifiable": false,
+  "has_sighash_single": false,
+  "silent_payments": {                 // only when a BIP 375 global field is present
+    "global_shares": [
+      { "scan_key": "02…", "ecdh_share": "03…", "dleq_proof": "…" }
+    ]
+  },
+  "unknown": { },                      // global pairs satd does not recognise
+  "inputs": [
+    {
+      "previous_txid": "…",
+      "previous_vout": 0,
+      "sequence": 4294967293,
+      "witness_utxo": { "amount": 0.001, "scriptPubKey": { "hex": "0014…" } },
+      "has_utxo": true,
+      "is_final": false,
+      "sp_shares": [
+        { "scan_key": "02…", "ecdh_share": "03…", "dleq_proof": "…" }
+      ],
+      "unknown": { }
+    }
+  ],
+  "outputs": [
+    {
+      "amount": 0.0009,
+      "script": { "hex": "5120…" },    // absent while it has not been computed
+      "silent_payment": { "scan_key": "02…", "spend_key": "03…", "label": 3 },
+      "unknown": { }
+    }
+  ],
+  "tx": { }, "tx_hex": "…",            // only when every output has a script
+  "unique_id": "…",                    // BIP 370's identifier for this PSBT
+  "fee": 0.0001                        // as in version 0: null unless every input's UTXO is known
+}
+```
+
+An output's `script` is **absent**, not empty, while a silent payment
+script is still being computed. The two mean different things, and a
+PSBT library that renders the second as the first describes an output
+paying nobody. For the same reason `tx` and `tx_hex` appear only once
+every output has a script.
+
+`amount` honours the per-request `amounts=sats|btc` switch, as elsewhere.
+A share whose DLEQ proof is missing keeps its row with a null
+`dleq_proof` rather than disappearing: a missing proof is the thing a
+reader most needs to see.
+
+### Where satd is stricter than Core's version 0 rules
+
+- **`combinepsbt` refuses a conflict.** Where two PSBTs give the same key
+  different values, satd refuses and names the field. Core keeps
+  whichever it saw first. For a BIP 375 ECDH share that value decides
+  where the money goes.
+- **`joinpsbts` refuses a committed silent payment PSBT.** Joining adds
+  inputs, and every silent payment output script derives from the input
+  set. A PSBT whose scripts are already computed, whose global ECDH share
+  is set, or which does not allow inputs and outputs to be added is
+  refused by name.
+- **`finalizepsbt` refuses silent payment outputs.** BIP 375 makes the
+  Transaction Extractor recompute and check every silent payment output
+  script before a transaction leaves the PSBT. Until satd can do that it
+  refuses rather than extract a transaction whose outputs it has not
+  verified.
+
+`analyzepsbt` reports `"silent_payments": {"verified": false}` on a PSBT
+with silent payment outputs, so a client can tell "not checked" from
+"checked and fine". The two must never look the same.
+
 ## Client-side PSBT signing (no signing RPC)
 
 There is no signing method: satd never handles private keys. Signing is a
@@ -246,3 +347,13 @@ xpriv is expanded over the standard BIP 44/49/84/86 paths, so it can sign
 PSBTs that carry no derivation metadata, including satd's own `createpsbt`
 output. The key never crosses the JSON-RPC boundary, so satd stays strictly
 keyless.
+
+A version 2 PSBT is refused by name, before the key prompt: signing one
+means taking on BIP 375's Signer duties — computing the ECDH shares and
+the output scripts that follow from them — and this signer does not do
+that yet. `sat-cli signpsbtwithsigner` does pass a version 2 PSBT to an
+external signer untouched, because for a silent payment the only party
+that can compute an ECDH share is the one holding the input's private
+key. What comes back is checked: a signer adds signature data, it does
+not choose the transaction, so a reply describing a different
+transaction is refused.

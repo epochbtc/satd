@@ -27,4 +27,7 @@ tls-config = { path = "../tls-config" }
 
 [dev-dependencies]
 tempfile = "3"
+# The vendored BIP 375 vectors, so the PSBT tool's tests use the BIP's own
+# bytes rather than a hand-rolled approximation of them.
+satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }
 rmcp = { workspace = true }

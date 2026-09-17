@@ -569,6 +569,101 @@ mod construction {
         assert!(json["error"].is_string());
     }
 
+    /// A BIP 375 vector, so the tool is refereed against the BIP's own bytes.
+    fn bip375_vector(prefix: &str) -> String {
+        let doc: serde_json::Value =
+            serde_json::from_str(satd_psbt::testing::BIP375_VECTORS).expect("vectors parse");
+        doc["valid"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|v| v["description"].as_str().unwrap_or_default().starts_with(prefix))
+            .unwrap_or_else(|| panic!("no vector starting {prefix:?}"))["psbt"]
+            .as_str()
+            .expect("base64")
+            .to_string()
+    }
+
+    /// Every action that takes a PSBT must handle a BIP 375 one. The MCP tools
+    /// call `node::rpc::psbt` directly, so they inherit version 2 support — but
+    /// "inherits it" is a claim, and this is the test of it.
+    #[test]
+    fn psbt_workflow_handles_a_bip375_psbt() {
+        let (ctx, _dir) = make_test_ctx();
+        let psbt = bip375_vector("can finalize: two inputs single-signer using global");
+
+        let decoded: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "decode",
+            &serde_json::json!({ "psbt": psbt }),
+        ))
+        .unwrap();
+        assert_eq!(decoded["psbt_version"], 2, "{decoded}");
+        assert!(
+            decoded["silent_payments"]["global_shares"].is_array(),
+            "the global ECDH shares should reach the JSON: {decoded}"
+        );
+
+        let analyzed: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "analyze",
+            &serde_json::json!({ "psbt": psbt }),
+        ))
+        .unwrap();
+        assert_eq!(analyzed["silent_payments"]["verified"], false, "{analyzed}");
+
+        let combined: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "combine",
+            &serde_json::json!({ "psbts": [psbt.clone(), psbt.clone()] }),
+        ))
+        .unwrap();
+        assert_eq!(
+            combined.as_str(),
+            Some(psbt.as_str()),
+            "combining a PSBT with itself must return it unchanged: {combined}"
+        );
+
+        // No UTXO in this test node's chain state, so `update` is a no-op —
+        // and a no-op must return the PSBT byte for byte, not a re-encoding.
+        let updated: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "update",
+            &serde_json::json!({ "psbt": psbt }),
+        ))
+        .unwrap();
+        assert_eq!(updated.as_str(), Some(psbt.as_str()), "{updated}");
+
+        // Silent payment outputs cannot be finalized until satd can verify
+        // them, and the refusal names why.
+        let finalized: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "finalize",
+            &serde_json::json!({ "psbt": psbt }),
+        ))
+        .unwrap();
+        assert!(
+            finalized["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("silent payment outputs cannot be finalized"),
+            "{finalized}"
+        );
+
+        // Joining a PSBT whose silent payment scripts are already computed
+        // would change the transaction they were computed from.
+        let joined: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "join",
+            &serde_json::json!({ "psbts": [psbt.clone(), psbt.clone()] }),
+        ))
+        .unwrap();
+        assert!(
+            joined["error"].as_str().unwrap_or_default().contains("computed"),
+            "{joined}"
+        );
+    }
+
     #[test]
     fn test_psbt_unknown_action() {
         let (ctx, _dir) = make_test_ctx();

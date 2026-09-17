@@ -1,0 +1,367 @@
+{
+  "analyzepsbt/bare": {
+    "ok": {
+      "estimated_feerate": null,
+      "estimated_vsize": 82,
+      "fee": null,
+      "inputs": [
+        {
+          "has_utxo": false,
+          "input_index": 0,
+          "is_final": false,
+          "next": "updater"
+        }
+      ],
+      "next": "updater"
+    }
+  },
+  "analyzepsbt/finalized": {
+    "ok": {
+      "estimated_feerate": null,
+      "estimated_vsize": 82,
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "input_index": 0,
+          "is_final": true,
+          "next": "finalized"
+        }
+      ],
+      "next": "extractor"
+    }
+  },
+  "analyzepsbt/signed": {
+    "ok": {
+      "estimated_feerate": null,
+      "estimated_vsize": 82,
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "input_index": 0,
+          "is_final": false,
+          "next": "signer"
+        }
+      ],
+      "next": "finalizer"
+    }
+  },
+  "analyzepsbt/updated": {
+    "ok": {
+      "estimated_feerate": null,
+      "estimated_vsize": 82,
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "input_index": 0,
+          "is_final": false,
+          "next": "signer"
+        }
+      ],
+      "next": "signer"
+    }
+  },
+  "analyzepsbt/with-unknowns": {
+    "ok": {
+      "estimated_feerate": null,
+      "estimated_vsize": 82,
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "input_index": 0,
+          "is_final": false,
+          "next": "signer"
+        }
+      ],
+      "next": "finalizer"
+    }
+  },
+  "combinepsbt-self/bare": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAAA"
+  },
+  "combinepsbt-self/finalized": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QBCGsCRzBEAiAXBfzaBiZu2zKxaYZ3s39nu25F1JLr/OZWqIDufxOOtgIgPc3jI53ZBjavZPskEspB45fJWKAwd3z/nIlAucd310wBIQLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIvwAA"
+  },
+  "combinepsbt-self/signed": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QiAgLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIv0cwRAIgFwX82gYmbtsysWmGd7N/Z7tuRdSS6/zmVqiA7n8TjrYCID3N4yOd2QY2r2T7JBLKQeOXyVigMHd8/5yJQLnHd9dMAQEDBAEAAAAAAA=="
+  },
+  "combinepsbt-self/updated": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QAAA=="
+  },
+  "combinepsbt-self/with-unknowns": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAABXpzYXRkBmdsb2JhbAABAR+ghgEAAAAAABYAFCJprLNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIBcF/NoGJm7bMrFphnezf2e7bkXUkuv85laogO5/E462AiA9zeMjndkGNq9k+yQSykHjl8lYoDB3fP+ciUC5x3fXTAEBAwQBAAAABXpzYXRkBWlucHV0AAV6c2F0ZAZvdXRwdXQA"
+  },
+  "combinepsbt/empty": {
+    "error": {
+      "code": -8,
+      "message": "Missing PSBTs"
+    }
+  },
+  "converttopsbt/not-hex": {
+    "error": {
+      "code": -22,
+      "message": "TX decode failed"
+    }
+  },
+  "converttopsbt/unsigned": {
+    "ok": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAAA"
+  },
+  "createpsbt/bad-address": {
+    "error": {
+      "code": -5,
+      "message": "Invalid Bitcoin address: not an address"
+    }
+  },
+  "createpsbt/one-in-one-out": {
+    "error": {
+      "code": -5,
+      "message": "Invalid Bitcoin address: bcrt1qcsc0vnz82md33pk7351p2h9au5ejvfevzfnp5r"
+    }
+  },
+  "decodepsbt/bare": {
+    "ok": {
+      "fee": null,
+      "inputs": [
+        {
+          "has_utxo": false,
+          "is_final": false
+        }
+      ],
+      "outputs": [
+        {}
+      ],
+      "tx": {
+        "locktime": 0,
+        "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
+        "version": 2,
+        "vin": 1,
+        "vout": 1
+      },
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+    }
+  },
+  "decodepsbt/finalized": {
+    "ok": {
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "final_scriptwitness": [
+            "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01",
+            "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf"
+          ],
+          "has_utxo": true,
+          "is_final": true,
+          "witness_utxo": {
+            "amount": 0.00100000,
+            "scriptPubKey": {
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+            }
+          }
+        }
+      ],
+      "outputs": [
+        {}
+      ],
+      "tx": {
+        "locktime": 0,
+        "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
+        "version": 2,
+        "vin": 1,
+        "vout": 1
+      },
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+    }
+  },
+  "decodepsbt/not-a-psbt": {
+    "error": {
+      "code": -22,
+      "message": "PSBT decode failed"
+    }
+  },
+  "decodepsbt/not-base64": {
+    "error": {
+      "code": -22,
+      "message": "PSBT base64 decode failed"
+    }
+  },
+  "decodepsbt/signed": {
+    "ok": {
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "is_final": false,
+          "partial_signatures": [
+            {
+              "pubkey": "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf",
+              "signature": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
+            }
+          ],
+          "witness_utxo": {
+            "amount": 0.00100000,
+            "scriptPubKey": {
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+            }
+          }
+        }
+      ],
+      "outputs": [
+        {}
+      ],
+      "tx": {
+        "locktime": 0,
+        "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
+        "version": 2,
+        "vin": 1,
+        "vout": 1
+      },
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+    }
+  },
+  "decodepsbt/updated": {
+    "ok": {
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "is_final": false,
+          "witness_utxo": {
+            "amount": 0.00100000,
+            "scriptPubKey": {
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+            }
+          }
+        }
+      ],
+      "outputs": [
+        {}
+      ],
+      "tx": {
+        "locktime": 0,
+        "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
+        "version": 2,
+        "vin": 1,
+        "vout": 1
+      },
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+    }
+  },
+  "decodepsbt/with-unknowns": {
+    "ok": {
+      "fee": 0.0001,
+      "inputs": [
+        {
+          "has_utxo": true,
+          "is_final": false,
+          "partial_signatures": [
+            {
+              "pubkey": "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf",
+              "signature": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
+            }
+          ],
+          "witness_utxo": {
+            "amount": 0.00100000,
+            "scriptPubKey": {
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+            }
+          }
+        }
+      ],
+      "outputs": [
+        {}
+      ],
+      "tx": {
+        "locktime": 0,
+        "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
+        "version": 2,
+        "vin": 1,
+        "vout": 1
+      },
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+    }
+  },
+  "finalizepsbt-extract/bare": {
+    "ok": {
+      "complete": false,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAAA"
+    }
+  },
+  "finalizepsbt-extract/finalized": {
+    "ok": {
+      "complete": true,
+      "hex": "0200000000010107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c0247304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c012102c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf00000000"
+    }
+  },
+  "finalizepsbt-extract/signed": {
+    "ok": {
+      "complete": true,
+      "hex": "0200000000010107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c0247304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c012102c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf00000000"
+    }
+  },
+  "finalizepsbt-extract/updated": {
+    "ok": {
+      "complete": false,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QAAA=="
+    }
+  },
+  "finalizepsbt-extract/with-unknowns": {
+    "ok": {
+      "complete": true,
+      "hex": "0200000000010107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c0247304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c012102c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf00000000"
+    }
+  },
+  "finalizepsbt-keep/bare": {
+    "ok": {
+      "complete": false,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAAA"
+    }
+  },
+  "finalizepsbt-keep/finalized": {
+    "ok": {
+      "complete": true,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QBCGsCRzBEAiAXBfzaBiZu2zKxaYZ3s39nu25F1JLr/OZWqIDufxOOtgIgPc3jI53ZBjavZPskEspB45fJWKAwd3z/nIlAucd310wBIQLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIvwAA"
+    }
+  },
+  "finalizepsbt-keep/signed": {
+    "ok": {
+      "complete": true,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QBAwQBAAAAAQhrAkcwRAIgFwX82gYmbtsysWmGd7N/Z7tuRdSS6/zmVqiA7n8TjrYCID3N4yOd2QY2r2T7JBLKQeOXyVigMHd8/5yJQLnHd9dMASECyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8AAA=="
+    }
+  },
+  "finalizepsbt-keep/updated": {
+    "ok": {
+      "complete": false,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QAAA=="
+    }
+  },
+  "finalizepsbt-keep/with-unknowns": {
+    "ok": {
+      "complete": true,
+      "psbt": "cHNidP8BAFICAAAAAQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////AZBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAABXpzYXRkBmdsb2JhbAABAR+ghgEAAAAAABYAFCJprLNKZFvTSWu79Qu7gckGP0+UAQMEAQAAAAEIawJHMEQCIBcF/NoGJm7bMrFphnezf2e7bkXUkuv85laogO5/E462AiA9zeMjndkGNq9k+yQSykHjl8lYoDB3fP+ciUC5x3fXTAEhAsgXu3Uhr8NeqW87+ycObrUN3/pVYGJ7lh/sAPKZZQi/BXpzYXRkBWlucHV0AAV6c2F0ZAZvdXRwdXQA"
+    }
+  },
+  "joinpsbts-self/bare": {
+    "ok": "cHNidP8BAJoCAAAAAgcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcBAAAAAP////8CkF8BAAAAAAAWABTEMPZMR1baMQ29GghVcu8pmSYnLJBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAAAAAA="
+  },
+  "joinpsbts-self/finalized": {
+    "ok": "cHNidP8BAJoCAAAAAgcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcBAAAAAP////8CkF8BAAAAAAAWABTEMPZMR1baMQ29GghVcu8pmSYnLJBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QBCGsCRzBEAiAXBfzaBiZu2zKxaYZ3s39nu25F1JLr/OZWqIDufxOOtgIgPc3jI53ZBjavZPskEspB45fJWKAwd3z/nIlAucd310wBIQLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIvwABAR+ghgEAAAAAABYAFCJprLNKZFvTSWu79Qu7gckGP0+UAQhrAkcwRAIgFwX82gYmbtsysWmGd7N/Z7tuRdSS6/zmVqiA7n8TjrYCID3N4yOd2QY2r2T7JBLKQeOXyVigMHd8/5yJQLnHd9dMASECyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL8AAAA="
+  },
+  "joinpsbts-self/signed": {
+    "ok": "cHNidP8BAJoCAAAAAgcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcBAAAAAP////8CkF8BAAAAAAAWABTEMPZMR1baMQ29GghVcu8pmSYnLJBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QiAgLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIv0cwRAIgFwX82gYmbtsysWmGd7N/Z7tuRdSS6/zmVqiA7n8TjrYCID3N4yOd2QY2r2T7JBLKQeOXyVigMHd8/5yJQLnHd9dMAQEDBAEAAAAAAQEfoIYBAAAAAAAWABQiaayzSmRb00lru/ULu4HJBj9PlCICAsgXu3Uhr8NeqW87+ycObrUN3/pVYGJ7lh/sAPKZZQi/RzBEAiAXBfzaBiZu2zKxaYZ3s39nu25F1JLr/OZWqIDufxOOtgIgPc3jI53ZBjavZPskEspB45fJWKAwd3z/nIlAucd310wBAQMEAQAAAAAAAA=="
+  },
+  "joinpsbts-self/updated": {
+    "ok": "cHNidP8BAJoCAAAAAgcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcBAAAAAP////8CkF8BAAAAAAAWABTEMPZMR1baMQ29GghVcu8pmSYnLJBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAAAAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QAAQEfoIYBAAAAAAAWABQiaayzSmRb00lru/ULu4HJBj9PlAAAAA=="
+  },
+  "joinpsbts-self/with-unknowns": {
+    "ok": "cHNidP8BAJoCAAAAAgcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQAAAAD/////BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcBAAAAAP////8CkF8BAAAAAAAWABTEMPZMR1baMQ29GghVcu8pmSYnLJBfAQAAAAAAFgAUxDD2TEdW2jENvRoIVXLvKZkmJywAAAAABXpzYXRkBmdsb2JhbAABAR+ghgEAAAAAABYAFCJprLNKZFvTSWu79Qu7gckGP0+UIgICyBe7dSGvw16pbzv7Jw5utQ3f+lVgYnuWH+wA8pllCL9HMEQCIBcF/NoGJm7bMrFphnezf2e7bkXUkuv85laogO5/E462AiA9zeMjndkGNq9k+yQSykHjl8lYoDB3fP+ciUC5x3fXTAEBAwQBAAAABXpzYXRkBWlucHV0AAEBH6CGAQAAAAAAFgAUImmss0pkW9NJa7v1C7uByQY/T5QiAgLIF7t1Ia/DXqlvO/snDm61Dd/6VWBie5Yf7ADymWUIv0cwRAIgFwX82gYmbtsysWmGd7N/Z7tuRdSS6/zmVqiA7n8TjrYCID3N4yOd2QY2r2T7JBLKQeOXyVigMHd8/5yJQLnHd9dMAQEDBAEAAAAFenNhdGQFaW5wdXQABXpzYXRkBm91dHB1dAAFenNhdGQGb3V0cHV0AA=="
+  },
+  "joinpsbts/empty": {
+    "error": {
+      "code": -8,
+      "message": "Missing PSBTs"
+    }
+  }
+}
