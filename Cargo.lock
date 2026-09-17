@@ -4668,6 +4668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "satd-psbt"
+version = "0.6.0-pre"
+dependencies = [
+ "base64 0.22.1",
+ "bitcoin",
+ "hex",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,23 @@
+[package]
+name = "satd-psbt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Lossless PSBT raw-map codec with PSBT version 2 (BIP 370) and Silent Payment (BIP 375) field support."
+
+[dependencies]
+# Transaction / script / key types and consensus encoding. The `bitcoin`
+# crate's own `Psbt` rejects any PSBT whose PSBT_GLOBAL_VERSION is above 0
+# (src/psbt/map/global.rs), which is why this crate carries its own codec
+# rather than wrapping it; `bitcoin::Psbt` still serves the version 0 path
+# untouched, and `RawPsbt::to_v0` hands work back to it.
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+# Used at the RPC and CLI boundaries, where a PSBT always arrives as base64.
+base64 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+hex = { workspace = true }
