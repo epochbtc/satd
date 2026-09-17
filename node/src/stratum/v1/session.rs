@@ -42,8 +42,8 @@ const VARDIFF_TICK: Duration = Duration::from_secs(10);
 /// Bound on remembered solutions, in case a tip stays put for a long time.
 const MAX_SEEN_SHARES: usize = 100_000;
 
-/// The connection must close.
-struct Close;
+/// The connection must close, and why, for the disconnect line.
+struct Close(&'static str);
 
 type SeenKey = (u32, [u8; EXTRANONCE2_LEN], u32, u32, i32);
 
@@ -126,7 +126,8 @@ pub(crate) async fn run<S>(
     let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut reason = "server closed the connection";
+    // Every way out of the loop says why.
+    let reason;
     loop {
         let authorized = session.payout.is_some();
         // New work and the vardiff tick come before the miner's own lines.
@@ -171,7 +172,8 @@ pub(crate) async fn run<S>(
                 break;
             }
         };
-        if result.is_err() {
+        if let Err(Close(why)) = result {
+            reason = why;
             break;
         }
     }
@@ -224,7 +226,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             Ok(Ok(())) => Ok(()),
             _ => {
                 tracing::debug!(target: "node::stratum", peer = %self.peer, "Stratum write failed; closing");
-                Err(Close)
+                Err(Close("write failed"))
             }
         }
     }
@@ -420,7 +422,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
                 // Unreachable with the fixed SV1 extranonce length; if it ever
                 // is reached, no job can be issued on this connection.
                 tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum job build failed");
-                return Err(Close);
+                return Err(Close("internal error"));
             }
         };
         let difficulty = self.vardiff.difficulty();
@@ -461,18 +463,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     /// Every refused submit is logged here, so no path can refuse one
     /// silently: a counter that rises with no line to explain it is the
     /// failure this exists to prevent.
+    ///
+    /// A submit before authorize is logged at debug: it comes from a peer
+    /// that is not yet a miner, and at warn anything that can reach the port
+    /// could fill the log with it.
     fn log_refusal(&self, refusal: &Refusal) {
-        tracing::warn!(
-            target: "node::stratum",
-            peer = %self.peer,
-            worker = self.worker(),
-            // A field the refusal came too early to know is left out.
-            job_id = refusal.job_id.map(|id| display(format!("{id:x}"))),
-            reason = refusal.reason,
-            difficulty = refusal.difficulty,
-            share_difficulty = refusal.hash_difficulty.map(|d| display(format_difficulty(d))),
-            "Stratum share rejected"
-        );
+        macro_rules! refused {
+            ($level:expr) => {
+                tracing::event!(
+                    target: "node::stratum",
+                    $level,
+                    peer = %self.peer,
+                    worker = self.worker(),
+                    // A field the refusal came too early to know is left out.
+                    job_id = refusal.job_id.map(|id| display(format!("{id:x}"))),
+                    reason = refusal.reason,
+                    difficulty = refusal.difficulty,
+                    share_difficulty = refusal.hash_difficulty.map(|d| display(format_difficulty(d))),
+                    "Stratum share rejected"
+                )
+            };
+        }
+        if refusal.error == StratumError::Unauthorized {
+            refused!(tracing::Level::DEBUG);
+        } else {
+            refused!(tracing::Level::WARN);
+        }
     }
 
     async fn judge_submit(&mut self, req: &Request) -> Result<(), Refusal> {

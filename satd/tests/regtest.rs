@@ -17811,19 +17811,62 @@ fn stratum_debug_category_logs_miner_diagnostics() {
     let disconnects = |log: &str| log.matches("Stratum miner disconnected").count();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // Off: the info lines only.
+    let early_submit = |rt: &tokio::runtime::Runtime| {
+        rt.block_on(async {
+            let mut early = plain_stratum_client(port);
+            let refused = early.call("mining.submit", json!(["x", "1", "00000000", "00000000", "00000000"])).await;
+            assert_eq!(refused["error"][0], 24, "{refused}");
+        })
+    };
+    // Off: the info lines only. A submit from a peer that never authorized
+    // is not one of them: at warn, anything that reaches the port could fill
+    // the log.
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
         client.handshake(&format!("{addr}.quiet")).await;
     });
+    early_submit(&rt);
     poll_until(|| disconnects(&log()) == 1, test_timeout(10), "the quiet miner's disconnect line");
     let quiet = log();
     assert!(quiet.contains("Stratum miner authorized"), "{quiet}");
     assert!(!quiet.contains("Stratum miner subscribed"), "debug lines must be off by default: {quiet}");
     assert!(!quiet.contains("Stratum version rolling negotiated"), "{quiet}");
+    assert!(!quiet.contains("submit before authorize"), "{quiet}");
+
+    // A worker name is the miner's to choose. One carrying a line break and
+    // a forged log line must not produce a line of its own, on the authorize,
+    // refusal or disconnect lines that name the worker.
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let forged = format!("{addr}.x\n2026-01-01T00:00:00.000000Z ERROR node::stratum: FORGED\u{1b}[31m");
+        let auth = client.call("mining.authorize", json!([forged, "x"])).await;
+        assert_eq!(auth["result"], true, "{auth}");
+        let bad = client.call("mining.submit", json!([forged, "zz", "00", "0", "0"])).await;
+        assert!(!bad["error"].is_null(), "{bad}");
+    });
+    poll_until(|| disconnects(&log()) == 2, test_timeout(10), "the forging miner's disconnect line");
+    let forging = log();
+    assert!(
+        !forging.lines().any(|l| l.starts_with("2026-01-01") || l.contains('\u{1b}')),
+        "a worker name wrote a line or an escape of its own:\n{forging}"
+    );
+    // Nor is it carried at all: the worker is kept as printable ASCII, so the
+    // escaped forms tracing would print do not appear either.
+    let forged_lines: Vec<&str> = forging.lines().filter(|l| l.contains("FORGED")).collect();
+    assert_eq!(forged_lines.len(), 3, "authorized, rejected, disconnected: {forged_lines:?}");
+    assert!(
+        forged_lines.iter().all(|l| !l.contains("\\n2026") && !l.contains("\\u{1b}")),
+        "{forged_lines:?}"
+    );
 
     let on = node.rpc_ok("logging", vec![json!(["stratum"])]);
     assert_eq!(on["stratum"], true, "{on}");
+    early_submit(&rt);
+    poll_until(
+        || log().lines().any(|l| l.contains("DEBUG") && l.contains("submit before authorize")),
+        test_timeout(10),
+        "the early submit, at debug",
+    );
 
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
@@ -17847,7 +17890,7 @@ fn stratum_debug_category_logs_miner_diagnostics() {
         let bad = client.call("mining.submit", json!([format!("{addr}.rig7"), "zz", "00", "0", "0"])).await;
         assert!(!bad["error"].is_null(), "{bad}");
     });
-    poll_until(|| disconnects(&log()) == 2, test_timeout(10), "rig7's disconnect line");
+    poll_until(|| disconnects(&log()) == 3, test_timeout(10), "rig7's disconnect line");
     let log = log();
     // The line containing both strings; the quiet miner logged none of these
     // at debug, so a match is rig7's.
@@ -18437,6 +18480,12 @@ mod sv2 {
         }
 
         pub async fn setup_with(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
+            self.send_setup(protocol, flags).await;
+            self.expect(0x01, Duration::from_secs(10)).await;
+        }
+
+        /// Send a `SetupConnection` without waiting for the answer.
+        pub async fn send_setup(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
             use stratum_core::common_messages_sv2::SetupConnection;
             let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
             let msg = SetupConnection {
@@ -18452,7 +18501,6 @@ mod sv2 {
                 device_id: s(""),
             };
             self.send(0x00, msg).await;
-            self.expect(0x01, Duration::from_secs(10)).await;
         }
 
         /// Open a standard channel: `(channel_id, target_le)`.
@@ -18704,6 +18752,35 @@ fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
         flood.abort();
         assert!(found.is_some(), "no SetNewPrevHash for the tip the miner's own block made");
     });
+}
+
+/// A channel's close line says why the server closed it. Every close the
+/// server made was reported as "server closed the connection", including a
+/// miner that stopped reading.
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_channel_close_names_why() {
+    let (node, _, v2_port) = start_stratum_v2_node(&["--loglevel=info"]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner.setup().await;
+        miner.open_standard(&format!("{addr}.rig")).await;
+        // A second SetupConnection is a protocol violation; the server closes.
+        miner.send_setup(stratum_core::common_messages_sv2::Protocol::MiningProtocol, 0b100).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+    let closed = || {
+        std::fs::read_to_string(&node.stderr_log)
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.contains("Stratum V2 channel closed"))
+            .map(str::to_string)
+    };
+    poll_until(|| closed().is_some(), test_timeout(10), "the channel's close line");
+    let line = closed().unwrap();
+    assert!(line.contains("reason=\"protocol violation\""), "{line}");
 }
 
 #[cfg(feature = "stratum-v2")]

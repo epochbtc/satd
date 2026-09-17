@@ -77,7 +77,10 @@ pub struct Payout {
     pub script: ScriptBuf,
     /// The address the username named, or `None` when the fallback was used.
     pub address: Option<String>,
-    /// The worker name after the first `.`, kept for logs only.
+    /// The worker name after the first `.`, for logs and `getstratuminfo`.
+    /// The miner chooses it, so it is kept only as [`label`](super::miner::label)
+    /// leaves it: printable ASCII, 64 characters at most, `None` if nothing
+    /// is left.
     pub worker: Option<String>,
 }
 
@@ -100,7 +103,7 @@ pub fn resolve_payout(
     fallback: Option<&ScriptBuf>,
 ) -> Result<Payout, PayoutError> {
     let (name, worker) = match username.split_once('.') {
-        Some((n, w)) => (n, Some(w.to_string())),
+        Some((n, w)) => (n, Some(super::miner::label(w)).filter(|w| !w.is_empty())),
         None => (username, None),
     };
     let parsed = Address::<NetworkUnchecked>::from_str(name)
@@ -135,6 +138,13 @@ mod tests {
         let p = resolve_payout(&format!("{regtest_addr}.a.b"), Network::Regtest, None).unwrap();
         assert_eq!(p.worker.as_deref(), Some("a.b"));
         let p = resolve_payout(&regtest_addr, Network::Regtest, None).unwrap();
+        assert_eq!(p.worker, None);
+        // The miner's own string, bounded and reduced to printable ASCII.
+        let p = resolve_payout(&format!("{regtest_addr}.rig\n1\u{1b}"), Network::Regtest, None).unwrap();
+        assert_eq!(p.worker.as_deref(), Some("rig1"));
+        let p = resolve_payout(&format!("{regtest_addr}.{}", "w".repeat(1000)), Network::Regtest, None).unwrap();
+        assert_eq!(p.worker.map(|w| w.len()), Some(super::super::miner::MAX_LABEL_CHARS));
+        let p = resolve_payout(&format!("{regtest_addr}.\n"), Network::Regtest, None).unwrap();
         assert_eq!(p.worker, None);
     }
 

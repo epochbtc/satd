@@ -65,8 +65,8 @@ pub(crate) struct V2Context {
     pub jd: Option<Arc<JobDeclaration>>,
 }
 
-/// The connection must close.
-struct Close;
+/// The connection must close, and why, for the disconnect line.
+struct Close(&'static str);
 
 type SeenKey = (u32, u32, u32, i32, Vec<u8>);
 
@@ -185,7 +185,8 @@ pub(crate) async fn run(
     let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut reason = "server closed the connection";
+    // Every way out of the loop says why.
+    let reason;
     loop {
         let has_channels = !session.channels.is_empty();
         // New work and the vardiff tick come before the miner's frames, as on
@@ -237,7 +238,8 @@ pub(crate) async fn run(
                 break;
             }
         };
-        if result.is_err() {
+        if let Err(Close(why)) = result {
+            reason = why;
             break;
         }
     }
@@ -250,13 +252,13 @@ impl Session {
     async fn send(&mut self, msg_type: u8, payload: &[u8]) -> Result<(), Close> {
         let bytes = noise::encode_frame(&mut self.codec, msg_type, payload).map_err(|e| {
             tracing::debug!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 encrypt failed");
-            Close
+            Close("encrypt failed")
         })?;
         match tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_all(&bytes)).await {
             Ok(Ok(())) => Ok(()),
             _ => {
                 tracing::debug!(target: "node::stratum", peer = %self.peer, "Stratum V2 write failed; closing");
-                Err(Close)
+                Err(Close("write failed"))
             }
         }
     }
@@ -274,12 +276,12 @@ impl Session {
                 msg_type,
                 "Stratum V2 message before SetupConnection; closing"
             );
-            return Err(Close);
+            return Err(Close("protocol violation"));
         }
         if msg_type == wire::SETUP_CONNECTION {
             if self.setup {
                 tracing::debug!(target: "node::stratum", peer = %self.peer, "Stratum V2 second SetupConnection; closing");
-                return Err(Close);
+                return Err(Close("protocol violation"));
             }
             return self.setup_connection(payload).await;
         }
@@ -335,7 +337,7 @@ impl Session {
     fn decode<T>(&self, decoded: Result<T, wire::DecodeError>) -> Result<T, Close> {
         decoded.map_err(|e| {
             tracing::debug!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 malformed message; closing");
-            Close
+            Close("malformed message")
         })
     }
 
@@ -366,7 +368,7 @@ impl Session {
                 "Stratum V2 SetupConnection refused"
             );
             self.send(wire::SETUP_CONNECTION_ERROR, &wire::setup_connection_error(flags, code)).await?;
-            return Err(Close);
+            return Err(Close("SetupConnection refused"));
         }
         self.device = miner::label(&format!("{} {} {}", req.vendor, req.hardware_version, req.firmware));
         tracing::debug!(
@@ -398,7 +400,7 @@ impl Session {
     /// request that names no usable address closes the connection.
     async fn allocate_token(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_allocate_mining_job_token(payload))?;
-        let Some(jd) = self.jd.clone() else { return Err(Close) };
+        let Some(jd) = self.jd.clone() else { return Err(Close("protocol violation")) };
         let config = self.shared.config.clone();
         let payout = match resolve_payout(&req.user_identifier, config.network, config.fallback_address.as_ref()) {
             Ok(p) => p,
@@ -409,7 +411,7 @@ impl Session {
                     user_identifier = %req.user_identifier,
                     "Stratum V2 job token refused: {e}; closing"
                 );
-                return Err(Close);
+                return Err(Close("job token refused"));
             }
         };
         let outputs = jd::coinbase_outputs(&payout.script);
@@ -419,7 +421,7 @@ impl Session {
                 peer = %self.peer,
                 "Stratum V2 job token refused: the token table is full of other connections' declared jobs; closing"
             );
-            return Err(Close);
+            return Err(Close("job token refused"));
         };
         self.send(
             wire::ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
@@ -432,7 +434,7 @@ impl Session {
     /// mempool and the current work.
     async fn declare_job(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_declare_mining_job(payload))?;
-        let Some(jd) = self.jd.clone() else { return Err(Close) };
+        let Some(jd) = self.jd.clone() else { return Err(Close("protocol violation")) };
         let request_id = req.request_id;
         let Some(payout) = jd.tokens.take_allocated(&req.mining_job_token) else {
             return self
@@ -487,7 +489,7 @@ impl Session {
             Ok(Err(refusal)) => self.declare_error(request_id, refusal.code, &refusal.details).await,
             Err(e) => {
                 tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 declaration check panicked");
-                Err(Close)
+                Err(Close("internal error"))
             }
         }
     }
@@ -704,7 +706,7 @@ impl Session {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 job build failed");
-                return Err(Close);
+                return Err(Close("internal error"));
             }
         };
         let share_target = ch.target(&work.block_target);
