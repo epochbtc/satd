@@ -81,7 +81,6 @@ const MAX_ONION_DIALS_PER_TICK: usize = 16;
 /// enough that an honest peer announcing a better chain (one such message,
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
 /// but a peer streaming endless unconnectable headers still accrues to a ban.
-const UNCONNECTING_HEADERS_BAN_SCORE: u32 = 1;
 /// Ban score charged when a peer relays a *consensus-invalid* transaction (bad
 /// script/signature, or outputs exceeding inputs). Mirrors the `block rejected`
 /// score: relaying an invalid tx is real misbehavior, but we deliberately avoid
@@ -149,6 +148,17 @@ const COMPACT_RECONSTRUCT_SUPPRESSION: Duration = Duration::from_secs(5);
 /// request simply goes unrecorded, and a block that arrives for it is treated
 /// as unsolicited.
 const MAX_IN_FLIGHT_BLOCKS_PER_PEER: usize = 256;
+/// Events the manager loop takes from the peer queue in one pass before
+/// yielding. A fairness bound so a busy peer cannot starve the periodic
+/// maintenance in the same loop — not a rate limit: a pass that fills it
+/// comes straight back for more (see `run`).
+const EVENTS_PER_DRAIN: usize = 64;
+
+/// Consecutive full drains before the loop takes its normal path anyway.
+/// Bounds how long sustained inbound traffic can defer the maintenance
+/// section; at `EVENTS_PER_DRAIN` apiece this is 512 messages.
+const MAX_FAST_DRAINS: u32 = 8;
+
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -2974,6 +2984,9 @@ impl PeerManager {
         // below stays on the interval — running it at the rate pings arrive
         // would change every cadence in this loop.
         let mut drain_only = false;
+        // Consecutive iterations that skipped the wait because the event queue
+        // was still full. Reset as soon as one drain comes up short.
+        let mut fast_drains: u32 = 0;
 
         loop {
             // Manager-loop heartbeat: bumped on every iteration so the
@@ -2994,7 +3007,7 @@ impl PeerManager {
             // Process up to 64 events per iteration, then yield for sync
             let mut processed = 0;
             loop {
-                if processed >= 64 {
+                if processed >= EVENTS_PER_DRAIN {
                     break;
                 }
                 match event_rx.try_recv() {
@@ -3016,6 +3029,27 @@ impl PeerManager {
                 }
                 processed += 1;
             }
+
+            // The cap above is a fairness yield, not a rate limit. Leaving a
+            // full queue to wait out the 500 ms interval caps every inbound
+            // path at `EVENTS_PER_DRAIN` messages per tick, which during
+            // initial block download is the whole of the node's throughput: a
+            // 999-block regtest sync from one peer ran at 16 blocks a second
+            // on a loopback socket, the peer idle between bursts, and timed
+            // out the 60-second wait in Core's `p2p_blockfilters`. So when the
+            // queue was still full, come straight back to it.
+            //
+            // Bounded, because a fast drain skips the maintenance below:
+            // after `MAX_FAST_DRAINS` in a row we take the normal path even
+            // with a backlog, so stall detection, fee filters and the rest
+            // keep their cadence under sustained load.
+            if processed >= EVENTS_PER_DRAIN && fast_drains < MAX_FAST_DRAINS {
+                fast_drains += 1;
+                drain_only = true;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            fast_drains = 0;
 
             if drain_only {
                 drain_only = tokio::select! {
@@ -3991,21 +4025,27 @@ impl PeerManager {
                 crate::chain::state::ChainError::PrevBlockNotFound
                 | crate::chain::state::ChainError::BadPrevBlock => {
                     // The announced header builds on a chain we haven't seen —
-                    // a competing/longer chain forking below our knowledge. Ask
-                    // this peer for the connecting headers (headers-first
-                    // discovery, rate-limited) so we can learn the chain;
-                    // `request_missing_blocks` then pulls its fork blocks. We
-                    // charge only a tiny ban score: an honest peer announcing a
-                    // better chain sends one such message and stays far under
-                    // the threshold, but a peer streaming endless unconnectable
-                    // headers still accrues to a disconnect (and the getheaders
-                    // throttle caps the work in the meantime).
+                    // a competing/longer chain forking below our knowledge, or,
+                    // far more often, a peer mining ahead of headers we have
+                    // not caught up on yet. Ask for the connecting headers
+                    // (headers-first discovery, rate-limited) so we can learn
+                    // the chain; `request_missing_blocks` then pulls its blocks.
+                    //
+                    // No ban score. Core's `HandleUnconnectingHeaders` charges
+                    // none: it sends the getheaders and records the peer as a
+                    // source for what it announced. (It used to disconnect at
+                    // `MAX_UNCONNECTING_HEADERS`; that was removed.) An
+                    // unconnected batch costs us nothing — no header is stored
+                    // — and the getheaders throttle already caps the work.
+                    //
+                    // satd charged a point per message on the theory that an
+                    // honest peer sends one and stays far under the threshold.
+                    // It does not: a node syncing 999 regtest blocks from a
+                    // peer that is still mining answers each of our getheaders
+                    // with a batch that no longer connects, and the exchange
+                    // ran to 100 points — a ban — in half a second, leaving the
+                    // node with no block source and its sync stopped dead.
                     self.maybe_send_getheaders(id);
-                    self.add_ban_score(
-                        id,
-                        UNCONNECTING_HEADERS_BAN_SCORE,
-                        "unconnecting header (unknown parent)",
-                    );
                 }
                 other => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
@@ -9723,6 +9763,42 @@ mod tests {
         let peers = pm.peers.read();
         let handle = peers.get(&1).expect("peer session must stay up");
         assert_eq!(handle.info.ban_score, 0, "an unconnectable block must not be ban-scored");
+    }
+
+    /// A peer that announces headers we cannot connect is not misbehaving.
+    /// Core's `HandleUnconnectingHeaders` charges nothing: it sends a
+    /// getheaders to fill the gap and keeps the peer as a download source.
+    ///
+    /// satd charged a point per message, on the theory that an honest peer
+    /// sends one and stays far under the threshold. Measured on a 999-block
+    /// regtest sync from a peer that was still mining, the exchange reached
+    /// 100 points — a ban — in half a second, and the syncing node was left
+    /// with no block source at 21 of 551 blocks, permanently.
+    #[test]
+    fn a_peer_announcing_headers_we_cannot_connect_is_not_banned() {
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.11:8333".parse().unwrap();
+        pm.peers.write().insert(
+            1,
+            mk_handle(1, addr, Direction::Outbound, PeerState::Connected),
+        );
+
+        // A header whose parent we have never seen. Far more of them than the
+        // ban threshold would have tolerated at a point apiece.
+        use bitcoin::hashes::Hash as _;
+        let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
+        header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x7au8; 32]);
+        for nonce in 0..(BAN_THRESHOLD + 10) {
+            header.nonce = nonce;
+            pm.handle_headers(1, vec![header]);
+        }
+
+        let peers = pm.peers.read();
+        let handle = peers.get(&1).expect("the peer session must stay up");
+        assert_eq!(
+            handle.info.ban_score, 0,
+            "an unconnecting header announcement must not be ban-scored"
+        );
     }
 
     /// PR 5: the relay assist paths honor the quarantine scope bits. A
