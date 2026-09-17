@@ -726,6 +726,16 @@ impl Session {
                 ),
             ),
         };
+        tracing::trace!(
+            target: "node::stratum",
+            peer = %self.peer,
+            channel_id = id,
+            job_id,
+            height = work.height,
+            difficulty = ch.vardiff.difficulty(),
+            activate,
+            "Stratum V2 job issued"
+        );
         ch.jobs.push(Job {
             template: Arc::new(template),
             difficulty: ch.vardiff.difficulty(),
@@ -807,8 +817,8 @@ impl Session {
                     channel_id,
                     job_id,
                     reason = code,
-                    difficulty = difficulty.unwrap_or(0),
-                    share_difficulty = hash_difficulty.map(format_difficulty).unwrap_or(0),
+                    difficulty,
+                    share_difficulty = hash_difficulty.map(|d| tracing::field::display(format_difficulty(d))),
                     "Stratum share rejected"
                 );
                 self.send(
@@ -877,7 +887,7 @@ impl Session {
                     channel_id,
                     job_id,
                     difficulty = job.difficulty,
-                    share_difficulty = format_difficulty(hash_difficulty),
+                    share_difficulty = %format_difficulty(hash_difficulty),
                     "Stratum share accepted"
                 );
                 Judged::Accepted { difficulty: job.difficulty, block: None }
@@ -939,7 +949,7 @@ impl Session {
                 accepted = total.accepted,
                 rejected = total.rejected,
                 stale = total.stale,
-                best_share = format_difficulty(ch.tally.best_share()),
+                best_share = %format_difficulty(ch.tally.best_share()),
                 %hashrate,
                 "Stratum V2 channel closed"
             );

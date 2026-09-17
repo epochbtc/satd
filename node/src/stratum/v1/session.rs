@@ -466,10 +466,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             target: "node::stratum",
             peer = %self.peer,
             worker = self.worker(),
-            job_id = %refusal.job_id.map(|id| format!("{id:x}")).unwrap_or_default(),
+            // A field the refusal came too early to know is left out.
+            job_id = refusal.job_id.map(|id| display(format!("{id:x}"))),
             reason = refusal.reason,
-            difficulty = refusal.difficulty.unwrap_or(0),
-            share_difficulty = refusal.hash_difficulty.map(format_difficulty).unwrap_or(0),
+            difficulty = refusal.difficulty,
+            share_difficulty = refusal.hash_difficulty.map(|d| display(format_difficulty(d))),
             "Stratum share rejected"
         );
     }
@@ -533,7 +534,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
                     worker = self.worker(),
                     job_id = %format!("{job_id:x}"),
                     difficulty = job.difficulty,
-                    share_difficulty = format_difficulty(hash_difficulty),
+                    share_difficulty = %format_difficulty(hash_difficulty),
                     "Stratum share accepted"
                 );
                 Ok(())
@@ -601,7 +602,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             accepted = total.accepted,
             rejected = total.rejected,
             stale = total.stale,
-            best_share = format_difficulty(self.tally.best_share()),
+            best_share = %format_difficulty(self.tally.best_share()),
             %hashrate,
             "Stratum miner disconnected"
         );

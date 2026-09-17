@@ -221,6 +221,68 @@ asking for work selection with `unsupported-feature-flags`.
 and channels, share counters, blocks found and the current job. See
 [JSON-RPC Extensions](json-rpc-extensions.md#stratum).
 
+## Verifying a miner
+
+The log shows whether a device is working from the node's side. Every miner
+gets these lines with no extra flags:
+
+| Line | Level | Says |
+|---|---|---|
+| `Stratum miner authorized` (V1), `Stratum V2 channel opened` | info | The payout address and worker, the user agent (V1) or device (V2), and the starting difficulty. |
+| `Stratum share rejected` | warn | Why: `low difficulty`, `stale or unknown job`, `duplicate`, `ntime out of range`, a malformed submit, or a submit before authorize (V2 uses its protocol's error codes). Where known it also names the job, the difficulty it was issued at, and `share_difficulty`, the difficulty the header actually achieved. |
+| `Stratum miner disconnected` (V1), `Stratum V2 channel closed` | info | Why it ended (for example `end of stream`, `idle`, `node shutting down`), how long it was connected, accepted, rejected and stale share counts, the best share, and the estimated hashrate. |
+
+`-debug=stratum` adds the detail for a device that is not behaving. Like any
+`-debug` category it can go in the config file (`debug=stratum`), be switched
+on at runtime with `sat-cli logging '["stratum"]'` and off with
+`sat-cli logging '[]' '["stratum"]'`, and a SIGHUP puts it back to what the
+config file says. `-debugexclude=stratum` keeps it out of `-debug=all`. With it
+on:
+
+- `Stratum miner subscribed` names the user agent the firmware sent, and
+  `Stratum V2 SetupConnection` the vendor, hardware version, firmware and
+  device id.
+- `Stratum version rolling negotiated` shows the mask the miner asked for and
+  the mask it was granted, and `Stratum miner suggested a difficulty` shows a
+  `mining.suggest_difficulty` and the difficulty adopted.
+- `Stratum share accepted` for every share, with the worker, job, difficulty and
+  `share_difficulty`. A share that is also a block is logged as a found block
+  instead.
+- A `vardiff retarget` line for every difficulty change.
+- `Stratum miner status` every five minutes for each miner: shares accepted,
+  rejected and stale since the last status line, the current difficulty, the
+  estimated hashrate, and the seconds since the last accepted share.
+
+`-loglevel=stratum:trace` also logs every job sent to a miner.
+
+The hashrate is estimated from the shares the node accepted: a share at
+difficulty `d` takes `d × 2^32` hashes on average, so the estimate is the sum of
+the accepted shares' difficulties over the last ten minutes (or since the miner
+connected, if that is shorter), times `2^32`, divided by that span. At
+vardiff's one share every 30 seconds, ten minutes is about twenty shares, so
+expect the estimate to wander about a quarter either side of the device's rated
+hashrate. A status line early in a connection covers only a few shares.
+
+What the lines point to:
+
+- **No `authorized` line.** The miner is not reaching the listener, or its
+  username is refused; the refusal is logged at warn.
+- **Authorized, then disconnected with `reason="idle"` and no shares.** The
+  device connected but is not submitting. Check that the node is issuing work:
+  during initial block download it withholds work and says so once.
+- **Every share `low difficulty`, with `share_difficulty` far below
+  `difficulty`.** The miner is hashing a different header from the one the
+  node rebuilds, so its shares are effectively random. Compare the granted
+  version-rolling mask with what the firmware rolls. Real bad luck puts
+  `share_difficulty` near `difficulty`, not orders of magnitude below it.
+- **Mostly `stale or unknown job`.** The miner is slow to switch to new work,
+  or its connection is lagging.
+- **A hashrate well below the device's rating over several status lines.** The
+  device is hashing slower than it should (thermal throttling, a failing
+  hashboard), or losing work to rejects.
+- **Repeated disconnect lines.** The device or its network is dropping the
+  connection. `connected_secs` says how long each one lasted.
+
 ## Configuration
 
 Every Stratum key is restart-only.

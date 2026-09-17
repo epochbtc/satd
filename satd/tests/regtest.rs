@@ -18713,7 +18713,8 @@ fn stratum_v2_extended_share_connects_block() {
     use serde_json::json;
     use stratum_core::binary_sv2::{self, B032};
     use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
-    let (node, _, v2_port) = start_stratum_v2_node(&[]);
+    // `-debug=stratum` too, for the channel's device and close lines below.
+    let (node, _, v2_port) = start_stratum_v2_node(&["--debug=stratum"]);
     let funder = DeterministicWallet::from_secret([0x6b; 32]);
     node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
     let dest = DeterministicWallet::from_secret([0x6c; 32]);
@@ -18805,6 +18806,21 @@ fn stratum_v2_extended_share_connects_block() {
     let txs = block["tx"].as_array().unwrap();
     assert_eq!(txs[1]["txid"], txid, "{block}");
     assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner_addr);
+    // The channel's lines: the device it set up with, and on disconnect the
+    // share it had accepted — the block.
+    poll_until(
+        || std::fs::read_to_string(&node.stderr_log).unwrap_or_default().contains("Stratum V2 channel closed"),
+        test_timeout(10),
+        "the channel's close line",
+    );
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    let find = |needle: &str| log.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle:?}:\n{log}"));
+    assert!(find("Stratum V2 SetupConnection").contains("device=test-miner"), "{log}");
+    let opened = find("Stratum V2 channel opened");
+    assert!(opened.contains("kind=\"extended\"") && opened.contains("device=test-miner"), "{opened}");
+    let closed = find("Stratum V2 channel closed");
+    assert!(closed.contains("accepted=1") && closed.contains("rejected=0"), "{closed}");
+    assert!(!closed.contains("best_share=0.000"), "the block is the best share: {closed}");
 }
 
 #[cfg(feature = "stratum-v2")]

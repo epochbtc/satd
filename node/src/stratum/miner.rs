@@ -178,10 +178,20 @@ pub fn format_hashrate(hashes_per_sec: f64) -> String {
     format!("{value:.2} {}", UNITS[unit])
 }
 
-/// A share difficulty for a log line: whole units, saturating.
-pub fn format_difficulty(difficulty: f64) -> u64 {
-    // `as` saturates, and maps an infinite (all-zero hash) to u64::MAX.
-    difficulty as u64
+/// An achieved share difficulty for a log line: whole units from 100 up,
+/// three decimals below, and scientific notation under 0.001 (regtest, where
+/// a miss is far below difficulty 1), where a floor would read every miss as
+/// zero.
+pub fn format_difficulty(difficulty: f64) -> String {
+    if !difficulty.is_finite() {
+        "inf".to_string()
+    } else if difficulty >= 100.0 {
+        format!("{difficulty:.0}")
+    } else if difficulty >= 0.001 || difficulty == 0.0 {
+        format!("{difficulty:.3}")
+    } else {
+        format!("{difficulty:.2e}")
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +250,10 @@ mod tests {
         assert_eq!(label("  \u{1b}[31m  "), "[31m");
         assert_eq!(format_hashrate(0.0), "0.00 H/s");
         assert_eq!(format_hashrate(1_210_000_000_000.0), "1.21 TH/s");
-        assert_eq!(format_difficulty(f64::INFINITY), u64::MAX);
+        assert_eq!(format_difficulty(f64::INFINITY), "inf");
+        assert_eq!(format_difficulty(123_456.7), "123457");
+        assert_eq!(format_difficulty(0.0421), "0.042");
+        assert_eq!(format_difficulty(0.0), "0.000");
+        assert_eq!(format_difficulty(4.66e-10), "4.66e-10");
     }
 }
