@@ -294,8 +294,9 @@ pub struct TestNode {
     /// an unusual --port format we can't extract.
     pub p2p_port: Option<u16>,
     pub cookie: String,
-    /// Path where the spawned satd's stderr is captured. Tests can read
-    /// this on failure to surface satd's internal logs in CI output.
+    /// Path where the spawned satd's stderr — and, for nodes from `start`,
+    /// its stdout log — is captured. Tests can read this on failure to
+    /// surface satd's internal logs in CI output, or assert on a log line.
     pub stderr_log: PathBuf,
 }
 
@@ -423,14 +424,22 @@ impl TestNode {
         // cheaper than the previous info-level-to-/dev/null path, so the
         // earlier I/O concern that kept capture opt-in no longer applies. The
         // `capture_stderr` flag is retained for API compatibility.
+        //
+        // satd's log lines go to stdout, so stdout shares the file: a test
+        // can assert on what the node logged, and a failure dump shows the
+        // log as well as the fatal error. The two handles share one file
+        // offset, so neither overwrites the other.
         let _ = capture_stderr;
         let stderr_log = datadir.join("satd.stderr");
-        let stderr_target = match std::fs::File::create(&stderr_log) {
-            Ok(f) => std::process::Stdio::from(f),
-            Err(_) => std::process::Stdio::null(),
+        let (stdout_target, stderr_target) = match std::fs::File::create(&stderr_log) {
+            Ok(f) => match f.try_clone() {
+                Ok(out) => (std::process::Stdio::from(out), std::process::Stdio::from(f)),
+                Err(_) => (std::process::Stdio::null(), std::process::Stdio::from(f)),
+            },
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
         };
         let mut process = cmd
-            .stdout(std::process::Stdio::null())
+            .stdout(stdout_target)
             .stderr(stderr_target)
             .spawn()
             .expect("Failed to start satd");

@@ -118,7 +118,7 @@ startup error.
 | `logtimestamps` | on | restart | core | Prepend a timestamp to each log line. Disable (`-nologtimestamps`) when journald / the container runtime already stamps lines. |
 | `logthreadnames` | off | restart | core | Prepend the originating thread name to each log line. |
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
-| `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). |
+| `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). satd adds `stratum`, the Stratum server's per-miner lines (see [Verifying a miner](stratum.md#verifying-a-miner)). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
 | `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |

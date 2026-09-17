@@ -17716,6 +17716,12 @@ fn notify_prevhash(params: &serde_json::Value) -> String {
 /// Build the header a miner would from a notify, grinding the nonce until it
 /// meets the block target. Returns `(extranonce2, ntime, nonce)`.
 fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 4], u32, u32) {
+    grind_stratum_header(extranonce1, params, true)
+}
+
+/// As [`grind_stratum_block`], but stopping at the first nonce whose header
+/// meets the block target (`meets`) or misses it (`!meets`).
+fn grind_stratum_header(extranonce1: &[u8], params: &serde_json::Value, meets: bool) -> ([u8; 4], u32, u32) {
     use bitcoin::hashes::{Hash, sha256d};
     let extranonce2 = [0xde, 0xad, 0xbe, 0xef];
     let mut coinbase = hex::decode(params[2].as_str().unwrap()).unwrap();
@@ -17741,7 +17747,7 @@ fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 
         bits: bitcoin::CompactTarget::from_consensus(hex_u32(6)),
         nonce: 0,
     };
-    while header.validate_pow(header.target()).is_err() {
+    while header.validate_pow(header.target()).is_ok() != meets {
         header.nonce += 1;
     }
     (extranonce2, header.time, header.nonce)
@@ -17787,6 +17793,128 @@ fn stratum_v1_subscribe_authorize_notify() {
     let status = node.rpc_ok("getserverstatus", vec![]);
     assert_eq!(status["stratum"]["bind"], format!("127.0.0.1:{port}"), "{status}");
     assert!(status["stratum_tls"].is_null(), "{status}");
+}
+
+/// `-debug=stratum` is how an operator checks a mining device from the node's
+/// side. Off, the Stratum server logs only its info lines; switched on — here
+/// live, through `logging`, the same state `-debug=stratum` sets — it names the
+/// device, the version-rolling mask it was granted and the difficulty it asked
+/// for, and every refused share says why and what the header achieved.
+#[test]
+fn stratum_debug_category_logs_miner_diagnostics() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}"), "--loglevel=info"]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(20), json!(addr)]);
+    let log = || std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    let disconnects = |log: &str| log.matches("Stratum miner disconnected").count();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let early_submit = |rt: &tokio::runtime::Runtime| {
+        rt.block_on(async {
+            let mut early = plain_stratum_client(port);
+            let refused = early.call("mining.submit", json!(["x", "1", "00000000", "00000000", "00000000"])).await;
+            assert_eq!(refused["error"][0], 24, "{refused}");
+        })
+    };
+    // Off: the info lines only. A submit from a peer that never authorized
+    // is not one of them: at warn, anything that reaches the port could fill
+    // the log.
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        client.handshake(&format!("{addr}.quiet")).await;
+    });
+    early_submit(&rt);
+    poll_until(|| disconnects(&log()) == 1, test_timeout(10), "the quiet miner's disconnect line");
+    let quiet = log();
+    assert!(quiet.contains("Stratum miner authorized"), "{quiet}");
+    assert!(!quiet.contains("Stratum miner subscribed"), "debug lines must be off by default: {quiet}");
+    assert!(!quiet.contains("Stratum version rolling negotiated"), "{quiet}");
+    assert!(!quiet.contains("submit before authorize"), "{quiet}");
+
+    // A worker name is the miner's to choose. One carrying a line break and
+    // a forged log line must not produce a line of its own, on the authorize,
+    // refusal or disconnect lines that name the worker.
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let forged = format!("{addr}.x\n2026-01-01T00:00:00.000000Z ERROR node::stratum: FORGED\u{1b}[31m");
+        let auth = client.call("mining.authorize", json!([forged, "x"])).await;
+        assert_eq!(auth["result"], true, "{auth}");
+        let bad = client.call("mining.submit", json!([forged, "zz", "00", "0", "0"])).await;
+        assert!(!bad["error"].is_null(), "{bad}");
+    });
+    poll_until(|| disconnects(&log()) == 2, test_timeout(10), "the forging miner's disconnect line");
+    let forging = log();
+    assert!(
+        !forging.lines().any(|l| l.starts_with("2026-01-01") || l.contains('\u{1b}')),
+        "a worker name wrote a line or an escape of its own:\n{forging}"
+    );
+    // Nor is it carried at all: the worker is kept as printable ASCII, so the
+    // escaped forms tracing would print do not appear either.
+    let forged_lines: Vec<&str> = forging.lines().filter(|l| l.contains("FORGED")).collect();
+    assert_eq!(forged_lines.len(), 3, "authorized, rejected, disconnected: {forged_lines:?}");
+    assert!(
+        forged_lines.iter().all(|l| !l.contains("\\n2026") && !l.contains("\\u{1b}")),
+        "{forged_lines:?}"
+    );
+
+    let on = node.rpc_ok("logging", vec![json!(["stratum"])]);
+    assert_eq!(on["stratum"], true, "{on}");
+    early_submit(&rt);
+    poll_until(
+        || log().lines().any(|l| l.contains("DEBUG") && l.contains("submit before authorize")),
+        test_timeout(10),
+        "the early submit, at debug",
+    );
+
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (extranonce1, _) = client.handshake(&format!("{addr}.rig7")).await;
+        let suggested = client.call("mining.suggest_difficulty", json!([1])).await;
+        assert_eq!(suggested["result"], true, "{suggested}");
+        // The suggestion comes with a job at the adopted difficulty.
+        let params = client.notification("mining.notify", Duration::from_secs(10)).await["params"].clone();
+        // A header that misses regtest's block target, which is also the
+        // share target there: a low-difficulty share.
+        let (extranonce2, ntime, nonce) = grind_stratum_header(&extranonce1, &params, false);
+        let low = client
+            .call(
+                "mining.submit",
+                json!([format!("{addr}.rig7"), params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+            )
+            .await;
+        assert_eq!(low["error"][0], 23, "{low}");
+        // A malformed submit is refused before any job is looked at. It was
+        // counted, but never logged.
+        let bad = client.call("mining.submit", json!([format!("{addr}.rig7"), "zz", "00", "0", "0"])).await;
+        assert!(!bad["error"].is_null(), "{bad}");
+    });
+    poll_until(|| disconnects(&log()) == 3, test_timeout(10), "rig7's disconnect line");
+    let log = log();
+    // The line containing both strings; the quiet miner logged none of these
+    // at debug, so a match is rig7's.
+    let line = |needle: &str, also: &str| {
+        log.lines()
+            .find(|l| l.contains(needle) && l.contains(also))
+            .unwrap_or_else(|| panic!("no {needle:?} line with {also:?} in:\n{log}"))
+    };
+    line("Stratum miner subscribed", "test-miner/1.0");
+    line("Stratum version rolling negotiated", "1fffe000");
+    line("Stratum miner suggested a difficulty", "adopted=1");
+    let authorized = line("Stratum miner authorized", "rig7");
+    assert!(authorized.contains("test-miner/1.0"), "authorize names the user agent: {authorized}");
+    let rejected: Vec<&str> = log.lines().filter(|l| l.contains("Stratum share rejected") && l.contains("rig7")).collect();
+    assert!(
+        rejected.iter().any(|l| l.contains("low difficulty") && l.contains("share_difficulty=")),
+        "a low-difficulty refusal names what the header achieved: {rejected:?}"
+    );
+    assert!(
+        rejected.iter().any(|l| l.contains("malformed job id")),
+        "a malformed submit is logged: {rejected:?}"
+    );
+    let closed = line("Stratum miner disconnected", "rig7");
+    assert!(closed.contains("accepted=0") && closed.contains("rejected=2"), "{closed}");
 }
 
 #[test]
@@ -18352,6 +18480,12 @@ mod sv2 {
         }
 
         pub async fn setup_with(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
+            self.send_setup(protocol, flags).await;
+            self.expect(0x01, Duration::from_secs(10)).await;
+        }
+
+        /// Send a `SetupConnection` without waiting for the answer.
+        pub async fn send_setup(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
             use stratum_core::common_messages_sv2::SetupConnection;
             let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
             let msg = SetupConnection {
@@ -18367,7 +18501,6 @@ mod sv2 {
                 device_id: s(""),
             };
             self.send(0x00, msg).await;
-            self.expect(0x01, Duration::from_secs(10)).await;
         }
 
         /// Open a standard channel: `(channel_id, target_le)`.
@@ -18621,6 +18754,35 @@ fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
     });
 }
 
+/// A channel's close line says why the server closed it. Every close the
+/// server made was reported as "server closed the connection", including a
+/// miner that stopped reading.
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_channel_close_names_why() {
+    let (node, _, v2_port) = start_stratum_v2_node(&["--loglevel=info"]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner.setup().await;
+        miner.open_standard(&format!("{addr}.rig")).await;
+        // A second SetupConnection is a protocol violation; the server closes.
+        miner.send_setup(stratum_core::common_messages_sv2::Protocol::MiningProtocol, 0b100).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+    let closed = || {
+        std::fs::read_to_string(&node.stderr_log)
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.contains("Stratum V2 channel closed"))
+            .map(str::to_string)
+    };
+    poll_until(|| closed().is_some(), test_timeout(10), "the channel's close line");
+    let line = closed().unwrap();
+    assert!(line.contains("reason=\"protocol violation\""), "{line}");
+}
+
 #[cfg(feature = "stratum-v2")]
 #[test]
 fn stratum_v2_extended_share_connects_block() {
@@ -18628,7 +18790,8 @@ fn stratum_v2_extended_share_connects_block() {
     use serde_json::json;
     use stratum_core::binary_sv2::{self, B032};
     use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
-    let (node, _, v2_port) = start_stratum_v2_node(&[]);
+    // `-debug=stratum` too, for the channel's device and close lines below.
+    let (node, _, v2_port) = start_stratum_v2_node(&["--debug=stratum"]);
     let funder = DeterministicWallet::from_secret([0x6b; 32]);
     node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
     let dest = DeterministicWallet::from_secret([0x6c; 32]);
@@ -18720,6 +18883,22 @@ fn stratum_v2_extended_share_connects_block() {
     let txs = block["tx"].as_array().unwrap();
     assert_eq!(txs[1]["txid"], txid, "{block}");
     assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner_addr);
+    // The channel's lines: the device it set up with, and on disconnect the
+    // share it had accepted — the block.
+    poll_until(
+        || std::fs::read_to_string(&node.stderr_log).unwrap_or_default().contains("Stratum V2 channel closed"),
+        test_timeout(10),
+        "the channel's close line",
+    );
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    let find = |needle: &str| log.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle:?}:\n{log}"));
+    assert!(find("Stratum V2 SetupConnection").contains("device=test-miner"), "{log}");
+    let opened = find("Stratum V2 channel opened");
+    assert!(opened.contains("kind=\"extended\"") && opened.contains("device=test-miner"), "{opened}");
+    let closed = find("Stratum V2 channel closed");
+    assert!(closed.contains("accepted=1") && closed.contains("rejected=0"), "{closed}");
+    assert!(closed.contains("reason=\"end of stream\""), "a miner hanging up is not a read failure: {closed}");
+    assert!(!closed.contains("best_share=0.000"), "the block is the best share: {closed}");
 }
 
 #[cfg(feature = "stratum-v2")]

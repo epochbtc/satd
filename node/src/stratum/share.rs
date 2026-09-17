@@ -27,9 +27,13 @@ pub enum ShareResult {
     /// The header meets the block target. The block is fully assembled.
     Block(Box<Block>),
     /// The header meets the share target but not the block target.
-    Share,
-    /// The header does not meet the share target.
-    LowDifficulty,
+    /// `hash_difficulty` is what the header actually achieved.
+    Share { hash_difficulty: f64 },
+    /// The header does not meet the share target. A figure far below the
+    /// job's difficulty on every share usually means the miner is hashing a
+    /// different header than the server reconstructs — a version-rolling or
+    /// extranonce mismatch — rather than being unlucky.
+    LowDifficulty { hash_difficulty: f64 },
     /// The job is unknown or superseded, or its timestamp would change the
     /// block's required difficulty.
     Stale,
@@ -67,6 +71,15 @@ pub fn network_difficulty(block_target: &[u8; 32]) -> u64 {
     }
     let d = u256_to_f64(&DIFF1_TARGET) / target;
     if d >= u64::MAX as f64 { u64::MAX } else { (d as u64).max(1) }
+}
+
+/// The difficulty a header hash achieved, in pool-difficulty units:
+/// `DIFF1_TARGET / hash`. The all-zero hash reads as infinite.
+pub fn hash_difficulty(hash: &bitcoin::BlockHash) -> f64 {
+    let mut be = hash.to_byte_array();
+    be.reverse();
+    let value = u256_to_f64(&be);
+    if value <= 0.0 { f64::INFINITY } else { u256_to_f64(&DIFF1_TARGET) / value }
 }
 
 /// Whether a block hash, as a 256-bit number, is at or below `target`.
@@ -124,10 +137,11 @@ pub fn validate_share(
             extranonce, ntime, nonce, version,
         ))));
     }
+    let hash_difficulty = hash_difficulty(&hash);
     if hash_meets_target(&hash, share_target) {
-        Ok(ShareResult::Share)
+        Ok(ShareResult::Share { hash_difficulty })
     } else {
-        Ok(ShareResult::LowDifficulty)
+        Ok(ShareResult::LowDifficulty { hash_difficulty })
     }
 }
 
@@ -229,12 +243,12 @@ mod tests {
         let target = effective_share_target(1 << 40, &job.work.block_target);
         assert_eq!(target, job.work.block_target, "clamped to the block target");
         let result = validate_share(&job, &[0u8; 8], NTIME, 7, 0x2000_0000, &target, u64::from(NTIME)).unwrap();
-        assert!(matches!(result, ShareResult::LowDifficulty), "{result:?}");
+        assert!(matches!(result, ShareResult::LowDifficulty { .. }), "{result:?}");
 
         let mut hard = [0u8; 32];
         hard[31] = 1;
         let result = validate_share(&job, &[0u8; 8], NTIME, 7, 0x2000_0000, &hard, u64::from(NTIME)).unwrap();
-        assert!(matches!(result, ShareResult::LowDifficulty), "{result:?}");
+        assert!(matches!(result, ShareResult::LowDifficulty { .. }), "{result:?}");
 
         assert!(validate_share(&job, &[0u8; 4], NTIME, 7, 0x2000_0000, &hard, 0).is_err());
     }
@@ -289,6 +303,29 @@ mod tests {
             validate_share(&job, &[0; 8], parent + 1_201, 0, 0x2000_0000, &easy, now).unwrap(),
             ShareResult::Stale
         ));
+    }
+
+    #[test]
+    fn hash_difficulty_is_diff1_over_the_hash() {
+        let hash_of = |target: [u8; 32]| {
+            let mut le = target;
+            le.reverse();
+            bitcoin::BlockHash::from_byte_array(le)
+        };
+        assert_eq!(hash_difficulty(&hash_of(DIFF1_TARGET)), 1.0);
+        let d = hash_difficulty(&hash_of(share_target(10_000)));
+        assert!((d - 10_000.0).abs() < 1e-6, "{d}");
+        assert_eq!(hash_difficulty(&hash_of([0; 32])), f64::INFINITY);
+        // A share's achieved difficulty meets the target it was judged by.
+        let job = job(0x1d00ffff);
+        let target = share_target(1);
+        for nonce in 0..16 {
+            match validate_share(&job, &[0u8; 8], NTIME, nonce, 0x2000_0000, &target, u64::from(NTIME)).unwrap() {
+                ShareResult::Share { hash_difficulty } => assert!(hash_difficulty >= 1.0),
+                ShareResult::LowDifficulty { hash_difficulty } => assert!(hash_difficulty < 1.0),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

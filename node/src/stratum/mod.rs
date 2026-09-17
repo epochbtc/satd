@@ -15,6 +15,7 @@
 
 pub mod config;
 pub mod job;
+pub mod miner;
 pub mod server;
 pub mod share;
 pub mod template;
