@@ -33,8 +33,11 @@ use super::noise::{self, TransportError};
 use super::wire;
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
+use crate::stratum::miner::{self, MinerTally, format_difficulty, format_hashrate};
 use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
-use crate::stratum::share::{ShareResult, effective_share_target, network_difficulty, validate_share};
+use crate::stratum::share::{
+    ShareResult, effective_share_target, hash_difficulty, network_difficulty, validate_share,
+};
 use crate::stratum::template::{ActiveTemplate, MAX_EXTRANONCE_LEN, Work};
 use crate::stratum::v1::VERSION_ROLLING_MASK;
 use crate::stratum::vardiff::Vardiff;
@@ -81,6 +84,7 @@ struct Channel {
     /// The previous-block hash the channel's jobs build on.
     prev_hash: Option<BlockHash>,
     seen: HashSet<SeenKey>,
+    tally: MinerTally,
     _count: CountGuard,
 }
 
@@ -91,6 +95,10 @@ impl Channel {
 
     fn hole_len(&self) -> usize {
         EXTRANONCE_PREFIX_LEN + self.extended.unwrap_or(0)
+    }
+
+    fn worker(&self) -> &str {
+        self.payout.worker.as_deref().unwrap_or("")
     }
 }
 
@@ -112,6 +120,8 @@ struct Session {
     jd: Option<Arc<JobDeclaration>>,
     /// Jobs this Job Declaration connection declared, newest last.
     declared: VecDeque<Arc<DeclaredJob>>,
+    /// Vendor, hardware and firmware from `SetupConnection`, made safe to log.
+    device: String,
 }
 
 /// Serve one connection until it closes, idles out, or the node shuts down.
@@ -168,12 +178,14 @@ pub(crate) async fn run(
         max_channels: ctx.max_channels.max(1),
         jd: ctx.jd.clone(),
         declared: VecDeque::new(),
+        device: String::new(),
     };
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
     let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut reason = "server closed the connection";
     loop {
         let has_channels = !session.channels.is_empty();
         // New work and the vardiff tick come before the miner's frames, as on
@@ -181,9 +193,13 @@ pub(crate) async fn run(
         // pause would otherwise never be sent the next job.
         let result = tokio::select! {
             biased;
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                reason = "node shutting down";
+                break;
+            }
             changed = work_rx.changed(), if has_channels => {
                 if changed.is_err() {
+                    reason = "node shutting down";
                     break;
                 }
                 let work = work_rx.borrow_and_update().clone();
@@ -192,20 +208,27 @@ pub(crate) async fn run(
                     None => Ok(()),
                 }
             }
-            _ = vardiff_tick.tick(), if has_channels => session.check_vardiff().await,
+            _ = vardiff_tick.tick(), if has_channels => {
+                session.log_status();
+                session.check_vardiff().await
+            }
             frame = frames.recv() => match frame {
                 Some(Ok((msg_type, payload))) => {
                     idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                     session.handle(msg_type, &payload, &mut work_rx).await
                 }
                 Some(Err(e)) => {
-                    tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 connection closed");
+                    tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 read failed");
+                    reason = "read failed";
                     break;
                 }
-                None => break,
+                None => {
+                    reason = "read failed";
+                    break;
+                }
             },
             _ = &mut idle => {
-                tracing::debug!(target: "node::stratum", %peer, "Stratum V2 connection idle; closing");
+                reason = "idle";
                 break;
             }
         };
@@ -213,6 +236,7 @@ pub(crate) async fn run(
             break;
         }
     }
+    session.log_close(reason);
     reader_task.abort();
     let _ = session.writer.shutdown().await;
 }
@@ -339,12 +363,14 @@ impl Session {
             self.send(wire::SETUP_CONNECTION_ERROR, &wire::setup_connection_error(flags, code)).await?;
             return Err(Close);
         }
+        self.device = miner::label(&format!("{} {} {}", req.vendor, req.hardware_version, req.firmware));
         tracing::debug!(
             target: "node::stratum",
             peer = %self.peer,
-            vendor = %req.vendor,
-            hardware = %req.hardware_version,
-            firmware = %req.firmware,
+            protocol = req.protocol,
+            flags = req.flags,
+            device = %self.device,
+            device_id = %miner::label(&req.device_id),
             "Stratum V2 SetupConnection"
         );
         self.setup = true;
@@ -610,6 +636,7 @@ impl Session {
             jobs: JobManager::new(),
             prev_hash: None,
             seen: HashSet::new(),
+            tally: MinerTally::new(std::time::Instant::now()),
             _count: CountGuard::new(self.shared.stats.clone(), |s| &s.channels),
         };
         let work = work_rx.borrow_and_update().clone();
@@ -624,7 +651,9 @@ impl Session {
             channel_id = id,
             kind = if extended.is_some() { "extended" } else { "standard" },
             address = channel.payout.address.as_deref().unwrap_or("<--stratumaddress>"),
-            worker = channel.payout.worker.as_deref().unwrap_or(""),
+            worker = channel.worker(),
+            device = %self.device,
+            difficulty = channel.vardiff.difficulty(),
             "Stratum V2 channel opened"
         );
         let reply = match extended {
@@ -743,13 +772,14 @@ impl Session {
         version: u32,
         miner_extranonce: Option<Vec<u8>>,
     ) -> Result<(), Close> {
-        let outcome = self.judge(channel_id, job_id, nonce, ntime, version, miner_extranonce);
-        self.shared.stats.share(match &outcome {
+        let judged = self.judge(channel_id, job_id, nonce, ntime, version, miner_extranonce);
+        let outcome = match &judged {
             Judged::Accepted { .. } => ShareOutcome::Accepted,
-            Judged::Rejected("stale-share") => ShareOutcome::Stale,
-            Judged::Rejected(_) => ShareOutcome::Rejected,
-        });
-        match outcome {
+            Judged::Rejected { code: "stale-share", .. } => ShareOutcome::Stale,
+            Judged::Rejected { .. } => ShareOutcome::Rejected,
+        };
+        self.shared.stats.share(outcome);
+        match judged {
             Judged::Accepted { difficulty, block } => {
                 if let Some((block, height, payout)) = block {
                     submit_found_block(&self.shared, block, height, &payout, self.peer).await;
@@ -760,13 +790,25 @@ impl Session {
                 )
                 .await
             }
-            Judged::Rejected(code) => {
+            Judged::Rejected { code, difficulty, hash_difficulty } => {
+                // Every refusal is logged here, including one for a channel
+                // that does not exist, which has no tally to count it in.
+                let worker = match self.channels.get_mut(&channel_id) {
+                    Some(ch) => {
+                        ch.tally.refuse(outcome);
+                        ch.worker().to_string()
+                    }
+                    None => String::new(),
+                };
                 tracing::warn!(
                     target: "node::stratum",
                     peer = %self.peer,
+                    worker,
                     channel_id,
                     job_id,
                     reason = code,
+                    difficulty = difficulty.unwrap_or(0),
+                    share_difficulty = hash_difficulty.map(format_difficulty).unwrap_or(0),
                     "Stratum share rejected"
                 );
                 self.send(
@@ -788,57 +830,136 @@ impl Session {
         miner_extranonce: Option<Vec<u8>>,
     ) -> Judged {
         let Some(ch) = self.channels.get_mut(&channel_id) else {
-            return Judged::Rejected("invalid-channel-id");
+            return Judged::refused("invalid-channel-id", None);
         };
         let mut extranonce = ch.prefix.to_vec();
         match (ch.extended, miner_extranonce) {
             (None, None) => {}
             (Some(size), Some(miner)) if miner.len() == size => extranonce.extend_from_slice(&miner),
-            _ => return Judged::Rejected("invalid-share"),
+            _ => return Judged::refused("invalid-share", None),
         }
         let Some(job) = ch.jobs.get(job_id).cloned() else {
-            return Judged::Rejected("stale-share");
+            return Judged::refused("stale-share", None);
         };
         let base = job.template.work.version as u32;
         let version = ((base & !VERSION_ROLLING_MASK) | (version & VERSION_ROLLING_MASK)) as i32;
         let key = (job_id, nonce, ntime, version, extranonce[EXTRANONCE_PREFIX_LEN..].to_vec());
         if ch.seen.contains(&key) {
-            return Judged::Rejected("duplicate-share");
+            return Judged::refused("duplicate-share", Some(&job));
         }
         let now = crate::time::now_secs();
         let result = match validate_share(&job.template, &extranonce, ntime, nonce, version, &job.share_target, now) {
             Ok(r) => r,
-            Err(_) => return Judged::Rejected("invalid-share"),
+            Err(_) => return Judged::refused("invalid-share", Some(&job)),
         };
-        let accept = |ch: &mut Channel, key| {
+        let accept = |ch: &mut Channel, key, hash_difficulty| {
             if ch.seen.len() >= MAX_SEEN_SHARES {
                 ch.seen.clear();
             }
             ch.seen.insert(key);
             ch.vardiff.record_share();
+            ch.tally.accept(std::time::Instant::now(), job.difficulty, hash_difficulty);
         };
         match result {
             ShareResult::Block(block) => {
-                accept(ch, key);
+                accept(ch, key, hash_difficulty(&block.block_hash()));
                 Judged::Accepted {
                     difficulty: job.difficulty,
                     block: Some((*block, job.template.work.height, ch.payout.clone())),
                 }
             }
-            ShareResult::Share => {
-                accept(ch, key);
-                tracing::debug!(target: "node::stratum", peer = %self.peer, channel_id, job_id, "Stratum share accepted");
+            ShareResult::Share { hash_difficulty } => {
+                accept(ch, key, hash_difficulty);
+                tracing::debug!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    worker = ch.worker(),
+                    channel_id,
+                    job_id,
+                    difficulty = job.difficulty,
+                    share_difficulty = format_difficulty(hash_difficulty),
+                    "Stratum share accepted"
+                );
                 Judged::Accepted { difficulty: job.difficulty, block: None }
             }
-            ShareResult::LowDifficulty => Judged::Rejected("difficulty-too-low"),
-            ShareResult::Stale => Judged::Rejected("stale-share"),
-            ShareResult::Duplicate => Judged::Rejected("duplicate-share"),
-            ShareResult::BadTime => Judged::Rejected("invalid-timestamp"),
+            ShareResult::LowDifficulty { hash_difficulty } => Judged::Rejected {
+                code: "difficulty-too-low",
+                difficulty: Some(job.difficulty),
+                hash_difficulty: Some(hash_difficulty),
+            },
+            ShareResult::Stale => Judged::refused("stale-share", Some(&job)),
+            ShareResult::Duplicate => Judged::refused("duplicate-share", Some(&job)),
+            ShareResult::BadTime => Judged::refused("invalid-timestamp", Some(&job)),
+        }
+    }
+
+    /// The periodic `-debug=stratum` reading for every channel.
+    fn log_status(&mut self) {
+        let now = std::time::Instant::now();
+        for ch in self.channels.values_mut() {
+            let Some(report) = ch.tally.status_due(now) else { continue };
+            tracing::debug!(
+                target: "node::stratum",
+                peer = %self.peer,
+                channel_id = ch.id,
+                worker = ch.worker(),
+                difficulty = ch.vardiff.difficulty(),
+                accepted = report.shares.accepted,
+                rejected = report.shares.rejected,
+                stale = report.shares.stale,
+                hashrate = %format_hashrate(report.hashrate),
+                last_share_secs = report.last_share_secs.map(|s| s.to_string()).unwrap_or_else(|| "never".into()),
+                "Stratum miner status"
+            );
+        }
+    }
+
+    /// One line per channel when the connection ends, at info, beside the
+    /// "channel opened" line; a connection that opened none gets a debug line.
+    fn log_close(&mut self, reason: &str) {
+        let now = std::time::Instant::now();
+        if self.channels.is_empty() {
+            tracing::debug!(target: "node::stratum", peer = %self.peer, reason, "Stratum V2 connection closed");
+            return;
+        }
+        let mut ids: Vec<u32> = self.channels.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(ch) = self.channels.get_mut(&id) else { continue };
+            let hashrate = format_hashrate(ch.tally.hashrate(now));
+            let total = ch.tally.total();
+            tracing::info!(
+                target: "node::stratum",
+                peer = %self.peer,
+                channel_id = id,
+                address = ch.payout.address.as_deref().unwrap_or("<--stratumaddress>"),
+                worker = ch.worker(),
+                reason,
+                connected_secs = ch.tally.connected_secs(now),
+                accepted = total.accepted,
+                rejected = total.rejected,
+                stale = total.stale,
+                best_share = format_difficulty(ch.tally.best_share()),
+                %hashrate,
+                "Stratum V2 channel closed"
+            );
         }
     }
 }
 
 enum Judged {
     Accepted { difficulty: u64, block: Option<(bitcoin::Block, u32, Payout)> },
-    Rejected(&'static str),
+    Rejected {
+        code: &'static str,
+        /// The difficulty the job was issued at, once the job is known.
+        difficulty: Option<u64>,
+        /// What the header achieved, once it was hashed.
+        hash_difficulty: Option<f64>,
+    },
+}
+
+impl Judged {
+    fn refused(code: &'static str, job: Option<&Job>) -> Self {
+        Judged::Rejected { code, difficulty: job.map(|j| j.difficulty), hash_difficulty: None }
+    }
 }

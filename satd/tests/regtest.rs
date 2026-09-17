@@ -17716,6 +17716,12 @@ fn notify_prevhash(params: &serde_json::Value) -> String {
 /// Build the header a miner would from a notify, grinding the nonce until it
 /// meets the block target. Returns `(extranonce2, ntime, nonce)`.
 fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 4], u32, u32) {
+    grind_stratum_header(extranonce1, params, true)
+}
+
+/// As [`grind_stratum_block`], but stopping at the first nonce whose header
+/// meets the block target (`meets`) or misses it (`!meets`).
+fn grind_stratum_header(extranonce1: &[u8], params: &serde_json::Value, meets: bool) -> ([u8; 4], u32, u32) {
     use bitcoin::hashes::{Hash, sha256d};
     let extranonce2 = [0xde, 0xad, 0xbe, 0xef];
     let mut coinbase = hex::decode(params[2].as_str().unwrap()).unwrap();
@@ -17741,7 +17747,7 @@ fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 
         bits: bitcoin::CompactTarget::from_consensus(hex_u32(6)),
         nonce: 0,
     };
-    while header.validate_pow(header.target()).is_err() {
+    while header.validate_pow(header.target()).is_ok() != meets {
         header.nonce += 1;
     }
     (extranonce2, header.time, header.nonce)
@@ -17787,6 +17793,85 @@ fn stratum_v1_subscribe_authorize_notify() {
     let status = node.rpc_ok("getserverstatus", vec![]);
     assert_eq!(status["stratum"]["bind"], format!("127.0.0.1:{port}"), "{status}");
     assert!(status["stratum_tls"].is_null(), "{status}");
+}
+
+/// `-debug=stratum` is how an operator checks a mining device from the node's
+/// side. Off, the Stratum server logs only its info lines; switched on — here
+/// live, through `logging`, the same state `-debug=stratum` sets — it names the
+/// device, the version-rolling mask it was granted and the difficulty it asked
+/// for, and every refused share says why and what the header achieved.
+#[test]
+fn stratum_debug_category_logs_miner_diagnostics() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}"), "--loglevel=info"]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(20), json!(addr)]);
+    let log = || std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    let disconnects = |log: &str| log.matches("Stratum miner disconnected").count();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Off: the info lines only.
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        client.handshake(&format!("{addr}.quiet")).await;
+    });
+    poll_until(|| disconnects(&log()) == 1, test_timeout(10), "the quiet miner's disconnect line");
+    let quiet = log();
+    assert!(quiet.contains("Stratum miner authorized"), "{quiet}");
+    assert!(!quiet.contains("Stratum miner subscribed"), "debug lines must be off by default: {quiet}");
+    assert!(!quiet.contains("Stratum version rolling negotiated"), "{quiet}");
+
+    let on = node.rpc_ok("logging", vec![json!(["stratum"])]);
+    assert_eq!(on["stratum"], true, "{on}");
+
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (extranonce1, _) = client.handshake(&format!("{addr}.rig7")).await;
+        let suggested = client.call("mining.suggest_difficulty", json!([1])).await;
+        assert_eq!(suggested["result"], true, "{suggested}");
+        // The suggestion comes with a job at the adopted difficulty.
+        let params = client.notification("mining.notify", Duration::from_secs(10)).await["params"].clone();
+        // A header that misses regtest's block target, which is also the
+        // share target there: a low-difficulty share.
+        let (extranonce2, ntime, nonce) = grind_stratum_header(&extranonce1, &params, false);
+        let low = client
+            .call(
+                "mining.submit",
+                json!([format!("{addr}.rig7"), params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+            )
+            .await;
+        assert_eq!(low["error"][0], 23, "{low}");
+        // A malformed submit is refused before any job is looked at. It was
+        // counted, but never logged.
+        let bad = client.call("mining.submit", json!([format!("{addr}.rig7"), "zz", "00", "0", "0"])).await;
+        assert!(!bad["error"].is_null(), "{bad}");
+    });
+    poll_until(|| disconnects(&log()) == 2, test_timeout(10), "rig7's disconnect line");
+    let log = log();
+    // The line containing both strings; the quiet miner logged none of these
+    // at debug, so a match is rig7's.
+    let line = |needle: &str, also: &str| {
+        log.lines()
+            .find(|l| l.contains(needle) && l.contains(also))
+            .unwrap_or_else(|| panic!("no {needle:?} line with {also:?} in:\n{log}"))
+    };
+    line("Stratum miner subscribed", "test-miner/1.0");
+    line("Stratum version rolling negotiated", "1fffe000");
+    line("Stratum miner suggested a difficulty", "adopted=1");
+    let authorized = line("Stratum miner authorized", "rig7");
+    assert!(authorized.contains("test-miner/1.0"), "authorize names the user agent: {authorized}");
+    let rejected: Vec<&str> = log.lines().filter(|l| l.contains("Stratum share rejected") && l.contains("rig7")).collect();
+    assert!(
+        rejected.iter().any(|l| l.contains("low difficulty") && l.contains("share_difficulty=")),
+        "a low-difficulty refusal names what the header achieved: {rejected:?}"
+    );
+    assert!(
+        rejected.iter().any(|l| l.contains("malformed job id")),
+        "a malformed submit is logged: {rejected:?}"
+    );
+    let closed = line("Stratum miner disconnected", "rig7");
+    assert!(closed.contains("accepted=0") && closed.contains("rejected=2"), "{closed}");
 }
 
 #[test]

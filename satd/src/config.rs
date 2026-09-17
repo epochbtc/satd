@@ -8544,6 +8544,7 @@ pub const DEBUG_CATEGORIES: &[&str] = &[
     "prune",
     "reindex",
     "rpc",
+    "stratum",
     "tor",
     "txpackages",
     "txreconciliation",
@@ -8558,6 +8559,9 @@ pub(crate) fn debug_category_target(category: &str) -> Option<&'static str> {
         "rpc" | "http" => Some("node::rpc"),
         "validation" | "bench" => Some("node::validation"),
         "coindb" | "blockstorage" | "leveldb" | "prune" | "reindex" => Some("node::storage"),
+        // satd's own: Core has no Stratum server. Per-miner connection,
+        // share and status lines for verifying a mining device.
+        "stratum" => Some("node::stratum"),
         _ => None,
     }
 }
@@ -9753,6 +9757,8 @@ bind=127.0.0.1:9002
             "i2p", "leveldb", "libevent", "lock", "mempool", "mempoolrej", "net", "prune",
             "proxy", "qt", "rand", "reindex", "rpc", "scan", "selectcoins", "tor", "txpackages",
             "txreconciliation", "validation", "walletdb", "zmq", "kernel", "privatebroadcast",
+            // satd-only categories.
+            "stratum",
         ] {
             if debug_category_target(cat).is_some() {
                 assert!(
@@ -14590,6 +14596,18 @@ notarealkey=1
         assert!(!all);
         assert!(dirs.contains(&"node::net=debug".to_string()));
         assert!(dirs.contains(&"node::mempool=debug".to_string()));
+    }
+
+    /// `-debug=stratum` turns on the Stratum server's per-miner lines and
+    /// nothing else; `-debugexclude=stratum` keeps them out of `-debug=all`.
+    #[test]
+    fn debug_directives_stratum_category() {
+        let (all, dirs) = debug_directives(&["stratum".to_string()], &[]);
+        assert!(!all);
+        assert_eq!(dirs, vec!["node::stratum=debug".to_string()]);
+        let (all, dirs) = debug_directives(&["all".to_string()], &["stratum".to_string()]);
+        assert!(all);
+        assert_eq!(dirs, vec!["node::stratum=info".to_string()]);
     }
 
     #[test]
