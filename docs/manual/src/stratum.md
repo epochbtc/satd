@@ -229,8 +229,8 @@ gets these lines with no extra flags:
 | Line | Level | Says |
 |---|---|---|
 | `Stratum miner authorized` (V1), `Stratum V2 channel opened` | info | The payout address and worker, the user agent (V1) or device (V2), and the starting difficulty. |
-| `Stratum share rejected` | warn | Why: `low difficulty`, `stale or unknown job`, `duplicate`, `ntime out of range`, a malformed submit, or a submit before authorize (V2 uses its protocol's error codes). Where known it also names the job, the difficulty it was issued at, and `share_difficulty`, the difficulty the header actually achieved. |
-| `Stratum miner disconnected` (V1), `Stratum V2 channel closed` | info | Why it ended (for example `end of stream`, `idle`, `node shutting down`), how long it was connected, accepted, rejected and stale share counts, the best share, and the estimated hashrate. |
+| `Stratum share rejected` | warn | Why: `low difficulty`, `stale or unknown job`, `duplicate`, `ntime out of range`, or a malformed submit (V2 uses its protocol's error codes). A submit from a connection that has not authorized is logged at debug instead, so a peer that is not a miner cannot fill the log. Where known it also names the job, the difficulty it was issued at, and `share_difficulty`, the difficulty the header actually achieved. |
+| `Stratum miner disconnected` (V1), `Stratum V2 channel closed` | info | Why it ended (for example `end of stream` when the miner hung up, `idle`, `write failed` when it stopped reading, `protocol violation`, `node shutting down`), how long it was connected, accepted, rejected and stale share counts, the best share, and the estimated hashrate. |
 
 `-debug=stratum` adds the detail for a device that is not behaving. Like any
 `-debug` category it can go in the config file (`debug=stratum`), be switched
