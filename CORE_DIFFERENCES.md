@@ -567,7 +567,9 @@ These surfaces will not ship. Each is a deliberate scope decision.
   and `signrawtransactionwithkey`. PSBT *signing* is offered too, but
   deliberately **client-side** via `sat-cli signpsbtwithkey`: the key is
   read from stdin and signed locally so it never traverses RPC or lands
-  in the keyless daemon. Core's v30 removal of
+  in the keyless daemon. That command is also satd's BIP 375 Signer —
+  computing a silent payment's ECDH shares needs an input's private key,
+  so it can only happen in the client. Core's v30 removal of
   `addmultisigaddress`, `dumpprivkey`, `dumpwallet`, the `import*`
   family, `sethdseed`, `upgradewallet`, etc. is a surface satd never
   exposed.

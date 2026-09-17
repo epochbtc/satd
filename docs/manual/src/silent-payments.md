@@ -425,16 +425,65 @@ sat-cli finalizepsbt "$SIGNED"
 sat-cli sendrawtransaction "$HEX"
 ```
 
-Step 3 is the one satd cannot do for you: computing an ECDH share needs the
-input's private key, which never enters this node. `sat-cli signpsbtwithkey`
-does not do it yet. `sat-cli signpsbtwithsigner` passes a version 2 PSBT to an
-external signer untouched, because a hardware device is exactly the right party
-to ask — but no shipping device writes BIP 375 fields today, so in practice the
-Signer is the sending wallet.
+Step 3 needs an input's private key, which never enters this node — so it
+happens in the client. `sat-cli signpsbtwithkey` does it.
+
+### Signing with `sat-cli`
+
+`sat-cli signpsbtwithkey` is a BIP 375 Signer. Given a version 2 PSBT and a key
+on stdin it does the Signer's duties in the order BIP 375 states them, because
+the order is the safety property:
+
+1. Refuse a transaction that cannot carry a silent payment at all — a segwit
+   version 2 or later input, or a sighash that is not SIGHASH_ALL.
+2. Record the public key of every input it holds, so that anyone else can
+   check whose key a share belongs to. satd's `createpsbt` has no wallet and
+   cannot write these, which makes it the Signer's job.
+3. Compute an ECDH share for each of those inputs, with a BIP 374 proof, and
+   check every share it did not produce.
+4. Once every eligible input is covered, compute each output's script and
+   clear `PSBT_GLOBAL_TX_MODIFIABLE`.
+5. Only then sign. **It never signs while an output has no script**: a
+   signature commits to the outputs, so signing first would commit to a
+   transaction that is still going to change.
+
+A signer holding only some of the inputs is the normal case, not an error. It
+writes its shares, names the inputs that still owe one, emits the PSBT, and
+exits 2 — the same exit code a partially signed version 0 PSBT gets. The next
+signer continues. A signer that holds *every* eligible input writes one global
+share per scan key instead of one per input; a signer that does not must not,
+because a global share claims to cover inputs it does not hold.
+
+The key is read from stdin, never over RPC, and the auxiliary randomness for
+each BIP 374 proof is 32 fresh bytes from the operating system. Reusing it
+across two proofs for the same key can leak the secret, which is why two runs
+over the same PSBT produce different proofs of the same share.
+
+### Signing with a device
+
+`sat-cli signpsbtwithsigner` passes a version 2 PSBT to an external signer
+untouched. For a silent payment the only party that can compute an ECDH share
+is the one holding the input's private key, so a device is exactly the right
+party to ask — and `sat-cli` cannot know which devices have learned BIP 375.
+
+No shipping device writes BIP 375 fields today. What does work now is the
+second half: BIP 375 says a PSBT is plain PSBTv2 once every output has a
+script, so a device that has never heard of BIP 375 can sign one another signer
+has already completed. In that case the device shows a taproot address, not the
+`sp1…` one, so the user's assurance is the node's verdict — run `analyzepsbt`
+and check for `ready`/`matches` before the PSBT goes to the device.
+
+Either way `sat-cli` checks the reply, with the same code the node runs. A
+signer adds signature data; it does not choose the transaction. A reply
+describing a different transaction, one whose silent payment script is not what
+its own shares derive to, or one carrying a signature while an output still has
+no script, is refused rather than emitted.
 
 ### What satd will not do
 
 - It will not choose which coins to spend. There is no wallet here.
+- It will not sign. Signing is `sat-cli`, in the client, with the key on
+  stdin.
 - It will not hold a scan or spend key, or a label.
 - It will not compute `PSBT_OUT_SCRIPT` for you. BIP 375 gives that to the
   Signer, along with clearing the modifiable flags, because computing it is
