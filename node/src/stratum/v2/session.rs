@@ -33,7 +33,7 @@ use super::noise::{self, TransportError};
 use super::wire;
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::miner::{self, MinerTally, format_difficulty, format_hashrate};
+use crate::stratum::miner::{self, MinerRecord, MinerSlot, format_difficulty, format_hashrate};
 use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{
     ShareResult, effective_share_target, hash_difficulty, network_difficulty, validate_share,
@@ -84,7 +84,8 @@ struct Channel {
     /// The previous-block hash the channel's jobs build on.
     prev_hash: Option<BlockHash>,
     seen: HashSet<SeenKey>,
-    tally: MinerTally,
+    /// This channel's `getstratuminfo` entry.
+    miner: MinerSlot,
     _count: CountGuard,
 }
 
@@ -633,6 +634,13 @@ impl Session {
         prefix[4..].copy_from_slice(&id.to_be_bytes());
         let mut max_target = max_target_le;
         max_target.reverse();
+        let miner = {
+            let mut record = MinerRecord::new("v2", self.peer, Some(id), config.initial_difficulty.max(1));
+            record.address = payout.address.clone();
+            record.worker = payout.worker.clone();
+            record.device = (!self.device.is_empty()).then(|| self.device.clone());
+            self.shared.stats.miners.register(record)
+        };
         let channel = Channel {
             id,
             extended,
@@ -643,7 +651,7 @@ impl Session {
             jobs: JobManager::new(),
             prev_hash: None,
             seen: HashSet::new(),
-            tally: MinerTally::new(std::time::Instant::now()),
+            miner,
             _count: CountGuard::new(self.shared.stats.clone(), |s| &s.channels),
         };
         let work = work_rx.borrow_and_update().clone();
@@ -766,6 +774,7 @@ impl Session {
             if let Some(d) = ch.vardiff.retarget(now, network_difficulty(&block_target)) {
                 let target = ch.target(&block_target);
                 ch.jobs.relax_share_targets(&target, d);
+                ch.miner.lock().difficulty = d;
                 let mut target_le = target;
                 target_le.reverse();
                 changes.push((ch.id, d, target_le));
@@ -812,7 +821,7 @@ impl Session {
                 // that does not exist, which has no tally to count it in.
                 let worker = match self.channels.get_mut(&channel_id) {
                     Some(ch) => {
-                        ch.tally.refuse(outcome);
+                        ch.miner.lock().tally.refuse(outcome);
                         ch.worker().to_string()
                     }
                     None => String::new(),
@@ -875,7 +884,7 @@ impl Session {
             }
             ch.seen.insert(key);
             ch.vardiff.record_share();
-            ch.tally.accept(std::time::Instant::now(), job.difficulty, hash_difficulty);
+            ch.miner.lock().tally.accept(std::time::Instant::now(), job.difficulty, hash_difficulty);
         };
         match result {
             ShareResult::Block(block) => {
@@ -914,7 +923,7 @@ impl Session {
     fn log_status(&mut self) {
         let now = std::time::Instant::now();
         for ch in self.channels.values_mut() {
-            let Some(report) = ch.tally.status_due(now) else { continue };
+            let Some(report) = ch.miner.lock().tally.status_due(now) else { continue };
             tracing::debug!(
                 target: "node::stratum",
                 peer = %self.peer,
@@ -943,8 +952,11 @@ impl Session {
         ids.sort_unstable();
         for id in ids {
             let Some(ch) = self.channels.get_mut(&id) else { continue };
-            let hashrate = format_hashrate(ch.tally.hashrate(now));
-            let total = ch.tally.total();
+            let (hashrate, total, connected_secs, best_share) = {
+                let mut record = ch.miner.lock();
+                let tally = &mut record.tally;
+                (format_hashrate(tally.hashrate(now)), tally.total(), tally.connected_secs(now), tally.best_share())
+            };
             tracing::info!(
                 target: "node::stratum",
                 peer = %self.peer,
@@ -952,11 +964,11 @@ impl Session {
                 address = ch.payout.address.as_deref().unwrap_or("<--stratumaddress>"),
                 worker = ch.worker(),
                 reason,
-                connected_secs = ch.tally.connected_secs(now),
+                connected_secs,
                 accepted = total.accepted,
                 rejected = total.rejected,
                 stale = total.stale,
-                best_share = %format_difficulty(ch.tally.best_share()),
+                best_share = %format_difficulty(best_share),
                 %hashrate,
                 "Stratum V2 channel closed"
             );

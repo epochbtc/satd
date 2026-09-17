@@ -244,6 +244,10 @@ impl ServerListenerStatus {
     pub fn set_stratum_handle(&self, handle: crate::stratum::StratumHandle) {
         *self.stratum.write() = Some(handle);
     }
+    /// The Stratum server, once bound.
+    pub fn stratum_handle(&self) -> Option<crate::stratum::StratumHandle> {
+        self.stratum.read().clone()
+    }
     pub fn set_stratum_v2(&self, bind: String) {
         self.inner.write().stratum_v2 = Some(bind);
     }

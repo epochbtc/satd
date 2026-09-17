@@ -1,12 +1,18 @@
-//! What one miner has been doing: the tally behind its log lines.
+//! What one miner has been doing: the tally behind its log lines, and the
+//! registry of connected miners behind `getstratuminfo`.
 //!
 //! Every figure here is derived from shares the server judged, so it
 //! describes the device as the node sees it — a miner whose own dashboard
 //! reports a hashrate this tally does not is hashing work the node never
 //! receives.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use parking_lot::{Mutex, MutexGuard};
 
 use super::server::ShareOutcome;
 
@@ -154,6 +160,129 @@ impl MinerTally {
     }
 }
 
+/// One connected miner, as `getstratuminfo` reports it: a Stratum V1
+/// connection once it authorized, or a Stratum V2 channel.
+#[derive(Debug)]
+pub struct MinerRecord {
+    /// `"v1"` or `"v2"`.
+    pub protocol: &'static str,
+    pub peer: SocketAddr,
+    /// The Stratum V2 channel; `None` for Stratum V1.
+    pub channel_id: Option<u32>,
+    /// The payout address, or `None` when the node's `--stratumaddress` pays.
+    pub address: Option<String>,
+    pub worker: Option<String>,
+    /// The Stratum V1 user agent or the Stratum V2 vendor, hardware and
+    /// firmware, already made safe by [`label`].
+    pub device: Option<String>,
+    /// The share difficulty the miner is currently set to.
+    pub difficulty: u64,
+    /// Unix time the miner connected (V1) or opened the channel (V2).
+    pub connected_time: u64,
+    pub tally: MinerTally,
+}
+
+impl MinerRecord {
+    pub fn new(protocol: &'static str, peer: SocketAddr, channel_id: Option<u32>, difficulty: u64) -> Self {
+        Self {
+            protocol,
+            peer,
+            channel_id,
+            address: None,
+            worker: None,
+            device: None,
+            difficulty,
+            connected_time: crate::time::now_secs(),
+            tally: MinerTally::new(Instant::now()),
+        }
+    }
+
+    fn info(&mut self, now: Instant, now_secs: u64) -> serde_json::Value {
+        let total = self.tally.total();
+        let last_share_time = self.tally.last_share_secs(now).map(|ago| now_secs.saturating_sub(ago));
+        let best = self.tally.best_share();
+        serde_json::json!({
+            "protocol": self.protocol,
+            "peer": self.peer.to_string(),
+            "channel_id": self.channel_id,
+            "address": self.address,
+            "worker": self.worker,
+            "device": self.device,
+            "difficulty": self.difficulty,
+            "connected_time": self.connected_time,
+            "shares": { "accepted": total.accepted, "rejected": total.rejected, "stale": total.stale },
+            // JSON has no infinity; an all-zero hash is not a share anyone finds.
+            "best_share_difficulty": if best.is_finite() { best } else { f64::MAX },
+            "last_share_time": last_share_time,
+            "hashrate": self.tally.hashrate(now),
+        })
+    }
+}
+
+/// The miners connected now.
+#[derive(Debug, Default)]
+pub struct MinerRegistry {
+    next_id: AtomicU64,
+    miners: Mutex<BTreeMap<u64, Arc<Mutex<MinerRecord>>>>,
+}
+
+impl MinerRegistry {
+    /// List `record` until the returned slot drops.
+    pub fn register(self: &Arc<Self>, record: MinerRecord) -> MinerSlot {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let record = Arc::new(Mutex::new(record));
+        self.miners.lock().insert(id, record.clone());
+        MinerSlot { registry: self.clone(), id, record }
+    }
+
+    fn records(&self) -> Vec<Arc<Mutex<MinerRecord>>> {
+        // Copied out, so a session's lock is never taken under the registry's.
+        self.miners.lock().values().cloned().collect()
+    }
+
+    /// Every connected miner, oldest first.
+    pub fn info(&self) -> Vec<serde_json::Value> {
+        let (now, now_secs) = (Instant::now(), crate::time::now_secs());
+        self.records().iter().map(|r| r.lock().info(now, now_secs)).collect()
+    }
+
+    /// How many miners are connected.
+    pub fn len(&self) -> usize {
+        self.miners.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The estimated hashrate of every connected miner, summed.
+    pub fn hashrate(&self) -> f64 {
+        let now = Instant::now();
+        self.records().iter().map(|r| r.lock().tally.hashrate(now)).sum()
+    }
+}
+
+/// A miner's entry in the [`MinerRegistry`], removed when this drops.
+#[derive(Debug)]
+pub struct MinerSlot {
+    registry: Arc<MinerRegistry>,
+    id: u64,
+    record: Arc<Mutex<MinerRecord>>,
+}
+
+impl MinerSlot {
+    /// The record. Take it once per statement: the lock is not reentrant.
+    pub fn lock(&self) -> MutexGuard<'_, MinerRecord> {
+        self.record.lock()
+    }
+}
+
+impl Drop for MinerSlot {
+    fn drop(&mut self) {
+        self.registry.miners.lock().remove(&self.id);
+    }
+}
+
 /// A miner-supplied string made safe to log: printable ASCII only, at most
 /// [`MAX_LABEL_CHARS`]. A miner is a remote peer, and its user agent must not
 /// be able to write a line break into the node's log.
@@ -240,6 +369,35 @@ mod tests {
         let report = tally.status_due(t0 + STATUS_INTERVAL * 2).expect("due");
         assert_eq!(report.shares, ShareCounts { accepted: 0, rejected: 1, stale: 0 });
         assert_eq!(tally.total().rejected, 2);
+    }
+
+    #[test]
+    fn registry_lists_miners_until_their_slot_drops() {
+        let registry = Arc::new(MinerRegistry::default());
+        let peer: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let first = registry.register(MinerRecord::new("v1", peer, None, 1_000));
+        let second = registry.register(MinerRecord::new("v2", peer, Some(3), 2_000));
+        {
+            let mut r = first.lock();
+            r.worker = Some("rig1".into());
+            r.tally.accept(Instant::now(), 1_000, 5_000.0);
+        }
+        let info = registry.info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0]["protocol"], "v1");
+        assert_eq!(info[0]["worker"], "rig1");
+        assert_eq!(info[0]["shares"]["accepted"], 1);
+        assert_eq!(info[0]["best_share_difficulty"], 5_000.0);
+        assert!(info[0]["last_share_time"].is_u64());
+        assert_eq!(info[1]["channel_id"], 3);
+        assert!(info[1]["last_share_time"].is_null());
+        drop(first);
+        let info = registry.info();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0]["difficulty"], 2_000);
+        drop(second);
+        assert!(registry.info().is_empty());
+        assert_eq!(registry.hashrate(), 0.0);
     }
 
     #[test]

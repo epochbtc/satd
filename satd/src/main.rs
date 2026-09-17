@@ -2872,6 +2872,7 @@ async fn main() {
                     config.statusadvertise.clone(),
                 ))
             }),
+            listeners: Some(listener_status.clone()),
         };
         // The TLS listener is set up before the plain one is spawned, and
         // every failure in it is fatal: an operator who asked for a

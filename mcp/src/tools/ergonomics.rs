@@ -51,6 +51,9 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         health: ctx.health.clone(),
         webhooks: ctx.webhooks.clone(),
         status: None,
+        // The MCP context holds no Stratum handle, so the `satd_stratum_*`
+        // families are absent here; the HTTP endpoint has them.
+        listeners: None,
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
@@ -90,6 +93,7 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         health: None,
         webhooks: None,
         status: None,
+        listeners: None,
     };
     let (ready, reason) = match metrics_ctx.is_ready() {
         Ok(()) => (true, None),
