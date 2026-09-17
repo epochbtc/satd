@@ -668,6 +668,83 @@ mod construction {
         );
     }
 
+    /// The MCP surface reaches the same creation path, including the version
+    /// argument a silent payment recipient needs and the refusal without it.
+    #[test]
+    fn psbt_workflow_creates_a_silent_payment_psbt() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use satd_psbt::SpAddress;
+
+        let (ctx, _dir) = make_test_ctx();
+        let secp = Secp256k1::new();
+        let address = SpAddress::new(
+            SecretKey::from_slice(&[0x51u8; 32]).unwrap().public_key(&secp),
+            SecretKey::from_slice(&[0x52u8; 32]).unwrap().public_key(&secp),
+        );
+        let sp1 = address.encode(ctx.network);
+        let inputs = serde_json::json!([{
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        }]);
+
+        // Without the version, refused by name rather than silently building
+        // a PSBT that cannot carry the recipient.
+        let refused: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "create",
+            &serde_json::json!({ "inputs": inputs, "outputs": { sp1.clone(): 0.01 } }),
+        ))
+        .unwrap();
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("psbt_version=2"),
+            "{refused}"
+        );
+
+        let created: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "create",
+            &serde_json::json!({
+                "inputs": inputs.clone(),
+                "outputs": { sp1.clone(): 0.01 },
+                "psbt_version": 2
+            }),
+        ))
+        .unwrap();
+        let b64 = created.as_str().unwrap_or_else(|| panic!("{created}"));
+
+        let decoded: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
+            &ctx,
+            "decode",
+            &serde_json::json!({ "psbt": b64 }),
+        ))
+        .unwrap();
+        assert_eq!(decoded["psbt_version"], 2, "{decoded}");
+        assert_eq!(
+            decoded["outputs"][0]["silent_payment"]["address"],
+            serde_json::json!(sp1),
+            "{decoded}"
+        );
+
+        // And the raw-transaction tool says why it cannot do the same thing.
+        let refused: serde_json::Value = serde_json::from_str(&cst::create_transaction(
+            &ctx,
+            &inputs,
+            &serde_json::json!({ sp1: 0.01 }),
+            None,
+        ))
+        .unwrap();
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("silent payment address"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn test_psbt_unknown_action() {
         let (ctx, _dir) = make_test_ctx();

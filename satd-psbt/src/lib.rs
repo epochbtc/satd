@@ -15,6 +15,7 @@
 //! - [`structure`] is BIP 375's structural check.
 //! - [`dleq`] is BIP 374, the proof that an ECDH share belongs to the input
 //!   claiming it.
+//! - [`address`] is the `sp1…` address codec.
 //! - [`sp`] is BIP 375's verification: which inputs contribute, whose keys
 //!   they really are, and what output script the shares derive to.
 //!
@@ -22,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod address;
 pub mod dleq;
 pub mod error;
 pub mod keys;
@@ -30,6 +32,7 @@ pub mod sp;
 pub mod structure;
 pub mod v2;
 
+pub use address::{AddressError, SpAddress};
 pub use error::{MapId, PsbtError};
 pub use raw::{PsbtVersion, RawMap, RawPair, RawPsbt, sniff_version, version_of_bytes};
 pub use structure::validate_structure;

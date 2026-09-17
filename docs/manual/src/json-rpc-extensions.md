@@ -311,6 +311,46 @@ A share whose DLEQ proof is missing keeps its row with a null
 `dleq_proof` rather than disappearing: a missing proof is the thing a
 reader most needs to see.
 
+### Creating one: `createpsbt psbt_version=2`
+
+`createpsbt` takes a trailing optional `psbt_version`. It defaults to 0, so
+every existing call is unaffected, and it sits **after** Core's own
+`replaceable` and `version` arguments so a positional call written against
+Core keeps meaning what it meant.
+
+```sh
+sat-cli createpsbt \
+  '[{"txid":"…","vout":0}]' \
+  '[{"tsp1q…":0.25},{"bcrt1q…":0.2499}]' \
+  0 null null 2
+```
+
+An `sp1…` (or `tsp1…`) output key is only accepted with `psbt_version=2`.
+Without it the node refuses by name — `silent payment recipients need a
+version 2 PSBT; pass psbt_version=2` — rather than building a PSBT that
+cannot carry the recipient, so a caller whose signer speaks only version 0
+learns at creation instead of at signing. `createrawtransaction` refuses an
+`sp1…` key outright and says why: a raw transaction has nowhere to put the
+information a Signer needs.
+
+Two details worth knowing.
+
+- **Use the array form of `outputs` when order matters.** A JSON object's key
+  order is the serialiser's business, and the output order decides both the
+  transaction and each silent payment output's `k`.
+- **A repeated `sp1…` key is legal**, unlike a repeated ordinary address. Two
+  payments to one recipient get `k = 0` and `k = 1`, and each keeps its own
+  amount.
+
+The PSBT comes back with `PSBT_GLOBAL_TX_MODIFIABLE` saying both inputs and
+outputs may still be added, and the silent payment output carrying its two
+keys and **no script**. Computing that script is the Signer's job, because
+computing it is what freezes the transaction.
+
+`decodepsbt` and `analyzepsbt` spell the recipient back as the `sp1…` address
+it came from. The PSBT itself carries only the two keys, so this is the only
+way an operator can check the recipient against what they were given.
+
 ### Where satd is stricter than Core's version 0 rules
 
 - **`combinepsbt` refuses a conflict.** Where two PSBTs give the same key

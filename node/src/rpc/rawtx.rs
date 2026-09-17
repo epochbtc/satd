@@ -750,35 +750,21 @@ pub fn create_raw_transaction(
     Ok(Value::String(hex::encode(raw)))
 }
 
-/// Core's `ParseOutputs` + `NormalizeOutputs` (`src/rpc/rawtransaction_util.cpp`),
-/// shared by `createrawtransaction` and `createpsbt` because Core routes both
-/// through the same `ConstructTransaction`.
+/// The output key/value pairs in source order, duplicates included.
 ///
-/// `network` is not decoration. Core decodes each key with the network-scoped
-/// `DecodeDestination`, so a testnet address handed to a mainnet node is a
-/// `-5 Invalid Bitcoin address` rather than an output. Accepting it builds a
-/// payment to a scriptPubKey whose key the sender does not control, and the
-/// address prefix — the one part of the encoding that would have caught the
-/// mistake — is not carried in the scriptPubKey, so nothing downstream can
-/// notice. `validateaddress`, `scantxoutset` and `deriveaddresses` are all
-/// network-scoped already; these two were the surface that still was not.
-pub fn parse_outputs(
+/// Extracted so `createpsbt` can split silent payment recipients out of the
+/// list without a second implementation of Core's normalisation: the object
+/// and array forms, the non-null rule, and the type errors all have to stay
+/// identical between the two methods, and the way to keep them identical is
+/// to have one of them.
+pub(crate) fn normalize_output_pairs(
     outputs: &Value,
-    network: bitcoin::Network,
-) -> Result<Vec<TxOut>, (i32, String)> {
-    let mut tx_outputs = Vec::new();
-    // Core dedupes on the decoded `CTxDestination`, not on the string, and
-    // reports the caller's spelling in the error.
-    let mut seen_destinations: std::collections::HashSet<bitcoin::ScriptBuf> =
-        std::collections::HashSet::new();
-    let mut seen_data = false;
-
-    // The key/value pairs in source order, duplicates included.
-    let mut pairs: Vec<(&str, &Value)> = Vec::new();
+) -> Result<Vec<(String, Value)>, (i32, String)> {
+    let mut pairs: Vec<(String, Value)> = Vec::new();
 
     if let Some(obj) = outputs.as_object() {
         for (key, val) in obj {
-            pairs.push((key.as_str(), val));
+            pairs.push((key.clone(), val.clone()));
         }
     } else if outputs.is_null() {
         // Core's `NormalizeOutputs` opens with this exact refusal.
@@ -805,7 +791,7 @@ pub fn parse_outputs(
                     return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
                 }
                 for (key, val) in map {
-                    pairs.push((key.as_str(), val));
+                    pairs.push((key.clone(), val.clone()));
                 }
             } else {
                 return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
@@ -813,34 +799,64 @@ pub fn parse_outputs(
         }
     }
 
-    // Core walks `outputs.getKeys()` -- which carries every repetition -- but
-    // reads each value as `outputs[name_]`, and `UniValue::operator[]` returns
-    // the *first* member with that key. So a repeated key is visited once per
-    // occurrence, always with the first occurrence's value.
-    //
-    // Reading each occurrence's own value instead changed which error a
-    // caller got: `{"<addr>": 0.01, "<addr>": "wat"}` is Core's
-    // "duplicated address" (it parses 0.01 twice and trips the dedupe), but
-    // reached `parse_btc_amount("wat")` here and came back "Invalid amount",
-    // naming a problem that is not the one to fix. For `data` -- which Core
-    // does not dedupe on value -- it changed the built script outright.
-    // One pass, not a scan-the-prefix-per-entry: `createrawtransaction` is
-    // reachable on the read-only listener with a body limit measured in
-    // megabytes, so anything quadratic in the number of outputs is a lever.
-    {
-        let mut first_value: std::collections::HashMap<&str, &Value> =
-            std::collections::HashMap::with_capacity(pairs.len());
-        for (key, val) in pairs.iter_mut() {
-            match first_value.get(*key) {
-                Some(first) => *val = first,
-                None => {
-                    first_value.insert(*key, *val);
-                }
+    Ok(pairs)
+}
+
+/// Core walks `outputs.getKeys()` -- which carries every repetition -- but
+/// reads each value as `outputs[name_]`, and `UniValue::operator[]` returns
+/// the *first* member with that key. So a repeated key is visited once per
+/// occurrence, always with the first occurrence's value.
+///
+/// Reading each occurrence's own value instead changed which error a caller
+/// got: `{"<addr>": 0.01, "<addr>": "wat"}` is Core's "duplicated address"
+/// (it parses 0.01 twice and trips the dedupe), but reached
+/// `parse_btc_amount("wat")` here and came back "Invalid amount", naming a
+/// problem that is not the one to fix. For `data` -- which Core does not
+/// dedupe on value -- it changed the built script outright.
+///
+/// One pass, not a scan-the-prefix-per-entry: `createrawtransaction` is
+/// reachable on the read-only listener with a body limit measured in
+/// megabytes, so anything quadratic in the number of outputs is a lever.
+pub(crate) fn apply_first_value_wins(pairs: &mut [(String, Value)]) {
+    let mut first_value: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::with_capacity(pairs.len());
+    for (key, val) in pairs.iter_mut() {
+        match first_value.get(key) {
+            Some(first) => *val = first.clone(),
+            None => {
+                first_value.insert(key.clone(), val.clone());
             }
         }
     }
+}
 
-    for (key, val) in pairs {
+/// Core's `ParseOutputs` + `NormalizeOutputs` (`src/rpc/rawtransaction_util.cpp`),
+/// shared by `createrawtransaction` and `createpsbt` because Core routes both
+/// through the same `ConstructTransaction`.
+///
+/// `network` is not decoration. Core decodes each key with the network-scoped
+/// `DecodeDestination`, so a testnet address handed to a mainnet node is a
+/// `-5 Invalid Bitcoin address` rather than an output. Accepting it builds a
+/// payment to a scriptPubKey whose key the sender does not control, and the
+/// address prefix — the one part of the encoding that would have caught the
+/// mistake — is not carried in the scriptPubKey, so nothing downstream can
+/// notice. `validateaddress`, `scantxoutset` and `deriveaddresses` are all
+/// network-scoped already; these two were the surface that still was not.
+pub fn parse_outputs(
+    outputs: &Value,
+    network: bitcoin::Network,
+) -> Result<Vec<TxOut>, (i32, String)> {
+    let mut tx_outputs = Vec::new();
+    // Core dedupes on the decoded `CTxDestination`, not on the string, and
+    // reports the caller's spelling in the error.
+    let mut seen_destinations: std::collections::HashSet<bitcoin::ScriptBuf> =
+        std::collections::HashSet::new();
+    let mut seen_data = false;
+
+    let mut pairs = normalize_output_pairs(outputs)?;
+    apply_first_value_wins(&mut pairs);
+
+    for (key, val) in &pairs {
         parse_output_entry(
             key,
             val,
@@ -855,7 +871,7 @@ pub fn parse_outputs(
 }
 
 /// Parse a single key-value output entry for `createrawtransaction`.
-fn parse_output_entry(
+pub(crate) fn parse_output_entry(
     key: &str,
     val: &Value,
     network: bitcoin::Network,
@@ -910,6 +926,20 @@ fn parse_output_entry(
         let script_pubkey = match decoded {
             crate::rpc::address_decode::Decoded::Valid(addr) => addr.script_pubkey(),
             crate::rpc::address_decode::Decoded::Invalid { .. } => {
+                // A silent payment address is not a script and never will be:
+                // the output it produces is derived from a shared secret the
+                // sender computes, which a raw transaction has nowhere to
+                // carry. Saying so is more use than "invalid address", since
+                // the address is perfectly valid and the method is wrong.
+                if satd_psbt::SpAddress::looks_like(key, network) {
+                    return Err((
+                        -5,
+                        format!(
+                            "{key} is a silent payment address; a raw transaction cannot pay \
+                             one. Use createpsbt with psbt_version=2."
+                        ),
+                    ));
+                }
                 return Err((-5, format!("Invalid Bitcoin address: {key}")));
             }
         };
@@ -1068,6 +1098,10 @@ fn parse_fixed_point(val: &str, decimals: u32) -> Option<i64> {
 /// accepts `NaN`, and `NaN < 0.0` and `NaN > 21_000_000.0` are both false, so
 /// both range guards fell through and `(NaN * 1e8).round() as u64` saturated
 /// to `0` — an output worth nothing, built without an error.
+pub(crate) fn parse_btc_amount_value(val: &Value) -> Result<Amount, (i32, String)> {
+    parse_btc_amount(val)
+}
+
 fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
     // Core reads the *literal text* of a JSON number (`UniValue::getValStr`),
     // never a parsed double, so a number and its string spelling are the same
@@ -2608,6 +2642,8 @@ mod tests {
             &outputs,
             None,
             bitcoin::Network::Regtest,
+            None,
+            None,
         )
         .expect_err("a mainnet address is not a regtest destination");
         assert_eq!(code, -5);
@@ -2619,7 +2655,7 @@ mod tests {
             { "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": "0.01" },
             { "data": "deadbeef" },
         ]);
-        let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest)
+        let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest, None, None)
             .expect("array-form outputs");
         assert!(v.as_str().expect("base64").starts_with("cHNidP8"));
     }
