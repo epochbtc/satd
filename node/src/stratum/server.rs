@@ -21,7 +21,13 @@ use crate::net::manager::PeerManager;
 /// transactions reach the miners.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Tip polling interval when no chain-event channel is wired.
+/// How often the tip is checked directly, independent of chain events.
+///
+/// Not a fallback for a missing event channel: some connect paths move the
+/// tip without emitting an event at all (the IBD connect loop is the one
+/// that matters, and a node catching up after a restart runs it), so a
+/// stratum server that only listened would hand out work for a tip the
+/// chain had already left behind, until the next [`REFRESH_INTERVAL`].
 const TIP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
@@ -530,7 +536,12 @@ async fn refresh_loop(
                 polled_tip = shared.chain.tip_snapshot();
                 refresh.reset();
             }
-            _ = refresh.tick() => {}
+            _ = refresh.tick() => {
+                // The periodic rebuild reads the tip too, so record what it
+                // built on; otherwise the next poll sees a tip that "moved"
+                // and rebuilds the same work again.
+                polled_tip = shared.chain.tip_snapshot();
+            }
             // Polled even while events flow: the download scheduler connects
             // blocks without emitting chain events, so a node that catches up
             // that way would otherwise hand out work on an old tip until the
