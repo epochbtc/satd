@@ -27,6 +27,9 @@ use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 use bitcoin::{OutPoint, ScriptBuf, TxOut, WitnessVersion};
 
 use crate::dleq;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use crate::error::PsbtError;
 use crate::keys;
 use crate::v2::{InputView, SpV0Info, V2View};
@@ -37,20 +40,27 @@ use crate::v2::{InputView, SpV0Info, V2View};
 /// valid.
 pub const K_MAX: u32 = 2323;
 
-/// The most elliptic-curve work one PSBT may ask the verifier for: one unit
-/// per DLEQ proof checked and one per output script derived.
+/// The most work one PSBT may ask the verifier for, in units of roughly one
+/// elliptic-curve operation.
 ///
-/// Both counts are products, not sums — proofs are (eligible inputs) x (scan
-/// keys carrying a per-input share) — and `analyzepsbt` is a read-capability
-/// method, so a PSBT that merely fits inside the 20 MiB request limit could
-/// otherwise ask for tens of seconds of curve arithmetic. Measured at about
-/// 128 microseconds per proof in a release build, this cap is worth under two
-/// seconds.
+/// Two things are counted, and the unit of each matters. **Shares are
+/// verified per scan key, not per output** — a scan key's outputs share one
+/// ECDH point, however many of them there are — so the proof count is
+/// (distinct scan keys) x (eligible inputs), the walk over the inputs looking
+/// for each scan key's shares being the cost whether or not an input turns
+/// out to carry one. **Scripts are derived per output**, twice, since two `k`
+/// orderings may be tried. Both are products, not sums, and `analyzepsbt` is
+/// a read-capability method, so a PSBT that merely fits inside the 20 MiB
+/// request limit could otherwise ask for tens of seconds of curve arithmetic.
+/// Measured at about 128 microseconds per proof in a release build, this cap
+/// is worth under two seconds.
 ///
-/// It is far above anything real. BIP 352 caps one scan key's outputs at
-/// `K_MAX`; a thousand inputs paying ten distinct recipients is ten thousand
-/// units, and a transaction with a thousand inputs is already at the edge of
-/// standardness.
+/// It is far above anything real. A thousand inputs paying ten distinct
+/// recipients is ten thousand units, and a transaction with a thousand inputs
+/// is already at the edge of standardness. Counting per output instead would
+/// refuse a legal transaction: BIP 352 lets one scan key take `K_MAX` outputs,
+/// and a handful of inputs paying that many would cross the cap while asking
+/// for a handful of proofs.
 pub const MAX_CURVE_OPERATIONS: usize = 10_000;
 
 /// BIP 341's nothing-up-my-sleeve point. A taproot output whose internal key
@@ -319,50 +329,51 @@ pub fn verify_with_binding(
     // transaction rather than of the contributing set.
     let input_hash = key_sum.as_ref().and_then(|sum| input_hash(&outpoints, sum));
 
-    // How much curve arithmetic this PSBT is asking for, counted before any
-    // of it is done. See [`MAX_CURVE_OPERATIONS`].
-    let mut work = 0usize;
-    let eligible: Vec<&InputReport> = inputs.iter().filter(|i| i.eligible()).collect();
+    // Outputs grouped by scan key, in output order. `k` counts within a
+    // group, so the group is the unit of work: the shares for a scan key are
+    // verified once for the group, however many outputs it holds.
+    //
+    // The index beside the vec is what keeps grouping off the output count.
+    // Scanning the groups already built for each output would be quadratic,
+    // and this runs before the work below is capped.
+    let mut groups: Vec<(SpV0Info, Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<[u8; 33], usize> = HashMap::new();
     for output in view.outputs() {
         let Some(info) = output.sp_v0_info()? else {
             continue;
         };
-        work += 1; // the output script derivation
-        let scan_bytes = info.scan_key.serialize();
+        match group_of.entry(info.scan_key.serialize()) {
+            Entry::Occupied(at) => groups[*at.get()].1.push(output.index()),
+            Entry::Vacant(slot) => {
+                slot.insert(groups.len());
+                groups.push((info, vec![output.index()]));
+            }
+        }
+    }
+
+    // How much work this PSBT is asking for, counted before any of it is
+    // done. See [`MAX_CURVE_OPERATIONS`].
+    let eligible: Vec<&InputReport> = inputs.iter().filter(|i| i.eligible()).collect();
+    let mut work = 0usize;
+    for (group, members) in &groups {
+        // Each output's script is derived once per `k` ordering tried, and
+        // `assign_k` tries two.
+        work = work.saturating_add(2 * members.len());
+        // One proof for a global share, and the whole eligible set walked
+        // looking for per-input ones — whether or not each input turns out to
+        // carry one, since finding that out is itself the walk.
         if view
             .raw()
             .global
-            .contains(keys::global::SP_ECDH_SHARE, &scan_bytes)
+            .contains(keys::global::SP_ECDH_SHARE, &group.scan_key.serialize())
         {
-            work += 1;
+            work = work.saturating_add(1);
         }
-        work += eligible
-            .iter()
-            .filter(|i| {
-                view.input(i.index).is_some_and(|input| {
-                    input
-                        .map()
-                        .contains(keys::input::SP_ECDH_SHARE, &scan_bytes)
-                })
-            })
-            .count();
+        work = work.saturating_add(eligible.len());
         if work > MAX_CURVE_OPERATIONS {
             return Err(PsbtError::TooMuchWork {
                 limit: MAX_CURVE_OPERATIONS,
             });
-        }
-    }
-
-    // Outputs grouped by scan key, in output order. `k` counts within a
-    // group, so the group is the unit of work.
-    let mut groups: Vec<(SpV0Info, Vec<usize>)> = Vec::new();
-    for output in view.outputs() {
-        let Some(info) = output.sp_v0_info()? else {
-            continue;
-        };
-        match groups.iter_mut().find(|(g, _)| g.scan_key == info.scan_key) {
-            Some((_, members)) => members.push(output.index()),
-            None => groups.push((info, vec![output.index()])),
         }
     }
 

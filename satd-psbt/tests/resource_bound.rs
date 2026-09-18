@@ -241,3 +241,68 @@ fn the_cost_is_linear_in_the_pairs_the_psbt_carries() {
          linear in the share-proof pairs"
     );
 }
+
+/// Outputs under one scan key cost one set of proofs between them, not one
+/// set each, and the cap has to count them that way or it refuses legal
+/// transactions.
+///
+/// BIP 352 lets a single scan key take `K_MAX` outputs — a batch payout to
+/// one recipient is exactly that shape — and the shares for those outputs are
+/// verified once for the whole group, because the group has one ECDH point.
+/// Five inputs paying `K_MAX` outputs is five proofs and about half a second.
+/// Counting per output instead would make it five times `K_MAX`, and
+/// `finalizepsbt` would refuse a transaction it should sign.
+#[test]
+fn many_outputs_to_one_scan_key_are_one_group_of_proofs() {
+    let mut raw = expensive_psbt();
+
+    // Five inputs, and every output under the first scan key.
+    raw.inputs.truncate(5);
+    let mut count = Vec::new();
+    satd_psbt::raw::write_compact_size(&mut count, raw.inputs.len() as u64);
+    raw.global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
+
+    let scan = {
+        let info = raw.outputs[0]
+            .get_single(keys::output::SP_V0_INFO)
+            .expect("the fixture puts one on every output");
+        info[..33].to_vec()
+    };
+    let secp = Secp256k1::new();
+    let template = raw.outputs[0].clone();
+    raw.outputs = (0..sp::K_MAX as usize)
+        .map(|i| {
+            let mut map = template.clone();
+            // A distinct spend key per output, as a batch payout would have.
+            let mut secret = [3u8; 32];
+            secret[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+            let spend =
+                PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&secret).expect("a secret"));
+            let mut info = scan.clone();
+            info.extend_from_slice(&spend.serialize());
+            map.set(RawPair::new(keys::output::SP_V0_INFO, Vec::new(), info));
+            map
+        })
+        .collect();
+    let mut count = Vec::new();
+    satd_psbt::raw::write_compact_size(&mut count, raw.outputs.len() as u64);
+    raw.global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
+
+    let view = V2View::new(&raw).expect("a version 2 PSBT");
+    let report = match sp::verify(&view, None) {
+        Ok(report) => report,
+        Err(satd_psbt::PsbtError::TooMuchWork { limit }) => panic!(
+            "{} outputs under one scan key with {} inputs was refused against a cap of \
+             {limit}; that is {} proofs, not {}",
+            sp::K_MAX,
+            raw.inputs.len(),
+            raw.inputs.len(),
+            sp::K_MAX as usize * raw.inputs.len(),
+        ),
+        Err(other) => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(report.outputs.len(), sp::K_MAX as usize);
+    // The proofs in the fixture are junk, so nothing is ready — what matters
+    // here is that the verifier looked at all.
+    assert!(report.outputs.iter().all(|o| o.status != sp::OutputStatus::Ready));
+}
