@@ -1323,3 +1323,67 @@ fn a_cmpctblock_built_after_connection_is_not_prefilled() {
         other => panic!("expected a cmpctblock, got {other:?}"),
     }
 }
+
+/// A peer that announces with `cmpctblock` is a block-download source.
+///
+/// This is not bookkeeping. The parallel download scheduler will not assign a
+/// peer heights above what the node believes that peer holds, and the node
+/// learns what a peer holds from Core's `UpdateBlockAvailability`. A
+/// high-bandwidth peer announces new blocks with `cmpctblock` **instead of**
+/// `headers` (BIP 152), so if that path does not record availability the node
+/// ends up knowing the headers, raising its download target, and asking
+/// nobody for the blocks — it wedges behind its only peer rather than syncing
+/// slowly.
+///
+/// The shape is the one a node following a peer that mines faster than it can
+/// fetch runs into: announcements arrive ahead of data, every block after the
+/// first lands on a header-only parent and is left to the scheduler, and the
+/// scheduler takes over once headers are more than 24 ahead of the tip.
+#[test]
+fn a_cmpctblock_announcement_makes_the_peer_a_download_source() {
+    // Enough announcements to cross the scheduler's creation threshold
+    // (`headers_tip > tip + 24`): below it the steady-state path fetches the
+    // chain and the scheduler, where the belief about the peer is consulted,
+    // never runs.
+    const ANNOUNCED: u32 = 30;
+
+    let (node, _) = started_node(1);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    // Only a high-bandwidth peer's pushes reach the compact path at all, and
+    // promotion is also the last thing to teach the node this peer's height
+    // through a `headers` message. Everything after it is compact, which is
+    // the point: the peer's version message claimed height 0.
+    promote(&node, &mut peer);
+
+    let tip = block_at(&node, &best_hash(&node));
+    let h = height(&node);
+
+    // The first announcement carries a transaction the node has never seen,
+    // so reconstruction needs a `getblocktxn`. Leaving that unanswered is
+    // what keeps its data behind its header — and every later block then
+    // lands on a header-only parent.
+    let first = build_block(&tip, h + 1, vec![unknown_tx(9_100)], true, 91);
+    peer.send(cmpct(HeaderAndShortIds::from_block(&first, 91, 2, &[]).unwrap()));
+    assert!(
+        peer.recv_until(is_getblocktxn_for(first.block_hash()), test_timeout(20)).is_some(),
+        "the node should try to reconstruct the first announcement"
+    );
+
+    let mut parent = first.clone();
+    for i in 1..ANNOUNCED {
+        let next = build_block(&parent, h + 1 + i, vec![], true, 9_200 + i);
+        peer.send(cmpct(HeaderAndShortIds::from_block(&next, u64::from(9_200 + i), 2, &[]).unwrap()));
+        parent = next;
+    }
+
+    // The node now knows headers well past its tip and has data for none of
+    // them. This peer announced every one of those headers and nothing else
+    // has spoken to the node, so it is the only source there is.
+    let asked = peer.recv_until(is_getdata_for(first.block_hash()), test_timeout(60));
+    assert!(
+        asked.is_some(),
+        "the node knows {ANNOUNCED} headers past its tip, has no data for them, and the \
+         peer that announced them is its only source; asking nobody is a wedge, not a delay"
+    );
+}

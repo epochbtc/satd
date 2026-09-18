@@ -4013,11 +4013,8 @@ impl PeerManager {
         self.apply_header_row_changes();
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
-        if let Some(last) = headers.last()
-            && let Some(entry) = self.chain_state.get_block_index(&last.block_hash())
-            && let Some(h) = self.peers.write().get_mut(&id)
-        {
-            h.info.best_known_height = Some(h.info.best_known_height.map_or(entry.height, |b| b.max(entry.height)));
+        if let Some(last) = headers.last() {
+            self.note_block_availability(id, &last.block_hash());
         }
         if let Some(e) = err {
             match e {
@@ -4182,6 +4179,31 @@ impl PeerManager {
         };
         for pid in peer_ids {
             self.assign_peer_work(pid);
+        }
+    }
+
+    /// Bitcoin Core's `UpdateBlockAvailability`: record that `id` has the
+    /// block it just announced, whatever route the announcement took.
+    ///
+    /// This is load-bearing for the download scheduler, not bookkeeping.
+    /// [`Self::assign_peer_work`] will not give a peer heights above what we
+    /// believe the peer holds, so an ingress that teaches us a header without
+    /// recording availability wedges the download rather than slowing it: the
+    /// target rises, the peer's believed height does not, and the scheduler
+    /// returns having asked for nothing. Every path that accepts a header
+    /// from a peer must come through here.
+    fn note_block_availability(&self, id: PeerId, hash: &bitcoin::BlockHash) {
+        if let Some(entry) = self.chain_state.get_block_index(hash) {
+            self.note_peer_height(id, entry.height);
+        }
+    }
+
+    /// Raise the height we believe `id` has reached. Never lowers it: a peer
+    /// that announced a block still has it after announcing an older one.
+    fn note_peer_height(&self, id: PeerId, height: u32) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.best_known_height =
+                Some(h.info.best_known_height.map_or(height, |b| b.max(height)));
         }
     }
 
@@ -4449,6 +4471,39 @@ impl PeerManager {
         }
         self.note_block_arrived(&block.block_hash());
         self.note_peer_has_block(id, block.block_hash());
+        // A peer that pushes a block has it, so the same availability rule
+        // applies here as to the announcement paths. The block's own index
+        // entry does not exist until it is accepted, and acceptance happens
+        // off this thread, so the height comes from the parent: a block is
+        // its parent's height plus one.
+        //
+        // Proof of work first. Core records availability only out of
+        // `AcceptBlockHeader`, which has checked the header by then, and the
+        // other two ingresses here inherit that: `handle_headers` records
+        // after `accept_headers` and the compact path after
+        // `accept_compact_header`. Without this a peer could raise the height
+        // we believe it has reached for nothing, by pushing a well-formed
+        // block whose header is garbage. (`reject_if_mutated` above does not
+        // cover it — that gate is about witness and merkle malleation.)
+        //
+        // Bounded by the network's powLimit, which is Core's own
+        // CheckProofOfWork. The hash against the header's *own* bits alone
+        // bounds nothing: a header may claim `0x20ffffff`, a target near 2^256
+        // that essentially any nonce meets. With the bound, the cheapest header
+        // that passes costs a minimum-difficulty block. Whether its difficulty
+        // is right for its place in the chain is still checked downstream,
+        // when the block is accepted.
+        //
+        // Nothing observable rides on this one — a pushed block carries its
+        // own data, so the scheduler has nothing to ask this peer for that it
+        // is not already getting. It is here so the invariant holds at every
+        // ingress rather than at the ones that happen to matter today.
+        if crate::validation::pow::check_proof_of_work_bounded(&block.header, self.chain_state.network)
+            .is_ok()
+            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+        {
+            self.note_peer_height(id, parent.height + 1);
+        }
 
         // Operator-requested single-block re-fetch. Must come before every
         // other route: the normal paths reject a block we already have an
@@ -7101,6 +7156,12 @@ impl PeerManager {
                 return None;
             }
         }
+        // A high-bandwidth peer announces with `cmpctblock` instead of
+        // `headers` (BIP 152), so this is the only place the announcement is
+        // seen. Without it the peer stays pinned at whatever height its last
+        // `headers` message left it at and the scheduler stops asking it for
+        // anything.
+        self.note_block_availability(id, &hash);
         self.chain_state.get_block_index(&hash)
     }
 
@@ -11333,6 +11394,41 @@ mod tests {
             fetched_in_full(&mut rx),
             "a reconstruction that never finishes must not hold the block hostage"
         );
+    }
+
+    /// A pushed block raises the height we believe its peer has — but only if
+    /// its header cost real work, judged against the network's powLimit and
+    /// not against the target the header names for itself.
+    #[test]
+    fn a_pushed_block_whose_header_names_a_free_target_does_not_raise_the_peers_height() {
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        for id in [1, 2] {
+            pm.peers.write().insert(id, mk_handle(id, addr, Direction::Inbound, PeerState::Connected));
+        }
+        let height_of = |pm: &PeerManager, id| pm.peers.read()[&id].info.best_known_height;
+
+        // 0x2101ffff overflows 256 bits; decoded without Core's checks the
+        // shift wraps it to a target near 2^256, which essentially any nonce
+        // meets. Regtest is the network where this matters least and it is
+        // still refused: its limit is easy, but a wrapped target is not a
+        // target at all.
+        let mut forged = regtest_child_of_genesis(&pm, 7);
+        forged.header.bits = bitcoin::CompactTarget::from_consensus(0x2101_ffff);
+        while crate::validation::pow::check_proof_of_work(&forged.header).is_err() {
+            forged.header.nonce += 1;
+        }
+        assert!(
+            forged.header.nonce < 4,
+            "precondition: the header must be free under the unbounded check"
+        );
+        pm.handle_block(1, forged, crate::net::flow::InFlight::new(pm.peer_flow(1)));
+        assert_eq!(height_of(&pm, 1), None, "a free header must not move the belief");
+
+        // A real regtest block does, so the gate is not refusing everything.
+        let honest = regtest_child_of_genesis(&pm, 8);
+        pm.handle_block(2, honest, crate::net::flow::InFlight::new(pm.peer_flow(2)));
+        assert_eq!(height_of(&pm, 2), Some(1), "a block with real work records its height");
     }
 
     /// However a block arrives, every partial reconstruction of it is moot.
