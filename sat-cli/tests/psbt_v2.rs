@@ -807,3 +807,51 @@ fn a_signer_that_finalizes_a_scriptsig_before_the_scripts_is_refused() {
     assert!(stdout.is_empty(), "nothing should have been emitted");
     std::fs::remove_file(&signer).ok();
 }
+
+/// A signer that declares a key the PSBT did not carry is doing its job, not
+/// substituting anything.
+///
+/// `createpsbt` has no wallet, so a PSBT the node builds names no public key
+/// for any input: only the party holding the key can say what it is. A signer
+/// that adds `PSBT_IN_BIP32_DERIVATION` for the inputs it holds — which
+/// `sat-cli` itself does, and which a compliant device does — turns a `None`
+/// into a `Some`, and that must not read as tampering. Non-taproot inputs are
+/// the common case, so refusing it would leave `signpsbtwithsigner` unable to
+/// complete most transactions.
+///
+/// What makes it safe is the check above it: the previous output each input
+/// spends is pinned to what was sent, and a key is only accepted when it hashes
+/// to that output's script. A key that appears where there was none is
+/// therefore the only key that could have appeared.
+#[test]
+fn a_signer_may_declare_a_key_the_psbt_did_not_have() {
+    use base64::Engine as _;
+
+    let secp = Secp256k1::new();
+    let wallet = wallet_key();
+    let scan = SecretKey::from_slice(&[0x89u8; 32]).unwrap().public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x8au8; 32]).unwrap().public_key(&secp);
+
+    // A PSBT as the node builds one: prevout known, no key declared.
+    let mut bare = sp_psbt(&secp, &wallet, &scan, &spend);
+    bare.inputs[0].remove(keys::input::BIP32_DERIVATION, &wallet.public_key(&secp).to_bytes());
+    assert!(
+        !bare.inputs[0].contains_type(keys::input::BIP32_DERIVATION),
+        "the point of this test is a PSBT that names no key"
+    );
+    let sent = base64::engine::general_purpose::STANDARD.encode(bare.serialize());
+
+    // What a signer hands back: its own key declared, its share and proof
+    // written, the scripts computed and the input signed. `sat-cli` is that
+    // signer here, so this is exactly a compliant reply.
+    let (code, reply, stderr) = run_sign(&bare, &wallet);
+    assert_eq!(code, 0, "{stderr}");
+    let reply_psbt = parse(&reply);
+    assert!(reply_psbt.inputs[0].contains_type(keys::input::BIP32_DERIVATION));
+
+    let signer = fake_signer("declares", &format!(r#"{{"psbt":"{reply}"}}"#));
+    let (code, stdout, stderr) = run_with_signer(&sent, &signer);
+    assert_eq!(code, 0, "a signer declaring its own key must not be refused: {stderr}");
+    assert!(!stdout.is_empty(), "the signed PSBT should have been emitted");
+    std::fs::remove_file(&signer).ok();
+}

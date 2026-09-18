@@ -1324,7 +1324,19 @@ fn verify_signer_reply(
                 after.index
             ));
         }
-        if before.public_key != after.public_key {
+        // Only a *change* counts. A PSBT the node built names no public key
+        // for any input — `createpsbt` has no wallet, and only the party
+        // holding the key can say what it is — so a signer that declares the
+        // inputs it holds turns a `None` into a `Some`, and that is the
+        // signer doing its job. Non-taproot inputs are the common case;
+        // refusing this would leave the signer path unable to complete one.
+        //
+        // It is safe because of the check above: the previous output is
+        // pinned to what was sent, and a key is only accepted when it hashes
+        // to that output's script, so the key that appears is the only key
+        // that could. A previous output that appears is pinned by nothing,
+        // which is why that check stays strict in both directions.
+        if before.public_key.is_some() && before.public_key != after.public_key {
             return Err(format!(
                 "the signer changed the public key bound to input {}; the ECDH shares are \
                  proved against it, so refusing to emit it",
