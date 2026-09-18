@@ -4013,11 +4013,8 @@ impl PeerManager {
         self.apply_header_row_changes();
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
-        if let Some(last) = headers.last()
-            && let Some(entry) = self.chain_state.get_block_index(&last.block_hash())
-            && let Some(h) = self.peers.write().get_mut(&id)
-        {
-            h.info.best_known_height = Some(h.info.best_known_height.map_or(entry.height, |b| b.max(entry.height)));
+        if let Some(last) = headers.last() {
+            self.note_block_availability(id, &last.block_hash());
         }
         if let Some(e) = err {
             match e {
@@ -4182,6 +4179,29 @@ impl PeerManager {
         };
         for pid in peer_ids {
             self.assign_peer_work(pid);
+        }
+    }
+
+    /// Bitcoin Core's `UpdateBlockAvailability`: record that `id` has the
+    /// block it just announced, whatever route the announcement took.
+    ///
+    /// This is load-bearing for the download scheduler, not bookkeeping.
+    /// [`Self::assign_peer_work`] will not give a peer heights above what we
+    /// believe the peer holds, so an ingress that teaches us a header without
+    /// recording availability wedges the download rather than slowing it: the
+    /// target rises, the peer's believed height does not, and the scheduler
+    /// returns having asked for nothing. Every path that accepts a header
+    /// from a peer must come through here.
+    fn note_block_availability(&self, id: PeerId, hash: &bitcoin::BlockHash) {
+        let Some(entry) = self.chain_state.get_block_index(hash) else {
+            return;
+        };
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.best_known_height = Some(
+                h.info
+                    .best_known_height
+                    .map_or(entry.height, |b| b.max(entry.height)),
+            );
         }
     }
 
@@ -7101,6 +7121,12 @@ impl PeerManager {
                 return None;
             }
         }
+        // A high-bandwidth peer announces with `cmpctblock` instead of
+        // `headers` (BIP 152), so this is the only place the announcement is
+        // seen. Without it the peer stays pinned at whatever height its last
+        // `headers` message left it at and the scheduler stops asking it for
+        // anything.
+        self.note_block_availability(id, &hash);
         self.chain_state.get_block_index(&hash)
     }
 
