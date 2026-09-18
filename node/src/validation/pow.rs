@@ -1,5 +1,5 @@
 use bitcoin::block::Header;
-use bitcoin::pow::CompactTarget;
+use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{BlockHash, Network};
 
 use crate::storage::blockindex::{target_from_compact, compact_from_target, BlockIndexEntry};
@@ -38,6 +38,64 @@ pub fn check_proof_of_work(header: &Header) -> Result<(), ValidationError> {
         .validate_pow(target)
         .map_err(|_| ValidationError::BadProofOfWork)?;
     Ok(())
+}
+
+/// The network's proof-of-work limit, as compact bits: Core's
+/// `consensus.powLimit`. No valid block on the network may claim an easier
+/// target than this.
+pub fn pow_limit_bits(network: Network) -> u32 {
+    match network {
+        Network::Regtest => REGTEST_POWLIMIT_BITS,
+        Network::Signet => SIGNET_POWLIMIT_BITS,
+        Network::Testnet | Network::Testnet4 => TESTNET_POWLIMIT_BITS,
+        _ => MAINNET_POWLIMIT_BITS,
+    }
+}
+
+/// Bitcoin Core's `DeriveTarget`: the target `bits` encodes, or `None` if it
+/// is not one a block on `network` could legitimately claim.
+///
+/// Rejects, in Core's order, a negative encoding, a zero target, an encoding
+/// that overflows 256 bits, and a target easier than the network's
+/// `powLimit`. The last two matter most: [`Header::target`] decodes whatever
+/// the header says, its shift wraps on an overflowing exponent, and nothing
+/// stops a header claiming `0x20ffffff` — a target near 2^256 that essentially
+/// any nonce meets. A check that trusts the header's own `bits` therefore
+/// bounds nothing; this is what makes "the hash meets the target" mean the
+/// header cost real work.
+pub fn derive_target(bits: CompactTarget, network: Network) -> Option<Target> {
+    let raw = bits.to_consensus();
+    let size = raw >> 24;
+    let word = raw & 0x007f_ffff;
+    let negative = word != 0 && raw & 0x0080_0000 != 0;
+    let overflow = word != 0
+        && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+    if negative || overflow {
+        return None;
+    }
+    let target = Target::from_compact(bits);
+    let limit = Target::from_compact(CompactTarget::from_consensus(pow_limit_bits(network)));
+    if target == Target::ZERO || target > limit {
+        return None;
+    }
+    Some(target)
+}
+
+/// Bitcoin Core's `CheckProofOfWork`: the header's hash meets its claimed
+/// target, *and* that target is one the network allows.
+///
+/// [`check_proof_of_work`] checks only the first half, and the second is
+/// what gives the first any weight — see [`derive_target`]. On accepted
+/// blocks the gap is covered by [`check_difficulty`], which pins `bits` to
+/// the chain's schedule; this is for the places that must judge a header
+/// before, or without, knowing where it sits in the chain.
+pub fn check_proof_of_work_bounded(header: &Header, network: Network) -> Result<(), ValidationError> {
+    let target = derive_target(header.bits, network).ok_or(ValidationError::BadProofOfWork)?;
+    if target.is_met_by(header.block_hash()) {
+        Ok(())
+    } else {
+        Err(ValidationError::BadProofOfWork)
+    }
 }
 
 /// Check that the block's difficulty bits match the expected value for this network.
@@ -357,6 +415,85 @@ pub fn check_future_timestamp(header: &Header, now: u64) -> Result<(), Validatio
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::pow::Target;
+
+    /// First nonce under 64 at which `check` accepts `header` with these
+    /// `bits` — a stand-in for "how much work does it take".
+    fn cheap_nonce(bits: u32, check: impl Fn(&Header) -> bool) -> Option<u32> {
+        let mut h = bitcoin::constants::genesis_block(Network::Bitcoin).header;
+        h.bits = CompactTarget::from_consensus(bits);
+        (0..64).find(|&n| {
+            h.nonce = n;
+            check(&h)
+        })
+    }
+
+    #[test]
+    fn a_header_that_names_its_own_easy_target_costs_nothing_until_bounded() {
+        // The gap: the hash against the header's *own* bits. Two encodings
+        // that pass it on the first nonce tried —
+        //   0x207fffff  a target near 2^255, the easiest honest encoding;
+        //   0x2101ffff  overflows 256 bits, and the decoder's shift wraps it
+        //               to a target near 2^256.
+        // (The encoding one might reach for first, 0x20ffffff, is not one of
+        // them: its mantissa sign bit is set, so it decodes to zero and meets
+        // nothing. The free ones are the non-negative ones.)
+        let unbounded = |h: &Header| check_proof_of_work(h).is_ok();
+        let bounded = |h: &Header| check_proof_of_work_bounded(h, Network::Bitcoin).is_ok();
+        for bits in [0x207f_ffff, 0x2101_ffff] {
+            assert!(
+                cheap_nonce(bits, unbounded).is_some(),
+                "{bits:08x}: expected the unbounded check to be free, which is the defect"
+            );
+            assert_eq!(
+                cheap_nonce(bits, bounded),
+                None,
+                "{bits:08x}: bounded by mainnet's powLimit it must not be"
+            );
+        }
+
+        // And real work still passes, so the bound is not refusing everything.
+        let genesis = bitcoin::constants::genesis_block(Network::Bitcoin).header;
+        assert!(check_proof_of_work_bounded(&genesis, Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn derive_target_follows_core_derive_target() {
+        let t = |bits: u32, net| derive_target(CompactTarget::from_consensus(bits), net);
+
+        // Each network's own limit is allowed, exactly.
+        for (net, limit) in [
+            (Network::Bitcoin, MAINNET_POWLIMIT_BITS),
+            (Network::Testnet, TESTNET_POWLIMIT_BITS),
+            (Network::Testnet4, TESTNET_POWLIMIT_BITS),
+            (Network::Signet, SIGNET_POWLIMIT_BITS),
+            (Network::Regtest, REGTEST_POWLIMIT_BITS),
+        ] {
+            assert!(t(limit, net).is_some(), "{net:?} accepts its own powLimit");
+        }
+        // One mantissa step easier than mainnet's limit is not.
+        assert!(t(0x1d01_0000, Network::Bitcoin).is_none(), "above powLimit");
+        // Regtest's limit is regtest's alone.
+        assert!(t(REGTEST_POWLIMIT_BITS, Network::Bitcoin).is_none());
+
+        // Harder than the limit is always fine.
+        assert!(t(0x1c00_ffff, Network::Bitcoin).is_some());
+
+        // Core's encoding rejections, each on a network where the limit
+        // would otherwise allow the value.
+        assert!(t(0x0492_3456, Network::Regtest).is_none(), "negative");
+        assert!(t(0x0000_0000, Network::Regtest).is_none(), "zero");
+        assert!(t(0x2101_ffff, Network::Regtest).is_none(), "overflow past 256 bits");
+        assert!(t(0x2300_0001, Network::Regtest).is_none(), "overflow by exponent alone");
+        // A zero mantissa with the sign bit set is zero, not negative.
+        assert!(t(0x0480_0000, Network::Regtest).is_none());
+
+        // The value itself matches the unchecked decode when it is valid.
+        assert_eq!(
+            t(MAINNET_POWLIMIT_BITS, Network::Bitcoin),
+            Some(Target::from_compact(CompactTarget::from_consensus(MAINNET_POWLIMIT_BITS)))
+        );
+    }
     use super::*;
     use crate::storage::blockindex::BlockStatus;
 

@@ -4484,15 +4484,22 @@ impl PeerManager {
         // `accept_compact_header`. Without this a peer could raise the height
         // we believe it has reached for nothing, by pushing a well-formed
         // block whose header is garbage. (`reject_if_mutated` above does not
-        // cover it — that gate is about witness and merkle malleation.) The
-        // header's difficulty is still checked against the chain downstream,
-        // when the block is accepted; what this rules out is the free case.
+        // cover it — that gate is about witness and merkle malleation.)
+        //
+        // Bounded by the network's powLimit, which is Core's own
+        // CheckProofOfWork. The hash against the header's *own* bits alone
+        // bounds nothing: a header may claim `0x20ffffff`, a target near 2^256
+        // that essentially any nonce meets. With the bound, the cheapest header
+        // that passes costs a minimum-difficulty block. Whether its difficulty
+        // is right for its place in the chain is still checked downstream,
+        // when the block is accepted.
         //
         // Nothing observable rides on this one — a pushed block carries its
         // own data, so the scheduler has nothing to ask this peer for that it
         // is not already getting. It is here so the invariant holds at every
         // ingress rather than at the ones that happen to matter today.
-        if crate::validation::pow::check_proof_of_work(&block.header).is_ok()
+        if crate::validation::pow::check_proof_of_work_bounded(&block.header, self.chain_state.network)
+            .is_ok()
             && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
         {
             self.note_peer_height(id, parent.height + 1);
@@ -11387,6 +11394,41 @@ mod tests {
             fetched_in_full(&mut rx),
             "a reconstruction that never finishes must not hold the block hostage"
         );
+    }
+
+    /// A pushed block raises the height we believe its peer has — but only if
+    /// its header cost real work, judged against the network's powLimit and
+    /// not against the target the header names for itself.
+    #[test]
+    fn a_pushed_block_whose_header_names_a_free_target_does_not_raise_the_peers_height() {
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        for id in [1, 2] {
+            pm.peers.write().insert(id, mk_handle(id, addr, Direction::Inbound, PeerState::Connected));
+        }
+        let height_of = |pm: &PeerManager, id| pm.peers.read()[&id].info.best_known_height;
+
+        // 0x2101ffff overflows 256 bits; decoded without Core's checks the
+        // shift wraps it to a target near 2^256, which essentially any nonce
+        // meets. Regtest is the network where this matters least and it is
+        // still refused: its limit is easy, but a wrapped target is not a
+        // target at all.
+        let mut forged = regtest_child_of_genesis(&pm, 7);
+        forged.header.bits = bitcoin::CompactTarget::from_consensus(0x2101_ffff);
+        while crate::validation::pow::check_proof_of_work(&forged.header).is_err() {
+            forged.header.nonce += 1;
+        }
+        assert!(
+            forged.header.nonce < 4,
+            "precondition: the header must be free under the unbounded check"
+        );
+        pm.handle_block(1, forged, crate::net::flow::InFlight::new(pm.peer_flow(1)));
+        assert_eq!(height_of(&pm, 1), None, "a free header must not move the belief");
+
+        // A real regtest block does, so the gate is not refusing everything.
+        let honest = regtest_child_of_genesis(&pm, 8);
+        pm.handle_block(2, honest, crate::net::flow::InFlight::new(pm.peer_flow(2)));
+        assert_eq!(height_of(&pm, 2), Some(1), "a block with real work records its height");
     }
 
     /// However a block arrives, every partial reconstruction of it is moot.
