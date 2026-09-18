@@ -17,6 +17,7 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- `getmempoolsummary [top_n]`, a bounded aggregate view of the mempool: a vsize histogram over every transaction plus the `top_n` by ancestor feerate. Replaces `getrawmempool verbose` for callers that only render an aggregate — on a mainnet-sized mempool that reply is ~85 MiB and ~4 s of node CPU, against ~9 KB here.
 - `-prune=1` is Bitcoin Core's spelling for *manual* pruning, and satd now implements it: prune mode with no budget, where the new `pruneblockchain` RPC is the only thing that ever deletes. `getblockchaininfo` reports such a node as pruned with `automatic_pruning: false` and no `prune_target_size`. satd refused the flag at startup before.
 - `-fastprune`, Core's 64 KiB block-file size. Pruning deletes whole files, so a short test chain never crossed the 128 MiB boundary and a prune could delete nothing.
 - The metrics and health endpoints can be served over TLS on a second port (`-metricstlsbind`), with optional client certificates (`-metricsmtls`), so Prometheus can scrape a node across a network without a reverse proxy (#752).

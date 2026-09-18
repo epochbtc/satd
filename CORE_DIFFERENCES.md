@@ -244,6 +244,14 @@ scanning (and thus the scan key) on the client.
 Bulk `getmempoolentry` (array → map of verbose entries), ring-buffered
 `getmempoolhistory [since_secs]` with feerate histogram snapshots.
 
+`getmempoolsummary [top_n]` returns the aggregate a dashboard actually
+renders — a vsize histogram over the whole mempool, plus the `top_n`
+transactions by ancestor feerate — in a reply bounded by `top_n` rather
+than by mempool size. Building the same view from `getrawmempool verbose`
+costs a reply of tens of MiB and seconds of CPU at a mainnet-sized
+mempool, nearly all of it discarded by such a caller. Bucket edges travel
+with the counts, so a client never hardcodes them.
+
 Bitcoin Core requires polling `getrawmempool` or rebuilding state from
 ZMQ per-tx events. satd's stream has explicit eviction reasons and RBF
 replacement linkage.

@@ -670,6 +670,69 @@ pub struct QuarantineReport {
     pub confirmed_anyway: u64,
 }
 
+/// vsize buckets used by [`Mempool::summary`], as `(min, max)` in vbytes; the
+/// final bucket is open-ended (`max == None`). The edges are published on the
+/// wire with the counts so a client labels its own axis from the response
+/// instead of hardcoding edges that would silently disagree after a change
+/// here.
+pub const MEMPOOL_VSIZE_BUCKETS: [(u64, Option<u64>); 8] = [
+    (0, Some(100)),
+    (100, Some(250)),
+    (250, Some(500)),
+    (500, Some(1_000)),
+    (1_000, Some(5_000)),
+    (5_000, Some(10_000)),
+    (10_000, Some(50_000)),
+    (50_000, None),
+];
+
+/// One vsize bucket of [`MempoolSummary::vsize_histogram`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MempoolVsizeBucket {
+    pub min_vsize: u64,
+    /// `None` for the open-ended top bucket; serializes as JSON `null`.
+    pub max_vsize: Option<u64>,
+    pub count: u32,
+}
+
+/// One row of [`MempoolSummary::top`]. Field names and semantics mirror the
+/// `getrawmempool verbose` entry they are derived from — `ancestorcount` and
+/// `descendantcount` include the transaction itself, `ancestorsize` and
+/// `ancestorfees` include its own vsize and fee.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MempoolSummaryEntry {
+    pub txid: String,
+    pub vsize: usize,
+    pub time: u64,
+    pub ancestorcount: usize,
+    pub ancestorsize: usize,
+    pub ancestorfees: u64,
+    pub descendantcount: usize,
+}
+
+/// Bounded aggregate view of the acting mempool — see [`Mempool::summary`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MempoolSummary {
+    /// Acting-class transaction count, as `getmempoolinfo.size` reports it.
+    pub size: usize,
+    /// Acting-class serialized bytes, as `getmempoolinfo.bytes` reports it.
+    pub bytes: usize,
+    pub vsize_histogram: Vec<MempoolVsizeBucket>,
+    pub top: Vec<MempoolSummaryEntry>,
+}
+
+/// Internal pre-sort row: keeps the raw [`Txid`] so the whole-mempool pass
+/// allocates no per-entry `String`. Only the surviving `top_n` rows are
+/// stringified.
+struct SummaryRollup {
+    txid: Txid,
+    vsize: usize,
+    time: u64,
+    ancestorcount: usize,
+    ancestorsize: usize,
+    ancestorfees: u64,
+}
+
 struct MempoolInner {
     // Keyed by already-uniform double-SHA256 hashes (Txid / OutPoint), so these
     // use a fast hasher (`FxHashMap`) rather than the default SipHash: hashing a
@@ -3527,33 +3590,112 @@ impl Mempool {
         count
     }
 
-    /// Get the set of in-mempool ancestors for a transaction.
-    pub fn get_ancestors(&self, txid: &Txid) -> Option<HashSet<Txid>> {
-        let inner = self.inner.read();
-        let entry = inner.entries.get(txid)?;
-        let mut ancestors = HashSet::new();
-        let mut queue: Vec<Txid> = Vec::new();
-
-        // Find direct parents
+    /// Fill `out` with the transitive in-mempool ancestors of `txid`, using
+    /// `queue` as scratch. Both are cleared on entry so a caller can reuse one
+    /// pair of allocations across a whole-mempool sweep.
+    ///
+    /// The walk is deliberately **not** scope-filtered: it matches the
+    /// historical `get_ancestors` shape, where the caller filters the result.
+    /// Filtering during the walk would additionally cut off any acting
+    /// ancestor reachable only *through* a quarantined one. Infectious
+    /// propagation (design §3) says that cannot happen, but the rollups below
+    /// are a reporting surface, not a place to lean on an invariant.
+    ///
+    /// Assumes the caller already holds the inner lock.
+    fn collect_ancestors(
+        inner: &MempoolInner,
+        txid: &Txid,
+        out: &mut HashSet<Txid>,
+        queue: &mut Vec<Txid>,
+    ) {
+        out.clear();
+        queue.clear();
+        let Some(entry) = inner.entries.get(txid) else {
+            return;
+        };
         for input in &entry.tx.input {
             let parent = input.previous_output.txid;
-            if inner.entries.contains_key(&parent) && ancestors.insert(parent) {
+            if inner.entries.contains_key(&parent) && out.insert(parent) {
                 queue.push(parent);
             }
         }
-
-        // Walk transitively
         while let Some(anc_txid) = queue.pop() {
             if let Some(anc) = inner.entries.get(&anc_txid) {
                 for input in &anc.tx.input {
                     let grandparent = input.previous_output.txid;
-                    if inner.entries.contains_key(&grandparent) && ancestors.insert(grandparent) {
+                    if inner.entries.contains_key(&grandparent) && out.insert(grandparent) {
                         queue.push(grandparent);
                     }
                 }
             }
         }
+    }
 
+    /// Fill `out` with the transitive in-mempool descendants of `txid` via the
+    /// `spends` reverse index. `queue` and `buf` are scratch. See
+    /// [`Self::collect_ancestors`] for why the walk is not scope-filtered.
+    ///
+    /// Assumes the caller already holds the inner lock.
+    fn collect_descendants(
+        inner: &MempoolInner,
+        txid: &Txid,
+        out: &mut HashSet<Txid>,
+        queue: &mut Vec<Txid>,
+        buf: &mut Vec<Txid>,
+    ) {
+        out.clear();
+        queue.clear();
+        if !inner.entries.contains_key(txid) {
+            return;
+        }
+        queue.push(*txid);
+        while let Some(current) = queue.pop() {
+            buf.clear();
+            Self::collect_children(inner, &current, buf);
+            for &child in buf.iter() {
+                if child != *txid && inner.entries.contains_key(&child) && out.insert(child) {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+
+    /// Acting-class rollup over a relative set: `(count, vsize, fees)`, where
+    /// `vsize` and `fees` include the subject transaction itself and `count`
+    /// does not. Quarantined relatives are excluded from all three (design
+    /// §6.1): the standard surface must never leak the quarantine class.
+    ///
+    /// Assumes the caller already holds the inner lock.
+    fn acting_rollup(
+        inner: &MempoolInner,
+        relatives: &HashSet<Txid>,
+        self_vsize: usize,
+        self_fee: u64,
+    ) -> (usize, usize, u64) {
+        let mut count = 0usize;
+        let mut vsize = self_vsize;
+        let mut fees = self_fee;
+        for r in relatives {
+            if let Some(e) = inner.entries.get(r)
+                && e.scope.is_acting()
+            {
+                count += 1;
+                vsize += e.weight / 4;
+                fees += e.fee;
+            }
+        }
+        (count, vsize, fees)
+    }
+
+    /// Get the set of in-mempool ancestors for a transaction.
+    pub fn get_ancestors(&self, txid: &Txid) -> Option<HashSet<Txid>> {
+        let inner = self.inner.read();
+        if !inner.entries.contains_key(txid) {
+            return None;
+        }
+        let mut ancestors = HashSet::new();
+        let mut queue: Vec<Txid> = Vec::new();
+        Self::collect_ancestors(&inner, txid, &mut ancestors, &mut queue);
         Some(ancestors)
     }
 
@@ -4164,29 +4306,14 @@ impl Mempool {
             return None;
         }
 
+        // The `entries` membership check inside the walk restores the old
+        // full-scan's invariant (it iterated `entries`, so it could only ever
+        // return live txids) and keeps this robust to any future
+        // `spends`/`entries` inconsistency rather than trusting it.
         let mut descendants = HashSet::new();
-        let mut queue = vec![*txid];
+        let mut queue: Vec<Txid> = Vec::new();
         let mut buf: Vec<Txid> = Vec::new();
-
-        while let Some(current) = queue.pop() {
-            buf.clear();
-            Self::collect_children(&inner, &current, &mut buf);
-            for &child in &buf {
-                // Only yield descendants actually present in the mempool, each
-                // once. The `entries` membership check restores the old
-                // full-scan's invariant (it iterated `entries`, so it could
-                // only ever return live txids) and keeps this robust to any
-                // future `spends`/`entries` inconsistency rather than trusting
-                // it. `insert` dedups and prevents re-walking; a valid mempool
-                // can't contain cycles, and the root is never re-added.
-                if child != *txid
-                    && inner.entries.contains_key(&child)
-                    && descendants.insert(child)
-                {
-                    queue.push(child);
-                }
-            }
-        }
+        Self::collect_descendants(&inner, txid, &mut descendants, &mut queue, &mut buf);
 
         Some(descendants)
     }
@@ -4209,6 +4336,123 @@ impl Mempool {
             }
         }
         Some(children)
+    }
+
+    /// Index into [`MEMPOOL_VSIZE_BUCKETS`] for a vsize in vbytes.
+    fn vsize_bucket(vsize: u64) -> usize {
+        MEMPOOL_VSIZE_BUCKETS
+            .iter()
+            .position(|(min, max)| vsize >= *min && max.is_none_or(|m| vsize < m))
+            .unwrap_or(MEMPOOL_VSIZE_BUCKETS.len() - 1)
+    }
+
+    /// Bounded aggregate view of the acting mempool: a vsize histogram over
+    /// every transaction, plus the `top_n` transactions by ancestor feerate
+    /// (descending, ties broken by smaller vsize — the order a miner would
+    /// consider them in).
+    ///
+    /// This exists because the only other way to obtain it — `getrawmempool
+    /// verbose` — is O(mempool) in reply size *and* in per-entry work, and a
+    /// caller rendering an aggregate discards essentially all of it. At a
+    /// mainnet-sized mempool that reply runs to tens of MiB and seconds of
+    /// CPU, per call. Everything here happens under a single read lock, with
+    /// no per-entry transaction clone, witness hash, or relative *list*:
+    /// relative sets are walked into two scratch allocations reused across the
+    /// whole sweep, and only the surviving rows are stringified.
+    ///
+    /// `top_n` is clamped by the caller; a value of 0 returns the histogram
+    /// with an empty `top`.
+    ///
+    /// The read lock is held across the whole sweep, where `getrawmempool
+    /// verbose` instead clones every entry under the lock and then re-takes it
+    /// per entry. That trade is worth making in this direction: the sweep here
+    /// is hash lookups and pointer-chasing over pre-sized scratch, so it holds
+    /// the lock for a fraction of the time the clone alone costs — and unlike
+    /// the re-locking version it sees one consistent mempool rather than a
+    /// graph that can shift between walks.
+    pub fn summary(&self, top_n: usize) -> MempoolSummary {
+        let inner = self.inner.read();
+
+        let mut counts = [0u32; MEMPOOL_VSIZE_BUCKETS.len()];
+        let mut rollups: Vec<SummaryRollup> = Vec::with_capacity(inner.entries.len());
+        let mut relatives: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = Vec::new();
+        let mut buf: Vec<Txid> = Vec::new();
+        let mut size = 0usize;
+
+        for (txid, entry) in inner.entries.iter() {
+            if !entry.scope.is_acting() {
+                continue;
+            }
+            size += 1;
+            let vsize = entry.weight / 4;
+            counts[Self::vsize_bucket(vsize as u64)] += 1;
+
+            Self::collect_ancestors(&inner, txid, &mut relatives, &mut queue);
+            let (ancestorcount, ancestorsize, ancestorfees) =
+                Self::acting_rollup(&inner, &relatives, vsize, entry.fee);
+
+            rollups.push(SummaryRollup {
+                txid: *txid,
+                vsize,
+                time: entry.time,
+                // `+ 1`: the transaction itself, matching the
+                // `getrawmempool verbose` field this mirrors.
+                ancestorcount: ancestorcount + 1,
+                ancestorsize,
+                ancestorfees,
+            });
+        }
+
+        // Ancestor feerate, descending. Compared as a cross-multiplied
+        // fraction in u128 rather than an f64 division: exact, total, and
+        // free of the NaN tiebreak an `f64` comparator would need. A zero
+        // `ancestorsize` cannot occur (it includes the subject's own vsize)
+        // but sorts as zero feerate if it ever did.
+        rollups.sort_unstable_by(|a, b| {
+            let lhs = a.ancestorfees as u128 * b.ancestorsize as u128;
+            let rhs = b.ancestorfees as u128 * a.ancestorsize as u128;
+            rhs.cmp(&lhs).then_with(|| a.vsize.cmp(&b.vsize))
+        });
+        rollups.truncate(top_n);
+
+        // Descendant counts only for the rows that survived, so the
+        // whole-mempool pass above walks each entry's ancestors once and
+        // nothing else.
+        let top = rollups
+            .into_iter()
+            .map(|r| {
+                Self::collect_descendants(&inner, &r.txid, &mut relatives, &mut queue, &mut buf);
+                let (descendantcount, _, _) = Self::acting_rollup(&inner, &relatives, 0, 0);
+                MempoolSummaryEntry {
+                    txid: r.txid.to_string(),
+                    vsize: r.vsize,
+                    time: r.time,
+                    ancestorcount: r.ancestorcount,
+                    ancestorsize: r.ancestorsize,
+                    ancestorfees: r.ancestorfees,
+                    // `+ 1`: the transaction itself, as above.
+                    descendantcount: descendantcount + 1,
+                }
+            })
+            .collect();
+
+        let vsize_histogram = MEMPOOL_VSIZE_BUCKETS
+            .iter()
+            .zip(counts.iter())
+            .map(|(&(min_vsize, max_vsize), &count)| MempoolVsizeBucket {
+                min_vsize,
+                max_vsize,
+                count,
+            })
+            .collect();
+
+        MempoolSummary {
+            size,
+            bytes: inner.acting_bytes(),
+            vsize_histogram,
+            top,
+        }
     }
 
     /// Get verbose entry data for a single mempool transaction (for RPC).
@@ -11590,6 +11834,46 @@ mod tests {
             Mempool::count_dust_outputs(&below, policy::DUST_RELAY_FEE_RATE),
             1,
             "an output below the threshold was not counted as dust"
+        );
+    }
+
+    /// Bucket edges are half-open `[min, max)`, so a vsize sitting exactly on
+    /// an edge belongs to the bucket above. Off-by-one here would silently
+    /// shift a histogram column, which is the kind of thing nobody notices.
+    #[test]
+    fn vsize_buckets_are_half_open_and_total() {
+        // Every edge value lands in the bucket it opens, not the one it closes.
+        assert_eq!(Mempool::vsize_bucket(0), 0);
+        assert_eq!(Mempool::vsize_bucket(99), 0);
+        assert_eq!(Mempool::vsize_bucket(100), 1);
+        assert_eq!(Mempool::vsize_bucket(249), 1);
+        assert_eq!(Mempool::vsize_bucket(250), 2);
+        assert_eq!(Mempool::vsize_bucket(499), 2);
+        assert_eq!(Mempool::vsize_bucket(500), 3);
+        assert_eq!(Mempool::vsize_bucket(999), 3);
+        assert_eq!(Mempool::vsize_bucket(1_000), 4);
+        assert_eq!(Mempool::vsize_bucket(4_999), 4);
+        assert_eq!(Mempool::vsize_bucket(5_000), 5);
+        assert_eq!(Mempool::vsize_bucket(9_999), 5);
+        assert_eq!(Mempool::vsize_bucket(10_000), 6);
+        assert_eq!(Mempool::vsize_bucket(49_999), 6);
+        assert_eq!(Mempool::vsize_bucket(50_000), 7);
+        // The top bucket is open-ended: nothing falls off the end.
+        assert_eq!(Mempool::vsize_bucket(u64::MAX), 7);
+
+        // And the table itself is contiguous — no gap, no overlap.
+        for w in MEMPOOL_VSIZE_BUCKETS.windows(2) {
+            assert_eq!(
+                w[0].1,
+                Some(w[1].0),
+                "bucket {:?} must end exactly where {:?} begins",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            MEMPOOL_VSIZE_BUCKETS.last().unwrap().1.is_none(),
+            "the last bucket must be open-ended"
         );
     }
 }

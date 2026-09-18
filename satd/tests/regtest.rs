@@ -19357,3 +19357,178 @@ fn getstratuminfo_reports_live_counters() {
     assert_eq!(info["miners"], json!([]), "{info}");
     assert!(!metrics(off_metrics).contains("satd_stratum_"), "no Stratum families without the server");
 }
+
+/// `getmempoolsummary` must agree, field for field, with the
+/// `getrawmempool verbose` entries it replaces.
+///
+/// This is the guard that matters. The summary exists so callers stop pulling
+/// the verbose dump, which means nothing downstream would notice if the two
+/// drifted — the whole point is that nobody is looking at both. So look at
+/// both here, over a parent/child pair that exercises the ancestor *and*
+/// descendant rollups (parent: 1 ancestor / 2 descendants counting itself;
+/// child: the reverse).
+#[test]
+fn getmempoolsummary_agrees_with_getrawmempool_verbose() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x93; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
+
+    let parent_fee = 1_000u64;
+    let (parent_hex, parent_txid) = common::build_signed_p2wpkh_spend_seq(
+        &node,
+        &wallet,
+        wallet.address.script_pubkey(),
+        parent_fee,
+        0xffff_fffd,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    let subsidy = 50u64 * 100_000_000;
+
+    let child_fee = 5_000u64;
+    let (child_hex, child_txid) = sign_p2wpkh_spend_of(
+        &wallet,
+        bitcoin::OutPoint {
+            txid: parent_txid.parse().expect("parent txid"),
+            vout: 0,
+        },
+        subsidy - parent_fee,
+        wallet.address.script_pubkey(),
+        child_fee,
+        0xffff_fffd,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
+
+    let verbose = node
+        .rpc_call_with_params("getrawmempool", vec![json!(true)])
+        .unwrap();
+    let verbose = verbose["result"].as_object().expect("verbose map");
+    assert_eq!(verbose.len(), 2, "parent and child are both in: {verbose:?}");
+
+    let summary = node.rpc_call("getmempoolsummary").unwrap();
+    let summary = &summary["result"];
+
+    // Totals line up with getmempoolinfo, which is where a client reads them
+    // today.
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    assert_eq!(summary["size"], info["result"]["size"], "size: {summary}");
+    assert_eq!(summary["bytes"], info["result"]["bytes"], "bytes: {summary}");
+
+    // The histogram covers every transaction exactly once.
+    let buckets = summary["vsize_histogram"].as_array().expect("histogram");
+    assert_eq!(buckets.len(), 8, "bucket count is part of the contract");
+    let counted: u64 = buckets.iter().map(|b| b["count"].as_u64().unwrap()).sum();
+    assert_eq!(
+        counted,
+        summary["size"].as_u64().unwrap(),
+        "every tx lands in exactly one bucket: {summary}"
+    );
+    // Edges are published so a client never hardcodes them.
+    assert_eq!(buckets[0]["min_vsize"].as_u64(), Some(0));
+    assert_eq!(buckets[0]["max_vsize"].as_u64(), Some(100));
+    assert!(
+        buckets[7]["max_vsize"].is_null(),
+        "top bucket is open-ended: {}",
+        buckets[7]
+    );
+
+    // Every row must match the verbose entry for the same txid.
+    let top = summary["top"].as_array().expect("top array");
+    assert_eq!(top.len(), 2, "both txs fit under the default top_n: {summary}");
+    for row in top {
+        let txid = row["txid"].as_str().expect("txid");
+        let v = verbose.get(txid).unwrap_or_else(|| panic!("{txid} absent from verbose"));
+        for field in [
+            "vsize",
+            "time",
+            "ancestorcount",
+            "ancestorsize",
+            "ancestorfees",
+            "descendantcount",
+        ] {
+            assert_eq!(
+                row[field], v[field],
+                "{field} disagrees for {txid}\n  summary: {row}\n  verbose: {v}"
+            );
+        }
+    }
+
+    // The relationship the rollups are actually about.
+    let row_of = |txid: &str| {
+        top.iter()
+            .find(|r| r["txid"].as_str() == Some(txid))
+            .unwrap_or_else(|| panic!("{txid} missing from top"))
+            .clone()
+    };
+    let child_txid = child_txid.to_string();
+    let parent = row_of(&parent_txid);
+    let child = row_of(&child_txid);
+    assert_eq!(parent["ancestorcount"].as_u64(), Some(1), "{parent}");
+    assert_eq!(parent["descendantcount"].as_u64(), Some(2), "{parent}");
+    assert_eq!(child["ancestorcount"].as_u64(), Some(2), "{child}");
+    assert_eq!(child["descendantcount"].as_u64(), Some(1), "{child}");
+
+    // Ordering: descending ancestor feerate. The child's package pays more per
+    // vbyte than the parent alone, so it sorts first.
+    let feerate = |r: &serde_json::Value| {
+        r["ancestorfees"].as_f64().unwrap() / r["ancestorsize"].as_f64().unwrap()
+    };
+    assert!(
+        feerate(&top[0]) >= feerate(&top[1]),
+        "top is sorted by ancestor feerate: {summary}"
+    );
+    assert_eq!(top[0]["txid"].as_str(), Some(child_txid.as_str()), "{summary}");
+
+    node.stop();
+}
+
+/// `top_n` bounds: it truncates, it is refused above the ceiling, and zero is
+/// a histogram-only request rather than an error.
+#[test]
+fn getmempoolsummary_top_n_is_bounded() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x94; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
+    let (hex, _txid) = common::build_signed_p2wpkh_spend_seq(
+        &node,
+        &wallet,
+        wallet.address.script_pubkey(),
+        1_000,
+        0xffff_fffd,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(hex)]);
+
+    let one = node
+        .rpc_call_with_params("getmempoolsummary", vec![json!(1u64)])
+        .unwrap();
+    assert_eq!(one["result"]["top"].as_array().map(Vec::len), Some(1));
+
+    // Zero still reports the whole-mempool histogram — the aggregate is not
+    // conditional on asking for rows.
+    let none = node
+        .rpc_call_with_params("getmempoolsummary", vec![json!(0u64)])
+        .unwrap();
+    assert_eq!(none["result"]["top"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        none["result"]["size"].as_u64(),
+        Some(1),
+        "histogram still counts the mempool: {none}"
+    );
+
+    // Above the ceiling is refused, not silently clamped.
+    let over = node
+        .rpc_call_with_params("getmempoolsummary", vec![json!(1_001u64)])
+        .unwrap();
+    assert_eq!(over["error"]["code"].as_i64(), Some(-8), "{over}");
+
+    node.stop();
+}

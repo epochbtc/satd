@@ -70,6 +70,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getmempoolentry", "Blockchain"),
     ("getmempoolhistory", "Blockchain"),
     ("getmempoolinfo", "Blockchain"),
+    ("getmempoolsummary", "Blockchain"),
     ("getpolicyinfo", "Blockchain"),
     ("getquarantineentry", "Blockchain"),
     ("getquarantineinfo", "Blockchain"),
@@ -184,6 +185,15 @@ const HELP_METHODS: &[(&str, &str)] = &[
 /// limit and as the plain-HTTP accept-level semaphore size, so the two
 /// bounds can't drift. Also passed to the startup-status RPC.
 pub const RPC_MAX_CONNECTIONS: u32 = 100;
+
+/// Default number of `getmempoolsummary` top-by-ancestor-feerate rows.
+/// Matches what the bundled TUI renders.
+const DEFAULT_MEMPOOL_SUMMARY_TOP_N: u64 = 50;
+
+/// Ceiling on `getmempoolsummary`'s `top_n`. Keeps the reply bounded by the
+/// method's own contract rather than by the transport's body cap: 1000 rows
+/// is on the order of 200 KB, whatever the mempool is doing.
+const MAX_MEMPOOL_SUMMARY_TOP_N: u64 = 1_000;
 
 /// Standard transaction version range — matches Core's `TX_MIN_STANDARD_VERSION`
 /// and `TX_MAX_STANDARD_VERSION` (src/policy/policy.h).
@@ -3587,6 +3597,34 @@ pub async fn start(
             "available": available,
             "snapshots": arr,
         }))
+    })?;
+
+    module.register_method("getmempoolsummary", |params, ctx, _extensions| {
+        // `getmempoolsummary [top_n]` — the bounded aggregate a dashboard
+        // actually needs: a vsize histogram over the whole acting mempool,
+        // plus the `top_n` transactions by ancestor feerate.
+        //
+        // The reply is bounded by `top_n` rather than by mempool size, which
+        // is the whole point. Reconstructing this from `getrawmempool
+        // verbose` costs a reply of tens of MiB and seconds of CPU at a
+        // mainnet-sized mempool, of which a caller drawing a histogram keeps
+        // a few hundred bytes.
+        let mut args = Args::new(&params);
+        let top_n: u64 = args.optional_or("top_n", DEFAULT_MEMPOOL_SUMMARY_TOP_N)?;
+        args.check()?;
+        if top_n > MAX_MEMPOOL_SUMMARY_TOP_N {
+            // Refuse rather than clamp: a caller that asked for more than it
+            // can have should learn that, not be handed a short list it may
+            // read as the whole answer.
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!("top_n out of range (0-{MAX_MEMPOOL_SUMMARY_TOP_N})"),
+                None::<()>,
+            ));
+        }
+        let summary = ctx.mempool.summary(top_n as usize);
+        serde_json::to_value(summary)
+            .map_err(|e| ErrorObjectOwned::owned(-32603, e.to_string(), None::<()>))
     })?;
 
     module.register_subscription(
