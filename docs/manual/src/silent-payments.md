@@ -479,6 +479,17 @@ describing a different transaction, one whose silent payment script is not what
 its own shares derive to, or one carrying a signature while an output still has
 no script, is refused rather than emitted.
 
+The reply is also checked against the document that was sent, input by input.
+A DLEQ proof says a share was computed from the key bound to an input, and
+which key that is comes from the previous output the PSBT says the input
+spends — which the device hands back along with everything else. A device that
+substitutes a previous output paying a key of its own can then do the rest of
+the BIP 375 work honestly against it: every proof verifies, and the script the
+outputs get is derived from a key no input has, so the recipient's scan never
+finds the payment. `sat-cli` refuses a reply that restates what an input
+spends, or the key bound to it. The node refuses the same thing at
+`finalizepsbt`, where the UTXO set has the last word.
+
 ### What satd will not do
 
 - It will not choose which coins to spend. There is no wallet here.

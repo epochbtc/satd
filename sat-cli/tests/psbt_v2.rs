@@ -710,3 +710,100 @@ fn a_signer_that_refuses_gets_its_message_relayed_with_an_explanation() {
     assert!(stdout.is_empty());
     std::fs::remove_file(&signer).ok();
 }
+
+/// A signer that restates what an input spends is refused, even though every
+/// proof in the reply checks out against the restated prevout.
+///
+/// This is the hole a DLEQ proof does not close on its own. The shares are
+/// proved against each input's public key, and the key comes from the previous
+/// output the PSBT claims the input spends — evidence the device hands back
+/// along with everything else. BIP 370's unique identifier commits to the
+/// outpoints but not to that evidence, so a device can swap in a previous
+/// output paying a key of its own and then do the whole BIP 375 job honestly
+/// against it: the shares verify, the proofs verify, and the script the
+/// outputs get is derived from a public key no input has. The recipient's scan
+/// never finds the payment and the money is gone.
+///
+/// The reply below is not tampered with by hand — it is what `sat-cli` itself
+/// produces for the substituted input, so every internal check in it passes.
+/// The node would catch it at `finalizepsbt`, where the UTXO set says what the
+/// inputs really pay; `sat-cli` has the document it sent, which is enough.
+#[test]
+fn a_signer_that_restates_a_prevout_is_refused() {
+    use base64::Engine as _;
+
+    let secp = Secp256k1::new();
+    let wallet = wallet_key();
+    let attacker = bitcoin::PrivateKey::from_slice(&[0x86u8; 32], bitcoin::Network::Regtest)
+        .expect("a key");
+    let scan = SecretKey::from_slice(&[0x84u8; 32]).unwrap().public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x85u8; 32]).unwrap().public_key(&secp);
+
+    // What the host sends: one input paying the wallet's key.
+    let sent = base64::engine::general_purpose::STANDARD
+        .encode(sp_psbt(&secp, &wallet, &scan, &spend).serialize());
+
+    // What comes back: the same outpoint, the same recipient, the same
+    // amount — and a previous output paying the device's own key, with the
+    // shares, proofs and script that honestly follow from it.
+    let (code, reply, stderr) = run_sign(&sp_psbt(&secp, &attacker, &scan, &spend), &attacker);
+    assert_eq!(code, 0, "{stderr}");
+    let reply_psbt = parse(&reply);
+    assert_ne!(
+        reply_psbt.outputs[0].get_single(keys::output::SCRIPT),
+        None,
+        "the substituted document is complete, which is what makes it dangerous"
+    );
+
+    let signer = fake_signer("prevout", &format!(r#"{{"psbt":"{reply}"}}"#));
+    let (code, stdout, stderr) = run_with_signer(&sent, &signer);
+    assert_eq!(code, 1, "it verifies internally, so only the comparison catches it: {stderr}");
+    assert!(
+        stderr.contains("changed what input 0 spends")
+            || stderr.contains("changed the public key bound to input 0"),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing should have been emitted");
+    std::fs::remove_file(&signer).ok();
+}
+
+/// Finalizing an input with a scriptSig counts as signing, so it is refused
+/// while a silent payment output still has no script — the same as a partial
+/// signature or a witness.
+///
+/// A signature commits to the outputs. One added while an output's script is
+/// still to be computed commits to a transaction that is going to change, and
+/// a P2SH-P2WPKH input is finalized with `PSBT_IN_FINAL_SCRIPTSIG` rather
+/// than a witness alone.
+#[test]
+fn a_signer_that_finalizes_a_scriptsig_before_the_scripts_is_refused() {
+    use base64::Engine as _;
+
+    let secp = Secp256k1::new();
+    let wallet = wallet_key();
+    let scan = SecretKey::from_slice(&[0x87u8; 32]).unwrap().public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x88u8; 32]).unwrap().public_key(&secp);
+
+    // Uncomputed: the output carries its scan and spend keys and no script.
+    let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
+    let sent = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    assert!(psbt.outputs[0].get_single(keys::output::SCRIPT).is_none());
+
+    let mut tampered = psbt.clone();
+    tampered.inputs[0].set(RawPair::new(
+        keys::input::FINAL_SCRIPTSIG,
+        Vec::new(),
+        vec![0x16, 0x00, 0x14],
+    ));
+    let tampered_b64 = base64::engine::general_purpose::STANDARD.encode(tampered.serialize());
+
+    let signer = fake_signer("scriptsig", &format!(r#"{{"psbt":"{tampered_b64}"}}"#));
+    let (code, stdout, stderr) = run_with_signer(&sent, &signer);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("still has no script"),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing should have been emitted");
+    std::fs::remove_file(&signer).ok();
+}

@@ -1264,7 +1264,7 @@ fn run_sign_with_signer_v2(
     // undetermined. Both are checked here, with the same code the node runs,
     // because the device is exactly the party a host cannot take on trust.
     if has_silent_payments
-        && let Err(why) = verify_signer_reply(&psbt)
+        && let Err(why) = verify_signer_reply(&original, &psbt)
     {
         eprintln!("error: {why}");
         return 1;
@@ -1287,17 +1287,57 @@ fn run_sign_with_signer_v2(
 /// trusting it, and this is that check. Refusing here rather than emitting is
 /// the point: a silent payment paid to the wrong script cannot be recovered,
 /// and the next thing that happens to an emitted PSBT is `finalizepsbt`.
-fn verify_signer_reply(psbt: &satd_psbt::RawPsbt) -> Result<(), String> {
+///
+/// It takes both documents because a proof is only as good as what it is
+/// proved against. The shares are proved against each input's public key, and
+/// which key an input has comes from the previous output the PSBT claims it
+/// spends — evidence the device hands back along with everything else, and
+/// which BIP 370's unique identifier does not cover. A device free to restate
+/// the prevouts is free to hand back a reply that verifies perfectly against
+/// inputs the transaction does not have. So the verifier's view of the inputs
+/// has to be the same on both sides.
+fn verify_signer_reply(
+    original: &satd_psbt::RawPsbt,
+    psbt: &satd_psbt::RawPsbt,
+) -> Result<(), String> {
     use satd_psbt::sp::{OutputStatus, ScriptState};
 
     satd_psbt::validate_structure(psbt).map_err(|e| e.to_string())?;
     let view = satd_psbt::V2View::new(psbt).map_err(|e| e.to_string())?;
     let report = satd_psbt::sp::verify(&view, None).map_err(|e| e.to_string())?;
 
+    let sent = satd_psbt::V2View::new(original)
+        .and_then(|v| satd_psbt::sp::verify(&v, None))
+        .map_err(|e| format!("the PSBT handed to the signer does not verify: {e}"))?;
+    if sent.inputs.len() != report.inputs.len() {
+        return Err(format!(
+            "the signer returned {} inputs against the {} it was given; refusing to emit it",
+            report.inputs.len(),
+            sent.inputs.len()
+        ));
+    }
+    for (before, after) in sent.inputs.iter().zip(&report.inputs) {
+        if before.prevout != after.prevout || before.outpoint != after.outpoint {
+            return Err(format!(
+                "the signer changed what input {} spends; the ECDH shares are proved \
+                 against it, so refusing to emit it",
+                after.index
+            ));
+        }
+        if before.public_key != after.public_key {
+            return Err(format!(
+                "the signer changed the public key bound to input {}; the ECDH shares are \
+                 proved against it, so refusing to emit it",
+                after.index
+            ));
+        }
+    }
+
     let signed = view.inputs().any(|i| {
         i.map().contains_type(satd_psbt::keys::input::PARTIAL_SIG)
             || i.map().contains_type(satd_psbt::keys::input::TAP_KEY_SIG)
             || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTWITNESS)
+            || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTSIG)
     });
 
     for output in &report.outputs {
