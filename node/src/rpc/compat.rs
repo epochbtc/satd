@@ -74,6 +74,29 @@ const MAX_NORMALIZE_REQUEST_BODY: usize = crate::rpc::RPC_MAX_BODY_SIZE;
 /// here — so the branch below is newly live.
 const MAX_NORMALIZE_RESPONSE_BODY: usize = 20 * 1024 * 1024;
 
+/// The caps are different numbers for different reasons, and re-coupling them
+/// would silently restore the bug this split fixes: a request-shaped budget
+/// policing replies whose size is set by the chain and the mempool. Checked at
+/// compile time, so it holds in every build rather than only under test.
+const _: () = {
+    assert!(
+        crate::rpc::RPC_MAX_RESPONSE_SIZE > crate::rpc::RPC_MAX_BODY_SIZE,
+        "a reply may legitimately dwarf the request that asked for it"
+    );
+    // The DOM-parse guard must stay well under what the engine will serve:
+    // parsing costs several times the body in live allocations.
+    assert!(
+        MAX_NORMALIZE_RESPONSE_BODY < crate::rpc::RPC_MAX_RESPONSE_SIZE,
+        "the parse guard is not the transport cap"
+    );
+    // The batch builders must work to what the inner service will serve, or
+    // they refuse batches it would have answered.
+    assert!(
+        crate::rpc::readonly::RESPONSE_BODY_LIMIT == crate::rpc::RPC_MAX_RESPONSE_SIZE,
+        "the read-only batch builder tracks the response cap"
+    );
+};
+
 /// Whether a reply is too large for this layer to DOM-parse, and must be
 /// forwarded in jsonrpsee's 2.0 shape instead. See
 /// [`MAX_NORMALIZE_RESPONSE_BODY`].
@@ -1402,30 +1425,6 @@ mod tests {
         assert!(text.contains(r#"{"a":1,"a":2}"#), "{text}");
     }
 
-
-    /// The request cap and the response cap are different numbers for
-    /// different reasons, and re-coupling them would silently restore the
-    /// bug: a request-shaped budget policing replies whose size is set by the
-    /// chain and the mempool.
-    #[test]
-    fn the_request_and_response_caps_are_separate() {
-        assert!(
-            crate::rpc::RPC_MAX_RESPONSE_SIZE > crate::rpc::RPC_MAX_BODY_SIZE,
-            "a reply may legitimately dwarf the request that asked for it"
-        );
-        // The batch builders must work to what the engine will serve, or they
-        // refuse batches the inner service would have answered.
-        assert_eq!(
-            crate::rpc::readonly::RESPONSE_BODY_LIMIT,
-            crate::rpc::RPC_MAX_RESPONSE_SIZE
-        );
-        // And the DOM-parse guard must stay well under it: parsing costs
-        // several times the body in live allocations.
-        assert!(
-            MAX_NORMALIZE_RESPONSE_BODY < crate::rpc::RPC_MAX_RESPONSE_SIZE,
-            "the parse guard is not the transport cap"
-        );
-    }
 
     /// The forward-instead-of-normalise branch, which was dead code until the
     /// caps were split — the engine refused anything that could reach it.
