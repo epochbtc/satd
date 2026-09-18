@@ -4193,15 +4193,17 @@ impl PeerManager {
     /// returns having asked for nothing. Every path that accepts a header
     /// from a peer must come through here.
     fn note_block_availability(&self, id: PeerId, hash: &bitcoin::BlockHash) {
-        let Some(entry) = self.chain_state.get_block_index(hash) else {
-            return;
-        };
+        if let Some(entry) = self.chain_state.get_block_index(hash) {
+            self.note_peer_height(id, entry.height);
+        }
+    }
+
+    /// Raise the height we believe `id` has reached. Never lowers it: a peer
+    /// that announced a block still has it after announcing an older one.
+    fn note_peer_height(&self, id: PeerId, height: u32) {
         if let Some(h) = self.peers.write().get_mut(&id) {
-            h.info.best_known_height = Some(
-                h.info
-                    .best_known_height
-                    .map_or(entry.height, |b| b.max(entry.height)),
-            );
+            h.info.best_known_height =
+                Some(h.info.best_known_height.map_or(height, |b| b.max(height)));
         }
     }
 
@@ -4469,6 +4471,19 @@ impl PeerManager {
         }
         self.note_block_arrived(&block.block_hash());
         self.note_peer_has_block(id, block.block_hash());
+        // A peer that pushes a block has it, so the same availability rule
+        // applies here as to the announcement paths. The block's own index
+        // entry does not exist until it is accepted, and acceptance happens
+        // off this thread, so the height comes from the parent: a block is
+        // its parent's height plus one.
+        //
+        // Nothing observable rides on this one — a pushed block carries its
+        // own data, so the scheduler has nothing to ask this peer for that it
+        // is not already getting. It is here so the invariant holds at every
+        // ingress rather than at the ones that happen to matter today.
+        if let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash) {
+            self.note_peer_height(id, parent.height + 1);
+        }
 
         // Operator-requested single-block re-fetch. Must come before every
         // other route: the normal paths reject a block we already have an
