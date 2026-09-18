@@ -25,6 +25,8 @@
 //! by a declared length that has not first been checked against the bytes
 //! actually remaining.
 
+use std::collections::HashSet;
+
 use crate::error::{MapId, PsbtError};
 use crate::keys::{self, MAGIC};
 
@@ -460,6 +462,10 @@ impl<'a> Reader<'a> {
 
     fn read_map(&mut self, id: MapId) -> Result<RawMap, PsbtError> {
         let mut map = RawMap::new();
+        // A set beside the vec, purely to keep the duplicate check off the
+        // pair count. Scanning the map per pair is quadratic, and a single
+        // map inside the 20 MiB request limit holds over a million pairs.
+        let mut seen: HashSet<(u64, Vec<u8>)> = HashSet::new();
         loop {
             if self.remaining() == 0 {
                 return Err(PsbtError::UnterminatedMap(id));
@@ -480,7 +486,7 @@ impl<'a> Reader<'a> {
             let key_data = key[kr.pos..].to_vec();
             let value = self.length_prefixed("a PSBT value")?.to_vec();
 
-            if map.contains(key_type, &key_data) {
+            if !seen.insert((key_type, key_data.clone())) {
                 return Err(PsbtError::DuplicateKey { map: id, key_type });
             }
             map.0.push(RawPair {
