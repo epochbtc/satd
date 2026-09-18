@@ -36,6 +36,16 @@ pub fn format_hash(h: &str) -> String {
 }
 
 /// Format duration in seconds to human-readable.
+/// Compact vbyte label for a histogram bucket edge: `0`, `250`, `1k`, `50k`.
+/// Keeps the axis under a sparkline that is only ~16 columns wide.
+pub fn format_vsize_edge(vsize: u64) -> String {
+    if vsize >= 1_000 && vsize.is_multiple_of(1_000) {
+        format!("{}k", vsize / 1_000)
+    } else {
+        vsize.to_string()
+    }
+}
+
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{}s", secs)

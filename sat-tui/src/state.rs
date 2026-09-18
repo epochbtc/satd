@@ -46,7 +46,18 @@ pub struct HistogramBucket {
     pub weight: u64,
 }
 
-/// Top-N mempool entry by ancestor feerate (derived from getrawmempool verbose).
+/// One vsize bucket of the mempool histogram, as `getmempoolsummary` reports
+/// it. The edges come from the node rather than being hardcoded here, so the
+/// axis label cannot drift out of step with the counts above it.
+#[derive(Debug, Clone)]
+pub struct VsizeBucket {
+    pub min_vsize: u64,
+    /// `None` for the open-ended top bucket.
+    pub max_vsize: Option<u64>,
+    pub count: u32,
+}
+
+/// Top-N mempool entry by ancestor feerate (from getmempoolsummary).
 #[derive(Debug, Clone)]
 pub struct MempoolTopEntry {
     pub txid: String,
@@ -443,7 +454,7 @@ pub struct AppState {
     pub tx_rate: Option<f64>,
     pub uptime_secs: Option<u64>,
     pub last_block_secs_ago: Option<u64>,
-    pub mempool_size_dist: Option<[u32; 8]>,
+    pub mempool_size_dist: Option<Vec<VsizeBucket>>,
 
     // System resources
     pub rss_bytes: Option<u64>,
@@ -503,6 +514,15 @@ pub struct AppState {
     pub selected_peer: usize,
     pub show_help: bool,
     pub show_reorgs: bool,
+
+    /// Methods whose most recent poll returned an error, with the message.
+    ///
+    /// The steady-state batch used to discard these outright (`if let Ok(v)`
+    /// with no else), so a panel whose RPC had been failing for weeks went on
+    /// rendering the last value it ever got, with nothing on screen to say so.
+    /// A monitoring tool showing stale data as though it were live is worse
+    /// than one showing an error.
+    pub rpc_failures: std::collections::BTreeMap<&'static str, String>,
 
     // Internal tracking
     prev_blocks: u32,
@@ -718,6 +738,8 @@ impl AppState {
             selected_peer: 0,
             show_help: false,
             show_reorgs: false,
+
+            rpc_failures: std::collections::BTreeMap::new(),
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -1058,68 +1080,73 @@ impl AppState {
         format!(" srv v{} · tui v{} ", srv, env!("CARGO_PKG_VERSION"))
     }
 
-    /// Update mempool size distribution + top-N from getrawmempool verbose response.
+    /// Update the mempool size distribution + top-N from a `getmempoolsummary`
+    /// response.
+    ///
+    /// The node does the bucketing and the sort; this reads the result. The
+    /// previous version pulled every mempool entry via `getrawmempool verbose`
+    /// and did both here, which meant transferring tens of MiB to render a
+    /// sparkline and fifty rows.
     pub fn update_mempool_dist(&mut self, v: &serde_json::Value) {
         self.loaded.mempool_dist = true;
-        let Some(obj) = v.as_object() else { return };
 
-        // Size distribution (existing vsize-bucket sparkline for steady view).
-        let mut dist = [0u32; 8];
-        for entry in obj.values() {
-            let vsize = entry.get("vsize").and_then(|s| s.as_u64()).unwrap_or(0);
-            let bucket = match vsize {
-                0..100 => 0,
-                100..250 => 1,
-                250..500 => 2,
-                500..1_000 => 3,
-                1_000..5_000 => 4,
-                5_000..10_000 => 5,
-                10_000..50_000 => 6,
-                _ => 7,
-            };
-            dist[bucket] += 1;
+        if let Some(buckets) = v.get("vsize_histogram").and_then(|h| h.as_array()) {
+            self.mempool_size_dist = Some(
+                buckets
+                    .iter()
+                    .map(|b| VsizeBucket {
+                        min_vsize: b.get("min_vsize").and_then(|x| x.as_u64()).unwrap_or(0),
+                        // Absent or null both mean the open-ended top bucket.
+                        max_vsize: b.get("max_vsize").and_then(|x| x.as_u64()),
+                        count: b.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    })
+                    .collect(),
+            );
         }
-        self.mempool_size_dist = Some(dist);
 
-        // Top-N by ancestor feerate (ancestorfees is in sats, ancestorsize
-        // in vbytes → feerate in sat/vB directly).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut entries: Vec<MempoolTopEntry> = obj
-            .iter()
-            .filter_map(|(txid, e)| {
-                let ancestor_fees = e.get("ancestorfees")?.as_u64()?;
-                let ancestor_size = e.get("ancestorsize")?.as_u64().unwrap_or(0);
-                let vsize = e.get("vsize")?.as_u64().unwrap_or(0);
-                let ancestor_feerate = if ancestor_size > 0 {
-                    ancestor_fees as f64 / ancestor_size as f64
-                } else {
-                    0.0
-                };
-                Some(MempoolTopEntry {
-                    txid: txid.clone(),
-                    vsize,
-                    ancestor_feerate,
-                    ancestor_count: e.get("ancestorcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
-                    descendant_count: e.get("descendantcount").and_then(|c| c.as_u64()).unwrap_or(1) as u32,
-                    age_secs: e.get("time")
-                        .and_then(|t| t.as_u64())
-                        .map(|t| now.saturating_sub(t))
-                        .unwrap_or(0),
-                })
+
+        // Already ordered by ancestor feerate, descending, and already cut to
+        // the requested row count — that ordering is part of the method's
+        // contract, so re-sorting here would only hide a node-side break.
+        self.mempool_top = v
+            .get("top")
+            .and_then(|t| t.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|e| {
+                        let ancestor_fees = e.get("ancestorfees")?.as_u64()?;
+                        let ancestor_size = e.get("ancestorsize")?.as_u64().unwrap_or(0);
+                        Some(MempoolTopEntry {
+                            txid: e.get("txid")?.as_str()?.to_string(),
+                            vsize: e.get("vsize")?.as_u64().unwrap_or(0),
+                            ancestor_feerate: if ancestor_size > 0 {
+                                ancestor_fees as f64 / ancestor_size as f64
+                            } else {
+                                0.0
+                            },
+                            ancestor_count: e
+                                .get("ancestorcount")
+                                .and_then(|c| c.as_u64())
+                                .unwrap_or(1) as u32,
+                            descendant_count: e
+                                .get("descendantcount")
+                                .and_then(|c| c.as_u64())
+                                .unwrap_or(1) as u32,
+                            age_secs: e
+                                .get("time")
+                                .and_then(|t| t.as_u64())
+                                .map(|t| now.saturating_sub(t))
+                                .unwrap_or(0),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
-        // Sort by ancestor feerate descending, tiebreak by smaller vsize.
-        entries.sort_by(|a, b| {
-            b.ancestor_feerate
-                .partial_cmp(&a.ancestor_feerate)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.vsize.cmp(&b.vsize))
-        });
-        entries.truncate(50);
-        self.mempool_top = entries;
+            .unwrap_or_default();
+
         if self.selected_mempool_row >= self.mempool_top.len() {
             self.selected_mempool_row = self.mempool_top.len().saturating_sub(1);
         }
@@ -1465,6 +1492,33 @@ impl AppState {
         self.force_mode.unwrap_or(self.mode)
     }
 
+    /// Record the outcome of one polled RPC: an error is remembered against
+    /// the method name, a success clears whatever was remembered.
+    pub fn record_rpc_result<T, E: std::fmt::Display>(
+        &mut self,
+        method: &'static str,
+        res: &Result<T, E>,
+    ) {
+        match res {
+            Ok(_) => {
+                self.rpc_failures.remove(method);
+            }
+            Err(e) => {
+                self.rpc_failures.insert(method, e.to_string());
+            }
+        }
+    }
+
+    /// One-line summary of currently-failing methods for the title bar, or
+    /// `None` when everything answered.
+    pub fn rpc_failure_line(&self) -> Option<String> {
+        if self.rpc_failures.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self.rpc_failures.keys().copied().collect();
+        Some(format!(" rpc failing: {} ", names.join(", ")))
+    }
+
     /// Check if data is stale (>5s since last poll).
     pub fn check_stale(&mut self) {
         if let Some(last) = self.last_poll {
@@ -1778,25 +1832,66 @@ mod tests {
     }
 
     #[test]
-    fn update_mempool_dist_computes_top_n_sorted_by_ancestor_feerate() {
+    fn update_mempool_dist_reads_the_summary_shape() {
+        // Rows arrive already ordered by the node; this asserts they are read
+        // in that order and the derived feerate is right, not that the TUI
+        // re-sorts them.
         let v = json!({
-            "lowest": {"fees": {"base": 0.00001}, "vsize": 200, "ancestorfees": 2000, "ancestorsize": 200,
-                       "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
-            "highest": {"fees": {"base": 0.001}, "vsize": 250, "ancestorfees": 100_000, "ancestorsize": 250,
-                        "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
-            "cpfp_child": {"fees": {"base": 0.0001}, "vsize": 300, "ancestorfees": 50_000, "ancestorsize": 500,
-                           "ancestorcount": 2, "descendantcount": 1, "time": 1_700_000_000},
+            "size": 3,
+            "bytes": 750,
+            "vsize_histogram": [
+                {"min_vsize": 0, "max_vsize": 100, "count": 0},
+                {"min_vsize": 100, "max_vsize": 250, "count": 1},
+                {"min_vsize": 250, "max_vsize": 500, "count": 2},
+                {"min_vsize": 500, "max_vsize": null, "count": 0},
+            ],
+            "top": [
+                {"txid": "highest", "vsize": 250, "ancestorfees": 100_000, "ancestorsize": 250,
+                 "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+                {"txid": "cpfp_child", "vsize": 300, "ancestorfees": 50_000, "ancestorsize": 500,
+                 "ancestorcount": 2, "descendantcount": 1, "time": 1_700_000_000},
+                {"txid": "lowest", "vsize": 200, "ancestorfees": 2_000, "ancestorsize": 200,
+                 "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            ],
         });
         let mut st = AppState::new();
         st.update_mempool_dist(&v);
+
         assert_eq!(st.mempool_top.len(), 3);
-        // 100_000/250 = 400 sat/vB (highest)
-        // 50_000/500 = 100 sat/vB
-        // 2_000/200 = 10 sat/vB
+        // 100_000/250 = 400 sat/vB, 50_000/500 = 100, 2_000/200 = 10.
         assert_eq!(st.mempool_top[0].txid, "highest");
         assert_eq!(st.mempool_top[1].txid, "cpfp_child");
         assert_eq!(st.mempool_top[2].txid, "lowest");
-        assert!(st.mempool_top[0].ancestor_feerate > st.mempool_top[1].ancestor_feerate);
+        assert_eq!(st.mempool_top[0].ancestor_feerate, 400.0);
+        assert_eq!(st.mempool_top[1].ancestor_feerate, 100.0);
+        assert_eq!(st.mempool_top[2].ancestor_count, 1);
+        assert!(st.mempool_top[0].age_secs > 0);
+
+        // Bucket edges come from the response, including the open-ended top.
+        let dist = st.mempool_size_dist.expect("histogram");
+        assert_eq!(dist.len(), 4);
+        assert_eq!(dist[1].min_vsize, 100);
+        assert_eq!(dist[1].max_vsize, Some(250));
+        assert_eq!(dist[1].count, 1);
+        assert_eq!(dist[3].max_vsize, None, "top bucket stays open-ended");
+    }
+
+    #[test]
+    fn update_mempool_dist_survives_a_truncated_response() {
+        // A row missing the fields the feerate is derived from is dropped
+        // rather than rendered as a zero-feerate entry that looks real.
+        let v = json!({
+            "vsize_histogram": [],
+            "top": [
+                {"txid": "no_ancestor_fields", "vsize": 200, "time": 1_700_000_000},
+                {"txid": "good", "vsize": 200, "ancestorfees": 2_000, "ancestorsize": 200,
+                 "ancestorcount": 1, "descendantcount": 1, "time": 1_700_000_000},
+            ],
+        });
+        let mut st = AppState::new();
+        st.update_mempool_dist(&v);
+        assert_eq!(st.mempool_top.len(), 1);
+        assert_eq!(st.mempool_top[0].txid, "good");
     }
 
     #[test]

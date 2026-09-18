@@ -451,18 +451,27 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getrawmempool` (verbose), `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`). |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`). |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar
 shows `stale`. The view continues to render; the indicator shows that
 the data on screen is older than the polling cadence implies.
 
+The health dot tracks the *connection*. A single RPC can fail while the
+connection is healthy — an unknown method against an older node, or one whose
+reply the node refuses to build — and that failure has its own indicator:
+`rpc failing: <method>` in the title bar, naming each method whose last poll
+errored. The panel fed by that method keeps its last value rather than
+blanking, so the indicator is the only thing distinguishing stale data from
+live data.
+
 ## Failure modes
 
 | What you see | What it means |
 |---|---|
 | `Connecting to satd…` | RPC unreachable, returning errors, or only `getstartupinfo` is responding. |
+| `rpc failing: <method>` in the title bar | That method's last poll returned an error while the connection stayed up. The panels it feeds are showing their last good value. |
 | Auth retry, then `Connecting…` | The cookie rotated and the retry also failed, which is common during a satd restart. Recovers on its own. |
 | Stale indicator (`✕ stale`) | Polling is alive but a recent call has not returned. Investigate if persistent. |
 | Empty / dashed fields (`—`, `-`) | The RPC backing that field has not returned yet, or returned an error. |

@@ -297,6 +297,22 @@ fn run_app(
 }
 
 async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
+    /// Apply one polled RPC result to state, recording success or failure
+    /// against the method name.
+    ///
+    /// This replaced a row of `if let Ok(v) = res { st.update(&v); }`, which
+    /// dropped every error on the floor. `getrawmempool verbose` had been
+    /// failing on every poll for weeks against a mainnet-sized mempool while
+    /// the panel went on showing whatever it last managed to fetch.
+    macro_rules! apply_poll {
+        ($st:expr, $method:literal, $res:expr, $update:ident) => {
+            $st.record_rpc_result($method, &$res);
+            if let Ok(v) = $res {
+                $st.$update(&v);
+            }
+        };
+    }
+
     let mut fast_interval = interval(Duration::from_millis(1500));
     let mut slow_counter: u32 = 0;
     let mut ibd_counter: u32 = 0;
@@ -418,21 +434,15 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             );
             {
                 let mut st = state.lock();
-                if let Ok(v) = index_res {
-                    st.update_index_info(&v);
-                }
-                if let Ok(v) = srv_res {
-                    st.update_server_status(&v);
-                }
-                if let Ok(v) = netinfo_res {
-                    st.update_server_version(&v);
-                }
+                apply_poll!(st, "getsatdindexinfo", index_res, update_index_info);
+                apply_poll!(st, "getserverstatus", srv_res, update_server_status);
+                apply_poll!(st, "getnetworkinfo", netinfo_res, update_server_version);
             }
 
             // Heavy steady-state batch — only meaningful at chain tip.
             // Skipped during IBD because most fields would be nullish.
             if is_steady {
-                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, rawmempool_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
+                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, mempool_summary_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
                     rpc.estimate_fees(),
                     rpc.get_mining_info(),
                     rpc.get_chain_tx_stats(),
@@ -441,7 +451,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                         let height = state.lock().blocks;
                         if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc { code: 0, message: "no blocks".into() }) }
                     },
-                    rpc.get_raw_mempool_verbose(),
+                    rpc.get_mempool_summary(),
                     rpc.get_tx_out_set_info(),
                     rpc.get_reorg_history(),
                     rpc.get_mempool_history(),
@@ -449,15 +459,15 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
 
                 {
                     let mut st = state.lock();
-                    if let Ok(v) = fees_res { st.update_fee_estimates(&v); }
-                    if let Ok(v) = mining_res { st.update_mining_info(&v); }
-                    if let Ok(v) = txstats_res { st.update_chain_tx_stats(&v); }
-                    if let Ok(v) = uptime_res { st.update_uptime(&v); }
-                    if let Ok(v) = blockstats_res { st.update_block_stats(&v); }
-                    if let Ok(v) = rawmempool_res { st.update_mempool_dist(&v); }
-                    if let Ok(v) = utxo_res { st.update_utxo_info(&v); }
-                    if let Ok(v) = reorgs_res { st.update_reorg_history(&v); }
-                    if let Ok(v) = mhist_res { st.update_mempool_history(&v); }
+                    apply_poll!(st, "estimatefees", fees_res, update_fee_estimates);
+                    apply_poll!(st, "getmininginfo", mining_res, update_mining_info);
+                    apply_poll!(st, "getchaintxstats", txstats_res, update_chain_tx_stats);
+                    apply_poll!(st, "uptime", uptime_res, update_uptime);
+                    apply_poll!(st, "getblockstats", blockstats_res, update_block_stats);
+                    apply_poll!(st, "getmempoolsummary", mempool_summary_res, update_mempool_dist);
+                    apply_poll!(st, "gettxoutsetinfo", utxo_res, update_utxo_info);
+                    apply_poll!(st, "getreorghistory", reorgs_res, update_reorg_history);
+                    apply_poll!(st, "getmempoolhistory", mhist_res, update_mempool_history);
                 }
 
                 // Refresh the difficulty-epoch anchor when the floor advances —
