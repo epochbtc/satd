@@ -94,6 +94,43 @@ replacement linkage directly. For the richer firehose with cursor replay,
 see the [Streaming Consumption API](streaming.md); `subscribemempool` is
 the lightweight JSON-RPC option.
 
+## Bounded mempool aggregate
+
+`getmempoolsummary ( top_n )` returns the view a dashboard renders — a vsize
+histogram over the whole acting mempool, plus the `top_n` transactions by
+ancestor feerate (descending, ties broken by smaller vsize).
+
+```json
+{
+  "size": 71594,
+  "bytes": 117777467,
+  "vsize_histogram": [
+    { "min_vsize": 0, "max_vsize": 100, "count": 4127 },
+    { "min_vsize": 50000, "max_vsize": null, "count": 6 }
+  ],
+  "top": [
+    { "txid": "…", "vsize": 141, "time": 1789255111,
+      "ancestorcount": 1, "ancestorsize": 141, "ancestorfees": 282,
+      "descendantcount": 1 }
+  ]
+}
+```
+
+The reply is bounded by `top_n` (default 50, ceiling 1000; above the ceiling is
+an `-8` error rather than a silent clamp) instead of by mempool size. The same
+view built from `getrawmempool verbose` costs a reply of tens of MiB and
+seconds of node CPU at a mainnet-sized mempool, essentially all of it discarded
+by a caller drawing an aggregate — the per-entry `depends` and `spentby` arrays
+alone are most of that payload.
+
+`size` and `bytes` match `getmempoolinfo`. Row field names and semantics match
+the `getrawmempool verbose` entry they derive from: `ancestorcount` and
+`descendantcount` include the transaction itself, `ancestorsize` and
+`ancestorfees` include its own vsize and fee. Bucket edges are half-open
+`[min_vsize, max_vsize)` and travel with the counts, so a client labels its axis
+from the response rather than hardcoding edges; the top bucket's `max_vsize` is
+`null`. The method is read-only.
+
 ## Silent-payment block data
 
 `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` returns the

@@ -286,6 +286,7 @@ SATD_ONLY = {
     "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "estimatefees": [["targets", False], ["mode", False]],
     "getmempoolhistory": [["since_secs", False]],
+    "getmempoolsummary": [["top_n", False]],
     "getquarantineentry": [["txid", False]],
     "getreorghistory": [["since_secs", False]],
     "getsilentpaymentblockdata": [

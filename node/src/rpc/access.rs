@@ -102,6 +102,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getmempoolentry"
         | "getmempoolhistory"
         | "getmempoolinfo"
+        | "getmempoolsummary"
         | "getmininginfo"
         | "getnettotals"
         | "getnetworkhashps"
