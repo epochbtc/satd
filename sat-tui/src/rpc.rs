@@ -222,8 +222,17 @@ impl RpcClient {
         self.call("getblockstats", &[serde_json::json!(height.to_string())]).await
     }
 
-    pub async fn get_raw_mempool_verbose(&self) -> Result<serde_json::Value, RpcError> {
-        self.call("getrawmempool", &[serde_json::json!(true)]).await
+    /// The mempool aggregate this TUI renders: a vsize histogram over the
+    /// whole mempool plus the top rows by ancestor feerate.
+    ///
+    /// This used to be `getrawmempool verbose`, which returns the entire
+    /// mempool as verbose entries. At a mainnet-sized mempool that reply runs
+    /// to tens of MiB — past the node's own response cap, so it failed
+    /// outright — while this panel reads six fields per entry and keeps 50
+    /// rows. `getmempoolsummary` computes the aggregate node-side and returns
+    /// a reply bounded by `top_n`.
+    pub async fn get_mempool_summary(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getmempoolsummary", &[serde_json::json!(MEMPOOL_TOP_N)]).await
     }
 
     pub async fn get_tx_out_set_info(&self) -> Result<serde_json::Value, RpcError> {
@@ -260,6 +269,10 @@ impl RpcClient {
 /// for steady-state methods while it is still pre-READY (e.g. mid-reindex):
 /// the daemon is reachable and answering, the method just isn't wired up yet,
 /// so it must never be treated as a connectivity failure.
+/// Rows requested from `getmempoolsummary`. The mempool table renders 50; the
+/// node's own ceiling is 1000.
+pub const MEMPOOL_TOP_N: u64 = 50;
+
 pub const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 
 #[derive(Debug)]

@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use crate::state::AppState;
 use crate::ui::{
     format_bytes, format_btc, format_duration, format_hash, format_hashrate, format_num,
-    peer_table, render_loading_panel,
+    format_vsize_edge, peer_table, render_loading_panel,
 };
 
 pub fn draw(f: &mut Frame, state: &AppState) {
@@ -49,6 +49,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
         Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
+        // A method that is failing while the connection is fine shows up
+        // nowhere else: the health dot tracks the connection, and the panel
+        // fed by that method just keeps its last value.
+        Span::styled(
+            state.rpc_failure_line().unwrap_or_default(),
+            Style::default().fg(Color::Red),
+        ),
     ]);
     f.render_widget(Paragraph::new(title), chunks[0]);
 
@@ -450,7 +457,7 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Mempool size distribution sparkline
     if let Some(dist) = &state.mempool_size_dist {
-        let dist_data: Vec<u64> = dist.iter().map(|&v| v as u64).collect();
+        let dist_data: Vec<u64> = dist.iter().map(|b| b.count as u64).collect();
         if mempool_inner.height > 5 {
             let spark_area = Rect {
                 x: mempool_inner.x,
@@ -470,9 +477,25 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
                     width: mempool_inner.width,
                     height: 1,
                 };
+                // Built from the buckets the node sent, not a fixed string:
+                // the old hardcoded label had drifted and named six edges for
+                // an eight-bucket histogram.
+                let axis = dist
+                    .iter()
+                    .map(|b| {
+                        let mut label = format_vsize_edge(b.min_vsize);
+                        // The open-ended top bucket gets a `+`, so a column
+                        // of lower edges cannot be misread as a closed range.
+                        if b.max_vsize.is_none() {
+                            label.push('+');
+                        }
+                        label
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        "0   250  500  1k  5k  50k",
+                        axis,
                         Style::default().fg(Color::DarkGray),
                     ))),
                     label_area,
