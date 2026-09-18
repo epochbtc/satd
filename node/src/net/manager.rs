@@ -4477,11 +4477,24 @@ impl PeerManager {
         // off this thread, so the height comes from the parent: a block is
         // its parent's height plus one.
         //
+        // Proof of work first. Core records availability only out of
+        // `AcceptBlockHeader`, which has checked the header by then, and the
+        // other two ingresses here inherit that: `handle_headers` records
+        // after `accept_headers` and the compact path after
+        // `accept_compact_header`. Without this a peer could raise the height
+        // we believe it has reached for nothing, by pushing a well-formed
+        // block whose header is garbage. (`reject_if_mutated` above does not
+        // cover it — that gate is about witness and merkle malleation.) The
+        // header's difficulty is still checked against the chain downstream,
+        // when the block is accepted; what this rules out is the free case.
+        //
         // Nothing observable rides on this one — a pushed block carries its
         // own data, so the scheduler has nothing to ask this peer for that it
         // is not already getting. It is here so the invariant holds at every
         // ingress rather than at the ones that happen to matter today.
-        if let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash) {
+        if crate::validation::pow::check_proof_of_work(&block.header).is_ok()
+            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+        {
             self.note_peer_height(id, parent.height + 1);
         }
 
