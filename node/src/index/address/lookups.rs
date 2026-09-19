@@ -327,7 +327,7 @@ impl AddressIndex for RocksAddressIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRow};
+    use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRowV3};
     use crate::storage::StoreBatch;
     use crate::storage::db::InMemoryStore;
 
@@ -509,10 +509,16 @@ mod tests {
             fixture_txid_ends(0x02, 0x02),
             fixture_txid_ends(0x01, 0x03),
         ];
-        let seqs = seed_ordinals(
+        // An earlier transaction funds `sh` three times; each block-7
+        // transaction spends one of those outputs *and* funds `sh`
+        // again, so every block-7 txid is in both streams — the case the
+        // merge's dedupe exists for.
+        let funder = fixture_txid(0x0f);
+        let all_seqs = seed_ordinals(
             &store_inner,
-            &[(7, txids[0]), (7, txids[1]), (7, txids[2])],
+            &[(3, funder), (7, txids[0]), (7, txids[1]), (7, txids[2])],
         );
+        let (funder_seq, seqs) = (all_seqs[0], &all_seqs[1..]);
         assert!(
             txids[0] > txids[1] && txids[1] > txids[2],
             "fixture premise: block position and txid order disagree"
@@ -524,12 +530,27 @@ mod tests {
         );
 
         let mut batch = StoreBatch::default();
+        for i in 0..3u32 {
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
+                scripthash: sh,
+                txseq: funder_seq,
+                vout: i,
+                amount_sat: 50,
+            });
+        }
         for (i, seq) in seqs.iter().enumerate() {
             batch.addr_funding_puts.push(AddrFundingRowV3 {
                 scripthash: sh,
                 txseq: *seq,
                 vout: 0,
                 amount_sat: 100 + i as u64,
+            });
+            batch.addr_spending_puts.push(AddrSpendingRowV3 {
+                scripthash: sh,
+                txseq: *seq,
+                vin: 0,
+                funding_txseq: funder_seq,
+                funding_vout: i as u32,
             });
             batch.coin_puts.push((
                 OutPoint { txid: txids[i], vout: 0 },
@@ -547,18 +568,31 @@ mod tests {
         );
 
         // The lockstep merge is the consumer that depends on the order:
-        // it compares by `Txid::cmp`, so a stream in any other order
-        // comes out of it unsorted.
+        // it compares by `Txid::cmp` and dedupes against the last pair
+        // it emitted, so a stream in any other order comes out of it
+        // unsorted and with a fund-and-spend txid emitted twice.
         let hist: Vec<bitcoin::Txid> = idx
             .confirmed_distinct_history_limited(&sh, 100)
             .unwrap()
             .into_iter()
             .map(|(_, txid)| txid)
             .collect();
+        let mut expected_hist = vec![funder];
+        expected_hist.extend(expected.iter().copied());
         assert_eq!(
-            hist, expected,
-            "distinct history must be in (height, txid) order, the order the merge assumes"
+            hist, expected_hist,
+            "distinct history must be in (height, txid) order with each txid once"
         );
+
+        // With duplicates counted against it, `limit` would truncate
+        // real history: 3 here would stop before the last transaction.
+        let limited: Vec<bitcoin::Txid> = idx
+            .confirmed_distinct_history_limited(&sh, 3)
+            .unwrap()
+            .into_iter()
+            .map(|(_, txid)| txid)
+            .collect();
+        assert_eq!(limited, expected_hist[..3].to_vec());
     }
 
     /// A funding row whose ordinal has no reverse-map entry is local
@@ -840,9 +874,11 @@ mod tests {
         // 10 funding + 10 spending rows for the same scripthash.
         // With limit=12, the unfixed code would have returned ~20
         // (10 + 10 from each side); the fixed code truncates to 12.
-        let txs: Vec<(u32, bitcoin::Txid)> =
+        let mut txs: Vec<(u32, bitcoin::Txid)> =
             (0..10u32).map(|i| (i, fixture_txid(i as u8))).collect();
-        let seqs = seed_ordinals(&store_inner, &txs);
+        txs.extend((0..10u32).map(|i| (i + 100, fixture_txid(0x80 + i as u8))));
+        let all_seqs = seed_ordinals(&store_inner, &txs);
+        let (seqs, spend_seqs) = all_seqs.split_at(10);
         let mut batch = StoreBatch::default();
         for i in 0..10u32 {
             batch.addr_funding_puts.push(AddrFundingRowV3 {
@@ -851,15 +887,12 @@ mod tests {
                 vout: 0,
                 amount_sat: 100,
             });
-            batch.addr_spending_puts.push(AddrSpendingRow {
+            batch.addr_spending_puts.push(AddrSpendingRowV3 {
                 scripthash: sh,
-                height: i + 100,
-                txid: fixture_txid(0x80 + i as u8),
+                txseq: spend_seqs[i as usize],
                 vin: 0,
-                prev_outpoint: OutPoint {
-                    txid: fixture_txid(0xff),
-                    vout: i,
-                },
+                funding_txseq: seqs[0],
+                funding_vout: i,
             });
         }
         store_inner.write_batch(batch).unwrap();

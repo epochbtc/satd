@@ -1867,44 +1867,55 @@ impl Store for CoinCache {
         limit: usize,
     ) -> Vec<(crate::index::address::AddrSpendingKey, OutPoint)> {
         // See iter_addr_funding_limited for the limit + 1 + |pending|
-        // bounding rationale.
-        let pending = self.pending_batch.lock();
-        let pending_removes: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
-            pending
-                .addr_spending_removes
+        // bounding rationale, and for why the pending rows are resolved
+        // through `self` rather than `inner`.
+        let (pending_removes, pending_raw) = {
+            let pending = self.pending_batch.lock();
+            let removes: std::collections::HashSet<crate::index::address::AddrSpendingKeyV3> =
+                pending
+                    .addr_spending_removes
+                    .iter()
+                    .filter(|k| &k.scripthash == sh)
+                    .copied()
+                    .collect();
+            let raw: Vec<(u64, u32, u64, u32)> = pending
+                .addr_spending_puts
                 .iter()
-                .filter(|k| &k.scripthash == sh)
-                .cloned()
+                .filter(|r| &r.scripthash == sh && !removes.contains(&r.key()))
+                .map(|r| (r.txseq, r.vin, r.funding_txseq, r.funding_vout))
                 .collect();
-        let pending_puts: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = pending
-            .addr_spending_puts
-            .iter()
-            .filter(|r| &r.scripthash == sh)
-            .filter_map(|r| {
-                let k = r.key();
-                if pending_removes.contains(&k) {
-                    None
-                } else {
-                    Some((k, r.prev_outpoint))
-                }
-            })
-            .collect();
-        drop(pending);
+            (removes, raw)
+        };
+        let pending_puts =
+            crate::storage::rocksdb_store::resolve_spending_rows_for(self, sh, pending_raw);
 
         let inner_limit = limit.saturating_add(1);
         let inner_rows = self.inner.iter_addr_spending_limited(sh, inner_limit);
         // Dedupe by key with pending taking precedence over inner.
-        // See `iter_addr_funding_limited` for the rationale.
+        // See `iter_addr_funding_limited` for the rationale, including
+        // why the pending removes are translated once rather than every
+        // inner row being resolved back to an ordinal.
+        let removed_resolved: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
+            crate::storage::rocksdb_store::resolve_spending_rows_for(
+                self,
+                sh,
+                pending_removes
+                    .iter()
+                    .map(|k| (k.txseq, k.vin, k.txseq, 0u32))
+                    .collect(),
+            )
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         let pending_keys: std::collections::HashSet<crate::index::address::AddrSpendingKey> =
             pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrSpendingKey, OutPoint)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
+            .filter(|(k, _)| !removed_resolved.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_spending_key_v2(a)
-                .cmp(&crate::index::address::encode_spending_key_v2(b))
+            (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
         });
         // Round-2 review M3: honor the trait contract — see
         // iter_addr_funding_limited for the rationale.
@@ -3653,8 +3664,8 @@ mod tests {
     /// (round-1 review, PR 803 H1). Block position, internal order and
     /// display order are three different orders here.
     #[test]
-    fn overlay_addr_funding_rows_are_in_txid_order_across_pending_and_flushed() {
-        use crate::index::address::{AddrFundingRowV3, scripthash_of};
+    fn overlay_addr_rows_are_in_txid_order_across_pending_and_flushed() {
+        use crate::index::address::{AddrFundingRowV3, AddrSpendingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
@@ -3667,25 +3678,40 @@ mod tests {
         assert!(txids[0].to_string() < txids[1].to_string());
         seed_ordinal_block(&cache, 7, 70, &txids);
 
+        // The spends' funding side, in an earlier block.
+        let funder = make_outpoint(0x60, 0).txid;
+        seed_ordinal_block(&cache, 3, 30, &[funder]);
+
         // Positions 0 and 2 are flushed; position 1 is pending.
+        let row_pair = |i: usize| {
+            (
+                AddrFundingRowV3 {
+                    scripthash: sh,
+                    txseq: 70 + i as u64,
+                    vout: 0,
+                    amount_sat: 1,
+                },
+                AddrSpendingRowV3 {
+                    scripthash: sh,
+                    txseq: 70 + i as u64,
+                    vin: 0,
+                    funding_txseq: 30,
+                    funding_vout: i as u32,
+                },
+            )
+        };
         let mut flushed = StoreBatch::default();
         for i in [0usize, 2] {
-            flushed.addr_funding_puts.push(AddrFundingRowV3 {
-                scripthash: sh,
-                txseq: 70 + i as u64,
-                vout: 0,
-                amount_sat: 1,
-            });
+            let (f, s) = row_pair(i);
+            flushed.addr_funding_puts.push(f);
+            flushed.addr_spending_puts.push(s);
         }
         cache.write_batch(flushed).unwrap();
         cache.flush_durable().unwrap();
         let mut pending = StoreBatch::default();
-        pending.addr_funding_puts.push(AddrFundingRowV3 {
-            scripthash: sh,
-            txseq: 71,
-            vout: 0,
-            amount_sat: 1,
-        });
+        let (f, s) = row_pair(1);
+        pending.addr_funding_puts.push(f);
+        pending.addr_spending_puts.push(s);
         pending
             .coin_puts
             .push((make_outpoint(0x61, 0), a_coin(7)));
@@ -3693,14 +3719,23 @@ mod tests {
 
         let mut expected = txids.to_vec();
         expected.sort();
-        let got: Vec<bitcoin::Txid> = cache
+        let funding: Vec<bitcoin::Txid> = cache
             .iter_addr_funding(&sh)
             .into_iter()
             .map(|(k, _)| k.txid)
             .collect();
         assert_eq!(
-            got, expected,
+            funding, expected,
             "overlay funding rows must be in (height, txid, vout) order by Txid::cmp"
+        );
+        let spending: Vec<bitcoin::Txid> = cache
+            .iter_addr_spending(&sh)
+            .into_iter()
+            .map(|(k, _)| k.txid)
+            .collect();
+        assert_eq!(
+            spending, expected,
+            "overlay spending rows must be in (height, txid, vin) order by Txid::cmp"
         );
     }
 
@@ -3755,7 +3790,7 @@ mod tests {
 
     #[test]
     fn test_pending_addr_spending_remove_then_put_keeps_row() {
-        use crate::index::address::{AddrSpendingRow, scripthash_of};
+        use crate::index::address::{AddrSpendingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
@@ -3763,25 +3798,28 @@ mod tests {
             [0x66; 32],
         ));
         let prev = make_outpoint(0xdd, 1);
+        // Both ends of the row name a transaction by ordinal, so both
+        // need to exist or the read (correctly) drops the row.
+        seed_ordinal_block(&cache, 1, 1, &[txid]);
+        seed_ordinal_block(&cache, 9, 900, &[prev.txid]);
 
         let mut disconnect = StoreBatch::default();
         disconnect
             .addr_spending_removes
-            .push(crate::index::address::AddrSpendingKey {
+            .push(crate::index::address::AddrSpendingKeyV3 {
                 scripthash: sh,
-                height: 1,
-                txid,
+                txseq: 1,
                 vin: 0,
             });
         cache.write_batch(disconnect).unwrap();
 
         let mut reconnect = StoreBatch::default();
-        reconnect.addr_spending_puts.push(AddrSpendingRow {
+        reconnect.addr_spending_puts.push(AddrSpendingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid,
+            txseq: 1,
             vin: 0,
-            prev_outpoint: prev,
+            funding_txseq: 900,
+            funding_vout: prev.vout,
         });
         cache.write_batch(reconnect).unwrap();
 
@@ -3795,7 +3833,7 @@ mod tests {
 
     #[test]
     fn test_pending_addr_spending_put_then_remove_nets_to_empty() {
-        use crate::index::address::{AddrSpendingRow, scripthash_of};
+        use crate::index::address::{AddrSpendingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
@@ -3803,14 +3841,16 @@ mod tests {
             bitcoin::hashes::sha256d::Hash::from_byte_array([0x77; 32]),
         );
         let prev = make_outpoint(0xaa, 0);
+        seed_ordinal_block(&cache, 1, 1, &[spending_txid]);
+        seed_ordinal_block(&cache, 9, 900, &[prev.txid]);
 
         let mut connect = StoreBatch::default();
-        connect.addr_spending_puts.push(AddrSpendingRow {
+        connect.addr_spending_puts.push(AddrSpendingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid: spending_txid,
+            txseq: 1,
             vin: 0,
-            prev_outpoint: prev,
+            funding_txseq: 900,
+            funding_vout: 0,
         });
         cache.write_batch(connect).unwrap();
         assert_eq!(cache.iter_addr_spending(&sh).len(), 1);
@@ -3818,10 +3858,9 @@ mod tests {
         let mut disconnect = StoreBatch::default();
         disconnect
             .addr_spending_removes
-            .push(crate::index::address::AddrSpendingKey {
+            .push(crate::index::address::AddrSpendingKeyV3 {
                 scripthash: sh,
-                height: 1,
-                txid: spending_txid,
+                txseq: 1,
                 vin: 0,
             });
         cache.write_batch(disconnect).unwrap();
