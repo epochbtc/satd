@@ -77,6 +77,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getrawmempool", "Blockchain"),
     ("getreorghistory", "Blockchain"),
     ("getsilentpaymentblockdata", "Blockchain"),
+    ("getstoragefootprint", "Blockchain"),
     ("gettxout", "Blockchain"),
     ("gettxoutproof", "Blockchain"),
     ("gettxoutsetinfo", "Blockchain"),
@@ -918,6 +919,13 @@ pub async fn start(
 
     module.register_method("getblockcount", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_block_count(&ctx.chain_state))
+    })?;
+
+    module.register_method("getstoragefootprint", |_params, ctx, _extensions| {
+        // Per-CF disk accounting. Reads RocksDB properties and LSM
+        // metadata only — no iteration, so it is safe on a live node
+        // under IBD, unlike `getblockfileaudit`.
+        Ok::<_, ErrorObjectOwned>(blockchain::get_storage_footprint(&ctx.chain_state))
     })?;
 
     module.register_method("getblockhash", |params, ctx, _extensions| {

@@ -17,6 +17,7 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- `getstoragefootprint` and `sat-cli debug storage-footprint` report per-column-family SST bytes, live key estimates, bytes per key and pending compaction, so operators can see where a chainstate's disk goes without an offline `ldb` dump against a stopped node. The `chain_tx` column family was missing from the existing per-CF diagnostics and is now reported.
 - `getmempoolsummary [top_n]`, a bounded aggregate view of the mempool: a vsize histogram over every transaction plus the `top_n` by ancestor feerate. Replaces `getrawmempool verbose` for callers that only render an aggregate — on a mainnet-sized mempool that reply is ~85 MiB and ~4 s of node CPU, against ~9 KB here.
 - `-prune=1` is Bitcoin Core's spelling for *manual* pruning, and satd now implements it: prune mode with no budget, where the new `pruneblockchain` RPC is the only thing that ever deletes. `getblockchaininfo` reports such a node as pruned with `automatic_pruning: false` and no `prune_target_size`. satd refused the flag at startup before.
 - `-fastprune`, Core's 64 KiB block-file size. Pruning deletes whole files, so a short test chain never crossed the 128 MiB boundary and a prune could delete nothing.

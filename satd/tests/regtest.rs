@@ -5125,6 +5125,121 @@ fn test_rpc_default_units_sats_emits_integers() {
 }
 
 #[test]
+fn test_getstoragefootprint_shape_and_cli() {
+    // `getstoragefootprint` is the measurement instrument for chainstate
+    // disk accounting: per-CF SST bytes, a live-key estimate, and the
+    // bytes still owed to compaction. Two things are pinned here — that
+    // every column family the binary creates is reported (a missing
+    // family under-reports the chainstate silently), and that the CLI
+    // passthrough returns the same object as the RPC.
+    let mut node = TestNode::start(&["--txindex=1", "--addressindex=1"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let response = node.rpc_call("getstoragefootprint").unwrap();
+    let result = &response["result"];
+    let cfs = result["column_families"]
+        .as_array()
+        .expect("column_families must be an array");
+    assert!(!cfs.is_empty(), "a live node reports at least one family");
+
+    for cf in cfs {
+        assert!(cf["name"].is_string(), "each row names its family: {cf:?}");
+        assert!(cf["sst_bytes"].is_u64(), "sst_bytes numeric: {cf:?}");
+        assert!(
+            cf["estimated_keys"].is_u64(),
+            "estimated_keys numeric: {cf:?}"
+        );
+        assert!(
+            cf["pending_compaction_bytes"].is_u64(),
+            "pending_compaction_bytes numeric: {cf:?}"
+        );
+    }
+
+    let names: Vec<&str> = cfs.iter().filter_map(|c| c["name"].as_str()).collect();
+    // The families the manual's footprint table documents. `chain_tx` is
+    // the one that was missing from the diagnostics before this landed.
+    for expected in [
+        "coins",
+        "block_index",
+        "height_index",
+        "undo",
+        "tx_index",
+        "metadata",
+        "chain_tx",
+        "addr_funding_v2",
+        "addr_spending_v2",
+        "outpoint_spend",
+        "sp_tweaks",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "column family {expected} missing from getstoragefootprint: {names:?}"
+        );
+    }
+
+    assert!(
+        result["total_sst_bytes"].is_u64(),
+        "total_sst_bytes must be present"
+    );
+    assert!(result["total_estimated_keys"].is_u64());
+    assert!(result["total_pending_compaction_bytes"].is_u64());
+
+    // CLI passthrough returns the same object.
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let sat_cli_bin = std::path::Path::new(satd_bin)
+        .parent()
+        .unwrap()
+        .join("sat-cli");
+    let out = Command::new(&sat_cli_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", node.datadir.display()))
+        .arg(format!("--rpcport={}", node.rpcport))
+        .arg("--output=json")
+        .args(["debug", "storage-footprint"])
+        .output()
+        .expect("Failed to run sat-cli");
+    assert!(
+        out.status.success(),
+        "sat-cli debug storage-footprint should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let cli: serde_json::Value =
+        serde_json::from_str(String::from_utf8(out.stdout).unwrap().trim()).expect("JSON output");
+    let cli_names: Vec<&str> = cli["column_families"]
+        .as_array()
+        .expect("CLI must return the same shape")
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(
+        names, cli_names,
+        "the CLI must pass the RPC object through unchanged"
+    );
+
+    // Pretty mode renders a table, not JSON.
+    let pretty = Command::new(&sat_cli_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", node.datadir.display()))
+        .arg(format!("--rpcport={}", node.rpcport))
+        .args(["debug", "storage-footprint"])
+        .output()
+        .expect("Failed to run sat-cli");
+    assert!(pretty.status.success());
+    let table = String::from_utf8(pretty.stdout).unwrap();
+    assert!(
+        table.contains("column_family") && table.contains("total:"),
+        "pretty mode should render a table, got: {table}"
+    );
+
+    node.stop();
+}
+
+#[test]
 fn test_sat_cli_subcommands_chain() {
     // Structured subcommand `sat-cli chain info` should translate to
     // getblockchaininfo. `sat-cli chain height` should emit the raw height.

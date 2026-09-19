@@ -47,6 +47,23 @@ node does not run `blockfilterindex`.
 > Measure the per-CF footprint after the node has idled and background
 > compaction has drained; see [Compaction](#compaction).
 
+To take the same measurement on your own node, ask it:
+
+```
+sat-cli debug storage-footprint
+```
+
+It reports, per column family, the on-disk SST bytes, an estimate of the live
+key count, their quotient (the effective post-compression cost of one row), and
+the bytes RocksDB still owes to compaction. The RPC behind it is
+`getstoragefootprint`; it reads RocksDB properties and LSM metadata only, with
+no iteration, so it is safe on a live node under IBD — unlike
+`getblockfileaudit`. Column families the running binary did not create — the
+filter indexes on a node without `-blockfilterindex`, the backfill temp CF on a
+node that never backfilled — are absent from the list rather than reported as
+zero. Take the measurement after compaction has drained; see
+[Compaction](#compaction).
+
 ## Why it is larger than `bitcoind + electrs + esplora`
 
 Three structural reasons.
@@ -318,3 +335,6 @@ compaction to reclaim the reindex-era L0 and overlap debt: a moderate drop, not
 a collapse, because most of the footprint is index data. satd logs a per-CF
 pending-compaction-bytes diagnostic every `compaction_diag_interval_secs`
 (default 60 s). Let those settle toward zero before taking a size measurement.
+`sat-cli debug storage-footprint` reports the same number per family as
+`pending_MB`, so you can check whether the backlog has drained without waiting
+for the next diagnostic line.

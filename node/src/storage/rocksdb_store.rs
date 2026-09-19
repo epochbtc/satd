@@ -90,6 +90,33 @@ const ALL_CFS: &[&str] = &[
     CF_SP_TWEAKS,
 ];
 
+/// Every column family the per-CF diagnostics report on, in
+/// largest-by-observed-load order so the most operationally relevant
+/// entries survive a truncated log line. This is the single source for
+/// `query_cf_property`, `sst_bytes_by_cf` and `estimated_keys_by_cf`;
+/// keeping one list means a new CF cannot be added to some diagnostics
+/// and missed by others, which is how `chain_tx` went unreported for
+/// three releases. `diag_cf_list_names_every_descriptor` asserts this
+/// list and `ALL_CFS` name the same families.
+const DIAG_CFS: &[&str] = &[
+    CF_ADDR_SPENDING_V2,
+    CF_ADDR_FUNDING_V2,
+    CF_OUTPOINT_SPEND,
+    CF_UNDO,
+    CF_COINS,
+    CF_TX_INDEX,
+    CF_BLOCK_INDEX,
+    CF_HEIGHT_INDEX,
+    CF_CHAIN_TX,
+    CF_METADATA,
+    #[cfg(feature = "block-filter-index")]
+    CF_FILTER,
+    #[cfg(feature = "block-filter-index")]
+    CF_FILTER_HEADER,
+    CF_ADDR_BACKFILL_TEMP,
+    CF_SP_TWEAKS,
+];
+
 const TIP_KEY: &[u8] = b"tip";
 const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
 const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
@@ -1214,24 +1241,7 @@ impl RocksDbStore {
     /// entries appear even when the log line is truncated by
     /// downstream tooling.
     fn query_cf_property(&self, property: &str) -> Vec<(&'static str, u64)> {
-        let names: &[&'static str] = &[
-            CF_ADDR_SPENDING_V2,
-            CF_ADDR_FUNDING_V2,
-            CF_OUTPOINT_SPEND,
-            CF_UNDO,
-            CF_COINS,
-            CF_TX_INDEX,
-            CF_BLOCK_INDEX,
-            CF_HEIGHT_INDEX,
-            CF_METADATA,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER_HEADER,
-            CF_ADDR_BACKFILL_TEMP,
-            CF_SP_TWEAKS,
-        ];
-        names
+        DIAG_CFS
             .iter()
             .filter_map(|name| {
                 let cf = self.db.cf_handle(name)?;
@@ -1942,24 +1952,7 @@ impl Store for RocksDbStore {
         // `per_cf=`. The metadata API is the documented, non-stringly-
         // typed accessor for the same number and does not depend on
         // the rocksdb property registry recognising the name.
-        let names: &[&'static str] = &[
-            CF_ADDR_SPENDING_V2,
-            CF_ADDR_FUNDING_V2,
-            CF_OUTPOINT_SPEND,
-            CF_UNDO,
-            CF_COINS,
-            CF_TX_INDEX,
-            CF_BLOCK_INDEX,
-            CF_HEIGHT_INDEX,
-            CF_METADATA,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER,
-            #[cfg(feature = "block-filter-index")]
-            CF_FILTER_HEADER,
-            CF_ADDR_BACKFILL_TEMP,
-            CF_SP_TWEAKS,
-        ];
-        names
+        DIAG_CFS
             .iter()
             .filter_map(|name| {
                 let cf = self.db.cf_handle(name)?;
@@ -1967,6 +1960,14 @@ impl Store for RocksDbStore {
                 Some((*name, meta.size))
             })
             .collect()
+    }
+
+    fn estimated_keys_by_cf(&self) -> Vec<(&'static str, u64)> {
+        // `rocksdb.estimate-num-keys` is exact while the data is still in
+        // the memtable and approximate once compaction has merged
+        // overwrites and tombstones. That is precise enough to multiply by
+        // a known row width and see where a chainstate's disk went.
+        self.query_cf_property("rocksdb.estimate-num-keys")
     }
 
     fn compact_chainstate(&self) -> Result<(), StoreError> {
@@ -2952,6 +2953,79 @@ mod tests {
     /// pins the puts-before-removes application order — the pre-fix
     /// removes-first order resurrected the spent coin. Counters must
     /// reflect the net state: the pair contributes nothing.
+    /// The diagnostics must cover every family the binary can create.
+    /// `chain_tx` was missing from both hand-maintained lists for three
+    /// releases, so `getstoragefootprint` would have under-reported the
+    /// chainstate by a whole family with no sign anything was absent.
+    /// `ALL_CFS` is the sanctioned proxy for "descriptor created": the
+    /// `debug_assert!` in `open()` already enforces descriptor ⊆
+    /// `ALL_CFS`, so equality with `DIAG_CFS` closes the loop.
+    #[test]
+    fn diag_cf_list_names_every_descriptor() {
+        let mut all: Vec<&str> = ALL_CFS.iter().copied().filter(|n| *n != "default").collect();
+        let mut diag: Vec<&str> = DIAG_CFS.to_vec();
+        all.sort_unstable();
+        diag.sort_unstable();
+        assert_eq!(
+            all, diag,
+            "DIAG_CFS and ALL_CFS must name the same column families; \
+             a family in ALL_CFS but not DIAG_CFS is invisible to \
+             getstoragefootprint and the startup diagnostics"
+        );
+    }
+
+    /// `estimated_keys_by_cf` must report the rows actually written.
+    /// RocksDB's `estimate-num-keys` is exact while the data is still
+    /// memtable-resident, which is the case for a freshly written temp
+    /// store, so this is a tight assertion rather than an order-of-
+    /// magnitude one.
+    #[test]
+    fn estimated_keys_by_cf_counts_written_rows() {
+        let (store, _dir) = temp_store(false);
+
+        let mut batch = StoreBatch::default();
+        for i in 0..1_000u32 {
+            let op = OutPoint {
+                txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [(i % 251) as u8; 32],
+                )),
+                vout: i,
+            };
+            batch.coin_puts.push((op, make_coin(1_000 + i as u64, 1)));
+        }
+        let (genesis_hash, genesis_entry) = regtest_genesis_entry();
+        for i in 0..10u8 {
+            let mut entry = genesis_entry.clone();
+            entry.height = i as u32;
+            batch
+                .block_index_puts
+                .push((if i == 0 { genesis_hash } else { make_block_hash(i) }, entry));
+        }
+        store.write_batch(batch).unwrap();
+
+        let counts: std::collections::HashMap<&str, u64> =
+            store.estimated_keys_by_cf().into_iter().collect();
+        let coins = *counts
+            .get(CF_COINS)
+            .expect("coins must appear in the key estimate");
+        let blocks = *counts
+            .get(CF_BLOCK_INDEX)
+            .expect("block_index must appear in the key estimate");
+        assert!(
+            coins.abs_diff(1_000) <= 100,
+            "coins key estimate {coins} should be within 10% of 1000"
+        );
+        assert!(
+            blocks.abs_diff(10) <= 1,
+            "block_index key estimate {blocks} should be within 10% of 10"
+        );
+        assert!(
+            counts.contains_key(CF_CHAIN_TX),
+            "chain_tx must be reported even when empty — an absent family \
+             and an empty one are different findings"
+        );
+    }
+
     #[test]
     fn write_batch_remove_wins_for_put_remove_pairs() {
         let (store, _dir) = temp_store(false);
