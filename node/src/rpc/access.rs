@@ -120,6 +120,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getrpcinfo"
         | "getserverstatus"
         | "getsilentpaymentblockdata"
+        // RocksDB property reads only; no scans, cheap enough for a
+        // consumer listener under IBD
+        | "getstoragefootprint"
         | "getstratuminfo"
         | "getsysteminfo"
         | "gettxout"

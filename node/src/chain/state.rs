@@ -1875,6 +1875,13 @@ impl ChainState {
         self.store.sst_bytes_by_cf()
     }
 
+    /// Per-column-family estimated live key count. Third leg of the
+    /// footprint diagnostics: divided into `sst_bytes_by_cf` it gives
+    /// the effective post-compression bytes per row for each family.
+    pub fn estimated_keys_by_cf(&self) -> Vec<(&'static str, u64)> {
+        self.store.estimated_keys_by_cf()
+    }
+
     /// Force a synchronous full-range compaction of the chainstate column
     /// family. Drains the dirty overlay first so the compaction includes
     /// pending writes. Long-running: returns only when RocksDB completes

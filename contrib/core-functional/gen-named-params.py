@@ -291,6 +291,7 @@ SATD_ONLY = {
     # satd-native index view; `getindexinfo` is the Core-compatible surface.
     "getsatdindexinfo": [],
     "getserverstatus": [],
+    "getstoragefootprint": [],
     "getstratuminfo": [],
     "getsysteminfo": [],
     "getwarnings": [],
