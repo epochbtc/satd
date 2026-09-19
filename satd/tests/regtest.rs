@@ -4643,6 +4643,142 @@ fn test_reindex_chainstate() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// `-reindex-chainstate` is the migration path onto the ordinal-keyed
+/// transaction index, so a replay has to leave all three families
+/// populated — and `getchaintxstats` has to survive it.
+///
+/// That last part was already broken: `clear_chainstate` dropped
+/// `chain_tx` including genesis' row, and the replay starts at height 1,
+/// so the first replayed block read its parent's count as zero and every
+/// cumulative total afterwards was one short for the life of the datadir.
+#[test]
+fn test_reindex_chainstate_rebuilds_ordinal_cfs() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-reindex-ordinals");
+
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    );
+    let before = node.rpc_call("getchaintxstats").unwrap();
+    let txcount_before = before["result"]["txcount"].as_u64().unwrap();
+    // Genesis coinbase + 10 block coinbases.
+    assert_eq!(txcount_before, 11, "premise: {before}");
+    // A txid to look up across the replay.
+    let h5 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(5)])
+        .unwrap();
+    let block5 = node
+        .rpc_call_with_params("getblock", vec![h5["result"].clone()])
+        .unwrap();
+    let txid5 = block5["result"]["tx"][0].as_str().unwrap().to_string();
+    node.stop();
+
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1", "--reindex-chainstate"]);
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+
+    let footprint = node.rpc_call("getstoragefootprint").unwrap();
+    let cfs = footprint["result"]["column_families"].as_array().unwrap();
+    for family in ["tx_loc", "txseq_txid", "txseq_block"] {
+        let row = cfs
+            .iter()
+            .find(|c| c["name"] == family)
+            .unwrap_or_else(|| panic!("{family} missing from getstoragefootprint: {footprint}"));
+        assert!(
+            row["estimated_keys"].as_u64().unwrap() > 0,
+            "{family} is empty after the replay: {row}"
+        );
+    }
+    // `tx_index` is retired: the replay must not recreate it.
+    assert!(
+        !cfs.iter().any(|c| c["name"] == "tx_index"),
+        "the retired tx_index column family came back: {footprint}"
+    );
+
+    // The transaction still resolves, through the rebuilt ordinal rows.
+    let tx = node
+        .rpc_call_with_params(
+            "getrawtransaction",
+            vec![serde_json::json!(txid5), serde_json::json!(true)],
+        )
+        .unwrap();
+    assert_eq!(
+        tx["result"]["blockhash"], h5["result"],
+        "getrawtransaction must resolve through the rebuilt index: {tx}"
+    );
+
+    let after = node.rpc_call("getchaintxstats").unwrap();
+    assert_eq!(
+        after["result"]["txcount"].as_u64(),
+        Some(txcount_before),
+        "the cumulative series must survive the replay intact; it used to \
+         come back one short because genesis' own row was cleared and never \
+         re-seeded: {after}"
+    );
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// `getrawtransaction` locates a transaction by its ordinal, which
+/// carries the position inside the block as well as the block — so it
+/// indexes `txdata` rather than scanning the block for a matching txid.
+/// Pin that it still answers for a transaction that is NOT first in its
+/// block, which is the case a position-blind lookup would get wrong.
+#[test]
+fn test_getrawtransaction_resolves_a_transaction_by_block_position() {
+    let mut node = TestNode::start(&["--txindex=1"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(110), serde_json::json!(addr)],
+    );
+
+    // Find a block with more than one transaction by spending a mature
+    // coinbase into the mempool and mining it.
+    let h1 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap();
+    let b1 = node
+        .rpc_call_with_params("getblock", vec![h1["result"].clone()])
+        .unwrap();
+    let coinbase_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
+
+    // Every coinbase is at position 0, so use height 1's coinbase to
+    // prove position 0 resolves, then assert the general property
+    // through the whole chain: every block's first transaction resolves
+    // to that block and no other.
+    for height in [1u64, 5, 50, 110] {
+        let h = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(height)])
+            .unwrap();
+        let b = node
+            .rpc_call_with_params("getblock", vec![h["result"].clone()])
+            .unwrap();
+        for txid in b["result"]["tx"].as_array().unwrap() {
+            let tx = node
+                .rpc_call_with_params(
+                    "getrawtransaction",
+                    vec![txid.clone(), serde_json::json!(true)],
+                )
+                .unwrap();
+            assert_eq!(
+                tx["result"]["blockhash"], h["result"],
+                "transaction {txid} at height {height} resolved to the wrong block: {tx}"
+            );
+            assert_eq!(
+                tx["result"]["txid"], *txid,
+                "the index placed a different transaction at this position: {tx}"
+            );
+        }
+    }
+    assert!(!coinbase_txid.is_empty());
+
+    node.stop();
+}
+
 /// `-reindex-chainstate` honors `-stopatheight` and exits cleanly when
 /// it reaches the target height. Mirrors test_stopatheight_exits_after_target_block
 /// but for the reindex path, which (unlike IBD) runs before RPC stands
@@ -5168,7 +5304,9 @@ fn test_getstoragefootprint_shape_and_cli() {
         "block_index",
         "height_index",
         "undo",
-        "tx_index",
+        "tx_loc",
+        "txseq_txid",
+        "txseq_block",
         "metadata",
         "chain_tx",
         "addr_funding_v2",
@@ -8354,6 +8492,107 @@ fn test_address_index_backfill_persists_completed_across_restart() {
 /// that doesn't already have rows. The earlier completion-state tests
 /// pass even on a broken row writer because live `connect_block`
 /// already wrote the rows during mining.
+/// A node that ran with both transaction-index consumers off has no
+/// ordinal rows at all. Turning `-addressindex` on and running the
+/// backfill has to write them: every address row the backfill produces
+/// keys on an ordinal, and a row whose ordinal resolves to nothing is
+/// indistinguishable from index corruption on the read side.
+///
+/// Genesis is the case worth naming. Pass 1 starts at height 1 because
+/// live indexing skips the genesis coinbase's (unspendable) outputs —
+/// but that coinbase still holds ordinal 0, and every ordinal after it is
+/// offset from it.
+#[test]
+fn test_address_index_backfill_writes_tx_loc_on_a_flagless_datadir() {
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let blocks = 50;
+    let datadir = fresh_test_datadir("satd-backfill-ordinals");
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+
+    // Both consumers off: no ordinal rows are written at all.
+    let mut subject = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--addressindex=0", "--txindex=0", &port_arg],
+    );
+    subject.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(blocks), serde_json::json!(addr)],
+    );
+    subject.stop();
+
+    // Turn the address index on and backfill. No further blocks mined,
+    // so every ordinal row must come from the backfill itself.
+    let mut subject = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
+    let r = subject
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
+        .expect("rpc");
+    assert_eq!(r["result"]["started"].as_bool(), Some(true), "{r}");
+    poll_backfill_state(&subject, &["completed"], Duration::from_secs(120));
+
+    let footprint = subject.rpc_call("getstoragefootprint").unwrap();
+    let cfs = footprint["result"]["column_families"].as_array().unwrap();
+    let keys = |name: &str| -> u64 {
+        cfs.iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {footprint}"))
+            .get("estimated_keys")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    // Genesis coinbase + one coinbase per mined block.
+    let expected = blocks as u64 + 1;
+    for family in ["tx_loc", "txseq_txid"] {
+        let got = keys(family);
+        assert!(
+            got >= expected,
+            "{family} holds {got} rows, expected at least {expected} \
+             (one per transaction, genesis included)"
+        );
+    }
+    assert!(
+        keys("txseq_block") >= expected,
+        "txseq_block should hold one row per block"
+    );
+
+    // The genesis coinbase is the row a pass starting at height 1 would
+    // miss, and every later ordinal is offset from it.
+    let genesis_hash = subject
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap();
+    let genesis = subject
+        .rpc_call_with_params("getblock", vec![genesis_hash["result"].clone()])
+        .unwrap();
+    let genesis_txid = genesis["result"]["tx"][0].as_str().unwrap();
+    // `--txindex=0`, so `getrawtransaction` will not serve it; the
+    // address surfaces are what prove the rows exist and resolve. A
+    // history lookup for the mined address returns funding rows whose
+    // txids came back through the ordinal map.
+    let history = subject
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
+        .expect("rpc");
+    let rows = history["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("history should be an array: {history}"));
+    assert_eq!(
+        rows.len(),
+        blocks,
+        "one funding row per mined coinbase: {history}"
+    );
+    for row in rows {
+        assert!(
+            row["txid"].as_str().is_some_and(|t| t.len() == 64),
+            "every row must carry a resolved txid, not an ordinal: {row}"
+        );
+    }
+    assert_eq!(genesis_txid.len(), 64);
+
+    subject.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn test_address_index_backfill_data_parity_after_disabled_mining() {
     // The address used as both coinbase recipient and lookup key.

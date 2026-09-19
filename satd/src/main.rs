@@ -81,6 +81,23 @@ impl Drop for ApiRuntimeGuard {
 /// chainstate never fully connected. Split out because it is needed twice:
 /// once before the reindex replay and once after it, so a replay that
 /// rebuilds a hole is caught in the same run rather than on the next start.
+/// Whether to refuse startup because the cumulative transaction-count
+/// series is incomplete.
+///
+/// The counts stopped being a `getchaintxstats` nicety in chainstate
+/// schema 4: they are the series every index row's ordinal is offset
+/// from, and `connect_block` fails closed rather than guess a base.
+///
+/// The asymmetry is deliberate. A validating-only node keeps the
+/// long-standing warn-and-continue — a gap there costs it one wrong RPC
+/// field. A node that will *write* index rows must not start, because the
+/// rows it writes are indistinguishable from correct ones and nothing
+/// downstream could tell that a lookup answered from the wrong
+/// transaction.
+fn index_refuses_incomplete_chain_tx(complete: bool, txindex: bool, addressindex: bool) -> bool {
+    !complete && (txindex || addressindex)
+}
+
 fn report_ancestry_damage(
     audit: &node::chain::tip_ancestry::TipAncestryAudit,
     prune_mb: u64,
@@ -1066,6 +1083,29 @@ async fn main() {
         Err(e) => {
             tracing::warn!(error = %e, "Cumulative tx-count backfill failed; continuing startup");
         }
+    }
+
+    // The cumulative counts stopped being a `getchaintxstats` nicety in
+    // schema 4: they are the series every index row's key is numbered
+    // from. A validating-only node still treats a gap as cosmetic and
+    // keeps the warn-and-continue above, but a node that will write index
+    // rows must not start on a chainstate whose numbering has holes — the
+    // rows it wrote would be indistinguishable from correct ones, and
+    // nothing downstream could tell that a lookup answered from the wrong
+    // transaction.
+    if index_refuses_incomplete_chain_tx(
+        chain_state.store_ref().chain_tx_backfill_complete(),
+        config.txindex,
+        config.addressindex,
+    ) {
+        tracing::error!(
+            "Cumulative transaction counts are incomplete on this datadir and the \
+             transaction/address indexes key on them. Run with --reindex-chainstate \
+             to rebuild, or start with --txindex=0 --addressindex=0 to run as a \
+             validating-only node."
+        );
+        auth.cleanup();
+        std::process::exit(EXIT_CHAINSTATE_DAMAGED);
     }
 
     // Reloadable reorg-webhook target, shared with the dispatcher. Stays `None`
@@ -4685,3 +4725,35 @@ async fn persist_sp_failed_with_cleanup(
     }
 }
 
+
+#[cfg(test)]
+mod startup_tests {
+    use super::index_refuses_incomplete_chain_tx;
+
+    /// The guard is one boolean expression, and getting it backwards in
+    /// either direction is silent: too strict and a validating-only node
+    /// refuses to start over a cosmetic gap, too lax and an indexing node
+    /// writes rows keyed on a numbering with holes in it.
+    #[test]
+    fn incomplete_chain_tx_refuses_only_when_an_index_will_write_rows() {
+        // Complete series: every configuration starts.
+        for (txindex, addressindex) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert!(
+                !index_refuses_incomplete_chain_tx(true, txindex, addressindex),
+                "a complete series must never refuse (txindex={txindex} addressindex={addressindex})"
+            );
+        }
+
+        // Incomplete series: a validating-only node still starts.
+        assert!(
+            !index_refuses_incomplete_chain_tx(false, false, false),
+            "a validating-only node keeps warn-and-continue: a gap costs it \
+             one wrong getchaintxstats field, not a mis-keyed index"
+        );
+        // Either index is enough to refuse — both write the ordinal rows.
+        assert!(index_refuses_incomplete_chain_tx(false, true, false));
+        assert!(index_refuses_incomplete_chain_tx(false, false, true));
+        assert!(index_refuses_incomplete_chain_tx(false, true, true));
+    }
+}

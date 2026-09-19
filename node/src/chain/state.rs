@@ -1394,6 +1394,35 @@ impl ChainState {
         Ok(())
     }
 
+    /// Re-seed the chainstate rows that describe genesis itself.
+    ///
+    /// `clear_chainstate` drops `chain_tx` and the transaction-ordinal
+    /// families along with the coins, and every path that clears then
+    /// resumes from the genesis tip — `-reindex-chainstate`, a rolled-back
+    /// snapshot load — leaves nothing behind describing genesis. The next
+    /// block connected reads its parent's cumulative transaction count and
+    /// finds no row.
+    ///
+    /// That was already wrong before schema 4: the missing count read as
+    /// zero, so `getchaintxstats` was one short for the life of the datadir.
+    /// Now it is fatal, because the count is the base every index row's
+    /// ordinal is offset from and `connect_block` fails closed rather than
+    /// guess. Genesis' coinbase output is never in the UTXO set, so there is
+    /// no coin to restore; the transaction still holds ordinal 0 and the
+    /// series counts it.
+    fn seed_genesis_chain_rows(&self) -> Result<(), ChainError> {
+        let genesis = bitcoin::constants::genesis_block(self.network);
+        let genesis_txid = genesis.txdata[0].compute_txid();
+        let mut seed = crate::storage::StoreBatch::default();
+        seed.chain_tx_puts
+            .push((genesis.block_hash(), genesis.txdata.len() as u64));
+        seed.tx_loc_puts.push((genesis_txid, 0));
+        seed.txseq_txid_puts.push((0, genesis_txid));
+        seed.txseq_block_puts.push((0, 0));
+        self.store.write_batch(seed)?;
+        Ok(())
+    }
+
     /// Undo a partial snapshot activation: detach + remove the background
     /// chainstate, clear any loaded coins, and reset the tip to genesis.
     /// Best-effort (used on an error path) — failures are logged, not
@@ -1410,6 +1439,9 @@ impl ChainState {
         }
         if let Err(e) = self.store.clear_chainstate() {
             tracing::error!(error = %e, "snapshot rollback: clear_chainstate failed");
+        }
+        if let Err(e) = self.seed_genesis_chain_rows() {
+            tracing::error!(error = %e, "snapshot rollback: genesis re-seed failed");
         }
         let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
         let reset = crate::storage::StoreBatch {
@@ -4166,6 +4198,50 @@ impl ChainState {
         self.store.get_tx_location(txid)
     }
 
+    /// Locate a transaction as `(block hash, index within the block)`.
+    ///
+    /// The ordinal carries the position, so a caller that wants the
+    /// transaction itself can index `block.txdata` instead of reading the
+    /// block and comparing every txid in it — a linear scan that cost up
+    /// to several thousand `compute_txid()` calls per
+    /// `getrawtransaction` on a full block.
+    ///
+    /// Ungated by `-txindex`, unlike `get_tx_location`: the rows exist
+    /// whenever either transaction-index consumer is on.
+    pub fn locate_tx(&self, txid: &bitcoin::Txid) -> Option<(BlockHash, usize)> {
+        let seq = self.store.get_tx_seq(txid)?;
+        let (first_txseq, height) = self.store.block_of_seq(seq)?;
+        let hash = self.store.get_block_hash_by_height(height)?;
+        Some((hash, (seq - first_txseq) as usize))
+    }
+
+    /// Raise the standing "block data is unusable" warning for a block
+    /// whose contents disagree with an index that points into it.
+    ///
+    /// Shares the warning shape and the `getblockfrompeer` remedy with
+    /// the flat-file read path, because the operator's repair is the
+    /// same: re-fetch the block.
+    pub fn report_index_block_mismatch(&self, hash: &BlockHash, detail: &str) {
+        let height = self.store.get_block_index(hash).map(|e| e.height);
+        tracing::error!(
+            block = %hash,
+            height,
+            detail,
+            "Block contents disagree with the transaction index (local corruption). \
+             Repair it with: getblockfrompeer <blockhash> <peerid>"
+        );
+        self.warnings.record(
+            &format!("blockdata.corrupt.{hash}"),
+            crate::warnings::Severity::Error,
+            format!("Block {hash} disagrees with the transaction index ({detail}); repair with getblockfrompeer"),
+            serde_json::json!({
+                "block": hash.to_string(),
+                "height": height,
+                "detail": detail,
+            }),
+        );
+    }
+
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
         let entry = self.store.get_block_index(hash)?;
         // HeaderOnly/Pruned entries never carry local block data. An `Invalid`
@@ -4992,6 +5068,15 @@ impl ChainState {
             p.set_total(plan.tip_height() as u64);
             p.set_stop_height(stop_at.map(|h| h as u64));
         }
+
+        // Re-seed genesis' own chainstate rows: the replay starts at
+        // height 1 because genesis is already the tip, and
+        // `clear_chainstate` left nothing describing genesis itself.
+        //
+        // Genesis' coinbase output is never in the UTXO set, so there is
+        // no coin to restore; the transaction still holds ordinal 0 and
+        // the series counts it.
+        self.seed_genesis_chain_rows()?;
 
         // Pipeline the replay like the IBD connect loop. A plain serial
         // read->connect->write loop leaves both CPU and disk idle between
@@ -7312,16 +7397,36 @@ impl ChainState {
                 .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
 
             let prev_hash = entry.header.prev_blockhash;
-            let batch = disconnect::disconnect_block(
-                &block,
-                &undo,
-                entry.height,
-                prev_hash,
-                &self.address_index,
-                #[cfg(feature = "block-filter-index")]
-                &self.filter_index,
-                &self.sp_index,
-            )?;
+            // The ordinal this block's first transaction took. `chain_tx`
+            // is hash-keyed, so the parent's row is unaffected by the
+            // reorg in flight and is still the right answer. A missing
+            // row is local damage: fail the reorg rather than remove the
+            // wrong ordinal rows, which would strand index entries
+            // pointing at transactions the chain no longer contains.
+            let first_txseq = if entry.height == 0 {
+                0
+            } else {
+                self.store
+                    .get_cumulative_tx_count(&prev_hash)
+                    .ok_or_else(|| {
+                        ChainError::FlatFile(format!(
+                            "chain_tx row missing for reorg at height {} (parent {}); \
+                             run with --reindex-chainstate",
+                            entry.height, prev_hash
+                        ))
+                    })?
+            };
+            let batch = disconnect::disconnect_block(&disconnect::DisconnectParams {
+            block: &block,
+            undo: &undo,
+            block_height: entry.height,
+            prev_hash,
+            first_txseq,
+            address_index: &self.address_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &self.filter_index,
+            sp_index: &self.sp_index,
+        })?;
             combined_batch.merge(batch);
 
             // Capture non-coinbase txs for mempool re-add, in block
@@ -15396,7 +15501,7 @@ pub(crate) mod tests {
 
         let victim = blocks[1].txdata[0].compute_txid();
         let mut batch = crate::storage::StoreBatch::default();
-        batch.tx_index_removes.push(victim);
+        batch.tx_loc_removes.push(victim);
         cs.store.write_batch(batch).unwrap();
         flush_and_drop_caches(&cs);
 
@@ -15437,7 +15542,7 @@ pub(crate) mod tests {
         // Take a row away, exactly as the fault-direction test does.
         let victim = blocks[1].txdata[0].compute_txid();
         let mut batch = crate::storage::StoreBatch::default();
-        batch.tx_index_removes.push(victim);
+        batch.tx_loc_removes.push(victim);
         cs.store.write_batch(batch).unwrap();
         flush_and_drop_caches(&cs);
 

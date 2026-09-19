@@ -34,7 +34,7 @@ enum DirtyEntry {
 /// - **Dirty map**: unbounded HashMap, flushed periodically to backing store.
 /// - **Clean LRU**: bounded LruCache, auto-evicts coldest entries.
 ///
-/// All overlay caches (block_index, height_hash, undo, tx_index) are
+/// All overlay caches (block_index, height_hash, undo, tx_loc) are
 /// bounded LRU caches to prevent unbounded memory growth.
 pub struct CoinCache {
     /// Byte budget the clean-coin LRU's entry cap was derived from, behind
@@ -77,7 +77,11 @@ pub struct CoinCache {
     pub perf_store_misses: AtomicU64,
     height_hash_cache: Mutex<LruCache<u32, BlockHash>>,
     undo_cache: Mutex<LruCache<BlockHash, UndoData>>,
-    tx_index_cache: Mutex<LruCache<Txid, BlockHash>>,
+    /// `txid -> ordinal` read-through cache. Keyed the same way the old
+    /// `txid -> block_hash` cache was; the block is composed from the
+    /// ordinal through the inner store's `txseq_block`, which is one
+    /// small ungated family and already hot.
+    tx_loc_cache: Mutex<LruCache<Txid, u64>>,
     /// Read-through cache for cumulative tx counts written by the current
     /// connect run but not yet flushed to the inner store, so
     /// `getchaintxstats` sees the tip's count immediately after a block
@@ -246,7 +250,7 @@ impl CoinCache {
             block_index_cache: Mutex::new(lru(block_index_cap.max(1))),
             height_hash_cache: Mutex::new(lru(height_hash_cap)),
             undo_cache: Mutex::new(lru(undo_cap)),
-            tx_index_cache: Mutex::new(lru(tx_index_cap.max(1))),
+            tx_loc_cache: Mutex::new(lru(tx_index_cap.max(1))),
             chain_tx_cache: Mutex::new(lru(chain_tx_cap)),
             flush_threshold: AtomicU32::new(flush_threshold),
             perf_dirty_hits: AtomicU64::new(0),
@@ -336,7 +340,7 @@ impl CoinCache {
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
-        self.tx_index_cache.lock().clear();
+        self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
     }
 
@@ -498,8 +502,12 @@ impl CoinCache {
             // accident of that emitter rather than a guarantee.
             || !batch.height_hash_removes.is_empty()
             || !batch.undo_puts.is_empty()
-            || !batch.tx_index_puts.is_empty()
-            || !batch.tx_index_removes.is_empty()
+            || !batch.tx_loc_puts.is_empty()
+            || !batch.tx_loc_removes.is_empty()
+            || !batch.txseq_txid_puts.is_empty()
+            || !batch.txseq_txid_removes.is_empty()
+            || !batch.txseq_block_puts.is_empty()
+            || !batch.txseq_block_removes.is_empty()
             || !batch.addr_funding_removes.is_empty()
             || !batch.addr_spending_removes.is_empty()
             || !batch.outpoint_spend_removes.is_empty()
@@ -773,7 +781,7 @@ impl CoinCache {
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
-        self.tx_index_cache.lock().clear();
+        self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
         // Second look: a foreign writer whose `note_mutation` check
         // interleaved the start of this discard can have landed (and
@@ -964,7 +972,7 @@ impl CoinCache {
             }
         }
         {
-            // `connect_block` fills `tx_index_puts` regardless of whether
+            // `connect_block` fills `tx_loc_puts` regardless of whether
             // `-txindex` is on, and the inner store drops them when it is
             // off. Absorbing them here anyway would make this cache the only
             // place those rows exist: `get_tx_location` would answer from the
@@ -972,13 +980,18 @@ impl CoinCache {
             // `getrawtransaction` resolve an arbitrary txid until the entry
             // aged out. Mirror the inner store instead — removes still apply,
             // so a stale row can never outlive its block.
-            let mut ti = self.tx_index_cache.lock();
+            //
+            // The gate is `has_txindex()` and not "either index is on"
+            // deliberately: this cache only ever serves `get_tx_location`,
+            // which is itself `-txindex`-gated. `get_tx_seq` goes to the
+            // inner store, so an address-index-only node loses nothing.
+            let mut ti = self.tx_loc_cache.lock();
             if self.inner.has_txindex() {
-                for &(txid, hash) in &batch.tx_index_puts {
-                    ti.put(txid, hash);
+                for &(txid, seq) in &batch.tx_loc_puts {
+                    ti.put(txid, seq);
                 }
             }
-            for txid in &batch.tx_index_removes {
+            for txid in &batch.tx_loc_removes {
                 ti.pop(txid);
             }
         }
@@ -1002,8 +1015,12 @@ impl CoinCache {
             || !batch.height_hash_puts.is_empty()
             || !batch.height_hash_removes.is_empty()
             || !batch.undo_puts.is_empty()
-            || !batch.tx_index_puts.is_empty()
-            || !batch.tx_index_removes.is_empty()
+            || !batch.tx_loc_puts.is_empty()
+            || !batch.tx_loc_removes.is_empty()
+            || !batch.txseq_txid_puts.is_empty()
+            || !batch.txseq_txid_removes.is_empty()
+            || !batch.txseq_block_puts.is_empty()
+            || !batch.txseq_block_removes.is_empty()
             || !batch.chain_tx_puts.is_empty()
             || !batch.addr_funding_puts.is_empty()
             || !batch.addr_spending_puts.is_empty()
@@ -1069,8 +1086,12 @@ impl CoinCache {
                     height_hash_puts: batch.height_hash_puts,
                     height_hash_removes: batch.height_hash_removes,
                     undo_puts: batch.undo_puts,
-                    tx_index_puts: batch.tx_index_puts,
-                    tx_index_removes: batch.tx_index_removes,
+                    tx_loc_puts: batch.tx_loc_puts,
+                    tx_loc_removes: batch.tx_loc_removes,
+                    txseq_txid_puts: batch.txseq_txid_puts,
+                    txseq_txid_removes: batch.txseq_txid_removes,
+                    txseq_block_puts: batch.txseq_block_puts,
+                    txseq_block_removes: batch.txseq_block_removes,
                     chain_tx_puts: batch.chain_tx_puts,
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
@@ -1132,8 +1153,12 @@ impl CoinCache {
                 let keyed = StoreBatch {
                     height_hash_puts: batch.height_hash_puts,
                     height_hash_removes: batch.height_hash_removes,
-                    tx_index_puts: batch.tx_index_puts,
-                    tx_index_removes: batch.tx_index_removes,
+                    tx_loc_puts: batch.tx_loc_puts,
+                    tx_loc_removes: batch.tx_loc_removes,
+                    txseq_txid_puts: batch.txseq_txid_puts,
+                    txseq_txid_removes: batch.txseq_txid_removes,
+                    txseq_block_puts: batch.txseq_block_puts,
+                    txseq_block_removes: batch.txseq_block_removes,
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
@@ -1449,14 +1474,109 @@ impl Store for CoinCache {
         // beyond `getrawtransaction` — `verify_chainstate` counts absent rows
         // through here, and a filter applied at read time would make every
         // row on a non-txindex node read as absent.
-        if let Some(&hash) = self.tx_index_cache.lock().get(txid) {
-            return Some(hash);
+        if let Some(&seq) = self.tx_loc_cache.lock().get(txid) {
+            let (_first, height) = self.inner.block_of_seq(seq)?;
+            return self.get_block_hash_by_height(height);
         }
         self.inner.get_tx_location(txid)
     }
 
     fn has_txindex(&self) -> bool {
         self.inner.has_txindex()
+    }
+
+    fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        // Same active-chain-not-flush-bound semantics as `lookup_spend`:
+        // a just-connected block's rows sit in `pending_batch` until the
+        // flush, and the ordinal families are what every other index
+        // resolves through — an ordinal that reads as absent here makes
+        // the row that names it look like corruption.
+        //
+        // The LRU alone is not enough: it is populated only when the
+        // inner store has `-txindex`, so on an `-addressindex`-only node
+        // it is always empty.
+        {
+            let pending = self.pending_batch.lock();
+            if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
+                return Some(*seq);
+            }
+            if pending.tx_loc_removes.contains(txid) {
+                return None;
+            }
+        }
+        if let Some(&seq) = self.tx_loc_cache.lock().get(txid) {
+            return Some(seq);
+        }
+        self.inner.get_tx_seq(txid)
+    }
+
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        if seqs.is_empty() {
+            return Vec::new();
+        }
+        // One pass over the pending batch for the whole slice, not one
+        // per ordinal: this is the batched read the index scans use, and
+        // a per-row pending scan would put the scan's cost back.
+        let (pending_puts, pending_removes) = {
+            let pending = self.pending_batch.lock();
+            if pending.txseq_txid_puts.is_empty() && pending.txseq_txid_removes.is_empty() {
+                (None, None)
+            } else {
+                (
+                    Some(
+                        pending
+                            .txseq_txid_puts
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::HashMap<u64, Txid>>(),
+                    ),
+                    Some(
+                        pending
+                            .txseq_txid_removes
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::HashSet<u64>>(),
+                    ),
+                )
+            }
+        };
+        let mut out = self.inner.txids_of_seqs(seqs);
+        if let (Some(puts), Some(removes)) = (pending_puts, pending_removes) {
+            for (i, seq) in seqs.iter().enumerate() {
+                if let Some(txid) = puts.get(seq) {
+                    out[i] = Some(*txid);
+                } else if removes.contains(seq) {
+                    out[i] = None;
+                }
+            }
+        }
+        out
+    }
+
+    fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
+        // The block covering an ordinal is the one with the greatest
+        // `first_txseq` not above it, so the pending batch can only
+        // *improve* on the inner answer — and it does exactly that for
+        // every block connected since the last flush.
+        let pending_best = {
+            let pending = self.pending_batch.lock();
+            let removed: std::collections::HashSet<u64> =
+                pending.txseq_block_removes.iter().copied().collect();
+            pending
+                .txseq_block_puts
+                .iter()
+                .filter(|(first, _)| *first <= seq && !removed.contains(first))
+                .max_by_key(|(first, _)| *first)
+                .copied()
+        };
+        let inner = self.inner.block_of_seq(seq);
+        match (pending_best, inner) {
+            (Some((pfirst, pheight)), Some((ifirst, _))) if pfirst >= ifirst => {
+                Some((pfirst, pheight))
+            }
+            (Some((pfirst, pheight)), None) => Some((pfirst, pheight)),
+            (_, other) => other,
+        }
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
@@ -1471,7 +1591,7 @@ impl Store for CoinCache {
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
-        self.tx_index_cache.lock().clear();
+        self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
         self.inner.clear_chainstate()
     }
@@ -1488,7 +1608,7 @@ impl Store for CoinCache {
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
-        self.tx_index_cache.lock().clear();
+        self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
         self.inner.clear_all()
     }
@@ -2663,6 +2783,114 @@ mod tests {
         );
     }
 
+    /// The cache re-materialises a `StoreBatch` three times — the
+    /// `has_non_coin` gate, the pass-through literal, and the buffered
+    /// `keyed` literal — and every one of them enumerates fields by
+    /// name. A field missing from any of the three is dropped in
+    /// silence: no error, no log, just a row that never reaches disk.
+    /// This walks a batch carrying one row in every field through the
+    /// buffered path (the one with a `..Default::default()` and so the
+    /// one that can silently omit), flushes, and reads each back.
+    #[test]
+    fn coin_cache_forwards_every_batch_field() {
+        let cache = make_cache(64);
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x5a; 32],
+        ));
+        let hash = make_block_hash(0x5b);
+
+        let mut batch = StoreBatch::default();
+        // A coin forces the buffered branch: with `coin_dirty == 0` the
+        // whole batch takes the pass-through literal instead.
+        batch.coin_puts.push((make_outpoint(0x5c, 0), make_coin(77, 1)));
+        batch.height_hash_puts.push((9, hash));
+        batch.tx_loc_puts.push((txid, 4));
+        batch.txseq_txid_puts.push((4, txid));
+        batch.txseq_block_puts.push((4, 9));
+        batch.chain_tx_puts.push((hash, 5));
+        cache.write_batch(batch).unwrap();
+        cache.flush_durable().unwrap();
+        cache.tx_loc_cache.lock().pop(&txid);
+
+        assert_eq!(cache.get_block_hash_by_height(9), Some(hash));
+        assert_eq!(cache.get_cumulative_tx_count(&hash), Some(5));
+        assert_eq!(
+            cache.get_tx_seq(&txid),
+            Some(4),
+            "tx_loc_puts dropped by one of the three batch literals"
+        );
+        assert_eq!(
+            cache.txids_of_seqs(&[4]),
+            vec![Some(txid)],
+            "txseq_txid_puts dropped by one of the three batch literals"
+        );
+        assert!(
+            cache.has_coin(&make_outpoint(0x5c, 0)),
+            "the coin itself must survive the round trip"
+        );
+    }
+
+    /// During IBD the chain runs in BulkLoad mode and blocks connect far
+    /// faster than the cache flushes, so `connect_block`'s read of the
+    /// parent's cumulative transaction count almost always lands on a row
+    /// that is still only in the pending batch. Since schema 4 that read
+    /// is the source of every index row's key and is fail-closed, so a
+    /// cache that could not serve it would refuse to connect the second
+    /// block of every flush window — which no test would have caught,
+    /// because the small chains unit tests build fit inside one window.
+    #[test]
+    fn coin_cache_serves_parent_chain_tx_from_pending_batch_under_bulkload() {
+        // A cache big enough that 3000 blocks' worth of writes never
+        // trigger an automatic flush.
+        let cache = make_cache(512);
+        cache.set_write_mode(WriteMode::BulkLoad);
+
+        // Distinct hashes: the counter is keyed by block hash, and a
+        // collision would let a wrong answer look right.
+        let block_hash = |i: u64| {
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array({
+                let mut b = [0u8; 32];
+                b[..8].copy_from_slice(&i.to_le_bytes());
+                b
+            }))
+        };
+
+        const BLOCKS: u64 = 3_000;
+        let mut running = 0u64;
+        for i in 0..BLOCKS {
+            let hash = block_hash(i);
+
+            // What `connect_block` does: read the parent's count, add
+            // this block's transactions, write the result.
+            if i > 0 {
+                assert_eq!(
+                    cache.get_cumulative_tx_count(&block_hash(i - 1)),
+                    Some(running),
+                    "block {i}: the parent's count must be visible before the flush; \
+                     connect_block fails closed without it"
+                );
+            }
+            let num_tx = (i % 5) + 1;
+            running += num_tx;
+
+            let mut batch = StoreBatch::default();
+            // A coin, so the batch buffers rather than passing straight
+            // through — the pass-through path is not the one under test.
+            batch
+                .coin_puts
+                .push((make_outpoint((i % 251) as u8, i as u32), make_coin(10, 1)));
+            batch.chain_tx_puts.push((hash, running));
+            cache.write_batch(batch).unwrap();
+        }
+
+        cache.flush_durable().unwrap();
+        assert_eq!(
+            cache.get_cumulative_tx_count(&block_hash(BLOCKS - 1)),
+            Some(running),
+            "the series must survive the flush intact"
+        );
+    }
+
     /// Same defect on the txindex, with a more routine trigger: a reorg
     /// removes the displaced block's txids and the replacement chain re-mines
     /// the same transactions, so put and remove collide on one txid. Losing
@@ -2674,7 +2902,7 @@ mod tests {
         let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
             [0x77; 32],
         ));
-        let new_block = make_block_hash(0xB2);
+        const NEW_SEQ: u64 = 42;
 
         let mut warm = StoreBatch::default();
         warm.coin_puts.push((make_outpoint(0x11, 0), make_coin(50, 1)));
@@ -2684,23 +2912,31 @@ mod tests {
         disconnect
             .coin_puts
             .push((make_outpoint(0x12, 0), make_coin(51, 1)));
-        disconnect.tx_index_removes.push(txid);
+        disconnect.tx_loc_removes.push(txid);
+        disconnect.txseq_txid_removes.push(NEW_SEQ);
         cache.write_batch(disconnect).unwrap();
 
         let mut connect = StoreBatch::default();
         connect
             .coin_puts
             .push((make_outpoint(0x13, 0), make_coin(52, 1)));
-        connect.tx_index_puts.push((txid, new_block));
+        connect.tx_loc_puts.push((txid, NEW_SEQ));
+        connect.txseq_txid_puts.push((NEW_SEQ, txid));
         cache.write_batch(connect).unwrap();
 
         cache.flush_durable().unwrap();
-        cache.tx_index_cache.lock().pop(&txid);
+        cache.tx_loc_cache.lock().pop(&txid);
         assert_eq!(
-            cache.get_tx_location(&txid),
-            Some(new_block),
+            cache.get_tx_seq(&txid),
+            Some(NEW_SEQ),
             "txindex entry lost: `getrawtransaction` would report a tx that IS \
              in the chain as unknown"
+        );
+        assert_eq!(
+            cache.txids_of_seqs(&[NEW_SEQ]),
+            vec![Some(txid)],
+            "the reverse map lost the same row; every index keyed on this \
+             ordinal would resolve to nothing"
         );
     }
 
@@ -2717,27 +2953,31 @@ mod tests {
         warm.coin_puts.push((make_outpoint(0x31, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
+        const SEQ: u64 = 43;
         let mut connect = StoreBatch::default();
         connect
             .coin_puts
             .push((make_outpoint(0x32, 0), make_coin(51, 1)));
-        connect.tx_index_puts.push((txid, make_block_hash(0xB4)));
+        connect.tx_loc_puts.push((txid, SEQ));
+        connect.txseq_txid_puts.push((SEQ, txid));
         cache.write_batch(connect).unwrap();
 
         let mut disconnect = StoreBatch::default();
         disconnect
             .coin_puts
             .push((make_outpoint(0x33, 0), make_coin(52, 1)));
-        disconnect.tx_index_removes.push(txid);
+        disconnect.tx_loc_removes.push(txid);
+        disconnect.txseq_txid_removes.push(SEQ);
         cache.write_batch(disconnect).unwrap();
 
         cache.flush_durable().unwrap();
-        cache.tx_index_cache.lock().pop(&txid);
+        cache.tx_loc_cache.lock().pop(&txid);
         assert_eq!(
-            cache.get_tx_location(&txid),
+            cache.get_tx_seq(&txid),
             None,
             "txindex row resurrected: the disconnect was the later op"
         );
+        assert_eq!(cache.txids_of_seqs(&[SEQ]), vec![None]);
     }
 
     // ---------------------------------------------------------------
