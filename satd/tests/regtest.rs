@@ -20487,3 +20487,178 @@ fn createpsbt_refuses_an_address_it_cannot_pay() {
 
     node.stop();
 }
+
+/// The send flow driven entirely by shipped binaries: `sat-cli` for every node
+/// call and for the signing, with no test-only sender anywhere in it.
+///
+/// This is the flow an integrator actually has. The hand-built end-to-end
+/// stays alongside it, because `sat-cli`'s Signer and the node's verifier share
+/// `satd-psbt` — so a test where both halves are satd proves the pipeline
+/// works, not that the cryptography is right. The independent referee is the
+/// cross-check at the end: the test-only sender in `tests/common/sp_send.rs`,
+/// which reimplements every primitive including the DLEQ prover, must derive
+/// the same output script from the same keys.
+#[test]
+fn bip375_end_to_end_with_the_sat_cli_signer() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use common::sp_send::SpInput;
+    use satd_psbt::SpAddress;
+    use serde_json::json;
+    use std::io::Write as _;
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x47u8; 32]);
+    let scan_secret = SecretKey::from_slice(&[0x2fu8; 32]).expect("a scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x30u8; 32]).expect("a spend secret");
+    let address = SpAddress::new(scan_secret.public_key(&secp), spend_secret.public_key(&secp));
+    let sp1 = address.encode(bitcoin::Network::Regtest);
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    node.mine_blocks(101, &wallet.address.to_string());
+    let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
+    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+
+    let sat_cli = {
+        let satd_bin = env!("CARGO_BIN_EXE_satd");
+        std::path::Path::new(satd_bin)
+            .parent()
+            .expect("a directory")
+            .join("sat-cli")
+    };
+    let call = |args: &[&str]| -> String {
+        let out = Command::new(&sat_cli)
+            .arg("--regtest")
+            .arg(format!("--datadir={}", node.datadir.display()))
+            .arg(format!("--rpcport={}", node.rpcport))
+            .args(args)
+            .output()
+            .expect("sat-cli runs");
+        assert!(
+            out.status.success(),
+            "sat-cli {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let created = call(&[
+        "createpsbt",
+        &format!(r#"[{{"txid":"{cb_txid}","vout":0}}]"#),
+        &format!(r#"[{{"{sp1}":25.0}},{{"{}":24.9999}}]"#, wallet.address),
+        "0",
+        "null",
+        "null",
+        "2",
+    ]);
+    let created = created.trim_matches('"').to_string();
+    let updated = call(&["utxoupdatepsbt", &created]);
+    let updated = updated.trim_matches('"').to_string();
+
+    // The Signer: the shipped binary, with the key on stdin and never over
+    // the wire.
+    let mut child = Command::new(&sat_cli)
+        .arg("signpsbtwithkey")
+        .arg(&updated)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sat-cli runs");
+    let wif = bitcoin::PrivateKey::new(wallet.sk, bitcoin::Network::Regtest).to_wif();
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(wif.as_bytes())
+        .expect("writes");
+    let out = child.wait_with_output().expect("completes");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(0), "signing failed: {stderr}");
+    assert!(stderr.contains("every output script computed and verified"), "{stderr}");
+    let signed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let analyzed = node.rpc_ok("analyzepsbt", vec![json!(signed.clone())]);
+    assert_eq!(analyzed["silent_payments"]["outputs"][0]["status"], "ready", "{analyzed}");
+    assert_eq!(analyzed["silent_payments"]["outputs"][0]["script"], "matches", "{analyzed}");
+
+    let finalized = node.rpc_ok("finalizepsbt", vec![json!(signed.clone())]);
+    assert_eq!(finalized["complete"], true, "{finalized}");
+    let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(raw_tx.clone())]);
+    let txid = txid.as_str().expect("a txid").to_string();
+    node.mine_blocks(1, &wallet.address.to_string());
+
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+    let data = node.rpc_ok(
+        "getsilentpaymentblockdata",
+        vec![json!(tip.as_str().expect("a hash")), json!(1)],
+    );
+    assert!(
+        data["tweaks"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .any(|t| t["txid"] == json!(txid)),
+        "{data}"
+    );
+
+    // The referee. Feed the *same* starting PSBT to the test-only sender,
+    // which shares no code with `sat-cli`'s Signer, and require the same
+    // output script. Two implementations, one answer.
+    let mut independent = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&updated)
+            .expect("base64"),
+    )
+    .expect("a PSBT");
+    let sp_inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    common::sp_send::fill_bip375(&secp, &mut independent, &sp_inputs, [0x6bu8; 32])
+        .expect("fills");
+
+    let by_sat_cli = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&signed)
+            .expect("base64"),
+    )
+    .expect("a PSBT");
+    for (i, (a, b)) in independent
+        .outputs
+        .iter()
+        .zip(by_sat_cli.outputs.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            a.get_single(satd_psbt::keys::output::SCRIPT),
+            b.get_single(satd_psbt::keys::output::SCRIPT),
+            "output {i}: the two senders disagree about where the money goes"
+        );
+    }
+    // The ECDH share is a function of the keys too, so it must match; the
+    // DLEQ proof must not, since its auxiliary randomness is fresh per proof.
+    let scan = address.scan_key.serialize();
+    assert_eq!(
+        independent.global.get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
+        by_sat_cli.global.get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
+    );
+    assert_ne!(
+        independent.global.get(satd_psbt::keys::global::SP_DLEQ, &scan),
+        by_sat_cli.global.get(satd_psbt::keys::global::SP_DLEQ, &scan),
+        "two proofs of the same statement must not be identical"
+    );
+
+    // And the transaction on chain pays the script both of them derived.
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_tx).expect("hex")).expect("a tx");
+    assert_eq!(
+        tx.output[0].script_pubkey.to_bytes(),
+        independent.outputs[0]
+            .get_single(satd_psbt::keys::output::SCRIPT)
+            .expect("a script")
+            .to_vec()
+    );
+
+    node.stop();
+}

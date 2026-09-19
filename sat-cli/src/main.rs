@@ -27,6 +27,7 @@ use std::path::PathBuf;
 
 mod policylint;
 mod sign;
+mod sign_v2;
 mod signer;
 
 #[derive(Parser, Debug)]
@@ -980,21 +981,12 @@ fn read_keys() -> Result<zeroize::Zeroizing<Vec<String>>, String> {
 /// Handle `signpsbtwithkey`. Returns the process exit code:
 /// `0` all inputs signed, `2` partial (PSBT still emitted), `1` hard error.
 fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u32) -> i32 {
-    use std::str::FromStr;
-
     let psbt_b64 = match resolve_psbt_b64(psbt_arg, psbt_file) {
         Ok(s) => s,
         Err(code) => return code,
     };
-
-    // Refuse a version 2 PSBT before asking for a key. Signing one means
-    // taking on the BIP 375 Signer duties — computing ECDH shares and the
-    // output scripts that follow from them — and this signer does not do that
-    // yet. Prompting first and failing afterwards would put a private key on
-    // the terminal for nothing.
     if sign::psbt_version(&psbt_b64) == satd_psbt::PsbtVersion::V2 {
-        eprintln!("error: version 2 PSBTs are not supported by this signer yet");
-        return 1;
+        return run_sign_v2(&psbt_b64, gap);
     }
 
     let mut psbt = match sign::psbt_from_base64(&psbt_b64) {
@@ -1005,16 +997,80 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u3
         }
     };
 
-    let key_lines = match read_keys() {
-        Ok(k) => k,
+    let (mut wif_keys, mut xprivs) = match read_signing_keys() {
+        Ok(keys) => keys,
+        Err(code) => return code,
+    };
+
+    let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs, gap);
+    erase_keys(&mut wif_keys, &mut xprivs);
+    emit_result(&psbt, &summary)
+}
+
+/// `signpsbtwithkey` for a version 2 PSBT, where signing means taking on BIP
+/// 375's Signer duties first: the ECDH shares, their proofs, and the output
+/// scripts that follow.
+///
+/// A partial run is a normal outcome, not an error. A signer holding some of
+/// the inputs writes what it can, says which inputs still owe a share, and
+/// emits the PSBT for the next one — exit code 2, the same as a partially
+/// signed version 0 PSBT.
+fn run_sign_v2(psbt_b64: &str, gap: u32) -> i32 {
+    // Parse before asking for a key, so a PSBT that was never going to work
+    // does not cost the user a key on a terminal first.
+    let mut raw = match sign::raw_psbt_from_base64(psbt_b64) {
+        Ok(raw) => raw,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
     };
+
+    let (mut wif_keys, mut xprivs) = match read_signing_keys() {
+        Ok(keys) => keys,
+        Err(code) => return code,
+    };
+
+    let outcome = sign_v2::sign_psbt_v2(&mut raw, &wif_keys, &xprivs, gap);
+    erase_keys(&mut wif_keys, &mut xprivs);
+
+    let summary = match outcome {
+        Ok(summary) => summary,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    println!("{}", sign::raw_psbt_to_base64(&raw));
+    for line in sign_v2::describe(&summary) {
+        eprintln!("{line}");
+    }
+    if summary.complete() {
+        0
+    } else {
+        eprintln!(
+            "warning: the PSBT is not finished; it is emitted so the next signer can continue"
+        );
+        2
+    }
+}
+
+/// Read the signing keys from stdin and sort them into WIF keys and xprivs.
+/// On failure prints the error and returns the exit code to use.
+fn read_signing_keys() -> Result<(Vec<bitcoin::PrivateKey>, Vec<bitcoin::bip32::Xpriv>), i32> {
+    use std::str::FromStr;
+
+    let key_lines = match read_keys() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(1);
+        }
+    };
     if key_lines.is_empty() {
         eprintln!("error: no private key provided on stdin");
-        return 1;
+        return Err(1);
     }
 
     let mut wif_keys = Vec::new();
@@ -1026,25 +1082,24 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u3
             xprivs.push(xp);
         } else {
             eprintln!("error: input is neither a valid WIF private key nor an xpriv");
-            return 1;
+            return Err(1);
         }
     }
+    Ok((wif_keys, xprivs))
+}
 
-    let summary = sign::sign_psbt(&mut psbt, &wif_keys, &xprivs, gap);
-    // Best-effort wipe of the parsed key material before it leaves scope.
-    // `secp256k1` has no `Zeroize` impl; `non_secure_erase` is its volatile
-    // overwrite (same technique as the zeroize crate). Residual copies the
-    // compiler or secp's C path may have made are unreachable.
-    for pk in &mut wif_keys {
+/// Best-effort wipe of the parsed key material before it leaves scope.
+///
+/// `secp256k1` has no `Zeroize` impl; `non_secure_erase` is its volatile
+/// overwrite (same technique as the zeroize crate). Residual copies the
+/// compiler or secp's C path may have made are unreachable.
+fn erase_keys(wif_keys: &mut [bitcoin::PrivateKey], xprivs: &mut [bitcoin::bip32::Xpriv]) {
+    for pk in wif_keys.iter_mut() {
         pk.inner.non_secure_erase();
     }
-    for xp in &mut xprivs {
+    for xp in xprivs.iter_mut() {
         xp.private_key.non_secure_erase();
     }
-    drop(wif_keys);
-    drop(xprivs);
-
-    emit_result(&psbt, &summary)
 }
 
 /// Handle `signpsbtwithsigner`. Resolves the PSBT, dispatches it to the external
@@ -1202,6 +1257,19 @@ fn run_sign_with_signer_v2(
         }
     }
 
+    // A signer may add signature data and, if it speaks BIP 375, ECDH shares
+    // and the output scripts that follow. What it may not do is hand back a
+    // silent payment output whose script is not what its own shares derive
+    // to, or a signature over a transaction whose outputs are still
+    // undetermined. Both are checked here, with the same code the node runs,
+    // because the device is exactly the party a host cannot take on trust.
+    if has_silent_payments
+        && let Err(why) = verify_signer_reply(&original, &psbt)
+    {
+        eprintln!("error: {why}");
+        return 1;
+    }
+
     let summary = match sign::summarize_v2(&psbt) {
         Ok(s) => s,
         Err(e) => {
@@ -1211,6 +1279,113 @@ fn run_sign_with_signer_v2(
     };
     println!("{}", sign::raw_psbt_to_base64(&psbt));
     report_summary(&summary)
+}
+
+/// Check what an external signer returned for a silent payment PSBT.
+///
+/// The DLEQ proofs exist so a host can check a device's share without
+/// trusting it, and this is that check. Refusing here rather than emitting is
+/// the point: a silent payment paid to the wrong script cannot be recovered,
+/// and the next thing that happens to an emitted PSBT is `finalizepsbt`.
+///
+/// It takes both documents because a proof is only as good as what it is
+/// proved against. The shares are proved against each input's public key, and
+/// which key an input has comes from the previous output the PSBT claims it
+/// spends — evidence the device hands back along with everything else, and
+/// which BIP 370's unique identifier does not cover. A device free to restate
+/// the prevouts is free to hand back a reply that verifies perfectly against
+/// inputs the transaction does not have. So the verifier's view of the inputs
+/// has to be the same on both sides.
+fn verify_signer_reply(
+    original: &satd_psbt::RawPsbt,
+    psbt: &satd_psbt::RawPsbt,
+) -> Result<(), String> {
+    use satd_psbt::sp::{OutputStatus, ScriptState};
+
+    satd_psbt::validate_structure(psbt).map_err(|e| e.to_string())?;
+    let view = satd_psbt::V2View::new(psbt).map_err(|e| e.to_string())?;
+    let report = satd_psbt::sp::verify(&view, None).map_err(|e| e.to_string())?;
+
+    let sent = satd_psbt::V2View::new(original)
+        .and_then(|v| satd_psbt::sp::verify(&v, None))
+        .map_err(|e| format!("the PSBT handed to the signer does not verify: {e}"))?;
+    if sent.inputs.len() != report.inputs.len() {
+        return Err(format!(
+            "the signer returned {} inputs against the {} it was given; refusing to emit it",
+            report.inputs.len(),
+            sent.inputs.len()
+        ));
+    }
+    for (before, after) in sent.inputs.iter().zip(&report.inputs) {
+        if before.prevout != after.prevout || before.outpoint != after.outpoint {
+            return Err(format!(
+                "the signer changed what input {} spends; the ECDH shares are proved \
+                 against it, so refusing to emit it",
+                after.index
+            ));
+        }
+        // Only a *change* counts. A PSBT the node built names no public key
+        // for any input — `createpsbt` has no wallet, and only the party
+        // holding the key can say what it is — so a signer that declares the
+        // inputs it holds turns a `None` into a `Some`, and that is the
+        // signer doing its job. Non-taproot inputs are the common case;
+        // refusing this would leave the signer path unable to complete one.
+        //
+        // It is safe because of the check above: the previous output is
+        // pinned to what was sent, and a key is only accepted when it hashes
+        // to that output's script, so the key that appears is the only key
+        // that could. A previous output that appears is pinned by nothing,
+        // which is why that check stays strict in both directions.
+        if before.public_key.is_some() && before.public_key != after.public_key {
+            return Err(format!(
+                "the signer changed the public key bound to input {}; the ECDH shares are \
+                 proved against it, so refusing to emit it",
+                after.index
+            ));
+        }
+    }
+
+    let signed = view.inputs().any(|i| {
+        i.map().contains_type(satd_psbt::keys::input::PARTIAL_SIG)
+            || i.map().contains_type(satd_psbt::keys::input::TAP_KEY_SIG)
+            || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTWITNESS)
+            || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTSIG)
+    });
+
+    for output in &report.outputs {
+        if output.script_state == ScriptState::Mismatch {
+            return Err(format!(
+                "the signer set a script for silent payment output {} that is not what its \
+                 ECDH shares derive to; refusing to emit it",
+                output.index
+            ));
+        }
+        if matches!(
+            output.status,
+            OutputStatus::InvalidProof | OutputStatus::InvalidInputs | OutputStatus::Unverifiable
+        ) {
+            return Err(format!(
+                "silent payment output {} came back {}{}; refusing to emit it",
+                output.index,
+                output.status.as_str(),
+                output
+                    .reason
+                    .as_ref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            ));
+        }
+        // A signature commits to the outputs. One added while an output has
+        // no script commits to a transaction that is still going to change.
+        if signed && output.script_state == ScriptState::Absent {
+            return Err(format!(
+                "the signer added a signature while silent payment output {} still has no \
+                 script; refusing to emit it",
+                output.index
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the PSBT base64 from a positional argument or `--psbt-file`. On

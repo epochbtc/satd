@@ -388,12 +388,19 @@ PSBTs that carry no derivation metadata, including satd's own `createpsbt`
 output. The key never crosses the JSON-RPC boundary, so satd stays strictly
 keyless.
 
-A version 2 PSBT is refused by name, before the key prompt: signing one
-means taking on BIP 375's Signer duties — computing the ECDH shares and
-the output scripts that follow from them — and this signer does not do
-that yet. `sat-cli signpsbtwithsigner` does pass a version 2 PSBT to an
-external signer untouched, because for a silent payment the only party
-that can compute an ECDH share is the one holding the input's private
-key. What comes back is checked: a signer adds signature data, it does
-not choose the transaction, so a reply describing a different
-transaction is refused.
+A version 2 PSBT is signed too, and signing one means doing BIP 375's
+Signer work first. See
+[Sending](silent-payments.md#signing-with-sat-cli) in the Silent
+Payments chapter.
+
+`sat-cli signpsbtwithsigner` passes a version 2 PSBT to an external
+signer untouched, because for a silent payment the only party that can
+compute an ECDH share is the one holding the input's private key — a
+device is exactly who should be asked, and `sat-cli` cannot know which
+devices have learned BIP 375. What comes back is checked with the same
+code the node runs: a reply describing a different transaction, one
+whose silent payment script is not what its own shares derive to, or one
+carrying a signature while an output still has no script, is refused
+rather than emitted. A signer that simply does not understand the PSBT
+has its own message relayed, with one line saying the device must
+support BIP 375.

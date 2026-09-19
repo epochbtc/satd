@@ -309,7 +309,7 @@ fn is_supported_script(script: &bitcoin::Script) -> bool {
 /// when given a master key, plus the bare key and a receive/change leaf scan
 /// for account-level keys — each over `0..gap`. The coin type follows the
 /// key's network (0' mainnet, 1' otherwise).
-fn expand_xpriv(
+pub(crate) fn expand_xpriv(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     xpriv: &bitcoin::bip32::Xpriv,
     gap: u32,

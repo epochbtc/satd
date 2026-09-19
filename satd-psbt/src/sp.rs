@@ -1020,6 +1020,54 @@ impl PointSum {
     }
 }
 
+/// A running scalar sum in which zero is a value.
+///
+/// The mirror of [`PointSum`], and there for the same reason: BIP 352 sums the
+/// input private keys, and an intermediate sum of zero is legal as long as the
+/// final one is not. `SecretKey::add_tweak` reports a zero sum as an error
+/// because a zero secret key does not exist, so the zero state is tracked here
+/// rather than mistaken for failure.
+#[derive(Debug, Clone, Copy)]
+enum ScalarSum {
+    Empty,
+    Zero,
+    Key(bitcoin::secp256k1::SecretKey),
+}
+
+impl ScalarSum {
+    fn add(self, key: &bitcoin::secp256k1::SecretKey) -> Self {
+        match self {
+            ScalarSum::Empty | ScalarSum::Zero => ScalarSum::Key(*key),
+            ScalarSum::Key(sum) => match Scalar::from_be_bytes(key.secret_bytes()) {
+                Err(_) => ScalarSum::Zero,
+                Ok(tweak) => match sum.add_tweak(&tweak) {
+                    Ok(next) => ScalarSum::Key(next),
+                    // The only rejection is a sum of zero modulo n.
+                    Err(_) => ScalarSum::Zero,
+                },
+            },
+        }
+    }
+
+    fn finish(self) -> Option<bitcoin::secp256k1::SecretKey> {
+        match self {
+            ScalarSum::Empty | ScalarSum::Zero => None,
+            ScalarSum::Key(key) => Some(key),
+        }
+    }
+}
+
+/// `Σ a_i`, or `None` when there is nothing to sum or the sum is zero.
+///
+/// Only the client-side signer calls this; the node holds no secrets. It lives
+/// here so that the sum and the point sum it must agree with stay next to each
+/// other.
+pub fn sum_secret_keys(
+    keys: impl Iterator<Item = bitcoin::secp256k1::SecretKey>,
+) -> Option<bitcoin::secp256k1::SecretKey> {
+    keys.fold(ScalarSum::Empty, |acc, key| acc.add(&key)).finish()
+}
+
 /// `Σ A_i`, or `None` when there is nothing to sum or the sum is infinity.
 ///
 /// An *intermediate* sum of infinity is not a failure; see [`PointSum`].
