@@ -82,8 +82,26 @@ pub struct StoreBatch {
     pub height_hash_puts: Vec<(u32, BlockHash)>,
     pub height_hash_removes: Vec<u32>,
     pub undo_puts: Vec<(BlockHash, UndoData)>,
-    pub tx_index_puts: Vec<(Txid, BlockHash)>,
-    pub tx_index_removes: Vec<Txid>,
+    /// `first ordinal of the block -> height`. One row per connected
+    /// block; `seek_for_prev` over this family turns any transaction
+    /// ordinal back into the block that holds it, and the difference is
+    /// the transaction's position within the block. Ungated: it is four
+    /// bytes per block and every ordinal read needs it.
+    pub txseq_block_puts: Vec<(u64, u32)>,
+    pub txseq_block_removes: Vec<u64>,
+    /// `txid -> ordinal`. Written for every transaction of every
+    /// connected block when either `-txindex` or `-addressindex` is on.
+    /// Replaces the old `tx_index` (`txid -> block_hash`): the ordinal
+    /// carries the block *and* the position, so `getrawtransaction` can
+    /// index into `txdata` instead of scanning the block for its txid.
+    pub tx_loc_puts: Vec<(Txid, u64)>,
+    pub tx_loc_removes: Vec<Txid>,
+    /// `ordinal -> txid`, the inverse of `tx_loc`. This is what lets
+    /// every other index drop its txid copies: the index rows key on
+    /// ordinals and the storage layer resolves them back to txids in one
+    /// batched `multi_get` before any row leaves it.
+    pub txseq_txid_puts: Vec<(u64, Txid)>,
+    pub txseq_txid_removes: Vec<u64>,
     /// Cumulative transaction count through each connected block:
     /// `(block_hash, nchaintx)` where `nchaintx = nchaintx(parent) + num_tx`.
     /// Written by `connect_block` for active-chain blocks and by the
@@ -223,9 +241,9 @@ impl StoreBatch {
     ///
     /// Each dedup block is guarded on BOTH vectors being non-empty. Guarding
     /// only the incoming one would build a set of every txid in the block on
-    /// each connect — `connect_block` fills `tx_index_puts` regardless of
+    /// each connect — `connect_block` fills `tx_loc_puts` regardless of
     /// whether `-txindex` is on, so that is the default path — purely to
-    /// filter a `tx_index_removes` that is empty outside a reorg.
+    /// filter a `tx_loc_removes` that is empty outside a reorg.
     ///
     /// Disjointness is what makes the merged batch order-independent at
     /// apply time. `Store` implementations write every put and then
@@ -263,24 +281,57 @@ impl StoreBatch {
 
         self.undo_puts.extend(other.undo_puts);
 
-        // tx_index: last-writer-wins by txid, same shape as the height
+        // tx_loc: last-writer-wins by txid, same shape as the height
         // index. The trigger here is routine rather than incidental — a
         // reorg removes the displaced block's txids and the replacement
         // chain re-mines the same transactions, so put and remove collide
         // on one txid and `getrawtransaction` reports a transaction that
         // IS in the chain as unknown.
-        if !other.tx_index_removes.is_empty() && !self.tx_index_puts.is_empty() {
+        if !other.tx_loc_removes.is_empty() && !self.tx_loc_puts.is_empty() {
             let drop: std::collections::HashSet<Txid> =
-                other.tx_index_removes.iter().copied().collect();
-            self.tx_index_puts.retain(|(txid, _)| !drop.contains(txid));
+                other.tx_loc_removes.iter().copied().collect();
+            self.tx_loc_puts.retain(|(txid, _)| !drop.contains(txid));
         }
-        if !other.tx_index_puts.is_empty() && !self.tx_index_removes.is_empty() {
+        if !other.tx_loc_puts.is_empty() && !self.tx_loc_removes.is_empty() {
             let drop: std::collections::HashSet<Txid> =
-                other.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
-            self.tx_index_removes.retain(|txid| !drop.contains(txid));
+                other.tx_loc_puts.iter().map(|(txid, _)| *txid).collect();
+            self.tx_loc_removes.retain(|txid| !drop.contains(txid));
         }
-        self.tx_index_puts.extend(other.tx_index_puts);
-        self.tx_index_removes.extend(other.tx_index_removes);
+        self.tx_loc_puts.extend(other.tx_loc_puts);
+        self.tx_loc_removes.extend(other.tx_loc_removes);
+
+        // txseq_txid and txseq_block: ordinal-keyed, and the same
+        // collision applies. A reorg frees a range of ordinals and the
+        // replacement chain reuses them immediately, so a remove from the
+        // disconnect and a put from the reconnect land on the same key
+        // inside one pending batch. Without the dedup the remove would
+        // annihilate the replacement's row and every index keyed on that
+        // ordinal would resolve to nothing.
+        if !other.txseq_txid_removes.is_empty() && !self.txseq_txid_puts.is_empty() {
+            let drop: std::collections::HashSet<u64> =
+                other.txseq_txid_removes.iter().copied().collect();
+            self.txseq_txid_puts.retain(|(seq, _)| !drop.contains(seq));
+        }
+        if !other.txseq_txid_puts.is_empty() && !self.txseq_txid_removes.is_empty() {
+            let drop: std::collections::HashSet<u64> =
+                other.txseq_txid_puts.iter().map(|(seq, _)| *seq).collect();
+            self.txseq_txid_removes.retain(|seq| !drop.contains(seq));
+        }
+        self.txseq_txid_puts.extend(other.txseq_txid_puts);
+        self.txseq_txid_removes.extend(other.txseq_txid_removes);
+
+        if !other.txseq_block_removes.is_empty() && !self.txseq_block_puts.is_empty() {
+            let drop: std::collections::HashSet<u64> =
+                other.txseq_block_removes.iter().copied().collect();
+            self.txseq_block_puts.retain(|(seq, _)| !drop.contains(seq));
+        }
+        if !other.txseq_block_puts.is_empty() && !self.txseq_block_removes.is_empty() {
+            let drop: std::collections::HashSet<u64> =
+                other.txseq_block_puts.iter().map(|(seq, _)| *seq).collect();
+            self.txseq_block_removes.retain(|seq| !drop.contains(seq));
+        }
+        self.txseq_block_puts.extend(other.txseq_block_puts);
+        self.txseq_block_removes.extend(other.txseq_block_removes);
         // chain_tx is hash-keyed; extend like block_index_puts (last write
         // for a given hash wins at flush time).
         self.chain_tx_puts.extend(other.chain_tx_puts);
@@ -529,9 +580,56 @@ pub trait Store: Send + Sync {
     fn utxo_height_hist(&self) -> Vec<u64>;
     /// Look up which block contains a transaction (txindex).
     /// Returns None if txindex is disabled or the txid is not found.
+    ///
+    /// Composed from the two ordinal families: `tx_loc` gives the
+    /// transaction's ordinal, `txseq_block` the block that holds it. A
+    /// caller that also wants the position inside the block should use
+    /// [`get_tx_seq`](Self::get_tx_seq) and [`block_of_seq`](Self::block_of_seq)
+    /// directly rather than scanning the block for the txid.
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash>;
     /// Whether this store has txindex enabled.
+    ///
+    /// This is the `-txindex` *flag*, i.e. Core's `getrawtransaction`
+    /// capability — not whether the ordinal families hold rows. The
+    /// address index populates them too, so a node with
+    /// `-txindex=0 -addressindex=1` answers `false` here while
+    /// [`get_tx_seq`](Self::get_tx_seq) still resolves.
     fn has_txindex(&self) -> bool;
+
+    /// A transaction's chain-order ordinal, or `None` when the ordinal
+    /// families are empty for it.
+    ///
+    /// Ungated by the `-txindex` flag, unlike `get_tx_location`: the rows
+    /// exist whenever either `-txindex` or `-addressindex` is on, and the
+    /// address index needs them regardless of what `-txindex` says.
+    /// Default: `None` for backends with no ordinal index.
+    fn get_tx_seq(&self, _txid: &Txid) -> Option<u64> {
+        None
+    }
+
+    /// Resolve ordinals back to txids, in the order given.
+    ///
+    /// Batched on purpose: this is the read-side inverse of every index
+    /// row that dropped its txid copy, so it runs once per scan over
+    /// hundreds of rows rather than once per row. `None` in a slot means
+    /// the ordinal has no row, which on a healthy chainstate cannot
+    /// happen for an ordinal that came out of an index row — callers
+    /// treat it as local corruption, skip the row and log.
+    /// Default: all `None`.
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        vec![None; seqs.len()]
+    }
+
+    /// The block holding an ordinal: `(first ordinal of that block,
+    /// height)`. The ordinal's position inside the block is
+    /// `seq - first_txseq`.
+    ///
+    /// `None` when no block covers the ordinal — including an ordinal
+    /// past the tip, which `seek_for_prev` would otherwise answer with
+    /// the last block. Default: `None`.
+    fn block_of_seq(&self, _seq: u64) -> Option<(u64, u32)> {
+        None
+    }
     /// Clear UTXO set, undo data, tx index, and tip. Keep block index intact.
     /// Used by `-reindex-chainstate`.
     fn clear_chainstate(&self) -> Result<(), StoreError>;

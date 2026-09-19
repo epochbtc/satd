@@ -91,6 +91,22 @@ pub enum ConnectError {
     /// panic on a synthetic fixture with a missing prevout.
     #[error("silent payment index emit failed: {0}")]
     SpIndexEmit(String),
+    /// The parent block has no `chain_tx` row, so this block's
+    /// transactions have no chain-order ordinal to be numbered from.
+    ///
+    /// Every index row this block would write keys on that ordinal, so
+    /// guessing (the pre-schema-4 behaviour was to restart the series at
+    /// zero) would mis-key the whole block against every other block.
+    /// This is local storage damage, not a verdict about the block:
+    /// `-reindex-chainstate` rebuilds the series from genesis.
+    #[error("cumulative transaction count missing for parent {parent}")]
+    ChainTxGap { parent: BlockHash },
+    /// The chain has more transactions than a 5-byte ordinal can name.
+    /// Unreachable below ~1.1 trillion transactions; the variant exists
+    /// so the encoder can never silently wrap two transactions onto one
+    /// ordinal.
+    #[error("transaction ordinal space exhausted")]
+    TxSeqOverflow,
 }
 
 impl ConnectError {
@@ -441,6 +457,31 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     };
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
+
+    // The chain-order ordinal this block's first transaction takes.
+    // Read here, before the transaction loop, because every index row
+    // the loop emits is keyed on `first_txseq + tx_idx`.
+    //
+    // Fail closed on a missing parent row. Before schema 4 this was an
+    // `unwrap_or(0)`, which silently restarted the cumulative series and
+    // only corrupted `getchaintxstats`; now it would number this block's
+    // transactions from zero and mis-key every index row it writes
+    // against every other block's. The parent is always connected on
+    // this path — the only way its row is absent is local damage, which
+    // `-reindex-chainstate` repairs.
+    let first_txseq = if is_genesis {
+        0
+    } else {
+        store
+            .get_cumulative_tx_count(&block.header.prev_blockhash)
+            .ok_or(ConnectError::ChainTxGap {
+                parent: block.header.prev_blockhash,
+            })?
+    };
+    if first_txseq + block.txdata.len() as u64 > node_index::TXSEQ_MAX {
+        return Err(ConnectError::TxSeqOverflow);
+    }
+
     let mut total_fees: u64 = 0;
 
     // Block-wide signature-operation cost accumulator (Core: nSigOpsCost),
@@ -841,6 +882,16 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             }
         }
 
+        // Transaction-ordinal rows. Both directions, because the index
+        // rows that key on the ordinal have to resolve back to a txid
+        // before they leave the storage layer. The store drops them when
+        // neither `-txindex` nor `-addressindex` is on; emitting them
+        // unconditionally here keeps `connect_block` free of index
+        // configuration, as it already is for the address rows.
+        let txseq = first_txseq + tx_idx as u64;
+        batch.tx_loc_puts.push((txid, txseq));
+        batch.txseq_txid_puts.push((txseq, txid));
+
         txids.push(txid);
     }
 
@@ -999,25 +1050,21 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     batch.height_hash_puts.push((height, block_hash));
 
     // Cumulative transaction count = count(parent) + this block's tx count.
-    // The parent is already connected (this is the single active-chain
-    // connect path), so its count is in the store. Genesis has no parent
-    // (prev = all-zeros → None → 0), so it correctly starts at its own
-    // num_tx. Consumed by getchaintxstats.
-    let parent_chain_tx = store
-        .get_cumulative_tx_count(&block.header.prev_blockhash)
-        .unwrap_or(0);
+    // Consumed by getchaintxstats, and — since schema 4 — the source of
+    // every index row's key. `first_txseq` was read at the top of this
+    // function, before the transaction loop that needs it.
     batch
         .chain_tx_puts
-        .push((block_hash, parent_chain_tx + block.txdata.len() as u64));
+        .push((block_hash, first_txseq + block.txdata.len() as u64));
 
     if !is_genesis {
         batch.undo_puts.push((block_hash, undo));
     }
 
-    // Populate txindex: map each txid to its containing block
-    for txid in &txids {
-        batch.tx_index_puts.push((*txid, block_hash));
-    }
+    // One row per block: the ordinal this block's numbering starts at.
+    // `seek_for_prev` over this family is what turns any ordinal back
+    // into a height, and the difference is the position in the block.
+    batch.txseq_block_puts.push((first_txseq, height));
 
     Ok(batch)
 }
@@ -1037,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_connect_genesis_block() {
-        let store = InMemoryStore::new();
+        let store = test_store();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let pos = FlatFilePos {
             file_number: 0,
@@ -1081,7 +1128,7 @@ mod tests {
     /// that a backfilled one does not.
     #[test]
     fn genesis_writes_no_sp_row_even_with_taproot_active_at_zero() {
-        let store = InMemoryStore::new();
+        let store = test_store();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let sp_index = crate::index::silent_payments::SpIndexConfig { enabled: true };
         assert_eq!(
@@ -1150,7 +1197,7 @@ mod tests {
     #[test]
     fn test_connect_skips_unspendable_outputs() {
         use bitcoin::script::Builder;
-        let store = InMemoryStore::new();
+        let store = test_store();
         // Seed genesis so block at height 1 has a valid parent context.
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
 
@@ -1393,9 +1440,31 @@ mod tests {
 
     // ── helpers for connect_block tests ───────────────────────────────
 
+    /// An `InMemoryStore` whose cumulative-transaction-count series is
+    /// seeded for the synthetic parents these fixtures use.
+    ///
+    /// Since schema 4 `connect_block` fails closed on a parent with no
+    /// `chain_tx` row: the ordinal every index row is keyed on is
+    /// `chain_tx(parent) + position`, so a gap would number the block
+    /// from zero and mis-key its rows against every other block's.
+    /// These fixtures build blocks with a placeholder `prev_blockhash`
+    /// (or regtest genesis), so seeding the series is the fixture's job,
+    /// exactly as seeding the parent's coins already is.
+    fn test_store() -> InMemoryStore {
+        let store = InMemoryStore::new();
+        let mut batch = StoreBatch::default();
+        batch.chain_tx_puts.push((BlockHash::all_zeros(), 0));
+        batch.chain_tx_puts.push((
+            bitcoin::constants::genesis_block(Network::Regtest).block_hash(),
+            1,
+        ));
+        store.write_batch(batch).unwrap();
+        store
+    }
+
     /// Create an InMemoryStore pre-loaded with a single coin.
     fn make_test_store_with_coin(coin_height: u32, coinbase: bool) -> (InMemoryStore, OutPoint, Coin) {
-        let store = InMemoryStore::new();
+        let store = test_store();
         let txid = bitcoin::Txid::from_raw_hash(
             bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
         );
@@ -1878,6 +1947,176 @@ mod tests {
         block
     }
 
+    /// Build a block with a chosen parent and a chosen transaction count,
+    /// so a test can drive a chain whose blocks differ in size.
+    ///
+    /// Beyond the coinbase, each extra transaction spends the previous
+    /// one's output — an intra-block chain of non-coinbase spends, which
+    /// `connect_block` resolves from `intra_block_coins` and which the
+    /// coinbase maturity rule does not touch. The first extra spends
+    /// `seed`, a coin the caller put in the store.
+    fn make_block_with_tx_count(
+        height: u32,
+        prev: BlockHash,
+        seed: OutPoint,
+        tx_count: usize,
+    ) -> Block {
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut txdata = vec![coinbase];
+        let mut prev_out = seed;
+        for _ in 1..tx_count {
+            let tx = Transaction {
+                version: Version(2),
+                lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: prev_out,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            prev_out = OutPoint {
+                txid: tx.compute_txid(),
+                vout: 0,
+            };
+            txdata.push(tx);
+        }
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata,
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    /// Ordinals are dense and chain-ordered across block boundaries: the
+    /// first transaction of a block takes the ordinal after the last
+    /// transaction of its parent, with no gaps and no reuse. That is the
+    /// whole premise every index row keyed on one relies on, and nothing
+    /// in a single block's rows can show it.
+    #[test]
+    fn connect_assigns_contiguous_ordinals_across_blocks() {
+        let store = test_store();
+        let counts = [1usize, 3, 2, 1, 4];
+        let mut prev = BlockHash::all_zeros();
+        let mut first_seqs = Vec::new();
+        let mut all_seqs: Vec<u64> = Vec::new();
+
+        for (i, count) in counts.iter().enumerate() {
+            let height = i as u32 + 1;
+            // A fresh spendable coin per block for the intra-block chain
+            // to start from.
+            let seed = OutPoint {
+                txid: bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([0x70 + i as u8; 32]),
+                ),
+                vout: 0,
+            };
+            let mut seed_batch = StoreBatch::default();
+            seed_batch.coin_puts.push((
+                seed,
+                Coin {
+                    amount: 1_000,
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                    height: 0,
+                    coinbase: false,
+                },
+            ));
+            store.write_batch(seed_batch).unwrap();
+
+            let block = make_block_with_tx_count(height, prev, seed, *count);
+            assert_eq!(block.txdata.len(), *count, "fixture built the wrong size");
+            let batch = connect_simple(&store, &block, height, 0).unwrap();
+
+            assert_eq!(batch.txseq_block_puts.len(), 1);
+            let first = batch.txseq_block_puts[0].0;
+            first_seqs.push(first);
+            assert_eq!(batch.txseq_block_puts[0].1, height);
+
+            // Forward and reverse rows must be exact inverses, one pair
+            // per transaction.
+            assert_eq!(batch.tx_loc_puts.len(), *count);
+            assert_eq!(batch.txseq_txid_puts.len(), *count);
+            for (j, (txid, seq)) in batch.tx_loc_puts.iter().enumerate() {
+                assert_eq!(*seq, first + j as u64);
+                assert_eq!(batch.txseq_txid_puts[j], (*seq, *txid));
+                all_seqs.push(*seq);
+            }
+
+            prev = block.block_hash();
+            store.write_batch(batch).unwrap();
+        }
+
+        assert_eq!(
+            first_seqs,
+            vec![0, 1, 4, 6, 7],
+            "each block starts where its parent's last transaction left off"
+        );
+        let total: usize = counts.iter().sum();
+        assert_eq!(
+            all_seqs,
+            (0..total as u64).collect::<Vec<_>>(),
+            "the ordinal series must be dense with no gaps or reuse"
+        );
+    }
+
+    /// The parent's cumulative transaction count is the only source of
+    /// a block's ordinal base. Before schema 4 a missing row silently
+    /// restarted the series at zero, which only broke `getchaintxstats`;
+    /// now it would number this block's transactions from zero and
+    /// mis-key every index row it writes against every other block's —
+    /// damage nothing downstream could detect. Fail closed instead.
+    #[test]
+    fn connect_refuses_when_parent_chain_tx_is_missing() {
+        // Deliberately NOT `test_store()`: this is the fixture without
+        // the seeded series.
+        let store = InMemoryStore::new();
+        let block = make_coinbase_only_block(1, 0xffff_ffff, 0);
+        let result = connect_simple(&store, &block, 1, 0);
+        assert!(
+            matches!(result, Err(ConnectError::ChainTxGap { parent }) if parent == BlockHash::all_zeros()),
+            "expected ChainTxGap, got {}",
+            match &result {
+                Ok(_) => "a connected block".to_string(),
+                Err(e) => e.to_string(),
+            }
+        );
+
+        // Genesis is the one block with no parent, and it is numbered
+        // from zero by definition rather than by a missing row.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let batch = connect_simple(&store, &genesis, 0, 0).unwrap();
+        assert_eq!(batch.txseq_block_puts, vec![(0, 0)]);
+    }
+
     fn connect_simple(
         store: &InMemoryStore,
         block: &Block,
@@ -1929,7 +2168,7 @@ mod tests {
         // over every transaction in the block, the coinbase included, and
         // rejects this bad-txns-nonfinal; satd exempted the coinbase from
         // the finality check and accepted it.
-        let store = InMemoryStore::new();
+        let store = test_store();
         let block = make_coinbase_only_block(1, 0x6400_0000, 0x2_ffff);
         let result = connect_simple(&store, &block, 1, 0);
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
@@ -1940,7 +2179,7 @@ mod tests {
         // Same locktime as above, but SEQUENCE_FINAL on the (only) input
         // disables locktime entirely — final in Core, and every real
         // coinbase ever mined has this shape.
-        let store = InMemoryStore::new();
+        let store = test_store();
         let block = make_coinbase_only_block(1, 0xffff_ffff, 0x2_ffff);
         assert!(connect_simple(&store, &block, 1, 0).is_ok());
     }
@@ -1982,7 +2221,7 @@ mod tests {
 
     #[test]
     fn test_spend_nonexistent_utxo() {
-        let store = InMemoryStore::new();
+        let store = test_store();
         let fake_outpoint = OutPoint {
             txid: bitcoin::Txid::from_raw_hash(
                 bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
@@ -2824,27 +3063,40 @@ mod tests {
         // Collect all txids from the block
         let block_txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
 
-        // Collect all txids from tx_index_puts
-        let indexed_txids: Vec<_> = batch.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
+        // Collect all txids from tx_loc_puts
+        let indexed_txids: Vec<_> = batch.tx_loc_puts.iter().map(|(txid, _)| *txid).collect();
 
         assert_eq!(
             block_txids.len(),
             indexed_txids.len(),
-            "tx_index_puts should have one entry per transaction"
+            "tx_loc_puts should have one entry per transaction"
         );
         for txid in &block_txids {
             assert!(
                 indexed_txids.contains(txid),
-                "txid {:?} should be in tx_index_puts",
+                "txid {:?} should be in tx_loc_puts",
                 txid
             );
         }
 
-        // Verify they all point to the correct block hash
-        let block_hash = block.block_hash();
-        for (_, bh) in &batch.tx_index_puts {
-            assert_eq!(*bh, block_hash, "tx_index entry should point to the block hash");
+        // The ordinals must be block position + the block's first
+        // ordinal, and the reverse map must be the exact inverse — a
+        // forward row whose reverse row is missing makes every index
+        // keyed on that ordinal resolve to nothing.
+        let first_txseq = batch.txseq_block_puts[0].0;
+        for (i, txid) in block_txids.iter().enumerate() {
+            assert_eq!(
+                batch.tx_loc_puts[i],
+                (*txid, first_txseq + i as u64),
+                "transaction {i} should take the ordinal at its block position"
+            );
+            assert_eq!(batch.txseq_txid_puts[i], (first_txseq + i as u64, *txid));
         }
+        assert_eq!(
+            batch.txseq_block_puts.len(),
+            1,
+            "exactly one txseq_block row per connected block"
+        );
     }
 
     // ── BIP 34/113/68 activation-height tests ────────────────────────
@@ -3194,7 +3446,7 @@ mod tests {
         // set (line 366 in connect_block: `if !is_genesis || !is_coinbase`).
         // The address-index emission lives inside that gate, so genesis
         // must not produce a funding row either.
-        let store = InMemoryStore::new();
+        let store = test_store();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let cfg = crate::index::address::AddressIndexConfig::default();
 

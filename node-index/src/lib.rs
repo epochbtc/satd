@@ -16,6 +16,7 @@ pub mod spend_keys;
 pub mod spend_trait;
 pub mod subscribe;
 pub mod trait_def;
+pub mod txseq;
 pub mod types;
 
 pub use config::AddressIndexConfig;
@@ -34,4 +35,8 @@ pub use spend_keys::{
 pub use spend_trait::SpendIndex;
 pub use subscribe::{SubscribeError, SubscriptionRegistry, status_hash};
 pub use trait_def::AddressIndex;
+pub use txseq::{
+    TXSEQ_LEN, TXSEQ_MAX, TXSEQ_UNKNOWN, TxSeq, VOUT_LEN, VOUT_MAX, decode_txseq, decode_u24,
+    encode_txseq, encode_u24,
+};
 pub use types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};

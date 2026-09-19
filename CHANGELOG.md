@@ -15,6 +15,11 @@ Bound for **0.6.0**, a minor release on the 0.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.6.0-pre.md`](docs/release-notes/0.6.0-pre.md).
 
+### Changed
+
+- **Chainstate schema 4.** The transaction index is keyed on dense chain-order transaction ordinals (`tx_loc`, `txseq_txid`, `txseq_block`) instead of `txid -> block_hash`, replacing the `tx_index` column family. An ordinal carries the transaction's position within its block as well as the block, so `getrawtransaction` indexes into the block instead of scanning it for a matching txid. Existing datadirs need one `-reindex-chainstate`; pruned datadirs must resync. A node that runs neither `-txindex` nor `-addressindex` writes no more than before.
+- A missing cumulative transaction count for a block's parent is now a hard error at connect time instead of silently restarting the count at zero. It also fixes a long-standing defect: `-reindex-chainstate` dropped genesis' own row and never re-seeded it, so every `getchaintxstats` total after a chainstate rebuild was one short for the life of the datadir.
+
 ### Added
 
 - `getstoragefootprint` and `sat-cli debug storage-footprint` report per-column-family SST bytes, live key estimates, bytes per key and pending compaction, so operators can see where a chainstate's disk goes without an offline `ldb` dump against a stopped node. The `chain_tx` column family was missing from the existing per-CF diagnostics and is now reported.
