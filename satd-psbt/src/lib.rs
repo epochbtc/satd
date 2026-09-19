@@ -39,6 +39,15 @@ pub use v2::{InputView, OutputView, SpProof, SpShare, SpV0Info, V2View};
 /// live in other crates.
 #[doc(hidden)]
 pub mod testing {
+    /// The vendored BIP 375 vectors, for crates that test their own PSBT
+    /// surfaces. See `satd-psbt/tests/vectors/README.md` for provenance.
+    #[cfg(feature = "test-vectors")]
+    pub const BIP375_VECTORS: &str = include_str!("../tests/vectors/bip375_test_vectors.json");
+
+    /// The vendored BIP 370 vectors.
+    #[cfg(feature = "test-vectors")]
+    pub const BIP370_VECTORS: &str = include_str!("../tests/vectors/bip370_test_vectors.json");
+
     use crate::keys;
     use crate::raw::{RawMap, RawPsbt};
 

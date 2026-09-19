@@ -502,7 +502,8 @@ impl<'a> Reader<'a> {
 // Compact size writing
 // ---------------------------------------------------------------------------
 
-pub(crate) fn compact_size_len(v: u64) -> usize {
+/// The number of bytes a minimally encoded compact size takes.
+pub fn compact_size_len(v: u64) -> usize {
     match v {
         0..=0xfc => 1,
         0xfd..=0xffff => 3,
@@ -511,7 +512,8 @@ pub(crate) fn compact_size_len(v: u64) -> usize {
     }
 }
 
-pub(crate) fn write_compact_size(out: &mut Vec<u8>, v: u64) {
+/// Append a minimally encoded compact size.
+pub fn write_compact_size(out: &mut Vec<u8>, v: u64) {
     match v {
         0..=0xfc => out.push(v as u8),
         0xfd..=0xffff => {

@@ -21,3 +21,10 @@ base64 = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 hex = { workspace = true }
+
+[features]
+# Compile the vendored BIP vectors into the crate so that other crates' tests
+# can referee themselves against the same bytes. Off by default: this is ~200
+# KiB of JSON that has no business in a shipped binary. `node`'s dev-dependency
+# turns it on, which reaches only its test and bench targets.
+test-vectors = []

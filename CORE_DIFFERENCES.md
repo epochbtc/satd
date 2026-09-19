@@ -466,6 +466,41 @@ preserved; the satd extension is opt-in per request or per flag.
   cross-block pipeline. Core parallelizes within a block via
   `CCheckQueue` but not across blocks.
 
+- **PSBT version 2 (BIP 370) and the BIP 375 silent payment fields** —
+  every PSBT method accepts a version 2 PSBT and answers with one. Core
+  does not: `PSBT_HIGHEST_VERSION` is 0 in its 2026-03 tree and the
+  version 2 pull request (#21283) is still open, so Core rejects any
+  PSBT whose `PSBT_GLOBAL_VERSION` is above zero. This is a superset,
+  not a divergence: the version 0 path is byte-identical to what it was,
+  error text included, and is guarded by a snapshot test. Four notes for
+  anyone comparing against Core.
+
+  - `decodepsbt` on a version 2 PSBT returns a different shape, with
+    `psbt_version`, `tx_version`, `fallback_locktime`, per-input
+    `previous_txid` / `previous_vout` / `sequence`, per-output `amount`
+    and `script`, a `silent_payments` object, and an `unknown` object
+    per map. Field names follow Core's own version 2 pull request where
+    it has one. `tx` and `tx_hex` appear only once every output has a
+    script: a silent payment output whose script has not been computed
+    yet describes no transaction, and emitting an empty script instead
+    would read as an output paying nobody.
+  - `combinepsbt` **refuses** two PSBTs that give different values for
+    the same key, naming the field. Core keeps whichever it saw first.
+    For a signature that hardly matters; for a BIP 375 ECDH share it
+    decides where the money goes, and picking one arbitrarily is the
+    wrong default for a field like that.
+  - `joinpsbts` refuses a silent payment PSBT whose output scripts are
+    already computed, whose global ECDH share is set, or which does not
+    allow inputs and outputs to be added. Joining changes the input set,
+    and every silent payment script derives from it.
+  - `finalizepsbt` refuses a PSBT carrying silent payment outputs while
+    satd cannot yet recompute and verify their scripts. BIP 375 gives
+    the Transaction Extractor that duty.
+
+  BIP 375 is still a draft. The field set has not moved since 0.1.0 and
+  satd is refereed against the BIP's published vectors, but a draft can
+  change.
+
 ---
 
 ## Intentional exclusions

@@ -987,6 +987,16 @@ fn run_sign(psbt_arg: Option<&str>, psbt_file: Option<&std::path::Path>, gap: u3
         Err(code) => return code,
     };
 
+    // Refuse a version 2 PSBT before asking for a key. Signing one means
+    // taking on the BIP 375 Signer duties — computing ECDH shares and the
+    // output scripts that follow from them — and this signer does not do that
+    // yet. Prompting first and failing afterwards would put a private key on
+    // the terminal for nothing.
+    if sign::psbt_version(&psbt_b64) == satd_psbt::PsbtVersion::V2 {
+        eprintln!("error: version 2 PSBTs are not supported by this signer yet");
+        return 1;
+    }
+
     let mut psbt = match sign::psbt_from_base64(&psbt_b64) {
         Ok(p) => p,
         Err(e) => {
@@ -1050,6 +1060,9 @@ fn run_sign_with_signer(
         Ok(s) => s,
         Err(code) => return code,
     };
+    if sign::psbt_version(&psbt_b64) == satd_psbt::PsbtVersion::V2 {
+        return run_sign_with_signer_v2(&psbt_b64, signer, fingerprint, chain);
+    }
     // Parse the PSBT locally before handing it to the signer; keep it so we can
     // verify the signer didn't alter the transaction.
     let original = match sign::psbt_from_base64(&psbt_b64) {
@@ -1103,6 +1116,103 @@ fn run_sign_with_signer(
     emit_result(&psbt, &summary)
 }
 
+/// `signpsbtwithsigner` for a version 2 PSBT.
+///
+/// The PSBT goes to the external signer untouched. Refusing it here would be
+/// the wrong call: for a silent payment the only party that can compute an
+/// ECDH share is the one holding the input's private key, so a device is
+/// exactly who should be asked — and `sat-cli` cannot know which devices have
+/// learned BIP 375. What it can do is check what comes back.
+fn run_sign_with_signer_v2(
+    psbt_b64: &str,
+    signer: &str,
+    fingerprint: Option<&str>,
+    chain: &str,
+) -> i32 {
+    let original = match sign::raw_psbt_from_base64(psbt_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let has_silent_payments = original
+        .outputs
+        .iter()
+        .any(|o| o.contains_type(satd_psbt::keys::output::SP_V0_INFO));
+    let original_id = match satd_psbt::V2View::new(&original).and_then(|v| v.unique_id()) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let argv = match signer::parse_signer_argv(signer) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let fp = match signer::resolve_fingerprint(&argv, fingerprint) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let signed_b64 = match signer::signtx(&argv, &fp, chain, psbt_b64) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            if has_silent_payments {
+                eprintln!(
+                    "note: this PSBT pays a silent payment address, so the signer must                      support BIP 375 to sign it"
+                );
+            }
+            return 1;
+        }
+    };
+    let psbt = match sign::raw_psbt_from_base64(&signed_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: signer returned an unparseable PSBT: {e}");
+            return 1;
+        }
+    };
+
+    // A signer adds signature data; it does not choose the transaction. BIP
+    // 370's unique identifier is what to compare, because it ignores the
+    // sequence numbers an Updater may legitimately have changed, and BIP 375
+    // extends it to cover a silent payment output whose script does not exist
+    // yet.
+    match satd_psbt::V2View::new(&psbt).and_then(|v| v.unique_id()) {
+        Ok(id) if id == original_id => {}
+        Ok(_) => {
+            eprintln!(
+                "error: signer returned a PSBT with a different unsigned transaction; \
+                 refusing to emit it"
+            );
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("error: signer returned a PSBT with no determinable transaction: {e}");
+            return 1;
+        }
+    }
+
+    let summary = match sign::summarize_v2(&psbt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    println!("{}", sign::raw_psbt_to_base64(&psbt));
+    report_summary(&summary)
+}
+
 /// Resolve the PSBT base64 from a positional argument or `--psbt-file`. On
 /// failure prints the error and returns the exit code to use.
 fn resolve_psbt_b64(
@@ -1126,6 +1236,12 @@ fn resolve_psbt_b64(
 /// exit code (0 fully signed, 2 partial — PSBT still emitted).
 fn emit_result(psbt: &bitcoin::psbt::Psbt, summary: &sign::SignSummary) -> i32 {
     println!("{}", sign::psbt_to_base64(psbt));
+    report_summary(summary)
+}
+
+/// Print the per-input report to stderr and return the exit code. Shared by
+/// the version 0 and version 2 paths so they report identically.
+fn report_summary(summary: &sign::SignSummary) -> i32 {
     for (i, outcome) in summary.per_input.iter().enumerate() {
         eprintln!("input {i}: {}", outcome.as_str());
     }
