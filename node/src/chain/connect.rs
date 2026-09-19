@@ -785,9 +785,14 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 // row and count it. That is correct rather than merely
                 // tolerable: an AssumeUTXO node's address index is
                 // incomplete until the operator runs `backfillindex
-                // address` after validation completes, and that
-                // backfill's second pass rewrites every height up to the
-                // snapshot.
+                // address` after validation completes. That backfill
+                // pins the chain tip at the moment it starts and walks
+                // every block from genesis to it — not just the blocks
+                // below the snapshot base — writing the ordinal rows of
+                // every transaction on the way (pass 1) and then the
+                // rows for every spend (pass 2). So a spend skipped here
+                // is rewritten by it, and once it has run the lookup
+                // above resolves every snapshot coin.
                 //
                 // The whole block is gated on the index being on: the
                 // fallback is a point read, and a validating-only node

@@ -1188,6 +1188,38 @@ impl CoinCache {
     }
 }
 
+/// What the pending batch says about a transaction's `tx_loc` row.
+enum PendingTxLoc {
+    /// A connected-since-flush block numbered it at this ordinal.
+    Put(u64),
+    /// A disconnected-since-flush block took it off the chain.
+    Removed,
+    /// The pending batch has nothing to say; the flushed rows stand.
+    Untouched,
+}
+
+impl CoinCache {
+    fn pending_tx_loc(&self, txid: &Txid) -> PendingTxLoc {
+        let pending = self.pending_batch.lock();
+        if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
+            PendingTxLoc::Put(*seq)
+        } else if pending.tx_loc_removes.contains(txid) {
+            PendingTxLoc::Removed
+        } else {
+            PendingTxLoc::Untouched
+        }
+    }
+
+    /// The ordinal the flushed rows give a transaction: the LRU first,
+    /// which mirrors the inner store, then the inner store itself.
+    fn flushed_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        if let Some(&seq) = self.tx_loc_cache.lock().get(txid) {
+            return Some(seq);
+        }
+        self.inner.get_tx_seq(txid)
+    }
+}
+
 impl Store for CoinCache {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         // Snapshot the invalidation generation BEFORE the dirty check: if
@@ -1499,19 +1531,11 @@ impl Store for CoinCache {
         // The LRU alone is not enough: it is populated only when the
         // inner store has `-txindex`, so on an `-addressindex`-only node
         // it is always empty.
-        {
-            let pending = self.pending_batch.lock();
-            if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
-                return Some(*seq);
-            }
-            if pending.tx_loc_removes.contains(txid) {
-                return None;
-            }
+        match self.pending_tx_loc(txid) {
+            PendingTxLoc::Put(seq) => Some(seq),
+            PendingTxLoc::Removed => None,
+            PendingTxLoc::Untouched => self.flushed_tx_seq(txid),
         }
-        if let Some(&seq) = self.tx_loc_cache.lock().get(txid) {
-            return Some(seq);
-        }
-        self.inner.get_tx_seq(txid)
     }
 
     fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
@@ -2079,11 +2103,27 @@ impl Store for CoinCache {
         // surface that as definitive "unspent". (Round-4 M1.)
         //
         // The pending rows are ordinal-keyed, so the outpoint has to be
-        // named that way first. `get_tx_seq` reads the pending batch
-        // too, which is what makes this work for a spend of an output
-        // created by the very same unflushed block.
-        let Some(funding_txseq) = self.get_tx_seq(&outpoint.txid) else {
-            return self.inner.lookup_spend(outpoint);
+        // named that way first — through the pending batch, which is
+        // what makes this work for a spend of an output created by the
+        // very same unflushed block.
+        //
+        // Round-1 review: when the pending batch has edited the funding
+        // transaction's own `tx_loc`, the inner store's rows for its
+        // outputs are keyed under an ordinal a reorg has retired, and
+        // every one of them was removed by the same reorg — a spender
+        // sits at or above the funding block, and disconnecting the
+        // funding block disconnects everything above it first. Those
+        // removes name the *old* ordinal, so they cannot be matched
+        // against the new one here; the inner rows are simply not
+        // consulted. What is spent is then exactly what the pending
+        // batch says is spent.
+        let (funding_txseq, funding_moved) = match self.pending_tx_loc(&outpoint.txid) {
+            PendingTxLoc::Removed => return Ok(None),
+            PendingTxLoc::Put(seq) => (seq, true),
+            PendingTxLoc::Untouched => match self.flushed_tx_seq(&outpoint.txid) {
+                Some(seq) => (seq, false),
+                None => return self.inner.lookup_spend(outpoint),
+            },
         };
         let key = (funding_txseq, outpoint.vout);
         let (pending_put, pending_remove) = {
@@ -2106,7 +2146,7 @@ impl Store for CoinCache {
             // batch as the spend row.
             return Ok(resolve_spending_ref_via(self, spending_txseq, vin));
         }
-        if pending_remove {
+        if pending_remove || funding_moved {
             return Ok(None);
         }
         self.inner.lookup_spend(outpoint)
@@ -2121,8 +2161,15 @@ impl Store for CoinCache {
         // here and `/tx/:txid/outspend/:vout` from `lookup_spend`, so
         // an overlay on one and not the other would make the two
         // endpoints disagree about the tip block's own spends.
-        let Some(funding_txseq) = self.get_tx_seq(txid) else {
-            return self.inner.lookup_spends_of_tx(txid);
+        // Same reorg rule as `lookup_spend`: a pending `tx_loc` edit for
+        // the funding transaction retires every inner row for it.
+        let (funding_txseq, funding_moved) = match self.pending_tx_loc(txid) {
+            PendingTxLoc::Removed => return Ok(Vec::new()),
+            PendingTxLoc::Put(seq) => (seq, true),
+            PendingTxLoc::Untouched => match self.flushed_tx_seq(txid) {
+                Some(seq) => (seq, false),
+                None => return self.inner.lookup_spends_of_tx(txid),
+            },
         };
         let (pending_puts, pending_removes) = {
             let pending = self.pending_batch.lock();
@@ -2141,15 +2188,19 @@ impl Store for CoinCache {
                     .collect::<std::collections::HashSet<u32>>(),
             )
         };
-        if pending_puts.is_empty() && pending_removes.is_empty() {
+        if pending_puts.is_empty() && pending_removes.is_empty() && !funding_moved {
             return self.inner.lookup_spends_of_tx(txid);
         }
 
         // Pending puts win over the inner row for the same vout; a
-        // pending remove with no matching put drops it.
-        let mut merged: std::collections::BTreeMap<u32, node_index::SpendingRef> = self
-            .inner
-            .lookup_spends_of_tx(txid)?
+        // pending remove with no matching put drops it; a moved funding
+        // transaction has no inner rows worth reading.
+        let inner_rows = if funding_moved {
+            Vec::new()
+        } else {
+            self.inner.lookup_spends_of_tx(txid)?
+        };
+        let mut merged: std::collections::BTreeMap<u32, node_index::SpendingRef> = inner_rows
             .into_iter()
             .filter(|(vout, _)| !pending_removes.contains(vout))
             .collect();
@@ -3809,6 +3860,122 @@ mod tests {
 
         cache.flush_durable().unwrap();
         assert_eq!(cache.lookup_spend(&prev).unwrap(), None);
+    }
+
+    /// Round-1 review (PR 802 M1): a reorg re-mines the funding
+    /// transaction at a different ordinal, and its old spender is not
+    /// re-mined. The pending batch removes the spend under the *old*
+    /// ordinal; the overlay resolved the outpoint to the *new* one, so
+    /// the remove never matched, and the inner store — still keyed on
+    /// the old ordinal — answered with a spend that is no longer on the
+    /// chain. Esplora's outspend would have named an orphaned spender
+    /// until the flush.
+    #[test]
+    fn lookup_spend_drops_inner_rows_once_a_reorg_moved_the_funding_ordinal() {
+        let cache = make_cache(16);
+        let funding = make_outpoint(0x41, 0);
+        let spender = make_outpoint(0x42, 0).txid;
+        // On disk: block 5 = [funding] at ordinal 10, block 6 = [spender]
+        // at ordinal 20, and the spend row between them.
+        seed_ordinal_block(&cache, 5, 10, &[funding.txid]);
+        seed_ordinal_block(&cache, 6, 20, &[spender]);
+        let mut commit = StoreBatch::default();
+        commit.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 10,
+            vout: 0,
+            spending_txseq: 20,
+            vin: 0,
+        });
+        cache.write_batch(commit).unwrap();
+        cache.flush_durable().unwrap();
+        assert!(cache.lookup_spend(&funding).unwrap().is_some());
+        assert_eq!(cache.lookup_spends_of_tx(&funding.txid).unwrap().len(), 1);
+
+        // Reorg, unflushed: block 6 off (its spend row with it), block 5
+        // off, then a replacement block 5 whose coinbase takes ordinal
+        // 10 and pushes the funding transaction to 11. The spender is
+        // not re-mined.
+        let mut disconnect = StoreBatch::default();
+        disconnect.spent_removes.push((10, 0));
+        disconnect.tx_loc_removes.extend([spender, funding.txid]);
+        disconnect.txseq_txid_removes.extend([20, 10]);
+        disconnect.txseq_block_removes.extend([20, 10]);
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x43, 0), a_coin(5)));
+        cache.write_batch(disconnect).unwrap();
+        let coinbase = make_outpoint(0x44, 0).txid;
+        let mut connect = StoreBatch::default();
+        let hash = make_block_hash(0xa5);
+        let mut entry = make_test_entry(5);
+        entry.num_tx = 2;
+        connect.block_index_puts.push((hash, entry));
+        connect.height_hash_puts.push((5, hash));
+        connect.txseq_block_puts.push((10, 5));
+        connect.tx_loc_puts.extend([(coinbase, 10), (funding.txid, 11)]);
+        connect
+            .txseq_txid_puts
+            .extend([(10, coinbase), (11, funding.txid)]);
+        connect
+            .coin_puts
+            .push((make_outpoint(0x45, 0), a_coin(5)));
+        cache.write_batch(connect).unwrap();
+        assert_eq!(cache.get_tx_seq(&funding.txid), Some(11));
+
+        assert_eq!(
+            cache.lookup_spend(&funding).unwrap(),
+            None,
+            "the only spender was disconnected and not re-mined; the inner \
+             row under the retired ordinal must not answer"
+        );
+        assert!(
+            cache.lookup_spends_of_tx(&funding.txid).unwrap().is_empty(),
+            "outspends must agree with outspend"
+        );
+
+        cache.flush_durable().unwrap();
+        assert_eq!(cache.lookup_spend(&funding).unwrap(), None);
+        assert!(cache.lookup_spends_of_tx(&funding.txid).unwrap().is_empty());
+    }
+
+    /// The adjacent case: the funding transaction is disconnected and
+    /// not re-mined at all, so the overlay has no ordinal for it. The
+    /// old code fell through to the inner store, which still had one.
+    #[test]
+    fn lookup_spend_drops_inner_rows_once_a_reorg_disconnected_the_funding_tx() {
+        let cache = make_cache(16);
+        let funding = make_outpoint(0x51, 0);
+        let spender = make_outpoint(0x52, 0).txid;
+        seed_ordinal_block(&cache, 5, 10, &[funding.txid]);
+        seed_ordinal_block(&cache, 6, 20, &[spender]);
+        let mut commit = StoreBatch::default();
+        commit.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 10,
+            vout: 0,
+            spending_txseq: 20,
+            vin: 0,
+        });
+        cache.write_batch(commit).unwrap();
+        cache.flush_durable().unwrap();
+        assert!(cache.lookup_spend(&funding).unwrap().is_some());
+
+        let mut disconnect = StoreBatch::default();
+        disconnect.spent_removes.push((10, 0));
+        disconnect.tx_loc_removes.extend([spender, funding.txid]);
+        disconnect.txseq_txid_removes.extend([20, 10]);
+        disconnect.txseq_block_removes.extend([20, 10]);
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x53, 0), a_coin(5)));
+        cache.write_batch(disconnect).unwrap();
+        assert_eq!(cache.get_tx_seq(&funding.txid), None);
+
+        assert_eq!(
+            cache.lookup_spend(&funding).unwrap(),
+            None,
+            "a funding transaction the reorg took off the chain has no spends"
+        );
+        assert!(cache.lookup_spends_of_tx(&funding.txid).unwrap().is_empty());
     }
 
     #[test]
