@@ -6905,6 +6905,7 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let (cs, _mp, dir) = make_funded_env(&[(input_op, coin)]);
         let mp = Mempool::with_config(MempoolConfig {
@@ -8740,6 +8741,7 @@ mod tests {
             script_pubkey: p2wpkh_spk(0x11),
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -10362,6 +10364,7 @@ mod tests {
             script_pubkey: p2wpkh_spk(0x11),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -10493,6 +10496,7 @@ mod tests {
             script_pubkey: p2wpkh_spk(0x11),
             height: 0,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
         let tx = spend_with(op, 40_000, 0x2B, 2, 0xffff_ffff, 0);
@@ -10682,6 +10686,7 @@ mod tests {
             script_pubkey: p2wpkh_spk(0x11),
             height: 0,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let (cs, mp, dir) = make_funded_env(&[(op, cb)]);
         // Sequence MAX and locktime 0 isolate maturity from the other guards.

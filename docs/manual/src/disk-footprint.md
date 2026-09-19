@@ -23,18 +23,18 @@ the chain's growth.
 | Column family | Role | Keyed by | Row size | Approx. on disk |
 |---|---|---|---|---|
 | `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~256 GB |
-| `outpoint_spend` | UTXO → the input that spent it | `prev_txid[32] ‖ vout` | 76 B | ~186 GB |
+| `spent` | UTXO → the input that spent it | `funding_txseq[5] ‖ vout[3]` | 16 B | to be measured |
 | `addr_funding_v2` | every output paying a script | `scripthash[16] ‖ height ‖ txid ‖ vout` | 64 B | ~178 GB |
 | `tx_loc` | txid → transaction ordinal | `txid[32]` | 37 B | to be measured |
 | `txseq_txid` | transaction ordinal → txid | `txseq[5]` | 37 B | to be measured |
 | `txseq_block` | first ordinal of a block → height | `txseq[5]` | 9 B | to be measured |
-| `undo` | per-block disconnect data | `block_hash[32]` | ~28 B / input | ~74 GB |
+| `undo` | per-block disconnect data | `block_hash[32]` | ~33 B / input (incl. the funding ordinal) | ~74 GB |
 | `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~13 GB |
-| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~28 B varint | ~10 GB |
+| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~29 B varint (incl. the funding ordinal) | ~10 GB |
 | `block_index` | header and status per block | `block_hash[32]` | ~100 B | ~120 MB |
 | `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB (estimate) |
 
-The three address/txid indices plus `outpoint_spend` are the bulk. Two rows
+The three address/txid indices plus `spent` are the bulk. Two rows
 often surprise operators. `undo` is not a rolling window: satd keeps the
 disconnect data for every block, so it grows with the chain. `coins` is the
 live UTXO set, which is served from the in-memory coin cache but still
@@ -76,8 +76,8 @@ Every spend writes two rows:
 
 - `addr_spending_v2`, keyed by script (`scripthash ‖ height ‖ …`). It answers
   "show me everything address A spent."
-- `outpoint_spend`, keyed by outpoint (`prev_txid ‖ vout`). It answers "what
-  input spent this UTXO" in a single keyed read.
+- `spent`, keyed by the spent output's funding transaction and vout. It
+  answers "what input spent this UTXO" in a single keyed read.
 
 electrs and Fulcrum keep one spend representation and derive the other
 direction on demand. satd spends the disk to keep both materialized, so both
@@ -88,7 +88,7 @@ largest source of the overage.
 
 The often-quoted "30–180 GB" figure is the electrs/Fulcrum address index alone.
 satd's address index alone (`addr_funding` + `addr_spending`) already exceeds
-that range. satd also carries a transaction index, an `outpoint_spend`
+that range. satd also carries a transaction index, a `spent`
 reverse index, and BIP 158 filters in the same database, because one binary
 serves Electrum, Esplora, `getrawtransaction`, and compact-filter clients. So
 compare satd's indices to electrs plus Core's `txindex` plus a spend index plus
@@ -144,7 +144,7 @@ spend in Bitcoin's history. The footprint is data, not per-row overhead.
 | Index vs. tip consistency | Always atomic: the index update is in the same `WriteBatch` as the block | Index lags the node; reorg-window races are possible |
 | Build cost | Index built inside `connect_block` validation | Second process re-scans every block to build a parallel DB |
 | Lookup path | O(1) keyed read, in-process function call | Cross-process RPC plus the indexer's own lookup |
-| Spend-by-outpoint | O(1) (`outpoint_spend`) | Often derived or scanned |
+| Spend-by-outpoint | O(1) (`spent`) | Often derived or scanned |
 | Operational surface | One process, one config, one backup, one reindex | Two or more processes to wire, monitor, and keep in lockstep |
 | TLS / auth | Native on every surface | Usually a separate reverse proxy |
 | Disk | Larger in aggregate | Smaller per tool, but you run several |
@@ -163,7 +163,7 @@ The indices are opt-in per surface. Match the disk to what you serve:
 |---|---|---|
 | Validating node only | (defaults; indices off) | none |
 | `getrawtransaction <txid>` anywhere | `-txindex=1` | `tx_loc`, `txseq_txid`, `txseq_block` |
-| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v2`, `addr_spending_v2`, `outpoint_spend`, `tx_loc`, `txseq_txid`, `txseq_block` |
+| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v2`, `addr_spending_v2`, `spent`, `tx_loc`, `txseq_txid`, `txseq_block` |
 | BIP 157/158 light-client service | `-blockfilterindex=basic -peerblockfilters=1` | `block_filter`, `block_filter_header` |
 | BIP 352 silent-payment scanning or serving | `-silentpaymentindex=1` | `sp_tweaks` |
 
@@ -340,14 +340,14 @@ body on the chain and cannot distinguish a data hole from an unknown block
 > versions. Datadirs that predate this may still carry a hole from an earlier
 > crash; nothing audits or migrates them on upgrade.
 
-## Upgrading to chainstate schema 4
+## Upgrading to chainstate schema 5
 
 The chainstate is versioned, and a satd that cannot read an older layout
 refuses to open the datadir rather than misinterpret its rows. The refusal
 names the remedy:
 
 ```
-Chainstate schema version mismatch: DB has v3, binary expects v4.
+Chainstate schema version mismatch: DB has v4, binary expects v5.
 Run with --reindex-chainstate to rebuild from existing block files.
 ```
 

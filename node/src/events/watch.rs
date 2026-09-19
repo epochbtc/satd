@@ -3419,6 +3419,7 @@ mod tests {
             script_pubkey: spk,
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -3428,6 +3429,7 @@ mod tests {
             script_pubkey: spk,
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -5331,6 +5333,7 @@ mod tests {
                         )),
                         height: 1,
                         coinbase: false,
+                        txseq: node_index::TXSEQ_UNKNOWN,
                     });
                 }
                 let output: Vec<TxOut> = given["outputs"]

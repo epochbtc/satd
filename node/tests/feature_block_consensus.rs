@@ -218,7 +218,13 @@ fn store_with_coin(amount: u64, height: u32, coinbase: bool) -> (InMemoryStore, 
     let store = differential_store();
     let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]));
     let outpoint = OutPoint { txid, vout: 0 };
-    let coin = Coin { amount, script_pubkey: bitcoin::ScriptBuf::new(), height, coinbase };
+    let coin = Coin {
+        amount,
+        script_pubkey: bitcoin::ScriptBuf::new(),
+        height,
+        coinbase,
+        txseq: node_index::TXSEQ_UNKNOWN,
+    };
     let mut batch = StoreBatch::default();
     batch.coin_puts.push((outpoint, coin));
     store.write_batch(batch).unwrap();
@@ -637,7 +643,13 @@ fn case_gap_bip30() -> Satd {
     let mut batch = StoreBatch::default();
     batch.coin_puts.push((
         OutPoint { txid: dup_txid, vout: 0 },
-        Coin { amount: 1_000, script_pubkey: bitcoin::ScriptBuf::new(), height: 1, coinbase: false },
+        Coin {
+            amount: 1_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 1,
+            coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
+        },
     ));
     store.write_batch(batch).unwrap();
     let block = block_of(vec![coinbase(200, block_subsidy(Network::Regtest, 200)), spend]);

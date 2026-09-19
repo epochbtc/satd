@@ -37,7 +37,12 @@ pub struct InMemoryStore {
     prune_height: parking_lot::RwLock<Option<u32>>,
     addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
     addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
-    outpoint_spend: parking_lot::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
+    /// `spent` rows, keyed `(funding ordinal, vout)` and valued
+    /// `(spending ordinal, vin)` — the on-disk shape, so the in-memory
+    /// backend exercises the same resolution path the real one does.
+    /// `BTreeMap` so `lookup_spends_of_tx` can range over one funding
+    /// transaction's outputs, as the RocksDB prefix scan does.
+    spent: parking_lot::RwLock<std::collections::BTreeMap<(u64, u32), (u64, u32)>>,
     #[cfg(feature = "block-filter-index")]
     filter: parking_lot::RwLock<std::collections::HashMap<FilterKey, Vec<u8>>>,
     #[cfg(feature = "block-filter-index")]
@@ -52,6 +57,14 @@ pub struct InMemoryStore {
     /// opt-in), mirroring the always-present `outpoint_spend` map.
     sp_tweaks: parking_lot::RwLock<std::collections::HashMap<u32, node_sp_index::SpBlockRow>>,
     sp_complete: parking_lot::RwLock<bool>,
+    /// Address- and spend-index completeness. The trait defaults both to
+    /// `true` for non-Rocks backends, which is the right answer for a
+    /// freshly built in-memory chain — but it makes the one transition
+    /// that clears them, an AssumeUTXO snapshot load, unobservable from
+    /// any in-memory test. Modelling them here is what lets a test see
+    /// that a snapshot leaves the indexes marked incomplete.
+    address_index_complete: parking_lot::RwLock<bool>,
+    spent_complete: parking_lot::RwLock<bool>,
     sp_backfill_cursor: parking_lot::RwLock<node_sp_index::cursor::BackfillCursor>,
     sp_backfill_last_error: parking_lot::RwLock<Option<String>>,
 }
@@ -83,7 +96,7 @@ impl InMemoryStore {
             prune_height: parking_lot::RwLock::new(None),
             addr_funding: parking_lot::RwLock::new(Vec::new()),
             addr_spending: parking_lot::RwLock::new(Vec::new()),
-            outpoint_spend: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            spent: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "block-filter-index")]
             filter: parking_lot::RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "block-filter-index")]
@@ -104,6 +117,8 @@ impl InMemoryStore {
             // stamp it explicitly (or drive a from-genesis connect chain,
             // which needs no backfill).
             sp_complete: parking_lot::RwLock::new(true),
+            address_index_complete: parking_lot::RwLock::new(true),
+            spent_complete: parking_lot::RwLock::new(true),
             sp_backfill_cursor: parking_lot::RwLock::new(
                 node_sp_index::cursor::BackfillCursor::idle(),
             ),
@@ -246,13 +261,13 @@ impl Store for InMemoryStore {
                 as_.retain(|r| r.key() != k);
             }
         }
-        if !batch.outpoint_spend_puts.is_empty() || !batch.outpoint_spend_removes.is_empty() {
-            let mut os = self.outpoint_spend.write();
-            for (op, sref) in batch.outpoint_spend_puts {
-                os.insert(op, sref);
+        if !batch.spent_puts.is_empty() || !batch.spent_removes.is_empty() {
+            let mut sp = self.spent.write();
+            for row in batch.spent_puts {
+                sp.insert(row.key(), (row.spending_txseq, row.vin));
             }
-            for op in batch.outpoint_spend_removes {
-                os.remove(&op);
+            for key in batch.spent_removes {
+                sp.remove(&key);
             }
         }
 
@@ -455,7 +470,7 @@ impl Store for InMemoryStore {
         self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();
-        self.outpoint_spend.write().clear();
+        self.spent.write().clear();
         #[cfg(feature = "block-filter-index")]
         {
             self.filter.write().clear();
@@ -477,7 +492,7 @@ impl Store for InMemoryStore {
         self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();
-        self.outpoint_spend.write().clear();
+        self.spent.write().clear();
         #[cfg(feature = "block-filter-index")]
         {
             self.filter.write().clear();
@@ -521,11 +536,85 @@ impl Store for InMemoryStore {
     }
 
     fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
-        Ok(self.outpoint_spend.read().get(outpoint).copied())
+        let Some(funding_txseq) = self.get_tx_seq(&outpoint.txid) else {
+            return Ok(None);
+        };
+        let Some((spending_txseq, vin)) = self
+            .spent
+            .read()
+            .get(&(funding_txseq, outpoint.vout))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        Ok(
+            crate::index::resolve::resolve_txseqs(self, &[spending_txseq])
+                .into_iter()
+                .next()
+                .flatten()
+                .map(|r| SpendingRef {
+                    spending_txid: r.txid,
+                    spending_vin: vin,
+                    height: r.height,
+                }),
+        )
+    }
+
+    fn lookup_spends_of_tx(&self, txid: &Txid) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
+        let Some(funding_txseq) = self.get_tx_seq(txid) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(u32, u64, u32)> = self
+            .spent
+            .read()
+            .range((funding_txseq, 0)..=(funding_txseq, u32::MAX))
+            .map(|(&(_, vout), &(seq, vin))| (vout, seq, vin))
+            .collect();
+        let seqs: Vec<u64> = rows.iter().map(|(_, seq, _)| *seq).collect();
+        let resolved = crate::index::resolve::resolve_txseqs(self, &seqs);
+        Ok(rows
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|((vout, _, vin), r)| {
+                let r = r?;
+                Some((
+                    vout,
+                    SpendingRef {
+                        spending_txid: r.txid,
+                        spending_vin: vin,
+                        height: r.height,
+                    },
+                ))
+            })
+            .collect())
     }
 
     fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {
         self.sp_tweaks.read().get(&height).cloned()
+    }
+
+    fn address_index_complete(&self) -> bool {
+        *self.address_index_complete.read()
+    }
+
+    fn mark_address_index_complete(&self) -> Result<(), StoreError> {
+        *self.address_index_complete.write() = true;
+        Ok(())
+    }
+
+    fn spent_complete(&self) -> bool {
+        *self.spent_complete.read()
+    }
+
+    fn mark_spent_complete(&self) -> Result<(), StoreError> {
+        *self.spent_complete.write() = true;
+        Ok(())
+    }
+
+    fn mark_index_incomplete_after_snapshot(&self) -> Result<(), StoreError> {
+        *self.address_index_complete.write() = false;
+        *self.spent_complete.write() = false;
+        Ok(())
     }
 
     fn silent_payment_index_complete(&self) -> bool {
@@ -637,6 +726,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 7,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
 
         let paired = mk_op(1);
@@ -699,6 +789,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
 
         let mut batch = StoreBatch::default();

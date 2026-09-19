@@ -6,5 +6,6 @@
 pub mod address;
 pub mod filter;
 pub mod outpoint_spend;
+pub mod resolve;
 pub mod silent_payments;
 pub mod stint;

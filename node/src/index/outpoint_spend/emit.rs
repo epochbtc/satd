@@ -1,37 +1,39 @@
-//! Emission helpers for the `outpoint_spend` CF. Mirrors
-//! `index::address::emit` but writes a single row per consumed UTXO
-//! keyed by the spent outpoint instead of by scripthash.
-
-use bitcoin::{OutPoint, Txid};
+//! Emission helpers for the `spent` column family. Mirrors
+//! `index::address::emit` but writes a single row per consumed UTXO,
+//! keyed by the ordinal of the transaction that created the output
+//! rather than by scripthash.
 
 use crate::index::address::config::AddressIndexConfig;
-use crate::index::outpoint_spend::SpendingRef;
 use crate::storage::StoreBatch;
+use node_index::SpentRow;
 
-/// Emit an `outpoint_spend` row for input `vin` of `txid` at `height`
-/// consuming `prev_outpoint`. Called from `connect_block` immediately
+/// Emit a `spent` row for input `vin` of the transaction with ordinal
+/// `spending_txseq`, consuming output `vout` of the transaction with
+/// ordinal `funding_txseq`. Called from `connect_block` immediately
 /// after the address-index spending row is queued, sharing the same
 /// guard. No-op when the index is disabled.
+///
+/// The caller resolves `funding_txseq` — it comes out of the spent coin
+/// on the hot path, which is why the coin carries it — and skips the
+/// call entirely when it cannot, rather than passing a placeholder.
 #[inline]
 pub fn emit_spend(
     batch: &mut StoreBatch,
     cfg: &AddressIndexConfig,
-    height: u32,
-    txid: Txid,
+    funding_txseq: u64,
+    vout: u32,
+    spending_txseq: u64,
     vin: u32,
-    prev_outpoint: OutPoint,
 ) {
     if !cfg.enabled {
         return;
     }
-    batch.outpoint_spend_puts.push((
-        prev_outpoint,
-        SpendingRef {
-            spending_txid: txid,
-            spending_vin: vin,
-            height,
-        },
-    ));
+    batch.spent_puts.push(SpentRow {
+        funding_txseq,
+        vout,
+        spending_txseq,
+        vin,
+    });
 }
 
 /// Build the removal key for a spending input. Used by
@@ -39,9 +41,9 @@ pub fn emit_spend(
 /// Returns `None` when the index is disabled so the caller can skip
 /// the push without an extra branch.
 #[inline]
-pub fn remove_key(cfg: &AddressIndexConfig, prev_outpoint: OutPoint) -> Option<OutPoint> {
+pub fn remove_key(cfg: &AddressIndexConfig, funding_txseq: u64, vout: u32) -> Option<(u64, u32)> {
     if !cfg.enabled {
         return None;
     }
-    Some(prev_outpoint)
+    Some((funding_txseq, vout))
 }

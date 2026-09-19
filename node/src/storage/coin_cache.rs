@@ -510,7 +510,7 @@ impl CoinCache {
             || !batch.txseq_block_removes.is_empty()
             || !batch.addr_funding_removes.is_empty()
             || !batch.addr_spending_removes.is_empty()
-            || !batch.outpoint_spend_removes.is_empty()
+            || !batch.spent_removes.is_empty()
             || !batch.chain_tx_puts.is_empty()
             // Silent-payment tweak rows ride the chainstate batch. They only
             // ever enter `pending` alongside a connect/disconnect (which set
@@ -1026,8 +1026,8 @@ impl CoinCache {
             || !batch.addr_spending_puts.is_empty()
             || !batch.addr_funding_removes.is_empty()
             || !batch.addr_spending_removes.is_empty()
-            || !batch.outpoint_spend_puts.is_empty()
-            || !batch.outpoint_spend_removes.is_empty()
+            || !batch.spent_puts.is_empty()
+            || !batch.spent_removes.is_empty()
             || !batch.addr_backfill_temp_puts.is_empty()
             || batch.backfill_cursor_advance.is_some()
             || !batch.sp_tweak_puts.is_empty()
@@ -1097,8 +1097,8 @@ impl CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
-                    outpoint_spend_puts: batch.outpoint_spend_puts,
-                    outpoint_spend_removes: batch.outpoint_spend_removes,
+                    spent_puts: batch.spent_puts,
+                    spent_removes: batch.spent_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
                     #[cfg(feature = "block-filter-index")]
@@ -1163,8 +1163,8 @@ impl CoinCache {
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
                     addr_spending_removes: batch.addr_spending_removes,
-                    outpoint_spend_puts: batch.outpoint_spend_puts,
-                    outpoint_spend_removes: batch.outpoint_spend_removes,
+                    spent_puts: batch.spent_puts,
+                    spent_removes: batch.spent_removes,
                     addr_backfill_temp_puts: batch.addr_backfill_temp_puts,
                     backfill_cursor_advance: batch.backfill_cursor_advance,
                     #[cfg(feature = "block-filter-index")]
@@ -1881,7 +1881,7 @@ impl Store for CoinCache {
     fn lookup_backfill_temp(
         &self,
         outpoint: &OutPoint,
-    ) -> Result<Option<crate::index::address::Scripthash>, StoreError> {
+    ) -> Result<Option<(crate::index::address::Scripthash, u64)>, StoreError> {
         self.inner.lookup_backfill_temp(outpoint)
     }
 
@@ -1921,12 +1921,16 @@ impl Store for CoinCache {
     // Index-completeness marker forwarders. Without these, the
     // trait defaults (return `true`) leak through and mask the
     // upgrade-gap detection done at store-open time.
-    fn outpoint_spend_complete(&self) -> bool {
-        self.inner.outpoint_spend_complete()
+    fn spent_complete(&self) -> bool {
+        self.inner.spent_complete()
     }
 
-    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
-        self.inner.mark_outpoint_spend_complete()
+    fn mark_spent_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_spent_complete()
+    }
+
+    fn mark_index_incomplete_after_snapshot(&self) -> Result<(), StoreError> {
+        self.inner.mark_index_incomplete_after_snapshot()
     }
 
     fn tx_index_complete(&self) -> bool {
@@ -2070,31 +2074,113 @@ impl Store for CoinCache {
         // be sitting in `pending_batch` until flush, so consult it
         // before forwarding to the inner store. Without this,
         // `RocksSpendIndex::spend_of` could return `Ok(None)` for an
-        // outpoint that was just spent — and with `outpoint_spend.complete`
+        // outpoint that was just spent — and with `spent.complete`
         // true (fresh datadir), the round-3 H2 enforcement would
         // surface that as definitive "unspent". (Round-4 M1.)
-        let pending = self.pending_batch.lock();
-        // Pending remove takes precedence: the on-disk net effect of
-        // remove-then-put is the put (last-writer-wins), but
-        // remove-only flips a previously-set entry off. Mirror that.
-        let pending_remove = pending
-            .outpoint_spend_removes
-            .iter()
-            .any(|op| op == outpoint);
-        let pending_put = pending
-            .outpoint_spend_puts
-            .iter()
-            .find(|(op, _)| op == outpoint)
-            .map(|(_, sref)| *sref);
-        drop(pending);
-        if let Some(sref) = pending_put {
-            return Ok(Some(sref));
+        //
+        // The pending rows are ordinal-keyed, so the outpoint has to be
+        // named that way first. `get_tx_seq` reads the pending batch
+        // too, which is what makes this work for a spend of an output
+        // created by the very same unflushed block.
+        let Some(funding_txseq) = self.get_tx_seq(&outpoint.txid) else {
+            return self.inner.lookup_spend(outpoint);
+        };
+        let key = (funding_txseq, outpoint.vout);
+        let (pending_put, pending_remove) = {
+            let pending = self.pending_batch.lock();
+            // Pending remove takes precedence: the on-disk net effect of
+            // remove-then-put is the put (last-writer-wins), but
+            // remove-only flips a previously-set entry off. Mirror that.
+            (
+                pending
+                    .spent_puts
+                    .iter()
+                    .find(|r| r.key() == key)
+                    .map(|r| (r.spending_txseq, r.vin)),
+                pending.spent_removes.contains(&key),
+            )
+        };
+        if let Some((spending_txseq, vin)) = pending_put {
+            // Resolve through `self`, not `inner`: the spending
+            // transaction's own ordinal rows are in the same pending
+            // batch as the spend row.
+            return Ok(resolve_spending_ref_via(self, spending_txseq, vin));
         }
         if pending_remove {
             return Ok(None);
         }
         self.inner.lookup_spend(outpoint)
     }
+
+    fn lookup_spends_of_tx(
+        &self,
+        txid: &Txid,
+    ) -> Result<Vec<(u32, node_index::SpendingRef)>, StoreError> {
+        // Same chainstate-bound-not-flush-bound contract as
+        // `lookup_spend`. Esplora answers `/tx/:txid/outspends` from
+        // here and `/tx/:txid/outspend/:vout` from `lookup_spend`, so
+        // an overlay on one and not the other would make the two
+        // endpoints disagree about the tip block's own spends.
+        let Some(funding_txseq) = self.get_tx_seq(txid) else {
+            return self.inner.lookup_spends_of_tx(txid);
+        };
+        let (pending_puts, pending_removes) = {
+            let pending = self.pending_batch.lock();
+            (
+                pending
+                    .spent_puts
+                    .iter()
+                    .filter(|r| r.funding_txseq == funding_txseq)
+                    .map(|r| (r.vout, r.spending_txseq, r.vin))
+                    .collect::<Vec<_>>(),
+                pending
+                    .spent_removes
+                    .iter()
+                    .filter(|(seq, _)| *seq == funding_txseq)
+                    .map(|(_, vout)| *vout)
+                    .collect::<std::collections::HashSet<u32>>(),
+            )
+        };
+        if pending_puts.is_empty() && pending_removes.is_empty() {
+            return self.inner.lookup_spends_of_tx(txid);
+        }
+
+        // Pending puts win over the inner row for the same vout; a
+        // pending remove with no matching put drops it.
+        let mut merged: std::collections::BTreeMap<u32, node_index::SpendingRef> = self
+            .inner
+            .lookup_spends_of_tx(txid)?
+            .into_iter()
+            .filter(|(vout, _)| !pending_removes.contains(vout))
+            .collect();
+        for (vout, spending_txseq, vin) in pending_puts {
+            // Resolve through `self`: the spending transaction's own
+            // ordinal rows are in the same pending batch.
+            if let Some(sref) = resolve_spending_ref_via(self, spending_txseq, vin) {
+                merged.insert(vout, sref);
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+}
+
+/// [`resolve_spending_ref`](crate::storage::rocksdb_store) for an
+/// arbitrary store — here so the cache can resolve against itself and
+/// see its own pending ordinal rows.
+fn resolve_spending_ref_via(
+    store: &dyn Store,
+    spending_txseq: u64,
+    vin: u32,
+) -> Option<node_index::SpendingRef> {
+    let resolved = crate::index::resolve::resolve_txseqs(store, &[spending_txseq])
+        .into_iter()
+        .next()
+        .flatten()?;
+    Some(node_index::SpendingRef {
+        spending_txid: resolved.txid,
+        spending_vin: vin,
+        height: resolved.height,
+    })
 }
 
 #[cfg(test)]
@@ -2116,6 +2202,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -3607,79 +3694,117 @@ mod tests {
         assert!(cache.iter_addr_spending(&sh).is_empty());
     }
 
+    /// Seed the ordinal rows a `spent` lookup resolves through, in a
+    /// coin-free batch so it lands in the inner store rather than the
+    /// pending buffer — matching a block connected before the one under
+    /// test.
+    fn seed_ordinal_block(
+        cache: &CoinCache,
+        height: u32,
+        first_txseq: u64,
+        txids: &[bitcoin::Txid],
+    ) {
+        let hash = make_block_hash(0x50u8.wrapping_add(height as u8));
+        let mut batch = StoreBatch::default();
+        let mut entry = make_test_entry(height);
+        entry.num_tx = txids.len() as u32;
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((height, hash));
+        batch.txseq_block_puts.push((first_txseq, height));
+        for (i, txid) in txids.iter().enumerate() {
+            batch.tx_loc_puts.push((*txid, first_txseq + i as u64));
+            batch.txseq_txid_puts.push((first_txseq + i as u64, *txid));
+        }
+        cache.write_batch(batch).unwrap();
+        cache.flush_durable().unwrap();
+    }
+
+    fn a_coin(height: u32) -> crate::storage::coinview::Coin {
+        crate::storage::coinview::Coin {
+            amount: 1_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height,
+            coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
+        }
+    }
+
     #[test]
     fn test_pending_lookup_spend_visible_before_flush() {
-        // A just-connected block buffers outpoint_spend rows in the
-        // pending batch; lookup_spend must see them before flush
-        // (round-4 M1).
+        // A just-connected block buffers `spent` rows in the pending
+        // batch; lookup_spend must see them before flush (round-4 M1).
         let cache = make_cache(16);
         let prev = make_outpoint(0x11, 0);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0x22, 0).txid,
+        let spender = make_outpoint(0x22, 0).txid;
+        seed_ordinal_block(&cache, 5, 10, &[prev.txid]);
+        seed_ordinal_block(&cache, 50, 20, &[spender]);
+        let expected = node_index::SpendingRef {
+            spending_txid: spender,
             spending_vin: 3,
             height: 50,
         };
+
         let mut batch = StoreBatch::default();
-        batch.outpoint_spend_puts.push((prev, sref));
+        batch.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 10,
+            vout: prev.vout,
+            spending_txseq: 20,
+            vin: 3,
+        });
         // Force the connect-shape (coin_puts non-empty) so the cache
         // takes the pending-buffered path.
-        batch.coin_puts.push((
-            make_outpoint(0x33, 0),
-            crate::storage::coinview::Coin {
-                amount: 50_000_000,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-                height: 50,
-                coinbase: false,
-            },
-        ));
+        batch.coin_puts.push((make_outpoint(0x33, 0), a_coin(50)));
         cache.write_batch(batch).unwrap();
 
         // Pre-flush lookup must see the buffered spend.
         assert_eq!(
             cache.lookup_spend(&prev).unwrap(),
-            Some(sref),
-            "pending outpoint_spend put must be visible before flush"
+            Some(expected),
+            "a pending spend row must be visible before flush"
         );
 
         cache.flush_durable().unwrap();
-        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(sref));
+        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(expected));
     }
 
     #[test]
-    fn test_pending_lookup_spend_remove_hides_inner_row() {
+    fn coin_cache_lookup_spend_overlay_hides_a_pending_remove() {
         // Pre-existing on-disk row, then a disconnect-shape pending
         // remove → lookup must report None even before flush.
         let cache = make_cache(16);
         let prev = make_outpoint(0x77, 0);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0x99, 0).txid,
+        let spender = make_outpoint(0x99, 0).txid;
+        seed_ordinal_block(&cache, 3, 30, &[prev.txid]);
+        seed_ordinal_block(&cache, 100, 40, &[spender]);
+        let expected = node_index::SpendingRef {
+            spending_txid: spender,
             spending_vin: 1,
             height: 100,
         };
+
         let mut commit = StoreBatch::default();
-        commit.outpoint_spend_puts.push((prev, sref));
+        commit.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 30,
+            vout: prev.vout,
+            spending_txseq: 40,
+            vin: 1,
+        });
         cache.write_batch(commit).unwrap();
         cache.flush_durable().unwrap();
-        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(sref));
+        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(expected));
 
         // Now buffer a remove via the connect-shape path.
         let mut disconnect = StoreBatch::default();
-        disconnect.outpoint_spend_removes.push(prev);
-        disconnect.coin_puts.push((
-            make_outpoint(0x88, 0),
-            crate::storage::coinview::Coin {
-                amount: 1_000,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-                height: 101,
-                coinbase: false,
-            },
-        ));
+        disconnect.spent_removes.push((30, prev.vout));
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x88, 0), a_coin(101)));
         cache.write_batch(disconnect).unwrap();
 
         assert_eq!(
             cache.lookup_spend(&prev).unwrap(),
             None,
-            "pending outpoint_spend remove must hide the inner row"
+            "a pending spend remove must hide the inner row"
         );
 
         cache.flush_durable().unwrap();
@@ -3692,41 +3817,33 @@ mod tests {
         // disconnect followed by reconnect) must end up visible.
         let cache = make_cache(16);
         let prev = make_outpoint(0xee, 2);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0xff, 0).txid,
+        let spender = make_outpoint(0xff, 0).txid;
+        seed_ordinal_block(&cache, 7, 70, &[prev.txid]);
+        seed_ordinal_block(&cache, 200, 90, &[spender]);
+        let expected = node_index::SpendingRef {
+            spending_txid: spender,
             spending_vin: 0,
             height: 200,
         };
 
         let mut step1 = StoreBatch::default();
-        step1.outpoint_spend_removes.push(prev);
-        step1.coin_puts.push((
-            make_outpoint(0xab, 0),
-            crate::storage::coinview::Coin {
-                amount: 1,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-                height: 200,
-                coinbase: false,
-            },
-        ));
+        step1.spent_removes.push((70, prev.vout));
+        step1.coin_puts.push((make_outpoint(0xab, 0), a_coin(200)));
         cache.write_batch(step1).unwrap();
 
         let mut step2 = StoreBatch::default();
-        step2.outpoint_spend_puts.push((prev, sref));
-        step2.coin_puts.push((
-            make_outpoint(0xcd, 0),
-            crate::storage::coinview::Coin {
-                amount: 1,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-                height: 201,
-                coinbase: false,
-            },
-        ));
+        step2.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 70,
+            vout: prev.vout,
+            spending_txseq: 90,
+            vin: 0,
+        });
+        step2.coin_puts.push((make_outpoint(0xcd, 0), a_coin(201)));
         cache.write_batch(step2).unwrap();
 
         // After remove-then-put, the put must win (it's the latest
         // operation against `prev`).
-        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(sref));
+        assert_eq!(cache.lookup_spend(&prev).unwrap(), Some(expected));
     }
 
     // ---------------------------------------------------------------
