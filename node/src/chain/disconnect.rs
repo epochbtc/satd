@@ -3,7 +3,7 @@ use bitcoin::{Block, OutPoint};
 use crate::index::address::AddressIndexConfig;
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::FilterIndexConfig;
-use crate::storage::StoreBatch;
+use crate::storage::{Store, StoreBatch};
 use crate::storage::undo::UndoData;
 
 /// Errors returned by `disconnect_block` when the on-disk undo data
@@ -34,6 +34,12 @@ pub enum DisconnectError {
 /// the chain, and a positional argument list that long is unreadable at
 /// the call site and easy to transpose.
 pub struct DisconnectParams<'a> {
+    /// Read-only store handle. Needed for one thing: an undo coin that
+    /// came from an AssumeUTXO snapshot carries `TXSEQ_UNKNOWN`, and the
+    /// `spent` row it needs to remove is keyed on the funding ordinal.
+    /// The fallback is the same `tx_loc` lookup `connect_block` used to
+    /// write the row, so the two agree on which rows exist.
+    pub store: &'a dyn Store,
     pub block: &'a Block,
     pub undo: &'a UndoData,
     pub block_height: u32,
@@ -74,6 +80,7 @@ pub struct DisconnectParams<'a> {
 pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, DisconnectError> {
     #[cfg(feature = "block-filter-index")]
     let DisconnectParams {
+        store,
         block,
         undo,
         block_height,
@@ -85,6 +92,7 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let DisconnectParams {
+        store,
         block,
         undo,
         block_height,
@@ -93,6 +101,7 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
         address_index,
         sp_index,
     } = params;
+    let store: &dyn Store = *store;
     let block_height = *block_height;
     let prev_hash = *prev_hash;
     let first_txseq = *first_txseq;
@@ -149,13 +158,32 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
             ) {
                 batch.addr_spending_removes.push(key);
             }
-            // outpoint_spend remove: keyed by the prev_outpoint, which
-            // lives on the input itself — no undo needed.
-            if let Some(op) = crate::index::outpoint_spend::emit::remove_key(
-                address_index,
-                input.previous_output,
-            ) {
-                batch.outpoint_spend_removes.push(op);
+            // spent remove: keyed by the ordinal of the transaction
+            // that created the consumed output. The undo coin carries
+            // it, exactly as the live coin did when `connect_block`
+            // wrote the row.
+            //
+            // A `TXSEQ_UNKNOWN` coin falls back to the same lookup the
+            // connect path used; a `None` there means no row was written
+            // in the first place, so no remove is emitted. Emitting one
+            // anyway would be harmless against RocksDB but would hide
+            // the asymmetry from the batch, and the merge dedup reasons
+            // about named keys.
+            if address_index.enabled {
+                let funding_txseq = if coin.txseq != node_index::TXSEQ_UNKNOWN {
+                    Some(coin.txseq)
+                } else {
+                    store.get_tx_seq(&input.previous_output.txid)
+                };
+                if let Some(funding_txseq) = funding_txseq
+                    && let Some(key) = crate::index::outpoint_spend::emit::remove_key(
+                        address_index,
+                        funding_txseq,
+                        input.previous_output.vout,
+                    )
+                {
+                    batch.spent_removes.push(key);
+                }
             }
             // Restore the spent coin. The outpoint is the input's
             // previous_output (the v1 undo format omits outpoints because
@@ -286,6 +314,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: coin_height,
             coinbase,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
 
         let mut batch = StoreBatch::default();
@@ -477,7 +506,9 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
+        let store = test_store();
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -561,6 +592,7 @@ mod tests {
         // Disconnect drops the row.
         let undo = UndoData::default();
         let disc = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -624,6 +656,7 @@ mod tests {
         assert!(store.get_sp_tweaks_row(1).is_none());
 
         let disc = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &UndoData::default(),
             block_height: 1,
@@ -681,6 +714,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -708,9 +742,18 @@ mod tests {
             "coinbase outputs should be in coin_removes"
         );
 
-        // outpoint_spend remove for the consumed UTXO must be present so
-        // the row written by connect_block doesn't survive a reorg.
-        assert_eq!(batch.outpoint_spend_removes, vec![outpoint]);
+        // The spend remove for the consumed UTXO must be present so the
+        // row written by connect_block doesn't survive a reorg. Keyed by
+        // the funding ordinal, which the undo coin carries — this
+        // fixture's coin is `TXSEQ_UNKNOWN` with no `tx_loc` row, the
+        // AssumeUTXO shape, so no row was written and none is removed.
+        // `disconnect_removes_the_spent_row_of_a_reorged_spend` covers
+        // the resolvable case.
+        assert!(
+            batch.spent_removes.is_empty(),
+            "an unresolvable funding ordinal must skip the remove, not \
+             name some other transaction's output"
+        );
     }
 
     #[test]
@@ -753,6 +796,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -777,7 +821,9 @@ mod tests {
         let block = make_coinbase_only_block(5, BlockHash::all_zeros());
         let undo = UndoData::default();
 
+        let store = test_store();
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 5,
@@ -800,7 +846,9 @@ mod tests {
         let block = make_coinbase_only_block(3, prev_hash);
         let undo = UndoData::default();
 
+        let store = test_store();
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 3,
@@ -827,12 +875,14 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let coin2 = Coin {
             amount: 20_000_000,
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         add_coin_to_store(&store, op1, coin1.clone());
         add_coin_to_store(&store, op2, coin2.clone());
@@ -932,6 +982,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: height,
@@ -966,6 +1017,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         add_coin_to_store(&store, op1, coin.clone());
         add_coin_to_store(&store, op2, coin.clone());
@@ -1065,6 +1117,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: height,
@@ -1096,6 +1149,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         add_coin_to_store(&store, other_op, other_coin.clone());
 
@@ -1106,6 +1160,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         add_coin_to_store(&store, spend_op, spend_coin);
 
@@ -1148,6 +1203,7 @@ mod tests {
 
         // Disconnect
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -1229,6 +1285,7 @@ mod tests {
 
         // Disconnect
         let disconnect_batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -1286,7 +1343,9 @@ mod tests {
         let block = make_coinbase_only_block(10, prev_hash);
         let undo = UndoData::default();
 
+        let store = test_store();
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 10,
@@ -1363,6 +1422,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -1399,6 +1459,88 @@ mod tests {
             batch.txseq_block_removes,
             vec![0],
             "the block's ordinal-range row must be removed too"
+        );
+    }
+
+    /// A reorg has to take the spend row back out, and the key it is
+    /// under is the funding ordinal the undo coin carries — the same
+    /// one the connect path used to write it. The two have to agree, or
+    /// the reorg strands a row pointing at a spend the chain no longer
+    /// contains.
+    #[test]
+    fn disconnect_removes_the_spent_row_of_a_reorged_spend() {
+        let store = test_store();
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
+            ),
+            vout: 0,
+        };
+        const FUNDING_SEQ: u64 = 55;
+        let coin = Coin {
+            amount: 50_000_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 0,
+            coinbase: false,
+            txseq: FUNDING_SEQ,
+        };
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((outpoint, coin.clone()));
+        seed.tx_loc_puts.push((outpoint.txid, FUNDING_SEQ));
+        seed.txseq_txid_puts.push((FUNDING_SEQ, outpoint.txid));
+        store.write_batch(seed).unwrap();
+
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let block_hash = block.block_hash();
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+        let written = connect_batch.spent_puts.clone();
+        assert_eq!(written.len(), 1, "premise: connect wrote one spend row");
+        let undo = connect_batch
+            .undo_puts
+            .iter()
+            .find(|(h, _)| *h == block_hash)
+            .map(|(_, u)| u.clone())
+            .unwrap();
+        store.write_batch(connect_batch).unwrap();
+
+        let batch = disconnect_block(&DisconnectParams {
+            store: &store,
+            block: &block,
+            undo: &undo,
+            block_height: 1,
+            prev_hash: BlockHash::all_zeros(),
+            first_txseq: 0,
+            address_index: &cfg,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            sp_index: &Default::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            batch.spent_removes,
+            vec![written[0].key()],
+            "the remove must name exactly the key the connect wrote"
         );
     }
 
@@ -1452,6 +1594,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -1522,6 +1665,7 @@ mod tests {
         store.write_batch(connect_batch).unwrap();
 
         let disc = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,
@@ -1542,7 +1686,7 @@ mod tests {
     fn test_disconnect_with_filter_index_enabled_emits_remove_key() {
         // Filter index on: disconnect produces one (type, height) remove.
         use crate::index::filter::FILTER_TYPE_BASIC;
-        let (_store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        let (store, outpoint, _coin) = make_test_store_with_coin(0, false);
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         // Synthesize a minimal-but-correct undo for the block (one
         // spent coin per non-coinbase input).
@@ -1554,6 +1698,7 @@ mod tests {
             peer_serve: false,
         };
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 42,
@@ -1573,12 +1718,13 @@ mod tests {
     #[cfg(feature = "block-filter-index")]
     #[test]
     fn test_disconnect_with_filter_index_disabled_emits_no_remove_key() {
-        let (_store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        let (store, outpoint, _coin) = make_test_store_with_coin(0, false);
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         let undo = UndoData {
             spent_coins: vec![_coin],
         };
         let batch = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 42,
@@ -1632,6 +1778,7 @@ mod tests {
         undo.spent_coins.clear();
 
         let result = disconnect_block(&DisconnectParams {
+            store: &store,
             block: &block,
             undo: &undo,
             block_height: 1,

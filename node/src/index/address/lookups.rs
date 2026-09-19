@@ -342,6 +342,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 

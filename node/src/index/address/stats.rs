@@ -17,6 +17,15 @@ static FUNDING_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SPENDING_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUNDING_REMOVES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SPENDING_REMOVES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Inputs whose funding transaction's ordinal could not be resolved at
+/// connect time, so no spend row was written for them.
+///
+/// Unlike the others this is counted at *emission*, not at commit: the
+/// thing being counted is a row that was never produced, so there is no
+/// commit for it to ride. It is bounded to AssumeUTXO nodes — a coin
+/// from a snapshot carries no ordinal, and until background validation
+/// reaches its funding block there is nothing to look one up in.
+static UNRESOLVED_SPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Increment the committed funding-rows counter by `n`.
 pub fn add_funding_rows(n: u64) {
@@ -38,6 +47,11 @@ pub fn add_spending_removes(n: u64) {
     SPENDING_REMOVES_TOTAL.fetch_add(n, Ordering::Relaxed);
 }
 
+/// Increment the unresolved-spends counter by one.
+pub fn inc_unresolved_spends() {
+    UNRESOLVED_SPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Snapshot all counters for `/metrics` rendering.
 pub fn snapshot() -> Snapshot {
     Snapshot {
@@ -45,6 +59,7 @@ pub fn snapshot() -> Snapshot {
         spending_rows: SPENDING_ROWS_TOTAL.load(Ordering::Relaxed),
         funding_removes: FUNDING_REMOVES_TOTAL.load(Ordering::Relaxed),
         spending_removes: SPENDING_REMOVES_TOTAL.load(Ordering::Relaxed),
+        unresolved_spends: UNRESOLVED_SPENDS_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -54,4 +69,5 @@ pub struct Snapshot {
     pub spending_rows: u64,
     pub funding_removes: u64,
     pub spending_removes: u64,
+    pub unresolved_spends: u64,
 }

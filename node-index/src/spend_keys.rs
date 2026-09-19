@@ -1,31 +1,48 @@
-//! Key/value encoding for the `outpoint_spend` column family.
+//! Key/value encoding for the `spent` column family.
 //!
 //! Schema layout:
 //!
 //! ```text
-//! outpoint_spend  key:   prev_txid[32] || prev_vout_be[4]                          (36 bytes)
-//!                 value: spending_txid[32] || spending_vin_be[4] || height_be[4]   (40 bytes)
+//! spent  key:   funding_txseq[5] || vout_be[3]      (8 bytes)
+//!        value: spending_txseq[5] || vin_be[3]      (8 bytes)
 //! ```
 //!
-//! The key is the spent outpoint; the value is the (txid, vin, height)
-//! that consumed it. One row per consumed UTXO; `connect_block` writes
-//! it, `disconnect_block` deletes it.
+//! The key is the spent output, named by the ordinal of the transaction
+//! that created it; the value is the input that consumed it, named the
+//! same way. One row per consumed UTXO; `connect_block` writes it,
+//! `disconnect_block` deletes it.
 //!
-//! Multi-byte fields are big-endian for byte-order iteration parity
-//! with the rest of the address-index schema.
+//! Sixteen bytes where the txid-keyed predecessor took seventy-six. The
+//! two 32-byte hashes it carried are recoverable from the ordinals
+//! through the `txseq_txid` column family, which the storage layer
+//! resolves in one batched lookup per scan — so this family stores each
+//! identifier once, in one place, instead of once per index that
+//! mentions it. The height the old value carried is likewise derivable,
+//! from `txseq_block`.
+//!
+//! The 5-byte ordinal prefix is what makes "every spend of transaction
+//! N" a prefix scan, replacing the 32-byte txid prefix the old layout
+//! used for the same query.
+//!
+//! Multi-byte fields are big-endian, so the byte order of a key is chain
+//! order — the same property the rest of the index schema relies on.
 
-use bitcoin::hashes::Hash;
-use bitcoin::{OutPoint, Txid};
+use bitcoin::Txid;
 
-/// Encoded key length (txid 32 + vout BE 4).
-pub const OUTPOINT_KEY_LEN: usize = 36;
+use crate::txseq::{TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_txseq, encode_u24};
 
-/// Encoded value length (txid 32 + vin BE 4 + height BE 4).
-pub const SPEND_VALUE_LEN: usize = 40;
+/// Encoded key length (ordinal 5 + vout BE 3).
+pub const SPENT_KEY_LEN: usize = TXSEQ_LEN + VOUT_LEN;
 
-const TXID_LEN: usize = 32;
+/// Encoded value length (ordinal 5 + vin BE 3).
+pub const SPENT_VALUE_LEN: usize = TXSEQ_LEN + VOUT_LEN;
 
 /// Reference to the input that spent a given outpoint.
+///
+/// The resolved, public shape: ordinals are a storage encoding, and the
+/// store turns them back into a txid and a height before a row leaves
+/// it. Unchanged from the txid-keyed layout, so every consumer is
+/// unaffected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SpendingRef {
     pub spending_txid: Txid,
@@ -33,99 +50,112 @@ pub struct SpendingRef {
     pub height: u32,
 }
 
-pub fn encode_outpoint_key(op: &OutPoint) -> [u8; OUTPOINT_KEY_LEN] {
-    let mut buf = [0u8; OUTPOINT_KEY_LEN];
-    buf[..TXID_LEN].copy_from_slice(op.txid.as_ref());
-    buf[TXID_LEN..].copy_from_slice(&op.vout.to_be_bytes());
+/// One row of the `spent` family, as it sits on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SpentRow {
+    pub funding_txseq: u64,
+    pub vout: u32,
+    pub spending_txseq: u64,
+    pub vin: u32,
+}
+
+impl SpentRow {
+    pub fn key(&self) -> (u64, u32) {
+        (self.funding_txseq, self.vout)
+    }
+}
+
+pub fn encode_spent_key(funding_txseq: u64, vout: u32) -> [u8; SPENT_KEY_LEN] {
+    let mut buf = [0u8; SPENT_KEY_LEN];
+    buf[..TXSEQ_LEN].copy_from_slice(&encode_txseq(TxSeq(funding_txseq)));
+    buf[TXSEQ_LEN..].copy_from_slice(&encode_u24(vout));
     buf
 }
 
-pub fn decode_outpoint_key(b: &[u8]) -> Option<OutPoint> {
-    if b.len() != OUTPOINT_KEY_LEN {
+pub fn decode_spent_key(b: &[u8]) -> Option<(u64, u32)> {
+    if b.len() != SPENT_KEY_LEN {
         return None;
     }
-    let mut txid_arr = [0u8; TXID_LEN];
-    txid_arr.copy_from_slice(&b[..TXID_LEN]);
-    let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(txid_arr));
-    let vout = u32::from_be_bytes(b[TXID_LEN..].try_into().ok()?);
-    Some(OutPoint { txid, vout })
+    let seq = decode_txseq(&b[..TXSEQ_LEN])?.0;
+    let vout = decode_u24(&b[TXSEQ_LEN..])?;
+    Some((seq, vout))
 }
 
-pub fn encode_spend_value(s: &SpendingRef) -> [u8; SPEND_VALUE_LEN] {
-    let mut buf = [0u8; SPEND_VALUE_LEN];
-    buf[..TXID_LEN].copy_from_slice(s.spending_txid.as_ref());
-    buf[TXID_LEN..TXID_LEN + 4].copy_from_slice(&s.spending_vin.to_be_bytes());
-    buf[TXID_LEN + 4..].copy_from_slice(&s.height.to_be_bytes());
+pub fn encode_spent_value(spending_txseq: u64, vin: u32) -> [u8; SPENT_VALUE_LEN] {
+    let mut buf = [0u8; SPENT_VALUE_LEN];
+    buf[..TXSEQ_LEN].copy_from_slice(&encode_txseq(TxSeq(spending_txseq)));
+    buf[TXSEQ_LEN..].copy_from_slice(&encode_u24(vin));
     buf
 }
 
-pub fn decode_spend_value(b: &[u8]) -> Option<SpendingRef> {
-    if b.len() != SPEND_VALUE_LEN {
+pub fn decode_spent_value(b: &[u8]) -> Option<(u64, u32)> {
+    if b.len() != SPENT_VALUE_LEN {
         return None;
     }
-    let mut txid_arr = [0u8; TXID_LEN];
-    txid_arr.copy_from_slice(&b[..TXID_LEN]);
-    let spending_txid =
-        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(txid_arr));
-    let spending_vin = u32::from_be_bytes(b[TXID_LEN..TXID_LEN + 4].try_into().ok()?);
-    let height = u32::from_be_bytes(b[TXID_LEN + 4..].try_into().ok()?);
-    Some(SpendingRef {
-        spending_txid,
-        spending_vin,
-        height,
-    })
+    let seq = decode_txseq(&b[..TXSEQ_LEN])?.0;
+    let vin = decode_u24(&b[TXSEQ_LEN..])?;
+    Some((seq, vin))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture_txid(byte: u8) -> Txid {
-        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    #[test]
+    fn test_spent_key_roundtrip() {
+        for (seq, vout) in [(0u64, 0u32), (1, 7), (1 << 32, 65_536), (super::super::txseq::TXSEQ_MAX, (1 << 24) - 1)]
+        {
+            let encoded = encode_spent_key(seq, vout);
+            assert_eq!(encoded.len(), SPENT_KEY_LEN);
+            assert_eq!(decode_spent_key(&encoded), Some((seq, vout)));
+        }
     }
 
     #[test]
-    fn test_outpoint_key_roundtrip() {
-        let op = OutPoint {
-            txid: fixture_txid(0x42),
-            vout: 7,
-        };
-        let encoded = encode_outpoint_key(&op);
-        assert_eq!(encoded.len(), OUTPOINT_KEY_LEN);
-        assert_eq!(decode_outpoint_key(&encoded), Some(op));
+    fn test_spent_value_roundtrip() {
+        let encoded = encode_spent_value(800_000, 3);
+        assert_eq!(encoded.len(), SPENT_VALUE_LEN);
+        assert_eq!(decode_spent_value(&encoded), Some((800_000, 3)));
     }
 
     #[test]
-    fn test_spend_value_roundtrip() {
-        let s = SpendingRef {
-            spending_txid: fixture_txid(0xab),
-            spending_vin: 3,
-            height: 800_000,
-        };
-        let encoded = encode_spend_value(&s);
-        assert_eq!(encoded.len(), SPEND_VALUE_LEN);
-        assert_eq!(decode_spend_value(&encoded), Some(s));
+    fn test_spent_key_decode_rejects_wrong_length() {
+        assert!(decode_spent_key(&[0u8; 7]).is_none());
+        assert!(decode_spent_key(&[0u8; 9]).is_none());
+        assert!(decode_spent_key(&[]).is_none());
+        assert!(decode_spent_value(&[0u8; 7]).is_none());
+        assert!(decode_spent_value(&[0u8; 9]).is_none());
     }
 
+    /// The 5-byte ordinal prefix is what makes "every spend of
+    /// transaction N" a prefix scan. Two different funding transactions
+    /// must not share it, and every output of one transaction must.
     #[test]
-    fn test_outpoint_key_decode_rejects_wrong_length() {
-        assert!(decode_outpoint_key(&[0u8; 35]).is_none());
-        assert!(decode_outpoint_key(&[0u8; 37]).is_none());
-        assert!(decode_outpoint_key(&[]).is_none());
+    fn test_spent_key_prefix_isolates_the_funding_transaction() {
+        let a = encode_spent_key(100, 0);
+        let b = encode_spent_key(100, 99);
+        let c = encode_spent_key(101, 0);
+        assert_eq!(&a[..TXSEQ_LEN], &b[..TXSEQ_LEN]);
+        assert_ne!(&a[..TXSEQ_LEN], &c[..TXSEQ_LEN]);
     }
 
+    /// Byte order is chain order, so a scan over the family visits
+    /// spends in the order the spent outputs were created.
     #[test]
-    fn test_spend_value_decode_rejects_wrong_length() {
-        assert!(decode_spend_value(&[0u8; 39]).is_none());
-        assert!(decode_spend_value(&[0u8; 41]).is_none());
-    }
-
-    #[test]
-    fn test_outpoint_key_prefix_isolates_txid() {
-        let a = OutPoint { txid: fixture_txid(0x10), vout: 99 };
-        let b = OutPoint { txid: fixture_txid(0x20), vout: 0 };
-        let ka = encode_outpoint_key(&a);
-        let kb = encode_outpoint_key(&b);
-        assert_ne!(&ka[..TXID_LEN], &kb[..TXID_LEN]);
+    fn test_spent_keys_sort_in_chain_order() {
+        let mut keys = [
+            encode_spent_key(2, 0),
+            encode_spent_key(1, 5),
+            encode_spent_key(1, 0),
+            encode_spent_key(1 << 33, 0),
+        ];
+        let expected = [
+            encode_spent_key(1, 0),
+            encode_spent_key(1, 5),
+            encode_spent_key(2, 0),
+            encode_spent_key(1 << 33, 0),
+        ];
+        keys.sort_unstable();
+        assert_eq!(keys, expected);
     }
 }

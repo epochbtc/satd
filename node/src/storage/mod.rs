@@ -21,6 +21,7 @@ use crate::index::address::{
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
 use crate::index::outpoint_spend::SpendingRef;
+use node_index::SpentRow;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
@@ -117,16 +118,20 @@ pub struct StoreBatch {
     pub addr_funding_removes: Vec<AddrFundingKey>,
     /// Address-history spending keys to remove (used by `disconnect_block`).
     pub addr_spending_removes: Vec<AddrSpendingKey>,
-    /// `outpoint_spend` rows: `(spent_outpoint, SpendingRef)`. Written by
-    /// `connect_block` for every input on the active chain so Esplora's
-    /// `outspend` and `gettxspendingprevout` (confirmed-side) can answer
-    /// in O(1).
-    pub outpoint_spend_puts: Vec<(OutPoint, SpendingRef)>,
-    /// Outpoints to remove from `outpoint_spend` (used by `disconnect_block`).
-    pub outpoint_spend_removes: Vec<OutPoint>,
-    /// `(outpoint -> scripthash)` rows for the deferred backfill's pass-1
-    /// temp CF. Empty for live `connect_block` writes.
-    pub addr_backfill_temp_puts: Vec<(OutPoint, Scripthash)>,
+    /// `spent` rows. Written by `connect_block` for every input on the
+    /// active chain so Esplora's `outspend` can answer in O(1).
+    ///
+    /// Both ends are named by transaction ordinal rather than txid: 16
+    /// bytes a row where the txid-keyed predecessor took 76, and the
+    /// identifiers it repeated are recoverable through `txseq_txid`.
+    pub spent_puts: Vec<SpentRow>,
+    /// `(funding ordinal, vout)` keys to remove from `spent` (used by
+    /// `disconnect_block`).
+    pub spent_removes: Vec<(u64, u32)>,
+    /// `(outpoint -> (scripthash, funding ordinal))` rows for the
+    /// deferred backfill's pass-1 temp CF. Empty for live
+    /// `connect_block` writes.
+    pub addr_backfill_temp_puts: Vec<(OutPoint, Scripthash, u64)>,
     /// Persist a backfill cursor advance atomically with the rows it
     /// describes. `None` for non-backfill writes.
     pub backfill_cursor_advance: Option<BackfillCursorWrite>,
@@ -366,24 +371,19 @@ impl StoreBatch {
         self.addr_spending_removes
             .extend(other.addr_spending_removes);
 
-        // outpoint_spend: same last-writer-wins by outpoint.
-        if !other.outpoint_spend_removes.is_empty() {
-            let drop: std::collections::HashSet<OutPoint> =
-                other.outpoint_spend_removes.iter().copied().collect();
-            self.outpoint_spend_puts
-                .retain(|(op, _)| !drop.contains(op));
+        // spent: same last-writer-wins, now by (funding ordinal, vout).
+        if !other.spent_removes.is_empty() {
+            let drop: std::collections::HashSet<(u64, u32)> =
+                other.spent_removes.iter().copied().collect();
+            self.spent_puts.retain(|r| !drop.contains(&r.key()));
         }
-        if !other.outpoint_spend_puts.is_empty() {
-            let drop: std::collections::HashSet<OutPoint> = other
-                .outpoint_spend_puts
-                .iter()
-                .map(|(op, _)| *op)
-                .collect();
-            self.outpoint_spend_removes.retain(|op| !drop.contains(op));
+        if !other.spent_puts.is_empty() {
+            let drop: std::collections::HashSet<(u64, u32)> =
+                other.spent_puts.iter().map(|r| r.key()).collect();
+            self.spent_removes.retain(|k| !drop.contains(k));
         }
-        self.outpoint_spend_puts.extend(other.outpoint_spend_puts);
-        self.outpoint_spend_removes
-            .extend(other.outpoint_spend_removes);
+        self.spent_puts.extend(other.spent_puts);
+        self.spent_removes.extend(other.spent_removes);
 
         // Backfill temp-CF rows. Last-writer-wins semantics by outpoint
         // would matter only if a single coalesced batch covered both
@@ -847,22 +847,53 @@ pub trait Store: Send + Sync {
         Ok(None)
     }
 
-    /// True when the `outpoint_spend` index is fully populated for
-    /// every input on the active chain. Set on fresh datadir
-    /// creation, after `clear_chainstate`/`clear_all`, and after
-    /// address-backfill `mark_completed`. False when an upgraded
-    /// datadir still has historical `addr_spending` rows that
-    /// pre-date this index. Default: `true` for non-Rocks backends.
-    fn outpoint_spend_complete(&self) -> bool {
+    /// True when the `spent` index is fully populated for every input
+    /// on the active chain. Set on fresh datadir creation, after
+    /// `clear_chainstate`/`clear_all`, and after address-backfill
+    /// `mark_completed`. False when an upgraded datadir still has
+    /// historical `addr_spending` rows that pre-date this index, and
+    /// after an AssumeUTXO snapshot load. Default: `true` for non-Rocks
+    /// backends.
+    ///
+    /// The public JSON names that report it — `txospenderindex` in
+    /// `getindexinfo`, `address.outpoint_spend.complete` in
+    /// `getsatdindexinfo` — are unchanged; they name the capability, not
+    /// the column family behind it.
+    fn spent_complete(&self) -> bool {
         true
     }
 
-    /// Stamp `outpoint_spend.complete` true. Called by the runner
-    /// when address backfill finishes pass 2 (which writes
-    /// outpoint_spend rows alongside addr_spending rows). Default:
-    /// no-op for backends that don't track the marker.
-    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
+    /// Stamp `spent.complete` true. Called by the runner when address
+    /// backfill finishes pass 2 (which writes `spent` rows alongside
+    /// addr_spending rows). Default: no-op for backends that don't
+    /// track the marker.
+    fn mark_spent_complete(&self) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// Stamp the address and spend completeness markers false after an
+    /// AssumeUTXO snapshot load.
+    ///
+    /// A snapshot brings a UTXO set with no history behind it: the
+    /// address and spend indexes hold nothing for anything below the
+    /// snapshot base, and the operator's documented remedy is
+    /// `backfillindex address` once background validation has reached
+    /// it. Leaving the markers true would let those surfaces answer
+    /// "unspent" and "no history" for outputs whose history the node
+    /// simply does not have yet. Default: no-op.
+    fn mark_index_incomplete_after_snapshot(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Every spend of the transaction with ordinal `funding_txseq`, as
+    /// `(vout, SpendingRef)` pairs.
+    ///
+    /// One prefix scan over `spent`, which is what the 5-byte ordinal
+    /// prefix is for. Esplora's `/tx/:txid/outspends` uses it so an
+    /// N-output transaction costs one txid lookup rather than N.
+    /// Default: empty.
+    fn lookup_spends_of_tx(&self, _txid: &bitcoin::Txid) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
+        Ok(Vec::new())
     }
 
     /// True when the `tx_index` CF is fully populated for every tx
@@ -957,10 +988,20 @@ pub trait Store: Send + Sync {
         false
     }
 
-    /// Look up `(outpoint -> scripthash)` from the temp CF. Returns
-    /// `Ok(None)` when the CF doesn't exist or the key isn't present;
-    /// `Err` only on backend I/O failure. Default: `Ok(None)`.
-    fn lookup_backfill_temp(&self, _outpoint: &OutPoint) -> Result<Option<Scripthash>, StoreError> {
+    /// Look up `(outpoint -> (scripthash, funding ordinal))` from the
+    /// temp CF. Returns `Ok(None)` when the CF doesn't exist or the key
+    /// isn't present; `Err` only on backend I/O failure. Default:
+    /// `Ok(None)`.
+    ///
+    /// Pass 1 records the ordinal alongside the scripthash because pass
+    /// 2 needs both and cannot recompute either: the scripthash lives in
+    /// the funding output's block, and the ordinal in that block's
+    /// position in the chain. Looking each up again would mean a second
+    /// read per input over the whole chain.
+    fn lookup_backfill_temp(
+        &self,
+        _outpoint: &OutPoint,
+    ) -> Result<Option<(Scripthash, u64)>, StoreError> {
         Ok(None)
     }
 

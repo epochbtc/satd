@@ -653,7 +653,7 @@ pub struct RpcContext {
     pub coinstatsindex_enabled: bool,
     /// Whether `-txospenderindex` was explicitly enabled at runtime.
     /// `getindexinfo` reports its real completeness, read from the store's
-    /// `outpoint_spend_complete` marker — not a constant. See `rpc::indexes`.
+    /// `spent_complete` marker — not a constant. See `rpc::indexes`.
     pub txospenderindex_enabled: bool,
     /// Runtime listener status — read by `getserverstatus`. Mutated by
     /// the satd binary after each optional listener (Esplora,

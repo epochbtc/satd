@@ -67,9 +67,11 @@ pub struct CoreIndexFlags {
 ///   was set; synced on the same predicate `getsatdindexinfo` uses, so
 ///   the two surfaces cannot disagree about one index.
 /// - `"txospenderindex"` — present when `-txospenderindex` was set;
-///   synced when `outpoint_spend_complete()` is true. satd has no
-///   separate spender index, but `outpoint_spend` is what actually
-///   backs `gettxspendingprevout`, so that marker is the honest answer.
+///   synced when `spent_complete()` is true. satd has no separate
+///   spender index, and does not implement `gettxspendingprevout`; the
+///   `spent` column family is what backs Esplora's outspend endpoints,
+///   so that marker is the honest answer. The JSON name is Core's and
+///   stays whatever the family behind it is called.
 /// - `"coinstatsindex"` — present when `-coinstatsindex` was set.
 ///   satd implements no UTXO-set hash index, so this never reports
 ///   synced; see the note on the entry itself.
@@ -134,7 +136,7 @@ pub fn get_index_info_core_compat(
         top.insert("coinstatsindex".into(), index_entry(false, 0));
     }
     if txospenderindex_enabled {
-        let synced = chain.store_ref().outpoint_spend_complete();
+        let synced = chain.store_ref().spent_complete();
         top.insert(
             "txospenderindex".into(),
             index_entry(synced, if synced { tip_height } else { 0 }),
@@ -241,17 +243,20 @@ pub fn get_index_info(
     }
     address.insert("backfill".into(), Value::Object(bf));
 
-    // outpoint_spend completeness — exposed under the address-index
-    // sibling because outpoint_spend rides the same on-disk lifecycle
-    // (populated by connect_block / cleared by clear_chainstate /
-    // stamped complete by backfill mark_completed). Operators reading
-    // this field see whether `/tx/:txid/outspend/...` and
-    // `gettxspendingprevout` (confirmed-side) can be trusted to
-    // distinguish "unspent" from "we don't know" (round-3 H2).
+    // Spend-index completeness — exposed under the address-index
+    // sibling because the `spent` family rides the same on-disk
+    // lifecycle (populated by connect_block / cleared by
+    // clear_chainstate / stamped complete by backfill mark_completed /
+    // cleared by a snapshot load). Operators reading this field see
+    // whether `/tx/:txid/outspend/...` can be trusted to distinguish
+    // "unspent" from "we don't know" (round-3 H2).
+    //
+    // The JSON key stays `outpoint_spend` — it is public, and it names
+    // the capability rather than the column family behind it.
     let mut outpoint_spend = serde_json::Map::new();
     outpoint_spend.insert(
         "complete".into(),
-        json!(chain.store_ref().outpoint_spend_complete()),
+        json!(chain.store_ref().spent_complete()),
     );
     address.insert("outpoint_spend".into(), Value::Object(outpoint_spend));
 

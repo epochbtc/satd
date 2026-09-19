@@ -656,6 +656,12 @@ pub fn deserialize_coin<R: Read>(r: &mut R) -> Result<Coin, CodecError> {
         script_pubkey,
         height,
         coinbase,
+        // Bitcoin Core's snapshot format carries no ordinal, and by
+        // design this codec stays byte-compatible with it. A coin loaded
+        // from a snapshot is therefore `TXSEQ_UNKNOWN` until its funding
+        // block is validated by the background chainstate; spending one
+        // before then falls back to a `tx_loc` lookup.
+        txseq: node_index::TXSEQ_UNKNOWN,
     })
 }
 
@@ -1070,6 +1076,7 @@ mod tests {
             script_pubkey: p2pkh_script(&[0xab; 20]),
             height: 800_000,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -1094,6 +1101,7 @@ mod tests {
             script_pubkey: p2pkh_script(&[0x11; 20]),
             height: 1,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let mut buf = Vec::new();
         serialize_coin(&mut buf, &coin).unwrap();
@@ -1112,6 +1120,7 @@ mod tests {
             script_pubkey: p2pkh_script(&[0x00; 20]),
             height: u32::MAX,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let mut buf = Vec::new();
         serialize_coin(&mut buf, &coin).unwrap();
@@ -1183,6 +1192,7 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let mut buf = Vec::new();
         write_txout_ser(&mut buf, &op, &coin).unwrap();
@@ -1210,6 +1220,7 @@ mod tests {
             script_pubkey: ScriptBuf::new(),
             height: 10,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let mut buf = Vec::new();
         write_txout_ser(&mut buf, &op, &coin).unwrap();
@@ -1241,6 +1252,7 @@ mod tests {
             script_pubkey: ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let mut buf = Vec::new();
         write_txout_ser(&mut buf, &op, &coin).unwrap();

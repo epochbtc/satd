@@ -255,7 +255,7 @@ startup error.
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
 | `coinstatsindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd implements no UTXO-set hash index: the key sets nothing, and `getindexinfo` reports the index as never synced rather than claiming a readiness it cannot deliver. |
-| `txospenderindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd has no separate spender index; `getindexinfo` answers from the `outpoint_spend` index that actually backs `gettxspendingprevout`. |
+| `txospenderindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd has no separate spender index and does not implement `gettxspendingprevout`; `getindexinfo` answers from the `spent` index that backs Esplora's outspend endpoints. |
 
 ## Mempool / relay policy
 

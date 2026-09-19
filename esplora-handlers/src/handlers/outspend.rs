@@ -89,13 +89,19 @@ pub async fn tx_outspends(
     // O(N × mempool_size).
     let mempool_index = build_mempool_spent_index(&state);
 
+    // Confirmed spends for the whole transaction in one prefix scan.
+    // The spend index keys on the funding transaction's ordinal, so all
+    // of a transaction's spends sit together; asking per output would
+    // re-derive that ordinal from the txid N times and do N point reads.
+    let confirmed: HashMap<u32, node_index::SpendingRef> =
+        state.spend_index.spends_of_tx(&txid)?.into_iter().collect();
+
     let mut out = Vec::with_capacity(output_count);
     for vout in 0..output_count as u32 {
-        out.push(build_outspend(
-            &state,
-            &OutPoint { txid, vout },
-            &mempool_index,
-        )?);
+        out.push(match confirmed.get(&vout) {
+            Some(sref) => confirmed_outspend(&state, sref),
+            None => build_outspend(&state, &OutPoint { txid, vout }, &mempool_index)?,
+        });
     }
     Ok(Json(out))
 }
