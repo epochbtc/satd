@@ -138,7 +138,6 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
         if tx.is_coinbase() {
             continue;
         }
-        let txid = txids[tx_idx];
         for (vin, input) in tx.input.iter().enumerate() {
             let coin = undo.spent_coins.get(undo_cursor).ok_or(
                 DisconnectError::UndoExhausted {
@@ -151,8 +150,7 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
             )?;
             if let Some(key) = crate::index::address::spending_remove_key(
                 address_index,
-                block_height,
-                txid,
+                first_txseq + tx_idx as u64,
                 vin as u32,
                 coin,
             ) {
@@ -1551,7 +1549,28 @@ mod tests {
         // input it consumed. The deletion symmetry mirrors the
         // connect-block emission so the address index stays atomic
         // with the chainstate across reorgs.
+        //
+        // The coin has to carry a resolvable funding ordinal: since the
+        // spending row's value names it, connect skips the row entirely
+        // without one (the AssumeUTXO case, covered by
+        // `connect_skips_spent_row_for_unknown_coin_without_tx_loc`).
         let (store, outpoint, _coin) = make_test_store_with_coin(0, false);
+        const FUNDING_SEQ: u64 = 61;
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((
+            outpoint,
+            Coin {
+                amount: 50_000_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+                height: 0,
+                coinbase: false,
+                txseq: FUNDING_SEQ,
+            },
+        ));
+        seed.tx_loc_puts.push((outpoint.txid, FUNDING_SEQ));
+        seed.txseq_txid_puts.push((FUNDING_SEQ, outpoint.txid));
+        store.write_batch(seed).unwrap();
+
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         let block_hash = block.block_hash();
         let cfg = crate::index::address::AddressIndexConfig::default();

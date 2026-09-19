@@ -22,7 +22,7 @@ the chain's growth.
 
 | Column family | Role | Keyed by | Row size | Approx. on disk |
 |---|---|---|---|---|
-| `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~256 GB |
+| `addr_spending_v3` | every input spending a script | `scripthash[16] ‖ txseq[5] ‖ vin[3]` | 32 B | to be measured |
 | `spent` | UTXO → the input that spent it | `funding_txseq[5] ‖ vout[3]` | 16 B | to be measured |
 | `addr_funding_v3` | every output paying a script | `scripthash[16] ‖ txseq[5] ‖ vout[3]` | 32 B | to be measured |
 | `tx_loc` | txid → transaction ordinal | `txid[32]` | 37 B | to be measured |
@@ -74,7 +74,7 @@ Three structural reasons.
 
 Every spend writes two rows:
 
-- `addr_spending_v2`, keyed by script (`scripthash ‖ height ‖ …`). It answers
+- `addr_spending_v3`, keyed by script (`scripthash ‖ txseq ‖ vin`). It answers
   "show me everything address A spent."
 - `spent`, keyed by the spent output's funding transaction and vout. It
   answers "what input spent this UTXO" in a single keyed read.
@@ -87,7 +87,7 @@ largest source of the overage.
 ### 2. satd indexes a superset of what any one external tool does
 
 The often-quoted "30–180 GB" figure is the electrs/Fulcrum address index alone.
-satd's address index alone (`addr_funding_v3` + `addr_spending_v2`) already
+satd's address index alone (`addr_funding_v3` + `addr_spending_v3`) already
 exceeds that range. satd also carries a transaction index, a `spent`
 reverse index, and BIP 158 filters in the same database, because one binary
 serves Electrum, Esplora, `getrawtransaction`, and compact-filter clients. So
@@ -163,7 +163,7 @@ The indices are opt-in per surface. Match the disk to what you serve:
 |---|---|---|
 | Validating node only | (defaults; indices off) | none |
 | `getrawtransaction <txid>` anywhere | `-txindex=1` | `tx_loc`, `txseq_txid`, `txseq_block` |
-| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v3`, `addr_spending_v2`, `spent`, `tx_loc`, `txseq_txid`, `txseq_block` |
+| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v3`, `addr_spending_v3`, `spent`, `tx_loc`, `txseq_txid`, `txseq_block` |
 | BIP 157/158 light-client service | `-blockfilterindex=basic -peerblockfilters=1` | `block_filter`, `block_filter_header` |
 | BIP 352 silent-payment scanning or serving | `-silentpaymentindex=1` | `sp_tweaks` |
 
@@ -340,14 +340,14 @@ body on the chain and cannot distinguish a data hole from an unknown block
 > versions. Datadirs that predate this may still carry a hole from an earlier
 > crash; nothing audits or migrates them on upgrade.
 
-## Upgrading to chainstate schema 6
+## Upgrading to chainstate schema 7
 
 The chainstate is versioned, and a satd that cannot read an older layout
 refuses to open the datadir rather than misinterpret its rows. The refusal
 names the remedy:
 
 ```
-Chainstate schema version mismatch: DB has v5, binary expects v6.
+Chainstate schema version mismatch: DB has v6, binary expects v7.
 Run with --reindex-chainstate to rebuild from existing block files.
 ```
 

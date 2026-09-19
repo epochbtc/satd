@@ -16,8 +16,8 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::index::address::cursor::BackfillState;
 use crate::index::address::{
-    AddrFundingKey, AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow,
-    Scripthash,
+    AddrFundingKey, AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingKeyV3,
+    AddrSpendingRowV3, Scripthash,
 };
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
@@ -120,11 +120,16 @@ pub struct StoreBatch {
     /// every consumer above are unchanged.
     pub addr_funding_puts: Vec<AddrFundingRowV3>,
     /// Address-history index spending rows. Populated in M2.
-    pub addr_spending_puts: Vec<AddrSpendingRow>,
+    ///
+    /// Keyed on the spending transaction's ordinal, and valued by the
+    /// consumed output named the same way: 32 bytes a row against 92,
+    /// with both txids the old row carried recoverable through the
+    /// ordinal families. The store resolves them before a row leaves it.
+    pub addr_spending_puts: Vec<AddrSpendingRowV3>,
     /// Address-history funding keys to remove (used by `disconnect_block`).
     pub addr_funding_removes: Vec<AddrFundingKeyV3>,
     /// Address-history spending keys to remove (used by `disconnect_block`).
-    pub addr_spending_removes: Vec<AddrSpendingKey>,
+    pub addr_spending_removes: Vec<AddrSpendingKeyV3>,
     /// `spent` rows. Written by `connect_block` for every input on the
     /// active chain so Esplora's `outspend` can answer in O(1).
     ///
@@ -365,12 +370,12 @@ impl StoreBatch {
 
         // addr_spending: same last-writer-wins by key.
         if !other.addr_spending_removes.is_empty() {
-            let drop: std::collections::HashSet<AddrSpendingKey> =
-                other.addr_spending_removes.iter().cloned().collect();
+            let drop: std::collections::HashSet<AddrSpendingKeyV3> =
+                other.addr_spending_removes.iter().copied().collect();
             self.addr_spending_puts.retain(|p| !drop.contains(&p.key()));
         }
         if !other.addr_spending_puts.is_empty() {
-            let drop: std::collections::HashSet<AddrSpendingKey> =
+            let drop: std::collections::HashSet<AddrSpendingKeyV3> =
                 other.addr_spending_puts.iter().map(|p| p.key()).collect();
             self.addr_spending_removes.retain(|k| !drop.contains(k));
         }

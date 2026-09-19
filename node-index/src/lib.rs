@@ -23,11 +23,11 @@ pub use config::AddressIndexConfig;
 pub use cursor::{BackfillCursor, BackfillState};
 pub use keys::{
     AddrFundingKey, AddrFundingKeyV3, AddrFundingKeyV3Payload, AddrFundingRow, AddrFundingRowV3,
-    AddrSpendingKey, AddrSpendingKeyV2Payload, AddrSpendingRow, KEY_LEN_V2, KEY_LEN_V3,
-    SCRIPTHASH_PREFIX_LEN, Scripthash, decode_funding_key_v3, decode_funding_value,
-    decode_spending_key_v2, decode_spending_value, encode_funding_key_v3, encode_funding_value,
-    encode_spending_key_v2, encode_spending_value, reconstruct_funding_key_v3,
-    reconstruct_spending_key, scripthash_of,
+    AddrSpendingKey, AddrSpendingKeyV3, AddrSpendingKeyV3Payload, AddrSpendingRow,
+    AddrSpendingRowV3, KEY_LEN_V3, SCRIPTHASH_PREFIX_LEN, Scripthash, decode_funding_key_v3,
+    decode_funding_value, decode_spending_key_v3, decode_spending_value, encode_funding_key_v3,
+    encode_funding_value, encode_spending_key_v3, encode_spending_value,
+    reconstruct_funding_key_v3, reconstruct_spending_key_v3, scripthash_of,
 };
 pub use spend_keys::{
     SPENT_KEY_LEN, SPENT_VALUE_LEN, SpendingRef, SpentRow, decode_spent_key, decode_spent_value,

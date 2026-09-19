@@ -28,15 +28,17 @@
 //! addr_funding_v3  key: scripthash_prefix[16] || txseq[5] || vout_be[3]                  (24 bytes)
 //!                  value: amount_sat_be[8]                                               (8 bytes)
 //!
-//! addr_spending_v2 key: scripthash_prefix[16] || height_be[4] || txid[32] || vin_be[4]   (56 bytes)
-//!                  value: prev_outpoint_txid[32] || prev_outpoint_vout_be[4]             (36 bytes)
+//! addr_spending_v3 key: scripthash_prefix[16] || txseq[5] || vin_be[3]                  (24 bytes)
+//!                  value: funding_txseq[5] || funding_vout_be[3]                         (8 bytes)
 //! ```
 //!
-//! The v3 funding key replaces a 4-byte height and a 32-byte txid with a
-//! 5-byte chain-order ordinal, from which both are recoverable: the
+//! Both v3 keys replace a 4-byte height and a 32-byte txid with a 5-byte
+//! chain-order ordinal, from which both are recoverable: the
 //! `txseq_txid` family maps back to the txid and `txseq_block` to the
-//! height. Thirty-two bytes a row against sixty-four, and the identifier
-//! is stored once, in one place, instead of once per index that mentions
+//! height. The spending value does the same for the `prev_outpoint` it
+//! used to carry. Thirty-two bytes a row where funding took
+//! sixty-four and spending took ninety-two — and each identifier is
+//! stored once, in one place, instead of once per index that mentions
 //! the transaction.
 //!
 //! An ordinal never leaves the storage layer. The store resolves each row
@@ -57,11 +59,7 @@ use crate::txseq::{TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_
 /// implement the legacy `hash160` variant.
 pub type Scripthash = [u8; 32];
 
-/// Encoded length of a v2 spending key. The funding side moved to the
-/// v3 layout; this stays until the spending side follows.
-pub const KEY_LEN_V2: usize = 56;
-
-/// Encoded length of a v3 funding key: the 16-byte scripthash prefix,
+/// Encoded length of a v3 funding or spending key: the 16-byte scripthash prefix,
 /// the transaction's 5-byte chain-order ordinal, and a 3-byte vout.
 ///
 /// u24 for the vout, not u16: a 1 MB transaction can carry more than
@@ -76,11 +74,11 @@ pub const SCRIPTHASH_PREFIX_LEN: usize = 16;
 /// Encoded length of a funding value.
 pub const FUNDING_VALUE_LEN: usize = 8;
 
-/// Encoded length of a spending value.
-pub const SPENDING_VALUE_LEN: usize = 36;
+/// Encoded length of a v3 spending value: the funding transaction's
+/// ordinal and the output index it created. The `prev_outpoint` the
+/// previous layout carried is this, resolved.
+pub const SPENDING_VALUE_LEN: usize = TXSEQ_LEN + VOUT_LEN;
 
-const HEIGHT_LEN: usize = 4;
-const TXID_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddrFundingKey {
@@ -140,6 +138,35 @@ impl AddrFundingRowV3 {
     }
 }
 
+/// A spending row's key as it sits on disk. See [`AddrFundingKeyV3`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AddrSpendingKeyV3 {
+    pub scripthash: Scripthash,
+    pub txseq: u64,
+    pub vin: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddrSpendingRowV3 {
+    pub scripthash: Scripthash,
+    pub txseq: u64,
+    pub vin: u32,
+    /// The output this input consumed, named the same way: the ordinal
+    /// of the transaction that created it, and its index.
+    pub funding_txseq: u64,
+    pub funding_vout: u32,
+}
+
+impl AddrSpendingRowV3 {
+    pub fn key(&self) -> AddrSpendingKeyV3 {
+        AddrSpendingKeyV3 {
+            scripthash: self.scripthash,
+            txseq: self.txseq,
+            vin: self.vin,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddrSpendingKey {
     pub scripthash: Scripthash,
@@ -183,10 +210,9 @@ pub struct AddrFundingKeyV3Payload {
     pub vout: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddrSpendingKeyV2Payload {
-    pub height: u32,
-    pub txid: Txid,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddrSpendingKeyV3Payload {
+    pub txseq: u64,
     pub vin: u32,
 }
 
@@ -210,31 +236,24 @@ pub fn decode_funding_key_v3(b: &[u8]) -> Option<AddrFundingKeyV3Payload> {
     Some(AddrFundingKeyV3Payload { txseq, vout })
 }
 
-pub fn encode_spending_key_v2(k: &AddrSpendingKey) -> [u8; KEY_LEN_V2] {
-    let mut buf = [0u8; KEY_LEN_V2];
+pub fn encode_spending_key_v3(k: &AddrSpendingKeyV3) -> [u8; KEY_LEN_V3] {
+    let mut buf = [0u8; KEY_LEN_V3];
     buf[..SCRIPTHASH_PREFIX_LEN].copy_from_slice(&k.scripthash[..SCRIPTHASH_PREFIX_LEN]);
     let mut o = SCRIPTHASH_PREFIX_LEN;
-    buf[o..o + HEIGHT_LEN].copy_from_slice(&k.height.to_be_bytes());
-    o += HEIGHT_LEN;
-    buf[o..o + TXID_LEN].copy_from_slice(k.txid.as_ref());
-    o += TXID_LEN;
-    buf[o..o + 4].copy_from_slice(&k.vin.to_be_bytes());
+    buf[o..o + TXSEQ_LEN].copy_from_slice(&encode_txseq(TxSeq(k.txseq)));
+    o += TXSEQ_LEN;
+    buf[o..].copy_from_slice(&encode_u24(k.vin));
     buf
 }
 
-pub fn decode_spending_key_v2(b: &[u8]) -> Option<AddrSpendingKeyV2Payload> {
-    if b.len() != KEY_LEN_V2 {
+pub fn decode_spending_key_v3(b: &[u8]) -> Option<AddrSpendingKeyV3Payload> {
+    if b.len() != KEY_LEN_V3 {
         return None;
     }
-    let mut o = SCRIPTHASH_PREFIX_LEN;
-    let height = u32::from_be_bytes(b[o..o + HEIGHT_LEN].try_into().ok()?);
-    o += HEIGHT_LEN;
-    let mut txid_arr = [0u8; TXID_LEN];
-    txid_arr.copy_from_slice(&b[o..o + TXID_LEN]);
-    let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(txid_arr));
-    o += TXID_LEN;
-    let vin = u32::from_be_bytes(b[o..].try_into().ok()?);
-    Some(AddrSpendingKeyV2Payload { height, txid, vin })
+    let o = SCRIPTHASH_PREFIX_LEN;
+    let txseq = decode_txseq(&b[o..o + TXSEQ_LEN])?.0;
+    let vin = decode_u24(&b[o + TXSEQ_LEN..])?;
+    Some(AddrSpendingKeyV3Payload { txseq, vin })
 }
 
 /// Recombine the caller's full scripthash with a decoded payload to
@@ -253,14 +272,13 @@ pub fn reconstruct_funding_key_v3(
     }
 }
 
-pub fn reconstruct_spending_key(
+pub fn reconstruct_spending_key_v3(
     caller_sh: &Scripthash,
-    payload: AddrSpendingKeyV2Payload,
-) -> AddrSpendingKey {
-    AddrSpendingKey {
+    payload: AddrSpendingKeyV3Payload,
+) -> AddrSpendingKeyV3 {
+    AddrSpendingKeyV3 {
         scripthash: *caller_sh,
-        height: payload.height,
-        txid: payload.txid,
+        txseq: payload.txseq,
         vin: payload.vin,
     }
 }
@@ -276,32 +294,29 @@ pub fn decode_funding_value(b: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(b.try_into().ok()?))
 }
 
-pub fn encode_spending_value(prev: &OutPoint) -> [u8; SPENDING_VALUE_LEN] {
+/// The consumed output, named by the ordinal of the transaction that
+/// created it. This is the `prev_outpoint` of the public row, before
+/// the store resolves it.
+pub fn encode_spending_value(funding_txseq: u64, funding_vout: u32) -> [u8; SPENDING_VALUE_LEN] {
     let mut buf = [0u8; SPENDING_VALUE_LEN];
-    buf[..TXID_LEN].copy_from_slice(prev.txid.as_ref());
-    buf[TXID_LEN..].copy_from_slice(&prev.vout.to_be_bytes());
+    buf[..TXSEQ_LEN].copy_from_slice(&encode_txseq(TxSeq(funding_txseq)));
+    buf[TXSEQ_LEN..].copy_from_slice(&encode_u24(funding_vout));
     buf
 }
 
-pub fn decode_spending_value(b: &[u8]) -> Option<OutPoint> {
+pub fn decode_spending_value(b: &[u8]) -> Option<(u64, u32)> {
     if b.len() != SPENDING_VALUE_LEN {
         return None;
     }
-    let mut txid_arr = [0u8; TXID_LEN];
-    txid_arr.copy_from_slice(&b[..TXID_LEN]);
-    let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(txid_arr));
-    let vout = u32::from_be_bytes(b[TXID_LEN..].try_into().ok()?);
-    Some(OutPoint { txid, vout })
+    let seq = decode_txseq(&b[..TXSEQ_LEN])?.0;
+    let vout = decode_u24(&b[TXSEQ_LEN..])?;
+    Some((seq, vout))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::ScriptBuf;
-
-    fn fixture_txid(byte: u8) -> Txid {
-        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
-    }
 
     fn fixture_scripthash(byte: u8) -> Scripthash {
         [byte; 32]
@@ -316,13 +331,13 @@ mod tests {
 
     #[test]
     fn spending_value_roundtrip() {
-        let outpoint = OutPoint {
-            txid: fixture_txid(0x55),
-            vout: 99,
-        };
-        let encoded = encode_spending_value(&outpoint);
-        let decoded = decode_spending_value(&encoded).expect("decode");
-        assert_eq!(decoded, outpoint);
+        for (seq, vout) in [(0u64, 0u32), (99, 1), (1 << 33, (1 << 24) - 1)] {
+            let encoded = encode_spending_value(seq, vout);
+            assert_eq!(encoded.len(), SPENDING_VALUE_LEN);
+            assert_eq!(decode_spending_value(&encoded), Some((seq, vout)));
+        }
+        assert!(decode_spending_value(&[0u8; 7]).is_none());
+        assert!(decode_spending_value(&[0u8; 9]).is_none());
     }
 
     #[test]
@@ -361,7 +376,7 @@ mod tests {
     /// transaction that has nothing to do with it.
     #[test]
     fn funding_key_v3_decode_rejects_a_v2_length_row() {
-        assert!(decode_funding_key_v3(&[0u8; KEY_LEN_V2]).is_none());
+        assert!(decode_funding_key_v3(&[0u8; 56]).is_none());
         assert!(decode_funding_key_v3(&[0u8; KEY_LEN_V3 - 1]).is_none());
         assert!(decode_funding_key_v3(&[0u8; KEY_LEN_V3 + 1]).is_none());
         assert!(decode_funding_key_v3(&[]).is_none());
@@ -370,18 +385,33 @@ mod tests {
     #[test]
     fn spending_key_roundtrip_via_reconstruct() {
         let sh = fixture_scripthash(0x33);
-        let key = AddrSpendingKey {
+        let key = AddrSpendingKeyV3 {
             scripthash: sh,
-            height: 800_000,
-            txid: fixture_txid(0x22),
+            txseq: 800_000,
             vin: 17,
         };
-        let encoded = encode_spending_key_v2(&key);
-        assert_eq!(encoded.len(), KEY_LEN_V2);
+        let encoded = encode_spending_key_v3(&key);
+        assert_eq!(encoded.len(), KEY_LEN_V3);
         assert_eq!(&encoded[..SCRIPTHASH_PREFIX_LEN], &sh[..SCRIPTHASH_PREFIX_LEN]);
-        let payload = decode_spending_key_v2(&encoded).expect("decode");
-        let recovered = reconstruct_spending_key(&sh, payload);
+        let payload = decode_spending_key_v3(&encoded).expect("decode");
+        let recovered = reconstruct_spending_key_v3(&sh, payload);
         assert_eq!(recovered, key);
+    }
+
+    /// The claim the footprint rests on: 24 bytes of key and 8 of value,
+    /// where the previous layout took 56 and 36.
+    #[test]
+    fn spending_row_bytes_are_32() {
+        let key = AddrSpendingKeyV3 {
+            scripthash: fixture_scripthash(0x01),
+            txseq: crate::txseq::TXSEQ_MAX,
+            vin: (1 << 24) - 1,
+        };
+        assert_eq!(encode_spending_key_v3(&key).len(), 24);
+        assert_eq!(
+            encode_spending_value(crate::txseq::TXSEQ_MAX, (1 << 24) - 1).len(),
+            8
+        );
     }
 
     #[test]
@@ -460,9 +490,9 @@ mod tests {
     fn decode_rejects_wrong_length() {
         assert!(decode_funding_key_v3(&[0u8; KEY_LEN_V3 - 1]).is_none());
         assert!(decode_funding_key_v3(&[0u8; KEY_LEN_V3 + 1]).is_none());
-        assert!(decode_spending_key_v2(&[0u8; 0]).is_none());
+        assert!(decode_spending_key_v3(&[0u8; 0]).is_none());
         assert!(decode_funding_value(&[0u8; 7]).is_none());
-        assert!(decode_spending_value(&[0u8; 35]).is_none());
+        assert!(decode_spending_value(&[0u8; SPENDING_VALUE_LEN - 1]).is_none());
     }
 
     #[test]
