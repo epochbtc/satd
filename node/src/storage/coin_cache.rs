@@ -1842,7 +1842,7 @@ impl Store for CoinCache {
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
+            (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
         });
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows. Without this truncate a large in-flight
@@ -3634,6 +3634,73 @@ mod tests {
         assert!(
             cache.iter_addr_funding(&sh).is_empty(),
             "post-flush funding rows must remain empty"
+        );
+    }
+
+    /// A txid whose internal bytes start with `first` and end with
+    /// `last`: `Txid::cmp` is decided by `first`, the display hex by
+    /// `last`, so the two orders can be made to disagree.
+    fn txid_with_ends(first: u8, last: u8) -> bitcoin::Txid {
+        let mut bytes = [0u8; 32];
+        bytes[0] = first;
+        bytes[31] = last;
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
+    }
+
+    /// The overlay merges flushed and pending rows and sorts the union
+    /// into the documented `(height, txid, vout)` order — by `Txid::cmp`,
+    /// the order the lockstep merge compares by, not by display hex
+    /// (round-1 review, PR 803 H1). Block position, internal order and
+    /// display order are three different orders here.
+    #[test]
+    fn overlay_addr_funding_rows_are_in_txid_order_across_pending_and_flushed() {
+        use crate::index::address::{AddrFundingRowV3, scripthash_of};
+
+        let cache = make_cache(16);
+        let sh = scripthash_of(&bitcoin::ScriptBuf::new());
+        let txids = [
+            txid_with_ends(0x03, 0x01),
+            txid_with_ends(0x02, 0x02),
+            txid_with_ends(0x01, 0x03),
+        ];
+        assert!(txids[0] > txids[1] && txids[1] > txids[2]);
+        assert!(txids[0].to_string() < txids[1].to_string());
+        seed_ordinal_block(&cache, 7, 70, &txids);
+
+        // Positions 0 and 2 are flushed; position 1 is pending.
+        let mut flushed = StoreBatch::default();
+        for i in [0usize, 2] {
+            flushed.addr_funding_puts.push(AddrFundingRowV3 {
+                scripthash: sh,
+                txseq: 70 + i as u64,
+                vout: 0,
+                amount_sat: 1,
+            });
+        }
+        cache.write_batch(flushed).unwrap();
+        cache.flush_durable().unwrap();
+        let mut pending = StoreBatch::default();
+        pending.addr_funding_puts.push(AddrFundingRowV3 {
+            scripthash: sh,
+            txseq: 71,
+            vout: 0,
+            amount_sat: 1,
+        });
+        pending
+            .coin_puts
+            .push((make_outpoint(0x61, 0), a_coin(7)));
+        cache.write_batch(pending).unwrap();
+
+        let mut expected = txids.to_vec();
+        expected.sort();
+        let got: Vec<bitcoin::Txid> = cache
+            .iter_addr_funding(&sh)
+            .into_iter()
+            .map(|(k, _)| k.txid)
+            .collect();
+        assert_eq!(
+            got, expected,
+            "overlay funding rows must be in (height, txid, vout) order by Txid::cmp"
         );
     }
 

@@ -336,6 +336,19 @@ mod tests {
         bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
     }
 
+    /// A txid whose internal bytes start with `first` and end with
+    /// `last`. `Txid`'s `Ord` compares internal bytes, so `first`
+    /// decides it; the display hex is the reverse, so `last` decides
+    /// that. A fixture built from uniform bytes cannot tell the two
+    /// orders apart.
+    fn fixture_txid_ends(first: u8, last: u8) -> bitcoin::Txid {
+        use bitcoin::hashes::Hash;
+        let mut bytes = [0u8; 32];
+        bytes[0] = first;
+        bytes[31] = last;
+        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
+    }
+
     /// Assign each `(height, txid)` a chain-order ordinal and write the
     /// families a v3 index row resolves through: `tx_loc`,
     /// `txseq_txid`, `txseq_block`, plus the block-index and
@@ -473,9 +486,14 @@ mod tests {
     /// (Electrum's `listunspent`, the lockstep merge in
     /// `confirmed_distinct_history_limited`) working unchanged.
     ///
-    /// This builds a block whose transactions are in the opposite txid
-    /// order from their positions, so a store that returned raw scan
-    /// order would fail.
+    /// "txid order" is `Txid`'s `Ord` — internal byte order, the order
+    /// the previous schema had on disk and the order the lockstep merge
+    /// compares by. Display-hex order is the reverse. The fixture makes
+    /// block order, internal order and display order three different
+    /// orders, so a store returning the raw scan *or* sorting by display
+    /// hex fails it (round-1 review, PR 803 H1: the display sort put
+    /// the merge's inputs out of step with its comparator, and Electrum
+    /// `get_history` came back unsorted with duplicates).
     #[test]
     fn test_address_index_utxos_order_matches_the_documented_contract() {
         let store_inner = Arc::new(InMemoryStore::new());
@@ -483,9 +501,14 @@ mod tests {
         let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
         let sh = [0x5a; 32];
 
-        // Three transactions in ONE block. Positions 0,1,2 carry txids
-        // that sort 0xcc, 0xbb, 0xaa — the reverse.
-        let txids = [fixture_txid(0xcc), fixture_txid(0xbb), fixture_txid(0xaa)];
+        // Three transactions in ONE block. Block position ascends with
+        // the last byte, so display order is block order and internal
+        // order is its exact reverse.
+        let txids = [
+            fixture_txid_ends(0x03, 0x01),
+            fixture_txid_ends(0x02, 0x02),
+            fixture_txid_ends(0x01, 0x03),
+        ];
         let seqs = seed_ordinals(
             &store_inner,
             &[(7, txids[0]), (7, txids[1]), (7, txids[2])],
@@ -493,6 +516,11 @@ mod tests {
         assert!(
             txids[0] > txids[1] && txids[1] > txids[2],
             "fixture premise: block position and txid order disagree"
+        );
+        assert!(
+            txids[0].to_string() < txids[1].to_string()
+                && txids[1].to_string() < txids[2].to_string(),
+            "fixture premise: display-hex order is block order, not txid order"
         );
 
         let mut batch = StoreBatch::default();
@@ -512,20 +540,25 @@ mod tests {
 
         let got: Vec<bitcoin::Txid> = idx.utxos(&sh).unwrap().iter().map(|u| u.txid).collect();
         let mut expected = txids.to_vec();
-        expected.sort_by_key(|t| t.to_string());
+        expected.sort();
         assert_eq!(
             got, expected,
             "utxos must come back in (height, txid, vout) order, not block order"
         );
 
-        // Same for history.
+        // The lockstep merge is the consumer that depends on the order:
+        // it compares by `Txid::cmp`, so a stream in any other order
+        // comes out of it unsorted.
         let hist: Vec<bitcoin::Txid> = idx
-            .confirmed_history(&sh)
+            .confirmed_distinct_history_limited(&sh, 100)
             .unwrap()
-            .iter()
-            .map(|e| e.txid())
+            .into_iter()
+            .map(|(_, txid)| txid)
             .collect();
-        assert_eq!(hist, expected);
+        assert_eq!(
+            hist, expected,
+            "distinct history must be in (height, txid) order, the order the merge assumes"
+        );
     }
 
     /// A funding row whose ordinal has no reverse-map entry is local

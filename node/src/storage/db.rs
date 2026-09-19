@@ -534,7 +534,7 @@ impl Store for InMemoryStore {
             })
             .collect();
         rows.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
+            (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
         });
         rows
     }

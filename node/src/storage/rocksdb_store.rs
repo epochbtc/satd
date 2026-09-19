@@ -263,6 +263,12 @@ const RETIRED_CF_NAMES: &[&str] = &[
 /// `confirmed_distinct_history_limited`, Electrum's `listunspent`), is
 /// unchanged by the re-keying.
 ///
+/// "txid order" is `Txid`'s own `Ord`: its internal byte order, which is
+/// what the previous schema laid down on disk (the key carried the raw
+/// 32 bytes) and what the lockstep merge compares by. Display-hex order
+/// is the *reverse* byte order, and sorting by it would put the two
+/// streams the merge consumes out of step with each other.
+///
 /// One batched resolution for the whole scan, not one per row: see
 /// [`crate::index::resolve::resolve_txseqs`].
 ///
@@ -309,7 +315,7 @@ pub(crate) fn resolve_funding_rows_for(
         ));
     }
     out.sort_by(|(a, _), (b, _)| {
-        (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
+        (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
     });
     out
 }
@@ -4740,10 +4746,28 @@ mod tests {
         assert_eq!(store.iter_addr_funding_limited(&sh, 100).len(), 50);
     }
 
+    /// A txid whose internal bytes start with `first` and end with `last`.
+    /// `Txid`'s `Ord` compares internal bytes, so `first` decides it;
+    /// the display hex is the reverse, so `last` decides that. Picking
+    /// the two to disagree is what tells the three orders apart.
+    fn txid_with_ends(first: u8, last: u8) -> Txid {
+        let mut bytes = [0u8; 32];
+        bytes[0] = first;
+        bytes[31] = last;
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
+    }
+
     /// The documented iteration order is `(height, txid, vout)`, but on
     /// disk the rows sort by *ordinal*, which is block position. Within
     /// a block the two disagree, so the store sorts the resolved rows
     /// before returning them.
+    ///
+    /// "txid order" is `Txid`'s `Ord` — internal byte order, which the
+    /// previous schema had on disk and the lockstep merge in
+    /// `confirmed_distinct_history_limited` compares by. The fixture is
+    /// built so that block order, internal order and display-hex order
+    /// are three different orders: a store that returned the raw scan
+    /// *or* sorted by display hex fails it (round-1 review, PR 803 H1).
     ///
     /// This is the RocksDB-path guard, and it is not redundant with the
     /// `lookups.rs` order test: that one runs against `InMemoryStore`,
@@ -4754,16 +4778,22 @@ mod tests {
         let (store, _dir) = temp_store(false);
         let sh = [0x3e; 32];
 
-        // One block, three transactions whose txids sort in the reverse
-        // of their block positions.
+        // One block, three transactions. Block position ascends with the
+        // *last* byte, so display-hex order equals block order and
+        // internal order is its exact reverse.
         let txids = [
-            make_outpoint(0xcc, 0).txid,
-            make_outpoint(0xbb, 0).txid,
-            make_outpoint(0xaa, 0).txid,
+            txid_with_ends(0x03, 0x01),
+            txid_with_ends(0x02, 0x02),
+            txid_with_ends(0x01, 0x03),
         ];
         assert!(
             txids[0] > txids[1] && txids[1] > txids[2],
             "fixture premise: block position and txid order disagree"
+        );
+        assert!(
+            txids[0].to_string() < txids[1].to_string()
+                && txids[1].to_string() < txids[2].to_string(),
+            "fixture premise: display-hex order is block order, not txid order"
         );
         seed_ordinal_block(&store, 4, 100, &txids);
 
@@ -4779,7 +4809,7 @@ mod tests {
         store.write_batch(batch).unwrap();
 
         let mut expected = txids.to_vec();
-        expected.sort_by_key(|t| t.to_string());
+        expected.sort();
         let funding: Vec<Txid> = store
             .iter_addr_funding(&sh)
             .into_iter()
