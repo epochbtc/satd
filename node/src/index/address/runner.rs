@@ -485,6 +485,28 @@ impl BackfillRunner {
         let started_at_unix = self.handle.cursor().started_at_unix;
         let debug_delay = debug_delay_ms();
 
+        // Genesis. Pass 1 starts at height 1 because live indexing skips
+        // the genesis coinbase's outputs (unspendable, never in the UTXO
+        // set — review-2 finding #7), but the genesis coinbase still
+        // holds ordinal 0 and every ordinal after it is offset from
+        // that. A node enabling `-addressindex` on a datadir that ran
+        // with both transaction-index consumers off has no ordinal rows
+        // at all, so pass 1 writes them — and it has to start where the
+        // numbering starts.
+        if resume_from == 0
+            && let Some(block) = self.chain.get_block(&snapshot.hashes[0])
+            && let Some(coinbase) = block.txdata.first()
+        {
+            let txid = coinbase.compute_txid();
+            let mut batch = StoreBatch::default();
+            batch.tx_loc_puts.push((txid, 0));
+            batch.txseq_txid_puts.push((0, txid));
+            batch.txseq_block_puts.push((0, 0));
+            self.chain
+                .store_ref()
+                .write_batch_mode(batch, WriteMode::Normal)?;
+        }
+
         // Loop starts at height 1 (resume_from is 0 on a fresh start),
         // matching connect.rs's "skip genesis coinbase" semantics:
         // height 0 only contains the genesis coinbase, which live
@@ -500,9 +522,31 @@ impl BackfillRunner {
 
             let block = self.read_via_snapshot(snapshot, h)?;
 
+            // The ordinal this block's transactions are numbered from.
+            // `chain_tx` is hash-keyed and written by `connect_block`
+            // for every block on the active chain, so the snapshot's own
+            // parent hash is the right key; the anchor checks around
+            // this write are what catch a reorg underneath it.
+            //
+            // Without it the ordinal rows cannot be placed, so a gap is
+            // a hard failure rather than a skipped block: a mis-numbered
+            // row is worse than no row, because nothing downstream can
+            // tell it apart from a correct one.
+            let first_txseq = self
+                .chain
+                .store_ref()
+                .get_cumulative_tx_count(&snapshot.hashes[(h - 1) as usize])
+                .ok_or(BackfillError::ChainTxGap { height: h })?;
+
             let mut batch = StoreBatch::default();
-            for tx in &block.txdata {
+            for (tx_idx, tx) in block.txdata.iter().enumerate() {
                 let txid = tx.compute_txid();
+                // Ordinal rows. Idempotent on a resumed pass: the same
+                // block yields the same ordinals, so a rewrite lands on
+                // identical values.
+                let txseq = first_txseq + tx_idx as u64;
+                batch.tx_loc_puts.push((txid, txseq));
+                batch.txseq_txid_puts.push((txseq, txid));
                 for (vout, output) in tx.output.iter().enumerate() {
                     let sh = scripthash_of(&output.script_pubkey);
                     batch.addr_funding_puts.push(AddrFundingRow {
@@ -517,6 +561,7 @@ impl BackfillRunner {
                         .push((OutPoint { txid, vout: vout as u32 }, sh));
                 }
             }
+            batch.txseq_block_puts.push((first_txseq, h));
             batch.backfill_cursor_advance = Some(BackfillCursorWrite {
                 state: BackfillState::Running,
                 pass: 1,

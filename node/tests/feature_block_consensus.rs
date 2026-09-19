@@ -196,9 +196,26 @@ fn block_index_entry(height: u32, time: u32, bits: u32) -> BlockIndexEntry {
     }
 }
 
+/// An `InMemoryStore` whose cumulative-transaction-count series is
+/// seeded for the placeholder parent these fixtures use.
+///
+/// Since schema 4 `connect_block` fails closed on a parent with no
+/// `chain_tx` row — the ordinal every index row is keyed on is
+/// `chain_tx(parent) + position` — and that refusal is local-storage
+/// damage, not a consensus verdict. Leaving the row out would make every
+/// case in this matrix report the same storage error where a Core-parity
+/// reject reason belongs.
+fn differential_store() -> InMemoryStore {
+    let store = InMemoryStore::new();
+    let mut batch = StoreBatch::default();
+    batch.chain_tx_puts.push((BlockHash::all_zeros(), 0));
+    store.write_batch(batch).unwrap();
+    store
+}
+
 /// An InMemoryStore pre-seeded with one spendable coin.
 fn store_with_coin(amount: u64, height: u32, coinbase: bool) -> (InMemoryStore, OutPoint) {
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]));
     let outpoint = OutPoint { txid, vout: 0 };
     let coin = Coin { amount, script_pubkey: bitcoin::ScriptBuf::new(), height, coinbase };
@@ -471,7 +488,7 @@ fn case_non_coinbase_null_input() -> Satd {
 // -- contextual / chain-level (connect_block) --
 
 fn case_spend_nonexistent() -> Satd {
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let fake = OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 };
     let block = block_of(vec![coinbase(1, 50_0000_0000), spending_tx(fake, 50_000_000, 2, 0xffff_ffff, 0)]);
     connect(&store, &block, 1, 0)
@@ -499,14 +516,14 @@ fn case_inputs_below_outputs() -> Satd {
 
 fn case_coinbase_value_too_high() -> Satd {
     // No fees; coinbase claims subsidy + 1.
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1) + 1)]);
     connect(&store, &block, 1, 0)
 }
 
 fn case_bad_coinbase_height_bip34() -> Satd {
     // Coinbase encodes height 999 but the block is at height 1.
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let block = block_of(vec![coinbase(999, block_subsidy(Network::Regtest, 1))]);
     connect(&store, &block, 1, 0)
 }
@@ -527,7 +544,7 @@ fn case_bip68_sequence_not_met() -> Satd {
 
 /// Spend an output created earlier in the same block (valid ordering).
 fn case_intra_block_spend_ok() -> Satd {
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let cbtx = coinbase(1, block_subsidy(Network::Regtest, 1));
     let cb_txid = cbtx.compute_txid();
     // The coinbase output is immature (height 1, spent at height 1), so to
@@ -598,7 +615,7 @@ fn case_gap_block_sigops() -> Satd {
     // Coinbase output packed with bare OP_CHECKMULTISIG (20 legacy sigops
     // each). 4001 ops → 80_020 sigop cost > MAX_BLOCK_SIGOPS_COST (80_000),
     // while staying far under MAX_BLOCK_WEIGHT. Core: `bad-blk-sigops`.
-    let store = InMemoryStore::new();
+    let store = differential_store();
     let script = bitcoin::ScriptBuf::from(vec![
         bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8();
         4001

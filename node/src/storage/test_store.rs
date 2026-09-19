@@ -20,7 +20,7 @@
 //! having no blocks.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bitcoin::{BlockHash, OutPoint, Txid};
 
@@ -45,6 +45,12 @@ pub(crate) struct StoreControls {
     txindex_complete: Arc<AtomicBool>,
     coin_gate: Arc<std::sync::Mutex<Option<ArmedCoinGate>>>,
     fail_next_write: Arc<AtomicBool>,
+    /// How many times each ordinal read has been called. The index read
+    /// paths resolve ordinals to txids in one batch per scan rather than
+    /// one per row; nothing about the returned rows shows which of the
+    /// two a caller did, so the count is the only way to pin it.
+    get_tx_seq_calls: Arc<AtomicU64>,
+    txids_of_seqs_calls: Arc<AtomicU64>,
 }
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
@@ -128,6 +134,25 @@ impl StoreControls {
     pub(crate) fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
     }
+
+    /// How many `get_tx_seq` calls the store has served since the last
+    /// reset.
+    pub(crate) fn get_tx_seq_calls(&self) -> u64 {
+        self.get_tx_seq_calls.load(Ordering::SeqCst)
+    }
+
+    /// How many `txids_of_seqs` calls the store has served since the last
+    /// reset. One per scan is the contract; one per row is the defect.
+    pub(crate) fn txids_of_seqs_calls(&self) -> u64 {
+        self.txids_of_seqs_calls.load(Ordering::SeqCst)
+    }
+
+    /// Zero both ordinal-read counters, so a test can set up state
+    /// without the setup's reads counting against the assertion.
+    pub(crate) fn reset_ordinal_read_counts(&self) {
+        self.get_tx_seq_calls.store(0, Ordering::SeqCst);
+        self.txids_of_seqs_calls.store(0, Ordering::SeqCst);
+    }
 }
 
 /// An [`InMemoryStore`] whose failure modes and index configuration can be set
@@ -166,6 +191,8 @@ impl ControllableStore {
                 txindex_complete: Arc::new(AtomicBool::new(true)),
                 coin_gate: Arc::new(std::sync::Mutex::new(None)),
                 fail_next_write: Arc::new(AtomicBool::new(false)),
+                get_tx_seq_calls: Arc::new(AtomicU64::new(0)),
+                txids_of_seqs_calls: Arc::new(AtomicU64::new(0)),
             },
         }
     }
@@ -283,6 +310,19 @@ impl Store for ControllableStore {
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
         self.inner.get_tx_location(txid)
     }
+    fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        self.controls.get_tx_seq_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_tx_seq(txid)
+    }
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        self.controls
+            .txids_of_seqs_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.txids_of_seqs(seqs)
+    }
+    fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
+        self.inner.block_of_seq(seq)
+    }
     fn clear_chainstate(&self) -> Result<(), StoreError> {
         self.inner.clear_chainstate()
     }
@@ -343,5 +383,63 @@ impl Store for ControllableStore {
     #[cfg(feature = "block-filter-index")]
     fn write_filter_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
         self.inner.write_filter_backfill_last_error(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StoreBatch;
+    use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+
+    /// Every trait method this wrapper forgets silently answers with the
+    /// trait default, and for the ordinal reads that default is "no
+    /// row" — which a caller cannot tell apart from a genuinely absent
+    /// transaction. The module doc calls this out for the block-index
+    /// scan; the ordinal reads are the same hazard, and the counters
+    /// make "did the call actually reach the inner store" observable.
+    #[test]
+    fn controllable_store_forwards_every_ordinal_read() {
+        let store = ControllableStore::new();
+        let controls = store.controls();
+
+        let g = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = g.block_hash();
+        let txid = g.txdata[0].compute_txid();
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((
+            hash,
+            BlockIndexEntry {
+                header: g.header,
+                height: 0,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            },
+        ));
+        batch.height_hash_puts.push((0, hash));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 0));
+        store.write_batch(batch).unwrap();
+
+        controls.reset_ordinal_read_counts();
+        assert_eq!(store.get_tx_seq(&txid), Some(0));
+        assert_eq!(store.txids_of_seqs(&[0]), vec![Some(txid)]);
+        assert_eq!(store.block_of_seq(0), Some((0, 0)));
+        assert_eq!(store.get_tx_location(&txid), Some(hash));
+
+        assert_eq!(
+            controls.get_tx_seq_calls(),
+            1,
+            "get_tx_seq must reach the inner store, not the trait default"
+        );
+        assert_eq!(
+            controls.txids_of_seqs_calls(),
+            1,
+            "txids_of_seqs must reach the inner store, not the trait default"
+        );
     }
 }

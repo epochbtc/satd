@@ -104,8 +104,8 @@ impl SplitStore {
     }
 
     /// Partition a batch into `(block-store mutations, coins-store
-    /// mutations)`. Block-index/height/txindex rows are moved out into
-    /// the block batch; everything else (coins, undo, tip — and any
+    /// mutations)`. Block-index, height and transaction-ordinal rows are
+    /// moved out into the block batch; everything else (coins, undo, tip — and any
     /// secondary-index rows, which the background never emits because it
     /// runs with those indexes disabled) stays in the original batch and
     /// goes to the coins store.
@@ -121,8 +121,17 @@ impl SplitStore {
             block_index_puts: std::mem::take(&mut batch.block_index_puts),
             height_hash_puts: std::mem::take(&mut batch.height_hash_puts),
             height_hash_removes: std::mem::take(&mut batch.height_hash_removes),
-            tx_index_puts: std::mem::take(&mut batch.tx_index_puts),
-            tx_index_removes: std::mem::take(&mut batch.tx_index_removes),
+            // Transaction ordinals live with the block index: an ordinal
+            // names a position in the *chain*, and both the served
+            // snapshot chain and the background validator's genesis→base
+            // fill have to write into one series or the two halves would
+            // number the same transaction differently.
+            tx_loc_puts: std::mem::take(&mut batch.tx_loc_puts),
+            tx_loc_removes: std::mem::take(&mut batch.tx_loc_removes),
+            txseq_txid_puts: std::mem::take(&mut batch.txseq_txid_puts),
+            txseq_txid_removes: std::mem::take(&mut batch.txseq_txid_removes),
+            txseq_block_puts: std::mem::take(&mut batch.txseq_block_puts),
+            txseq_block_removes: std::mem::take(&mut batch.txseq_block_removes),
             // Cumulative tx counts live with the block index in the shared
             // store so the served (snapshot) chain and the background's
             // genesis→base fills land in one CF — visible to getchaintxstats
@@ -164,9 +173,21 @@ impl Store for SplitStore {
         self.block_store.has_txindex()
     }
 
-    /// Delegated for the same reason as `has_txindex` above: `tx_index_puts`
-    /// and `tx_index_removes` are routed to the block store, so its marker is
-    /// the one describing the rows this store actually reads. The trait
+    fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        self.block_store.get_tx_seq(txid)
+    }
+
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        self.block_store.txids_of_seqs(seqs)
+    }
+
+    fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
+        self.block_store.block_of_seq(seq)
+    }
+
+    /// Delegated for the same reason as `has_txindex` above: the ordinal
+    /// families are routed to the block store, so its marker is the one
+    /// describing the rows this store actually reads. The trait
     /// default is `true` ("non-Rocks backends are freshly built"), which is
     /// the fail-open answer here — it would tell a consistency audit that a
     /// known-incomplete index is complete.
@@ -344,6 +365,64 @@ mod tests {
             chainwork: [0u8; 32],
         };
         (g.block_hash(), entry)
+    }
+
+    /// Ordinals name a position in the *chain*, so both halves of a
+    /// split store have to agree on the numbering. Routing them to the
+    /// private coins store would give the served snapshot chain and the
+    /// background validator's genesis-to-base fill two independent
+    /// series, and a transaction would resolve to a different ordinal
+    /// depending on which half answered.
+    #[test]
+    fn split_store_routes_ordinal_rows_to_the_block_half() {
+        let bdir = tempfile::tempdir().unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let block_store = store(bdir.path());
+        let coins_store = store(cdir.path());
+        let split = SplitStore::new(block_store.clone(), coins_store.clone(), None);
+
+        let (hash, mut entry) = genesis_entry();
+        entry.num_tx = 1;
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x9a; 32]));
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((0, hash));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 0));
+        // A coin, so the batch is not block-only and the split actually
+        // has to partition rather than pass everything through.
+        batch.coin_puts.push((outpoint(0x1a), coin(5_000)));
+        split.write_batch(batch).unwrap();
+
+        assert_eq!(
+            block_store.get_tx_seq(&txid),
+            Some(0),
+            "tx_loc must land in the block half"
+        );
+        assert_eq!(
+            block_store.txids_of_seqs(&[0]),
+            vec![Some(txid)],
+            "txseq_txid must land in the block half"
+        );
+        assert_eq!(
+            block_store.block_of_seq(0),
+            Some((0, 0)),
+            "txseq_block must land in the block half"
+        );
+        assert_eq!(
+            coins_store.get_tx_seq(&txid),
+            None,
+            "an ordinal row in the private coins half would give the two \
+             chainstates independent numbering"
+        );
+        assert!(coins_store.has_coin(&outpoint(0x1a)), "coins still route private");
+
+        // And the reads delegate the same way.
+        assert_eq!(split.get_tx_seq(&txid), Some(0));
+        assert_eq!(split.txids_of_seqs(&[0]), vec![Some(txid)]);
+        assert_eq!(split.block_of_seq(0), Some((0, 0)));
     }
 
     /// The background catch-up thread writes block-index rows into the

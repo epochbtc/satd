@@ -58,6 +58,16 @@ pub enum BackfillError {
     ReorgInvalidated { height: u32, detail: String },
     #[error("address index is disabled (--addressindex=0); refusing to run backfill")]
     AddressIndexDisabled,
+    /// No cumulative transaction count for the block below `height`, so
+    /// its transactions have no ordinal to be numbered from. Every index
+    /// row the backfill would write keys on that ordinal, so writing
+    /// anything here would produce rows nothing can tell apart from
+    /// correct ones.
+    #[error(
+        "cumulative transaction count missing below height {height}; \
+         run with --reindex-chainstate to rebuild it"
+    )]
+    ChainTxGap { height: u32 },
 }
 
 /// Shared handle so RPCs can drive the task without a tokio

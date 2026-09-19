@@ -191,9 +191,9 @@ pub fn repair_lost_connect_delta(
     let block_txids: HashSet<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
     for tx in &block.txdata {
         let txid = tx.compute_txid();
-        if let Some(loc) = store.get_tx_location(&txid) {
+        if let Some(seq) = store.get_tx_seq(&txid) {
             return Err(RepairError::SignatureMismatch(format!(
-                "txindex already maps {txid} to {loc}"
+                "txindex already maps {txid} to ordinal {seq}"
             )));
         }
         for vout in 0..tx.output.len() as u32 {
@@ -316,7 +316,7 @@ pub fn repair_lost_connect_delta(
     // Capture verification keys before the batch is consumed.
     let created: Vec<OutPoint> = batch.coin_puts.iter().map(|(op, _)| *op).collect();
     let spent: Vec<OutPoint> = batch.coin_removes.iter().map(|(op, _, _)| *op).collect();
-    let tx_rows: Vec<Txid> = batch.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
+    let tx_rows: Vec<(Txid, u64)> = batch.tx_loc_puts.clone();
     let report = RepairReport {
         block_hash,
         height,
@@ -357,7 +357,20 @@ pub fn repair_lost_connect_delta(
             )));
         }
     }
-    for txid in &tx_rows {
+    for (txid, seq) in &tx_rows {
+        // Both directions. The forward row alone would let a repair that
+        // wrote `tx_loc` and dropped `txseq_txid` pass, and every index
+        // row keyed on that ordinal would then resolve to nothing.
+        if store.get_tx_seq(txid) != Some(*seq) {
+            return Err(RepairError::Postcondition(format!(
+                "tx_loc row for {txid} missing after write"
+            )));
+        }
+        if store.txids_of_seqs(&[*seq]) != vec![Some(*txid)] {
+            return Err(RepairError::Postcondition(format!(
+                "txseq_txid row for ordinal {seq} missing after write"
+            )));
+        }
         if store.get_tx_location(txid) != Some(block_hash) {
             return Err(RepairError::Postcondition(format!(
                 "txindex row for {txid} missing after write"
@@ -529,30 +542,39 @@ mod tests {
             .push((block1_hash, index_entry(&block1, 1, BlockStatus::DataStored)));
         store.write_batch(batch).unwrap();
 
-        // Block 2 connects over the hole, exactly as production did:
-        // its chain_tx anchors on a missing parent count (→ 0).
+        // Block 2 sits over the hole, exactly as production left it: its
+        // cumulative count and its transaction ordinals both anchor on a
+        // parent row that is not there, so both restart from zero.
+        //
+        // Written by hand rather than through `connect_block`, because
+        // `connect_block` can no longer produce this state — it fails
+        // closed on a missing parent count (that is the fix). What the
+        // repair tool faces is a datadir an older binary left behind, so
+        // the fixture has to lay those bytes down directly.
         let block2 = seal(block1_hash, vec![make_coinbase(2, 0)]);
         let block2_hash = block2.block_hash();
-        let batch2 = connect::connect_block(&ConnectParams {
-            replay_plan: None,
-            store,
-            block: &block2,
-            height: 2,
-            parent_chainwork: &[0u8; 32],
-            flat_pos: FlatFilePos { file_number: 0, data_pos: 0 },
-            script_verifier: &NoopVerifier,
-            median_time_past: 0,
-            network: Network::Regtest,
-            pre_verified_txs: None,
-            num_threads: 1,
-            precomputed_txids: None,
-            address_index: &AddressIndexConfig::default(),
-            sp_index: &Default::default(),
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &Default::default(),
-            phase_tracker: None,
-        })
-        .unwrap();
+        let cb2_txid = block2.txdata[0].compute_txid();
+        let mut batch2 = StoreBatch::default();
+        batch2
+            .block_index_puts
+            .push((block2_hash, index_entry(&block2, 2, BlockStatus::Valid)));
+        batch2.height_hash_puts.push((2, block2_hash));
+        batch2.tip = Some(block2_hash);
+        batch2.coin_puts.push((
+            OutPoint { txid: cb2_txid, vout: 0 },
+            Coin {
+                amount: block2.txdata[0].output[0].value.to_sat(),
+                script_pubkey: block2.txdata[0].output[0].script_pubkey.clone(),
+                height: 2,
+                coinbase: true,
+            },
+        ));
+        batch2.undo_puts.push((block2_hash, crate::storage::undo::UndoData::default()));
+        // The wrong numbering: parent count read as zero.
+        batch2.chain_tx_puts.push((block2_hash, 1));
+        batch2.tx_loc_puts.push((cb2_txid, 0));
+        batch2.txseq_txid_puts.push((0, cb2_txid));
+        batch2.txseq_block_puts.push((0, 2));
         store.write_batch(batch2).unwrap();
         assert_eq!(store.get_tip(), Some(block2_hash));
         // The production wrongness this sets up: block 2's count

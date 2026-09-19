@@ -258,15 +258,38 @@ pub fn verify_chainstate_with(
             }
         }
 
+        // The ordinal this block's transactions are numbered from. The
+        // audit checks both directions of the ordinal map against it, so
+        // a `tx_loc` row pointing at an ordinal the reverse map does not
+        // own — which would make every index row keyed on that ordinal
+        // resolve to nothing — shows up as a fault rather than passing.
+        let block_first_txseq = if height == 0 {
+            Some(0)
+        } else {
+            store.get_cumulative_tx_count(&parent_hash)
+        };
+
         match read_block(&cursor, &entry) {
             Some(block) => {
-                for tx in &block.txdata {
+                for (tx_idx, tx) in block.txdata.iter().enumerate() {
                     let txid = tx.compute_txid();
-                    match store.get_tx_location(&txid) {
-                        Some(loc) if loc != cursor => {
-                            report.tx_index_wrong.push((txid, loc));
+                    let expected_seq = block_first_txseq.map(|f| f + tx_idx as u64);
+                    match store.get_tx_seq(&txid) {
+                        Some(seq) => {
+                            if expected_seq.is_some_and(|e| e != seq) {
+                                report
+                                    .tx_index_wrong
+                                    .push((txid, store.get_tx_location(&txid).unwrap_or(cursor)));
+                            } else if store.txids_of_seqs(&[seq]) != vec![Some(txid)] {
+                                // Forward row present, reverse row missing
+                                // or pointing elsewhere.
+                                report.tx_index_absent += 1;
+                            } else if store.block_of_seq(seq).map(|(_, h)| h) != Some(height) {
+                                report
+                                    .tx_index_wrong
+                                    .push((txid, store.get_tx_location(&txid).unwrap_or(cursor)));
+                            }
                         }
-                        Some(_) => {}
                         None => report.tx_index_absent += 1,
                     }
                     if !tx.is_coinbase() {
