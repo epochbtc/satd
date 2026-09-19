@@ -633,6 +633,16 @@ pub trait Store: Send + Sync {
         Vec::new()
     }
 
+    /// Per-column-family estimated live key count. Third leg of the
+    /// footprint diagnostics: `sst_bytes_by_cf` says how much disk a
+    /// family occupies, this says across how many rows, and their
+    /// quotient is the effective post-compression bytes per row — the
+    /// number that decides whether a family is worth re-encoding.
+    /// Default: empty.
+    fn estimated_keys_by_cf(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
     /// Iterate every `block_index` entry, invoking `visit` once per row.
     /// Used by the blockfile slack audit (and any other diagnostic that
     /// needs the full block_index set). Order is unspecified. Returning

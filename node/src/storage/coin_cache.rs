@@ -1572,6 +1572,10 @@ impl Store for CoinCache {
         self.inner.sst_bytes_by_cf()
     }
 
+    fn estimated_keys_by_cf(&self) -> Vec<(&'static str, u64)> {
+        self.inner.estimated_keys_by_cf()
+    }
+
     fn compact_chainstate(&self) -> Result<(), StoreError> {
         // Drain pending writes before forcing a compaction so the dirty
         // overlay's contents are visible to the compaction range and

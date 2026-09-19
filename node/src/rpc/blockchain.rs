@@ -551,6 +551,70 @@ pub fn get_block_count(chain_state: &ChainState) -> Value {
     json!(chain_state.tip_height())
 }
 
+/// `getstoragefootprint` — per-column-family chainstate disk accounting.
+///
+/// Three numbers per family: on-disk SST bytes, an estimate of the live
+/// key count, and the bytes RocksDB still owes to compaction. Their
+/// quotient (`sst_bytes / estimated_keys`) is the effective
+/// post-compression cost of one row, which is the number that decides
+/// whether a family's key encoding is worth changing. Before this
+/// existed the only way to get it was an offline `ldb` dump against a
+/// stopped node.
+///
+/// Cheap: RocksDB properties and LSM metadata, no scans. The key count
+/// is exact for memtable-resident data and approximate once compaction
+/// has merged overwrites and tombstones, so a family whose rows are
+/// frequently overwritten (`metadata`) will read high.
+///
+/// Families the running binary did not create — feature-gated indexes,
+/// the backfill temp CF on a node that never backfilled — are absent
+/// from the list rather than reported as zero.
+pub fn get_storage_footprint(chain_state: &ChainState) -> Value {
+    let keys: std::collections::BTreeMap<&str, u64> =
+        chain_state.estimated_keys_by_cf().into_iter().collect();
+    let pending: std::collections::BTreeMap<&str, u64> = chain_state
+        .pending_compaction_bytes_by_cf()
+        .into_iter()
+        .collect();
+
+    // `sst_bytes_by_cf` is the authority on which families exist: it is
+    // the one built from live CF handles. The other two are joined onto
+    // it so a property that failed on one family cannot drop the family.
+    let mut total_sst: u64 = 0;
+    let mut total_keys: u64 = 0;
+    let mut total_pending: u64 = 0;
+    let column_families: Vec<Value> = chain_state
+        .sst_bytes_by_cf()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let estimated_keys = keys.get(name).copied().unwrap_or(0);
+            let pending_compaction_bytes = pending.get(name).copied().unwrap_or(0);
+            total_sst += bytes;
+            total_keys += estimated_keys;
+            total_pending += pending_compaction_bytes;
+            let bytes_per_key = if estimated_keys > 0 {
+                json!((bytes as f64 / estimated_keys as f64 * 100.0).round() / 100.0)
+            } else {
+                Value::Null
+            };
+            json!({
+                "name": name,
+                "sst_bytes": bytes,
+                "estimated_keys": estimated_keys,
+                "bytes_per_key": bytes_per_key,
+                "pending_compaction_bytes": pending_compaction_bytes,
+            })
+        })
+        .collect();
+
+    json!({
+        "column_families": column_families,
+        "total_sst_bytes": total_sst,
+        "total_estimated_keys": total_keys,
+        "total_pending_compaction_bytes": total_pending,
+    })
+}
+
 /// `getblockhash` — return the block hash at a given height.
 pub fn get_block_hash(
     chain_state: &ChainState,

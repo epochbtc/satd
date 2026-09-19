@@ -284,6 +284,10 @@ enum DebugCmd {
     /// total bytes. Read-only; safe on a live node. Cost on mainnet is
     /// ~one minute.
     BlockfileAudit,
+    /// Per-column-family chainstate disk accounting: SST bytes, live key
+    /// estimate, bytes per key, and bytes still owed to compaction.
+    /// Reads RocksDB properties only — cheap, safe under IBD.
+    StorageFootprint,
 }
 
 #[derive(Subcommand, Debug)]
@@ -381,6 +385,7 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         },
         Cmd::Debug { sub } => match sub {
             DebugCmd::BlockfileAudit => ("getblockfileaudit".into(), vec![]),
+            DebugCmd::StorageFootprint => ("getstoragefootprint".into(), vec![]),
         },
         Cmd::SignPsbtWithKey { .. } => {
             unreachable!("signpsbtwithkey is handled locally before RPC dispatch")
@@ -446,6 +451,14 @@ fn render_to_string(cmd: &Cmd, result: &serde_json::Value, output: &OutputFormat
         return render_blockfile_audit(result);
     }
 
+    // `debug storage-footprint` — pretty table of per-CF disk use.
+    if let Cmd::Debug {
+        sub: DebugCmd::StorageFootprint,
+    } = cmd
+    {
+        return render_storage_footprint(result);
+    }
+
     // `node version` — extract just the version fields from getnetworkinfo.
     if let Cmd::Node {
         sub: NodeCmd::Version,
@@ -502,6 +515,63 @@ fn render_mempool_top(obj: &serde_json::Map<String, serde_json::Value>, limit: u
             out.push_str(&format!("{:<64}  {:>8}  {:>14.8}\n", txid, vsize, fee));
         }
     }
+    out
+}
+
+/// Render the `getstoragefootprint` response as a per-column-family table,
+/// largest family first. Falls through to JSON when the shape is not what
+/// we expect, so a newer daemon's extra fields still display.
+fn render_storage_footprint(result: &serde_json::Value) -> String {
+    let Some(cfs) = result.get("column_families").and_then(|v| v.as_array()) else {
+        return format!("{}\n", serde_json::to_string_pretty(result).unwrap());
+    };
+    let mut rows: Vec<(&str, u64, u64, u64)> = cfs
+        .iter()
+        .map(|c| {
+            (
+                c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                c.get("sst_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                c.get("estimated_keys").and_then(|v| v.as_u64()).unwrap_or(0),
+                c.get("pending_compaction_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
+    // Largest first: the point of the command is "where did my disk go",
+    // and the answer is almost always in the first two rows.
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<38}  {:>12}  {:>14}  {:>10}  {:>12}\n",
+        "column_family", "size_MB", "est_keys", "B/key", "pending_MB"
+    ));
+    for (name, bytes, keys, pending) in &rows {
+        let per_key = if *keys > 0 {
+            format!("{:.1}", *bytes as f64 / *keys as f64)
+        } else {
+            "-".to_string()
+        };
+        out.push_str(&format!(
+            "{:<38}  {:>12.1}  {:>14}  {:>10}  {:>12.1}\n",
+            name,
+            *bytes as f64 / 1_048_576.0,
+            keys,
+            per_key,
+            *pending as f64 / 1_048_576.0,
+        ));
+    }
+    let total = result.get("total_sst_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total_pending = result
+        .get("total_pending_compaction_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    out.push_str(&format!(
+        "\ntotal: {:.2} GB SST, {:.2} GB pending compaction\n",
+        total as f64 / 1_073_741_824.0,
+        total_pending as f64 / 1_073_741_824.0,
+    ));
     out
 }
 
