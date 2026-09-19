@@ -754,19 +754,12 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
 
                 batch.coin_removes.push((outpoint, coin.amount, coin.height));
 
-                // Address-history index: spending row, atomic with the
-                // chainstate update via the same StoreBatch. No-op when
-                // the index is disabled.
-                crate::index::address::emit_spending(
-                    &mut batch,
-                    address_index,
-                    height,
-                    txid,
-                    in_idx as u32,
-                    &coin,
-                    outpoint,
-                );
-
+                // Address-history spending row and the spend index,
+                // atomic with the chainstate update via the same
+                // StoreBatch. Both name the consumed output by the
+                // ordinal of the transaction that created it, so both
+                // need the same resolution — done once, below.
+                //
                 // spent index: keyed by the consumed output, named by
                 // the ordinal of the transaction that created it, so
                 // Esplora outspend can answer in O(1). Same flag, same
@@ -806,6 +799,15 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                     };
                     match funding_txseq {
                         Some(funding_txseq) => {
+                            crate::index::address::emit_spending(
+                                &mut batch,
+                                address_index,
+                                txseq,
+                                in_idx as u32,
+                                &coin,
+                                funding_txseq,
+                                outpoint.vout,
+                            );
                             crate::index::outpoint_spend::emit::emit_spend(
                                 &mut batch,
                                 address_index,
@@ -816,13 +818,20 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                             );
                         }
                         None => {
+                            // Neither row can be written: the address
+                            // row's *value* is the funding ordinal too,
+                            // so it no longer survives an unresolvable
+                            // input the way it did when it carried the
+                            // outpoint. Same counter, same remedy —
+                            // `backfillindex address` after background
+                            // validation reaches the funding block.
                             crate::index::address::stats::inc_unresolved_spends();
                             tracing::debug!(
                                 outpoint = %outpoint,
                                 height,
-                                "spend index: no ordinal for the funding transaction \
-                                 (AssumeUTXO coin spent before background validation \
-                                 reached its block); skipping the row"
+                                "address and spend index: no ordinal for the funding \
+                                 transaction (AssumeUTXO coin spent before background \
+                                 validation reached its block); skipping both rows"
                             );
                         }
                     }
@@ -2286,10 +2295,17 @@ mod tests {
             crate::index::address::stats::snapshot().unresolved_spends > before,
             "the skip must be counted"
         );
-        // The block still connects and its address-index spending row is
-        // still written: that row keys on the *spending* transaction,
-        // which this block numbers itself.
-        assert_eq!(batch.addr_spending_puts.len(), 1);
+        // The address-index spending row is skipped too: its value is
+        // the funding ordinal, so it cannot be written either. Same
+        // counter, same remedy.
+        assert!(
+            batch.addr_spending_puts.is_empty(),
+            "the address spending row names the funding ordinal in its value, \
+             so it cannot be written without one"
+        );
+        // The block itself still connects — this is an index gap, not a
+        // consensus failure.
+        assert!(!batch.coin_puts.is_empty());
     }
 
     /// The same coin, but its funding transaction has been indexed by
@@ -3659,23 +3675,73 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(batch.addr_spending_puts.len(), 1);
-        let row = &batch.addr_spending_puts[0];
-        assert_eq!(row.height, 1);
-        assert_eq!(row.prev_outpoint, outpoint);
-
-        // The spend index rides the same hook: one row per consumed
-        // UTXO, keyed by the ordinal of the transaction that created it.
-        //
+        // The spending row's *value* is now the funding ordinal, so it
+        // shares the spend index's fate: an unresolvable input skips
+        // both rows rather than writing one against a guessed ordinal.
         // The fixture's coin carries `TXSEQ_UNKNOWN` and its funding
-        // transaction has no `tx_loc` row, which is the AssumeUTXO
-        // shape — so the row is deliberately skipped rather than written
-        // against a guessed ordinal. `connect_writes_spent_rows_keyed_on_the_funding_ordinal`
+        // transaction has no `tx_loc` row — the AssumeUTXO shape.
+        // `connect_emits_a_spending_row_naming_the_funding_ordinal`
         // covers the resolvable case.
         assert!(
-            batch.spent_puts.is_empty(),
-            "an unresolvable funding ordinal must skip the row, not invent one"
+            batch.addr_spending_puts.is_empty(),
+            "an unresolvable funding ordinal must skip the spending row"
         );
+        assert!(
+            batch.spent_puts.is_empty(),
+            "an unresolvable funding ordinal must skip the spend row, not invent one"
+        );
+    }
+
+    /// The resolvable case: the spending row names the spending
+    /// transaction by its own ordinal and the consumed output by the
+    /// funding transaction's, so both 32-byte identifiers the previous
+    /// layout carried are gone.
+    #[test]
+    fn connect_emits_a_spending_row_naming_the_funding_ordinal() {
+        let store = test_store();
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x45; 32]),
+            ),
+            vout: 0,
+        };
+        const FUNDING_SEQ: u64 = 33;
+        seed_resolvable_coin(&store, outpoint, FUNDING_SEQ);
+
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        assert_eq!(batch.addr_spending_puts.len(), 1);
+        let row = &batch.addr_spending_puts[0];
+        let first_txseq = batch.txseq_block_puts[0].0;
+        assert_eq!(
+            row.txseq,
+            first_txseq + 1,
+            "the spending transaction is at position 1 of this block"
+        );
+        assert_eq!(row.vin, 0);
+        assert_eq!(row.funding_txseq, FUNDING_SEQ);
+        assert_eq!(row.funding_vout, outpoint.vout);
     }
 
     #[test]

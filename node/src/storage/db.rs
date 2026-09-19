@@ -1,7 +1,7 @@
 use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::index::address::{
-    AddrFundingKey, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, Scripthash,
+    AddrFundingKey, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRowV3, Scripthash,
 };
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::FilterKey;
@@ -36,7 +36,7 @@ pub struct InMemoryStore {
     /// `None` until something is actually pruned.
     prune_height: parking_lot::RwLock<Option<u32>>,
     addr_funding: parking_lot::RwLock<Vec<AddrFundingRowV3>>,
-    addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
+    addr_spending: parking_lot::RwLock<Vec<AddrSpendingRowV3>>,
     /// `spent` rows, keyed `(funding ordinal, vout)` and valued
     /// `(spending ordinal, vin)` — the on-disk shape, so the in-memory
     /// backend exercises the same resolution path the real one does.
@@ -540,17 +540,42 @@ impl Store for InMemoryStore {
     }
 
     fn iter_addr_spending(&self, sh: &Scripthash) -> Vec<(AddrSpendingKey, OutPoint)> {
-        let mut rows: Vec<(AddrSpendingKey, OutPoint)> = self
+        // The on-disk shape, resolved and ordered exactly as the RocksDB
+        // backend does. See `iter_addr_funding`.
+        let mut raw: Vec<(u64, u32, u64, u32)> = self
             .addr_spending
             .read()
-            
             .iter()
             .filter(|r| &r.scripthash == sh)
-            .map(|r| (r.key(), r.prev_outpoint))
+            .map(|r| (r.txseq, r.vin, r.funding_txseq, r.funding_vout))
             .collect();
+        raw.sort_unstable();
+        let mut seqs: Vec<u64> = Vec::with_capacity(raw.len() * 2);
+        for (txseq, _, funding_txseq, _) in &raw {
+            seqs.push(*txseq);
+            seqs.push(*funding_txseq);
+        }
+        let resolved = crate::index::resolve::resolve_txseqs(self, &seqs);
+        let mut rows: Vec<(AddrSpendingKey, OutPoint)> = Vec::with_capacity(raw.len());
+        for (i, (_, vin, _, funding_vout)) in raw.into_iter().enumerate() {
+            let (Some(spender), Some(funder)) = (resolved[i * 2], resolved[i * 2 + 1]) else {
+                continue;
+            };
+            rows.push((
+                AddrSpendingKey {
+                    scripthash: *sh,
+                    height: spender.height,
+                    txid: spender.txid,
+                    vin,
+                },
+                OutPoint {
+                    txid: funder.txid,
+                    vout: funding_vout,
+                },
+            ));
+        }
         rows.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_spending_key_v2(a)
-                .cmp(&crate::index::address::encode_spending_key_v2(b))
+            (a.height, a.txid.to_string(), a.vin).cmp(&(b.height, b.txid.to_string(), b.vin))
         });
         rows
     }

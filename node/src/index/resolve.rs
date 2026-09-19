@@ -225,6 +225,43 @@ mod tests {
         assert_eq!(rows, sorted, "rows come back in (height, txid, vout) order");
     }
 
+    /// A spending row names two transactions — the spender in its key
+    /// and the consumed output's creator in its value — and both go
+    /// into one batched resolution. Resolving them separately would
+    /// double the reads for no benefit, because the two ends are
+    /// usually in different blocks and the batch dedups anyway.
+    #[test]
+    fn spending_rows_resolve_both_ends_in_one_batch() {
+        let store = store_with_two_blocks();
+        let controls = store.controls();
+        let sh = [0x8d; 32];
+
+        // 300 rows: spenders in the second block, funders in the first.
+        let raw: Vec<(u64, u32, u64, u32)> = (0..300u32)
+            .map(|i| (3 + (i % 3) as u64, i, (i % 3) as u64, i))
+            .collect();
+
+        controls.reset_ordinal_read_counts();
+        let rows = crate::storage::rocksdb_store::resolve_spending_rows_for(&store, &sh, raw);
+
+        assert_eq!(rows.len(), 300, "every row resolves on both ends");
+        assert_eq!(
+            controls.txids_of_seqs_calls(),
+            1,
+            "both ends of every row resolve in one batch, not two per row"
+        );
+        // The key carries the spender, the value the consumed output.
+        assert!(
+            rows.iter().all(|(k, prev)| k.height == 1 && prev.txid != k.txid),
+            "the key must name the spender and the value the funder"
+        );
+        let mut sorted = rows.clone();
+        sorted.sort_by(|(a, _), (b, _)| {
+            (a.height, a.txid.to_string(), a.vin).cmp(&(b.height, b.txid.to_string(), b.vin))
+        });
+        assert_eq!(rows, sorted, "rows come back in (height, txid, vin) order");
+    }
+
     /// An ordinal with no reverse row is local corruption. It must come
     /// back as `None` — a caller can then skip the row and say so —
     /// rather than as a zeroed or invented txid a consumer would read as

@@ -5310,7 +5310,7 @@ fn test_getstoragefootprint_shape_and_cli() {
         "metadata",
         "chain_tx",
         "addr_funding_v3",
-        "addr_spending_v2",
+        "addr_spending_v3",
         "spent",
         "sp_tweaks",
     ] {
@@ -11978,6 +11978,130 @@ fn electrum_round_trip(port: u16, request: &serde_json::Value) -> serde_json::Va
     let n = reader.read_line(&mut line).expect("read response");
     assert!(n > 0, "EOF before electrum response arrived");
     serde_json::from_str(line.trim_end()).expect("electrum response is valid JSON")
+}
+
+/// The spending row's *value* is the consumed output, named by the
+/// ordinal of the transaction that created it — so `getaddresshistory`'s
+/// `prev_txid` and `prev_vout`, which go on the wire, are now a
+/// resolution rather than a stored field.
+///
+/// That is the one place a wrong resolution would be invisible: a
+/// `prev_txid` naming some other real transaction looks exactly like a
+/// correct one. Pin it byte-for-byte across a full chainstate rebuild,
+/// together with Esplora's address endpoints, which join on the same
+/// value.
+#[test]
+fn test_getaddresshistory_identical_across_reindex_including_prev_txid() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+    let datadir = fresh_test_datadir("satd-addr-spending-v3");
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--esplora=1", &bind, "--txindex=1", &port_arg],
+    );
+
+    let wallet = DeterministicWallet::from_secret([0x2d; 32]);
+    let mining_addr = wallet.address.to_string();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(110), serde_json::json!(mining_addr)],
+    );
+
+    // Spend block 1's coinbase so the mining address has a *spending*
+    // row whose prev_outpoint is a coinbase of its own.
+    let dest = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let dest_script = dest
+        .parse::<bitcoin::Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let (raw_hex, spend_txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest_script, 1_000);
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(mining_addr)],
+    );
+
+    let snapshot = |node: &TestNode| -> (String, String, String) {
+        let history = node
+            .rpc_call_with_params(
+                "getaddresshistory",
+                vec![serde_json::json!(mining_addr.clone())],
+            )
+            .expect("rpc");
+        let utxos = node
+            .rpc_call_with_params(
+                "getaddressutxos",
+                vec![serde_json::json!(mining_addr.clone())],
+            )
+            .expect("rpc");
+        let esplora = esplora_get(esplora_port, &format!("/address/{}", mining_addr))
+            .text()
+            .expect("esplora body");
+        (
+            serde_json::to_string(&history["result"]).unwrap(),
+            serde_json::to_string(&utxos["result"]).unwrap(),
+            esplora,
+        )
+    };
+
+    let before = snapshot(&node);
+
+    // Premise: there is a spending row, and it names the coinbase it
+    // consumed. Without one, the assertion below would pass vacuously.
+    let rows: serde_json::Value = serde_json::from_str(&before.0).unwrap();
+    let spending: Vec<&serde_json::Value> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["type"] == "spending")
+        .collect();
+    assert_eq!(spending.len(), 1, "premise: one spending row: {}", before.0);
+    assert_eq!(spending[0]["txid"].as_str(), Some(spend_txid.as_str()));
+    assert!(
+        spending[0]["prev_txid"]
+            .as_str()
+            .is_some_and(|t| t.len() == 64),
+        "the wire must carry a resolved prev_txid, not an ordinal: {}",
+        before.0
+    );
+    assert_eq!(spending[0]["prev_vout"].as_u64(), Some(0));
+
+    node.stop();
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--esplora=1",
+            &bind,
+            "--txindex=1",
+            &port_arg,
+            "--reindex-chainstate",
+        ],
+    );
+    let after = snapshot(&node);
+
+    assert_eq!(
+        before.0, after.0,
+        "getaddresshistory must be byte-identical across the rebuild, \
+         prev_txid and prev_vout included"
+    );
+    assert_eq!(before.1, after.1, "getaddressutxos must be byte-identical");
+    assert_eq!(
+        before.2, after.2,
+        "the Esplora address endpoint joins funding and spending rows on \
+         the resolved prev_outpoint, so its chain stats must match too"
+    );
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }
 
 /// Address funding rows are stored keyed on a transaction ordinal and

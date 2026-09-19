@@ -54,7 +54,7 @@ use crate::index::address::backfill::{BackfillError, BackfillHandle};
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::cursor::BackfillState;
 use crate::index::address::keys::{
-    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, scripthash_of,
+    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKeyV3, AddrSpendingRowV3, scripthash_of,
 };
 use crate::storage::{BackfillCursorWrite, Store, StoreBatch, WriteMode};
 
@@ -423,7 +423,6 @@ impl BackfillRunner {
             };
             let mut batch = StoreBatch::default();
             for (tx_idx, tx) in old_block.txdata.iter().enumerate() {
-                let txid = tx.compute_txid();
                 let txseq = old_first_txseq + tx_idx as u64;
                 for (vout, output) in tx.output.iter().enumerate() {
                     batch.addr_funding_removes.push(AddrFundingKeyV3 {
@@ -457,10 +456,9 @@ impl BackfillRunner {
                         };
                         batch.spent_removes.push((funding_txseq, prev.vout));
                         total_spending_removes += 1;
-                        batch.addr_spending_removes.push(AddrSpendingKey {
+                        batch.addr_spending_removes.push(AddrSpendingKeyV3 {
                             scripthash: sh,
-                            height: h,
-                            txid,
+                            txseq,
                             vin: vin as u32,
                         });
                     }
@@ -669,7 +667,6 @@ impl BackfillRunner {
                 if tx.is_coinbase() {
                     continue;
                 }
-                let txid = tx.compute_txid();
                 for (vin, input) in tx.input.iter().enumerate() {
                     let prev = input.previous_output;
                     let (sh, funding_txseq) = self
@@ -677,12 +674,12 @@ impl BackfillRunner {
                         .store_ref()
                         .lookup_backfill_temp(&prev)?
                         .ok_or(BackfillError::TempCfMiss(prev))?;
-                    batch.addr_spending_puts.push(AddrSpendingRow {
+                    batch.addr_spending_puts.push(AddrSpendingRowV3 {
                         scripthash: sh,
-                        height: h,
-                        txid,
+                        txseq: spending_first_txseq + tx_idx as u64,
                         vin: vin as u32,
-                        prev_outpoint: prev,
+                        funding_txseq,
+                        funding_vout: prev.vout,
                     });
                     // The spend index rides the same pass-2 walk: one row
                     // per consumed UTXO, written atomically with the
