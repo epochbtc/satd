@@ -16,7 +16,8 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::index::address::cursor::BackfillState;
 use crate::index::address::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
+    AddrFundingKey, AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow,
+    Scripthash,
 };
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
@@ -111,11 +112,17 @@ pub struct StoreBatch {
     /// that block and is simply off the active chain).
     pub chain_tx_puts: Vec<(BlockHash, u64)>,
     /// Address-history index funding rows. Populated in M2.
-    pub addr_funding_puts: Vec<AddrFundingRow>,
+    ///
+    /// Keyed on the creating transaction's chain-order ordinal rather
+    /// than its height and txid: 32 bytes a row against 64, with both
+    /// recoverable through the ordinal families. The store resolves them
+    /// before a row leaves it, so the public [`AddrFundingKey`] and
+    /// every consumer above are unchanged.
+    pub addr_funding_puts: Vec<AddrFundingRowV3>,
     /// Address-history index spending rows. Populated in M2.
     pub addr_spending_puts: Vec<AddrSpendingRow>,
     /// Address-history funding keys to remove (used by `disconnect_block`).
-    pub addr_funding_removes: Vec<AddrFundingKey>,
+    pub addr_funding_removes: Vec<AddrFundingKeyV3>,
     /// Address-history spending keys to remove (used by `disconnect_block`).
     pub addr_spending_removes: Vec<AddrSpendingKey>,
     /// `spent` rows. Written by `connect_block` for every input on the
@@ -344,12 +351,12 @@ impl StoreBatch {
         // addr_funding: incoming removes invalidate any prior put for
         // the same key, and incoming puts invalidate any prior remove.
         if !other.addr_funding_removes.is_empty() {
-            let drop: std::collections::HashSet<AddrFundingKey> =
-                other.addr_funding_removes.iter().cloned().collect();
+            let drop: std::collections::HashSet<AddrFundingKeyV3> =
+                other.addr_funding_removes.iter().copied().collect();
             self.addr_funding_puts.retain(|p| !drop.contains(&p.key()));
         }
         if !other.addr_funding_puts.is_empty() {
-            let drop: std::collections::HashSet<AddrFundingKey> =
+            let drop: std::collections::HashSet<AddrFundingKeyV3> =
                 other.addr_funding_puts.iter().map(|p| p.key()).collect();
             self.addr_funding_removes.retain(|k| !drop.contains(k));
         }

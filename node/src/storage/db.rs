@@ -1,7 +1,7 @@
 use bitcoin::{BlockHash, OutPoint, Txid};
 
 use crate::index::address::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, Scripthash,
+    AddrFundingKey, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, Scripthash,
 };
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::FilterKey;
@@ -35,7 +35,7 @@ pub struct InMemoryStore {
     /// Lowest height whose block data is still held (Core's `pruneheight`).
     /// `None` until something is actually pruned.
     prune_height: parking_lot::RwLock<Option<u32>>,
-    addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
+    addr_funding: parking_lot::RwLock<Vec<AddrFundingRowV3>>,
     addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
     /// `spent` rows, keyed `(funding ordinal, vout)` and valued
     /// `(spending ordinal, vin)` — the on-disk shape, so the in-memory
@@ -504,17 +504,37 @@ impl Store for InMemoryStore {
     }
 
     fn iter_addr_funding(&self, sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
-        let mut rows: Vec<(AddrFundingKey, u64)> = self
+        // The on-disk shape, resolved and ordered exactly as the RocksDB
+        // backend does — an in-memory store that skipped the resolution
+        // would let a test pass against rows the real one cannot serve.
+        let mut raw: Vec<(u64, u32, u64)> = self
             .addr_funding
             .read()
-            
             .iter()
             .filter(|r| &r.scripthash == sh)
-            .map(|r| (r.key(), r.amount_sat))
+            .map(|r| (r.txseq, r.vout, r.amount_sat))
+            .collect();
+        raw.sort_unstable();
+        let seqs: Vec<u64> = raw.iter().map(|(seq, _, _)| *seq).collect();
+        let resolved = crate::index::resolve::resolve_txseqs(self, &seqs);
+        let mut rows: Vec<(AddrFundingKey, u64)> = raw
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|((_, vout, amount), r)| {
+                let r = r?;
+                Some((
+                    AddrFundingKey {
+                        scripthash: *sh,
+                        height: r.height,
+                        txid: r.txid,
+                        vout,
+                    },
+                    amount,
+                ))
+            })
             .collect();
         rows.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_funding_key_v2(a)
-                .cmp(&crate::index::address::encode_funding_key_v2(b))
+            (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
         });
         rows
     }

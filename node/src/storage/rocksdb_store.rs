@@ -44,11 +44,17 @@ const CF_METADATA: &str = "metadata";
 /// reorg needs no deletion — a stale block's value stays correct for that
 /// block and is simply not on the active chain.
 const CF_CHAIN_TX: &str = "chain_tx";
-/// Address-history CFs. The `_v2` suffix is fossilized in the on-disk
-/// schema (legacy `addr_funding` / `addr_spending` were dropped in the
-/// storage-format-cleanup PR); keys carry a 16-byte scripthash prefix
-/// rather than a full 32-byte scripthash.
-pub(crate) const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
+/// Address-history CFs. Keys carry a 16-byte scripthash prefix rather
+/// than a full 32-byte scripthash.
+///
+/// The funding side is `_v3`: `sh[16] || txseq[5] || vout[3]`, 32 bytes
+/// a row against the 64 its predecessor took, because a chain-order
+/// ordinal replaces the height and txid it used to carry — both
+/// recoverable through `txseq_block` and `txseq_txid`.
+///
+/// The spending side is still `_v2`. Its suffix is fossilized from the
+/// storage-format cleanup that dropped the unsuffixed CFs.
+pub(crate) const CF_ADDR_FUNDING_V3: &str = "addr_funding_v3";
 pub(crate) const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
 /// Confirmed-side spend index: `funding_txseq[5] || vout[3]` ->
 /// `spending_txseq[5] || vin[3]`. Written alongside the address-index
@@ -104,7 +110,7 @@ const ALL_CFS: &[&str] = &[
     CF_TXSEQ_BLOCK,
     CF_METADATA,
     CF_CHAIN_TX,
-    CF_ADDR_FUNDING_V2,
+    CF_ADDR_FUNDING_V3,
     CF_ADDR_SPENDING_V2,
     CF_SPENT,
     // Gated exactly like the descriptors `open()` creates for them: on a
@@ -130,7 +136,7 @@ const ALL_CFS: &[&str] = &[
 /// list and `ALL_CFS` name the same families.
 const DIAG_CFS: &[&str] = &[
     CF_ADDR_SPENDING_V2,
-    CF_ADDR_FUNDING_V2,
+    CF_ADDR_FUNDING_V3,
     CF_SPENT,
     CF_UNDO,
     CF_COINS,
@@ -220,13 +226,14 @@ const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height
 // transaction index is keyed on dense chain-order ordinals (`tx_loc`,
 // `txseq_txid`, `txseq_block`) instead of `txid -> block_hash`. v5:
 // coins carry their funding transaction's ordinal and the spend index
-// (`spent`) is keyed on it.
+// (`spent`) is keyed on it. v6: address-index funding rows key on it
+// too (`addr_funding_v3`).
 //
 // A chainstate stamped at any earlier version is refused: the binary
 // cannot read rows in a layout it no longer knows, and there is no
 // in-place upgrade because the new families have to be built from the
 // blocks. `-reindex-chainstate` rebuilds them in one pass.
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Column families this binary no longer creates or reads. Discovered on
 /// open, declared bare so RocksDB will mount the DB at all, and dropped
@@ -237,7 +244,75 @@ const CURRENT_SCHEMA_VERSION: u32 = 5;
 /// `addr_funding` / `addr_spending` are the pre-cleanup address-history
 /// CFs; `tx_index` is the txid-keyed transaction index that the ordinal
 /// families replaced in schema 4.
-const RETIRED_CF_NAMES: &[&str] = &["addr_funding", "addr_spending", "tx_index", "outpoint_spend"];
+const RETIRED_CF_NAMES: &[&str] = &[
+    "addr_funding",
+    "addr_spending",
+    "tx_index",
+    "outpoint_spend",
+    "addr_funding_v2",
+];
+
+/// Resolve raw v3 funding rows into the public `(AddrFundingKey, amount)`
+/// shape and put them in the documented `(height, txid, vout)` order.
+///
+/// On-disk the rows are ordinal-keyed, so a prefix scan already yields
+/// them in chain order — which differs from the documented order only in
+/// how transactions of the *same block* tie-break. The sort settles
+/// that, so the iteration order the trait promises, and every consumer
+/// that relies on it (the lockstep merge in
+/// `confirmed_distinct_history_limited`, Electrum's `listunspent`), is
+/// unchanged by the re-keying.
+///
+/// One batched resolution for the whole scan, not one per row: see
+/// [`crate::index::resolve::resolve_txseqs`].
+///
+/// A row whose ordinal does not resolve is local corruption — the rows
+/// are written in the same atomic batch as the ordinal families — so it
+/// is logged and skipped rather than emitted with an invented txid a
+/// consumer would read as real.
+pub(crate) fn resolve_funding_rows_for(
+    store: &dyn Store,
+    sh: &crate::index::address::Scripthash,
+    raw: Vec<(u64, u32, u64)>,
+) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let seqs: Vec<u64> = raw.iter().map(|(seq, _, _)| *seq).collect();
+    let resolved = crate::index::resolve::resolve_txseqs(store, &seqs);
+    let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::with_capacity(raw.len());
+    for ((txseq, vout, amount), r) in raw.into_iter().zip(resolved) {
+        let Some(r) = r else {
+            tracing::error!(
+                target: "storage",
+                scripthash_prefix = %hex::encode(&sh[..8]),
+                txseq,
+                vout,
+                "addr_funding_v3 row references a transaction ordinal with no \
+                 reverse-map entry; skipping it. This is local index corruption — \
+                 rebuild with --reindex-chainstate."
+            );
+            continue;
+        };
+        out.push((
+            // Re-attach the caller's full scripthash. Collisions
+            // (different full scripthashes sharing this 16-byte prefix)
+            // are admitted by design — see the module docstring in
+            // `node_index::keys`.
+            crate::index::address::AddrFundingKey {
+                scripthash: *sh,
+                height: r.height,
+                txid: r.txid,
+                vout,
+            },
+            amount,
+        ));
+    }
+    out.sort_by(|(a, _), (b, _)| {
+        (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
+    });
+    out
+}
 
 /// Turn a `spent` row's value into the public [`SpendingRef`] shape.
 ///
@@ -545,7 +620,7 @@ impl RocksDbStore {
             // circuits to the matching SST blocks instead of scanning.
             // Marked hot.
             ColumnFamilyDescriptor::new(
-                CF_ADDR_FUNDING_V2,
+                CF_ADDR_FUNDING_V3,
                 make_cf_opts(true, 32, Some(16), true),
             ),
             ColumnFamilyDescriptor::new(
@@ -1151,7 +1226,7 @@ impl RocksDbStore {
         let bloom = matches!(
             name,
             CF_COINS
-                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_FUNDING_V3
                 | CF_ADDR_SPENDING_V2
                 | CF_SPENT
                 | CF_TX_LOC
@@ -1163,7 +1238,7 @@ impl RocksDbStore {
         let bloom = matches!(
             name,
             CF_COINS
-                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_FUNDING_V3
                 | CF_ADDR_SPENDING_V2
                 | CF_SPENT
                 | CF_TX_LOC
@@ -1171,7 +1246,7 @@ impl RocksDbStore {
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
-            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
+            CF_ADDR_FUNDING_V3 | CF_ADDR_SPENDING_V2 => 32,
             CF_SPENT => 16,
             CF_UNDO | CF_TX_LOC | CF_TXSEQ_TXID => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
@@ -1215,7 +1290,7 @@ impl RocksDbStore {
         // initial open.
         let hot = matches!(
             name,
-            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_SPENT | CF_UNDO
+            CF_ADDR_FUNDING_V3 | CF_ADDR_SPENDING_V2 | CF_SPENT | CF_UNDO
         );
         let target_file_size = if hot {
             self.tuning.hot_cf_target_file_size_base
@@ -1229,7 +1304,7 @@ impl RocksDbStore {
         // spend uses a 32-byte (txid) prefix. Mirror the
         // prefix-extractor we set on initial CF creation so
         // `drop_and_recreate_cf` (used by `clear_*` paths) preserves it.
-        if matches!(name, CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2) {
+        if matches!(name, CF_ADDR_FUNDING_V3 | CF_ADDR_SPENDING_V2) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
         } else if matches!(name, CF_SPENT) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
@@ -1580,14 +1655,14 @@ impl RocksDbStore {
         // Empty-batch fast-path avoids touching the CF handles when
         // the index is disabled or the block had no relevant rows.
         if !batch.addr_funding_puts.is_empty() || !batch.addr_funding_removes.is_empty() {
-            let cf_af = self.cf(CF_ADDR_FUNDING_V2);
+            let cf_af = self.cf(CF_ADDR_FUNDING_V3);
             for row in &batch.addr_funding_puts {
-                let key = crate::index::address::encode_funding_key_v2(&row.key());
+                let key = crate::index::address::encode_funding_key_v3(&row.key());
                 let value = crate::index::address::encode_funding_value(row.amount_sat);
                 wb.put_cf(&cf_af, key, value);
             }
             for key in &batch.addr_funding_removes {
-                let encoded = crate::index::address::encode_funding_key_v2(key);
+                let encoded = crate::index::address::encode_funding_key_v3(key);
                 wb.delete_cf(&cf_af, encoded);
             }
         }
@@ -2244,7 +2319,7 @@ impl Store for RocksDbStore {
         // Address-history index sits in chainstate and must clear too,
         // otherwise -reindex-chainstate would leave stale rows that
         // reference UTXOs the new chainstate is about to overwrite.
-        cfs.push(CF_ADDR_FUNDING_V2);
+        cfs.push(CF_ADDR_FUNDING_V3);
         cfs.push(CF_ADDR_SPENDING_V2);
         cfs.push(CF_SPENT);
         // Cumulative-tx-count index: rebuilt from genesis by the reindex
@@ -2308,7 +2383,7 @@ impl Store for RocksDbStore {
             CF_TX_LOC,
             CF_TXSEQ_TXID,
             CF_TXSEQ_BLOCK,
-            CF_ADDR_FUNDING_V2,
+            CF_ADDR_FUNDING_V3,
             CF_ADDR_SPENDING_V2,
             CF_SPENT,
             CF_CHAIN_TX,
@@ -2464,22 +2539,21 @@ impl Store for RocksDbStore {
         sh: &crate::index::address::Scripthash,
         limit: usize,
     ) -> Vec<(crate::index::address::AddrFundingKey, u64)> {
-        let mut out: Vec<(crate::index::address::AddrFundingKey, u64)> = Vec::new();
-        let cf = self.cf(CF_ADDR_FUNDING_V2);
+        let cf = self.cf(CF_ADDR_FUNDING_V3);
         let sh_prefix = &sh[..crate::index::address::SCRIPTHASH_PREFIX_LEN];
-        let mut count = 0usize;
+        let mut raw: Vec<(u64, u32, u64)> = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf, sh_prefix) {
-            if count >= limit {
+            if raw.len() >= limit {
                 break;
             }
             let (k, v) = match item {
                 Ok(kv) => kv,
                 Err(_) => continue,
             };
-            if k.len() != crate::index::address::KEY_LEN_V2 || &k[..sh_prefix.len()] != sh_prefix {
+            if k.len() != crate::index::address::KEY_LEN_V3 || &k[..sh_prefix.len()] != sh_prefix {
                 break;
             }
-            let payload = match crate::index::address::decode_funding_key_v2(&k) {
+            let payload = match crate::index::address::decode_funding_key_v3(&k) {
                 Some(p) => p,
                 None => continue,
             };
@@ -2487,15 +2561,9 @@ impl Store for RocksDbStore {
                 Some(a) => a,
                 None => continue,
             };
-            // Reconstruct the canonical in-memory key by re-attaching
-            // the caller's full scripthash. Collisions (different full
-            // scripthashes sharing this 16-byte prefix) are admitted by
-            // design — see module docstring in `node_index::keys`.
-            let key = crate::index::address::reconstruct_funding_key(sh, payload);
-            out.push((key, amount));
-            count += 1;
+            raw.push((payload.txseq, payload.vout, amount));
         }
-        out
+        resolve_funding_rows_for(self, sh, raw)
     }
 
     fn iter_addr_spending(
@@ -4097,7 +4165,7 @@ mod tests {
         let (store, _dir) = temp_store(false);
         // CF handles must resolve. cf() panics on missing CF, so this
         // exercises the descriptor registration path end-to-end.
-        let _af = store.cf(CF_ADDR_FUNDING_V2);
+        let _af = store.cf(CF_ADDR_FUNDING_V3);
         let _as_ = store.cf(CF_ADDR_SPENDING_V2);
     }
 
@@ -4108,10 +4176,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-            let _af = store.cf(CF_ADDR_FUNDING_V2);
+            let _af = store.cf(CF_ADDR_FUNDING_V3);
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        let _af = store.cf(CF_ADDR_FUNDING_V2);
+        let _af = store.cf(CF_ADDR_FUNDING_V3);
         let _as_ = store.cf(CF_ADDR_SPENDING_V2);
     }
 
@@ -4165,23 +4233,22 @@ mod tests {
 
     #[test]
     fn test_address_index_write_batch_funding_put_then_read() {
-        use crate::index::address::{AddrFundingRow, encode_funding_key_v2, encode_funding_value};
+        use crate::index::address::{AddrFundingRowV3, encode_funding_key_v3, encode_funding_value};
 
         let (store, _dir) = temp_store(false);
-        let row = AddrFundingRow {
+        let row = AddrFundingRowV3 {
             scripthash: [0xAB; 32],
-            height: 42,
-            txid: make_outpoint(0xCD, 0).txid,
+            txseq: 42,
             vout: 7,
             amount_sat: 123_456_789,
         };
 
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(row.clone());
+        batch.addr_funding_puts.push(row);
         store.write_batch(batch).unwrap();
 
-        let cf = store.cf(CF_ADDR_FUNDING_V2);
-        let encoded = encode_funding_key_v2(&row.key());
+        let cf = store.cf(CF_ADDR_FUNDING_V3);
+        let encoded = encode_funding_key_v3(&row.key());
         let raw = store
             .db
             .get_cf(&cf, encoded)
@@ -4639,16 +4706,24 @@ mod tests {
 
     #[test]
     fn test_iter_addr_funding_limited_aborts_at_cap() {
-        use crate::index::address::AddrFundingRow;
+        use crate::index::address::AddrFundingRowV3;
         let (store, _dir) = temp_store(false);
 
+        // Fifty rows, one per block, each in its own transaction — the
+        // ordinal scaffolding has to exist or the rows resolve to
+        // nothing and the iterator (correctly) drops them.
         let sh = [0xab; 32];
+        let txids: Vec<Txid> = (0..50u32)
+            .map(|i| make_outpoint(0x10 + (i as u8 % 8), i).txid)
+            .collect();
+        for (i, txid) in txids.iter().enumerate() {
+            seed_ordinal_block(&store, i as u32, i as u64, std::slice::from_ref(txid));
+        }
         let mut batch = StoreBatch::default();
         for i in 0..50u32 {
-            batch.addr_funding_puts.push(AddrFundingRow {
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
                 scripthash: sh,
-                height: i,
-                txid: make_outpoint(0x10 + (i as u8 % 8), 0).txid,
+                txseq: i as u64,
                 vout: i,
                 amount_sat: 1000 + (i as u64),
             });
@@ -4663,6 +4738,58 @@ mod tests {
         assert_eq!(store.iter_addr_funding_limited(&sh, 0).len(), 0);
         // limit > total: returns total.
         assert_eq!(store.iter_addr_funding_limited(&sh, 100).len(), 50);
+    }
+
+    /// The documented iteration order is `(height, txid, vout)`, but on
+    /// disk the rows sort by *ordinal*, which is block position. Within
+    /// a block the two disagree, so the store sorts the resolved rows
+    /// before returning them.
+    ///
+    /// This is the RocksDB-path guard, and it is not redundant with the
+    /// `lookups.rs` order test: that one runs against `InMemoryStore`,
+    /// which has its own sort, so it passes with this one deleted.
+    #[test]
+    fn iter_addr_rows_come_back_in_the_documented_order_not_ordinal_order() {
+        use crate::index::address::AddrFundingRowV3;
+        let (store, _dir) = temp_store(false);
+        let sh = [0x3e; 32];
+
+        // One block, three transactions whose txids sort in the reverse
+        // of their block positions.
+        let txids = [
+            make_outpoint(0xcc, 0).txid,
+            make_outpoint(0xbb, 0).txid,
+            make_outpoint(0xaa, 0).txid,
+        ];
+        assert!(
+            txids[0] > txids[1] && txids[1] > txids[2],
+            "fixture premise: block position and txid order disagree"
+        );
+        seed_ordinal_block(&store, 4, 100, &txids);
+
+        let mut batch = StoreBatch::default();
+        for i in 0..txids.len() {
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
+                scripthash: sh,
+                txseq: 100 + i as u64,
+                vout: 0,
+                amount_sat: 1,
+            });
+        }
+        store.write_batch(batch).unwrap();
+
+        let mut expected = txids.to_vec();
+        expected.sort_by_key(|t| t.to_string());
+        let funding: Vec<Txid> = store
+            .iter_addr_funding(&sh)
+            .into_iter()
+            .map(|(k, _)| k.txid)
+            .collect();
+        assert_eq!(
+            funding, expected,
+            "funding rows must come back in (height, txid, vout) order, \
+             not the ordinal order they are stored in"
+        );
     }
 
     #[test]
@@ -4690,11 +4817,11 @@ mod tests {
     #[test]
     fn prefix_collisions_admitted() {
         // Two different full scripthashes that share the first 16
-        // bytes will both surface in a v2 read for either. The
+        // bytes will both surface in a read for either. The
         // module-level docstring spells out this collision-tolerant
         // posture; the test pins it so an accidental tightening
         // (e.g. adding a full-scripthash redundancy check) is loud.
-        use crate::index::address::AddrFundingRow;
+        use crate::index::address::AddrFundingRowV3;
 
         let (store, _dir) = temp_store(false);
         let sh_alice = {
@@ -4710,32 +4837,32 @@ mod tests {
             sh
         };
 
+        seed_ordinal_block(&store, 1, 10, &[make_outpoint(0xA1, 0).txid]);
+        seed_ordinal_block(&store, 2, 20, &[make_outpoint(0xA2, 0).txid]);
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh_alice,
-            height: 1,
-            txid: make_outpoint(0xA1, 0).txid,
+            txseq: 10,
             vout: 0,
             amount_sat: 1,
         });
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh_mallory,
-            height: 2,
-            txid: make_outpoint(0xA2, 0).txid,
+            txseq: 20,
             vout: 0,
             amount_sat: 2,
         });
         store.write_batch(batch).unwrap();
 
         // Querying with Alice's full scripthash returns BOTH rows
-        // because they're indistinguishable at the v2 16-byte prefix.
+        // because they're indistinguishable at the 16-byte prefix.
         // Returned keys carry Alice's scripthash (the caller's
         // identity) even for Mallory's row — that's the trade-off.
         let got = store.iter_addr_funding(&sh_alice);
         assert_eq!(
             got.len(),
             2,
-            "v2 prefix collision must yield both rows, not silently filter",
+            "a prefix collision must yield both rows, not silently filter",
         );
         for (k, _) in &got {
             assert_eq!(k.scripthash, sh_alice);
@@ -4780,7 +4907,7 @@ mod tests {
         let (store, _dir) = temp_store(false);
         store.write_batch(StoreBatch::default()).unwrap();
         // Both CFs must still be empty.
-        let af = store.cf(CF_ADDR_FUNDING_V2);
+        let af = store.cf(CF_ADDR_FUNDING_V3);
         let as_ = store.cf(CF_ADDR_SPENDING_V2);
         assert!(
             store
@@ -4800,7 +4927,7 @@ mod tests {
 
     #[test]
     fn test_address_index_metrics_reflect_committed_rows_only() {
-        use crate::index::address::{AddrFundingRow, AddrSpendingRow, scripthash_of, stats};
+        use crate::index::address::{AddrFundingRowV3, AddrSpendingRow, scripthash_of, stats};
 
         // Use a fresh process snapshot to compute deltas — the static
         // counters accumulate across tests in the same binary.
@@ -4813,10 +4940,9 @@ mod tests {
         ));
 
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid,
+            txseq: 1,
             vout: 0,
             amount_sat: 1000,
         });
