@@ -213,6 +213,10 @@ The server registers the following tools. Each returns a text result.
 - `sign_transaction`: sign with WIF keys client-side. Params: `hex_tx`, `private_keys`, `prevtxs`, `sighash`.
 - `send_transaction`: broadcast a signed raw tx. Param: `hex_tx`.
 - `psbt_workflow`: PSBT `create`/`decode`/`analyze`/`combine`/`finalize`/`update`/`convert`/`join`.
+  Accepts PSBT version 0 and version 2 (BIP 370), the BIP 375 silent payment
+  fields included. A version 2 PSBT in is a version 2 PSBT out, and `decode`
+  returns the version 2 shape described under
+  [PSBT version 2](json-rpc-extensions.md#psbt-version-2-bip-370-and-bip-375).
 
 ### Mining
 - `get_mining_info`: difficulty, network hashrate, height.

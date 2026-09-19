@@ -19,4 +19,13 @@ zeroize = { workspace = true }
 rpassword = { workspace = true }
 shlex = { workspace = true }
 satd-policy = { path = "../satd-policy" }
+# PSBT version 2 (BIP 370) and silent payment (BIP 375) carriage. The client
+# needs its own copy because it does not link `node` — there is no RocksDB in
+# the CLI, and signing must stay here rather than move to the daemon.
+satd-psbt = { path = "../satd-psbt" }
 tls-config = { path = "../tls-config", features = ["client"] }
+
+[dev-dependencies]
+# The vendored BIP 375 vectors, so the version 2 CLI tests use the BIP's own
+# bytes.
+satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }

@@ -89,6 +89,9 @@ rcgen = { workspace = true }
 # `node -> tls-config` with the workspace's ring + tls12 features, so this adds
 # no crate and no second crypto provider.
 tokio-rustls = { workspace = true }
+# PSBT version 2 construction for the BIP 375 regtest tests, and the vendored
+# BIP vectors they are refereed against.
+satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }
 # In-test Stratum V2 miner: a Noise NX initiator and the SV2 message types, so
 # the server is checked against an independent implementation of both.
 stratum-core = { workspace = true }

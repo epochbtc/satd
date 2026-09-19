@@ -376,7 +376,7 @@ impl SatdMcpServer {
         tools::construction::send_transaction(&self.ctx, &p.hex_tx, p.allow_quarantined)
     }
 
-    #[tool(description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs).")]
+    #[tool(description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs). Both PSBT version 0 and version 2 (BIP 370) are accepted, including the BIP 375 silent payment fields; a version 2 PSBT decodes to a different JSON shape, and a version 2 PSBT is always answered with a version 2 PSBT.")]
     fn psbt_workflow(&self, Parameters(p): Parameters<PsbtWorkflowParams>) -> String {
         tools::construction::psbt_workflow(
             &self.ctx,

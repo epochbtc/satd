@@ -90,6 +90,70 @@ pub fn psbt_to_base64(psbt: &Psbt) -> String {
     BASE64.encode(psbt.serialize())
 }
 
+/// The PSBT version some base64 declares, without committing to parsing the
+/// whole thing. A version 0 PSBT must keep reaching the version 0 parser and
+/// its error messages, so anything unreadable answers `V0`.
+pub fn psbt_version(b64: &str) -> satd_psbt::PsbtVersion {
+    match BASE64.decode(b64.trim()) {
+        Ok(bytes) => satd_psbt::version_of_bytes(&bytes).unwrap_or(satd_psbt::PsbtVersion::V0),
+        Err(_) => satd_psbt::PsbtVersion::V0,
+    }
+}
+
+pub fn raw_psbt_from_base64(b64: &str) -> Result<satd_psbt::RawPsbt, String> {
+    let raw = BASE64
+        .decode(b64.trim())
+        .map_err(|e| format!("PSBT base64 decode failed: {e}"))?;
+    satd_psbt::RawPsbt::parse(&raw).map_err(|e| format!("PSBT decode failed: {e}"))
+}
+
+pub fn raw_psbt_to_base64(raw: &satd_psbt::RawPsbt) -> String {
+    BASE64.encode(raw.serialize())
+}
+
+/// The same per-input report as [`summarize`], for a version 2 PSBT.
+///
+/// This signer cannot produce version 2 signatures yet, so the only caller is
+/// `signpsbtwithsigner`, reporting on what an external signer handed back.
+pub fn summarize_v2(raw: &satd_psbt::RawPsbt) -> Result<SignSummary, String> {
+    use satd_psbt::keys;
+
+    let view = satd_psbt::V2View::new(raw).map_err(|e| e.to_string())?;
+    let prevouts: Vec<Option<TxOut>> = view
+        .inputs()
+        .map(|i| i.prevout().ok().flatten())
+        .collect();
+    let all_prevouts_known = prevouts.iter().all(|p| p.is_some());
+
+    let per_input = view
+        .inputs()
+        .map(|input| {
+            let map = input.map();
+            if map.contains_type(keys::input::FINAL_SCRIPTSIG)
+                || map.contains_type(keys::input::FINAL_SCRIPTWITNESS)
+            {
+                return InputOutcome::AlreadyFinal;
+            }
+            if map.contains_type(keys::input::PARTIAL_SIG)
+                || map.contains_type(keys::input::TAP_KEY_SIG)
+            {
+                return InputOutcome::Signed;
+            }
+            match &prevouts[input.index()] {
+                None => InputOutcome::MissingUtxo,
+                Some(prevout) if !is_supported_script(&prevout.script_pubkey) => {
+                    InputOutcome::Unsupported
+                }
+                Some(prevout) if prevout.script_pubkey.is_p2tr() && !all_prevouts_known => {
+                    InputOutcome::MissingUtxo
+                }
+                Some(_) => InputOutcome::NoMatchingKey,
+            }
+        })
+        .collect();
+    Ok(SignSummary { per_input })
+}
+
 /// Sign `psbt` in place with the given WIF keys and/or xprivs. Never finalizes
 /// inputs — that is `finalizepsbt`'s job on the node.
 pub fn sign_psbt(
