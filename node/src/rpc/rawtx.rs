@@ -155,32 +155,59 @@ pub fn get_raw_transaction(
         return Err((-5, "No such transaction found in the provided block. Use gettransaction for wallet transactions.".to_string()));
     }
 
-    // Fallback to txindex if available
-    if let Some(block_hash) = chain_state.get_tx_location(&txid)
-        && let Some(block) = chain_state.get_block(&block_hash) {
-            let entry = chain_state.get_block_index(&block_hash);
-            for tx in &block.txdata {
-                if tx.compute_txid() == txid {
-                    return if verbose {
-                        let height = entry.as_ref().map(|e| e.height);
-                        let confirmations =
-                            height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                        Ok(decode_transaction_verbose_net(
-                            tx,
-                            Some(&block_hash.to_string()),
-                            height,
-                            confirmations,
-                            verbosity,
-                            Some((chain_state, &block)),
-                            chain_state.network,
-                        ))
-                    } else {
-                        let raw = bitcoin::consensus::serialize(tx);
-                        Ok(Value::String(hex::encode(raw)))
-                    };
-                }
+    // Fallback to txindex if available.
+    //
+    // The index answers with the transaction's position in its block, not
+    // just the block, so this indexes `txdata` rather than scanning the
+    // block and comparing every txid in it. On a full block that scan was
+    // several thousand `compute_txid()` calls for one lookup.
+    //
+    // The position is checked, not trusted: an index row that points at a
+    // transaction with a different txid means the index and the block
+    // files disagree, which is local corruption. Raise the standing
+    // warning (same shape, same `getblockfrompeer` remedy as an unreadable
+    // block) and answer "not found" rather than returning the wrong
+    // transaction under the requested txid.
+    if chain_state.store_ref().has_txindex()
+        && let Some((block_hash, tx_idx)) = chain_state.locate_tx(&txid)
+        && let Some(block) = chain_state.get_block(&block_hash)
+    {
+        match block.txdata.get(tx_idx) {
+            Some(tx) if tx.compute_txid() == txid => {
+                let entry = chain_state.get_block_index(&block_hash);
+                return if verbose {
+                    let height = entry.as_ref().map(|e| e.height);
+                    let confirmations =
+                        height.map(|h| confirmations_for(chain_state, &block_hash, h));
+                    Ok(decode_transaction_verbose_net(
+                        tx,
+                        Some(&block_hash.to_string()),
+                        height,
+                        confirmations,
+                        verbosity,
+                        Some((chain_state, &block)),
+                        chain_state.network,
+                    ))
+                } else {
+                    let raw = bitcoin::consensus::serialize(tx);
+                    Ok(Value::String(hex::encode(raw)))
+                };
+            }
+            other => {
+                chain_state.report_index_block_mismatch(
+                    &block_hash,
+                    &format!(
+                        "transaction index places {txid} at position {tx_idx}, where the \
+                         block holds {}",
+                        match other {
+                            Some(tx) => tx.compute_txid().to_string(),
+                            None => format!("nothing ({} transactions)", block.txdata.len()),
+                        }
+                    ),
+                );
             }
         }
+    }
 
     Err((-5, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.".to_string()))
 }

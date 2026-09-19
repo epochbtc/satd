@@ -130,11 +130,12 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
     // counted every transaction in the window as a missing row and called a
     // healthy node damaged — and passing false silently disabled the txindex
     // checks altogether, because `get_tx_location` short-circuits to `None`
-    // before it reads the column family, so a genuinely broken index came back
-    // `consistent`. An auditor cannot be expected to know a stranger's
+    // before it reads the column families, so a genuinely broken index came
+    // back `consistent`. An auditor cannot be expected to know a stranger's
     // `-txindex` setting, and the persisted completeness marker means they do
-    // not have to. `CF_TX_INDEX` is in the descriptor list unconditionally, so
-    // opening with it on creates nothing that was not there already.
+    // not have to. The transaction-ordinal families are in the descriptor
+    // list unconditionally, so opening with it on creates nothing that was
+    // not there already.
     let store = RocksDbStore::open(&args.datadir, true, 256, false, 1000)
         .map_err(|e| format!("cannot open chainstate (is the node stopped?): {e}"))?;
 

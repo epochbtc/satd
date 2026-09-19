@@ -13,12 +13,28 @@ use crate::storage::coinview::{Coin, outpoint_to_key};
 use crate::storage::profile::StorageTuning;
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
+use node_index::TxSeq;
 
 pub(crate) const CF_BLOCK_INDEX: &str = "block_index";
 const CF_COINS: &str = "coins";
 const CF_HEIGHT_INDEX: &str = "height_index";
 pub(crate) const CF_UNDO: &str = "undo";
-const CF_TX_INDEX: &str = "tx_index";
+/// `txid -> txseq[5]`. The transaction index, re-keyed: instead of the
+/// containing block's 32-byte hash, a 5-byte chain-order ordinal that
+/// carries the block *and* the position within it. Point-lookup only.
+const CF_TX_LOC: &str = "tx_loc";
+/// `txseq[5] -> txid[32]`, the inverse of `tx_loc`. This is what lets
+/// every other index key on ordinals instead of repeating the txid: the
+/// storage layer resolves rows back to txids before they leave it, in
+/// one batched `multi_get` per scan. Keys are dense and ascending, so
+/// RocksDB's prefix-delta encoding compresses them to near nothing and
+/// the family costs roughly what the txids themselves do.
+const CF_TXSEQ_TXID: &str = "txseq_txid";
+/// `first_txseq[5] -> height[4]`. One row per connected block.
+/// `seek_for_prev` turns any ordinal back into its block; the difference
+/// is the transaction's index within the block. Ungated — four bytes per
+/// block, and every ordinal read needs it.
+const CF_TXSEQ_BLOCK: &str = "txseq_block";
 const CF_METADATA: &str = "metadata";
 /// Cumulative-transaction-count index: `block_hash -> u64_le`. The value
 /// is the number of transactions in the chain through (and including)
@@ -71,7 +87,9 @@ const ALL_CFS: &[&str] = &[
     CF_BLOCK_INDEX,
     CF_HEIGHT_INDEX,
     CF_UNDO,
-    CF_TX_INDEX,
+    CF_TX_LOC,
+    CF_TXSEQ_TXID,
+    CF_TXSEQ_BLOCK,
     CF_METADATA,
     CF_CHAIN_TX,
     CF_ADDR_FUNDING_V2,
@@ -104,7 +122,9 @@ const DIAG_CFS: &[&str] = &[
     CF_OUTPOINT_SPEND,
     CF_UNDO,
     CF_COINS,
-    CF_TX_INDEX,
+    CF_TX_LOC,
+    CF_TXSEQ_TXID,
+    CF_TXSEQ_BLOCK,
     CF_BLOCK_INDEX,
     CF_HEIGHT_INDEX,
     CF_CHAIN_TX,
@@ -140,14 +160,18 @@ const SCHEMA_KEY: &[u8] = b"schema_version";
 /// false so subsequent restarts continue to surface the gap even
 /// after live `connect_block` has appended new rows. (Review H6.)
 const OUTPOINT_SPEND_COMPLETE_KEY: &[u8] = b"outpoint_spend.complete";
-/// `tx_index.complete` metadata flag — symmetric to
-/// `outpoint_spend.complete` but for the `tx_index` CF that backs
-/// `getrawtransaction` / `gettxlocation` and Esplora's `/tx/:txid`
-/// confirmed-side lookup. Stamped true on fresh datadir, on
-/// `clear_chainstate` / `clear_all`. False when an upgraded datadir
-/// has historical block-index entries but the tx_index CF is empty
-/// (the operator previously ran with `txindex=0`). (Round-3 H1.)
-const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
+/// `tx_loc.complete` metadata flag — symmetric to
+/// `outpoint_spend.complete` but for the transaction-ordinal families
+/// that back `getrawtransaction` / `gettxlocation` and Esplora's
+/// `/tx/:txid` confirmed-side lookup. Stamped true on fresh datadir, on
+/// `clear_chainstate` / `clear_all`. False when an upgraded datadir has
+/// historical block-index entries but the ordinal families are empty
+/// (the operator previously ran with both indexes off). (Round-3 H1.)
+///
+/// A new key rather than a rename of `tx_index.complete`: a schema-4
+/// datadir is the only one that can reach this code, and the old key's
+/// value described a column family that no longer exists.
+const TX_LOC_COMPLETE_KEY: &[u8] = b"tx_loc.complete";
 /// `chain_tx.backfill_complete` metadata flag. True once the one-shot
 /// cumulative-tx-count backfill has populated `CF_CHAIN_TX` for the
 /// active chain. Absent/false on an upgraded datadir before the backfill
@@ -158,7 +182,7 @@ const CHAIN_TX_BACKFILL_COMPLETE_KEY: &[u8] = b"chain_tx.backfill_complete";
 /// how Core decides whether to emit the field at all.
 const PRUNE_HEIGHT_KEY: &[u8] = b"prune.height";
 /// Persisted "address-history index is complete for the active chain"
-/// marker. Mirrors `TX_INDEX_COMPLETE_KEY` — set true after a clean
+/// marker. Mirrors `TX_LOC_COMPLETE_KEY` — set true after a clean
 /// backfill (or on fresh datadirs that started with addressindex=1
 /// from genesis); cleared atomically when a block connects while
 /// addressindex is disabled. Round-1 review H2.
@@ -180,27 +204,26 @@ const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
 #[cfg(feature = "block-filter-index")]
 const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
 // v2: compact varint coins. v3: storage-format cleanup — v1 undo
-// dual-read and v1 address-history CFs were dropped, so chainstates
-// stamped at v2 must be rebuilt with --reindex-chainstate before the
-// new binary can serve them.
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+// dual-read and v1 address-history CFs were dropped. v4: the
+// transaction index is keyed on dense chain-order ordinals (`tx_loc`,
+// `txseq_txid`, `txseq_block`) instead of `txid -> block_hash`.
+//
+// A chainstate stamped at any earlier version is refused: the binary
+// cannot read rows in a layout it no longer knows, and there is no
+// in-place upgrade because the new families have to be built from the
+// blocks. `-reindex-chainstate` rebuilds them in one pass.
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
-/// Address-history CFs from the pre-cleanup era. Discovered on open and
-/// dropped post-schema-check (or by the reindex path) so chainstates
-/// migrated under the prior optimization stack can mount cleanly. New
-/// installs never create these.
-const LEGACY_ADDR_CF_NAMES: &[&str] = &["addr_funding", "addr_spending"];
-
-/// Outcome of a v2 → v3 compatibility probe. See `probe_v3_compat`.
-#[derive(Debug)]
-enum V3CompatProbe {
-    /// No v0 undo rows, legacy address CFs empty. Safe to restamp v2 → v3.
-    Compatible,
-    /// At least one undo row lacks the v1 magic prefix.
-    HasLegacyUndo,
-    /// The named legacy address-index CF has at least one row.
-    HasLegacyAddrRows(&'static str),
-}
+/// Column families this binary no longer creates or reads. Discovered on
+/// open, declared bare so RocksDB will mount the DB at all, and dropped
+/// immediately after the schema check has confirmed the chainstate is at
+/// the current version (so a datadir that still *depends* on their rows
+/// is refused before they are discarded).
+///
+/// `addr_funding` / `addr_spending` are the pre-cleanup address-history
+/// CFs; `tx_index` is the txid-keyed transaction index that the ordinal
+/// families replaced in schema 4.
+const RETIRED_CF_NAMES: &[&str] = &["addr_funding", "addr_spending", "tx_index"];
 
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -456,7 +479,22 @@ impl RocksDbStore {
             // friendly. Larger SST target reduces the count of files
             // that pile up at the bottom level during IBD.
             ColumnFamilyDescriptor::new(CF_UNDO, make_cf_opts(false, 16, None, true)),
-            ColumnFamilyDescriptor::new(CF_TX_INDEX, make_cf_opts(false, 16, None, false)),
+            // tx_loc: bloom ON, unlike the `tx_index` it replaces. Every
+            // read of this family is a point lookup on a 32-byte hash
+            // with no locality, which is exactly the shape a bloom
+            // filter is for; `tx_index` went without one only because
+            // nothing else in the read path depended on it being fast.
+            // The address index now resolves spends through it.
+            ColumnFamilyDescriptor::new(CF_TX_LOC, make_cf_opts(true, 16, None, false)),
+            // txseq_txid: no bloom. Keys are dense and ascending, so a
+            // lookup lands in a block the index already narrowed to, and
+            // the bloom would be pure overhead on a family written once
+            // per transaction.
+            ColumnFamilyDescriptor::new(CF_TXSEQ_TXID, make_cf_opts(false, 16, None, false)),
+            // txseq_block: one small row per block. Same shape as
+            // chain_tx, and read by `seek_for_prev` rather than by point
+            // lookup, so no bloom.
+            ColumnFamilyDescriptor::new(CF_TXSEQ_BLOCK, make_cf_opts(false, 2, None, false)),
             ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts(false, 2, None, false)),
             // chain_tx: one 8-byte row per block (block_hash -> cumulative
             // tx count). Small, point-lookup only (getchaintxstats), no
@@ -533,7 +571,7 @@ impl RocksDbStore {
         // Pre-cleanup `addr_funding` / `addr_spending`. Register with
         // bare opts so RocksDB opens; we drop them after the schema
         // check confirms it's safe to discard.
-        for legacy in LEGACY_ADDR_CF_NAMES {
+        for legacy in RETIRED_CF_NAMES {
             if existing_cfs.iter().any(|n| n == legacy) {
                 cf_descriptors.push(ColumnFamilyDescriptor::new(*legacy, Options::default()));
             }
@@ -546,7 +584,7 @@ impl RocksDbStore {
         for d in &cf_descriptors {
             let name = d.name();
             debug_assert!(
-                ALL_CFS.contains(&name) || LEGACY_ADDR_CF_NAMES.contains(&name),
+                ALL_CFS.contains(&name) || RETIRED_CF_NAMES.contains(&name),
                 "column family `{name}` is not listed in ALL_CFS; \
                  flush_durable would not persist its BulkLoad writes"
             );
@@ -569,41 +607,13 @@ impl RocksDbStore {
                     let stored = u32::from_le_bytes(v[..].try_into().unwrap_or([0; 4]));
                     if stored == CURRENT_SCHEMA_VERSION {
                         // Already at current version.
-                    } else if stored == 2 {
-                        // v2 → v3 in-place upgrade. v3 differs from v2
-                        // only in what's *removed*: legacy v0 undo
-                        // dual-read and the `addr_funding` /
-                        // `addr_spending` CFs. If the chainstate ran
-                        // both prior offline migrators it's already in
-                        // a v3-compatible shape, so probe for the
-                        // incompatible artifacts; restamp if clean,
-                        // refuse if not.
-                        match Self::probe_v3_compat(&db)? {
-                            V3CompatProbe::Compatible => {
-                                Self::stamp_schema(&db, CURRENT_SCHEMA_VERSION)?;
-                                tracing::info!(
-                                    target: "storage",
-                                    "Schema marker upgraded v2 -> v3 in place; chainstate \
-                                     was already in the post-cleanup shape."
-                                );
-                            }
-                            V3CompatProbe::HasLegacyUndo => {
-                                return Err(StoreError::Database(
-                                    "Chainstate has pre-cleanup undo rows (no v1 magic). \
-                                     Run with --reindex-chainstate to rebuild from \
-                                     existing block files.".to_string(),
-                                ));
-                            }
-                            V3CompatProbe::HasLegacyAddrRows(cf) => {
-                                return Err(StoreError::Database(format!(
-                                    "Chainstate has non-empty legacy address-index CF \
-                                     '{}'. Run with --reindex-chainstate to rebuild from \
-                                     existing block files.",
-                                    cf
-                                )));
-                            }
-                        }
                     } else {
+                        // No in-place upgrade arm. Schema 4 changed how
+                        // the transaction index is *keyed*, not just what
+                        // it contains, so there is nothing to re-stamp:
+                        // the new families have to be built from the
+                        // blocks, which is exactly what
+                        // `-reindex-chainstate` does.
                         return Err(StoreError::Database(format!(
                             "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
                              Run with --reindex-chainstate to rebuild from existing block files.",
@@ -646,7 +656,7 @@ impl RocksDbStore {
         // this AFTER the schema check ensures a v2 chainstate with
         // populated legacy CFs is rejected before we can discard the
         // rows it still depends on.
-        for legacy in LEGACY_ADDR_CF_NAMES {
+        for legacy in RETIRED_CF_NAMES {
             if db.cf_handle(legacy).is_some() {
                 db.drop_cf(legacy).map_err(|e| {
                     StoreError::Database(format!("Failed to drop legacy CF '{}': {}", legacy, e))
@@ -726,12 +736,12 @@ impl RocksDbStore {
             );
         }
 
-        // tx_index.complete marker — round-3 H1, refined in round-4
+        // tx_loc.complete marker — round-3 H1, refined in round-4
         // H1 to a one-way invalidation flag.
         //
         // Trust the persisted value once stamped. The previous
         // round's "recompute on every open" logic interpreted
-        // "tx_index CF has any rows" as complete, which silently
+        // "the transaction index has any rows" as complete, which silently
         // re-flipped the marker to true after a partial-txindex run
         // (e.g. legacy empty + one txindex-on block + Esplora restart
         // would let stale historical 404s through). The corrected
@@ -748,8 +758,9 @@ impl RocksDbStore {
         //     accept partial histories.
         //   - Marker already present → don't touch it. `clear_*`
         //     paths re-stamp true; `connect_block` paths stamp
-        //     false in `write_batch_mode` when txindex is disabled.
-        if store.read_tx_index_complete().is_none() {
+        //     false in `write_batch_mode` when *neither* txindex nor
+        //     addressindex is on (either one writes the families).
+        if store.read_tx_loc_complete().is_none() {
             let block_index_has_rows = store
                 .db
                 .cf_handle(CF_BLOCK_INDEX)
@@ -761,15 +772,15 @@ impl RocksDbStore {
                         .map(|item| item.is_ok())
                 })
                 .unwrap_or(false);
-            store.write_tx_index_complete(!block_index_has_rows)?;
+            store.write_tx_loc_complete(!block_index_has_rows)?;
         }
         if txindex && !store.tx_index_complete() {
             tracing::warn!(
                 target: "storage",
-                "tx_index CF is enabled but on-disk data is incomplete (this datadir was \
-                 previously synced with --txindex=0). Confirmed /tx/:txid lookups will \
-                 false-404 historical transactions until you restart with \
-                 --reindex-chainstate."
+                "the tx_loc transaction index is enabled but on-disk data is incomplete \
+                 (this datadir was previously synced with --txindex=0 and \
+                 --addressindex=0). Confirmed /tx/:txid lookups will false-404 \
+                 historical transactions until you restart with --reindex-chainstate."
             );
         }
 
@@ -993,21 +1004,21 @@ impl RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    fn read_tx_index_complete(&self) -> Option<bool> {
+    fn read_tx_loc_complete(&self) -> Option<bool> {
         let cf = self.db.cf_handle(CF_METADATA)?;
-        match self.db.get_cf(&cf, TX_INDEX_COMPLETE_KEY) {
+        match self.db.get_cf(&cf, TX_LOC_COMPLETE_KEY) {
             Ok(Some(v)) => v.first().map(|b| *b != 0),
             _ => None,
         }
     }
 
-    fn write_tx_index_complete(&self, value: bool) -> Result<(), StoreError> {
+    fn write_tx_loc_complete(&self, value: bool) -> Result<(), StoreError> {
         let cf = self
             .db
             .cf_handle(CF_METADATA)
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
-            .put_cf(&cf, TX_INDEX_COMPLETE_KEY, [u8::from(value)])
+            .put_cf(&cf, TX_LOC_COMPLETE_KEY, [u8::from(value)])
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -1104,6 +1115,7 @@ impl RocksDbStore {
                 | CF_ADDR_FUNDING_V2
                 | CF_ADDR_SPENDING_V2
                 | CF_OUTPOINT_SPEND
+                | CF_TX_LOC
                 | CF_FILTER
                 | CF_FILTER_HEADER
                 | CF_SP_TWEAKS
@@ -1115,13 +1127,14 @@ impl RocksDbStore {
                 | CF_ADDR_FUNDING_V2
                 | CF_ADDR_SPENDING_V2
                 | CF_OUTPOINT_SPEND
+                | CF_TX_LOC
                 | CF_SP_TWEAKS
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
             CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
             CF_OUTPOINT_SPEND => 16,
-            CF_UNDO | CF_TX_INDEX => 16,
+            CF_UNDO | CF_TX_LOC | CF_TXSEQ_TXID => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
             #[cfg(feature = "block-filter-index")]
             CF_FILTER => 16,
@@ -1192,36 +1205,6 @@ impl RocksDbStore {
         wb.put_cf(&cf_meta, SCHEMA_KEY, version.to_le_bytes());
         db.write(wb)
             .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    /// Decide whether a chainstate stamped at schema v2 is structurally
-    /// already in the v3 shape (because the prior offline migrators
-    /// ran). v3 differs from v2 by removing the v0 undo dual-read and
-    /// the legacy `addr_funding` / `addr_spending` CFs, so the probe
-    /// just confirms neither artifact is present. Pure-read: no
-    /// writes, no side effects, so it's safe to call before deciding
-    /// whether to restamp or refuse.
-    ///
-    /// The undo scan reads only the first 8 bytes of each row's value
-    /// (the magic check) and short-circuits on the first non-v1 row.
-    fn probe_v3_compat(db: &DB) -> Result<V3CompatProbe, StoreError> {
-        if let Some(cf_undo) = db.cf_handle(CF_UNDO) {
-            for item in db.iterator_cf(&cf_undo, IteratorMode::Start) {
-                let (_, v) = item.map_err(|e| StoreError::Database(e.to_string()))?;
-                let magic = crate::storage::undo::V1_MAGIC;
-                if v.len() < magic.len() || v[..magic.len()] != magic {
-                    return Ok(V3CompatProbe::HasLegacyUndo);
-                }
-            }
-        }
-        for legacy in LEGACY_ADDR_CF_NAMES {
-            if let Some(cf) = db.cf_handle(legacy)
-                && db.iterator_cf(&cf, IteratorMode::Start).next().is_some()
-            {
-                return Ok(V3CompatProbe::HasLegacyAddrRows(legacy));
-            }
-        }
-        Ok(V3CompatProbe::Compatible)
     }
 
     /// Query a per-CF integer property across every CF this binary
@@ -1296,22 +1279,30 @@ impl RocksDbStore {
         let cf_undo = self.cf(CF_UNDO);
         let cf_meta = self.cf(CF_METADATA);
 
-        // tx_index.complete one-way invalidation (round-4 H1).
+        // tx_loc.complete one-way invalidation (round-4 H1).
         //
-        // If the runtime has txindex disabled but this batch is
-        // connecting/reorging blocks (any coin movement), the
-        // tx_index CF will not get the rows for those blocks. Stamp
+        // If the runtime has both transaction-index consumers disabled
+        // but this batch is connecting/reorging blocks (any coin
+        // movement), the ordinal families will not get the rows for
+        // those blocks. Stamp
         // the completeness marker false IN THE SAME `WriteBatch` as
         // the chainstate update so the invalidation is atomic with
         // the connect — a crash mid-write either rolls everything
         // back or commits both. `coin_puts` is the connect signal
         // (every connected non-empty block creates outputs);
         // `coin_removes` covers the disconnect-with-txindex-off case
-        // where existing tx_index rows for the now-undone block
+        // where existing ordinal rows for the now-undone block
         // become stale.
-        if !self.txindex_enabled && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        //
+        // The gate is "neither index is on", not "txindex is off": the
+        // address index writes the same families, so a node running
+        // `-txindex=0 -addressindex=1` keeps them complete and must not
+        // have the marker cleared under it.
+        if !self.txindex_enabled
+            && !self.addressindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
         {
-            wb.put_cf(&cf_meta, TX_INDEX_COMPLETE_KEY, [0u8]);
+            wb.put_cf(&cf_meta, TX_LOC_COMPLETE_KEY, [0u8]);
         }
 
         // Same invalidation contract for the address-index marker
@@ -1483,16 +1474,53 @@ impl RocksDbStore {
             wb.put_cf(&cf_undo, hash_bytes(hash), &value);
         }
 
-        // Tx index
-        if self.txindex_enabled
-            && (!batch.tx_index_puts.is_empty() || !batch.tx_index_removes.is_empty())
-        {
-            let cf_txi = self.cf(CF_TX_INDEX);
-            for (txid, block_hash) in &batch.tx_index_puts {
-                wb.put_cf(&cf_txi, txid_bytes(txid), hash_bytes(block_hash));
+        // Transaction-ordinal families.
+        //
+        // `tx_loc` and `txseq_txid` ride the same gate: either index
+        // wants them. `-txindex` wants txid -> location; `-addressindex`
+        // wants both directions, because its rows key on ordinals and
+        // have to resolve back to txids before they leave the store. A
+        // validating-only node pays for neither.
+        let want_tx_ordinals = self.txindex_enabled || self.addressindex_enabled;
+        if want_tx_ordinals && (!batch.tx_loc_puts.is_empty() || !batch.tx_loc_removes.is_empty()) {
+            let cf_txl = self.cf(CF_TX_LOC);
+            for (txid, seq) in &batch.tx_loc_puts {
+                wb.put_cf(&cf_txl, txid_bytes(txid), node_index::encode_txseq(TxSeq(*seq)));
             }
-            for txid in &batch.tx_index_removes {
-                wb.delete_cf(&cf_txi, txid_bytes(txid));
+            for txid in &batch.tx_loc_removes {
+                wb.delete_cf(&cf_txl, txid_bytes(txid));
+            }
+        }
+        if want_tx_ordinals
+            && (!batch.txseq_txid_puts.is_empty() || !batch.txseq_txid_removes.is_empty())
+        {
+            let cf_seq = self.cf(CF_TXSEQ_TXID);
+            for (seq, txid) in &batch.txseq_txid_puts {
+                wb.put_cf(
+                    &cf_seq,
+                    node_index::encode_txseq(TxSeq(*seq)),
+                    txid_bytes(txid),
+                );
+            }
+            for seq in &batch.txseq_txid_removes {
+                wb.delete_cf(&cf_seq, node_index::encode_txseq(TxSeq(*seq)));
+            }
+        }
+        // `txseq_block` is ungated. It is four bytes per block, and it is
+        // the only thing that can turn an ordinal back into a height — so
+        // a node that turns `-addressindex` on later would otherwise have
+        // ordinals it cannot place without a full reindex.
+        if !batch.txseq_block_puts.is_empty() || !batch.txseq_block_removes.is_empty() {
+            let cf_tsb = self.cf(CF_TXSEQ_BLOCK);
+            for (first_txseq, height) in &batch.txseq_block_puts {
+                wb.put_cf(
+                    &cf_tsb,
+                    node_index::encode_txseq(TxSeq(*first_txseq)),
+                    height.to_be_bytes(),
+                );
+            }
+            for first_txseq in &batch.txseq_block_removes {
+                wb.delete_cf(&cf_tsb, node_index::encode_txseq(TxSeq(*first_txseq)));
             }
         }
 
@@ -2076,9 +2104,79 @@ impl Store for RocksDbStore {
         if !self.txindex_enabled {
             return None;
         }
-        let cf = self.cf(CF_TX_INDEX);
+        // Three point reads where there used to be one: txid -> ordinal,
+        // ordinal -> block, height -> hash. In exchange the index rows
+        // that mention this transaction no longer carry a copy of its
+        // txid. Callers that also want the position in the block should
+        // use `get_tx_seq` + `block_of_seq` and index `txdata` directly
+        // rather than reading the block and scanning it.
+        let seq = self.get_tx_seq(txid)?;
+        let (_first, height) = self.block_of_seq(seq)?;
+        self.get_block_hash_by_height(height)
+    }
+
+    fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        // Deliberately not gated on `txindex_enabled`: the address index
+        // writes this family too and needs it regardless of what
+        // `-txindex` says. `has_txindex()` remains the `-txindex` flag.
+        let cf = self.cf(CF_TX_LOC);
         let value = self.db.get_cf(&cf, txid_bytes(txid)).ok()??;
-        hash_from_bytes(&value)
+        node_index::decode_txseq(&value).map(|s| s.0)
+    }
+
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        if seqs.is_empty() {
+            return Vec::new();
+        }
+        let cf = self.cf(CF_TXSEQ_TXID);
+        let keys: Vec<[u8; node_index::TXSEQ_LEN]> = seqs
+            .iter()
+            .map(|s| node_index::encode_txseq(TxSeq(*s)))
+            .collect();
+        let cf_keys: Vec<_> = keys.iter().map(|k| (&cf, k.as_slice())).collect();
+        self.db
+            .multi_get_cf(cf_keys)
+            .into_iter()
+            .map(|result| {
+                result.ok().flatten().and_then(|v| {
+                    if v.len() != 32 {
+                        return None;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&v);
+                    Some(Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
+        let cf = self.cf(CF_TXSEQ_BLOCK);
+        let target = node_index::encode_txseq(TxSeq(seq));
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_for_prev(target);
+        if !iter.valid() {
+            return None;
+        }
+        let first_txseq = node_index::decode_txseq(iter.key()?)?.0;
+        let height_bytes: [u8; 4] = iter.value()?.try_into().ok()?;
+        let height = u32::from_be_bytes(height_bytes);
+
+        // `seek_for_prev` lands on the last block for *any* larger
+        // ordinal, including one past the tip, so the row it found has
+        // to be checked against that block's transaction count. Without
+        // this an ordinal beyond the chain would resolve to the tip
+        // block and a caller would index past the end of `txdata`.
+        let num_tx = self
+            .get_block_hash_by_height(height)
+            .and_then(|h| self.get_block_index(&h))
+            .map(|e| e.num_tx as u64)?;
+        if seq >= first_txseq + num_tx {
+            return None;
+        }
+        Some((first_txseq, height))
     }
 
     fn has_txindex(&self) -> bool {
@@ -2086,11 +2184,16 @@ impl Store for RocksDbStore {
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
-        let mut cfs = if self.txindex_enabled {
-            vec![CF_COINS, CF_UNDO, CF_METADATA, CF_TX_INDEX]
-        } else {
-            vec![CF_COINS, CF_UNDO, CF_METADATA]
-        };
+        let mut cfs = vec![CF_COINS, CF_UNDO, CF_METADATA];
+        // The transaction-ordinal families ride the same gate as their
+        // writes: either index populates them, so either index's node
+        // has rows to rebuild.
+        if self.txindex_enabled || self.addressindex_enabled {
+            cfs.push(CF_TX_LOC);
+            cfs.push(CF_TXSEQ_TXID);
+        }
+        // `txseq_block` is written unconditionally, so it always clears.
+        cfs.push(CF_TXSEQ_BLOCK);
         // Address-history index sits in chainstate and must clear too,
         // otherwise -reindex-chainstate would leave stale rows that
         // reference UTXOs the new chainstate is about to overwrite.
@@ -2099,7 +2202,7 @@ impl Store for RocksDbStore {
         cfs.push(CF_OUTPOINT_SPEND);
         // Cumulative-tx-count index: rebuilt from genesis by the reindex
         // replay's connect_block calls, so clear it here and re-stamp the
-        // backfill marker below (same reasoning as tx_index).
+        // backfill marker below (same reasoning as the ordinal families).
         cfs.push(CF_CHAIN_TX);
         // Same reasoning for the BIP 158 filter index: -reindex-chainstate
         // is going to rebuild filters from genesis via the normal
@@ -2122,7 +2225,7 @@ impl Store for RocksDbStore {
         self.drop_backfill_temp_cf()?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
-        // Re-stamp outpoint_spend.complete + tx_index.complete +
+        // Re-stamp outpoint_spend.complete + tx_loc.complete +
         // address_index.complete: -reindex-chainstate produces a
         // from-empty re-population which connect_block will fill
         // atomically across all index CFs (round-3 H1, round-2-review
@@ -2130,7 +2233,7 @@ impl Store for RocksDbStore {
         // remediation (`--reindex-chainstate`) would silently leave
         // Electrum / Esplora address surfaces refusing to bind.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)?;
+        self.write_tx_loc_complete(true)?;
         self.write_address_index_complete(true)?;
         // The reindex replay repopulates chain_tx from genesis via
         // connect_block, so the cumulative index is complete afterward.
@@ -2155,7 +2258,9 @@ impl Store for RocksDbStore {
             CF_HEIGHT_INDEX,
             CF_UNDO,
             CF_METADATA,
-            CF_TX_INDEX,
+            CF_TX_LOC,
+            CF_TXSEQ_TXID,
+            CF_TXSEQ_BLOCK,
             CF_ADDR_FUNDING_V2,
             CF_ADDR_SPENDING_V2,
             CF_OUTPOINT_SPEND,
@@ -2178,7 +2283,7 @@ impl Store for RocksDbStore {
         // Same completeness markers as `clear_chainstate` —
         // see comment there for the round-2-review H2 rationale.
         self.write_outpoint_spend_complete(true)?;
-        self.write_tx_index_complete(true)?;
+        self.write_tx_loc_complete(true)?;
         self.write_address_index_complete(true)?;
         self.write_chain_tx_backfill_complete(true)?;
         #[cfg(feature = "block-filter-index")]
@@ -2400,7 +2505,7 @@ impl Store for RocksDbStore {
     }
 
     fn tx_index_complete(&self) -> bool {
-        self.read_tx_index_complete().unwrap_or(false)
+        self.read_tx_loc_complete().unwrap_or(false)
     }
 
     fn chain_tx_backfill_complete(&self) -> bool {
@@ -2974,6 +3079,40 @@ mod tests {
         );
     }
 
+    /// The `debug_assert!` in `open()` enforces "descriptor created =>
+    /// listed in ALL_CFS", but only in debug builds and only for CFs the
+    /// open path actually reaches. This asserts the same correspondence
+    /// from the other side and unconditionally: open a store, list what
+    /// RocksDB actually created, and require `ALL_CFS` to name exactly
+    /// that. A CF missing from `ALL_CFS` loses its WAL-less BulkLoad
+    /// writes on process exit — which looks like a clean shutdown and a
+    /// silently truncated index.
+    #[test]
+    fn all_cfs_names_every_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _store = RocksDbStore::open(dir.path(), true, 16, false, -1).unwrap();
+        }
+        let mut created = DB::list_cf(&Options::default(), dir.path().join("chainstate")).unwrap();
+        // The backfill temp CF is created lazily when a backfill starts,
+        // so a freshly opened store has not made it yet.
+        created.retain(|n| n != CF_ADDR_BACKFILL_TEMP);
+        created.sort();
+
+        let mut listed: Vec<String> = ALL_CFS
+            .iter()
+            .filter(|n| **n != CF_ADDR_BACKFILL_TEMP)
+            .map(|n| n.to_string())
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            created, listed,
+            "ALL_CFS must name exactly the column families open() creates; \
+             a missing one loses its BulkLoad writes on flush_durable"
+        );
+    }
+
     /// `estimated_keys_by_cf` must report the rows actually written.
     /// RocksDB's `estimate-num-keys` is exact while the data is still
     /// memtable-resident, which is the case for a freshly written temp
@@ -3058,6 +3197,80 @@ mod tests {
         assert!(store.get_coin(&kept).is_some(), "unpaired put must survive");
         assert_eq!(store.coin_count(), 1, "counters must match the net state");
         assert_eq!(store.coin_total_amount(), 2_000);
+    }
+
+    /// `seek_for_prev` answers "the nearest block row at or before this
+    /// ordinal" for *any* ordinal, including one past the tip, so the
+    /// found row has to be checked against the block's transaction
+    /// count. Without the bound, an ordinal beyond the chain resolves to
+    /// the last block and a caller indexes past the end of `txdata`.
+    #[test]
+    fn block_of_seq_rejects_an_ordinal_past_the_last_block() {
+        let (store, _dir) = temp_store(true);
+        let (hash, mut entry) = regtest_genesis_entry();
+        entry.height = 0;
+        entry.num_tx = 3;
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((0, hash));
+        batch.txseq_block_puts.push((0, 0));
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.block_of_seq(0), Some((0, 0)));
+        assert_eq!(store.block_of_seq(2), Some((0, 0)), "last tx of the block");
+        assert_eq!(
+            store.block_of_seq(3),
+            None,
+            "one past the block's transaction count is past the chain"
+        );
+        assert_eq!(store.block_of_seq(1_000_000), None);
+    }
+
+    /// The remove-wins contract, for the three ordinal families. A reorg
+    /// frees a range of ordinals and the replacement chain reuses them
+    /// immediately, so a put and a remove for the same key inside one
+    /// batch is routine rather than exotic — and a RocksDB `WriteBatch`
+    /// is last-write-wins per key, so the apply order is what decides.
+    #[test]
+    fn write_batch_remove_wins_for_ordinal_families() {
+        let (store, _dir) = temp_store(true);
+        let paired =
+            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xA1; 32]));
+        let kept = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xA2; 32]));
+        let (hash, mut entry) = regtest_genesis_entry();
+        entry.num_tx = 2;
+
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((0, hash));
+        batch.tx_loc_puts.push((paired, 0));
+        batch.tx_loc_puts.push((kept, 1));
+        batch.tx_loc_removes.push(paired);
+        batch.txseq_txid_puts.push((0, paired));
+        batch.txseq_txid_puts.push((1, kept));
+        batch.txseq_txid_removes.push(0);
+        batch.txseq_block_puts.push((0, 0));
+        batch.txseq_block_puts.push((10, 5));
+        batch.txseq_block_removes.push(10);
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(
+            store.get_tx_seq(&paired),
+            None,
+            "tx_loc put+remove pair must net to absent — the remove wins"
+        );
+        assert_eq!(store.get_tx_seq(&kept), Some(1), "unpaired put must survive");
+        assert_eq!(
+            store.txids_of_seqs(&[0, 1]),
+            vec![None, Some(kept)],
+            "txseq_txid must follow the same contract"
+        );
+        assert_eq!(
+            store.block_of_seq(5),
+            None,
+            "txseq_block put+remove pair must net to absent"
+        );
     }
 
     fn regtest_genesis_entry() -> (BlockHash, BlockIndexEntry) {
@@ -3434,8 +3647,12 @@ mod tests {
         let mut batch = StoreBatch::default();
         batch.height_hash_puts.push((100, hash));
         batch.height_hash_removes.push(100);
-        batch.tx_index_puts.push((txid, hash));
-        batch.tx_index_removes.push(txid);
+        batch.tx_loc_puts.push((txid, 7));
+        batch.tx_loc_removes.push(txid);
+        batch.txseq_txid_puts.push((7, txid));
+        batch.txseq_txid_removes.push(7);
+        batch.txseq_block_puts.push((7, 100));
+        batch.txseq_block_removes.push(7);
         store.write_batch(batch).unwrap();
 
         assert!(
@@ -3513,12 +3730,24 @@ mod tests {
         assert!(store.has_txindex());
 
         let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xBB; 32]));
-        let block_hash = make_block_hash(0xCC);
+        let (block_hash, mut entry) = regtest_genesis_entry();
+        entry.height = 0;
+        entry.num_tx = 1;
 
         let mut batch = StoreBatch::default();
-        batch.tx_index_puts.push((txid, block_hash));
+        batch.block_index_puts.push((block_hash, entry));
+        batch.height_hash_puts.push((0, block_hash));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 0));
         store.write_batch(batch).unwrap();
 
+        // `get_tx_location` is composed from the two ordinal families
+        // plus the height index; all three have to be right for it to
+        // answer, which is why the fixture writes the block rows too.
+        assert_eq!(store.get_tx_seq(&txid), Some(0));
+        assert_eq!(store.txids_of_seqs(&[0]), vec![Some(txid)]);
+        assert_eq!(store.block_of_seq(0), Some((0, 0)));
         let recovered = store.get_tx_location(&txid).unwrap();
         assert_eq!(recovered, block_hash);
     }
@@ -3588,7 +3817,9 @@ mod tests {
         batch.coin_puts.push((op, coin));
         batch.tip = Some(tip_hash);
         batch.height_hash_puts.push((0, genesis_hash));
-        batch.tx_index_puts.push((txid, genesis_hash));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 0));
         store.write_batch(batch).unwrap();
 
         assert!(store.get_block_index(&genesis_hash).is_some());
@@ -3678,7 +3909,9 @@ mod tests {
         batch.coin_puts.push((op, coin));
         batch.tip = Some(hash);
         batch.height_hash_puts.push((0, hash));
-        batch.tx_index_puts.push((txid, hash));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 0));
         store.write_batch(batch).unwrap();
 
         store.clear_chainstate().unwrap();
@@ -4420,78 +4653,43 @@ mod tests {
         let _ = RocksDbStore::open(&path, false, 16, false, -1).expect("reopen ok");
     }
 
+    /// Every schema older than the current one is refused, with the
+    /// message that names the recovery. There is no in-place upgrade arm
+    /// any more: schema 4 changed how the transaction index is *keyed*,
+    /// so there is nothing to re-stamp — the new families have to be
+    /// built from the blocks, which is what `-reindex-chainstate` does.
+    ///
+    /// Opening a v3 datadir under a v4 binary without refusing would be
+    /// the worst outcome available: `tx_index` still holds rows, the
+    /// binary reads none of them, and every confirmed lookup would
+    /// silently answer "not found" on a chain that has the transaction.
     #[test]
-    fn open_at_v2_with_legacy_addr_rows_refuses() {
-        // v2 chainstate with non-empty legacy address-index CFs (i.e.,
-        // the prior `--migrate-addr-index` was never run). The v2→v3
-        // probe must catch this and refuse with a message pointing to
-        // --reindex-chainstate — recovery must be reachable, not
-        // require manual filesystem surgery.
-        let (path, _dir) = synth_prior_datadir(2, true);
-        let err = RocksDbStore::open(&path, false, 16, false, -1)
-            .err()
-            .expect("open should refuse a v2 chainstate with legacy addr rows");
-        let msg = match err {
-            StoreError::Database(s) => s,
-            other => panic!("expected Database error, got {:?}", other),
-        };
-        assert!(
-            msg.contains("legacy address-index CF"),
-            "error should name the legacy CF: {}",
-            msg
-        );
-        assert!(
-            msg.contains("--reindex-chainstate"),
-            "error should mention the recovery flag: {}",
-            msg
-        );
-    }
-
-    #[test]
-    fn open_at_v2_with_v0_undo_refuses() {
-        // v2 chainstate carrying a pre-cleanup undo row (no v1 magic).
-        // Probe must catch it before serving traffic; opening anyway
-        // would surface later as generic "missing undo" during reorg
-        // or filter backfill.
-        let (path, _dir) = synth_prior_datadir_with(2, false, true);
-        let err = RocksDbStore::open(&path, false, 16, false, -1)
-            .err()
-            .expect("open should refuse a v2 chainstate with pre-cleanup undo");
-        let msg = match err {
-            StoreError::Database(s) => s,
-            other => panic!("expected Database error, got {:?}", other),
-        };
-        assert!(
-            msg.contains("pre-cleanup undo"),
-            "error should mention the undo format break: {}",
-            msg
-        );
-        assert!(
-            msg.contains("--reindex-chainstate"),
-            "error should mention the recovery flag: {}",
-            msg
-        );
-    }
-
-    #[test]
-    fn open_at_v2_with_clean_chainstate_autoupgrades_to_v3() {
-        // v2 chainstate where both prior migrators successfully ran:
-        // legacy address CFs are empty, undo has no pre-cleanup rows.
-        // Open must succeed without reindex AND must persist the v3
-        // marker so subsequent opens skip the probe.
-        let (path, _dir) = synth_prior_datadir(2, false);
-        let store = RocksDbStore::open(&path, false, 16, false, -1)
-            .expect("v2 chainstate with no incompatible artifacts should auto-upgrade");
-        drop(store);
-        assert_eq!(
-            read_schema_version_raw(&path),
-            Some(CURRENT_SCHEMA_VERSION),
-            "auto-upgrade must persist the v3 marker"
-        );
-        // Reopen using the normal path — no probe, no auto-upgrade
-        // needed, must just succeed.
-        let _ = RocksDbStore::open(&path, false, 16, false, -1)
-            .expect("reopen of an auto-upgraded chainstate should be a plain v3 open");
+    fn a_prior_schema_datadir_is_refused_with_the_reindex_chainstate_message() {
+        for stored in [2u32, 3] {
+            let (path, _dir) = synth_prior_datadir(stored, false);
+            let err = RocksDbStore::open(&path, false, 16, false, -1)
+                .err()
+                .unwrap_or_else(|| panic!("open should refuse a v{stored} chainstate"));
+            let msg = match err {
+                StoreError::Database(s) => s,
+                other => panic!("expected Database error, got {:?}", other),
+            };
+            assert!(
+                msg.contains(&format!("DB has v{stored}")),
+                "error should name the stored version: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("binary expects v{CURRENT_SCHEMA_VERSION}")),
+                "error should name the expected version: {msg}"
+            );
+            assert!(
+                msg.contains("--reindex-chainstate"),
+                "error should name the recovery: {msg}"
+            );
+            // And the refusal must be durable: a second open sees the
+            // same stored version, not a marker the failed open moved.
+            assert_eq!(read_schema_version_raw(&path), Some(stored));
+        }
     }
 
     #[test]
@@ -4520,16 +4718,17 @@ mod tests {
         let (store, _dir) = temp_store(true);
 
         // A realistic connect batch: coins, block index, undo, height
-        // index, tip, txindex — written WAL-less as during IBD/reindex.
+        // index, tip, ordinals — written WAL-less as during IBD/reindex.
         let (hash, entry) = regtest_genesis_entry();
         let mut batch = StoreBatch::default();
         batch.coin_puts.push((make_outpoint(0xAA, 0), make_coin(50_000, 1)));
         batch.block_index_puts.push((hash, entry));
         batch.tip = Some(hash);
         batch.height_hash_puts.push((1, hash));
-        batch
-            .tx_index_puts
-            .push((Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xAA; 32])), hash));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xAA; 32]));
+        batch.tx_loc_puts.push((txid, 0));
+        batch.txseq_txid_puts.push((0, txid));
+        batch.txseq_block_puts.push((0, 1));
         store
             .write_batch_mode(batch, WriteMode::BulkLoad)
             .unwrap();
@@ -4538,7 +4737,15 @@ mod tests {
 
         // After a durable flush, no data CF may still hold the write in
         // its (volatile, WAL-less) active memtable.
-        for cf_name in [CF_COINS, CF_BLOCK_INDEX, CF_HEIGHT_INDEX, CF_TX_INDEX, CF_METADATA] {
+        for cf_name in [
+            CF_COINS,
+            CF_BLOCK_INDEX,
+            CF_HEIGHT_INDEX,
+            CF_TX_LOC,
+            CF_TXSEQ_TXID,
+            CF_TXSEQ_BLOCK,
+            CF_METADATA,
+        ] {
             let cf = store.cf(cf_name);
             let entries = store
                 .db

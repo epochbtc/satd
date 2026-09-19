@@ -22,7 +22,14 @@ pub struct InMemoryStore {
     tip: parking_lot::RwLock<Option<BlockHash>>,
     height_index: parking_lot::RwLock<std::collections::HashMap<u32, BlockHash>>,
     undo: parking_lot::RwLock<std::collections::HashMap<BlockHash, UndoData>>,
-    tx_index: parking_lot::RwLock<std::collections::HashMap<Txid, BlockHash>>,
+    /// `txid -> ordinal`, and its inverse. `BTreeMap` for the
+    /// ordinal-keyed side so `block_of_seq`'s "largest first_txseq not
+    /// greater than this" has the same shape here as RocksDB's
+    /// `seek_for_prev`.
+    tx_loc: parking_lot::RwLock<std::collections::HashMap<Txid, u64>>,
+    txseq_txid: parking_lot::RwLock<std::collections::BTreeMap<u64, Txid>>,
+    /// `first ordinal of a block -> height`.
+    txseq_block: parking_lot::RwLock<std::collections::BTreeMap<u64, u32>>,
     chain_tx: parking_lot::RwLock<std::collections::HashMap<BlockHash, u64>>,
     chain_tx_backfill_complete: parking_lot::RwLock<bool>,
     /// Lowest height whose block data is still held (Core's `pruneheight`).
@@ -64,7 +71,9 @@ impl InMemoryStore {
             tip: parking_lot::RwLock::new(None),
             height_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             undo: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            tx_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tx_loc: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            txseq_txid: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
+            txseq_block: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             chain_tx: parking_lot::RwLock::new(std::collections::HashMap::new()),
             // Default false so a manually-populated InMemoryStore behaves
             // like an upgraded datadir (backfill runs); connect-driven test
@@ -176,7 +185,9 @@ impl Store for InMemoryStore {
         let mut tip = self.tip.write();
         let mut hi = self.height_index.write();
         let mut undo = self.undo.write();
-        let mut txi = self.tx_index.write();
+        let mut txl = self.tx_loc.write();
+        let mut tst = self.txseq_txid.write();
+        let mut tsb = self.txseq_block.write();
         let mut ctx = self.chain_tx.write();
 
         for (hash, entry) in batch.block_index_puts {
@@ -200,11 +211,23 @@ impl Store for InMemoryStore {
         for (hash, data) in batch.undo_puts {
             undo.insert(hash, data);
         }
-        for (txid, block_hash) in batch.tx_index_puts {
-            txi.insert(txid, block_hash);
+        for (txid, seq) in batch.tx_loc_puts {
+            txl.insert(txid, seq);
         }
-        for txid in batch.tx_index_removes {
-            txi.remove(&txid);
+        for txid in batch.tx_loc_removes {
+            txl.remove(&txid);
+        }
+        for (seq, txid) in batch.txseq_txid_puts {
+            tst.insert(seq, txid);
+        }
+        for seq in batch.txseq_txid_removes {
+            tst.remove(&seq);
+        }
+        for (first_txseq, height) in batch.txseq_block_puts {
+            tsb.insert(first_txseq, height);
+        }
+        for first_txseq in batch.txseq_block_removes {
+            tsb.remove(&first_txseq);
         }
         for (hash, count) in batch.chain_tx_puts {
             ctx.insert(hash, count);
@@ -389,17 +412,46 @@ impl Store for InMemoryStore {
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
-        self.tx_index.read().get(txid).copied()
+        let seq = self.get_tx_seq(txid)?;
+        let (_first, height) = self.block_of_seq(seq)?;
+        self.get_block_hash_by_height(height)
     }
 
     fn has_txindex(&self) -> bool {
         true // always enabled in tests
     }
 
+    fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
+        self.tx_loc.read().get(txid).copied()
+    }
+
+    fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {
+        let map = self.txseq_txid.read();
+        seqs.iter().map(|s| map.get(s).copied()).collect()
+    }
+
+    fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
+        let (&first_txseq, &height) = self.txseq_block.read().range(..=seq).next_back()?;
+        // Same bound as the RocksDB impl: the nearest-preceding block row
+        // matches any larger ordinal, including one past the tip, so it
+        // is only an answer if the block actually holds that many
+        // transactions.
+        let num_tx = self
+            .get_block_hash_by_height(height)
+            .and_then(|h| self.get_block_index(&h))
+            .map(|e| e.num_tx as u64)?;
+        if seq >= first_txseq + num_tx {
+            return None;
+        }
+        Some((first_txseq, height))
+    }
+
     fn clear_chainstate(&self) -> Result<(), StoreError> {
         self.coins.write().clear();
         self.undo.write().clear();
-        self.tx_index.write().clear();
+        self.tx_loc.write().clear();
+        self.txseq_txid.write().clear();
+        self.txseq_block.write().clear();
         self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();
@@ -419,7 +471,9 @@ impl Store for InMemoryStore {
         self.height_index.write().clear();
         self.coins.write().clear();
         self.undo.write().clear();
-        self.tx_index.write().clear();
+        self.tx_loc.write().clear();
+        self.txseq_txid.write().clear();
+        self.txseq_block.write().clear();
         self.chain_tx.write().clear();
         self.addr_funding.write().clear();
         self.addr_spending.write().clear();

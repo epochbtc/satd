@@ -842,6 +842,15 @@ serves correctly with partial history while they progress. End-to-end
 migration timings on representative hardware are not yet benchmarked;
 this section will be updated when measurements are available.
 
+`-reindex-chainstate` is also satd's own upgrade path across chainstate
+schema versions. The chainstate is versioned; a newer satd that cannot
+read an older layout refuses to open the datadir and names the flag in
+the refusal rather than reading rows it would misinterpret. The block
+files are never touched by that rebuild — only the RocksDB chainstate is
+discarded and replayed — so the chain does not have to be downloaded
+again. A pruned datadir is the exception: the replay needs every block,
+and a pruned node has to resync.
+
 ---
 
 ## References

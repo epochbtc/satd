@@ -25,7 +25,9 @@ the chain's growth.
 | `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~256 GB |
 | `outpoint_spend` | UTXO → the input that spent it | `prev_txid[32] ‖ vout` | 76 B | ~186 GB |
 | `addr_funding_v2` | every output paying a script | `scripthash[16] ‖ height ‖ txid ‖ vout` | 64 B | ~178 GB |
-| `tx_index` | txid → containing block | `txid[32]` | 64 B | ~79 GB |
+| `tx_loc` | txid → transaction ordinal | `txid[32]` | 37 B | to be measured |
+| `txseq_txid` | transaction ordinal → txid | `txseq[5]` | 37 B | to be measured |
+| `txseq_block` | first ordinal of a block → height | `txseq[5]` | 9 B | to be measured |
 | `undo` | per-block disconnect data | `block_hash[32]` | ~28 B / input | ~74 GB |
 | `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~13 GB |
 | `coins` | the live UTXO set | `txid[32] ‖ vout` | ~28 B varint | ~10 GB |
@@ -42,7 +44,7 @@ The filter row is the one figure here that is still an estimate. The measured
 node does not run `blockfilterindex`.
 
 > **Note.** During a `-reindex` or `-reindex-chainstate`, RocksDB compaction
-> falls behind the write rate, so `tx_index` in particular can read much larger
+> falls behind the write rate, so the transaction index in particular can read much larger
 > than its settled size (uncompacted L0 SSTs, bloom filters, and index blocks).
 > Measure the per-CF footprint after the node has idled and background
 > compaction has drained; see [Compaction](#compaction).
@@ -86,21 +88,38 @@ largest source of the overage.
 
 The often-quoted "30–180 GB" figure is the electrs/Fulcrum address index alone.
 satd's address index alone (`addr_funding` + `addr_spending`) already exceeds
-that range. satd also carries a Core-style `tx_index`, an `outpoint_spend`
+that range. satd also carries a transaction index, an `outpoint_spend`
 reverse index, and BIP 158 filters in the same database, because one binary
 serves Electrum, Esplora, `getrawtransaction`, and compact-filter clients. So
 compare satd's indices to electrs plus Core's `txindex` plus a spend index plus
 a filter index, fused into one store.
 
-### 3. satd trades pointer compactness for self-containment
+### 3. satd keys on transaction ordinals
 
-`tx_index` stores the full 32-byte block hash as its value, where Core's
-`txindex` stores an on-disk position (`CDiskTxPos`) of about 12 bytes. That
-costs about 20 extra bytes per transaction, roughly 24 GB across the chain, and
-one extra indirection on read. In exchange, the index is independent of
-block-file layout and survives block-file re-packing. satd's keys are also
-fixed-width binary tuned for prefix seeks rather than byte-minimal, which costs
-a little space and speeds up range scans.
+Core's `txindex` stores an on-disk position (`CDiskTxPos`, about 12 bytes),
+which is compact but ties the index to the block-file layout. satd stores a
+**transaction ordinal** instead: transactions are numbered in chain order
+from the genesis coinbase at 0, so the transaction at position *i* of a block
+takes `nchaintx(parent) + i` — the cumulative count satd already keeps per
+block for `getchaintxstats`. Five bytes hold 2^40 of them, and the encoding
+is big-endian, so the byte order of a key is the order the transactions were
+mined.
+
+That buys two things. The index stays independent of block-file layout and
+survives re-packing, as a block-hash value would — but at 5 bytes rather than
+32. And because an ordinal names the position inside the block as well as the
+block, `getrawtransaction` indexes straight into the block's transaction list
+instead of reading the block and comparing every txid in it.
+
+Two column families hold it: `tx_loc` maps a txid to its ordinal, and
+`txseq_txid` maps back. The reverse map is what lets other indexes drop their
+txid copies — a row keys on an ordinal, and the storage layer resolves it to
+a txid, in one batched lookup per scan, before the row leaves it. A third,
+`txseq_block`, is one small row per block that turns an ordinal back into a
+height.
+
+satd's keys are fixed-width binary tuned for prefix seeks rather than
+byte-minimal, which costs a little space and speeds up range scans.
 
 ### What satd already does to keep the footprint down
 
@@ -143,8 +162,8 @@ The indices are opt-in per surface. Match the disk to what you serve:
 | You want… | Flags | Heavy CFs pulled in |
 |---|---|---|
 | Validating node only | (defaults; indices off) | none |
-| `getrawtransaction <txid>` anywhere | `-txindex=1` | `tx_index` |
-| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v2`, `addr_spending_v2`, `outpoint_spend`, `tx_index` |
+| `getrawtransaction <txid>` anywhere | `-txindex=1` | `tx_loc`, `txseq_txid`, `txseq_block` |
+| Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v2`, `addr_spending_v2`, `outpoint_spend`, `tx_loc`, `txseq_txid`, `txseq_block` |
 | BIP 157/158 light-client service | `-blockfilterindex=basic -peerblockfilters=1` | `block_filter`, `block_filter_header` |
 | BIP 352 silent-payment scanning or serving | `-silentpaymentindex=1` | `sp_tweaks` |
 
@@ -320,6 +339,33 @@ body on the chain and cannot distinguish a data hole from an unknown block
 > every write path, so the window above is closed for blocks written by current
 > versions. Datadirs that predate this may still carry a hole from an earlier
 > crash; nothing audits or migrates them on upgrade.
+
+## Upgrading to chainstate schema 4
+
+The chainstate is versioned, and a satd that cannot read an older layout
+refuses to open the datadir rather than misinterpret its rows. The refusal
+names the remedy:
+
+```
+Chainstate schema version mismatch: DB has v3, binary expects v4.
+Run with --reindex-chainstate to rebuild from existing block files.
+```
+
+`-reindex-chainstate` discards the RocksDB chainstate and replays the block
+files into a new one, rebuilding every enabled index inline as it goes. The
+block files themselves are never touched, so nothing is downloaded again,
+and because the old column families are dropped before the replay starts the
+datadir never grows beyond its current size during the rebuild. It is a
+single pass over the chain; budget roughly what an `-assumevalid` sync of the
+same chain costs on your hardware.
+
+Two cases need more than that:
+
+- **Pruned nodes.** The replay needs every block, and a pruned node does not
+  have them. Such a node has to resync.
+- **AssumeUTXO nodes.** Unchanged from before: run `backfillindex address`
+  once background validation has reached the snapshot base, as the
+  snapshot's own coins carry no history behind them.
 
 ## Compaction
 
