@@ -1915,7 +1915,7 @@ impl Store for CoinCache {
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid.to_string(), a.vin).cmp(&(b.height, b.txid.to_string(), b.vin))
+            (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
         });
         // Round-2 review M3: honor the trait contract — see
         // iter_addr_funding_limited for the rationale.
@@ -3664,8 +3664,8 @@ mod tests {
     /// (round-1 review, PR 803 H1). Block position, internal order and
     /// display order are three different orders here.
     #[test]
-    fn overlay_addr_funding_rows_are_in_txid_order_across_pending_and_flushed() {
-        use crate::index::address::{AddrFundingRowV3, scripthash_of};
+    fn overlay_addr_rows_are_in_txid_order_across_pending_and_flushed() {
+        use crate::index::address::{AddrFundingRowV3, AddrSpendingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
@@ -3678,25 +3678,40 @@ mod tests {
         assert!(txids[0].to_string() < txids[1].to_string());
         seed_ordinal_block(&cache, 7, 70, &txids);
 
+        // The spends' funding side, in an earlier block.
+        let funder = make_outpoint(0x60, 0).txid;
+        seed_ordinal_block(&cache, 3, 30, &[funder]);
+
         // Positions 0 and 2 are flushed; position 1 is pending.
+        let row_pair = |i: usize| {
+            (
+                AddrFundingRowV3 {
+                    scripthash: sh,
+                    txseq: 70 + i as u64,
+                    vout: 0,
+                    amount_sat: 1,
+                },
+                AddrSpendingRowV3 {
+                    scripthash: sh,
+                    txseq: 70 + i as u64,
+                    vin: 0,
+                    funding_txseq: 30,
+                    funding_vout: i as u32,
+                },
+            )
+        };
         let mut flushed = StoreBatch::default();
         for i in [0usize, 2] {
-            flushed.addr_funding_puts.push(AddrFundingRowV3 {
-                scripthash: sh,
-                txseq: 70 + i as u64,
-                vout: 0,
-                amount_sat: 1,
-            });
+            let (f, s) = row_pair(i);
+            flushed.addr_funding_puts.push(f);
+            flushed.addr_spending_puts.push(s);
         }
         cache.write_batch(flushed).unwrap();
         cache.flush_durable().unwrap();
         let mut pending = StoreBatch::default();
-        pending.addr_funding_puts.push(AddrFundingRowV3 {
-            scripthash: sh,
-            txseq: 71,
-            vout: 0,
-            amount_sat: 1,
-        });
+        let (f, s) = row_pair(1);
+        pending.addr_funding_puts.push(f);
+        pending.addr_spending_puts.push(s);
         pending
             .coin_puts
             .push((make_outpoint(0x61, 0), a_coin(7)));
@@ -3704,14 +3719,23 @@ mod tests {
 
         let mut expected = txids.to_vec();
         expected.sort();
-        let got: Vec<bitcoin::Txid> = cache
+        let funding: Vec<bitcoin::Txid> = cache
             .iter_addr_funding(&sh)
             .into_iter()
             .map(|(k, _)| k.txid)
             .collect();
         assert_eq!(
-            got, expected,
+            funding, expected,
             "overlay funding rows must be in (height, txid, vout) order by Txid::cmp"
+        );
+        let spending: Vec<bitcoin::Txid> = cache
+            .iter_addr_spending(&sh)
+            .into_iter()
+            .map(|(k, _)| k.txid)
+            .collect();
+        assert_eq!(
+            spending, expected,
+            "overlay spending rows must be in (height, txid, vin) order by Txid::cmp"
         );
     }
 

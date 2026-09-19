@@ -337,6 +337,10 @@ pub(crate) fn resolve_funding_rows_for(
 /// different blocks, so resolving them separately would double the
 /// reads for no benefit.
 ///
+/// "txid order" is `Txid::cmp`, as for the funding rows and for the same
+/// reason: the lockstep merge consumes both streams under one
+/// comparator, so they have to agree.
+///
 /// A row that does not resolve on either end is local corruption; see
 /// [`resolve_funding_rows_for`].
 pub(crate) fn resolve_spending_rows_for(
@@ -386,7 +390,7 @@ pub(crate) fn resolve_spending_rows_for(
         ));
     }
     out.sort_by(|(a, _), (b, _)| {
-        (a.height, a.txid.to_string(), a.vin).cmp(&(b.height, b.txid.to_string(), b.vin))
+        (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
     });
     out
 }

@@ -575,7 +575,7 @@ impl Store for InMemoryStore {
             ));
         }
         rows.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid.to_string(), a.vin).cmp(&(b.height, b.txid.to_string(), b.vin))
+            (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
         });
         rows
     }
