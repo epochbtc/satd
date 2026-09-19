@@ -327,7 +327,7 @@ impl AddressIndex for RocksAddressIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRow};
+    use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRowV3};
     use crate::storage::StoreBatch;
     use crate::storage::db::InMemoryStore;
 
@@ -807,9 +807,11 @@ mod tests {
         // 10 funding + 10 spending rows for the same scripthash.
         // With limit=12, the unfixed code would have returned ~20
         // (10 + 10 from each side); the fixed code truncates to 12.
-        let txs: Vec<(u32, bitcoin::Txid)> =
+        let mut txs: Vec<(u32, bitcoin::Txid)> =
             (0..10u32).map(|i| (i, fixture_txid(i as u8))).collect();
-        let seqs = seed_ordinals(&store_inner, &txs);
+        txs.extend((0..10u32).map(|i| (i + 100, fixture_txid(0x80 + i as u8))));
+        let all_seqs = seed_ordinals(&store_inner, &txs);
+        let (seqs, spend_seqs) = all_seqs.split_at(10);
         let mut batch = StoreBatch::default();
         for i in 0..10u32 {
             batch.addr_funding_puts.push(AddrFundingRowV3 {
@@ -818,15 +820,12 @@ mod tests {
                 vout: 0,
                 amount_sat: 100,
             });
-            batch.addr_spending_puts.push(AddrSpendingRow {
+            batch.addr_spending_puts.push(AddrSpendingRowV3 {
                 scripthash: sh,
-                height: i + 100,
-                txid: fixture_txid(0x80 + i as u8),
+                txseq: spend_seqs[i as usize],
                 vin: 0,
-                prev_outpoint: OutPoint {
-                    txid: fixture_txid(0xff),
-                    vout: i,
-                },
+                funding_txseq: seqs[0],
+                funding_vout: i,
             });
         }
         store_inner.write_batch(batch).unwrap();

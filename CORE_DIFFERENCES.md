@@ -101,7 +101,7 @@ expect Core's peer set to carry over.
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families
 (`block_index`, `coins`, `tx_loc`, `txseq_txid`, `txseq_block`,
-`addr_funding_v3`, `addr_spending_v2`, `block_filters`,
+`addr_funding_v3`, `addr_spending_v3`, `block_filters`,
 `block_filter_headers`, `cf_meta`, `spent`, `undo`, `tip`,
 `height_hash`). Index updates ride the same
 `WriteBatch` as the connect-block / disconnect-block path, so
@@ -186,11 +186,11 @@ Atomic with `connect_block` / `disconnect_block`. Default-on
 (`--addressindex=1`); auto-required by Esplora and Electrum. Mempool
 variant in-memory; subscription registry per-scripthash; deferred
 AssumeUTXO backfill via `backfillindex address`. Two RocksDB column
-families: `addr_funding_v3`, keyed by
-`(scripthash_prefix[16], txseq[5], vout[3])`, and `addr_spending_v2`,
-keyed by `(scripthash_prefix[16], height_be[4], txid[32], vin_be[4])`.
-`txseq` is a dense chain-order transaction ordinal; the store resolves
-it back to the height and txid before a row leaves it.
+families, `addr_funding_v3` and `addr_spending_v3`, keyed by
+`(scripthash_prefix[16], txseq[5], vout/vin[3])`. `txseq` is a dense
+chain-order transaction ordinal; the store resolves it back to the
+height and txid before a row leaves it, so the documented iteration
+order and every consumer above are unchanged.
 Source lives in `node-index/` and `node/src/index/address/`.
 
 Bitcoin Core deliberately stays out of address-indexing for scaling

@@ -9,11 +9,11 @@
 //! comes from the existing `RocksDBStore::write_batch_mode` path which
 //! commits all CFs in a single `rocksdb::WriteBatch`.
 
-use bitcoin::{OutPoint, TxOut, Txid};
+use bitcoin::TxOut;
 
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::keys::{
-    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, scripthash_of,
+    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKeyV3, AddrSpendingRowV3, scripthash_of,
 };
 use crate::storage::StoreBatch;
 use crate::storage::coinview::Coin;
@@ -49,30 +49,36 @@ pub fn emit_funding(
     // case the rows never reach disk.
 }
 
-/// Emit a spending row for input `vin` of `txid` at `height` consuming
-/// a previously-funded output. The spent `Coin` is the resolved input
-/// (from the UTXO cache, intra-block coins, or the store) — its
-/// `script_pubkey` is the scripthash source, and `prev_outpoint` is
-/// what the row will reference.
+/// Emit a spending row for input `vin` of the transaction with ordinal
+/// `txseq`, consuming output `funding_vout` of the transaction with
+/// ordinal `funding_txseq`. The spent `Coin` is the resolved input (from
+/// the UTXO cache, intra-block coins, or the store) — its
+/// `script_pubkey` is the scripthash source.
+///
+/// The caller resolves `funding_txseq` — it comes out of the spent coin
+/// on the hot path — and skips the call entirely when it cannot, rather
+/// than passing a placeholder. Ordinal 0 is the genesis coinbase's, so a
+/// placeholder would point the row at a real transaction.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_spending(
     batch: &mut StoreBatch,
     cfg: &AddressIndexConfig,
-    height: u32,
-    txid: Txid,
+    txseq: u64,
     vin: u32,
     spent: &Coin,
-    prev_outpoint: OutPoint,
+    funding_txseq: u64,
+    funding_vout: u32,
 ) {
     if !cfg.enabled {
         return;
     }
-    batch.addr_spending_puts.push(AddrSpendingRow {
+    batch.addr_spending_puts.push(AddrSpendingRowV3 {
         scripthash: scripthash_of(&spent.script_pubkey),
-        height,
-        txid,
+        txseq,
         vin,
-        prev_outpoint,
+        funding_txseq,
+        funding_vout,
     });
     // Counters are bumped at the commit boundary — see emit_funding.
 }
@@ -96,24 +102,21 @@ pub fn funding_remove_key(
     })
 }
 
-/// Build a spending-removal key for `(scripthash, height, txid, vin)`.
-/// Used by `disconnect_block` when reversing a connected block's
-/// spending rows.
+/// Build a spending-removal key for `(scripthash, txseq, vin)`. Used by
+/// `disconnect_block` when reversing a connected block's spending rows.
 #[inline]
 pub fn spending_remove_key(
     cfg: &AddressIndexConfig,
-    height: u32,
-    txid: Txid,
+    txseq: u64,
     vin: u32,
     spent: &Coin,
-) -> Option<AddrSpendingKey> {
+) -> Option<AddrSpendingKeyV3> {
     if !cfg.enabled {
         return None;
     }
-    Some(AddrSpendingKey {
+    Some(AddrSpendingKeyV3 {
         scripthash: scripthash_of(&spent.script_pubkey),
-        height,
-        txid,
+        txseq,
         vin,
     })
 }
