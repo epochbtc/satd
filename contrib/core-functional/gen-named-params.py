@@ -253,6 +253,20 @@ SATD_SLOT_ALIASES = {
     "sendrawtransaction": {1: "allowquarantined"},
 }
 
+# satd extensions that add a NEW trailing slot to a Core method. Core's own
+# arguments keep their positions, so a positional call written against Core is
+# unaffected; the satd argument sits past the last one Core declares.
+#
+# Distinct from SATD_SLOT_ALIASES, which names a slot Core already has. Use
+# that where satd reinterprets one of Core's arguments, and this where satd
+# adds one Core does not have at all.
+SATD_EXTRA_ARGS = {
+    # `psbt_version` selects a BIP 370 version 2 PSBT, which is what a silent
+    # payment recipient needs. Core has no version 2 at all, so there is no
+    # slot to share: it goes after `replaceable` and `version`.
+    "createpsbt": [["psbt_version", False]],
+}
+
 SATD_ONLY = {
     # satd-only RPCs that take arguments. Core has no row for these, so without
     # an entry here the table would give them `[]` and every named call would be
@@ -351,6 +365,13 @@ def build(bitcoin_dir, repo_root):
                 if idx >= len(row):
                     sys.exit(f"{m}: alias slot {idx} is beyond Core's arity")
                 row[idx][0] = f"{row[idx][0]}|{alias}"
+            for extra in SATD_EXTRA_ARGS.get(m, []):
+                if any(a[0] == extra[0] for a in row):
+                    sys.exit(
+                        f"{m}: extra argument {extra[0]!r} collides with one Core declares; "
+                        "use SATD_SLOT_ALIASES if satd is reinterpreting Core's slot"
+                    )
+                row.append(list(extra))
             table[m] = row
         else:
             # Neither Core nor SATD_ONLY knows this method. Defaulting to `[]`

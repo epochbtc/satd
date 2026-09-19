@@ -54,7 +54,7 @@ fn script_is_computed(map: &RawMap) -> bool {
 /// accessors, so that a malformed share or proof is *shown* to the operator
 /// rather than turning the whole call into a parse error. Diagnosing a PSBT
 /// is what this method is for.
-pub fn decode(raw: &RawPsbt) -> Result<Value, RpcError> {
+pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value, RpcError> {
     let view = V2View::new(raw).map_err(bad)?;
     let unit = default_unit();
 
@@ -177,6 +177,19 @@ pub fn decode(raw: &RawPsbt) -> Result<Value, RpcError> {
             if info.len() == 66 {
                 sp["scan_key"] = json!(hex::encode(&info[..33]));
                 sp["spend_key"] = json!(hex::encode(&info[33..]));
+                // The `sp1…` string the recipient handed the sender. It is
+                // not in the PSBT — only the two keys are — so an operator
+                // reading a PSBT has no other way to check that the recipient
+                // written down is the one they meant.
+                if let Some(network) = network
+                    && let (Ok(scan), Ok(spend)) = (
+                        bitcoin::secp256k1::PublicKey::from_slice(&info[..33]),
+                        bitcoin::secp256k1::PublicKey::from_slice(&info[33..]),
+                    )
+                {
+                    sp["address"] =
+                        json!(satd_psbt::SpAddress::new(scan, spend).encode(network));
+                }
             } else {
                 // Shown, not swallowed: an operator staring at a rejected
                 // PSBT needs to see which field is the wrong length.
@@ -339,6 +352,7 @@ pub fn fee(view: &V2View<'_>) -> Option<Amount> {
 /// `"verified": false` so that a client can tell "not checked" from "checked
 /// and fine". The two must never look the same.
 pub fn analyze(raw: &RawPsbt, chain_state: Option<&ChainState>) -> Result<Value, RpcError> {
+    let network = chain_state.map(|c| c.network);
     let view = V2View::new(raw).map_err(bad)?;
 
     let mut inputs = Vec::with_capacity(raw.inputs.len());
@@ -431,7 +445,7 @@ pub fn analyze(raw: &RawPsbt, chain_state: Option<&ChainState>) -> Result<Value,
                 if !report.extractable() && (next == "extractor" || next == "finalizer") {
                     out["next"] = json!("signer");
                 }
-                out["silent_payments"] = silent_payments_json(&view, &report);
+                out["silent_payments"] = silent_payments_json(&report, network);
             }
             Err(reason) => {
                 out["next"] = json!("updater");
@@ -466,7 +480,7 @@ pub fn verify_silent_payments(
 }
 
 /// The `silent_payments` object: what satd checked, and what it concluded.
-fn silent_payments_json(view: &V2View<'_>, report: &SpReport) -> Value {
+fn silent_payments_json(report: &SpReport, network: Option<bitcoin::Network>) -> Value {
     let inputs: Vec<Value> = report
         .inputs
         .iter()
@@ -500,6 +514,11 @@ fn silent_payments_json(view: &V2View<'_>, report: &SpReport) -> Value {
                 "status": output.status.as_str(),
                 "script": output.script_state.as_str(),
             });
+            if let Some(network) = network {
+                v["address"] = json!(
+                    satd_psbt::SpAddress::new(output.scan_key, output.spend_key).encode(network)
+                );
+            }
             if let Some(label) = output.label {
                 v["label"] = json!(label);
             }
@@ -528,7 +547,6 @@ fn silent_payments_json(view: &V2View<'_>, report: &SpReport) -> Value {
         })
         .collect();
 
-    let _ = view;
     json!({
         "verified": true,
         "eligible_inputs": report.eligible_inputs(),

@@ -2342,6 +2342,16 @@ pub async fn start(
             .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
         let locktime: Option<u32> = args.optional("locktime")?;
+        // Core's trailing pair. satd has never honoured either here, and this
+        // does not start: they are read only so that the satd argument after
+        // them lands in the slot a Core-shaped positional call leaves free.
+        let _replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
+        let _version: Option<serde_json::Value> = args.raw("version")?;
+        // satd extension: `psbt_version=2` emits a BIP 370 version 2 PSBT,
+        // which is what a silent payment recipient needs. It goes *after*
+        // Core's arguments so that a positional call written against Core
+        // keeps meaning what it meant.
+        let psbt_version: Option<u32> = args.optional("psbt_version")?;
         args.check()?;
         // Same duplicate-preserving read as `createrawtransaction`: Core
         // reaches one `ParseOutputs` from both, so both must see the same
@@ -2350,15 +2360,24 @@ pub async fn start(
             Some(pairs) => serde_json::Value::Array(pairs),
             None => outputs,
         };
-        psbt::create_psbt(&inputs, &outputs, locktime, ctx.chain_state.network)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        psbt::create_psbt(
+            &inputs,
+            &outputs,
+            locktime,
+            ctx.chain_state.network,
+            psbt_version,
+            Some(&ctx.chain_state),
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("decodepsbt", |params, _ctx, _extensions| {
+    module.register_method("decodepsbt", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let psbt_b64: String = args.required("psbt")?;
         args.check()?;
-        psbt::decode_psbt(&psbt_b64)
+        // The chain state is read only for the network, so that a silent
+        // payment output can be shown as the `sp1…` address it names.
+        psbt::decode_psbt(&psbt_b64, Some(&ctx.chain_state))
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

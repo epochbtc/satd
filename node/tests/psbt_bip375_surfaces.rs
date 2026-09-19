@@ -199,7 +199,7 @@ fn the_loss_checker_notices_a_lossy_codec() {
 #[test]
 fn bip375_survives_decodepsbt() {
     let (description, raw) = seeded("can finalize: two inputs single-signer using per-input");
-    let out = psbt::decode_psbt(&to_b64(&raw))
+    let out = psbt::decode_psbt(&to_b64(&raw), None)
         .unwrap_or_else(|e| panic!("{description}: decodepsbt failed: {e:?}"));
 
     assert_eq!(out["psbt_version"], 2);
@@ -264,7 +264,7 @@ fn bip375_survives_decodepsbt() {
 fn every_bip375_vector_decodes() {
     for group in ["valid", "invalid"] {
         for (description, bytes) in vectors(group) {
-            let out = psbt::decode_psbt(&B64.encode(&bytes))
+            let out = psbt::decode_psbt(&B64.encode(&bytes), None)
                 .unwrap_or_else(|e| panic!("{group} {description}: {e:?}"));
             assert_eq!(out["psbt_version"], 2, "{description}");
         }
@@ -603,18 +603,18 @@ fn finalizepsbt_refuses_an_uncomputed_silent_payment_script() {
 #[test]
 fn version_0_errors_are_unchanged() {
     assert_eq!(
-        psbt::decode_psbt("not base64 at all !!"),
+        psbt::decode_psbt("not base64 at all !!", None),
         Err((-22, "PSBT base64 decode failed".to_string()))
     );
     assert_eq!(
-        psbt::decode_psbt(&B64.encode(b"definitely not a psbt")),
+        psbt::decode_psbt(&B64.encode(b"definitely not a psbt"), None),
         Err((-22, "PSBT decode failed".to_string()))
     );
     // A PSBT that declares version 2 gets the reason appended, which is new
     // surface and so cannot break a version 0 client.
     let mut truncated = satd_psbt::keys::MAGIC.to_vec();
     truncated.extend_from_slice(&[0x01, 0xfb, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00]);
-    let err = psbt::decode_psbt(&B64.encode(&truncated)).expect_err("incomplete");
+    let err = psbt::decode_psbt(&B64.encode(&truncated), None).expect_err("incomplete");
     assert_eq!(err.0, -22);
     assert!(err.1.starts_with("PSBT decode failed: "), "got: {}", err.1);
 }

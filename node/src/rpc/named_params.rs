@@ -96,6 +96,20 @@ fn invalid(msg: String) -> ErrorObjectOwned {
 /// unknown parameter. `satd_slot_aliases_are_really_aliases` keeps this honest.
 const SATD_SLOT_ALIASES: &[&str] = &["allowquarantined"];
 
+/// satd arguments that Core's methods do not have at all, appended after
+/// Core's own so a positional call written against Core keeps its meaning.
+///
+/// Distinct from [`SATD_SLOT_ALIASES`], which names a slot Core already
+/// declares. The generator carries the same list (`SATD_EXTRA_ARGS` in
+/// `contrib/core-functional/gen-named-params.py`), and
+/// `satd_extra_args_are_trailing` keeps this side honest: an extra argument
+/// that is not last would sit in a slot a Core client is already using.
+///
+/// Only the test reads it — the table below is the shipped artefact, and this
+/// is the statement of what the table must satisfy.
+#[cfg(test)]
+const SATD_EXTRA_ARGS: &[(&str, &str)] = &[("createpsbt", "psbt_version")];
+
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
         "addconnection" => &[("address", false), ("connection_type", false), ("v2transport", false)],
@@ -107,7 +121,9 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "combinepsbt" => &[("txs", false)],
         "combinerawtransaction" => &[("txs", false)],
         "converttopsbt" => &[("hexstring", false), ("permitsigdata", false), ("iswitness", false)],
-        "createpsbt" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false)],
+        // SATD_ONLY trailing argument: `psbt_version`. It sits after Core's
+        // own, so a positional call written against Core is unaffected.
+        "createpsbt" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false), ("psbt_version", false)],
         "createrawtransaction" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false)],
         "decodepsbt" => &[("psbt", false)],
         "decoderawtransaction" => &[("hexstring", false), ("iswitness", false)],
@@ -670,6 +686,28 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A satd-only argument on a Core method must be the last one. Anywhere
+    /// else it would occupy a slot a positional call written against Core is
+    /// already using, so `createpsbt inputs outputs 0 true` would put Core's
+    /// `replaceable` into satd's argument and fail on its type.
+    #[test]
+    fn satd_extra_args_are_trailing() {
+        for (method, extra) in SATD_EXTRA_ARGS {
+            let row = arg_names(method)
+                .unwrap_or_else(|| panic!("{method} has no named-parameter row"));
+            assert_eq!(
+                row.last().map(|(name, _)| *name),
+                Some(*extra),
+                "{method}: {extra} must be the last argument"
+            );
+            assert_eq!(
+                row.iter().filter(|(name, _)| name == extra).count(),
+                1,
+                "{method}: {extra} appears more than once"
+            );
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

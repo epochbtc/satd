@@ -71,15 +71,28 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let input_slice = inputs.map(|v| v.as_slice()).unwrap_or(&[]);
-            psbt::create_psbt(input_slice, outputs, locktime, ctx.network)
-                .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
+            // `psbt_version=2` is what a silent payment recipient needs; the
+            // node refuses one without it rather than silently dropping it.
+            let psbt_version = params
+                .get("psbt_version")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            psbt::create_psbt(
+                input_slice,
+                outputs,
+                locktime,
+                ctx.network,
+                psbt_version,
+                Some(&ctx.chain_state),
+            )
+            .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "decode" => {
             let psbt_b64 = params
                 .get("psbt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            psbt::decode_psbt(psbt_b64)
+            psbt::decode_psbt(psbt_b64, Some(&ctx.chain_state))
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "analyze" => {

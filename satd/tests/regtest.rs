@@ -20121,3 +20121,369 @@ fn bip375_catches_a_prevout_that_disagrees_with_the_utxo_set() {
 
     node.stop();
 }
+
+/// `createpsbt` with a silent payment recipient, end to end on a real chain.
+///
+/// Same flow as `bip375_end_to_end_send_verify_and_scan`, but the PSBT comes
+/// from the node instead of being hand-built. The hand-built test stays: a
+/// verifier proven only against PSBTs the same codebase created has proven
+/// less than it looks.
+#[test]
+fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use common::sp_send::SpInput;
+    use satd_psbt::SpAddress;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x45u8; 32]);
+    let scan_secret = SecretKey::from_slice(&[0x27u8; 32]).expect("a scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x28u8; 32]).expect("a spend secret");
+    let address = SpAddress::new(scan_secret.public_key(&secp), spend_secret.public_key(&secp));
+    let sp1 = address.encode(bitcoin::Network::Regtest);
+    assert!(sp1.starts_with("tsp1"), "regtest uses the test prefix: {sp1}");
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    node.mine_blocks(101, &wallet.address.to_string());
+    let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
+    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+
+    let inputs = json!([{ "txid": cb_txid.to_string(), "vout": 0 }]);
+    // The array form, not the object form: a JSON object's key order is the
+    // serialiser's business, and the output order is what decides both the
+    // transaction and each silent payment output's `k`.
+    let outputs = json!([
+        { sp1.clone(): 25.0 },
+        { wallet.address.to_string(): 24.9999 },
+    ]);
+
+    // Without an explicit version the node refuses, by name, rather than
+    // building a version 0 PSBT that quietly cannot carry the recipient.
+    let refused = node
+        .rpc_call_with_params("createpsbt", vec![inputs.clone(), outputs.clone()])
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -8, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("psbt_version=2"),
+        "the refusal should say what to pass: {refused}"
+    );
+
+    // And `createrawtransaction` says why a raw transaction cannot pay one.
+    let refused = node
+        .rpc_call_with_params("createrawtransaction", vec![inputs.clone(), outputs.clone()])
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -5, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("silent payment address"),
+        "{refused}"
+    );
+
+    let created = node.rpc_ok(
+        "createpsbt",
+        vec![inputs, outputs, json!(0), json!(null), json!(null), json!(2)],
+    );
+    let b64 = created.as_str().expect("a base64 PSBT").to_string();
+
+    // The node shows the recipient back as the address that was asked for,
+    // which is the only way an operator can check it against what they were
+    // given: the PSBT itself carries only the two keys.
+    let decoded = node.rpc_ok("decodepsbt", vec![json!(b64.clone())]);
+    assert_eq!(decoded["psbt_version"], 2, "{decoded}");
+    assert_eq!(decoded["outputs"][0]["silent_payment"]["address"], json!(sp1), "{decoded}");
+    assert!(
+        decoded["outputs"][0]["script"].is_null(),
+        "a silent payment output has no script until a Signer computes one: {decoded}"
+    );
+    assert_eq!(decoded["inputs_modifiable"], true, "{decoded}");
+    assert_eq!(decoded["outputs_modifiable"], true, "{decoded}");
+
+    // The rest is the ordinary flow.
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64)]);
+    let mut psbt = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(updated.as_str().expect("base64"))
+            .expect("base64"),
+    )
+    .expect("a PSBT");
+
+    let sp_inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    common::sp_send::fill_bip375(&secp, &mut psbt, &sp_inputs, [0x3au8; 32]).expect("fills");
+    common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
+    let signed = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+
+    let analyzed = node.rpc_ok("analyzepsbt", vec![json!(signed.clone())]);
+    assert_eq!(analyzed["silent_payments"]["outputs"][0]["status"], "ready", "{analyzed}");
+    assert_eq!(analyzed["silent_payments"]["outputs"][0]["script"], "matches", "{analyzed}");
+    assert_eq!(analyzed["silent_payments"]["outputs"][0]["address"], json!(sp1), "{analyzed}");
+
+    let finalized = node.rpc_ok("finalizepsbt", vec![json!(signed)]);
+    assert_eq!(finalized["complete"], true, "{finalized}");
+    let txid = node.rpc_ok(
+        "sendrawtransaction",
+        vec![json!(finalized["hex"].as_str().expect("a transaction"))],
+    );
+    let txid = txid.as_str().expect("a txid").to_string();
+    node.mine_blocks(1, &wallet.address.to_string());
+
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+    let data = node.rpc_ok(
+        "getsilentpaymentblockdata",
+        vec![json!(tip.as_str().expect("a hash")), json!(1)],
+    );
+    assert!(
+        data["tweaks"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .any(|t| t["txid"] == json!(txid)),
+        "{data}"
+    );
+
+    node.stop();
+}
+
+/// Paying one recipient twice in one transaction is legal — the two outputs
+/// get `k = 0` and `k = 1` — so a repeated `sp1…` key must survive the
+/// duplicate detection that an ordinary repeated address trips.
+#[test]
+fn createpsbt_allows_a_repeated_silent_payment_address() {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use satd_psbt::SpAddress;
+    use serde_json::json;
+
+    let secp = Secp256k1::new();
+    let address = SpAddress::new(
+        SecretKey::from_slice(&[0x29u8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x2au8; 32]).unwrap().public_key(&secp),
+    );
+    let sp1 = address.encode(bitcoin::Network::Regtest);
+    let ordinary = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let mut node = TestNode::start(&[]);
+    let inputs = json!([{ "txid": "00".repeat(32), "vout": 0 }]);
+
+    // Two payments to the same silent payment address: accepted, and each
+    // keeps its own amount.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"createpsbt","params":[{inputs},{{"{sp1}":0.01,"{sp1}":0.02}},0,null,null,2]}}"#
+    );
+    let created = node.rpc_call_raw_body(&body).expect("a response");
+    assert!(created["error"].is_null(), "{created}");
+    let raw = satd_psbt::RawPsbt::parse(
+        &{
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(created["result"].as_str().expect("a base64 PSBT"))
+                .expect("base64")
+        },
+    )
+    .expect("a PSBT");
+    assert_eq!(raw.outputs.len(), 2, "both payments are present");
+    let amounts: Vec<i64> = raw
+        .outputs
+        .iter()
+        .map(|o| {
+            let raw = o.get_single(satd_psbt::keys::output::AMOUNT).expect("an amount");
+            i64::from_le_bytes(raw.try_into().expect("8 bytes"))
+        })
+        .collect();
+    assert_eq!(amounts, vec![1_000_000, 2_000_000], "each keeps its own amount");
+
+    // An ordinary address repeated is still Core's "duplicated address".
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"createpsbt","params":[{inputs},{{"{ordinary}":0.01,"{ordinary}":0.02}},0,null,null,2]}}"#
+    );
+    let refused = node.rpc_call_raw_body(&body).expect("a response");
+    assert_eq!(refused["error"]["code"], -8, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("duplicate"),
+        "{refused}"
+    );
+
+    node.stop();
+}
+
+/// The version 0 path must not have moved: without `psbt_version`, and with
+/// no silent payment recipient, `createpsbt` answers exactly as before.
+#[test]
+fn createpsbt_without_psbt_version_is_unchanged() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let inputs = json!([{ "txid": "00".repeat(32), "vout": 0 }]);
+    let outputs = json!({ "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01 });
+
+    let bare = node.rpc_ok("createpsbt", vec![inputs.clone(), outputs.clone()]);
+    let explicit_zero = node.rpc_ok(
+        "createpsbt",
+        vec![inputs.clone(), outputs.clone(), json!(0), json!(null), json!(null), json!(0)],
+    );
+    assert_eq!(bare, explicit_zero, "psbt_version=0 is the default");
+
+    // And Core's own trailing arguments still land where Core puts them: a
+    // positional `replaceable` must not be read as the satd extension.
+    let with_core_args = node.rpc_ok(
+        "createpsbt",
+        vec![inputs.clone(), outputs.clone(), json!(0), json!(true), json!(2)],
+    );
+    assert_eq!(with_core_args, bare, "{with_core_args}");
+
+    // The named form reaches the same slot.
+    let named = node
+        .rpc_call_with_named_params(
+            "createpsbt",
+            json!({ "inputs": inputs, "outputs": outputs, "psbt_version": 2 }),
+        )
+        .expect("a response");
+    let v2 = named["result"].as_str().expect("a base64 PSBT");
+    assert_eq!(
+        satd_psbt::version_of_bytes(&{
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(v2).expect("base64")
+        })
+        .expect("a version"),
+        satd_psbt::PsbtVersion::V2
+    );
+
+    node.stop();
+}
+
+/// BIP 352 forbids a segwit version 2 or later input anywhere in a transaction
+/// paying a silent payment address: there is no defined way for such an input
+/// to contribute a public key. The node refuses at creation, against previous
+/// outputs it actually has, rather than letting the caller find out when the
+/// extractor says no.
+#[test]
+fn createpsbt_refuses_a_segwit_v2_input_with_a_silent_payment_recipient() {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use satd_psbt::SpAddress;
+    use serde_json::json;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x46u8; 32]);
+    let address = SpAddress::new(
+        SecretKey::from_slice(&[0x2bu8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x2cu8; 32]).unwrap().public_key(&secp),
+    );
+    let sp1 = address.encode(bitcoin::Network::Regtest);
+
+    let mut node = TestNode::start(&[]);
+    node.mine_blocks(101, &wallet.address.to_string());
+
+    // Create a segwit v2 output and mine it, so the node has one to look up.
+    let v2_script = bitcoin::ScriptBuf::from_hex("5220000000000000000000000000000000000000000000000000000000000000dead")
+        .expect("a segwit v2 script");
+    let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbase(
+        &node,
+        &wallet,
+        1,
+        v2_script,
+        10_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw)]);
+    node.mine_blocks(1, &wallet.address.to_string());
+
+    let inputs = json!([{ "txid": txid, "vout": 0 }]);
+    let outputs = json!({ sp1: 0.01 });
+    let refused = node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![inputs.clone(), outputs.clone(), json!(0), json!(null), json!(null), json!(2)],
+        )
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -8, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("segwit version 2"),
+        "{refused}"
+    );
+
+    // The same input paying an ordinary address is fine: the restriction is
+    // BIP 352's, not a blanket refusal of segwit v2.
+    let ordinary = json!({ "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01 });
+    let created = node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![inputs, ordinary, json!(0), json!(null), json!(null), json!(2)],
+        )
+        .expect("a response");
+    assert!(created["error"].is_null(), "{created}");
+
+    node.stop();
+}
+
+/// An address for the wrong network, and a version this node cannot pay, are
+/// each refused by name.
+#[test]
+fn createpsbt_refuses_an_address_it_cannot_pay() {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use satd_psbt::SpAddress;
+    use serde_json::json;
+
+    let secp = Secp256k1::new();
+    let address = SpAddress::new(
+        SecretKey::from_slice(&[0x2du8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x2eu8; 32]).unwrap().public_key(&secp),
+    );
+
+    let mut node = TestNode::start(&[]);
+    let inputs = json!([{ "txid": "00".repeat(32), "vout": 0 }]);
+
+    // A mainnet address on a regtest node reads as an ordinary bad address,
+    // since `sp1…` is not this network's prefix at all.
+    let mainnet = address.encode(bitcoin::Network::Bitcoin);
+    let refused = node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![
+                inputs.clone(),
+                json!({ mainnet: 0.01 }),
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(2),
+            ],
+        )
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -5, "{refused}");
+
+    // A future address version: the prefix matches, so this node recognises it
+    // and says what it cannot do rather than calling it invalid.
+    let future = SpAddress { version: 1, ..address }.encode(bitcoin::Network::Regtest);
+    let refused = node
+        .rpc_call_with_params(
+            "createpsbt",
+            vec![
+                inputs,
+                json!({ future: 0.01 }),
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(2),
+            ],
+        )
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -5, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("version 1"),
+        "{refused}"
+    );
+
+    node.stop();
+}

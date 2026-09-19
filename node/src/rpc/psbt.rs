@@ -71,6 +71,8 @@ pub fn create_psbt(
     outputs: &Value,
     locktime: Option<u32>,
     network: bitcoin::Network,
+    psbt_version: Option<u32>,
+    chain_state: Option<&ChainState>,
 ) -> Result<Value, (i32, String)> {
     // Build the unsigned transaction (same logic as createrawtransaction)
     let mut tx_inputs = Vec::new();
@@ -95,11 +97,53 @@ pub fn create_psbt(
         });
     }
 
-    let tx_outputs = crate::rpc::rawtx::parse_outputs(outputs, network)?;
+    let parsed = parse_psbt_outputs(outputs, network)?;
+    let has_silent_payments = parsed
+        .iter()
+        .any(|o| matches!(o, PsbtOutput::SilentPayment { .. }));
+
+    match psbt_version {
+        // D5: a caller whose signer cannot read version 2 should learn that at
+        // creation, not at signing. Refusing by name is how.
+        None | Some(0) => {
+            if has_silent_payments {
+                return Err((
+                    -8,
+                    "silent payment recipients need a version 2 PSBT; pass psbt_version=2"
+                        .to_string(),
+                ));
+            }
+        }
+        Some(2) => {}
+        Some(other) => {
+            return Err((
+                -8,
+                format!("psbt_version must be 0 or 2, not {other}"),
+            ));
+        }
+    }
 
     let lt = locktime
         .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)
         .unwrap_or(bitcoin::blockdata::locktime::absolute::LockTime::ZERO);
+
+    if psbt_version == Some(2) {
+        if has_silent_payments {
+            refuse_ineligible_inputs(&tx_inputs, chain_state)?;
+        }
+        let raw = build_v2_psbt(&tx_inputs, &parsed, lt)?;
+        return Ok(Value::String(raw_to_base64(&raw)));
+    }
+
+    let tx_outputs: Vec<TxOut> = parsed
+        .into_iter()
+        .map(|o| match o {
+            PsbtOutput::Ordinary(txout) => txout,
+            PsbtOutput::SilentPayment { .. } => {
+                unreachable!("refused above when the version is not 2")
+            }
+        })
+        .collect();
 
     let tx = Transaction {
         version: Version(2),
@@ -113,11 +157,228 @@ pub fn create_psbt(
     Ok(Value::String(psbt_to_base64(&psbt)))
 }
 
+/// One requested output: an ordinary script, or a silent payment recipient
+/// that has no script yet and will not have one until a Signer computes it.
+enum PsbtOutput {
+    Ordinary(TxOut),
+    SilentPayment {
+        amount: Amount,
+        address: satd_psbt::SpAddress,
+    },
+}
+
+/// `createpsbt`'s outputs, with silent payment recipients split out.
+///
+/// `createrawtransaction` shares `parse_outputs` with `createpsbt` and must
+/// keep refusing an `sp1…` key: a raw transaction has nowhere to put the
+/// information a Signer needs. So the silent payment keys are peeled off here,
+/// in `createpsbt`'s own wrapper, and everything else goes to the shared
+/// parser one entry at a time — the same parser, the same errors.
+fn parse_psbt_outputs(
+    outputs: &Value,
+    network: bitcoin::Network,
+) -> Result<Vec<PsbtOutput>, (i32, String)> {
+    use satd_psbt::SpAddress;
+
+    let mut pairs = crate::rpc::rawtx::normalize_output_pairs(outputs)?;
+
+    // Core's first-value-wins rule exists because of how `UniValue` reads a
+    // repeated key, and it applies to the keys Core knows about. A repeated
+    // silent payment address is *legal* — two payments to one recipient get
+    // k = 0 and k = 1 — so each occurrence has to keep its own amount.
+    let (sp_pairs, mut ordinary): (Vec<_>, Vec<_>) = pairs
+        .drain(..)
+        .partition(|(key, _)| SpAddress::looks_like(key, network));
+    crate::rpc::rawtx::apply_first_value_wins(&mut ordinary);
+
+    // Rebuild the original order: the output order decides the transaction,
+    // and for silent payments it decides the `k` values too.
+    let mut ordinary = ordinary.into_iter();
+    let mut sp_pairs = sp_pairs.into_iter();
+    let original = crate::rpc::rawtx::normalize_output_pairs(outputs)?;
+
+    let mut out = Vec::with_capacity(original.len());
+    let mut seen_destinations: std::collections::HashSet<bitcoin::ScriptBuf> =
+        std::collections::HashSet::new();
+    let mut seen_data = false;
+
+    for (key, _) in original {
+        if SpAddress::looks_like(&key, network) {
+            let (key, val) = sp_pairs.next().expect("partition preserved the count");
+            let address = SpAddress::decode(&key, network)
+                .map_err(|e| (-5, format!("Invalid silent payment address: {e}")))?;
+            // A version above 0 carries something satd does not understand;
+            // paying it by reading only the first two keys would be a guess.
+            address
+                .require_v0()
+                .map_err(|e| (-5, format!("Invalid silent payment address: {e}")))?;
+            let amount = crate::rpc::rawtx::parse_btc_amount_value(&val)?;
+            out.push(PsbtOutput::SilentPayment { amount, address });
+        } else {
+            let (key, val) = ordinary.next().expect("partition preserved the count");
+            let mut built = Vec::new();
+            crate::rpc::rawtx::parse_output_entry(
+                &key,
+                &val,
+                network,
+                &mut built,
+                &mut seen_destinations,
+                &mut seen_data,
+            )?;
+            out.extend(built.into_iter().map(PsbtOutput::Ordinary));
+        }
+    }
+    Ok(out)
+}
+
+/// BIP 352 forbids a segwit version 2 or later input anywhere in a transaction
+/// that pays a silent payment address: there is no defined way for such an
+/// input to contribute a public key, so the shared secret cannot be computed.
+///
+/// Checked here, at creation, against previous outputs the node actually has —
+/// a caller learns before it starts collecting signatures rather than when the
+/// extractor refuses.
+fn refuse_ineligible_inputs(
+    inputs: &[TxIn],
+    chain_state: Option<&ChainState>,
+) -> Result<(), (i32, String)> {
+    let Some(chain_state) = chain_state else {
+        return Ok(());
+    };
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(coin) = chain_state.get_coin(&input.previous_output) else {
+            continue;
+        };
+        if let Some(version) = coin.script_pubkey.witness_version()
+            && version > bitcoin::WitnessVersion::V1
+        {
+            return Err((
+                -8,
+                format!(
+                    "input {index} spends a segwit version {} output, which cannot contribute \
+                     to a silent payment",
+                    version.to_num()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Assemble a version 2 PSBT from the requested inputs and outputs.
+///
+/// A silent payment output gets an amount and a `PSBT_OUT_SP_V0_INFO` and
+/// **no** `PSBT_OUT_SCRIPT`: BIP 375 gives computing it to the Signer, because
+/// computing it is what freezes the transaction. `PSBT_GLOBAL_TX_MODIFIABLE`
+/// says so — both inputs and outputs are still modifiable until then.
+fn build_v2_psbt(
+    inputs: &[TxIn],
+    outputs: &[PsbtOutput],
+    lock_time: bitcoin::absolute::LockTime,
+) -> Result<satd_psbt::RawPsbt, (i32, String)> {
+    use satd_psbt::keys;
+    use satd_psbt::raw::{RawMap, RawPair, RawPsbt, write_compact_size};
+
+    let mut global = RawMap::new();
+    global.set(RawPair::new(
+        keys::global::VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(
+        keys::global::TX_VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(
+        keys::global::FALLBACK_LOCKTIME,
+        Vec::new(),
+        lock_time.to_consensus_u32().to_le_bytes().to_vec(),
+    ));
+    let mut count = Vec::new();
+    write_compact_size(&mut count, inputs.len() as u64);
+    global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
+    let mut count = Vec::new();
+    write_compact_size(&mut count, outputs.len() as u64);
+    global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
+    global.set(RawPair::new(
+        keys::global::TX_MODIFIABLE,
+        Vec::new(),
+        vec![keys::modifiable::INPUTS | keys::modifiable::OUTPUTS],
+    ));
+
+    let raw_inputs = inputs
+        .iter()
+        .map(|input| {
+            let mut map = RawMap::new();
+            map.set(RawPair::new(
+                keys::input::PREVIOUS_TXID,
+                Vec::new(),
+                bitcoin::consensus::serialize(&input.previous_output.txid),
+            ));
+            map.set(RawPair::new(
+                keys::input::OUTPUT_INDEX,
+                Vec::new(),
+                input.previous_output.vout.to_le_bytes().to_vec(),
+            ));
+            map.set(RawPair::new(
+                keys::input::SEQUENCE,
+                Vec::new(),
+                input.sequence.0.to_le_bytes().to_vec(),
+            ));
+            map
+        })
+        .collect();
+
+    let mut raw_outputs = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let mut map = RawMap::new();
+        match output {
+            PsbtOutput::Ordinary(txout) => {
+                map.set(RawPair::new(
+                    keys::output::AMOUNT,
+                    Vec::new(),
+                    (txout.value.to_sat() as i64).to_le_bytes().to_vec(),
+                ));
+                map.set(RawPair::new(
+                    keys::output::SCRIPT,
+                    Vec::new(),
+                    txout.script_pubkey.to_bytes(),
+                ));
+            }
+            PsbtOutput::SilentPayment { amount, address } => {
+                map.set(RawPair::new(
+                    keys::output::AMOUNT,
+                    Vec::new(),
+                    (amount.to_sat() as i64).to_le_bytes().to_vec(),
+                ));
+                map.set(RawPair::new(
+                    keys::output::SP_V0_INFO,
+                    Vec::new(),
+                    address.to_info(),
+                ));
+            }
+        }
+        raw_outputs.push(map);
+    }
+
+    Ok(RawPsbt {
+        global,
+        inputs: raw_inputs,
+        outputs: raw_outputs,
+    })
+}
+
 /// `decodepsbt` — decode a base64-encoded PSBT to JSON.
-pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
+/// `chain_state` is used only to spell a silent payment output's address for
+/// the network this node is on. The version 0 path ignores it.
+pub fn decode_psbt(
+    psbt_b64: &str,
+    chain_state: Option<&ChainState>,
+) -> Result<Value, (i32, String)> {
     match parse_any(psbt_b64)? {
         Parsed::V0(psbt) => decode_psbt_v0(&psbt),
-        Parsed::V2(raw) => psbt_v2::decode(&raw),
+        Parsed::V2(raw) => psbt_v2::decode(&raw, chain_state.map(|c| c.network)),
     }
 }
 

@@ -79,7 +79,7 @@ fn take_snapshot() -> Value {
     };
 
     for (name, b64) in fixtures() {
-        record(&format!("decodepsbt/{name}"), psbt::decode_psbt(&b64));
+        record(&format!("decodepsbt/{name}"), psbt::decode_psbt(&b64, None));
         record(&format!("analyzepsbt/{name}"), psbt::analyze_psbt(&b64, None));
         record(
             &format!("finalizepsbt-extract/{name}"),
@@ -107,6 +107,8 @@ fn take_snapshot() -> Value {
             &json!({ "bcrt1qcsc0vnz82md33pk7351p2h9au5ejvfevzfnp5r": 0.001 }),
             None,
             Network::Regtest,
+            None,
+            None,
         ),
     );
     record(
@@ -116,6 +118,8 @@ fn take_snapshot() -> Value {
             &json!({ "not an address": 0.001 }),
             None,
             Network::Regtest,
+            None,
+            None,
         ),
     );
     let raw_tx = hex::encode(bitcoin::consensus::serialize(&unsigned_tx()));
@@ -123,10 +127,10 @@ fn take_snapshot() -> Value {
     record("converttopsbt/not-hex", psbt::convert_to_psbt("zz", false, None));
 
     // Error paths shared by every method that takes a PSBT.
-    record("decodepsbt/not-base64", psbt::decode_psbt("!!!"));
+    record("decodepsbt/not-base64", psbt::decode_psbt("!!!", None));
     record(
         "decodepsbt/not-a-psbt",
-        psbt::decode_psbt(&B64.encode(b"nope")),
+        psbt::decode_psbt(&B64.encode(b"nope"), None),
     );
     record("combinepsbt/empty", psbt::combine_psbt(&[]));
     record("joinpsbts/empty", psbt::join_psbts(&[]));

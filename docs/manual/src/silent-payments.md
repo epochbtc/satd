@@ -399,12 +399,16 @@ wrong script cannot be recovered.
 
 ### The flow
 
-satd does not create the PSBT — it has no wallet and no coin selection — but
-every other step is a node call.
+satd has no wallet and no coin selection, so choosing which coins to spend is
+still the caller's. Everything else is a node call.
 
 ```sh
-# 1. A wallet builds a version 2 PSBT naming the recipient's silent payment
-#    code, with no output script for it yet.
+# 1. Build a version 2 PSBT naming the recipient. The `sp1…` key needs
+#    psbt_version=2; without it the node refuses and says so.
+sat-cli createpsbt \
+  '[{"txid":"…","vout":0}]' \
+  '[{"sp1q…":0.25},{"bc1q…":0.2499}]' \
+  0 null null 2
 
 # 2. The node fills in the previous outputs it knows about.
 sat-cli utxoupdatepsbt "$PSBT"
@@ -430,6 +434,7 @@ Signer is the sending wallet.
 
 ### What satd will not do
 
+- It will not choose which coins to spend. There is no wallet here.
 - It will not hold a scan or spend key, or a label.
 - It will not compute `PSBT_OUT_SCRIPT` for you. BIP 375 gives that to the
   Signer, along with clearing the modifiable flags, because computing it is

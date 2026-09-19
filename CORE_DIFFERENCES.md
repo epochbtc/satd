@@ -534,6 +534,15 @@ preserved; the satd extension is opt-in per request or per flag.
   accepts either and reports which it used; an assignment that is
   neither is refused.
 
+  `createpsbt` takes a trailing satd-only `psbt_version` (0 default, 2),
+  which is what accepts an `sp1…` output key. It sits after Core's own
+  `replaceable` and `version` arguments, so a positional call written
+  against Core is unaffected, and a silent payment recipient without it
+  is refused by name rather than dropped. A repeated `sp1…` key is
+  allowed — two payments to one recipient get `k = 0` and `k = 1` —
+  unlike a repeated ordinary address, which stays Core's "duplicated
+  address". `createrawtransaction` refuses an `sp1…` key and says why.
+
   Verification work is capped. `analyzepsbt` is a read-capability
   method, and proof checks are (eligible inputs) × (scan keys with a
   per-input share), so a PSBT inside the 20 MiB request limit could
