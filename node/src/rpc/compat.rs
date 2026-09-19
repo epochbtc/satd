@@ -54,7 +54,55 @@ use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 /// body before the limit could reject it. An over-limit request is
 /// answered with `413 Payload Too Large`, the same outcome jsonrpsee gives
 /// for a request exceeding its own `max_request_body_size`.
-const MAX_NORMALIZE_BODY: usize = crate::rpc::RPC_MAX_BODY_SIZE;
+const MAX_NORMALIZE_REQUEST_BODY: usize = crate::rpc::RPC_MAX_BODY_SIZE;
+
+/// Largest reply this layer will DOM-parse — to map an error's HTTP status,
+/// or to rewrite the envelope down to JSON-RPC 1.0.
+///
+/// Deliberately **not**
+/// [`RPC_MAX_RESPONSE_SIZE`](crate::rpc::RPC_MAX_RESPONSE_SIZE). That bound
+/// is what the node will *serve*; this one is what this layer will *parse*,
+/// and a DOM parse costs several times the body's size in live allocations.
+/// Tying the two together would mean a 256 MiB reply triggering a parse
+/// measured in gigabytes, which is the memory-DoS this middleware is
+/// otherwise careful to avoid.
+///
+/// A reply above this is forwarded in jsonrpsee's 2.0 shape instead: the
+/// answer is correct JSON, only its envelope is 2.0, and that beats
+/// truncating or refusing it. Before #723 split the caps this was
+/// unreachable — the engine refused any reply over 20 MiB before it got
+/// here — so the branch below is newly live.
+const MAX_NORMALIZE_RESPONSE_BODY: usize = 20 * 1024 * 1024;
+
+/// The caps are different numbers for different reasons, and re-coupling them
+/// would silently restore the bug this split fixes: a request-shaped budget
+/// policing replies whose size is set by the chain and the mempool. Checked at
+/// compile time, so it holds in every build rather than only under test.
+const _: () = {
+    assert!(
+        crate::rpc::RPC_MAX_RESPONSE_SIZE > crate::rpc::RPC_MAX_BODY_SIZE,
+        "a reply may legitimately dwarf the request that asked for it"
+    );
+    // The DOM-parse guard must stay well under what the engine will serve:
+    // parsing costs several times the body in live allocations.
+    assert!(
+        MAX_NORMALIZE_RESPONSE_BODY < crate::rpc::RPC_MAX_RESPONSE_SIZE,
+        "the parse guard is not the transport cap"
+    );
+    // The batch builders must work to what the inner service will serve, or
+    // they refuse batches it would have answered.
+    assert!(
+        crate::rpc::readonly::RESPONSE_BODY_LIMIT == crate::rpc::RPC_MAX_RESPONSE_SIZE,
+        "the read-only batch builder tracks the response cap"
+    );
+};
+
+/// Whether a reply is too large for this layer to DOM-parse, and must be
+/// forwarded in jsonrpsee's 2.0 shape instead. See
+/// [`MAX_NORMALIZE_RESPONSE_BODY`].
+fn too_large_to_normalise(len: usize) -> bool {
+    len > MAX_NORMALIZE_RESPONSE_BODY
+}
 
 /// Bitcoin Core's libevent `MAX_HEADERS_SIZE` — URIs longer than this
 /// produce `400 Bad Request`.
@@ -84,7 +132,7 @@ pub(crate) fn plan_request(body: &[u8]) -> RequestPlan {
     // The body is already size-bounded by the caller (Content-Length
     // pre-check + `Limited` read), so this only guards the empty case;
     // the length check is kept as defense-in-depth.
-    if body.is_empty() || body.len() > MAX_NORMALIZE_BODY {
+    if body.is_empty() || body.len() > MAX_NORMALIZE_REQUEST_BODY {
         return RequestPlan::default();
     }
     // Each request object is read as a list of *raw* member text, not as a
@@ -697,13 +745,13 @@ where
                 .get(hyper::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<usize>().ok())
-                && len > MAX_NORMALIZE_BODY
+                && len > MAX_NORMALIZE_REQUEST_BODY
             {
                 return Ok(payload_too_large());
             }
 
             // Bound the actual read: `Limited` returns an error once more
-            // than `MAX_NORMALIZE_BODY` bytes arrive, so a chunked /
+            // than `MAX_NORMALIZE_REQUEST_BODY` bytes arrive, so a chunked /
             // length-omitting body cannot force unbounded allocation
             // either. On the length-limit error answer 413; any other
             // (transport) error yields an empty body so the inner service
@@ -716,7 +764,7 @@ where
             // then withholds the body holds a connection and a task open
             // indefinitely. Core's libevent timeout covers head and body with
             // one bufferevent read timeout.
-            let collect = Limited::new(body, MAX_NORMALIZE_BODY).collect();
+            let collect = Limited::new(body, MAX_NORMALIZE_REQUEST_BODY).collect();
             let collected = match with_optional_timeout(body_timeout, collect).await {
                 Some(Ok(buf)) => buf.to_bytes(),
                 Some(Err(e))
@@ -791,7 +839,7 @@ where
             // normalisation below does: a reply that large is a result, not
             // an error object, and parsing it here would be the DOM parse the
             // cap exists to avoid.
-            let oversized = resp_bytes.len() > MAX_NORMALIZE_BODY;
+            let oversized = too_large_to_normalise(resp_bytes.len());
             if !oversized
                 && let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0)
             {
@@ -803,15 +851,15 @@ where
             let out_body = if client_spoke_2_0 {
                 resp_bytes.to_vec()
             } else if oversized {
-                // Unreachable today, and deliberately kept: jsonrpsee is
-                // configured with the same 20 MiB cap on the response side
-                // (`max_response_body_size`, `server.rs`), and replaces any
-                // reply larger than that with `-32008 Response is too big`
-                // while serialising the envelope — so nothing over the cap
-                // ever reaches this layer. Lifting that cap is #723; this
-                // branch is what the compat layer will do when it can be
-                // reached, and is why the note in the 0.5.2 release notes
-                // describes the engine's refusal rather than this forward.
+                // Reachable since the request and response caps were split
+                // (#723). It was not before: jsonrpsee enforced the same
+                // 20 MiB on the response side and replaced any larger reply
+                // with `-32008 Response is too big` while serialising the
+                // envelope, so nothing over the cap ever arrived here. The
+                // engine now serves up to `RPC_MAX_RESPONSE_SIZE`, while
+                // this layer still refuses to DOM-parse past
+                // `MAX_NORMALIZE_RESPONSE_BODY` — the gap between the two is
+                // exactly this branch.
                 //
                 // Normalisation DOM-parses the body to touch three top-level
                 // keys, which costs several times its size again. A reply
@@ -925,7 +973,7 @@ fn request_timeout() -> HttpResponse<HttpBody> {
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding
-/// [`MAX_NORMALIZE_BODY`], matching jsonrpsee's own oversized-request
+/// [`MAX_NORMALIZE_REQUEST_BODY`], matching jsonrpsee's own oversized-request
 /// outcome.
 fn payload_too_large() -> HttpResponse<HttpBody> {
     hyper::Response::builder()
@@ -1377,4 +1425,17 @@ mod tests {
         assert!(text.contains(r#"{"a":1,"a":2}"#), "{text}");
     }
 
+
+    /// The forward-instead-of-normalise branch, which was dead code until the
+    /// caps were split — the engine refused anything that could reach it.
+    #[test]
+    fn a_reply_past_the_parse_guard_is_forwarded_not_normalised() {
+        assert!(!too_large_to_normalise(0));
+        assert!(!too_large_to_normalise(MAX_NORMALIZE_RESPONSE_BODY));
+        assert!(too_large_to_normalise(MAX_NORMALIZE_RESPONSE_BODY + 1));
+        // The case this is really about: a verbose mempool reply on a busy
+        // node is served by the engine now, and lands in the forward branch
+        // rather than being DOM-parsed.
+        assert!(too_large_to_normalise(85 * 1024 * 1024));
+    }
 }

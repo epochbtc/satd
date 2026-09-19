@@ -4004,7 +4004,7 @@ pub async fn start(
     let server_cfg = ServerConfig::builder()
         .max_connections(RPC_MAX_CONNECTIONS)
         .max_request_body_size(crate::rpc::RPC_MAX_BODY_SIZE as u32)
-        .max_response_body_size(crate::rpc::RPC_MAX_BODY_SIZE as u32)
+        .max_response_body_size(crate::rpc::RPC_MAX_RESPONSE_SIZE as u32)
         .build();
     // Methods is Arc-backed and cheap to clone — one copy is consumed
     // by each per-bind `Server::start()` call below, plus one to feed

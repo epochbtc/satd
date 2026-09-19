@@ -32,10 +32,11 @@ use crate::rpc::access::readonly_listener_allows;
 pub const READONLY_REJECT_CODE: i32 = -32001;
 
 /// The response-size bound the batch-response builder below works to. The
-/// read-only listeners share the full listener's `ServerConfig`, so this is
-/// the same [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the inner
-/// service enforces.
-pub(crate) const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_BODY_SIZE;
+/// read-only listeners share the full listener's `ServerConfig`, so this
+/// tracks [`RPC_MAX_RESPONSE_SIZE`](crate::rpc::RPC_MAX_RESPONSE_SIZE) —
+/// the bound the inner service enforces on a reply. Building a batch to a
+/// smaller figure would refuse batches the inner service would have served.
+pub(crate) const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_RESPONSE_SIZE;
 
 fn rejected_error(method: &str) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(

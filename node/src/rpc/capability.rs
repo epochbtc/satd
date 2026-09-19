@@ -35,9 +35,9 @@ use crate::rpc::access::{RpcAccess, classify};
 pub const CAPABILITY_DENIED_CODE: i32 = -32004;
 
 /// The response-size bound used by the batch-response builder, matching the
-/// [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the inner service
-/// enforces.
-const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_BODY_SIZE;
+/// [`RPC_MAX_RESPONSE_SIZE`](crate::rpc::RPC_MAX_RESPONSE_SIZE) the inner
+/// service enforces on a reply.
+const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_RESPONSE_SIZE;
 
 /// The capability a method requires. Read-classified methods need `rpc:read`;
 /// everything else — mempool-submit, control, block-connecting, AND unclassified
