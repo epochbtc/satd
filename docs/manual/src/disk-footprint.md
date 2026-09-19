@@ -15,33 +15,50 @@ satd keeps everything in one RocksDB with multiple column families (CFs). The
 indices are append-mostly: rows are added as blocks connect and removed only on
 disconnect during a reorg, so no tombstone debt accumulates over time.
 
-The on-disk column is measured, not estimated. It comes from the per-CF SST
-totals of one fully-indexed mainnet node in August 2026, at height 963,000 with
-`txindex`, `addressindex` and `silentpaymentindex` all on. Your numbers track
-the chain's growth.
+| Column family | Role | Keyed by | Row size | Before | After (projected) |
+|---|---|---|---|---|---|
+| `addr_spending_v3` | every input spending a script | `scripthash[16] ‖ txseq[5] ‖ vin[3]` | 32 B (was 92) | ~256 GB | ~89 GB |
+| `spent` | UTXO → the input that spent it | `funding_txseq[5] ‖ vout[3]` | 16 B (was 76) | ~186 GB | ~39 GB |
+| `addr_funding_v3` | every output paying a script | `scripthash[16] ‖ txseq[5] ‖ vout[3]` | 32 B (was 64) | ~178 GB | ~89 GB |
+| `tx_loc` + `txseq_txid` | txid ↔ transaction ordinal | `txid[32]` / `txseq[5]` | 37 B each (was 64, one way) | ~79 GB | ~91 GB |
+| `txseq_block` | first ordinal of a block → height | `txseq[5]` | 9 B | — | ~10 MB |
+| `undo` | per-block disconnect data | `block_hash[32]` | ~33 B / input | ~74 GB | ~87 GB |
+| `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~13 GB | ~13 GB |
+| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~29 B varint | ~10 GB | ~10 GB |
+| `block_index` | header and status per block | `block_hash[32]` | ~100 B | ~120 MB | ~120 MB |
+| `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB | ~30 GB |
+| **total** | | | | **~826 GB** | **~449 GB** |
 
-| Column family | Role | Keyed by | Row size | Approx. on disk |
-|---|---|---|---|---|
-| `addr_spending_v3` | every input spending a script | `scripthash[16] ‖ txseq[5] ‖ vin[3]` | 32 B | to be measured |
-| `spent` | UTXO → the input that spent it | `funding_txseq[5] ‖ vout[3]` | 16 B | to be measured |
-| `addr_funding_v3` | every output paying a script | `scripthash[16] ‖ txseq[5] ‖ vout[3]` | 32 B | to be measured |
-| `tx_loc` | txid → transaction ordinal | `txid[32]` | 37 B | to be measured |
-| `txseq_txid` | transaction ordinal → txid | `txseq[5]` | 37 B | to be measured |
-| `txseq_block` | first ordinal of a block → height | `txseq[5]` | 9 B | to be measured |
-| `undo` | per-block disconnect data | `block_hash[32]` | ~33 B / input (incl. the funding ordinal) | ~74 GB |
-| `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~13 GB |
-| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~29 B varint (incl. the funding ordinal) | ~10 GB |
-| `block_index` | header and status per block | `block_hash[32]` | ~100 B | ~120 MB |
-| `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB (estimate) |
+**Read the two columns differently.** *Before* is measured: the per-CF SST
+totals of one fully-indexed mainnet node in August 2026, at height 963,000
+with `txindex`, `addressindex` and `silentpaymentindex` all on. *After* is
+a projection — the measured figure scaled by the change in row width — for
+the chainstate schema that keys every index on a transaction ordinal. It
+has not yet been re-measured on a synced node; when it is, this table gets
+real numbers and this paragraph goes away.
 
-The three address/txid indices plus `spent` are the bulk. Two rows
-often surprise operators. `undo` is not a rolling window: satd keeps the
-disconnect data for every block, so it grows with the chain. `coins` is the
-live UTXO set, which is served from the in-memory coin cache but still
-serializes to several GB.
+The projection is conservative. Both columns are post-compression (LZ4 at
+L2–L5, Zstd at the bottom), and the dense ascending ordinals that replaced
+the 32-byte hashes compress considerably better than the hashes did — a
+hash is incompressible by construction — so the measured after-figure
+should land at or below the projection rather than above it.
 
-The filter row is the one figure here that is still an estimate. The measured
-node does not run `blockfilterindex`.
+Two rows in the after column go *up*, and both are deliberate. `undo`
+gains five bytes per spend and `coins` about one per coin, because a coin
+now carries the ordinal of the transaction that created it. That is what
+lets `connect_block` key a spend row without a lookup: paying ~15 GB
+across the two smallest families takes ~150 GB off the two largest. The
+transaction index also goes up, because it is now two families instead of
+one — that reverse map is what every other index drops its txid copies
+*for*.
+
+Two rows often surprise operators. `undo` is not a rolling window: satd
+keeps the disconnect data for every block, so it grows with the chain.
+`coins` is the live UTXO set, which is served from the in-memory coin
+cache but still serializes to several GB.
+
+The filter row is the one figure here that was always an estimate. The
+measured node does not run `blockfilterindex`.
 
 > **Note.** During a `-reindex` or `-reindex-chainstate`, RocksDB compaction
 > falls behind the write rate, so the transaction index in particular can read much larger
@@ -96,30 +113,47 @@ a filter index, fused into one store.
 
 ### 3. satd keys on transaction ordinals
 
-Core's `txindex` stores an on-disk position (`CDiskTxPos`, about 12 bytes),
-which is compact but ties the index to the block-file layout. satd stores a
-**transaction ordinal** instead: transactions are numbered in chain order
-from the genesis coinbase at 0, so the transaction at position *i* of a block
-takes `nchaintx(parent) + i` — the cumulative count satd already keeps per
-block for `getchaintxstats`. Five bytes hold 2^40 of them, and the encoding
+Every index used to key on a 32-byte txid. A txid is a hash: incompressible,
+and written once per index that mentions the transaction. On a fully indexed
+node that repetition was the single largest line in the chainstate — the same
+identifiers stored five to seven times over.
+
+An **ordinal** replaces it. Transactions are numbered in chain order from the
+genesis coinbase at 0, so the transaction at position *i* of a block takes
+`nchaintx(parent) + i` — the cumulative count satd already keeps per block for
+`getchaintxstats`. Nothing new has to be counted. Five bytes hold 2^40 of
+them, about 880 times the chain's current transaction count, and the encoding
 is big-endian, so the byte order of a key is the order the transactions were
 mined.
 
-That buys two things. The index stays independent of block-file layout and
-survives re-packing, as a block-hash value would — but at 5 bytes rather than
-32. And because an ordinal names the position inside the block as well as the
-block, `getrawtransaction` indexes straight into the block's transaction list
+Two column families hold the mapping: `tx_loc` from txid to ordinal, and
+`txseq_txid` back. The reverse map is the part that makes the rest work — a
+row keys on an ordinal, and the storage layer resolves it to a txid, in one
+batched lookup per scan, before the row leaves. A third, `txseq_block`, is one
+small row per block that turns an ordinal back into a height. Because an
+ordinal names the position inside the block as well as the block,
+`getrawtransaction` also indexes straight into the block's transaction list
 instead of reading the block and comparing every txid in it.
 
-Two column families hold it: `tx_loc` maps a txid to its ordinal, and
-`txseq_txid` maps back. The reverse map is what lets other indexes drop their
-txid copies — a row keys on an ordinal, and the storage layer resolves it to
-a txid, in one batched lookup per scan, before the row leaves it. A third,
-`txseq_block`, is one small row per block that turns an ordinal back into a
-height.
+The ordinal is a storage encoding, not a new public identifier. Nothing on any
+wire changes.
 
-satd's keys are fixed-width binary tuned for prefix seeks rather than
-byte-minimal, which costs a little space and speeds up range scans.
+Against Core, the comparison is with `CDiskTxPos` — an on-disk position of
+about 12 bytes, compact but tied to the block-file layout. satd's 5-byte
+ordinal is smaller and stays independent of that layout, so a block-file
+re-pack does not invalidate the index.
+
+The design is borrowed. [rbitcoin](https://github.com/reardencode/rbitcoin)
+stores the chain as a decomposed relational archive — separate bodies for
+outputs, input witnesses and spend annotations, with a dense 32-byte-per-
+transaction txid sidefile — and numbers everything by position rather than by
+hash. satd keeps Core-compatible flat block files and a UTXO set, so the two
+designs are not interchangeable, but the observation that the hashes are the
+footprint, and that one dense sidefile can carry them for every index at once,
+is rbitcoin's.
+
+satd's keys are otherwise fixed-width binary tuned for prefix seeks rather
+than byte-minimal, which costs a little space and speeds up range scans.
 
 ### What satd already does to keep the footprint down
 
@@ -131,10 +165,12 @@ The schema is close to the smallest encoding of what it indexes:
   read.
 - **Varint-packed UTXOs.** The `coins` CF uses a compact varint encoding,
   about 28 B typical against about 43 B for a naive struct.
-- **Fixed-width keys, no delimiters.** Heights are big-endian, so range scans
-  return rows in chain order with no secondary sort.
+- **Fixed-width keys, no delimiters.** Ordinals are big-endian, so range
+  scans return rows in chain order with no secondary sort.
+- **One copy of each transaction identifier.** Index rows name transactions by
+  a 5-byte ordinal; the 32-byte txid lives once, in `txseq_txid`.
 
-The size is `row_count × ~70 B`, and `row_count` is every output and every
+The size is `row_count × ~32 B`, and `row_count` is every output and every
 spend in Bitcoin's history. The footprint is data, not per-row overhead.
 
 ## What the disk buys you

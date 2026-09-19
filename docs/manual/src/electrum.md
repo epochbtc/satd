@@ -237,6 +237,13 @@ backend.
 - `--txindex` is required for `blockchain.transaction.get`, `get_merkle`,
   and `id_from_pos`. `--addressindex` (on by default) backs every
   `scripthash.*` method.
+- **History order is unchanged by the ordinal-keyed chainstate.** The
+  address index stores rows keyed on a dense transaction ordinal rather
+  than a height and txid (see [Disk Footprint](disk-footprint.md)), but
+  the store resolves and orders them before they leave it, so
+  `get_history`, `listunspent` and `get_balance` return exactly the rows,
+  in exactly the order, that they did before. Nothing on the Electrum
+  wire carries an ordinal.
 - satd advertises a single protocol version (`protocol_min == protocol_max
   == 1.4`); it does not negotiate a range.
 - `server.peers.subscribe` returns an empty list: satd does not participate

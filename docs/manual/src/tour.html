@@ -1402,25 +1402,37 @@ pub async fn tip_hash(
   <div class="slide-body">
     <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
     <h2>Five indexes, one commit point</h2>
-    <p>Address history, outpoint-spend, tx index, BIP 158 filters, and BIP 352 silent-payment tweaks all ride the same <code>StoreBatch</code> as the chainstate. There is no index-writer thread and no post-commit hook — emission happens inline in <code>connect_block</code>'s loop, right next to the coin mutation it describes:</p>
+    <p>Address history, the spend index, the transaction index, BIP 158 filters, and BIP 352 silent-payment tweaks all ride the same <code>StoreBatch</code> as the chainstate. There is no index-writer thread and no post-commit hook — emission happens inline in <code>connect_block</code>'s loop, right next to the coin mutation it describes:</p>
     <div class="code"><div class="code-head"><span class="path">node/src/chain/connect.rs:643</span></div>
 <pre><code class="lang-rust">batch.coin_removes.push((outpoint, coin.amount, coin.height));
 
-// Address-history index: spending row, atomic with the
-// chainstate update via the same StoreBatch. No-op when
-// the index is disabled.
-crate::index::address::emit_spending(
-    &amp;mut batch, address_index, height, txid,
-    in_idx as u32, &amp;coin, outpoint,
-);
-
-// outpoint_spend index: keyed by the consumed outpoint
-// so Esplora outspend / gettxspendingprevout can answer
-// in O(1). Same flag, same atomic batch.
-crate::index::outpoint_spend::emit::emit_spend(
-    &amp;mut batch, address_index, height, txid,
-    in_idx as u32, outpoint,
-);</code></pre></div>
+// Address-history spending row and the spend index, atomic
+// with the chainstate update via the same StoreBatch. Both
+// name the consumed output by the ordinal of the transaction
+// that created it — which the coin carries, so the hot path
+// does no lookup.
+if address_index.enabled {
+    let funding_txseq = if coin.txseq != TXSEQ_UNKNOWN {
+        Some(coin.txseq)
+    } else {
+        store.get_tx_seq(&amp;outpoint.txid)
+    };
+    match funding_txseq {
+        Some(funding_txseq) =&gt; {
+            crate::index::address::emit_spending(
+                &amp;mut batch, address_index, txseq,
+                in_idx as u32, &amp;coin,
+                funding_txseq, outpoint.vout,
+            );
+            crate::index::outpoint_spend::emit::emit_spend(
+                &amp;mut batch, address_index,
+                funding_txseq, outpoint.vout,
+                txseq, in_idx as u32,
+            );
+        }
+        None =&gt; { /* AssumeUTXO coin: skip, count, backfill */ }
+    }
+}</code></pre></div>
     <p>The commit side states the guarantee — and even runs it in reverse: disabling an index while blocks connect clears its completeness marker <em>inside the same batch</em>, so the "this index is trustworthy" bit can't be lost to a crash window:</p>
     <div class="code"><div class="code-head"><span class="path">node/src/storage/rocksdb_store.rs:1519</span></div>
 <pre><code class="lang-rust">// BIP 158 filter index. Filter blob and chained filter header
@@ -1429,7 +1441,7 @@ crate::index::outpoint_spend::emit::emit_spend(
 // handlers can never observe a filter row whose chain segment
 // is partially committed. Empty-batch fast-path skips both CFs.</code></pre></div>
     <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
-    Core's <code>BaseIndex</code> framework runs each index as a background thread consuming validation events into its own LevelDB, with its own "best block" pointer — an index can lag the tip, and callers must handle "index not synced". That design is <em>why</em> Core deliberately stays out of address indexing at scale, and why electrs exists. satd's single-batch design makes tip-consistency structural — the trade is that the connect path pays index write costs inline, and a fully-indexed node spends serious disk (the address index is ~120–180 GB compressed at mainnet tip, documented and opt-out via <code>--addressindex=0</code>).</div>
+    Core's <code>BaseIndex</code> framework runs each index as a background thread consuming validation events into its own LevelDB, with its own "best block" pointer — an index can lag the tip, and callers must handle "index not synced". That design is <em>why</em> Core deliberately stays out of address indexing at scale, and why electrs exists. satd's single-batch design makes tip-consistency structural — the trade is that the connect path pays index write costs inline, and a fully-indexed node spends serious disk (documented, and opt-out via <code>--addressindex=0</code>).</div>
   </div>
 </section>
 
@@ -1437,14 +1449,16 @@ crate::index::outpoint_spend::emit::emit_spend(
   <div class="slide-body">
     <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
     <h2>The address index: the key layout is the query plan</h2>
-    <p>Two column families, one 56-byte key shape. Every field is big-endian and the scripthash prefix leads, so RocksDB's own byte ordering <em>is</em> <code>(height, txid, vout)</code> ascending for a fixed script — <code>get_history</code> is a straight prefix iteration with no sort:</p>
+    <p>Two column families, one 24-byte key shape. Every field is big-endian and the scripthash prefix leads, so RocksDB's own byte ordering <em>is</em> chain order for a fixed script — <code>get_history</code> is a prefix iteration, not a scan-and-sort:</p>
     <div class="code"><div class="code-head"><span class="path">node-index/src/keys.rs:25</span></div>
-<pre><code class="lang-plain">addr_funding_v2  key: scripthash_prefix[16] || height_be[4] || txid[32] || vout_be[4]  (56 bytes)
-                 value: amount_sat_be[8]                                               (8 bytes)
+<pre><code class="lang-plain">addr_funding_v3  key: scripthash_prefix[16] || txseq[5] || vout_be[3]   (24 bytes)
+                 value: amount_sat_be[8]                                (8 bytes)
 
-addr_spending_v2 key: scripthash_prefix[16] || height_be[4] || txid[32] || vin_be[4]   (56 bytes)
-                 value: prev_outpoint_txid[32] || prev_outpoint_vout_be[4]             (36 bytes)</code></pre></div>
-    <p>Truncating the scripthash to 16 bytes saves ~16 bytes per row — "the bulk of the disk-size delta against Bitcoin Core + electrs" — and the module doc defends the collision posture rather than hand-waving it:</p>
+addr_spending_v3 key: scripthash_prefix[16] || txseq[5] || vin_be[3]    (24 bytes)
+                 value: funding_txseq[5] || funding_vout_be[3]          (8 bytes)</code></pre></div>
+    <p><code>txseq</code> is a dense chain-order <em>transaction ordinal</em>: transactions numbered from the genesis coinbase at 0, so the transaction at position <em>i</em> of a block takes <code>nchaintx(parent) + i</code> — the cumulative count the node already kept for <code>getchaintxstats</code>. Five bytes hold 2^40 of them. It replaces a 4-byte height and a 32-byte txid, both recoverable from it: <code>txseq_block</code> gives the height, <code>txseq_txid</code> the txid. A txid is a hash — incompressible, and it used to be written once per index that mentioned the transaction. Now it is written once, in one place, and each index row costs 32 bytes instead of 64 or 92.</p>
+    <p>An ordinal never leaves the storage layer: rows resolve to the public <code>(height, txid, vout/vin)</code> shape — in one batched lookup per scan, not one per row — and sort into the documented order before they are returned. Nothing on the Electrum or Esplora wire changed.</p>
+    <p>Truncating the scripthash to 16 bytes saves another ~16 bytes per row, and the module doc defends the collision posture rather than hand-waving it:</p>
     <div class="code"><div class="code-head"><span class="path">node-index/src/keys.rs:15</span></div>
 <pre><code class="lang-rust">//! ## Collision posture
 //!
@@ -1455,7 +1469,8 @@ addr_spending_v2 key: scripthash_prefix[16] || height_be[4] || txid[32] || vin_b
 //! is "querying scripthash X also returns events for scripthash Y" —
 //! both X and Y are public on-chain data, so no privacy or correctness
 //! violation results for the address-index use case.</code></pre></div>
-    <p>The portable half (trait, key codec, cursor types) lives in the leaf crate <code>node-index</code> so Electrum, Esplora, and SDK consumers depend on it without pulling in <code>ChainState</code>. The companion <code>outpoint_spend</code> CF answers the inverse question the UTXO set can't — "this output is gone, <em>what spent it?</em>" — keyed txid-first so <code>/tx/:txid/outspends</code> fans out in one seek. Its read adapter is fail-closed: a miss is only reported as "unspent" when the completeness marker covers the whole active chain; otherwise it returns <code>Incomplete</code> rather than a plausible lie.</p>
+    <p>The portable half (trait, key codec, cursor types) lives in the leaf crate <code>node-index</code> so Electrum, Esplora, and SDK consumers depend on it without pulling in <code>ChainState</code>. The companion <code>spent</code> CF answers the inverse question the UTXO set can't — "this output is gone, <em>what spent it?</em>" — as <code>funding_txseq[5] || vout[3]</code> → <code>spending_txseq[5] || vin[3]</code>, sixteen bytes where the txid-keyed version took seventy-six, ordinal-prefixed so <code>/tx/:txid/outspends</code> fans out in one seek. Its read adapter is fail-closed: a miss is only reported as "unspent" when the completeness marker covers the whole active chain; otherwise it returns <code>Incomplete</code> rather than a plausible lie.</p>
+    <p>The funding ordinal has to be in hand when a spend connects, and looking it up per input would be a point read for every input ever mined — so the <em>coin</em> carries it. <code>connect_block</code> already resolves every input's coin, so the hot path does no lookup at all: about a byte per coin and five per spend in the undo data, to take sixty off every spend row.</p>
   </div>
 </section>
 
