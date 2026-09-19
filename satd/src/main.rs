@@ -3003,18 +3003,19 @@ async fn main() {
             // Round-3 H1: txindex completeness check.
             //
             // The runtime flag tells us txindex is enabled, but the
-            // CF could be partially populated from a previous
-            // `--txindex=0` run. With Esplora on, that produces
-            // false 404s for historical confirmed txs — exactly the
-            // failure mode round-1's H3 hard-fail was designed to
-            // prevent. Refuse to start the listener and tell the
-            // operator how to fix.
+            // families could be partially populated from a previous run
+            // with both transaction-index consumers off. With Esplora
+            // on, that produces false 404s for historical confirmed txs
+            // — exactly the failure mode round-1's H3 hard-fail was
+            // designed to prevent. Refuse to start the listener and tell
+            // the operator how to fix.
             if !chain_state.store_ref().tx_index_complete() {
                 eprintln!(
-                    "Error: esplora is enabled and --txindex=1, but the on-disk tx_index \n\
-                     CF is incomplete (this datadir was previously synced with \n\
-                     --txindex=0). Restart with --reindex-chainstate to populate \n\
-                     historical rows, or set --esplora=0 to skip the tx-endpoint surface."
+                    "Error: esplora is enabled and --txindex=1, but the on-disk \n\
+                     transaction index (tx_loc) is incomplete (this datadir was \n\
+                     previously synced with --txindex=0 and --addressindex=0). \n\
+                     Restart with --reindex-chainstate to populate historical rows, \n\
+                     or set --esplora=0 to skip the tx-endpoint surface."
                 );
                 auth.cleanup();
                 std::process::exit(1);
@@ -3273,16 +3274,18 @@ async fn main() {
 
     // Start the Electrum server if enabled. Refuses to bind when
     // addressindex=0 (already enforced by Config::load) or when the
-    // tx_index CF is incomplete (a datadir previously synced with
-    // --txindex=0 has historical gaps that would 404 silently). Bind
-    // failure is fatal, mirroring the Esplora pattern above.
+    // transaction index is incomplete (a datadir previously synced with
+    // both transaction-index consumers off has historical gaps that
+    // would 404 silently). Bind failure is fatal, mirroring the Esplora
+    // pattern above.
     if config.electrum {
         if !chain_state.store_ref().tx_index_complete() {
             eprintln!(
-                "Error: electrum is enabled and --txindex=1, but the on-disk tx_index \n\
-                 CF is incomplete (this datadir was previously synced with \n\
-                 --txindex=0). Restart with --reindex-chainstate to populate \n\
-                 historical rows, or set --electrum=0 to skip the Electrum server."
+                "Error: electrum is enabled and --txindex=1, but the on-disk \n\
+                 transaction index (tx_loc) is incomplete (this datadir was \n\
+                 previously synced with --txindex=0 and --addressindex=0). \n\
+                 Restart with --reindex-chainstate to populate historical rows, \n\
+                 or set --electrum=0 to skip the Electrum server."
             );
             auth.cleanup();
             std::process::exit(1);

@@ -8,6 +8,21 @@ pub struct Coin {
     pub script_pubkey: bitcoin::ScriptBuf,
     pub height: u32,
     pub coinbase: bool,
+    /// Chain-order ordinal of the transaction that created this output.
+    ///
+    /// The spend indexes key on it, and this is where `connect_block`
+    /// gets it: the connect path already resolves every input's coin, so
+    /// carrying the ordinal inside the coin means the hot path never
+    /// looks one up. The alternative — a point read per input against a
+    /// bloom-filtered ~45 GB family — would be paid once for every input
+    /// in the chain.
+    ///
+    /// [`TXSEQ_UNKNOWN`](node_index::TXSEQ_UNKNOWN) for coins loaded from
+    /// an AssumeUTXO snapshot: Bitcoin Core's snapshot format carries no
+    /// ordinal, and the history those coins came from has not been
+    /// validated yet. Spending such a coin falls back to one lookup.
+    #[serde(default)]
+    pub txseq: u64,
 }
 
 /// Serialize an OutPoint to a fixed 36-byte key (txid LE + vout LE).
@@ -51,8 +66,14 @@ mod script_serde {
 
 // ---------------------------------------------------------------------------
 // Compact serialization for RocksDB coins CF.
-// Format: [varint(height<<1 | coinbase)] [varint(amount)] [varint(script_len)] [script]
+// Format: [varint(height<<1 | coinbase)] [varint(txseq)] [varint(amount)]
+//         [varint(script_len)] [script]
 // ~28 bytes for P2WPKH vs ~43 with bincode (35% smaller).
+//
+// There is no per-coin version byte. The chainstate schema version is
+// the format gate: a binary that reads this layout refuses a datadir
+// written in any other, and undo rows embed compact coins so both change
+// shape at the same schema step.
 // ---------------------------------------------------------------------------
 
 /// Encode a u64 as a variable-length integer (7 bits per byte, MSB = more).
@@ -91,6 +112,7 @@ impl Coin {
         // Pack height and coinbase into a single varint
         let height_cb = ((self.height as u64) << 1) | (self.coinbase as u64);
         encode_varint(height_cb, &mut buf);
+        encode_varint(self.txseq, &mut buf);
         encode_varint(self.amount, &mut buf);
         let script = self.script_pubkey.as_bytes();
         encode_varint(script.len() as u64, &mut buf);
@@ -123,9 +145,16 @@ impl Coin {
         }
         let height = height_u64 as u32;
         let coinbase = (height_cb & 1) != 0;
-        let (amount, n2) = decode_varint(data.get(n1..)?)?;
-        let (script_len, n3) = decode_varint(data.get(n1 + n2..)?)?;
-        let script_start = n1 + n2 + n3;
+        // No default on a short read. A record that ends here was
+        // written in a layout this binary does not read, and the schema
+        // gate is supposed to have refused the datadir before anything
+        // reached this function — so treat it as corruption rather than
+        // silently producing a coin with ordinal 0, which is the genesis
+        // coinbase's ordinal and would key spend rows onto it.
+        let (txseq, n2) = decode_varint(data.get(n1..)?)?;
+        let (amount, n3) = decode_varint(data.get(n1 + n2..)?)?;
+        let (script_len, n4) = decode_varint(data.get(n1 + n2 + n3..)?)?;
+        let script_start = n1 + n2 + n3 + n4;
         let script_end = script_start.checked_add(script_len as usize)?;
         if script_end > data.len() {
             return None;
@@ -137,6 +166,7 @@ impl Coin {
                 script_pubkey,
                 height,
                 coinbase,
+                txseq,
             },
             script_end,
         ))
@@ -168,6 +198,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
             height: 100,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = bincode::serialize(&coin).unwrap();
         let decoded: Coin = bincode::deserialize(&encoded).unwrap();
@@ -216,6 +247,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(), // empty script
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = bincode::serialize(&coin).unwrap();
         let decoded: Coin = bincode::deserialize(&encoded).unwrap();
@@ -232,6 +264,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
             height: 800_000,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = coin.serialize_compact();
         assert!(encoded.len() < 35, "compact should be <35 bytes, got {}", encoded.len());
@@ -249,6 +282,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
             height: 100,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = coin.serialize_compact();
         let decoded = Coin::deserialize_compact(&encoded).unwrap();
@@ -265,13 +299,60 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = coin.serialize_compact();
-        assert_eq!(encoded.len(), 3); // 1 byte each for height_cb, amount, script_len
+        // 1 byte each for height_cb, txseq, amount, script_len.
+        assert_eq!(encoded.len(), 4);
         let decoded = Coin::deserialize_compact(&encoded).unwrap();
         assert_eq!(decoded.amount, 0);
         assert_eq!(decoded.height, 0);
         assert!(!decoded.coinbase);
+    }
+
+    /// The ordinal has to survive the round trip, and a record that
+    /// ends before it must be rejected rather than defaulted.
+    ///
+    /// Defaulting would produce ordinal 0 — the genesis coinbase's —
+    /// so every spend of such a coin would key its `spent` row onto
+    /// genesis. The chainstate schema version is supposed to make a
+    /// short record unreachable; this is what happens if it ever is.
+    #[test]
+    fn coin_compact_roundtrip_carries_txseq_and_rejects_truncation() {
+        for txseq in [0u64, 1, 127, 128, 1 << 20, node_index::TXSEQ_MAX] {
+            let coin = Coin {
+                amount: 12_345,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                height: 700_000,
+                coinbase: false,
+                txseq,
+            };
+            let encoded = coin.serialize_compact();
+            let decoded = Coin::deserialize_compact(&encoded).expect("must decode");
+            assert_eq!(decoded, coin, "ordinal {txseq} must survive the round trip");
+        }
+
+        // A record in the pre-ordinal shape: height_cb, amount,
+        // script_len, script. The ordinal varint reads the amount, the
+        // amount reads the length, and the length reads the script —
+        // so the truncation has to be caught by a bounds check, not by
+        // a length mismatch alone.
+        let mut short = Vec::new();
+        encode_varint(2, &mut short); // height_cb
+        encode_varint(5_000, &mut short); // amount, read as the ordinal
+        encode_varint(1, &mut short); // script_len, read as the amount
+        short.push(0x51); // script, read as the length
+        assert!(
+            Coin::deserialize_compact(&short).is_none(),
+            "a record written in the previous layout must be rejected, not \
+             silently re-interpreted"
+        );
+
+        // And the genuinely truncated case: nothing at all after the
+        // height.
+        let mut truncated = Vec::new();
+        encode_varint(2, &mut truncated);
+        assert!(Coin::deserialize_compact(&truncated).is_none());
     }
 
     #[test]
@@ -310,8 +391,9 @@ mod tests {
         let height_cb = (u32::MAX as u64) << 1;
         let mut buf = Vec::new();
         encode_varint(height_cb, &mut buf);
-        encode_varint(1, &mut buf);
-        encode_varint(0, &mut buf);
+        encode_varint(0, &mut buf); // txseq
+        encode_varint(1, &mut buf); // amount
+        encode_varint(0, &mut buf); // script_len
         let coin = Coin::deserialize_compact(&buf).expect("u32::MAX height should decode");
         assert_eq!(coin.height, u32::MAX);
     }
@@ -323,6 +405,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
             height: 500_000,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let compact = coin.serialize_compact();
         let bincode_encoded = bincode::serialize(&coin).unwrap();

@@ -388,6 +388,14 @@ impl MetricsContext {
             &[],
             addr_stats.spending_removes,
         );
+        metric(
+            &mut out,
+            "satd_addrindex_unresolved_spends_total",
+            "Inputs whose funding transaction ordinal could not be resolved at connect time (AssumeUTXO coins spent before background validation reached their block); `backfillindex address` after validation completes fills the gap.",
+            "counter",
+            &[],
+            addr_stats.unresolved_spends,
+        );
         if let Some(subs) = &self.addr_subs {
             metric(
                 &mut out,

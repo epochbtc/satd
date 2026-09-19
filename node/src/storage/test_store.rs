@@ -335,6 +335,9 @@ impl Store for ControllableStore {
     fn iter_addr_spending(&self, sh: &Scripthash) -> Vec<(AddrSpendingKey, OutPoint)> {
         self.inner.iter_addr_spending(sh)
     }
+    fn lookup_spends_of_tx(&self, txid: &Txid) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
+        self.inner.lookup_spends_of_tx(txid)
+    }
     fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
         self.inner.lookup_spend(outpoint)
     }

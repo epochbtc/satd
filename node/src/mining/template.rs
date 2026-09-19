@@ -816,6 +816,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -1075,6 +1076,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD1), immature)]);
         // The template is built at height 1, so the coinbase has 1 of the 100
@@ -1102,6 +1104,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 0,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD2), ordinary)]);
         let tx = tx_spending(confirmed_prev(0xD2), 50_000, 0x52, 0xffff_ffff, 0);

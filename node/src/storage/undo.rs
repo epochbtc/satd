@@ -5,10 +5,15 @@
 //! for each spend is recoverable from the block's tx inputs (the
 //! connect-order invariant guarantees `undo.spent_coins[i]` belongs to
 //! the i-th non-coinbase input), so we don't store it. Per-spend cost
-//! is ~28 bytes for typical P2WPKH.
+//! is ~33 bytes for typical P2WPKH: the coin's own ~28, plus 1–5 for
+//! the funding-transaction ordinal it now carries.
 //!
-//! The magic/version split lets future schema revisions reuse the
-//! magic and bump only the version byte.
+//! The magic and version are unchanged by that: the embedded coins
+//! changed shape, and the chainstate schema version is what gates the
+//! whole datadir, so a binary that can read these rows is by
+//! construction one that can read the coins inside them. The
+//! magic/version split lets future format revisions reuse the magic and
+//! bump only the version byte.
 
 use crate::storage::coinview::{Coin, decode_varint, encode_varint};
 
@@ -124,6 +129,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 

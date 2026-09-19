@@ -50,10 +50,18 @@ const CF_CHAIN_TX: &str = "chain_tx";
 /// rather than a full 32-byte scripthash.
 pub(crate) const CF_ADDR_FUNDING_V2: &str = "addr_funding_v2";
 pub(crate) const CF_ADDR_SPENDING_V2: &str = "addr_spending_v2";
-/// Confirmed-side spend index: `prev_outpoint -> SpendingRef`. Written
-/// alongside the address-index spending rows; the two CFs answer
-/// different shapes of the same question.
-const CF_OUTPOINT_SPEND: &str = "outpoint_spend";
+/// Confirmed-side spend index: `funding_txseq[5] || vout[3]` ->
+/// `spending_txseq[5] || vin[3]`. Written alongside the address-index
+/// spending rows; the two CFs answer different shapes of the same
+/// question.
+///
+/// Sixteen bytes a row where the txid-keyed predecessor took
+/// seventy-six: both ends are named by transaction ordinal, and the two
+/// 32-byte hashes the old value carried are recovered through
+/// `txseq_txid` in one batched lookup per scan. The 5-byte ordinal
+/// prefix makes "every spend of transaction N" a prefix scan, replacing
+/// the 32-byte txid prefix the old layout used for the same query.
+const CF_SPENT: &str = "spent";
 /// BIP 158 compact-block-filter blobs, keyed by
 /// `(filter_type:u8 || height_be:u32)`. Value: raw GCS-encoded filter.
 /// Sibling to `cf_filter_header`.
@@ -69,6 +77,10 @@ const CF_FILTER_HEADER: &str = "block_filter_header";
 /// scripthashes without reading flat-file undo data. Dropped wholesale
 /// on Completed or Cancelled.
 const CF_ADDR_BACKFILL_TEMP: &str = "addr_backfill_outpoint_to_scripthash";
+/// Width of a backfill temp-CF value: `scripthash[32] || txseq[5]`.
+/// Pass 1 records both because pass 2 needs both and can recompute
+/// neither without a second read of the funding output's block.
+const TEMP_VALUE_LEN: usize = 32 + node_index::TXSEQ_LEN;
 
 /// BIP 352 silent-payment tweak index. One row per block from taproot
 /// activation upward, keyed `height_be[4]`. Always compiled (runtime
@@ -94,7 +106,7 @@ const ALL_CFS: &[&str] = &[
     CF_CHAIN_TX,
     CF_ADDR_FUNDING_V2,
     CF_ADDR_SPENDING_V2,
-    CF_OUTPOINT_SPEND,
+    CF_SPENT,
     // Gated exactly like the descriptors `open()` creates for them: on a
     // consensus-only build (`--no-default-features`) this store can never
     // create or write these CFs, so listing them would break the
@@ -119,7 +131,7 @@ const ALL_CFS: &[&str] = &[
 const DIAG_CFS: &[&str] = &[
     CF_ADDR_SPENDING_V2,
     CF_ADDR_FUNDING_V2,
-    CF_OUTPOINT_SPEND,
+    CF_SPENT,
     CF_UNDO,
     CF_COINS,
     CF_TX_LOC,
@@ -159,7 +171,7 @@ const SCHEMA_KEY: &[u8] = b"schema_version";
 /// On open: if absent and `addr_spending` has historical rows, stamp
 /// false so subsequent restarts continue to surface the gap even
 /// after live `connect_block` has appended new rows. (Review H6.)
-const OUTPOINT_SPEND_COMPLETE_KEY: &[u8] = b"outpoint_spend.complete";
+const SPENT_COMPLETE_KEY: &[u8] = b"spent.complete";
 /// `tx_loc.complete` metadata flag — symmetric to
 /// `outpoint_spend.complete` but for the transaction-ordinal families
 /// that back `getrawtransaction` / `gettxlocation` and Esplora's
@@ -206,13 +218,15 @@ const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height
 // v2: compact varint coins. v3: storage-format cleanup — v1 undo
 // dual-read and v1 address-history CFs were dropped. v4: the
 // transaction index is keyed on dense chain-order ordinals (`tx_loc`,
-// `txseq_txid`, `txseq_block`) instead of `txid -> block_hash`.
+// `txseq_txid`, `txseq_block`) instead of `txid -> block_hash`. v5:
+// coins carry their funding transaction's ordinal and the spend index
+// (`spent`) is keyed on it.
 //
 // A chainstate stamped at any earlier version is refused: the binary
 // cannot read rows in a layout it no longer knows, and there is no
 // in-place upgrade because the new families have to be built from the
 // blocks. `-reindex-chainstate` rebuilds them in one pass.
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Column families this binary no longer creates or reads. Discovered on
 /// open, declared bare so RocksDB will mount the DB at all, and dropped
@@ -223,7 +237,30 @@ const CURRENT_SCHEMA_VERSION: u32 = 4;
 /// `addr_funding` / `addr_spending` are the pre-cleanup address-history
 /// CFs; `tx_index` is the txid-keyed transaction index that the ordinal
 /// families replaced in schema 4.
-const RETIRED_CF_NAMES: &[&str] = &["addr_funding", "addr_spending", "tx_index"];
+const RETIRED_CF_NAMES: &[&str] = &["addr_funding", "addr_spending", "tx_index", "outpoint_spend"];
+
+/// Turn a `spent` row's value into the public [`SpendingRef`] shape.
+///
+/// `None` when the spending transaction's ordinal does not resolve,
+/// which on a healthy chainstate cannot happen — the `spent` row and the
+/// ordinal rows are written in the same atomic batch. Treating it as
+/// "no spend" rather than inventing a txid keeps a corrupt row from
+/// being reported as a real spend by a transaction that does not exist.
+fn resolve_spending_ref(
+    store: &dyn Store,
+    spending_txseq: u64,
+    vin: u32,
+) -> Option<node_index::SpendingRef> {
+    let resolved = crate::index::resolve::resolve_txseqs(store, &[spending_txseq])
+        .into_iter()
+        .next()
+        .flatten()?;
+    Some(node_index::SpendingRef {
+        spending_txid: resolved.txid,
+        spending_vin: vin,
+        height: resolved.height,
+    })
+}
 
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
@@ -515,13 +552,15 @@ impl RocksDbStore {
                 CF_ADDR_SPENDING_V2,
                 make_cf_opts(true, 32, Some(16), true),
             ),
-            // outpoint_spend: bloom on (point lookups dominate), 16 MB
-            // write-buf because the row is small (40-byte value, 36-byte
-            // key) and one row per non-coinbase input — heavier than
-            // tx_index but lighter than addr_spending. 32-byte prefix
-            // (txid) lets `outspends` for a tx fan out cheaply.
-            // Also hot — write rate matches addr_spending.
-            ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32), true)),
+            // spent: bloom on (point lookups dominate), 16 MB write-buf
+            // because the row is small (8-byte key, 8-byte value) and
+            // one row per non-coinbase input — heavier than the
+            // transaction index but lighter than addr_spending. A
+            // 5-byte prefix (the funding ordinal) lets `outspends` for a
+            // transaction fan out cheaply; that was 32 bytes when the
+            // key carried a txid. Also hot — write rate matches
+            // addr_spending.
+            ColumnFamilyDescriptor::new(CF_SPENT, make_cf_opts(true, 16, Some(5), true)),
             // BIP 352 silent-payment tweak index. Bloom on (point lookups
             // for serving and the rescan fast path dominate); 16 MB
             // write-buf because per-block emission is write-heavy during
@@ -704,7 +743,7 @@ impl RocksDbStore {
         //    Decide which by looking at addr_spending; stamp the
         //    correct value so the diagnostic doesn't disappear once
         //    `connect_block` starts appending new outpoint_spend rows.
-        let marker = store.read_outpoint_spend_complete();
+        let marker = store.read_spent_complete();
         if marker.is_none() {
             // Pre-PR-D datadirs only have addr_spending; post-PR-D
             // writes go to addr_spending_v2. Either presence means
@@ -724,9 +763,9 @@ impl RocksDbStore {
                     .unwrap_or(false)
             };
             let addr_has_rows = cf_has_rows(CF_ADDR_SPENDING_V2);
-            store.write_outpoint_spend_complete(!addr_has_rows)?;
+            store.write_spent_complete(!addr_has_rows)?;
         }
-        if !store.outpoint_spend_complete() {
+        if !store.spent_complete() {
             tracing::warn!(
                 target: "storage",
                 "outpoint_spend index is incomplete relative to addr_spending: \
@@ -986,21 +1025,21 @@ impl RocksDbStore {
     /// Read the `outpoint_spend.complete` marker from the metadata CF.
     /// Returns `None` when the key doesn't exist (fresh datadir or
     /// pre-marker upgrade).
-    fn read_outpoint_spend_complete(&self) -> Option<bool> {
+    fn read_spent_complete(&self) -> Option<bool> {
         let cf = self.db.cf_handle(CF_METADATA)?;
-        match self.db.get_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY) {
+        match self.db.get_cf(&cf, SPENT_COMPLETE_KEY) {
             Ok(Some(v)) => v.first().map(|b| *b != 0),
             _ => None,
         }
     }
 
-    fn write_outpoint_spend_complete(&self, value: bool) -> Result<(), StoreError> {
+    fn write_spent_complete(&self, value: bool) -> Result<(), StoreError> {
         let cf = self
             .db
             .cf_handle(CF_METADATA)
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
-            .put_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY, [u8::from(value)])
+            .put_cf(&cf, SPENT_COMPLETE_KEY, [u8::from(value)])
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -1114,7 +1153,7 @@ impl RocksDbStore {
             CF_COINS
                 | CF_ADDR_FUNDING_V2
                 | CF_ADDR_SPENDING_V2
-                | CF_OUTPOINT_SPEND
+                | CF_SPENT
                 | CF_TX_LOC
                 | CF_FILTER
                 | CF_FILTER_HEADER
@@ -1126,14 +1165,14 @@ impl RocksDbStore {
             CF_COINS
                 | CF_ADDR_FUNDING_V2
                 | CF_ADDR_SPENDING_V2
-                | CF_OUTPOINT_SPEND
+                | CF_SPENT
                 | CF_TX_LOC
                 | CF_SP_TWEAKS
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
             CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 => 32,
-            CF_OUTPOINT_SPEND => 16,
+            CF_SPENT => 16,
             CF_UNDO | CF_TX_LOC | CF_TXSEQ_TXID => 16,
             CF_BLOCK_INDEX | CF_HEIGHT_INDEX => 8,
             #[cfg(feature = "block-filter-index")]
@@ -1176,7 +1215,7 @@ impl RocksDbStore {
         // initial open.
         let hot = matches!(
             name,
-            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_OUTPOINT_SPEND | CF_UNDO
+            CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_SPENT | CF_UNDO
         );
         let target_file_size = if hot {
             self.tuning.hot_cf_target_file_size_base
@@ -1192,8 +1231,10 @@ impl RocksDbStore {
         // `drop_and_recreate_cf` (used by `clear_*` paths) preserves it.
         if matches!(name, CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
-        } else if matches!(name, CF_OUTPOINT_SPEND) {
-            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        } else if matches!(name, CF_SPENT) {
+            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
+                node_index::TXSEQ_LEN,
+            ));
         }
         cf_opts
     }
@@ -1563,18 +1604,19 @@ impl RocksDbStore {
             }
         }
 
-        // outpoint_spend index: same atomic-with-chainstate contract as
-        // the addr-CFs. Empty-batch fast-path skips the CF handle.
-        if !batch.outpoint_spend_puts.is_empty() || !batch.outpoint_spend_removes.is_empty() {
-            let cf_os = self.cf(CF_OUTPOINT_SPEND);
-            for (op, sref) in &batch.outpoint_spend_puts {
-                let key = node_index::encode_outpoint_key(op);
-                let value = node_index::encode_spend_value(sref);
-                wb.put_cf(&cf_os, key, value);
+        // spent index: same atomic-with-chainstate contract as the
+        // addr-CFs. Empty-batch fast-path skips the CF handle.
+        if !batch.spent_puts.is_empty() || !batch.spent_removes.is_empty() {
+            let cf_sp = self.cf(CF_SPENT);
+            for row in &batch.spent_puts {
+                wb.put_cf(
+                    &cf_sp,
+                    node_index::encode_spent_key(row.funding_txseq, row.vout),
+                    node_index::encode_spent_value(row.spending_txseq, row.vin),
+                );
             }
-            for op in &batch.outpoint_spend_removes {
-                let key = node_index::encode_outpoint_key(op);
-                wb.delete_cf(&cf_os, key);
+            for (funding_txseq, vout) in &batch.spent_removes {
+                wb.delete_cf(&cf_sp, node_index::encode_spent_key(*funding_txseq, *vout));
             }
         }
 
@@ -1656,9 +1698,14 @@ impl RocksDbStore {
                     batch.addr_backfill_temp_puts.len(),
                 ))
             })?;
-            for (outpoint, sh) in &batch.addr_backfill_temp_puts {
+            for (outpoint, sh, funding_txseq) in &batch.addr_backfill_temp_puts {
                 let key = backfill_temp_key(outpoint);
-                wb.put_cf(&cf_temp, key, sh);
+                let mut value = [0u8; TEMP_VALUE_LEN];
+                value[..32].copy_from_slice(sh);
+                value[32..].copy_from_slice(&node_index::encode_txseq(node_index::TxSeq(
+                    *funding_txseq,
+                )));
+                wb.put_cf(&cf_temp, key, value);
             }
         }
 
@@ -2199,7 +2246,7 @@ impl Store for RocksDbStore {
         // reference UTXOs the new chainstate is about to overwrite.
         cfs.push(CF_ADDR_FUNDING_V2);
         cfs.push(CF_ADDR_SPENDING_V2);
-        cfs.push(CF_OUTPOINT_SPEND);
+        cfs.push(CF_SPENT);
         // Cumulative-tx-count index: rebuilt from genesis by the reindex
         // replay's connect_block calls, so clear it here and re-stamp the
         // backfill marker below (same reasoning as the ordinal families).
@@ -2232,7 +2279,7 @@ impl Store for RocksDbStore {
         // H2). Without the address re-stamp the operator's documented
         // remediation (`--reindex-chainstate`) would silently leave
         // Electrum / Esplora address surfaces refusing to bind.
-        self.write_outpoint_spend_complete(true)?;
+        self.write_spent_complete(true)?;
         self.write_tx_loc_complete(true)?;
         self.write_address_index_complete(true)?;
         // The reindex replay repopulates chain_tx from genesis via
@@ -2263,7 +2310,7 @@ impl Store for RocksDbStore {
             CF_TXSEQ_BLOCK,
             CF_ADDR_FUNDING_V2,
             CF_ADDR_SPENDING_V2,
-            CF_OUTPOINT_SPEND,
+            CF_SPENT,
             CF_CHAIN_TX,
             CF_SP_TWEAKS,
         ];
@@ -2282,7 +2329,7 @@ impl Store for RocksDbStore {
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
         // Same completeness markers as `clear_chainstate` —
         // see comment there for the round-2-review H2 rationale.
-        self.write_outpoint_spend_complete(true)?;
+        self.write_spent_complete(true)?;
         self.write_tx_loc_complete(true)?;
         self.write_address_index_complete(true)?;
         self.write_chain_tx_backfill_complete(true)?;
@@ -2493,15 +2540,21 @@ impl Store for RocksDbStore {
         out
     }
 
-    fn outpoint_spend_complete(&self) -> bool {
+    fn spent_complete(&self) -> bool {
         // Default to false when the metadata key is missing — that
         // shouldn't happen post-`open()` but we'd rather under-claim
         // completeness than over-claim it.
-        self.read_outpoint_spend_complete().unwrap_or(false)
+        self.read_spent_complete().unwrap_or(false)
     }
 
-    fn mark_outpoint_spend_complete(&self) -> Result<(), StoreError> {
-        self.write_outpoint_spend_complete(true)
+    fn mark_spent_complete(&self) -> Result<(), StoreError> {
+        self.write_spent_complete(true)
+    }
+
+    fn mark_index_incomplete_after_snapshot(&self) -> Result<(), StoreError> {
+        self.write_spent_complete(false)?;
+        self.write_address_index_complete(false)?;
+        Ok(())
     }
 
     fn tx_index_complete(&self) -> bool {
@@ -2735,30 +2788,92 @@ impl Store for RocksDbStore {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<node_index::SpendingRef>, StoreError> {
-        let cf = self.cf(CF_OUTPOINT_SPEND);
-        let key = node_index::encode_outpoint_key(outpoint);
-        match self.db.get_cf(&cf, key) {
-            Ok(Some(v)) => match node_index::decode_spend_value(&v) {
-                Some(sref) => Ok(Some(sref)),
-                None => {
-                    // A row exists but its value is malformed. Fail
-                    // loud so corruption is visible — silently
-                    // returning None would mask a real spend as
-                    // unspent in the answers `SpendIndex` callers
-                    // rely on (Esplora outspend, gettxspendingprevout).
-                    let msg = format!(
-                        "outpoint_spend: corrupt value for {}:{} (got {} bytes)",
-                        outpoint.txid,
-                        outpoint.vout,
-                        v.len()
-                    );
-                    tracing::error!(target: "storage", "{}", msg);
-                    Err(StoreError::Database(msg))
-                }
-            },
-            Ok(None) => Ok(None),
-            Err(e) => Err(StoreError::Database(e.to_string())),
+        // Three steps where the txid-keyed layout took one: the spent
+        // outpoint's funding transaction has to be named by ordinal
+        // before the row can be found, and the row names its spender the
+        // same way. In exchange the row itself is 16 bytes instead of 76.
+        let Some(funding_txseq) = self.get_tx_seq(&outpoint.txid) else {
+            // No ordinal for the funding transaction means nothing ever
+            // indexed it, which is the same answer as "no spend row".
+            return Ok(None);
+        };
+        let cf = self.cf(CF_SPENT);
+        let key = node_index::encode_spent_key(funding_txseq, outpoint.vout);
+        let raw = match self.db.get_cf(&cf, key) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(StoreError::Database(e.to_string())),
+        };
+        let Some((spending_txseq, vin)) = node_index::decode_spent_value(&raw) else {
+            // A row exists but its value is malformed. Fail loud so
+            // corruption is visible — silently returning None would mask
+            // a real spend as unspent in the answers `SpendIndex` callers
+            // rely on (Esplora outspend).
+            let msg = format!(
+                "spent: corrupt value for {}:{} (got {} bytes)",
+                outpoint.txid,
+                outpoint.vout,
+                raw.len()
+            );
+            tracing::error!(target: "storage", "{}", msg);
+            return Err(StoreError::Database(msg));
+        };
+        Ok(resolve_spending_ref(self, spending_txseq, vin))
+    }
+
+    fn lookup_spends_of_tx(
+        &self,
+        txid: &Txid,
+    ) -> Result<Vec<(u32, node_index::SpendingRef)>, StoreError> {
+        // One txid lookup and one prefix scan for the whole
+        // transaction, which is what the 5-byte ordinal prefix on this
+        // family is for. Esplora's `/tx/:txid/outspends` used to pay one
+        // point read per output.
+        let Some(funding_txseq) = self.get_tx_seq(txid) else {
+            return Ok(Vec::new());
+        };
+        let cf = self.cf(CF_SPENT);
+        let prefix = node_index::encode_txseq(node_index::TxSeq(funding_txseq));
+        let mut rows: Vec<(u32, u64, u32)> = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf, prefix) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => return Err(StoreError::Database(e.to_string())),
+            };
+            // A prefix iterator can run past the prefix it was seeded
+            // with; stop at the first key that is not ours.
+            if k.len() != node_index::SPENT_KEY_LEN || k[..prefix.len()] != prefix {
+                break;
+            }
+            let Some((_, vout)) = node_index::decode_spent_key(&k) else {
+                continue;
+            };
+            let Some((spending_txseq, vin)) = node_index::decode_spent_value(&v) else {
+                continue;
+            };
+            rows.push((vout, spending_txseq, vin));
         }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Resolve every spender in one batch rather than one per row.
+        let seqs: Vec<u64> = rows.iter().map(|(_, seq, _)| *seq).collect();
+        let resolved = crate::index::resolve::resolve_txseqs(self, &seqs);
+        Ok(rows
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|((vout, _, vin), r)| {
+                let r = r?;
+                Some((
+                    vout,
+                    node_index::SpendingRef {
+                        spending_txid: r.txid,
+                        spending_vin: vin,
+                        height: r.height,
+                    },
+                ))
+            })
+            .collect())
     }
 
     fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
@@ -2810,7 +2925,7 @@ impl Store for RocksDbStore {
     fn lookup_backfill_temp(
         &self,
         outpoint: &OutPoint,
-    ) -> Result<Option<crate::index::address::Scripthash>, StoreError> {
+    ) -> Result<Option<(crate::index::address::Scripthash, u64)>, StoreError> {
         let cf = match self.db.cf_handle(CF_ADDR_BACKFILL_TEMP) {
             Some(c) => c,
             None => return Ok(None),
@@ -2818,15 +2933,25 @@ impl Store for RocksDbStore {
         let key = backfill_temp_key(outpoint);
         match self.db.get_cf(&cf, key) {
             Ok(Some(v)) => {
-                if v.len() != 32 {
+                // Exact length, not a minimum. The temp CF is written by
+                // pass 1 and read by pass 2 of the same run, so a value
+                // of any other width is a row from a different layout —
+                // and a short read would hand pass 2 an ordinal it
+                // invented rather than one pass 1 recorded.
+                if v.len() != TEMP_VALUE_LEN {
                     return Err(StoreError::Database(format!(
-                        "corrupt backfill temp value: {} bytes (expected 32)",
+                        "corrupt backfill temp value: {} bytes (expected {TEMP_VALUE_LEN})",
                         v.len()
                     )));
                 }
                 let mut sh = [0u8; 32];
-                sh.copy_from_slice(&v);
-                Ok(Some(sh))
+                sh.copy_from_slice(&v[..32]);
+                let seq = node_index::decode_txseq(&v[32..])
+                    .ok_or_else(|| {
+                        StoreError::Database("corrupt backfill temp ordinal".to_string())
+                    })?
+                    .0;
+                Ok(Some((sh, seq)))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(StoreError::Database(e.to_string())),
@@ -3180,6 +3305,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 7,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
 
         let paired = mk_op(1);
@@ -3302,6 +3428,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
             height,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
@@ -4105,61 +4232,208 @@ mod tests {
         assert!(store.db.get_cf(&cf, encoded).unwrap().is_none());
     }
 
+    /// Seed the rows a `spent` lookup needs to resolve: one block at
+    /// `height` whose transactions start at `first_txseq`, and a
+    /// forward/reverse ordinal pair for each txid given.
+    ///
+    /// The spend index no longer stores the identifiers it returns —
+    /// that is the point — so a fixture has to provide what they resolve
+    /// through, exactly as a connected block would.
+    fn seed_ordinal_block(
+        store: &RocksDbStore,
+        height: u32,
+        first_txseq: u64,
+        txids: &[Txid],
+    ) -> BlockHash {
+        let hash = make_block_hash(0x50 + height as u8);
+        let (_, mut entry) = regtest_genesis_entry();
+        entry.height = height;
+        entry.num_tx = txids.len() as u32;
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((height, hash));
+        batch.txseq_block_puts.push((first_txseq, height));
+        for (i, txid) in txids.iter().enumerate() {
+            batch.tx_loc_puts.push((*txid, first_txseq + i as u64));
+            batch.txseq_txid_puts.push((first_txseq + i as u64, *txid));
+        }
+        store.write_batch(batch).unwrap();
+        hash
+    }
+
+    /// Pass 1 of the address backfill records a scripthash *and* the
+    /// funding transaction's ordinal, because pass 2 needs both and can
+    /// recompute neither without re-reading the funding output's block.
+    ///
+    /// The length check is exact rather than a minimum: a value of any
+    /// other width is a row from a different layout, and reading the
+    /// first 32 bytes of one would hand pass 2 an ordinal it invented.
     #[test]
-    fn test_outpoint_spend_write_batch_put_then_lookup() {
+    fn backfill_temp_value_carries_the_ordinal_and_rejects_v2_length() {
         let (store, _dir) = temp_store(false);
-        let prev = make_outpoint(0x77, 2);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0xab, 0).txid,
-            spending_vin: 4,
-            height: 100,
-        };
+        store.create_backfill_temp_cf().unwrap();
+        let op = make_outpoint(0x5e, 3);
+        let sh = [0x7a; 32];
 
         let mut batch = StoreBatch::default();
-        batch.outpoint_spend_puts.push((prev, sref));
+        batch.addr_backfill_temp_puts.push((op, sh, 4_242));
         store.write_batch(batch).unwrap();
 
-        let got = store.lookup_spend(&prev).unwrap();
-        assert_eq!(got, Some(sref));
+        assert_eq!(
+            store.lookup_backfill_temp(&op).unwrap(),
+            Some((sh, 4_242)),
+            "pass 2 reads back both halves"
+        );
+
+        // A bare 32-byte value — the shape pass 1 wrote before the
+        // ordinal was added — must be refused, not silently truncated.
+        let cf = store.cf(CF_ADDR_BACKFILL_TEMP);
+        store
+            .db
+            .put_cf(&cf, backfill_temp_key(&op), sh)
+            .expect("inject a previous-layout row");
+        match store.lookup_backfill_temp(&op) {
+            Err(StoreError::Database(msg)) => assert!(
+                msg.contains("corrupt backfill temp value"),
+                "expected a corruption diagnostic, got {msg}"
+            ),
+            other => panic!("a 32-byte value must be refused, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_outpoint_spend_write_batch_remove_clears_row() {
+    fn test_spent_write_batch_put_then_lookup() {
         let (store, _dir) = temp_store(false);
-        let prev = make_outpoint(0x66, 0);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0x99, 0).txid,
-            spending_vin: 0,
-            height: 7,
-        };
+        let funding = make_outpoint(0x77, 2);
+        let spender = make_outpoint(0xab, 0).txid;
+        // Funding transaction at ordinal 10 (height 5), spender at
+        // ordinal 20 (height 100).
+        seed_ordinal_block(&store, 5, 10, &[funding.txid]);
+        seed_ordinal_block(&store, 100, 20, &[spender]);
+
+        let mut batch = StoreBatch::default();
+        batch.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 10,
+            vout: funding.vout,
+            spending_txseq: 20,
+            vin: 4,
+        });
+        store.write_batch(batch).unwrap();
+
+        // The row carries two ordinals and sixteen bytes; what comes
+        // back is the txid and height the caller expects.
+        assert_eq!(
+            store.lookup_spend(&funding).unwrap(),
+            Some(node_index::SpendingRef {
+                spending_txid: spender,
+                spending_vin: 4,
+                height: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn test_spent_write_batch_remove_clears_row() {
+        let (store, _dir) = temp_store(false);
+        let funding = make_outpoint(0x66, 0);
+        let spender = make_outpoint(0x99, 0).txid;
+        seed_ordinal_block(&store, 1, 3, &[funding.txid]);
+        seed_ordinal_block(&store, 7, 9, &[spender]);
 
         let mut put = StoreBatch::default();
-        put.outpoint_spend_puts.push((prev, sref));
+        put.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 3,
+            vout: 0,
+            spending_txseq: 9,
+            vin: 0,
+        });
         store.write_batch(put).unwrap();
-        assert!(store.lookup_spend(&prev).unwrap().is_some());
+        assert!(store.lookup_spend(&funding).unwrap().is_some());
 
         let mut rm = StoreBatch::default();
-        rm.outpoint_spend_removes.push(prev);
+        rm.spent_removes.push((3, 0));
         store.write_batch(rm).unwrap();
-        assert_eq!(store.lookup_spend(&prev).unwrap(), None);
+        assert_eq!(store.lookup_spend(&funding).unwrap(), None);
+    }
+
+    /// One prefix scan returns every spend of a transaction, which is
+    /// what the 5-byte ordinal key prefix is for. Unspent outputs are
+    /// absent rather than present-and-empty.
+    #[test]
+    fn test_spent_lookup_spends_of_tx_returns_every_spent_output() {
+        let (store, _dir) = temp_store(false);
+        let funding = make_outpoint(0x21, 0).txid;
+        let spender_a = make_outpoint(0x22, 0).txid;
+        let spender_b = make_outpoint(0x23, 0).txid;
+        seed_ordinal_block(&store, 1, 100, &[funding]);
+        seed_ordinal_block(&store, 2, 200, &[spender_a, spender_b]);
+
+        let mut batch = StoreBatch::default();
+        // vouts 0 and 2 spent; vout 1 left unspent.
+        batch.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 100,
+            vout: 0,
+            spending_txseq: 200,
+            vin: 0,
+        });
+        batch.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 100,
+            vout: 2,
+            spending_txseq: 201,
+            vin: 1,
+        });
+        // A spend of a *different* funding transaction, to prove the
+        // prefix scan stops at its own prefix.
+        batch.spent_puts.push(node_index::SpentRow {
+            funding_txseq: 101,
+            vout: 0,
+            spending_txseq: 200,
+            vin: 3,
+        });
+        store.write_batch(batch).unwrap();
+
+        let got = store.lookup_spends_of_tx(&funding).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    0,
+                    node_index::SpendingRef {
+                        spending_txid: spender_a,
+                        spending_vin: 0,
+                        height: 2
+                    }
+                ),
+                (
+                    2,
+                    node_index::SpendingRef {
+                        spending_txid: spender_b,
+                        spending_vin: 1,
+                        height: 2
+                    }
+                ),
+            ],
+            "only this transaction's spent outputs, in vout order"
+        );
     }
 
     #[test]
-    fn test_outpoint_spend_lookup_unknown_returns_none() {
+    fn test_spent_lookup_unknown_returns_none() {
         let (store, _dir) = temp_store(false);
         let unknown = make_outpoint(0xff, 9);
         assert_eq!(store.lookup_spend(&unknown).unwrap(), None);
     }
 
     #[test]
-    fn test_outpoint_spend_lookup_on_corrupt_value_returns_error() {
+    fn test_spent_lookup_on_corrupt_value_returns_error() {
         let (store, _dir) = temp_store(false);
         let prev = make_outpoint(0xaa, 0);
+        seed_ordinal_block(&store, 1, 42, &[prev.txid]);
         // Inject a malformed value (wrong length) directly via the CF
         // handle, bypassing the codec. This simulates an on-disk
         // corruption or a future codec mismatch.
-        let cf = store.cf(CF_OUTPOINT_SPEND);
-        let key = node_index::encode_outpoint_key(&prev);
+        let cf = store.cf(CF_SPENT);
+        let key = node_index::encode_spent_key(42, prev.vout);
         store
             .db
             .put_cf(&cf, key, b"too-short")
@@ -4178,14 +4452,14 @@ mod tests {
     }
 
     #[test]
-    fn test_outpoint_spend_complete_true_on_fresh_datadir() {
+    fn test_spent_complete_true_on_fresh_datadir() {
         let (store, _dir) = temp_store(false);
         // Fresh datadir → marker stamped true on first open.
-        assert!(store.outpoint_spend_complete());
+        assert!(store.spent_complete());
     }
 
     #[test]
-    fn test_outpoint_spend_complete_false_on_legacy_upgrade() {
+    fn test_spent_complete_false_on_legacy_upgrade() {
         // Simulate a pre-#99 datadir: addr_spending rows present, no
         // outpoint_spend marker. Open() must detect and stamp false.
         let dir = tempfile::tempdir().unwrap();
@@ -4208,15 +4482,15 @@ mod tests {
             let cf = store.cf(CF_METADATA);
             store
                 .db
-                .delete_cf(&cf, OUTPOINT_SPEND_COMPLETE_KEY)
+                .delete_cf(&cf, SPENT_COMPLETE_KEY)
                 .unwrap();
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        assert!(!store.outpoint_spend_complete());
+        assert!(!store.spent_complete());
     }
 
     #[test]
-    fn test_outpoint_spend_complete_marker_persists_across_reopen() {
+    fn test_spent_complete_marker_persists_across_reopen() {
         // Once stamped false, the warning must keep firing on each
         // restart even after live connect_block has appended new
         // outpoint_spend rows. (Round-2 H6 contract.)
@@ -4225,21 +4499,21 @@ mod tests {
             let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
             // Force the marker false via the helper; this is what
             // open() does when it detects a legacy datadir.
-            store.write_outpoint_spend_complete(false).unwrap();
+            store.write_spent_complete(false).unwrap();
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        assert!(!store.outpoint_spend_complete());
+        assert!(!store.spent_complete());
     }
 
     #[test]
-    fn test_outpoint_spend_complete_after_clear_chainstate() {
+    fn test_spent_complete_after_clear_chainstate() {
         let (store, _dir) = temp_store(false);
-        store.write_outpoint_spend_complete(false).unwrap();
-        assert!(!store.outpoint_spend_complete());
+        store.write_spent_complete(false).unwrap();
+        assert!(!store.spent_complete());
         store.clear_chainstate().unwrap();
         // -reindex-chainstate stamps complete because every block
         // will be re-applied via connect_block.
-        assert!(store.outpoint_spend_complete());
+        assert!(store.spent_complete());
     }
 
     // ── address_index.complete marker (round-1 review H2) ────────
@@ -4296,6 +4570,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: 100,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
         batch.coin_puts.push((outpoint, coin));
         store.write_batch(batch).unwrap();
@@ -4344,7 +4619,7 @@ mod tests {
         // Sister markers should also be true (sanity check the
         // existing contract).
         assert!(store.tx_index_complete());
-        assert!(store.outpoint_spend_complete());
+        assert!(store.spent_complete());
     }
 
     #[test]
@@ -4468,24 +4743,34 @@ mod tests {
     }
 
     #[test]
-    fn test_outpoint_spend_persists_across_reopen() {
+    fn test_spent_persists_across_reopen() {
         // Verifies the CF descriptor is registered on subsequent opens
         // (so an existing chainstate-on-disk doesn't fail to mount).
         let dir = tempfile::tempdir().unwrap();
         let prev = make_outpoint(0x33, 1);
-        let sref = node_index::SpendingRef {
-            spending_txid: make_outpoint(0x44, 0).txid,
-            spending_vin: 2,
-            height: 50,
-        };
+        let spender = make_outpoint(0x44, 0).txid;
         {
             let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            seed_ordinal_block(&store, 1, 5, &[prev.txid]);
+            seed_ordinal_block(&store, 50, 60, &[spender]);
             let mut batch = StoreBatch::default();
-            batch.outpoint_spend_puts.push((prev, sref));
+            batch.spent_puts.push(node_index::SpentRow {
+                funding_txseq: 5,
+                vout: prev.vout,
+                spending_txseq: 60,
+                vin: 2,
+            });
             store.write_batch(batch).unwrap();
         }
         let store2 = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        assert_eq!(store2.lookup_spend(&prev).unwrap(), Some(sref));
+        assert_eq!(
+            store2.lookup_spend(&prev).unwrap(),
+            Some(node_index::SpendingRef {
+                spending_txid: spender,
+                spending_vin: 2,
+                height: 50,
+            })
+        );
     }
 
     #[test]

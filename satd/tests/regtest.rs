@@ -5311,7 +5311,7 @@ fn test_getstoragefootprint_shape_and_cli() {
         "chain_tx",
         "addr_funding_v2",
         "addr_spending_v2",
-        "outpoint_spend",
+        "spent",
         "sp_tweaks",
     ] {
         assert!(
@@ -9168,6 +9168,114 @@ fn test_address_index_backfill_duplicate_rpc_race_rejected() {
     node.stop();
 }
 
+/// The spend index no longer stores the identifiers it answers with:
+/// a row is sixteen bytes naming two transaction ordinals, and the
+/// txid and height come back through the ordinal map. The observable
+/// answer must be unchanged, and it must survive the rebuild that
+/// migrates a datadir onto the new layout.
+///
+/// Byte-for-byte across a `-reindex-chainstate`, because that is the
+/// assertion a wrong resolution cannot pass: a row that resolved to the
+/// wrong transaction would still look well-formed on its own.
+#[test]
+fn test_esplora_outspends_match_after_ordinal_spent_index() {
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+    let datadir = fresh_test_datadir("satd-outspend-ordinals");
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--esplora=1", &bind, "--txindex=1", &port_arg],
+    );
+
+    // Mine to a key we hold so the coinbase can be spent.
+    let wallet = DeterministicWallet::from_secret([0x5a; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![
+            serde_json::json!(110),
+            serde_json::json!(wallet.address.to_string()),
+        ],
+    );
+    let cb_txid = common::block1_coinbase_txid(&node);
+
+    // Spend block 1's coinbase and confirm it.
+    let dest = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let dest_script = dest
+        .parse::<bitcoin::Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let (raw_hex, spend_txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest_script, 1_000);
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(dest)],
+    );
+
+    let outspends_before = esplora_get(esplora_port, &format!("/tx/{}/outspends", cb_txid))
+        .text()
+        .expect("outspends body");
+    let one_before = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb_txid))
+        .text()
+        .expect("outspend body");
+
+    let parsed: serde_json::Value = serde_json::from_str(&outspends_before).unwrap();
+    assert_eq!(parsed[0]["spent"], true, "premise: the coinbase was spent");
+    assert_eq!(
+        parsed[0]["txid"].as_str(),
+        Some(spend_txid.as_str()),
+        "the index must resolve back to the spending txid: {outspends_before}"
+    );
+    assert_eq!(parsed[0]["status"]["block_height"].as_u64(), Some(111));
+
+    node.stop();
+
+    // Rebuild the whole chainstate and ask again.
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--esplora=1",
+            &bind,
+            "--txindex=1",
+            &port_arg,
+            "--reindex-chainstate",
+        ],
+    );
+    let outspends_after = esplora_get(esplora_port, &format!("/tx/{}/outspends", cb_txid))
+        .text()
+        .expect("outspends body");
+    let one_after = esplora_get(esplora_port, &format!("/tx/{}/outspend/0", cb_txid))
+        .text()
+        .expect("outspend body");
+
+    assert_eq!(
+        outspends_before, outspends_after,
+        "/outspends must be byte-identical across the rebuild"
+    );
+    assert_eq!(
+        one_before, one_after,
+        "/outspend/:vout must be byte-identical across the rebuild"
+    );
+
+    // And the Core-compat index surface reports the spend index synced,
+    // under the JSON name it has always used.
+    let info = node.rpc_call("getsatdindexinfo").unwrap();
+    assert_eq!(
+        info["result"]["address"]["outpoint_spend"]["complete"], true,
+        "the spend index must be complete after a full replay: {info}"
+    );
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 // ── Esplora REST scaffolding (PR 2) ──
 
 /// Helper: GET a path from the Esplora server and return body as String.
@@ -9964,14 +10072,25 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let datadir = fresh_test_datadir("satd-legacy-txi");
 
-    // Phase 1: sync with --esplora=0 (no txindex implication, no
-    // tx_index rows written).
+    // Phase 1: sync with --esplora=0 and BOTH transaction-index
+    // consumers off, so no ordinal rows are written.
+    //
+    // `--addressindex=0` is load-bearing since the index moved onto
+    // transaction ordinals: the address index writes the same families
+    // the transaction index reads, so a node running `--addressindex=1
+    // --txindex=0` keeps them complete and no longer needs a reindex to
+    // turn Esplora on. Only a node that ran with neither has the gap
+    // this gate is for.
     let rpcport1 = find_available_port();
     let p2p_port1 = find_available_port();
     let mut node1 = TestNode::start_with_datadir(
         &datadir,
         rpcport1,
-        &["--esplora=0", &format!("--port={}", p2p_port1)],
+        &[
+            "--esplora=0",
+            "--addressindex=0",
+            &format!("--port={}", p2p_port1),
+        ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
@@ -9998,8 +10117,8 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("tx_index") && stderr.contains("incomplete"),
-        "expected tx_index incomplete diag in stderr; got: {stderr}"
+        stderr.contains("tx_loc") && stderr.contains("incomplete"),
+        "expected a tx_loc incomplete diag in stderr; got: {stderr}"
     );
     assert!(
         stderr.contains("--reindex-chainstate"),
@@ -10018,29 +10137,40 @@ fn test_esplora_refuses_partial_txindex_history() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let datadir = fresh_test_datadir("satd-partial-txi");
 
-    // Phase 1: legacy sync with --esplora=0 --txindex=0. tx_index
-    // stays empty; the marker is invalidated to false on first
-    // block-connect under txindex=off.
+    // Phase 1: legacy sync with --esplora=0 and both transaction-index
+    // consumers off. The ordinal families stay empty; the marker is
+    // invalidated to false on the first block connected that way. See
+    // `test_esplora_refuses_legacy_txindex_incomplete_datadir` for why
+    // `--addressindex=0` is part of the premise.
     let rpcport1 = find_available_port();
     let p2p_port1 = find_available_port();
     let mut node1 = TestNode::start_with_datadir(
         &datadir,
         rpcport1,
-        &["--esplora=0", &format!("--port={}", p2p_port1)],
+        &[
+            "--esplora=0",
+            "--addressindex=0",
+            &format!("--port={}", p2p_port1),
+        ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     node1.stop();
 
-    // Phase 2: enable --txindex=1 (still --esplora=0). This writes
-    // ONE block's tx_index rows on top of the empty CF, but doesn't
+    // Phase 2: enable --txindex=1 (still --esplora=0). This writes ONE
+    // block's ordinal rows on top of the empty families, but doesn't
     // change the marker (it's stamped false from phase 1).
     let rpcport2 = find_available_port();
     let p2p_port2 = find_available_port();
     let mut node2 = TestNode::start_with_datadir(
         &datadir,
         rpcport2,
-        &["--esplora=0", "--txindex", &format!("--port={}", p2p_port2)],
+        &[
+            "--esplora=0",
+            "--txindex",
+            "--addressindex=0",
+            &format!("--port={}", p2p_port2),
+        ],
     );
     node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     node2.stop();
@@ -10066,7 +10196,7 @@ fn test_esplora_refuses_partial_txindex_history() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        stderr.contains("tx_loc") && stderr.contains("incomplete"),
         "expected incomplete diag in stderr; got: {stderr}"
     );
 }
@@ -10089,20 +10219,32 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
     let mut node1 = TestNode::start_with_datadir(
         &datadir,
         rpcport1,
-        &["--esplora=0", "--txindex", &format!("--port={}", p2p_port1)],
+        &[
+            "--esplora=0",
+            "--txindex",
+            "--addressindex=0",
+            &format!("--port={}", p2p_port1),
+        ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     node1.stop();
 
-    // Phase 2: connect ONE more block with --txindex=0. This MUST
-    // flip the marker to false via the connect-time invalidation.
+    // Phase 2: connect ONE more block with both transaction-index
+    // consumers off. This MUST flip the marker to false via the
+    // connect-time invalidation. `--addressindex=0` is part of the
+    // premise: the address index writes the same families, so with it
+    // on there would be no gap to invalidate.
     let rpcport2 = find_available_port();
     let p2p_port2 = find_available_port();
     let mut node2 = TestNode::start_with_datadir(
         &datadir,
         rpcport2,
-        &["--esplora=0", &format!("--port={}", p2p_port2)],
+        &[
+            "--esplora=0",
+            "--addressindex=0",
+            &format!("--port={}", p2p_port2),
+        ],
     );
     node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     node2.stop();
@@ -10126,7 +10268,7 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("tx_index") && stderr.contains("incomplete"),
+        stderr.contains("tx_loc") && stderr.contains("incomplete"),
         "expected incomplete diag in stderr; got: {stderr}"
     );
 }
