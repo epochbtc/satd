@@ -100,9 +100,10 @@ expect Core's peer set to carry over.
 **Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families
-(`block_index`, `coins`, `tx_index`, `addr_funding_v2`,
-`addr_spending_v2`, `block_filters`, `block_filter_headers`,
-`cf_meta`, `outpoint_spend`, `undo`, `tip`, `height_hash`). Index updates ride the same
+(`block_index`, `coins`, `tx_loc`, `txseq_txid`, `txseq_block`,
+`addr_funding_v2`, `addr_spending_v2`, `block_filters`,
+`block_filter_headers`, `cf_meta`, `spent`, `undo`, `tip`,
+`height_hash`). Index updates ride the same
 `WriteBatch` as the connect-block / disconnect-block path, so
 protocol handlers cannot observe an index out of sync with the tip.
 This is the architectural foundation for native Esplora and Electrum

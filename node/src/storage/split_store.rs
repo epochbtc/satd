@@ -350,6 +350,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 

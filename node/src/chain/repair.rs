@@ -327,7 +327,7 @@ pub fn repair_lost_connect_delta(
         tx_index_rows: tx_rows.len(),
         addr_funding_rows: batch.addr_funding_puts.len(),
         addr_spending_rows: batch.addr_spending_puts.len(),
-        outpoint_spend_rows: batch.outpoint_spend_puts.len(),
+        outpoint_spend_rows: batch.spent_puts.len(),
         chain_tx_rewrites,
         applied: apply,
     };
@@ -495,6 +495,7 @@ mod tests {
                 script_pubkey: bitcoin::ScriptBuf::new(),
                 height: 0,
                 coinbase: false,
+                txseq: node_index::TXSEQ_UNKNOWN,
             },
         ));
         store.write_batch(batch).unwrap();
@@ -567,6 +568,7 @@ mod tests {
                 script_pubkey: block2.txdata[0].output[0].script_pubkey.clone(),
                 height: 2,
                 coinbase: true,
+                txseq: node_index::TXSEQ_UNKNOWN,
             },
         ));
         batch2.undo_puts.push((block2_hash, crate::storage::undo::UndoData::default()));

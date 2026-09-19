@@ -29,8 +29,8 @@ pub use keys::{
     reconstruct_funding_key, reconstruct_spending_key, scripthash_of,
 };
 pub use spend_keys::{
-    OUTPOINT_KEY_LEN, SPEND_VALUE_LEN, SpendingRef, decode_outpoint_key, decode_spend_value,
-    encode_outpoint_key, encode_spend_value,
+    SPENT_KEY_LEN, SPENT_VALUE_LEN, SpendingRef, SpentRow, decode_spent_key, decode_spent_value,
+    encode_spent_key, encode_spent_value,
 };
 pub use spend_trait::SpendIndex;
 pub use subscribe::{SubscribeError, SubscriptionRegistry, status_hash};

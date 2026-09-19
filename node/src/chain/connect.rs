@@ -595,6 +595,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
         let txid = txid_slice[tx_idx];
+        // This transaction's chain-order ordinal. Every index row it
+        // produces — its own location rows, the coins it creates, the
+        // spends it makes — is keyed on it.
+        let txseq = first_txseq + tx_idx as u64;
 
         // Context-free transaction checks
         check_transaction(tx)?;
@@ -763,17 +767,66 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                     outpoint,
                 );
 
-                // outpoint_spend index: keyed by the consumed outpoint
-                // so Esplora outspend / gettxspendingprevout can answer
-                // in O(1). Same flag, same atomic batch.
-                crate::index::outpoint_spend::emit::emit_spend(
-                    &mut batch,
-                    address_index,
-                    height,
-                    txid,
-                    in_idx as u32,
-                    outpoint,
-                );
+                // spent index: keyed by the consumed output, named by
+                // the ordinal of the transaction that created it, so
+                // Esplora outspend can answer in O(1). Same flag, same
+                // atomic batch.
+                //
+                // The funding ordinal rides in the coin, which this loop
+                // already has — the alternative is a bloom-filtered
+                // point read per input against a family the size of the
+                // chain's transaction count, paid once for every input
+                // ever mined.
+                //
+                // `TXSEQ_UNKNOWN` means the coin came from an AssumeUTXO
+                // snapshot, whose format carries no ordinal. Fall back to
+                // one lookup; on a miss the funding block has not been
+                // validated by the background chainstate yet, so skip the
+                // row and count it. That is correct rather than merely
+                // tolerable: an AssumeUTXO node's address index is
+                // incomplete until the operator runs `backfillindex
+                // address` after validation completes. That backfill
+                // pins the chain tip at the moment it starts and walks
+                // every block from genesis to it — not just the blocks
+                // below the snapshot base — writing the ordinal rows of
+                // every transaction on the way (pass 1) and then the
+                // rows for every spend (pass 2). So a spend skipped here
+                // is rewritten by it, and once it has run the lookup
+                // above resolves every snapshot coin.
+                //
+                // The whole block is gated on the index being on: the
+                // fallback is a point read, and a validating-only node
+                // would be paying it per snapshot coin for a row it is
+                // going to discard.
+                if address_index.enabled {
+                    let funding_txseq = if coin.txseq != node_index::TXSEQ_UNKNOWN {
+                        Some(coin.txseq)
+                    } else {
+                        store.get_tx_seq(&outpoint.txid)
+                    };
+                    match funding_txseq {
+                        Some(funding_txseq) => {
+                            crate::index::outpoint_spend::emit::emit_spend(
+                                &mut batch,
+                                address_index,
+                                funding_txseq,
+                                outpoint.vout,
+                                txseq,
+                                in_idx as u32,
+                            );
+                        }
+                        None => {
+                            crate::index::address::stats::inc_unresolved_spends();
+                            tracing::debug!(
+                                outpoint = %outpoint,
+                                height,
+                                "spend index: no ordinal for the funding transaction \
+                                 (AssumeUTXO coin spent before background validation \
+                                 reached its block); skipping the row"
+                            );
+                        }
+                    }
+                }
             }
 
             // Sum outputs
@@ -866,6 +919,11 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                     script_pubkey: output.script_pubkey.clone(),
                     height,
                     coinbase: is_coinbase,
+                    // The ordinal of the transaction creating this
+                    // output. Carried in the coin so that when it is
+                    // spent, the connect path has the funding ordinal
+                    // already in hand and never looks one up.
+                    txseq,
                 };
                 intra_block_coins.insert(outpoint, coin.clone());
                 batch.coin_puts.push((outpoint, coin));
@@ -888,7 +946,6 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         // neither `-txindex` nor `-addressindex` is on; emitting them
         // unconditionally here keeps `connect_block` free of index
         // configuration, as it already is for the address rows.
-        let txseq = first_txseq + tx_idx as u64;
         batch.tx_loc_puts.push((txid, txseq));
         batch.txseq_txid_puts.push((txseq, txid));
 
@@ -1474,6 +1531,7 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
             height: coin_height,
             coinbase,
+            txseq: node_index::TXSEQ_UNKNOWN,
         };
 
         let mut batch = StoreBatch::default();
@@ -2048,6 +2106,7 @@ mod tests {
                     script_pubkey: bitcoin::ScriptBuf::new(),
                     height: 0,
                     coinbase: false,
+                    txseq: node_index::TXSEQ_UNKNOWN,
                 },
             ));
             store.write_batch(seed_batch).unwrap();
@@ -2086,6 +2145,207 @@ mod tests {
             (0..total as u64).collect::<Vec<_>>(),
             "the ordinal series must be dense with no gaps or reuse"
         );
+    }
+
+    /// Give `store` a coin at `outpoint` whose funding transaction has
+    /// the given ordinal, and the ordinal rows to resolve it.
+    fn seed_resolvable_coin(store: &InMemoryStore, outpoint: OutPoint, funding_txseq: u64) {
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((
+            outpoint,
+            Coin {
+                amount: 50_000_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+                height: 0,
+                coinbase: false,
+                txseq: funding_txseq,
+            },
+        ));
+        batch.tx_loc_puts.push((outpoint.txid, funding_txseq));
+        batch.txseq_txid_puts.push((funding_txseq, outpoint.txid));
+        store.write_batch(batch).unwrap();
+    }
+
+    /// The `spent` row names both ends by ordinal. The funding end comes
+    /// out of the coin — which is why the coin carries it — and the
+    /// spending end from the connecting block's own numbering.
+    #[test]
+    fn connect_writes_spent_rows_keyed_on_the_funding_ordinal() {
+        let store = test_store();
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
+            ),
+            vout: 0,
+        };
+        const FUNDING_SEQ: u64 = 77;
+        seed_resolvable_coin(&store, outpoint, FUNDING_SEQ);
+
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        let first_txseq = batch.txseq_block_puts[0].0;
+        assert_eq!(
+            batch.spent_puts,
+            vec![node_index::SpentRow {
+                funding_txseq: FUNDING_SEQ,
+                vout: outpoint.vout,
+                // The spending transaction is at position 1 (after the
+                // coinbase) of this block.
+                spending_txseq: first_txseq + 1,
+                vin: 0,
+            }],
+            "the key names the funding transaction, the value the spender"
+        );
+    }
+
+    /// An AssumeUTXO coin carries no ordinal and, until background
+    /// validation reaches its funding block, there is nothing to look
+    /// one up in. Writing a row anyway would have to invent an ordinal,
+    /// and ordinal 0 is the genesis coinbase's — so the spend would be
+    /// recorded against genesis, indistinguishable from a real row.
+    /// Skip it and count instead; `backfillindex address` fills the gap.
+    #[test]
+    fn connect_skips_spent_row_for_unknown_coin_without_tx_loc() {
+        let store = test_store();
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x43; 32]),
+            ),
+            vout: 0,
+        };
+        // A snapshot coin: sentinel ordinal, and no `tx_loc` row.
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((
+            outpoint,
+            Coin {
+                amount: 50_000_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+                height: 0,
+                coinbase: false,
+                txseq: node_index::TXSEQ_UNKNOWN,
+            },
+        ));
+        store.write_batch(seed).unwrap();
+
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let before = crate::index::address::stats::snapshot().unresolved_spends;
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        assert!(
+            batch.spent_puts.is_empty(),
+            "no ordinal is available, so no row may be written"
+        );
+        // The counter is process-wide and other tests in this binary
+        // skip spends too, so only the lower bound is assertable here.
+        // The claim that matters — no row is written — is the batch
+        // assertion above; this pins that the skip is *observable*,
+        // which is the only sign an operator gets that the index has a
+        // gap to backfill.
+        assert!(
+            crate::index::address::stats::snapshot().unresolved_spends > before,
+            "the skip must be counted"
+        );
+        // The block still connects and its address-index spending row is
+        // still written: that row keys on the *spending* transaction,
+        // which this block numbers itself.
+        assert_eq!(batch.addr_spending_puts.len(), 1);
+    }
+
+    /// The same coin, but its funding transaction has been indexed by
+    /// the background validator in the meantime. The fallback lookup
+    /// finds the ordinal and the row is written.
+    #[test]
+    fn connect_resolves_unknown_coin_via_tx_loc_when_present() {
+        let store = test_store();
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x44; 32]),
+            ),
+            vout: 0,
+        };
+        const FUNDING_SEQ: u64 = 91;
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((
+            outpoint,
+            Coin {
+                amount: 50_000_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+                height: 0,
+                coinbase: false,
+                txseq: node_index::TXSEQ_UNKNOWN,
+            },
+        ));
+        // The ordinal rows the background validator would have written.
+        seed.tx_loc_puts.push((outpoint.txid, FUNDING_SEQ));
+        seed.txseq_txid_puts.push((FUNDING_SEQ, outpoint.txid));
+        store.write_batch(seed).unwrap();
+
+        let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
+        let cfg = crate::index::address::AddressIndexConfig::default();
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &cfg,
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        assert_eq!(batch.spent_puts.len(), 1);
+        assert_eq!(batch.spent_puts[0].funding_txseq, FUNDING_SEQ);
     }
 
     /// The parent's cumulative transaction count is the only source of
@@ -3396,13 +3656,18 @@ mod tests {
         assert_eq!(row.height, 1);
         assert_eq!(row.prev_outpoint, outpoint);
 
-        // outpoint_spend rides the same hook: one row per consumed UTXO,
-        // keyed by the spent outpoint.
-        assert_eq!(batch.outpoint_spend_puts.len(), 1);
-        let (op, sref) = &batch.outpoint_spend_puts[0];
-        assert_eq!(*op, outpoint);
-        assert_eq!(sref.height, 1);
-        assert_eq!(sref.spending_vin, 0);
+        // The spend index rides the same hook: one row per consumed
+        // UTXO, keyed by the ordinal of the transaction that created it.
+        //
+        // The fixture's coin carries `TXSEQ_UNKNOWN` and its funding
+        // transaction has no `tx_loc` row, which is the AssumeUTXO
+        // shape — so the row is deliberately skipped rather than written
+        // against a guessed ordinal. `connect_writes_spent_rows_keyed_on_the_funding_ordinal`
+        // covers the resolvable case.
+        assert!(
+            batch.spent_puts.is_empty(),
+            "an unresolvable funding ordinal must skip the row, not invent one"
+        );
     }
 
     #[test]
@@ -3437,7 +3702,7 @@ mod tests {
 
         assert!(batch.addr_funding_puts.is_empty());
         assert!(batch.addr_spending_puts.is_empty());
-        assert!(batch.outpoint_spend_puts.is_empty());
+        assert!(batch.spent_puts.is_empty());
     }
 
     #[test]

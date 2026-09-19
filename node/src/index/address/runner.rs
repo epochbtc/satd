@@ -415,22 +415,27 @@ impl BackfillRunner {
                 if h <= spending_high && !tx.is_coinbase() {
                     for (vin, input) in tx.input.iter().enumerate() {
                         let prev = input.previous_output;
-                        // outpoint_spend remove is keyed by prev_outpoint
-                        // alone, so it can be emitted unconditionally —
-                        // a temp-CF miss only affects the addr_spending
-                        // remove (which needs the scripthash). Pushing
-                        // these together used to gate the outpoint_spend
-                        // remove on the same lookup; that allowed stale
-                        // outpoint-spend rows to survive reorg cleanup
-                        // when the temp CF was partial/corrupt
-                        // (review M7).
-                        batch.outpoint_spend_removes.push(prev);
-                        total_spending_removes += 1;
-
-                        let sh = match chain.store_ref().lookup_backfill_temp(&prev) {
-                            Ok(Some(sh)) => sh,
+                        // Both removes now need the temp CF: the
+                        // address-index remove needs the scripthash and
+                        // the spend remove needs the funding ordinal,
+                        // and both are in the one value.
+                        //
+                        // A miss therefore skips both, where the
+                        // outpoint-keyed remove used to be emitted
+                        // unconditionally (review M7). That is not a
+                        // regression: a temp-CF miss means pass 1 never
+                        // recorded this output, so pass 2 never wrote
+                        // either row for it, and there is nothing to
+                        // remove. An unconditional remove against an
+                        // ordinal this code cannot know would name some
+                        // other transaction's output.
+                        let (sh, funding_txseq) = match chain.store_ref().lookup_backfill_temp(&prev)
+                        {
+                            Ok(Some(v)) => v,
                             Ok(None) | Err(_) => continue,
                         };
+                        batch.spent_removes.push((funding_txseq, prev.vout));
+                        total_spending_removes += 1;
                         batch.addr_spending_removes.push(AddrSpendingKey {
                             scripthash: sh,
                             height: h,
@@ -556,9 +561,11 @@ impl BackfillRunner {
                         vout: vout as u32,
                         amount_sat: output.value.to_sat(),
                     });
-                    batch
-                        .addr_backfill_temp_puts
-                        .push((OutPoint { txid, vout: vout as u32 }, sh));
+                    batch.addr_backfill_temp_puts.push((
+                        OutPoint { txid, vout: vout as u32 },
+                        sh,
+                        txseq,
+                    ));
                 }
             }
             batch.txseq_block_puts.push((first_txseq, h));
@@ -629,12 +636,23 @@ impl BackfillRunner {
 
             let block = self.read_via_snapshot(snapshot, h)?;
 
+            // This block's ordinal base, for the spending end of each
+            // `spent` row. Same source and same failure mode as pass 1.
+            let spending_first_txseq = self
+                .chain
+                .store_ref()
+                .get_cumulative_tx_count(&snapshot.hashes[(h - 1) as usize])
+                .ok_or(BackfillError::ChainTxGap { height: h })?;
+
             let mut batch = StoreBatch::default();
-            for tx in block.txdata.iter().filter(|t| !t.is_coinbase()) {
+            for (tx_idx, tx) in block.txdata.iter().enumerate() {
+                if tx.is_coinbase() {
+                    continue;
+                }
                 let txid = tx.compute_txid();
                 for (vin, input) in tx.input.iter().enumerate() {
                     let prev = input.previous_output;
-                    let sh = self
+                    let (sh, funding_txseq) = self
                         .chain
                         .store_ref()
                         .lookup_backfill_temp(&prev)?
@@ -646,17 +664,17 @@ impl BackfillRunner {
                         vin: vin as u32,
                         prev_outpoint: prev,
                     });
-                    // outpoint_spend rides the same pass-2 walk: one row
+                    // The spend index rides the same pass-2 walk: one row
                     // per consumed UTXO, written atomically with the
-                    // address-index spending row.
-                    batch.outpoint_spend_puts.push((
-                        prev,
-                        node_index::SpendingRef {
-                            spending_txid: txid,
-                            spending_vin: vin as u32,
-                            height: h,
-                        },
-                    ));
+                    // address-index spending row. Both ends are named by
+                    // ordinal — the funding end from the temp CF, the
+                    // spending end from this block's own numbering.
+                    batch.spent_puts.push(node_index::SpentRow {
+                        funding_txseq,
+                        vout: prev.vout,
+                        spending_txseq: spending_first_txseq + tx_idx as u64,
+                        vin: vin as u32,
+                    });
                 }
             }
             batch.backfill_cursor_advance = Some(BackfillCursorWrite {

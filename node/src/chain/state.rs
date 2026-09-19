@@ -1390,6 +1390,20 @@ impl ChainState {
         }
         self.headers_tip_height
             .fetch_max(anchor.height, Ordering::Relaxed);
+
+        // A snapshot brings a UTXO set with no history behind it. The
+        // address and spend indexes hold nothing for anything below the
+        // base, and the operator's documented remedy is `backfillindex
+        // address` once background validation has reached it.
+        //
+        // A fresh datadir stamps both completeness markers true, and
+        // nothing here used to clear them — so a node that loaded a
+        // snapshot answered "this address has no history" and "this
+        // output is unspent" with the authority of a complete index, for
+        // the entire chain below the base. Those are the two answers the
+        // markers exist to prevent.
+        self.store.mark_index_incomplete_after_snapshot()?;
+
         self.store.flush()?;
         Ok(())
     }
@@ -7417,6 +7431,7 @@ impl ChainState {
                     })?
             };
             let batch = disconnect::disconnect_block(&disconnect::DisconnectParams {
+            store: &*self.store,
             block: &block,
             undo: &undo,
             block_height: entry.height,
@@ -10948,6 +10963,7 @@ pub(crate) mod tests {
                             script_pubkey: bitcoin::ScriptBuf::from(vec![0x51u8]),
                             height: 99,
                             coinbase: false,
+                            txseq: node_index::TXSEQ_UNKNOWN,
                         },
                     ));
                     b.height_hash_puts.push((99, tip));
@@ -12036,6 +12052,24 @@ pub(crate) mod tests {
         assert_eq!(arr[0]["validated"], false);
         assert_eq!(arr[0]["snapshot_blockhash"], snap_hash.to_string());
 
+        // The address and spend indexes must be marked incomplete. A
+        // snapshot brings a UTXO set with no history behind it, so both
+        // hold nothing for anything below the base — and a fresh datadir
+        // stamps them complete, which would have those surfaces answer
+        // "no history" and "unspent" with the authority of a full index
+        // for the entire chain below the snapshot. The operator's
+        // remedy is `backfillindex address` once background validation
+        // reaches the base, and the markers are what make the surfaces
+        // refuse until then.
+        assert!(
+            !dst.store.address_index_complete(),
+            "a snapshot load must mark the address index incomplete"
+        );
+        assert!(
+            !dst.store.spent_complete(),
+            "a snapshot load must mark the spend index incomplete"
+        );
+
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
     }
@@ -12320,6 +12354,7 @@ pub(crate) mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             height: 1,
             coinbase: false,
+            txseq: node_index::TXSEQ_UNKNOWN,
         }
     }
 
