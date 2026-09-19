@@ -234,6 +234,15 @@ blockstream.info and mempool.space within these constraints:
 - **Fee histogram bucketing** uses fixed boundaries spanning realistic mainnet
   fee regimes: 1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500,
   1000 sat/vB.
+- **History order is unchanged by the ordinal-keyed chainstate.** The
+  address and spend indexes store rows keyed on a dense transaction
+  ordinal rather than a height and txid (see
+  [Disk Footprint](disk-footprint.md)), but the store resolves and orders
+  them before they leave it. `/address/:addr`, `/address/:addr/txs/chain`,
+  `/address/:addr/utxo`, `/tx/:txid/outspend/:vout` and
+  `/tx/:txid/outspends` return exactly the objects they did before,
+  `txid` and `status` fields included. Nothing on the Esplora wire
+  carries an ordinal.
 - **WebSocket** subscriptions are not implemented; SSE is the supported
   live-updates transport. Most consumers (BDK, the mempool.space SDK) accept
   SSE as a drop-in replacement.
