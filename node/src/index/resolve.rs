@@ -189,6 +189,42 @@ mod tests {
         );
     }
 
+    /// The funding iterator resolves its whole scan in one batch. A
+    /// per-row implementation returns identical rows, so only the call
+    /// count can tell them apart — and on a busy scripthash the
+    /// difference is one lookup against tens of thousands.
+    ///
+    /// Exercised through the helper the iterator calls, because that is
+    /// the boundary a counting wrapper can observe: an iterator on a
+    /// concrete store resolves against itself.
+    #[test]
+    fn funding_rows_resolve_in_one_batch_for_the_whole_scan() {
+        let store = store_with_two_blocks();
+        let controls = store.controls();
+        let sh = [0x7c; 32];
+
+        // 500 rows over the 6 ordinals the fixture chain holds — one
+        // transaction paying the same script many times, which is the
+        // shape that makes per-row resolution expensive.
+        let raw: Vec<(u64, u32, u64)> = (0..500u32).map(|i| ((i % 6) as u64, i, 1u64)).collect();
+
+        controls.reset_ordinal_read_counts();
+        let rows = crate::storage::rocksdb_store::resolve_funding_rows_for(&store, &sh, raw);
+
+        assert_eq!(rows.len(), 500, "every row resolves");
+        assert_eq!(
+            controls.txids_of_seqs_calls(),
+            1,
+            "the scan must resolve once, not once per row"
+        );
+        // And the result is in the documented order.
+        let mut sorted = rows.clone();
+        sorted.sort_by(|(a, _), (b, _)| {
+            (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
+        });
+        assert_eq!(rows, sorted, "rows come back in (height, txid, vout) order");
+    }
+
     /// An ordinal with no reverse row is local corruption. It must come
     /// back as `None` — a caller can then skip the row and say so —
     /// rather than as a zeroed or invented txid a consumer would read as

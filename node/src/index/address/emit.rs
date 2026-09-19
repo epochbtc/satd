@@ -13,31 +13,33 @@ use bitcoin::{OutPoint, TxOut, Txid};
 
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::keys::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, scripthash_of,
+    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, scripthash_of,
 };
 use crate::storage::StoreBatch;
 use crate::storage::coinview::Coin;
 
-/// Emit a funding row for an output created at `(txid, vout)` in the
-/// block at `height`. Called from the per-output loop of
+/// Emit a funding row for output `vout` of the transaction with
+/// chain-order ordinal `txseq`. Called from the per-output loop of
 /// `connect_block`, immediately after the coin is appended to
 /// `coin_puts`.
+///
+/// The row is keyed on the ordinal rather than the height and txid the
+/// public key carries — both are recoverable from it, and the store
+/// resolves them before the row leaves.
 #[inline]
 pub fn emit_funding(
     batch: &mut StoreBatch,
     cfg: &AddressIndexConfig,
-    height: u32,
-    txid: Txid,
+    txseq: u64,
     vout: u32,
     txout: &TxOut,
 ) {
     if !cfg.enabled {
         return;
     }
-    batch.addr_funding_puts.push(AddrFundingRow {
+    batch.addr_funding_puts.push(AddrFundingRowV3 {
         scripthash: scripthash_of(&txout.script_pubkey),
-        height,
-        txid,
+        txseq,
         vout,
         amount_sat: txout.value.to_sat(),
     });
@@ -75,24 +77,21 @@ pub fn emit_spending(
     // Counters are bumped at the commit boundary — see emit_funding.
 }
 
-/// Build a funding-removal key for `(scripthash, height, txid, vout)`.
-/// Used by `disconnect_block` when reversing a connected block's
-/// funding rows.
+/// Build a funding-removal key for `(scripthash, txseq, vout)`. Used by
+/// `disconnect_block` when reversing a connected block's funding rows.
 #[inline]
 pub fn funding_remove_key(
     cfg: &AddressIndexConfig,
-    height: u32,
-    txid: Txid,
+    txseq: u64,
     vout: u32,
     txout: &TxOut,
-) -> Option<AddrFundingKey> {
+) -> Option<AddrFundingKeyV3> {
     if !cfg.enabled {
         return None;
     }
-    Some(AddrFundingKey {
+    Some(AddrFundingKeyV3 {
         scripthash: scripthash_of(&txout.script_pubkey),
-        height,
-        txid,
+        txseq,
         vout,
     })
 }

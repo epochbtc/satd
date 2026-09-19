@@ -54,7 +54,7 @@ use crate::index::address::backfill::{BackfillError, BackfillHandle};
 use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::cursor::BackfillState;
 use crate::index::address::keys::{
-    AddrFundingKey, AddrFundingRow, AddrSpendingKey, AddrSpendingRow, scripthash_of,
+    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKey, AddrSpendingRow, scripthash_of,
 };
 use crate::storage::{BackfillCursorWrite, Store, StoreBatch, WriteMode};
 
@@ -400,14 +400,35 @@ impl BackfillRunner {
                     continue;
                 }
             };
+            // The ordinal base of the block being cleaned up. `chain_tx`
+            // is hash-keyed, so the *old* block's own row is still on
+            // disk after the reorg and still describes the numbering the
+            // rows were written under — which is the numbering they have
+            // to be removed under.
+            let old_first_txseq = match chain
+                .store_ref()
+                .get_cumulative_tx_count(&old_block.header.prev_blockhash)
+            {
+                Some(v) => v,
+                None => {
+                    tracing::warn!(
+                        height = h,
+                        old_hash = %old_hash,
+                        "addr-index reorg cleanup: no cumulative transaction count for \
+                         the displaced block's parent, so its rows cannot be named; \
+                         skipping height"
+                    );
+                    continue;
+                }
+            };
             let mut batch = StoreBatch::default();
-            for tx in &old_block.txdata {
+            for (tx_idx, tx) in old_block.txdata.iter().enumerate() {
                 let txid = tx.compute_txid();
+                let txseq = old_first_txseq + tx_idx as u64;
                 for (vout, output) in tx.output.iter().enumerate() {
-                    batch.addr_funding_removes.push(AddrFundingKey {
+                    batch.addr_funding_removes.push(AddrFundingKeyV3 {
                         scripthash: scripthash_of(&output.script_pubkey),
-                        height: h,
-                        txid,
+                        txseq,
                         vout: vout as u32,
                     });
                     total_funding_removes += 1;
@@ -554,10 +575,9 @@ impl BackfillRunner {
                 batch.txseq_txid_puts.push((txseq, txid));
                 for (vout, output) in tx.output.iter().enumerate() {
                     let sh = scripthash_of(&output.script_pubkey);
-                    batch.addr_funding_puts.push(AddrFundingRow {
+                    batch.addr_funding_puts.push(AddrFundingRowV3 {
                         scripthash: sh,
-                        height: h,
-                        txid,
+                        txseq,
                         vout: vout as u32,
                         amount_sat: output.value.to_sat(),
                     });
