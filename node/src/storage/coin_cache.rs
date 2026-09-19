@@ -1475,7 +1475,11 @@ impl Store for CoinCache {
         // through here, and a filter applied at read time would make every
         // row on a non-txindex node read as absent.
         if let Some(&seq) = self.tx_loc_cache.lock().get(txid) {
-            let (_first, height) = self.inner.block_of_seq(seq)?;
+            // The ordinal is the inner store's, but the block it lands
+            // in is resolved through the overlay: a reorg's pending
+            // batch can have moved this ordinal into a different block
+            // than the one the inner rows still describe.
+            let (_first, height) = self.block_of_seq(seq)?;
             return self.get_block_hash_by_height(height);
         }
         self.inner.get_tx_location(txid)
@@ -1555,21 +1559,34 @@ impl Store for CoinCache {
 
     fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
         // The block covering an ordinal is the one with the greatest
-        // `first_txseq` not above it, so the pending batch can only
-        // *improve* on the inner answer — and it does exactly that for
-        // every block connected since the last flush.
-        let pending_best = {
+        // `first_txseq` not above it. The pending batch holds two kinds
+        // of edits to that map: rows for blocks connected since the last
+        // flush, which can only improve on the inner answer, and rows
+        // for blocks a reorg disconnected, which make the inner answer
+        // *wrong* until the flush lands. A disconnected block's row
+        // still sits in the inner store, and `seek_for_prev` will find
+        // it whenever the replacement chain numbers the same ordinal
+        // from a lower base — a replacement block with more transactions
+        // than the one it displaced does exactly that. So an inner row
+        // the pending batch removed is not a candidate at all, whatever
+        // its base; the pending rows are the only truth above the last
+        // surviving inner base.
+        let (pending_best, removed) = {
             let pending = self.pending_batch.lock();
             let removed: std::collections::HashSet<u64> =
                 pending.txseq_block_removes.iter().copied().collect();
-            pending
+            let best = pending
                 .txseq_block_puts
                 .iter()
                 .filter(|(first, _)| *first <= seq && !removed.contains(first))
                 .max_by_key(|(first, _)| *first)
-                .copied()
+                .copied();
+            (best, removed)
         };
-        let inner = self.inner.block_of_seq(seq);
+        let inner = self
+            .inner
+            .block_of_seq(seq)
+            .filter(|(ifirst, _)| !removed.contains(ifirst));
         match (pending_best, inner) {
             (Some((pfirst, pheight)), Some((ifirst, _))) if pfirst >= ifirst => {
                 Some((pfirst, pheight))
@@ -2938,6 +2955,85 @@ mod tests {
             "the reverse map lost the same row; every index keyed on this \
              ordinal would resolve to nothing"
         );
+    }
+
+    /// Round-1 review (PR 801 M1): a reorg's pending batch removes the
+    /// displaced blocks' `txseq_block` rows, but those rows still sit in
+    /// the inner store until the flush. When the replacement block is
+    /// longer than the one it displaced, an ordinal it now covers used
+    /// to belong to the *next* displaced block, whose inner row has a
+    /// higher base than the replacement's pending row — and the overlay
+    /// preferred the higher base, i.e. a block that is no longer on the
+    /// chain. `get_tx_location` resolved through the inner store outright
+    /// and never saw the pending rows at all.
+    #[test]
+    fn block_of_seq_overlay_masks_an_inner_row_the_pending_batch_removed() {
+        let cache = make_cache(10);
+        let moved = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x6a; 32],
+        ));
+
+        // On disk: block 5 numbers 10..=19, block 6 numbers 20..=24.
+        // `moved` is block 6's third transaction, ordinal 22.
+        let (h5_old, h6_old) = (make_block_hash(0x05), make_block_hash(0x06));
+        let mut seed = StoreBatch::default();
+        for (hash, height, first, num_tx) in [(h5_old, 5u32, 10u64, 10u32), (h6_old, 6, 20, 5)] {
+            let mut entry = make_test_entry(height);
+            entry.num_tx = num_tx;
+            seed.block_index_puts.push((hash, entry));
+            seed.height_hash_puts.push((height, hash));
+            seed.txseq_block_puts.push((first, height));
+        }
+        seed.tx_loc_puts.push((moved, 22));
+        seed.txseq_txid_puts.push((22, moved));
+        cache.write_batch(seed).unwrap();
+        cache.flush_durable().unwrap();
+        assert_eq!(cache.block_of_seq(22), Some((20, 6)));
+        assert_eq!(cache.get_tx_location(&moved), Some(h6_old));
+
+        // Reorg, unflushed: both blocks come off, and the replacement
+        // block 5 carries fifteen transactions, so it now numbers
+        // 10..=24 and `moved` (still ordinal 22) is inside it.
+        let h5_new = make_block_hash(0x55);
+        let mut disconnect = StoreBatch::default();
+        disconnect.txseq_block_removes.push(20);
+        disconnect.txseq_block_removes.push(10);
+        disconnect.height_hash_removes.push(6);
+        disconnect.tx_loc_removes.push(moved);
+        disconnect.txseq_txid_removes.push(22);
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x12, 0), make_coin(51, 1)));
+        cache.write_batch(disconnect).unwrap();
+        let mut connect = StoreBatch::default();
+        let mut entry = make_test_entry(5);
+        entry.num_tx = 15;
+        connect.block_index_puts.push((h5_new, entry));
+        connect.height_hash_puts.push((5, h5_new));
+        connect.txseq_block_puts.push((10, 5));
+        connect.tx_loc_puts.push((moved, 22));
+        connect.txseq_txid_puts.push((22, moved));
+        connect
+            .coin_puts
+            .push((make_outpoint(0x13, 0), make_coin(52, 1)));
+        cache.write_batch(connect).unwrap();
+
+        assert_eq!(
+            cache.block_of_seq(22),
+            Some((10, 5)),
+            "ordinal 22 is in the replacement block 5; the displaced block 6's \
+             inner row must not win on its higher base"
+        );
+        assert_eq!(
+            cache.get_tx_location(&moved),
+            Some(h5_new),
+            "getrawtransaction would name a block the transaction is no longer in"
+        );
+
+        // The flush lands the same answer.
+        cache.flush_durable().unwrap();
+        assert_eq!(cache.block_of_seq(22), Some((10, 5)));
+        assert_eq!(cache.get_tx_location(&moved), Some(h5_new));
     }
 
     /// The txindex mirror: a tx that the replacement chain does *not* re-mine
