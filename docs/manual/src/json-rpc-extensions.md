@@ -322,15 +322,15 @@ reader most needs to see.
   set. A PSBT whose scripts are already computed, whose global ECDH share
   is set, or which does not allow inputs and outputs to be added is
   refused by name.
-- **`finalizepsbt` refuses silent payment outputs.** BIP 375 makes the
-  Transaction Extractor recompute and check every silent payment output
-  script before a transaction leaves the PSBT. Until satd can do that it
-  refuses rather than extract a transaction whose outputs it has not
-  verified.
+- **`finalizepsbt` is the Transaction Extractor.** It recomputes every
+  silent payment output script and refuses unless each one verifies and
+  matches. There is no override flag, and `extract=false` is gated too.
 
-`analyzepsbt` reports `"silent_payments": {"verified": false}` on a PSBT
-with silent payment outputs, so a client can tell "not checked" from
-"checked and fine". The two must never look the same.
+`analyzepsbt` reports a `silent_payments` object with a per-output
+verdict; see [Sending](silent-payments.md#sending-bip-375) in the Silent
+Payments chapter for the statuses and what satd checks to reach them. A
+`verified: false` object carries a `reason` and means satd could not run
+the checks — it never means they passed.
 
 ## Client-side PSBT signing (no signing RPC)
 

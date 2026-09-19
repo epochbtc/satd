@@ -14,6 +14,12 @@ scan-key matcher, with typed support in both SDKs. The matching kernel is
 tested for parity against the BIP 352 reference vectors. Everything is opt-in;
 a node that enables none of it behaves exactly as before.
 
+It also carries and checks the **send** side, through
+[BIP 375](https://github.com/bitcoin/bips/blob/master/bip-0375.mediawiki)
+PSBTs — see [Sending](#sending-bip-375) below. satd holds no keys and signs
+nothing; what it adds is the verification a sender otherwise has no way to
+run.
+
 This chapter is the integrator guide: what each consumption mode gives you, how
 to pick one, and how to operate the index behind them. The wire-level contract
 lives in the
@@ -319,3 +325,114 @@ Both SDKs' `ResilientWatch` re-registers scan-key targets automatically on
 reconnect, so a dropped connection never silently stops the watch; see the
 [Rust SDK](rust-sdk.md) and [Go SDK](go-sdk.md) chapters for the
 reconnect-and-resume contract and the TLS posture around scan secrets.
+
+## Sending (BIP 375)
+
+Paying a silent payment address is not something a wallet can do alone with a
+raw transaction. The output script is derived from a shared secret between the
+sender's input keys and the recipient's scan key, so whoever assembles the
+transaction has to be told what that secret produced — and has no way to check
+the answer. [BIP 375](https://github.com/bitcoin/bips/blob/master/bip-0375.mediawiki)
+is how that conversation happens inside a PSBT, and satd is the party that
+checks it.
+
+> BIP 375 is a draft. Its field set has not changed since 0.1.0 and satd is
+> refereed against the vectors it publishes, but a draft can still change.
+
+### What satd does
+
+BIP 375 PSBTs are PSBT version 2 only, and satd accepts version 2 on every
+PSBT method (see
+[PSBT version 2](json-rpc-extensions.md#psbt-version-2-bip-370-and-bip-375)).
+On top of carrying the fields, satd verifies them:
+
+1. **Which inputs may contribute.** BIP 352 admits P2TR, P2WPKH, P2PKH and
+   P2SH-P2WPKH, excludes a taproot input committed to the
+   nothing-up-my-sleeve internal key, and forbids a segwit version 2 or later
+   input anywhere in the transaction. Every signature must be SIGHASH_ALL, or
+   the outputs the secret was computed from could still change.
+2. **Whose key each input really is.** A taproot input's key is in its script.
+   For the others, satd takes the key from the PSBT's derivation data,
+   signatures or witness and keeps only one whose `hash160` matches the
+   previous output's script. **This is stricter than BIP 375's reference
+   validator**, which takes the first declared key and never checks it. Without
+   the check, a PSBT can name any key, prove an ECDH share against it, derive
+   an output from it, and pass — while the transaction spends something else
+   and the recipient scans for an output that was never created.
+3. **Every ECDH share has a valid proof.** BIP 374 DLEQ proofs are what make a
+   share checkable without the private key behind it. satd verifies the global
+   proof against the sum of the contributing keys, and each per-input proof
+   against that input's own key.
+4. **The output scripts are what the shares derive to.** satd recomputes each
+   silent payment output script from BIP 352 and compares.
+5. **The previous outputs are the real ones.** A `witness_utxo` is whatever
+   the PSBT's author wrote, and for a taproot input it *is* the key the share
+   is supposed to belong to. satd looks each one up in its own UTXO set. This
+   is the one check a node can do and a hardware wallet cannot.
+
+### Reading the verdict
+
+`analyzepsbt` reports a `silent_payments` object for any PSBT with silent
+payment outputs. Each output gets a status:
+
+| Status | Meaning |
+|---|---|
+| `ready` | Shares complete, proofs valid, keys bound, and the script either absent or equal to the derived one. |
+| `missing_shares` | An eligible input still owes an ECDH share for this scan key. Normal while the PSBT is going round; a fault once the script has been computed. |
+| `invalid_proof` | A DLEQ proof does not verify. `invalid_inputs` names which input and why. |
+| `invalid_script` | `PSBT_OUT_SCRIPT` is present and is not what the shares derive to. |
+| `invalid_inputs` | The transaction cannot carry a silent payment: a segwit v2+ input, a sighash that is not SIGHASH_ALL, or a degenerate key sum. |
+| `invalid_prevout` | A previous output disagrees with the UTXO set. |
+| `unverifiable` | An eligible input's public key is not pinned down by the PSBT, so its share cannot be checked. |
+
+The object also carries `derived_script` whenever satd could compute one, which
+is what lets a coordinator see where the money is actually going before anyone
+signs. A `verified: false` object with a `reason` means satd could not run the
+checks at all — a malformed field, or a PSBT asking for more work than any
+relayable transaction needs. It never means "checked and fine".
+
+`finalizepsbt` is BIP 375's Transaction Extractor, so it refuses unless every
+silent payment output is `ready` with a matching script. There is no override
+flag, and `extract=false` is gated too: a finalised PSBT is one
+`sendrawtransaction` away from the chain, and a silent payment paid to the
+wrong script cannot be recovered.
+
+### The flow
+
+satd does not create the PSBT — it has no wallet and no coin selection — but
+every other step is a node call.
+
+```sh
+# 1. A wallet builds a version 2 PSBT naming the recipient's silent payment
+#    code, with no output script for it yet.
+
+# 2. The node fills in the previous outputs it knows about.
+sat-cli utxoupdatepsbt "$PSBT"
+
+# 3. A Signer — the wallet, or a hardware device that speaks BIP 375 —
+#    computes the ECDH shares, proves them, derives the output scripts,
+#    clears PSBT_GLOBAL_TX_MODIFIABLE, and only then signs.
+
+# 4. The node checks all of it before anyone commits.
+sat-cli analyzepsbt "$SIGNED"     # silent_payments.outputs[].status == "ready"
+
+# 5. Extract and broadcast.
+sat-cli finalizepsbt "$SIGNED"
+sat-cli sendrawtransaction "$HEX"
+```
+
+Step 3 is the one satd cannot do for you: computing an ECDH share needs the
+input's private key, which never enters this node. `sat-cli signpsbtwithkey`
+does not do it yet. `sat-cli signpsbtwithsigner` passes a version 2 PSBT to an
+external signer untouched, because a hardware device is exactly the right party
+to ask — but no shipping device writes BIP 375 fields today, so in practice the
+Signer is the sending wallet.
+
+### What satd will not do
+
+- It will not hold a scan or spend key, or a label.
+- It will not compute `PSBT_OUT_SCRIPT` for you. BIP 375 gives that to the
+  Signer, along with clearing the modifiable flags, because computing it is
+  what freezes the transaction.
+- It will not verify `PSBT_OUT_SP_V0_LABEL`: checking a label needs the
+  recipient's scan secret.

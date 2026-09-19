@@ -493,9 +493,53 @@ preserved; the satd extension is opt-in per request or per flag.
     already computed, whose global ECDH share is set, or which does not
     allow inputs and outputs to be added. Joining changes the input set,
     and every silent payment script derives from it.
-  - `finalizepsbt` refuses a PSBT carrying silent payment outputs while
-    satd cannot yet recompute and verify their scripts. BIP 375 gives
-    the Transaction Extractor that duty.
+  - `analyzepsbt` reports a `silent_payments` object on any PSBT with
+    silent payment outputs: which inputs contribute, where each previous
+    output came from, and a per-output status — `ready`,
+    `missing_shares`, `invalid_proof`, `invalid_script`,
+    `invalid_inputs`, `invalid_prevout` or `unverifiable` — with the
+    script satd derived. Core has no equivalent because Core has no
+    version 2. `verified: false` with a reason means satd could not run
+    the checks; it never means they passed.
+  - `finalizepsbt` is BIP 375's Transaction Extractor: it refuses unless
+    every silent payment output verifies **and** carries the script satd
+    independently derives. No override flag, and `extract=false` is
+    gated too — a finalised PSBT is one `sendrawtransaction` from the
+    chain, and a silent payment paid to the wrong script cannot be
+    recovered.
+
+  Two places where satd is stricter than BIP 375's own reference
+  validator, both deliberate and both with a named test.
+
+  - **The input public key is bound to the previous output.** The
+    reference takes the first `PSBT_IN_BIP32_DERIVATION` key and never
+    checks it against the script being spent, so a PSBT can name any
+    key, prove an ECDH share against it, derive an output from it, and
+    pass every check — while the transaction spends a different key and
+    the recipient's money lands on a script nobody holds. satd keeps
+    only a key whose `hash160` matches. 46 of the 49 non-taproot inputs
+    in the BIP's own vectors do not bind, so those vectors are refereed
+    against the reference's rule explicitly and the strict rule has its
+    own tests.
+  - **Each previous output is cross-checked against the UTXO set.** A
+    `witness_utxo` is whatever the PSBT's author wrote. This is the one
+    check a node can do that a hardware wallet cannot.
+
+  And one place where satd is deliberately more permissive. Within a
+  scan key, BIP 352 states no ordering for the `k` counter — only that
+  every value from zero is used — and the two specifications' vectors
+  disagree: BIP 375's valid vector 9 assigns `k` by output index, BIP
+  352's labelled-address sending vector by spend-key order. Both pay the
+  recipient identically, since a receiver scans `k = 0, 1, 2, …`. satd
+  accepts either and reports which it used; an assignment that is
+  neither is refused.
+
+  Verification work is capped. `analyzepsbt` is a read-capability
+  method, and proof checks are (eligible inputs) × (scan keys with a
+  per-input share), so a PSBT inside the 20 MiB request limit could
+  otherwise ask for tens of seconds of curve arithmetic. satd counts the
+  work before doing any and refuses above 10,000 operations — far more
+  than any relayable transaction needs.
 
   BIP 375 is still a draft. The field set has not moved since 0.1.0 and
   satd is refereed against the BIP's published vectors, but a draft can

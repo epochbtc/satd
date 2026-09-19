@@ -610,7 +610,11 @@ mod construction {
             &serde_json::json!({ "psbt": psbt }),
         ))
         .unwrap();
-        assert_eq!(analyzed["silent_payments"]["verified"], false, "{analyzed}");
+        assert_eq!(analyzed["silent_payments"]["verified"], true, "{analyzed}");
+        assert!(
+            analyzed["silent_payments"]["outputs"][0]["status"].is_string(),
+            "{analyzed}"
+        );
 
         let combined: serde_json::Value = serde_json::from_str(&cst::psbt_workflow(
             &ctx,
@@ -646,7 +650,7 @@ mod construction {
             finalized["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("silent payment outputs cannot be finalized"),
+                .contains("not ready to extract"),
             "{finalized}"
         );
 

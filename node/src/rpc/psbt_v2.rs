@@ -10,8 +10,9 @@
 //! edit in turn, and a node that quietly drops an unfamiliar field breaks the
 //! next party's work in a way nobody notices until the money has moved.
 
-use bitcoin::{Amount, TxOut};
+use bitcoin::{Amount, OutPoint, TxOut};
 use satd_psbt::raw::{PsbtVersion, RawMap, RawPair, RawPsbt};
+use satd_psbt::sp::{self, OutputStatus, PrevoutSource, SpReport};
 use satd_psbt::{PsbtError, V2View, keys};
 use serde_json::{Value, json};
 
@@ -337,7 +338,7 @@ pub fn fee(view: &V2View<'_>) -> Option<Amount> {
 /// silent payment verdicts land in a later change; until then the object says
 /// `"verified": false` so that a client can tell "not checked" from "checked
 /// and fine". The two must never look the same.
-pub fn analyze(raw: &RawPsbt) -> Result<Value, RpcError> {
+pub fn analyze(raw: &RawPsbt, chain_state: Option<&ChainState>) -> Result<Value, RpcError> {
     let view = V2View::new(raw).map_err(bad)?;
 
     let mut inputs = Vec::with_capacity(raw.inputs.len());
@@ -416,9 +417,167 @@ pub fn analyze(raw: &RawPsbt) -> Result<Value, RpcError> {
         None => Value::Null,
     };
     if view.has_sp_outputs() {
-        out["silent_payments"] = json!({ "verified": false });
+        // `analyzepsbt` is the method an operator reaches for when a PSBT is
+        // not working, so a PSBT too malformed to check must produce a
+        // reading, not a refusal. `verified: false` with a reason is that
+        // reading; it can never be mistaken for `verified: true`.
+        let checked = satd_psbt::validate_structure(raw)
+            .map_err(|e| e.to_string())
+            .and_then(|()| verify_silent_payments(&view, chain_state).map_err(|(_, msg)| msg));
+        match checked {
+            Ok(report) => {
+                // The Signer's work is not done while any silent payment
+                // output is unverified, whatever the inputs look like.
+                if !report.extractable() && (next == "extractor" || next == "finalizer") {
+                    out["next"] = json!("signer");
+                }
+                out["silent_payments"] = silent_payments_json(&view, &report);
+            }
+            Err(reason) => {
+                out["next"] = json!("updater");
+                out["silent_payments"] = json!({ "verified": false, "reason": reason });
+            }
+        }
     }
     Ok(out)
+}
+
+/// Run BIP 375's checks, with the UTXO set behind them when a node is asking.
+pub fn verify_silent_payments(
+    view: &V2View<'_>,
+    chain_state: Option<&ChainState>,
+) -> Result<SpReport, RpcError> {
+    // A `witness_utxo` is whatever the PSBT's author wrote, and for a taproot
+    // input it *is* the public key the ECDH share is supposed to belong to.
+    // Looking the previous output up in the UTXO set is the one check a node
+    // can do that a hardware wallet cannot.
+    match chain_state {
+        None => sp::verify(view, None).map_err(bad),
+        Some(chain_state) => {
+            let lookup = |outpoint: &OutPoint| {
+                chain_state.get_coin(outpoint).map(|coin| TxOut {
+                    value: Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey.clone(),
+                })
+            };
+            sp::verify(view, Some(&lookup)).map_err(bad)
+        }
+    }
+}
+
+/// The `silent_payments` object: what satd checked, and what it concluded.
+fn silent_payments_json(view: &V2View<'_>, report: &SpReport) -> Value {
+    let inputs: Vec<Value> = report
+        .inputs
+        .iter()
+        .map(|input| {
+            let mut v = json!({
+                "input_index": input.index,
+                "eligible": input.eligible(),
+                "prevout": match input.prevout_source {
+                    PrevoutSource::NotChecked => "not_checked",
+                    PrevoutSource::UtxoSet => "utxo_set",
+                    PrevoutSource::Psbt => "psbt",
+                    PrevoutSource::Mismatch => "mismatch",
+                },
+            });
+            if let Some(reason) = &input.ineligible {
+                v["reason"] = json!(reason.reason());
+            }
+            v
+        })
+        .collect();
+
+    let outputs: Vec<Value> = report
+        .outputs
+        .iter()
+        .map(|output| {
+            let mut v = json!({
+                "output_index": output.index,
+                "scan_key": hex::encode(output.scan_key.serialize()),
+                "spend_key": hex::encode(output.spend_key.serialize()),
+                "k": output.k,
+                "status": output.status.as_str(),
+                "script": output.script_state.as_str(),
+            });
+            if let Some(label) = output.label {
+                v["label"] = json!(label);
+            }
+            if !output.missing_inputs.is_empty() {
+                v["missing_inputs"] = json!(output.missing_inputs);
+            }
+            if !output.invalid_inputs.is_empty() {
+                v["invalid_inputs"] = json!(
+                    output
+                        .invalid_inputs
+                        .iter()
+                        .map(|(index, reason)| json!({
+                            "input_index": index,
+                            "reason": reason,
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(script) = &output.derived_script {
+                v["derived_script"] = json!(hex::encode(script.as_bytes()));
+            }
+            if let Some(reason) = &output.reason {
+                v["reason"] = json!(reason);
+            }
+            v
+        })
+        .collect();
+
+    let _ = view;
+    json!({
+        "verified": true,
+        "eligible_inputs": report.eligible_inputs(),
+        "inputs": inputs,
+        "outputs": outputs,
+    })
+}
+
+/// The extractor gate. Every silent payment output must verify *and* carry the
+/// script it derives to before a transaction may leave this PSBT.
+///
+/// There is no override flag. `extract=false` is gated too: a finalised PSBT
+/// is one `sendrawtransaction` away from the chain, and a silent payment that
+/// pays the wrong script is not recoverable — the recipient scans for an
+/// output that was never created.
+pub fn extractor_gate(view: &V2View<'_>, chain_state: Option<&ChainState>) -> Result<(), RpcError> {
+    satd_psbt::validate_structure(view.raw()).map_err(bad)?;
+    let report = verify_silent_payments(view, chain_state)?;
+    let Some(problem) = report.first_problem() else {
+        return Ok(());
+    };
+    let detail = problem
+        .reason
+        .clone()
+        .or_else(|| {
+            problem
+                .invalid_inputs
+                .first()
+                .map(|(index, reason)| format!("input {index}: {reason}"))
+        })
+        .or_else(|| {
+            (!problem.missing_inputs.is_empty()).then(|| {
+                format!(
+                    "inputs {:?} owe an ECDH share for this scan key",
+                    problem.missing_inputs
+                )
+            })
+        });
+    let status = if problem.status == OutputStatus::Ready {
+        // Ready but with no script yet: the Signer has not finished.
+        "the script has not been computed".to_string()
+    } else {
+        problem.status.as_str().to_string()
+    };
+    Err(refuse(format!(
+        "silent payment output {} is not ready to extract: {status}{}",
+        problem.index,
+        detail.map(|d| format!(" ({d})")).unwrap_or_default()
+    )))
 }
 
 // ---------------------------------------------------------------------------

@@ -234,3 +234,346 @@ pub fn sp_outputs(
 pub fn scan_pubkey_of(secp: &Secp256k1<All>, scan_secret: &SecretKey) -> PublicKey {
     scan_secret.public_key(secp)
 }
+
+// ---------------------------------------------------------------------------
+// BIP 375: filling a version 2 PSBT
+// ---------------------------------------------------------------------------
+//
+// Same rule as the rest of this file: every primitive is reimplemented rather
+// than borrowed. `satd_psbt::dleq` and `satd_psbt::sp` are what the node runs,
+// and a test that proves the node agrees with itself proves nothing. The
+// referee for this half is BIP 374's own proof vectors, which `satd-psbt`
+// checks against independently — so when the end-to-end test passes, three
+// implementations have agreed through two specifications.
+//
+// The raw PSBT codec *is* borrowed: it is a byte format, not a calculation,
+// and re-implementing a serialiser proves nothing about cryptography.
+
+const TAG_DLEQ_AUX: &[u8] = b"BIP0374/aux";
+const TAG_DLEQ_NONCE: &[u8] = b"BIP0374/nonce";
+const TAG_DLEQ_CHALLENGE: &[u8] = b"BIP0374/challenge";
+
+/// `x mod n` over a 32-byte big-endian scalar. Any 256-bit value is below
+/// `2n`, so one conditional subtraction is enough.
+fn scalar_reduce_mod_n(x: &[u8; 32]) -> [u8; 32] {
+    scalar_add_mod_n(x, &[0u8; 32])
+}
+
+/// The summed, parity-corrected input secret — BIP 352's `a`.
+pub fn input_secret_sum(secp: &Secp256k1<All>, inputs: &[SpInput]) -> Option<SecretKey> {
+    let mut acc = [0u8; 32];
+    for inp in inputs {
+        let sk = if inp.is_taproot
+            && inp.secret.public_key(secp).x_only_public_key().1
+                == bitcoin::secp256k1::Parity::Odd
+        {
+            inp.secret.negate()
+        } else {
+            inp.secret
+        };
+        acc = scalar_add_mod_n(&acc, &sk.secret_bytes());
+    }
+    SecretKey::from_slice(&acc).ok()
+}
+
+/// BIP 374 `GenerateProof(a, B, r, G, m)` with the secp256k1 generator and no
+/// message, which is the shape BIP 375 uses.
+pub fn dleq_prove(
+    secp: &Secp256k1<All>,
+    a: &SecretKey,
+    b: &PublicKey,
+    aux: &[u8; 32],
+) -> Option<[u8; 64]> {
+    let big_a = a.public_key(secp);
+    let big_c = b.mul_tweak(secp, &Scalar::from_be_bytes(a.secret_bytes()).ok()?).ok()?;
+
+    // t = bytes(32, a) XOR hash_BIP0374/aux(r)
+    let aux_hash = tagged_hash(TAG_DLEQ_AUX, aux);
+    let mut t = a.secret_bytes();
+    for (byte, mask) in t.iter_mut().zip(aux_hash.iter()) {
+        *byte ^= mask;
+    }
+
+    let mut nonce_msg = t.to_vec();
+    nonce_msg.extend_from_slice(&big_a.serialize());
+    nonce_msg.extend_from_slice(&big_c.serialize());
+    let k = scalar_reduce_mod_n(&tagged_hash(TAG_DLEQ_NONCE, &nonce_msg));
+    let k_sk = SecretKey::from_slice(&k).ok()?;
+    let r1 = k_sk.public_key(secp);
+    let r2 = b.mul_tweak(secp, &Scalar::from_be_bytes(k).ok()?).ok()?;
+
+    let generator = SecretKey::from_slice(&{
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        one
+    })
+    .ok()?
+    .public_key(secp);
+
+    let mut challenge = Vec::with_capacity(33 * 6);
+    for point in [&big_a, b, &big_c, &generator, &r1, &r2] {
+        challenge.extend_from_slice(&point.serialize());
+    }
+    let e = tagged_hash(TAG_DLEQ_CHALLENGE, &challenge);
+
+    // s = (k + e·a) mod n, with the reduction done by hand so that the
+    // degenerate cases the BIP permits do not turn into API errors.
+    let e_reduced = scalar_reduce_mod_n(&e);
+    let s = if e_reduced == [0u8; 32] {
+        k
+    } else {
+        let ea = a.mul_tweak(&Scalar::from_be_bytes(e_reduced).ok()?).ok()?;
+        scalar_add_mod_n(&k, &ea.secret_bytes())
+    };
+
+    let mut proof = [0u8; 64];
+    proof[..32].copy_from_slice(&e);
+    proof[32..].copy_from_slice(&s);
+    Some(proof)
+}
+
+/// Take a version 2 PSBT whose outputs name silent payment recipients and do
+/// the BIP 375 Signer's work short of signing: write an ECDH share and a DLEQ
+/// proof for every scan key, compute every `PSBT_OUT_SCRIPT`, and clear the
+/// modifiable flags.
+///
+/// `inputs` must list every input that contributes a key, in input order.
+pub fn fill_bip375(
+    secp: &Secp256k1<All>,
+    raw: &mut satd_psbt::RawPsbt,
+    inputs: &[SpInput],
+    aux: [u8; 32],
+) -> Result<(), String> {
+    use satd_psbt::keys;
+    use satd_psbt::raw::RawPair;
+
+    let a_sum = input_secret_sum(secp, inputs).ok_or("the input secrets sum to zero")?;
+    let a_sum_pub = a_sum.public_key(secp);
+
+    let all_outpoints: Vec<OutPoint> = inputs.iter().map(|i| i.outpoint).collect();
+    let lowest = all_outpoints
+        .iter()
+        .min_by(|a, b| ser_outpoint(a).cmp(&ser_outpoint(b)))
+        .ok_or("no inputs")?;
+    let mut msg = ser_outpoint(lowest);
+    msg.extend_from_slice(&a_sum_pub.serialize());
+    let input_hash = tagged_hash(TAG_INPUTS, &msg);
+    let shared_scalar = a_sum
+        .mul_tweak(&Scalar::from_be_bytes(input_hash).map_err(|_| "input_hash is not a scalar")?)
+        .map_err(|_| "input_hash times the key sum is zero")?;
+
+    // Every scan key named by an output, and the share and proof for it.
+    let mut scan_keys: Vec<PublicKey> = Vec::new();
+    for output in &raw.outputs {
+        if let Some(info) = output.get_single(keys::output::SP_V0_INFO) {
+            let scan = PublicKey::from_slice(&info[..33]).map_err(|_| "a bad scan key")?;
+            if !scan_keys.contains(&scan) {
+                scan_keys.push(scan);
+            }
+        }
+    }
+    for scan in &scan_keys {
+        let share = scan
+            .mul_tweak(secp, &Scalar::from_be_bytes(a_sum.secret_bytes()).map_err(|_| "a")?)
+            .map_err(|_| "a·B_scan is not a point")?;
+        let proof = dleq_prove(secp, &a_sum, scan, &aux).ok_or("could not prove")?;
+        raw.global.set(RawPair::new(
+            keys::global::SP_ECDH_SHARE,
+            scan.serialize().to_vec(),
+            share.serialize().to_vec(),
+        ));
+        raw.global.set(RawPair::new(
+            keys::global::SP_DLEQ,
+            scan.serialize().to_vec(),
+            proof.to_vec(),
+        ));
+    }
+
+    // The output scripts, `k` counting within each scan key in output order.
+    let mut k_by_scan: std::collections::HashMap<[u8; 33], u32> = Default::default();
+    for output in &mut raw.outputs {
+        let Some(info) = output.get_single(keys::output::SP_V0_INFO).map(<[u8]>::to_vec) else {
+            continue;
+        };
+        let scan = PublicKey::from_slice(&info[..33]).map_err(|_| "a bad scan key")?;
+        let spend = PublicKey::from_slice(&info[33..]).map_err(|_| "a bad spend key")?;
+        let ecdh = scan
+            .mul_tweak(
+                secp,
+                &Scalar::from_be_bytes(shared_scalar.secret_bytes()).map_err(|_| "a")?,
+            )
+            .map_err(|_| "no shared secret")?;
+        let k = k_by_scan.entry(scan.serialize()).or_insert(0);
+        let mut buf = ecdh.serialize().to_vec();
+        buf.extend_from_slice(&k.to_be_bytes());
+        *k += 1;
+        let t_k = tagged_hash(TAG_SHARED_SECRET, &buf);
+        let t_k_sk = SecretKey::from_slice(&t_k).map_err(|_| "t_k is not a scalar")?;
+        let p_k = spend
+            .combine(&t_k_sk.public_key(secp))
+            .map_err(|_| "the output key is at infinity")?;
+        let script = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(p_k.x_only_public_key().0),
+        );
+        output.set(RawPair::new(
+            keys::output::SCRIPT,
+            Vec::new(),
+            script.to_bytes(),
+        ));
+    }
+
+    // Once every silent payment script is computed, the transaction they were
+    // computed from is fixed.
+    raw.global.set(RawPair::new(
+        keys::global::TX_MODIFIABLE,
+        Vec::new(),
+        vec![0u8],
+    ));
+    Ok(())
+}
+
+/// Sign every P2WPKH input the given key unlocks, writing a
+/// `PSBT_IN_PARTIAL_SIG` for the node's `finalizepsbt` to assemble.
+///
+/// Must run after [`fill_bip375`]: a signature commits to every output, so the
+/// silent payment scripts have to exist first. That ordering is the whole
+/// reason BIP 375 forbids a Signer from signing while an output has no script.
+pub fn sign_p2wpkh_inputs(
+    secp: &Secp256k1<All>,
+    raw: &mut satd_psbt::RawPsbt,
+    secret: &SecretKey,
+) -> Result<usize, String> {
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use satd_psbt::keys;
+    use satd_psbt::raw::RawPair;
+
+    let pubkey = bitcoin::PublicKey::new(secret.public_key(secp));
+    let want = bitcoin::ScriptBuf::new_p2wpkh(
+        &pubkey.wpubkey_hash().map_err(|_| "an uncompressed key")?,
+    );
+
+    let tx = {
+        let view = satd_psbt::V2View::new(raw).map_err(|e| e.to_string())?;
+        view.unsigned_tx().map_err(|e| e.to_string())?
+    };
+
+    let mut prevouts: Vec<Option<bitcoin::TxOut>> = Vec::new();
+    for input in &raw.inputs {
+        prevouts.push(
+            input
+                .get_single(keys::input::WITNESS_UTXO)
+                .and_then(|raw| bitcoin::consensus::deserialize(raw).ok()),
+        );
+    }
+
+    let mut signed = 0usize;
+    for (index, prevout) in prevouts.iter().enumerate() {
+        let Some(prevout) = prevout else { continue };
+        if prevout.script_pubkey != want {
+            continue;
+        }
+        let mut cache = SighashCache::new(&tx);
+        let sighash = cache
+            .p2wpkh_signature_hash(index, &want, prevout.value, EcdsaSighashType::All)
+            .map_err(|e| e.to_string())?;
+        let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        let mut sig = secp.sign_ecdsa(&msg, secret).serialize_der().to_vec();
+        sig.push(EcdsaSighashType::All as u8);
+        raw.inputs[index].set(RawPair::new(
+            keys::input::PARTIAL_SIG,
+            pubkey.to_bytes(),
+            sig,
+        ));
+        signed += 1;
+    }
+    Ok(signed)
+}
+
+/// Build a version 2 PSBT that spends one outpoint and pays one silent payment
+/// recipient plus change.
+///
+/// Nothing is filled in beyond what a BIP 370 Constructor writes: no previous
+/// output, no ECDH share, no output script for the silent payment. That is the
+/// starting point of the send flow, and the shape `utxoupdatepsbt` and then a
+/// Signer are meant to complete.
+pub fn build_psbt(
+    outpoint: bitcoin::OutPoint,
+    sp_amount_sat: u64,
+    change_amount_sat: u64,
+    recipient: &SpRecipient,
+    change_script: &bitcoin::ScriptBuf,
+    wallet_pubkey: &bitcoin::PublicKey,
+) -> satd_psbt::RawPsbt {
+    use satd_psbt::keys;
+    use satd_psbt::raw::{RawMap, RawPair, RawPsbt};
+
+    let mut global = RawMap::new();
+    global.set(RawPair::new(keys::global::VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
+    global.set(RawPair::new(keys::global::TX_VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
+    global.set(RawPair::new(
+        keys::global::FALLBACK_LOCKTIME,
+        Vec::new(),
+        0u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), vec![1u8]));
+    global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), vec![2u8]));
+    // Both modifiable: nothing has committed to the input set yet.
+    global.set(RawPair::new(
+        keys::global::TX_MODIFIABLE,
+        Vec::new(),
+        vec![keys::modifiable::INPUTS | keys::modifiable::OUTPUTS],
+    ));
+
+    let mut input = RawMap::new();
+    input.set(RawPair::new(
+        keys::input::PREVIOUS_TXID,
+        Vec::new(),
+        bitcoin::consensus::serialize(&outpoint.txid),
+    ));
+    input.set(RawPair::new(
+        keys::input::OUTPUT_INDEX,
+        Vec::new(),
+        outpoint.vout.to_le_bytes().to_vec(),
+    ));
+    input.set(RawPair::new(
+        keys::input::SEQUENCE,
+        Vec::new(),
+        0xffff_ffffu32.to_le_bytes().to_vec(),
+    ));
+    // The derivation entry is what lets a verifier bind this input's key to
+    // the output it spends; a real wallet writes one so that a signer knows
+    // what to sign with.
+    input.set(RawPair::new(
+        keys::input::BIP32_DERIVATION,
+        wallet_pubkey.to_bytes(),
+        vec![0u8; 4],
+    ));
+
+    let mut sp_output = RawMap::new();
+    sp_output.set(RawPair::new(
+        keys::output::AMOUNT,
+        Vec::new(),
+        (sp_amount_sat as i64).to_le_bytes().to_vec(),
+    ));
+    let mut info = recipient.scan_pubkey.serialize().to_vec();
+    info.extend_from_slice(&recipient.spend_pubkey.serialize());
+    sp_output.set(RawPair::new(keys::output::SP_V0_INFO, Vec::new(), info));
+
+    let mut change_output = RawMap::new();
+    change_output.set(RawPair::new(
+        keys::output::AMOUNT,
+        Vec::new(),
+        (change_amount_sat as i64).to_le_bytes().to_vec(),
+    ));
+    change_output.set(RawPair::new(
+        keys::output::SCRIPT,
+        Vec::new(),
+        change_script.to_bytes(),
+    ));
+
+    RawPsbt {
+        global,
+        inputs: vec![input],
+        outputs: vec![sp_output, change_output],
+    }
+}

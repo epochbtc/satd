@@ -280,7 +280,7 @@ fn bip375_survives_analyzepsbt() {
     for group in ["valid", "invalid"] {
         for (description, bytes) in vectors(group) {
             let raw = RawPsbt::parse(&bytes).expect("parses");
-            let out = psbt::analyze_psbt(&B64.encode(&bytes))
+            let out = psbt::analyze_psbt(&B64.encode(&bytes), None)
                 .unwrap_or_else(|e| panic!("{description}: {e:?}"));
 
             let has_sp = raw
@@ -288,11 +288,36 @@ fn bip375_survives_analyzepsbt() {
                 .iter()
                 .any(|o| o.contains_type(keys::output::SP_V0_INFO));
             if has_sp {
+                let sp = &out["silent_payments"];
+                // A PSBT too malformed to check reports that it was not
+                // checked, with a reason. What it must never do is look the
+                // same as one that checked out.
+                if sp["verified"] == Value::Bool(false) {
+                    assert!(sp["reason"].is_string(), "{description}: {out}");
+                    assert!(
+                        out["next"] == "updater" || out["next"] == "signer",
+                        "{description}: {out}"
+                    );
+                    continue;
+                }
+                assert_eq!(sp["verified"], Value::Bool(true), "{description}");
+                assert!(sp["inputs"].is_array(), "{description}: {out}");
                 assert_eq!(
-                    out["silent_payments"]["verified"],
-                    Value::Bool(false),
-                    "{description}: a client must be able to tell \"not checked\" from \"fine\""
+                    sp["outputs"].as_array().map(|a| a.len()),
+                    Some(
+                        raw.outputs
+                            .iter()
+                            .filter(|o| o.contains_type(keys::output::SP_V0_INFO))
+                            .count()
+                    ),
+                    "{description}: every silent payment output needs a verdict: {out}"
                 );
+                for verdict in sp["outputs"].as_array().expect("an array") {
+                    assert!(
+                        verdict["status"].is_string() && verdict["script"].is_string(),
+                        "{description}: {verdict}"
+                    );
+                }
             }
 
             let awaiting = raw.outputs.iter().any(|o| {
@@ -476,7 +501,7 @@ fn bip375_survives_finalizepsbt() {
     let mut raw = RawPsbt::parse(&bytes).expect("parses");
     plant_unknowns(&mut raw);
 
-    let out = psbt::finalize_psbt(&to_b64(&raw), false)
+    let out = psbt::finalize_psbt(&to_b64(&raw), false, None)
         .unwrap_or_else(|e| panic!("{description}: finalizepsbt failed: {e:?}"));
     let after = from_b64(out["psbt"].as_str().expect("a base64 PSBT"));
 
@@ -497,20 +522,80 @@ fn bip375_survives_finalizepsbt() {
     assert!(found.is_empty(), "{description}: {found:?}");
 }
 
-/// Until satd can recompute and check a silent payment output script, it must
-/// not extract a transaction carrying one. Refusing is the safe floor.
+/// `finalizepsbt` is BIP 375's Transaction Extractor, so it recomputes every
+/// silent payment output script before it lets a transaction out. A PSBT that
+/// verifies goes through.
 #[test]
-fn finalizepsbt_refuses_silent_payment_outputs_for_now() {
-    let (_, raw) = seeded("can finalize: one P2PKH input");
+fn finalizepsbt_accepts_a_verified_silent_payment_psbt() {
+    // The one vector whose input key really does hash to the output it
+    // spends — most of the BIP's vectors do not bind, which is its own
+    // finding, covered in `satd-psbt`'s key-binding tests.
+    let (description, raw) = seeded("can finalize: one P2PKH input");
     for extract in [true, false] {
-        let err = psbt::finalize_psbt(&to_b64(&raw), extract)
-            .expect_err("a silent payment PSBT must not be finalized yet");
+        psbt::finalize_psbt(&to_b64(&raw), extract, None)
+            .unwrap_or_else(|e| panic!("{description}: should have been accepted: {e:?}"));
+    }
+}
+
+/// And one that does not verify is refused by name, with no override, for
+/// `extract=false` as well: a finalised PSBT is one `sendrawtransaction` away
+/// from the chain, and a silent payment paid to the wrong script cannot be
+/// recovered.
+#[test]
+fn finalizepsbt_refuses_an_unverified_silent_payment_psbt() {
+    let (_, original) = seeded("can finalize: one P2PKH input");
+
+    // Replace the per-input ECDH share with another valid point. The DLEQ
+    // proof no longer covers it, so the output script derives from a shared
+    // secret that is not the recipient's.
+    let scan_key = original.inputs[0]
+        .get_all(keys::input::SP_ECDH_SHARE)
+        .next()
+        .map(|(key, _)| key.to_vec())
+        .expect("the vector has a per-input share");
+    let mut tampered = original.clone();
+    tampered.inputs[0].set(RawPair::new(
+        keys::input::SP_ECDH_SHARE,
+        scan_key,
+        // The generator: a valid point, and not the right one.
+        hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .expect("hex"),
+    ));
+
+    for extract in [true, false] {
+        let err = psbt::finalize_psbt(&to_b64(&tampered), extract, None)
+            .expect_err("a tampered share must not be extractable");
         assert_eq!(err.0, -22);
-        assert_eq!(
-            err.1,
-            "silent payment outputs cannot be finalized by this version"
+        assert!(
+            err.1.contains("silent payment output 0") && err.1.contains("invalid_proof"),
+            "the refusal should name the output and the verdict, got: {}",
+            err.1
         );
     }
+
+    // And `analyzepsbt` says the same thing rather than a different one.
+    let out = psbt::analyze_psbt(&to_b64(&tampered), None).expect("analyzes");
+    assert_eq!(out["silent_payments"]["outputs"][0]["status"], "invalid_proof");
+    assert_eq!(
+        out["silent_payments"]["outputs"][0]["invalid_inputs"][0]["input_index"],
+        0
+    );
+    assert_eq!(out["next"], "signer", "{out}");
+}
+
+/// A PSBT whose silent payment output has no script yet verifies as far as it
+/// goes, but is not extractable: the Signer has not finished.
+#[test]
+fn finalizepsbt_refuses_an_uncomputed_silent_payment_script() {
+    let raw = joinable();
+    let err = psbt::finalize_psbt(&to_b64(&raw), true, None)
+        .expect_err("an uncomputed script must not be extractable");
+    assert_eq!(err.0, -22);
+    assert!(
+        err.1.contains("not ready to extract"),
+        "got: {}",
+        err.1
+    );
 }
 
 /// The version 0 path must be exactly where it was. Its error text included:

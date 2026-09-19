@@ -2332,3 +2332,160 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
     );
     assert!(m.height > 0, "a confirmed match carries its block height");
 }
+
+/// The BIP 375 send flow, end to end, with the recipient watching.
+///
+/// `bip375_end_to_end_send_verify_and_scan` in the regtest suite proves the
+/// node's own index carries a tweak for a PSBT-built payment. This proves the
+/// other half of the release criterion: a wallet that registered only its scan
+/// credential — never a spending key — is told about the payment as it arrives,
+/// and can re-derive the output key offline from what the event carries.
+///
+/// The transaction is built the way an integrator would: a version 2 PSBT
+/// naming the recipient, `utxoupdatepsbt` for the previous output, a Signer
+/// that computes the ECDH share and the output script, then `analyzepsbt`,
+/// `finalizepsbt` and `sendrawtransaction`. Nothing hand-assembles the
+/// transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
+    use crate::common::sp_send::{self, SpInput, SpRecipient};
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::OutPoint;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    let (sn, wallet) = matured_node_args(vec!["-silentpaymentindex=1"]).await;
+
+    let secp = Secp256k1::new();
+    let scan_secret = SecretKey::from_slice(&[0x31; 32]).expect("scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x32; 32]).expect("spend secret");
+    let recipient = SpRecipient {
+        scan_pubkey: scan_secret.public_key(&secp),
+        spend_pubkey: spend_secret.public_key(&secp),
+    };
+
+    // Register before broadcasting: watch-sets have no replay, so a match that
+    // happens before the registration lands is simply never delivered.
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client
+        .watch(vec![crate::common::grpc_client::add_silent_payments(
+            &scan_secret.secret_bytes(),
+            &recipient.spend_pubkey.serialize(),
+            &[],
+        )])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let rpc = sn.node.rpc_handle();
+    let cb_txid_str = tokio::task::spawn_blocking(move || block1_coinbase_txid(&rpc))
+        .await
+        .unwrap();
+    let outpoint = OutPoint {
+        txid: bitcoin::Txid::from_str(&cb_txid_str).expect("txid"),
+        vout: 0,
+    };
+
+    const SUBSIDY: u64 = 50 * 100_000_000;
+    const FEE: u64 = 10_000;
+    let sp_amount = SUBSIDY / 2;
+    let change_amount = SUBSIDY - sp_amount - FEE;
+
+    let psbt = sp_send::build_psbt(
+        outpoint,
+        sp_amount,
+        change_amount,
+        &recipient,
+        &wallet.address.script_pubkey(),
+        &wallet.pk,
+    );
+
+    // The whole RPC-driven flow, off the async worker threads.
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let (raw_tx, txid, derived_script) = tokio::task::spawn_blocking(move || {
+        let secp = Secp256k1::new();
+        let ok = |v: Result<serde_json::Value, String>| {
+            let v = v.expect("the node answered");
+            assert!(v["error"].is_null(), "{v}");
+            v["result"].clone()
+        };
+
+        let updated = ok(rpc.call("utxoupdatepsbt", vec![json!(b64)]));
+        let mut psbt = satd_psbt::RawPsbt::parse(
+            &base64::engine::general_purpose::STANDARD
+                .decode(updated.as_str().expect("a base64 PSBT"))
+                .expect("base64"),
+        )
+        .expect("a PSBT");
+
+        let inputs = [SpInput { outpoint, secret: w.sk, is_taproot: false }];
+        sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x5cu8; 32]).expect("fills");
+        sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &w.sk).expect("signs");
+        let filled = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+
+        let analyzed = ok(rpc.call("analyzepsbt", vec![json!(filled.clone())]));
+        assert_eq!(
+            analyzed["silent_payments"]["outputs"][0]["status"], "ready",
+            "{analyzed}"
+        );
+        assert_eq!(
+            analyzed["silent_payments"]["outputs"][0]["script"], "matches",
+            "{analyzed}"
+        );
+        let derived = analyzed["silent_payments"]["outputs"][0]["derived_script"]
+            .as_str()
+            .expect("a derived script")
+            .to_string();
+
+        let finalized = ok(rpc.call("finalizepsbt", vec![json!(filled)]));
+        assert_eq!(finalized["complete"], true, "{finalized}");
+        let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+        let txid = rpc.send_raw_tx(&raw_tx);
+        (raw_tx, txid, derived)
+    })
+    .await
+    .unwrap();
+
+    // The recipient's side: a match for the scan credential it registered.
+    let ev = next_event_matching(&mut stream, 30, |b| {
+        matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed)
+    })
+    .await;
+    let Some(Body::SilentPaymentMatched(m)) = ev.body else {
+        unreachable!("matched above")
+    };
+    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid));
+    assert_eq!(m.vout, 0, "the silent payment is the first output");
+    assert_eq!(m.amount, sp_amount);
+    assert_eq!(m.k, 0);
+    assert_eq!(
+        hex::encode(&m.scan_pubkey),
+        hex::encode(recipient.scan_pubkey.serialize())
+    );
+
+    // The output key the watcher was told about is the one the node's verifier
+    // independently derived from the PSBT, which is the one the sender paid to.
+    assert_eq!(
+        derived_script,
+        format!("5120{}", hex::encode(&m.output_pubkey))
+    );
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_tx).expect("hex")).expect("a tx");
+    assert_eq!(
+        hex::encode(tx.output[0].script_pubkey.as_bytes()),
+        derived_script
+    );
+
+    // And confirmed, after a block.
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 30, |b| {
+        matches!(b, Body::SilentPaymentMatched(m) if m.confirmed)
+    })
+    .await;
+    let Some(Body::SilentPaymentMatched(m)) = ev.body else {
+        unreachable!("matched above")
+    };
+    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid));
+}

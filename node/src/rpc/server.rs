@@ -2362,11 +2362,14 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("analyzepsbt", |params, _ctx, _extensions| {
+    module.register_method("analyzepsbt", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let psbt_b64: String = args.required("psbt")?;
         args.check()?;
-        psbt::analyze_psbt(&psbt_b64)
+        // The chain state is used only to cross-check a version 2 PSBT's
+        // previous outputs against the UTXO set; the version 0 path answers
+        // exactly as it did before.
+        psbt::analyze_psbt(&psbt_b64, Some(&ctx.chain_state))
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -2383,8 +2386,7 @@ pub async fn start(
         let psbt_b64: String = args.required("psbt")?;
         let extract: bool = args.optional_or("extract", true)?;
         args.check()?;
-        let _ = &ctx; // suppress unused
-        psbt::finalize_psbt(&psbt_b64, extract)
+        psbt::finalize_psbt(&psbt_b64, extract, Some(&ctx.chain_state))
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

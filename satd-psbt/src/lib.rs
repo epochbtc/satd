@@ -13,14 +13,20 @@
 //! - [`v2`] reads BIP 370 and BIP 375 fields out of a raw PSBT, and converts
 //!   one to a `bitcoin::Psbt` so that version 0 code can finish the job.
 //! - [`structure`] is BIP 375's structural check.
+//! - [`dleq`] is BIP 374, the proof that an ECDH share belongs to the input
+//!   claiming it.
+//! - [`sp`] is BIP 375's verification: which inputs contribute, whose keys
+//!   they really are, and what output script the shares derive to.
 //!
 //! Nothing in this crate holds key material or signs anything.
 
 #![forbid(unsafe_code)]
 
+pub mod dleq;
 pub mod error;
 pub mod keys;
 pub mod raw;
+pub mod sp;
 pub mod structure;
 pub mod v2;
 

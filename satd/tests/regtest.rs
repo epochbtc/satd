@@ -19764,18 +19764,360 @@ fn bip375_psbt_decodes_and_analyzes_over_rpc() {
     );
 
     let analyzed = node.rpc_ok("analyzepsbt", vec![json!(b64.clone())]);
-    assert_eq!(analyzed["silent_payments"]["verified"], false, "{analyzed}");
+    let sp = &analyzed["silent_payments"];
+    assert_eq!(sp["verified"], true, "{analyzed}");
+    assert_eq!(sp["outputs"][0]["status"], "missing_shares", "{analyzed}");
+    assert_eq!(sp["outputs"][0]["script"], "absent", "{analyzed}");
+    // The outpoint is not one this node has, so the node says which copy of
+    // the previous output it used rather than implying it checked one.
+    assert_eq!(sp["inputs"][0]["prevout"], "psbt", "{analyzed}");
     assert_eq!(analyzed["next"], "signer", "{analyzed}");
 
-    // And `finalizepsbt` refuses it by name until satd can verify it.
+    // And `finalizepsbt` refuses it by name: the Signer has not finished.
     let err = node
         .rpc_call_with_params("finalizepsbt", vec![json!(b64)])
         .expect("a response");
     assert_eq!(err["error"]["code"], -22, "{err}");
-    assert_eq!(
-        err["error"]["message"],
-        "silent payment outputs cannot be finalized by this version",
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not ready to extract"),
         "{err}"
     );
+    node.stop();
+}
+
+/// The whole send-side path, on a real chain.
+///
+/// A Constructor builds a version 2 PSBT naming a silent payment recipient; the
+/// node fills in the previous output; a Signer computes the ECDH share, proves
+/// it, derives the output script and signs; the node verifies all of that,
+/// finalises, and the transaction is broadcast and mined. Then the receive side
+/// has to agree: the node's own silent payment index must carry a tweak for the
+/// transaction the send side produced.
+///
+/// The two halves are deliberately separate implementations. The sender in
+/// `tests/common/sp_send.rs` reimplements every primitive — the tagged hashes,
+/// the DLEQ proof, the derivation — rather than calling `satd-psbt`, and is
+/// refereed against BIP 352's and BIP 374's own vectors. So agreement here is
+/// agreement between two implementations through two specifications, not a
+/// program agreeing with itself.
+#[test]
+fn bip375_end_to_end_send_verify_and_scan() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use common::sp_send::{SpInput, SpRecipient};
+    use serde_json::json;
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x42u8; 32]);
+    let scan_secret = SecretKey::from_slice(&[0x21u8; 32]).expect("a scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x22u8; 32]).expect("a spend secret");
+    let recipient = SpRecipient {
+        scan_pubkey: scan_secret.public_key(&secp),
+        spend_pubkey: spend_secret.public_key(&secp),
+    };
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    // 101 blocks so block 1's coinbase is spendable.
+    node.mine_blocks(101, &wallet.address.to_string());
+
+    let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
+    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    const SUBSIDY: u64 = 50 * 100_000_000;
+    const FEE: u64 = 10_000;
+    let sp_amount = SUBSIDY / 2;
+    let change_amount = SUBSIDY - sp_amount - FEE;
+
+    let psbt = common::sp_send::build_psbt(
+        outpoint,
+        sp_amount,
+        change_amount,
+        &recipient,
+        &wallet.address.script_pubkey(),
+        &wallet.pk,
+    );
+    let b64 = |raw: &satd_psbt::RawPsbt| {
+        base64::engine::general_purpose::STANDARD.encode(raw.serialize())
+    };
+    let from_b64 = |s: &str| {
+        satd_psbt::RawPsbt::parse(
+            &base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .expect("base64"),
+        )
+        .expect("a PSBT")
+    };
+
+    // The Updater: the node fills in the previous output it knows about.
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64(&psbt))]);
+    let mut psbt = from_b64(updated.as_str().expect("a base64 PSBT"));
+    let filled = psbt.inputs[0]
+        .get_single(satd_psbt::keys::input::WITNESS_UTXO)
+        .expect("the node filled in the previous output");
+    let filled: bitcoin::TxOut = bitcoin::consensus::deserialize(filled).expect("a TxOut");
+    assert_eq!(filled.value.to_sat(), SUBSIDY);
+    assert_eq!(filled.script_pubkey, wallet.address.script_pubkey());
+
+    // Before the Signer has done anything, the output has no script and the
+    // node says so rather than pretending the PSBT is finished.
+    let before = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(before["next"], "signer", "{before}");
+    let sp = &before["silent_payments"];
+    assert_eq!(sp["verified"], true, "{before}");
+    assert_eq!(sp["outputs"][0]["status"], "missing_shares", "{before}");
+    assert_eq!(sp["outputs"][0]["script"], "absent", "{before}");
+    assert_eq!(
+        sp["inputs"][0]["prevout"], "utxo_set",
+        "the node should recognise its own UTXO: {before}"
+    );
+
+    // And it will not extract a transaction from it.
+    let refused = node
+        .rpc_call_with_params("finalizepsbt", vec![json!(b64(&psbt))])
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -22, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not ready to extract"),
+        "{refused}"
+    );
+
+    // The Signer: shares, proofs, output scripts, frozen transaction, then
+    // signatures — in that order, because a signature commits to the outputs.
+    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
+    let signed = common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
+    assert_eq!(signed, 1);
+
+    // The node's verdict on the Signer's work.
+    let after = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    let sp = &after["silent_payments"];
+    assert_eq!(sp["verified"], true, "{after}");
+    assert_eq!(sp["eligible_inputs"], json!([0]), "{after}");
+    assert_eq!(sp["outputs"][0]["status"], "ready", "{after}");
+    assert_eq!(sp["outputs"][0]["script"], "matches", "{after}");
+    assert_eq!(sp["outputs"][0]["k"], 0, "{after}");
+    assert!(sp["outputs"][0]["derived_script"].is_string(), "{after}");
+    assert_eq!(sp["inputs"][0]["prevout"], "utxo_set", "{after}");
+
+    // The Extractor.
+    let finalized = node.rpc_ok("finalizepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(finalized["complete"], true, "{finalized}");
+    let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(raw_tx)]);
+    let txid = txid.as_str().expect("a txid").to_string();
+    node.mine_blocks(1, &wallet.address.to_string());
+
+    // The receive side: the node's own index must carry a tweak for it. The
+    // sender and the index share no code, so this is the two halves agreeing.
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+    let tip = tip.as_str().expect("a hash").to_string();
+    let data = node.rpc_ok(
+        "getsilentpaymentblockdata",
+        vec![json!(tip), json!(1)],
+    );
+    let tweaks = data["tweaks"].as_array().expect("an array");
+    assert!(
+        tweaks.iter().any(|t| t["txid"] == json!(txid)),
+        "the index should carry a tweak for the transaction the sender built: {data}"
+    );
+
+    // And the output really is the one the recipient will find: the script in
+    // the mined transaction is the one the sender derived, which the node
+    // independently recomputed and called `matches`.
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_tx).expect("hex")).expect("a tx");
+    let derived = after["silent_payments"]["outputs"][0]["derived_script"]
+        .as_str()
+        .expect("a derived script");
+    assert_eq!(hex::encode(tx.output[0].script_pubkey.as_bytes()), derived);
+    assert!(tx.output[0].script_pubkey.is_p2tr());
+
+    node.stop();
+}
+
+/// The same flow with one ECDH share replaced by another valid point. The node
+/// must catch it, name the input, and refuse to extract.
+///
+/// Paired with the passing flow above on purpose: a refusal test on its own
+/// passes against a node that refuses everything.
+#[test]
+fn bip375_end_to_end_catches_a_tampered_share() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use common::sp_send::{SpInput, SpRecipient};
+    use satd_psbt::keys;
+    use satd_psbt::raw::RawPair;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x43u8; 32]);
+    let scan_secret = SecretKey::from_slice(&[0x23u8; 32]).expect("a scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x24u8; 32]).expect("a spend secret");
+    let recipient = SpRecipient {
+        scan_pubkey: scan_secret.public_key(&secp),
+        spend_pubkey: spend_secret.public_key(&secp),
+    };
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    node.mine_blocks(101, &wallet.address.to_string());
+    let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
+    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    const SUBSIDY: u64 = 50 * 100_000_000;
+
+    let psbt = common::sp_send::build_psbt(
+        outpoint,
+        SUBSIDY / 2,
+        SUBSIDY / 2 - 10_000,
+        &recipient,
+        &wallet.address.script_pubkey(),
+        &wallet.pk,
+    );
+    let b64 = |raw: &satd_psbt::RawPsbt| {
+        base64::engine::general_purpose::STANDARD.encode(raw.serialize())
+    };
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64(&psbt))]);
+    let mut psbt = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(updated.as_str().expect("base64"))
+            .expect("base64"),
+    )
+    .expect("a PSBT");
+
+    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
+    common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
+
+    // Sanity: the untampered PSBT does verify, so what follows is about the
+    // tampering and not about the fixture.
+    let good = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(good["silent_payments"]["outputs"][0]["status"], "ready", "{good}");
+
+    // Replace the global ECDH share with another valid point. Its DLEQ proof
+    // no longer covers it, and the output script no longer derives from it.
+    let scan_key = recipient.scan_pubkey.serialize().to_vec();
+    psbt.global.set(RawPair::new(
+        keys::global::SP_ECDH_SHARE,
+        scan_key,
+        recipient.spend_pubkey.serialize().to_vec(),
+    ));
+
+    let bad = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(
+        bad["silent_payments"]["outputs"][0]["status"], "invalid_proof",
+        "{bad}"
+    );
+    assert_eq!(bad["next"], "signer", "{bad}");
+
+    for extract in [true, false] {
+        let refused = node
+            .rpc_call_with_params(
+                "finalizepsbt",
+                vec![json!(b64(&psbt)), json!(extract)],
+            )
+            .expect("a response");
+        assert_eq!(refused["error"]["code"], -22, "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("silent payment output 0") && message.contains("invalid_proof"),
+            "the refusal should name the output and the verdict: {refused}"
+        );
+    }
+
+    node.stop();
+}
+
+/// A previous output that disagrees with the UTXO set. This is the one check a
+/// node can do and a hardware wallet cannot: a `witness_utxo` is whatever the
+/// PSBT's author wrote, and every key and amount the derivation uses hangs off
+/// it.
+#[test]
+fn bip375_catches_a_prevout_that_disagrees_with_the_utxo_set() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use common::sp_send::{SpInput, SpRecipient};
+    use satd_psbt::keys;
+    use satd_psbt::raw::RawPair;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let wallet = common::DeterministicWallet::from_secret([0x44u8; 32]);
+    let scan_secret = SecretKey::from_slice(&[0x25u8; 32]).expect("a scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x26u8; 32]).expect("a spend secret");
+    let recipient = SpRecipient {
+        scan_pubkey: scan_secret.public_key(&secp),
+        spend_pubkey: spend_secret.public_key(&secp),
+    };
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    node.mine_blocks(101, &wallet.address.to_string());
+    let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
+    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    const SUBSIDY: u64 = 50 * 100_000_000;
+
+    let psbt = common::sp_send::build_psbt(
+        outpoint,
+        SUBSIDY / 2,
+        SUBSIDY / 2 - 10_000,
+        &recipient,
+        &wallet.address.script_pubkey(),
+        &wallet.pk,
+    );
+    let b64 = |raw: &satd_psbt::RawPsbt| {
+        base64::engine::general_purpose::STANDARD.encode(raw.serialize())
+    };
+    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64(&psbt))]);
+    let mut psbt = satd_psbt::RawPsbt::parse(
+        &base64::engine::general_purpose::STANDARD
+            .decode(updated.as_str().expect("base64"))
+            .expect("base64"),
+    )
+    .expect("a PSBT");
+
+    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
+    common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
+    let good = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(good["silent_payments"]["outputs"][0]["status"], "ready", "{good}");
+
+    // Understate the previous output's amount. Everything the PSBT says about
+    // itself still hangs together; only the chain disagrees.
+    let claimed = bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(SUBSIDY - 1),
+        script_pubkey: wallet.address.script_pubkey(),
+    };
+    psbt.inputs[0].set(RawPair::new(
+        keys::input::WITNESS_UTXO,
+        Vec::new(),
+        bitcoin::consensus::serialize(&claimed),
+    ));
+
+    let bad = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
+    assert_eq!(bad["silent_payments"]["inputs"][0]["prevout"], "mismatch", "{bad}");
+    assert_eq!(
+        bad["silent_payments"]["outputs"][0]["status"], "invalid_prevout",
+        "{bad}"
+    );
+
+    let refused = node
+        .rpc_call_with_params("finalizepsbt", vec![json!(b64(&psbt))])
+        .expect("a response");
+    assert_eq!(refused["error"]["code"], -22, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid_prevout"),
+        "{refused}"
+    );
+
     node.stop();
 }

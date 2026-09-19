@@ -87,7 +87,7 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .get("psbt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            psbt::analyze_psbt(psbt_b64)
+            psbt::analyze_psbt(psbt_b64, Some(&ctx.chain_state))
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "combine" => {
@@ -108,7 +108,7 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .get("extract")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            psbt::finalize_psbt(psbt_b64, extract)
+            psbt::finalize_psbt(psbt_b64, extract, Some(&ctx.chain_state))
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "update" => {
