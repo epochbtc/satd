@@ -30,11 +30,12 @@ pub use node_index::AddressIndexConfig;
 pub use node_index::{BackfillCursor, BackfillState};
 pub use emit::{emit_funding, emit_spending, funding_remove_key, spending_remove_key};
 pub use node_index::{
-    AddrFundingKey, AddrFundingKeyV2Payload, AddrFundingRow, AddrSpendingKey,
-    AddrSpendingKeyV2Payload, AddrSpendingRow, KEY_LEN_V2, SCRIPTHASH_PREFIX_LEN, Scripthash,
-    decode_funding_key_v2, decode_funding_value, decode_spending_key_v2, decode_spending_value,
-    encode_funding_key_v2, encode_funding_value, encode_spending_key_v2, encode_spending_value,
-    reconstruct_funding_key, reconstruct_spending_key, scripthash_of,
+    AddrFundingKey, AddrFundingKeyV3, AddrFundingKeyV3Payload, AddrFundingRow, AddrFundingRowV3,
+    AddrSpendingKey, AddrSpendingKeyV2Payload, AddrSpendingRow, KEY_LEN_V2, KEY_LEN_V3,
+    SCRIPTHASH_PREFIX_LEN, Scripthash, decode_funding_key_v3, decode_funding_value,
+    decode_spending_key_v2, decode_spending_value, encode_funding_key_v3, encode_funding_value,
+    encode_spending_key_v2, encode_spending_value, reconstruct_funding_key_v3,
+    reconstruct_spending_key, scripthash_of,
 };
 pub use lookups::RocksAddressIndex;
 pub use mempool::{MempoolAddrIndex, NotifyBundle, mempool_index_task};

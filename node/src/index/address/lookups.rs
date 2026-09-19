@@ -327,13 +327,69 @@ impl AddressIndex for RocksAddressIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::address::keys::{AddrFundingRow, AddrSpendingRow};
+    use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRow};
     use crate::storage::StoreBatch;
     use crate::storage::db::InMemoryStore;
 
     fn fixture_txid(byte: u8) -> bitcoin::Txid {
         use bitcoin::hashes::Hash;
         bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    }
+
+    /// Assign each `(height, txid)` a chain-order ordinal and write the
+    /// families a v3 index row resolves through: `tx_loc`,
+    /// `txseq_txid`, `txseq_block`, plus the block-index and
+    /// height-index rows `block_of_seq` bounds its answer with.
+    ///
+    /// A funding row on disk names its transaction by ordinal alone, so
+    /// a fixture that writes rows without this scaffolding writes rows
+    /// nothing can read back — which is exactly what a real chainstate
+    /// would call corruption.
+    ///
+    /// Transactions are numbered in the order given, which must be
+    /// non-decreasing in height for the numbering to be chain order.
+    /// Returns the ordinal assigned to each.
+    fn seed_ordinals(store: &InMemoryStore, txs: &[(u32, bitcoin::Txid)]) -> Vec<u64> {
+        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+        use bitcoin::hashes::Hash;
+
+        let g = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut batch = StoreBatch::default();
+        let mut seqs = Vec::with_capacity(txs.len());
+        let mut per_height: std::collections::BTreeMap<u32, (u64, u32)> = Default::default();
+
+        for (i, (height, txid)) in txs.iter().enumerate() {
+            let seq = i as u64;
+            seqs.push(seq);
+            batch.tx_loc_puts.push((*txid, seq));
+            batch.txseq_txid_puts.push((seq, *txid));
+            per_height
+                .entry(*height)
+                .and_modify(|(_, n)| *n += 1)
+                .or_insert((seq, 1));
+        }
+
+        for (height, (first_txseq, num_tx)) in per_height {
+            let hash = bitcoin::BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([height as u8; 32]),
+            );
+            batch.block_index_puts.push((
+                hash,
+                BlockIndexEntry {
+                    header: g.header,
+                    height,
+                    status: BlockStatus::Valid,
+                    num_tx,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            ));
+            batch.height_hash_puts.push((height, hash));
+            batch.txseq_block_puts.push((first_txseq, height));
+        }
+        store.write_batch(batch).unwrap();
+        seqs
     }
 
     fn make_coin(amount: u64, height: u32) -> crate::storage::coinview::Coin {
@@ -380,14 +436,25 @@ mod tests {
         let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
         let sh = [0xab; 32];
 
-        // Three funding rows at heights 10, 5, 7. The store iterator
-        // returns them sorted; confirmed_history must too.
+        // Three funding rows at heights 5, 7, 10, written out of order.
+        // The store iterator returns them sorted; confirmed_history
+        // must too.
+        let seqs = seed_ordinals(
+            &store_inner,
+            &[
+                (5, fixture_txid(5)),
+                (7, fixture_txid(7)),
+                (10, fixture_txid(10)),
+            ],
+        );
         let mut batch = StoreBatch::default();
-        for h in [10u32, 5, 7] {
-            batch.addr_funding_puts.push(AddrFundingRow {
+        for (i, _) in [10u32, 5, 7].iter().enumerate() {
+            // Push in an order that does not match the ordinals, so a
+            // store that returned insertion order would fail.
+            let seq = seqs[[2usize, 0, 1][i]];
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
                 scripthash: sh,
-                height: h,
-                txid: fixture_txid(h as u8),
+                txseq: seq,
                 vout: 0,
                 amount_sat: 100,
             });
@@ -397,6 +464,104 @@ mod tests {
         let history = idx.confirmed_history(&sh).unwrap();
         let heights: Vec<u32> = history.iter().map(|e| e.height()).collect();
         assert_eq!(heights, vec![5, 7, 10]);
+    }
+
+    /// The documented order is `(height, txid, vout)`. On disk the rows
+    /// are ordinal-keyed, and ordinal order is *block position*, not
+    /// txid order — so within one block the two disagree. The store
+    /// sorts before returning, which is what keeps every consumer
+    /// (Electrum's `listunspent`, the lockstep merge in
+    /// `confirmed_distinct_history_limited`) working unchanged.
+    ///
+    /// This builds a block whose transactions are in the opposite txid
+    /// order from their positions, so a store that returned raw scan
+    /// order would fail.
+    #[test]
+    fn test_address_index_utxos_order_matches_the_documented_contract() {
+        let store_inner = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = store_inner.clone();
+        let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
+        let sh = [0x5a; 32];
+
+        // Three transactions in ONE block. Positions 0,1,2 carry txids
+        // that sort 0xcc, 0xbb, 0xaa — the reverse.
+        let txids = [fixture_txid(0xcc), fixture_txid(0xbb), fixture_txid(0xaa)];
+        let seqs = seed_ordinals(
+            &store_inner,
+            &[(7, txids[0]), (7, txids[1]), (7, txids[2])],
+        );
+        assert!(
+            txids[0] > txids[1] && txids[1] > txids[2],
+            "fixture premise: block position and txid order disagree"
+        );
+
+        let mut batch = StoreBatch::default();
+        for (i, seq) in seqs.iter().enumerate() {
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
+                scripthash: sh,
+                txseq: *seq,
+                vout: 0,
+                amount_sat: 100 + i as u64,
+            });
+            batch.coin_puts.push((
+                OutPoint { txid: txids[i], vout: 0 },
+                make_coin(100 + i as u64, 7),
+            ));
+        }
+        store_inner.write_batch(batch).unwrap();
+
+        let got: Vec<bitcoin::Txid> = idx.utxos(&sh).unwrap().iter().map(|u| u.txid).collect();
+        let mut expected = txids.to_vec();
+        expected.sort_by_key(|t| t.to_string());
+        assert_eq!(
+            got, expected,
+            "utxos must come back in (height, txid, vout) order, not block order"
+        );
+
+        // Same for history.
+        let hist: Vec<bitcoin::Txid> = idx
+            .confirmed_history(&sh)
+            .unwrap()
+            .iter()
+            .map(|e| e.txid())
+            .collect();
+        assert_eq!(hist, expected);
+    }
+
+    /// A funding row whose ordinal has no reverse-map entry is local
+    /// corruption: the rows are written in the same atomic batch as the
+    /// ordinal families, so one cannot exist without the other on a
+    /// healthy chainstate. It must be skipped, not emitted with an
+    /// invented txid that a consumer would read as a real transaction.
+    #[test]
+    fn test_address_index_skips_a_row_whose_ordinal_does_not_resolve() {
+        let store_inner = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = store_inner.clone();
+        let idx = RocksAddressIndex::new(store, AddressIndexConfig::default());
+        let sh = [0x6b; 32];
+
+        let good = fixture_txid(0x11);
+        let seqs = seed_ordinals(&store_inner, &[(3, good)]);
+
+        let mut batch = StoreBatch::default();
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
+            scripthash: sh,
+            txseq: seqs[0],
+            vout: 0,
+            amount_sat: 500,
+        });
+        // An ordinal nothing ever indexed.
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
+            scripthash: sh,
+            txseq: 9_999,
+            vout: 0,
+            amount_sat: 600,
+        });
+        store_inner.write_batch(batch).unwrap();
+
+        let history = idx.confirmed_history(&sh).unwrap();
+        assert_eq!(history.len(), 1, "the unresolvable row must be dropped");
+        assert_eq!(history[0].txid(), good);
     }
 
     #[test]
@@ -409,18 +574,17 @@ mod tests {
         // Two funding rows; both unspent → balance is the sum.
         let txid_a = fixture_txid(0x10);
         let txid_b = fixture_txid(0x11);
+        let seqs = seed_ordinals(&store_inner, &[(1, txid_a), (2, txid_b)]);
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid: txid_a,
+            txseq: seqs[0],
             vout: 0,
             amount_sat: 1000,
         });
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 2,
-            txid: txid_b,
+            txseq: seqs[1],
             vout: 1,
             amount_sat: 2500,
         });
@@ -447,18 +611,17 @@ mod tests {
         let txid_a = fixture_txid(0x20);
         let txid_b = fixture_txid(0x21);
         // Fund two outpoints, then spend one.
+        let seqs = seed_ordinals(&store_inner, &[(1, txid_a), (2, txid_b)]);
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid: txid_a,
+            txseq: seqs[0],
             vout: 0,
             amount_sat: 1000,
         });
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 2,
-            txid: txid_b,
+            txseq: seqs[1],
             vout: 0,
             amount_sat: 4000,
         });
@@ -493,18 +656,17 @@ mod tests {
 
         let txid_a = fixture_txid(0x30);
         let txid_b = fixture_txid(0x31);
+        let seqs = seed_ordinals(&store_inner, &[(1, txid_a), (2, txid_b)]);
         let mut batch = StoreBatch::default();
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid: txid_a,
+            txseq: seqs[0],
             vout: 0,
             amount_sat: 1000,
         });
-        batch.addr_funding_puts.push(AddrFundingRow {
+        batch.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 2,
-            txid: txid_b,
+            txseq: seqs[1],
             vout: 0,
             amount_sat: 2000,
         });
@@ -553,14 +715,16 @@ mod tests {
         // yields 20 raw funding rows for 4 distinct (height, txid)
         // pairs — duplicate factor 5, above the previous fixed-2
         // assumption.
+        let txs: Vec<(u32, bitcoin::Txid)> =
+            (0..4u32).map(|i| (i, fixture_txid(0x10 + i as u8))).collect();
+        let seqs = seed_ordinals(&store_inner, &txs);
         let mut batch = StoreBatch::default();
-        for i in 0..4u32 {
-            let txid = fixture_txid(0x10 + i as u8);
+        for (i, seq) in seqs.iter().enumerate() {
+            let _ = i;
             for vout in 0..5u32 {
-                batch.addr_funding_puts.push(AddrFundingRow {
+                batch.addr_funding_puts.push(AddrFundingRowV3 {
                     scripthash: sh,
-                    height: i,
-                    txid,
+                    txseq: *seq,
                     vout,
                     amount_sat: 100,
                 });
@@ -598,14 +762,16 @@ mod tests {
         let sh = [0xfe; 32];
 
         // 4 txs × 5 outputs each = 20 raw funding rows.
+        let txs: Vec<(u32, bitcoin::Txid)> =
+            (0..4u32).map(|i| (i, fixture_txid(0x80 + i as u8))).collect();
+        let seqs = seed_ordinals(&store_inner, &txs);
         let mut batch = StoreBatch::default();
-        for i in 0..4u32 {
-            let txid = fixture_txid(0x80 + i as u8);
+        for (i, seq) in seqs.iter().enumerate() {
+            let _ = i;
             for vout in 0..5u32 {
-                batch.addr_funding_puts.push(AddrFundingRow {
+                batch.addr_funding_puts.push(AddrFundingRowV3 {
                     scripthash: sh,
-                    height: i,
-                    txid,
+                    txseq: *seq,
                     vout,
                     amount_sat: 100,
                 });
@@ -641,12 +807,14 @@ mod tests {
         // 10 funding + 10 spending rows for the same scripthash.
         // With limit=12, the unfixed code would have returned ~20
         // (10 + 10 from each side); the fixed code truncates to 12.
+        let txs: Vec<(u32, bitcoin::Txid)> =
+            (0..10u32).map(|i| (i, fixture_txid(i as u8))).collect();
+        let seqs = seed_ordinals(&store_inner, &txs);
         let mut batch = StoreBatch::default();
         for i in 0..10u32 {
-            batch.addr_funding_puts.push(AddrFundingRow {
+            batch.addr_funding_puts.push(AddrFundingRowV3 {
                 scripthash: sh,
-                height: i,
-                txid: fixture_txid(i as u8),
+                txseq: seqs[i as usize],
                 vout: 0,
                 amount_sat: 100,
             });

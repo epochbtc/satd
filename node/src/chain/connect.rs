@@ -923,12 +923,12 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 intra_block_coins.insert(outpoint, coin.clone());
                 batch.coin_puts.push((outpoint, coin));
 
-                // Address-history index: funding row.
+                // Address-history index: funding row, keyed on this
+                // transaction's ordinal.
                 crate::index::address::emit_funding(
                     &mut batch,
                     address_index,
-                    height,
-                    txid,
+                    txseq,
                     vout as u32,
                     output,
                 );
@@ -3611,9 +3611,17 @@ mod tests {
             2,
             "expected 2 funding rows (coinbase output + spending tx output)"
         );
-        // Every funding row's height must be the block height.
+        // Every funding row must key on a transaction of this block —
+        // the rows carry an ordinal, not a height, so "in this block"
+        // is the range the block's own ordinal row opens.
+        let first_txseq = batch.txseq_block_puts[0].0;
+        let range = first_txseq..first_txseq + block.txdata.len() as u64;
         for row in &batch.addr_funding_puts {
-            assert_eq!(row.height, 1);
+            assert!(
+                range.contains(&row.txseq),
+                "funding row ordinal {} is outside this block's range {range:?}",
+                row.txseq
+            );
         }
     }
 

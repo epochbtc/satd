@@ -5309,7 +5309,7 @@ fn test_getstoragefootprint_shape_and_cli() {
         "txseq_block",
         "metadata",
         "chain_tx",
-        "addr_funding_v2",
+        "addr_funding_v3",
         "addr_spending_v2",
         "spent",
         "sp_tweaks",
@@ -11978,6 +11978,136 @@ fn electrum_round_trip(port: u16, request: &serde_json::Value) -> serde_json::Va
     let n = reader.read_line(&mut line).expect("read response");
     assert!(n > 0, "EOF before electrum response arrived");
     serde_json::from_str(line.trim_end()).expect("electrum response is valid JSON")
+}
+
+/// Address funding rows are stored keyed on a transaction ordinal and
+/// resolved back to `(height, txid)` before they leave the store. The
+/// resolution and the ordering are the parts that can go wrong without
+/// producing anything that looks malformed, so this pins the whole
+/// Electrum address surface byte-for-byte across a full chainstate
+/// rebuild — the migration path onto the new layout.
+///
+/// Several addresses, several transactions per block, so that ordinal
+/// order (block position) and the documented `(height, txid, vout)`
+/// order actually disagree within a block.
+#[test]
+fn test_electrum_listunspent_and_balance_identical_across_reindex() {
+    let electrum_port = find_available_port();
+    let bind = format!("--electrumbind=127.0.0.1:{}", electrum_port);
+    let rpcport = find_available_port();
+    let p2p_port = find_available_port();
+    let port_arg = format!("--port={}", p2p_port);
+    let datadir = fresh_test_datadir("satd-addr-funding-v3");
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--electrum=1", &bind, "--txindex=1", &port_arg],
+    );
+
+    // Mine to a key we hold, then fan out to three destinations in a
+    // single transaction so one block carries several funding rows.
+    let wallet = DeterministicWallet::from_secret([0x3c; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![
+            serde_json::json!(110),
+            serde_json::json!(wallet.address.to_string()),
+        ],
+    );
+
+    let dests = [
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202",
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202",
+    ];
+    let dest_script = dests[0]
+        .parse::<bitcoin::Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let (raw_hex, _spend_txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest_script, 1_000);
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![
+            serde_json::json!(1),
+            serde_json::json!(wallet.address.to_string()),
+        ],
+    );
+
+    // Snapshot the address surface for both the mining key (110+
+    // coinbase funding rows, several blocks) and the spend
+    // destination.
+    let scripthash_of_addr = |addr: &str| -> String {
+        use bitcoin::hashes::Hash as _;
+        let spk = addr
+            .parse::<bitcoin::Address<_>>()
+            .unwrap()
+            .assume_checked()
+            .script_pubkey();
+        let h = bitcoin::hashes::sha256::Hash::hash(spk.as_bytes());
+        // Electrum takes the scripthash byte-reversed.
+        let mut b = h.to_byte_array();
+        b.reverse();
+        hex::encode(b)
+    };
+    let probes: Vec<String> = [wallet.address.to_string(), dests[0].to_string()]
+        .iter()
+        .map(|a| scripthash_of_addr(a))
+        .collect();
+
+    let snapshot = |port: u16, probes: &[String]| -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, sh) in probes.iter().enumerate() {
+            for method in [
+                "blockchain.scripthash.listunspent",
+                "blockchain.scripthash.get_balance",
+                "blockchain.scripthash.get_history",
+            ] {
+                let v = electrum_round_trip(
+                    port,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": i + 1,
+                        "method": method,
+                        "params": [sh],
+                    }),
+                );
+                out.push(serde_json::to_string(&v["result"]).unwrap());
+            }
+        }
+        out
+    };
+
+    let before = snapshot(electrum_port, &probes);
+    assert!(
+        before.iter().any(|r| r.len() > 10),
+        "premise: the probes must have history to compare"
+    );
+    node.stop();
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--electrum=1",
+            &bind,
+            "--txindex=1",
+            &port_arg,
+            "--reindex-chainstate",
+        ],
+    );
+    let after = snapshot(electrum_port, &probes);
+
+    assert_eq!(
+        before, after,
+        "listunspent, get_balance and get_history must be byte-identical \
+         across the chainstate rebuild"
+    );
+
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }
 
 /// `server.version` round-trips and reports satd's name plus protocol
