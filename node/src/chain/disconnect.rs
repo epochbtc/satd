@@ -218,11 +218,11 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
                 .coin_removes
                 .push((outpoint, output.value.to_sat(), block_height));
 
-            // Address-history funding remove for this output.
+            // Address-history funding remove for this output, keyed on
+            // the same ordinal `connect_block` wrote it under.
             if let Some(key) = crate::index::address::funding_remove_key(
                 address_index,
-                block_height,
-                txid,
+                first_txseq + tx_idx_rev as u64,
                 vout as u32,
                 output,
             ) {
@@ -1590,6 +1590,21 @@ mod tests {
         let spending_count = connect_batch.addr_spending_puts.len();
         assert!(funding_count >= 1, "expected at least one addr_funding_puts");
         assert_eq!(spending_count, 1, "expected exactly one addr_spending_puts");
+        // Capture the exact keys, not just how many. Since the rows key
+        // on transaction ordinals, a disconnect that emitted the right
+        // *number* of removes under the wrong ordinals would strand
+        // every row it was meant to take out and delete rows belonging
+        // to some other block — and a count check passes either way.
+        let funding_keys: std::collections::HashSet<_> = connect_batch
+            .addr_funding_puts
+            .iter()
+            .map(|r| r.key())
+            .collect();
+        let spending_keys: std::collections::HashSet<_> = connect_batch
+            .addr_spending_puts
+            .iter()
+            .map(|r| r.key())
+            .collect();
 
         store.write_batch(connect_batch).unwrap();
 
@@ -1608,14 +1623,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            batch.addr_funding_removes.len(),
-            funding_count,
-            "addr_funding_removes count must match connect's addr_funding_puts"
+            batch
+                .addr_funding_removes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            funding_keys,
+            "addr_funding_removes must name exactly the keys connect wrote"
         );
         assert_eq!(
-            batch.addr_spending_removes.len(),
-            spending_count,
-            "addr_spending_removes count must match connect's addr_spending_puts"
+            batch
+                .addr_spending_removes
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            spending_keys,
+            "addr_spending_removes must name exactly the keys connect wrote"
         );
     }
 

@@ -1730,28 +1730,33 @@ impl Store for CoinCache {
         // pending remove (e.g. connect-then-disconnect before flush),
         // the on-disk outcome is "removed". We mirror that here so the
         // pre-flush read view matches the post-flush state.
-        let pending = self.pending_batch.lock();
-        let pending_removes: std::collections::HashSet<crate::index::address::AddrFundingKey> =
-            pending
-                .addr_funding_removes
+        //
+        // The pending rows are ordinal-keyed, as they are on disk, so
+        // they are resolved here — through `self`, not `inner`, because
+        // a block connected since the last flush has its own ordinal
+        // rows in this same pending batch.
+        let (pending_removes, pending_raw) = {
+            let pending = self.pending_batch.lock();
+            let removes: std::collections::HashSet<crate::index::address::AddrFundingKeyV3> =
+                pending
+                    .addr_funding_removes
+                    .iter()
+                    .filter(|k| &k.scripthash == sh)
+                    .copied()
+                    .collect();
+            let raw: Vec<(u64, u32, u64)> = pending
+                .addr_funding_puts
                 .iter()
-                .filter(|k| &k.scripthash == sh)
-                .cloned()
+                .filter(|r| &r.scripthash == sh && !removes.contains(&r.key()))
+                .map(|r| (r.txseq, r.vout, r.amount_sat))
                 .collect();
-        let pending_puts: Vec<(crate::index::address::AddrFundingKey, u64)> = pending
-            .addr_funding_puts
-            .iter()
-            .filter(|r| &r.scripthash == sh)
-            .filter_map(|r| {
-                let k = r.key();
-                if pending_removes.contains(&k) {
-                    None
-                } else {
-                    Some((k, r.amount_sat))
-                }
-            })
-            .collect();
-        drop(pending);
+            (removes, raw)
+        };
+        let pending_puts = crate::storage::rocksdb_store::resolve_funding_rows_for(
+            self,
+            sh,
+            pending_raw,
+        );
 
         // Round-1 review M4: bound the inner scan. The handler only
         // needs to know "is there more than `cap`?", so asking inner
@@ -1770,16 +1775,33 @@ impl Store for CoinCache {
         // is still buffered) would surface twice in the merged result.
         // Backfill is the first writer that goes through the no-coin
         // pass-through alongside a non-empty pending_batch.
+        //
+        // Both sides are resolved by now, so the dedup and the
+        // pending-remove filter compare resolved keys. A pending remove
+        // names an ordinal; the inner row it would hide resolves to the
+        // same `(height, txid, vout)`, so translate the removes once
+        // rather than resolving every inner row back to an ordinal.
+        let removed_resolved: std::collections::HashSet<crate::index::address::AddrFundingKey> =
+            crate::storage::rocksdb_store::resolve_funding_rows_for(
+                self,
+                sh,
+                pending_removes
+                    .iter()
+                    .map(|k| (k.txseq, k.vout, 0u64))
+                    .collect(),
+            )
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         let pending_keys: std::collections::HashSet<crate::index::address::AddrFundingKey> =
             pending_puts.iter().map(|(k, _)| k.clone()).collect();
         let mut all: Vec<(crate::index::address::AddrFundingKey, u64)> = inner_rows
             .into_iter()
-            .filter(|(k, _)| !pending_removes.contains(k) && !pending_keys.contains(k))
+            .filter(|(k, _)| !removed_resolved.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
         all.sort_by(|(a, _), (b, _)| {
-            crate::index::address::encode_funding_key_v2(a)
-                .cmp(&crate::index::address::encode_funding_key_v2(b))
+            (a.height, a.txid.to_string(), a.vout).cmp(&(b.height, b.txid.to_string(), b.vout))
         });
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows. Without this truncate a large in-flight
@@ -3415,20 +3437,23 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn test_pending_addr_funding_put_then_remove_nets_to_empty() {
-        use crate::index::address::{AddrFundingRow, scripthash_of};
+        use crate::index::address::{AddrFundingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
         let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
             [0x99; 32],
         ));
+        // The row names its transaction by ordinal, so the families it
+        // resolves through have to exist or the read (correctly) drops
+        // it as unresolvable.
+        seed_ordinal_block(&cache, 1, 1, &[txid]);
 
         // Connect-side: stage a funding row in the pending batch.
         let mut connect = StoreBatch::default();
-        connect.addr_funding_puts.push(AddrFundingRow {
+        connect.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid,
+            txseq: 1,
             vout: 0,
             amount_sat: 1_000,
         });
@@ -3445,10 +3470,9 @@ mod tests {
         let mut disconnect = StoreBatch::default();
         disconnect
             .addr_funding_removes
-            .push(crate::index::address::AddrFundingKey {
+            .push(crate::index::address::AddrFundingKeyV3 {
                 scripthash: sh,
-                height: 1,
-                txid,
+                txseq: 1,
                 vout: 0,
             });
         cache.write_batch(disconnect).unwrap();
@@ -3473,22 +3497,22 @@ mod tests {
         // implementation's per-key netting only handled the
         // put-then-remove direction; remove-then-put would have
         // dropped the new put.
-        use crate::index::address::{AddrFundingRow, scripthash_of};
+        use crate::index::address::{AddrFundingRowV3, scripthash_of};
 
         let cache = make_cache(16);
         let sh = scripthash_of(&bitcoin::ScriptBuf::new());
         let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
             [0x55; 32],
         ));
+        seed_ordinal_block(&cache, 1, 1, &[txid]);
 
         // Stage a remove for the row first (e.g. disconnecting block A).
         let mut disconnect = StoreBatch::default();
         disconnect
             .addr_funding_removes
-            .push(crate::index::address::AddrFundingKey {
+            .push(crate::index::address::AddrFundingKeyV3 {
                 scripthash: sh,
-                height: 1,
-                txid,
+                txseq: 1,
                 vout: 0,
             });
         cache.write_batch(disconnect).unwrap();
@@ -3496,10 +3520,9 @@ mod tests {
         // Now stage a put for the same key (reconnecting the same block
         // or an alternate block at the same height that reuses the row).
         let mut reconnect = StoreBatch::default();
-        reconnect.addr_funding_puts.push(AddrFundingRow {
+        reconnect.addr_funding_puts.push(AddrFundingRowV3 {
             scripthash: sh,
-            height: 1,
-            txid,
+            txseq: 1,
             vout: 0,
             amount_sat: 7_777,
         });
