@@ -68,6 +68,13 @@
           # `tonic_build` reads at compile time; keep those.
           # Also keep license/attribution files referenced by some
           # downstream build scripts and the `vendor/` directories.
+          #
+          # This is an allowlist, so a compile-time asset in a new format
+          # is dropped silently and fails the build as a missing file --
+          # `node/src/status/status.js`, which `node/src/status/render.rs`
+          # pulls in with `include_str!`, was added with no `.js` here and
+          # broke `nix build` until this was widened. Adding an asset in a
+          # format not listed below means adding it below.
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             name = "satd-source";
@@ -75,11 +82,19 @@
               let
                 rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
                 isProto = pkgs.lib.hasSuffix ".proto" rel;
+                # A crate's own compile-time assets. Scoped to `src/` so
+                # the manual's `docs/manual/src/**` stays out: it is not
+                # built here, and letting it in would make every docs edit
+                # a new derivation.
+                isCrateAsset =
+                  pkgs.lib.hasInfix "/src/" ("/" + rel)
+                  && !(pkgs.lib.hasPrefix "docs/" rel)
+                  && pkgs.lib.any (ext: pkgs.lib.hasSuffix ext rel) [ ".js" ".css" ".html" ];
                 isVendorAttribution =
                   pkgs.lib.hasInfix "/vendor/" ("/" + rel);
                 isCargoOrRust = craneLib.filterCargoSources path type;
               in
-              isProto || isVendorAttribution || isCargoOrRust;
+              isProto || isCrateAsset || isVendorAttribution || isCargoOrRust;
           };
 
           # Native deps every cargo build in this workspace needs.
