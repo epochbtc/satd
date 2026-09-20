@@ -50,6 +50,7 @@ use libfuzzer_sys::fuzz_target;
 use node::chain::connect::{check_block_version, connect_block, ConnectParams};
 use node::storage::db::InMemoryStore;
 use node::storage::flatfile::FlatFilePos;
+use node::storage::{Store, StoreBatch};
 use node::validation::block::check_block;
 use node::validation::script::ConsensusVerifier;
 
@@ -68,8 +69,9 @@ const CORE_RPC_PORT: u16 = 28443;
 const CORE_USER: &str = "fuzz";
 const CORE_PASS: &str = "fuzzpw";
 
-/// Resident shared base: a Core node at regtest genesis and an empty
-/// in-process UTXO store. Built once, reused for every fuzz iteration.
+/// Resident shared base: a Core node at regtest genesis and an
+/// in-process store holding the rows a real chainstate has at genesis.
+/// Built once, reused for every fuzz iteration.
 struct Base {
     rpc: Client,
     store: InMemoryStore,
@@ -169,9 +171,45 @@ fn spawn_base() -> Base {
         ));
     }
 
+    // A real chainstate at genesis is not an empty store: connecting
+    // genesis writes its cumulative transaction count, and `connect_block`
+    // reads the parent's count to number the child's transactions. That
+    // read is deliberately fail-closed — a missing row is storage damage,
+    // and guessing zero would mis-key every index row in the block
+    // against every other block — so a store without it makes satd reject
+    // every block the fuzzer builds, while Core accepts the valid ones.
+    // Modelling the row here keeps the harness a chainstate rather than a
+    // bare map. Genesis holds exactly one transaction.
+    let store = InMemoryStore::new();
+    let mut batch = StoreBatch::default();
+    batch.chain_tx_puts.push((genesis, 1));
+    store
+        .write_batch(batch)
+        .unwrap_or_else(|e| harness_failure(&format!("seeding the genesis chain_tx row failed: {e}")));
+
+    // Self-check the fixture before any comparison runs.
+    //
+    // This is a harness invariant, not a consensus assertion: if the base
+    // store is missing a row `connect_block` needs, satd rejects every
+    // block for a storage reason while Core accepts the valid ones, and
+    // every iteration reports a consensus divergence. That is how this
+    // check came to exist - the triage filed a divergence issue against
+    // satd/Core block acceptance when the fault was two lines above.
+    // Failing here instead routes it to the broken-harness bucket, which
+    // says so plainly and files nothing against consensus.
+    if store.get_cumulative_tx_count(&genesis).is_none() {
+        harness_failure(
+            "base store has no cumulative transaction count for genesis, so \
+             connect_block cannot number a child block's transactions and will \
+             reject every block the fuzzer builds. The comparison would report \
+             a consensus divergence on satd's side for every input. Seed the \
+             rows a real chainstate holds at genesis before comparing.",
+        );
+    }
+
     Base {
         rpc,
-        store: InMemoryStore::new(),
+        store,
         tip: genesis,
         height: 0,
         tip_time: GENESIS_TIME,
