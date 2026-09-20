@@ -89,18 +89,25 @@ satd is built with these priorities in mind:
 
 ## Getting Started
 
-### Try it in 2 minutes (signet, Docker)
+### Installing
 
-No build required — stream a live signet sync (peers connecting, blocks flowing)
-straight to your terminal:
+| On | Install | |
+|---|---|---|
+| **Umbrel** | add the community app store `https://github.com/epochbtc/umbrel-apps` under **App Store → ⋯ → Community App Stores**, then install **satd** | [steps](https://epochbtc.github.io/satd/installing.html#umbrel) |
+| **StartOS** | build and sideload [`epochbtc/satd-startos`](https://github.com/epochbtc/satd-startos); submitted to Start9's community registry | [steps](https://epochbtc.github.io/satd/installing.html#startos) |
+| **A VM, mini-PC or spare SSD** | boot the signed appliance image from a [release](https://github.com/epochbtc/satd/releases) (from 0.6.0): satd plus wallets and Lightning, on signet out of the box | [steps](https://epochbtc.github.io/satd/installing.html#appliance-image) |
+| **Docker** | `ghcr.io/epochbtc/satd`, multi-arch, cosign-signed | [steps](https://epochbtc.github.io/satd/installing.html#container) |
+| **Linux or macOS** | a minisign-signed tarball from the [releases page](https://github.com/epochbtc/satd/releases) | [steps](https://epochbtc.github.io/satd/installing.html#release-tarball) |
+
+To try it first, run a signet node in Docker and watch
+it sync:
 
 ```sh
 docker run --rm -it -v satd-signet:/var/lib/satd \
-  ghcr.io/epochbtc/satd:0.3.0 --signet --datadir=/var/lib/satd
+  ghcr.io/epochbtc/satd:latest --signet --datadir=/var/lib/satd
 ```
 
-Within seconds the node connects to signet peers and begins Initial Block
-Download. Query it from another terminal (signet RPC is on `38332`, cookie auth):
+Query it from another terminal (signet RPC is on `38332`, cookie auth):
 
 ```sh
 docker exec <container> sat-cli \
