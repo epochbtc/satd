@@ -63,6 +63,11 @@ fn required_capability(method: &str) -> Capability {
         "sendmsgtopeer" => Capability::TestNet,
         _ => match classify(method) {
             Some(RpcAccess::Read) => Capability::RpcRead,
+            // Handing a transaction to the mempool is its own capability so a
+            // broadcaster need not hold node control; `rpc:write` implies it
+            // (see `CapabilitySet::contains`), so existing write tokens are
+            // unaffected.
+            Some(RpcAccess::MempoolSubmit) => Capability::RpcSubmit,
             _ => Capability::RpcWrite,
         },
     }
@@ -315,12 +320,68 @@ mod tests {
     #[tokio::test]
     async fn read_token_is_forbidden_on_a_write_method() {
         let (svc, dispatched) = filter();
+        let rp = svc.call(req_with("stop", Some(read_only_token()))).await;
+        assert!(rp.is_error());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(rp.as_json().get().contains("rpc:write"));
+    }
+
+    #[tokio::test]
+    async fn read_token_is_forbidden_on_a_submit_method() {
+        let (svc, dispatched) = filter();
         let rp = svc
             .call(req_with("sendrawtransaction", Some(read_only_token())))
             .await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("rpc:write"));
+        // The denial names the capability that would have admitted the call.
+        assert!(rp.as_json().get().contains("rpc:submit"), "{}", rp.as_json().get());
+    }
+
+    fn submit_token() -> Principal {
+        Principal::token(
+            Arc::from("sub"),
+            CapabilitySet::EMPTY
+                .with(Capability::RpcRead)
+                .with(Capability::RpcSubmit),
+            None,
+            None,
+            Principal::operator().accounting().clone(),
+        )
+    }
+
+    /// A submit token broadcasts but cannot control the node; a write token
+    /// keeps broadcasting because `rpc:write` implies `rpc:submit`.
+    #[tokio::test]
+    async fn submit_token_broadcasts_but_cannot_control() {
+        for method in ["sendrawtransaction", "submitpackage"] {
+            assert_eq!(required_capability(method), Capability::RpcSubmit, "{method}");
+            let (svc, dispatched) = filter();
+            let rp = svc.call(req_with(method, Some(submit_token()))).await;
+            assert!(rp.is_success(), "{method}: {}", rp.as_json().get());
+            assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        }
+        for method in ["stop", "addnode", "invalidateblock", "totallynewrpc"] {
+            let (svc, dispatched) = filter();
+            let rp = svc.call(req_with(method, Some(submit_token()))).await;
+            assert!(rp.is_error(), "{method} must be denied to a submit token");
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+            assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
+        }
+
+        let write_token = Principal::token(
+            Arc::from("rw"),
+            CapabilitySet::EMPTY.with(Capability::RpcWrite),
+            None,
+            None,
+            Principal::operator().accounting().clone(),
+        );
+        let (svc, dispatched) = filter();
+        let rp = svc
+            .call(req_with("sendrawtransaction", Some(write_token)))
+            .await;
+        assert!(rp.is_success(), "{}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

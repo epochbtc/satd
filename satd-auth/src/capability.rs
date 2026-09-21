@@ -14,8 +14,22 @@ use std::fmt;
 pub enum Capability {
     /// Read-only JSON-RPC methods.
     RpcRead,
-    /// Mutating JSON-RPC (`sendrawtransaction`, node/index control, mining).
+    /// Mutating JSON-RPC (node/index control, mining, and everything
+    /// [`Capability::RpcSubmit`] grants).
+    ///
+    /// Implies [`Capability::RpcSubmit`]: a set holding `rpc:write` satisfies
+    /// a check for `rpc:submit`, so a token minted before the submit
+    /// capability existed keeps broadcasting. The converse does not hold.
     RpcWrite,
+    /// Mempool submission only: `sendrawtransaction`, `submitpackage`, and
+    /// the other methods the read-only listener classes as mempool-submit.
+    ///
+    /// The read-only listener already tells "hand a transaction to the
+    /// mempool" apart from "control the node"; this carries that distinction
+    /// into bearer tokens, so a broadcaster (a payment processor, a wallet
+    /// backend) can hold `rpc:read` + `rpc:submit` and never `stop`,
+    /// `addnode`, or `invalidateblock`. Implied by [`Capability::RpcWrite`].
+    RpcSubmit,
     /// Esplora REST / SSE.
     EsploraRead,
     /// Open a streaming subscription (gRPC events).
@@ -46,9 +60,10 @@ pub enum Capability {
 
 /// Every capability, in bit order. The single source of truth used to derive
 /// [`CapabilitySet::ALL`] and to render a set for logging.
-const ALL_CAPS: [Capability; 8] = [
+const ALL_CAPS: [Capability; 9] = [
     Capability::RpcRead,
     Capability::RpcWrite,
+    Capability::RpcSubmit,
     Capability::EsploraRead,
     Capability::StreamSubscribe,
     Capability::StreamWatch,
@@ -63,6 +78,7 @@ impl Capability {
         match self {
             Capability::RpcRead => "rpc:read",
             Capability::RpcWrite => "rpc:write",
+            Capability::RpcSubmit => "rpc:submit",
             Capability::EsploraRead => "esplora:read",
             Capability::StreamSubscribe => "stream:subscribe",
             Capability::StreamWatch => "stream:watch",
@@ -111,6 +127,7 @@ impl CapabilitySet {
         CapabilitySet(
             Capability::RpcRead.bit()
                 | Capability::RpcWrite.bit()
+                | Capability::RpcSubmit.bit()
                 | Capability::EsploraRead.bit()
                 | Capability::StreamSubscribe.bit()
                 | Capability::StreamWatch.bit()
@@ -131,8 +148,16 @@ impl CapabilitySet {
     }
 
     /// Does the set grant `c`?
+    ///
+    /// This is the single check every surface reaches through
+    /// `Principal::has`, so the one implication in the vocabulary lives here:
+    /// [`Capability::RpcWrite`] grants [`Capability::RpcSubmit`]. A set that
+    /// holds only `rpc:submit` does **not** satisfy `rpc:write`.
     pub const fn contains(self, c: Capability) -> bool {
-        self.0 & c.bit() != 0
+        if self.0 & c.bit() != 0 {
+            return true;
+        }
+        matches!(c, Capability::RpcSubmit) && self.0 & Capability::RpcWrite.bit() != 0
     }
 
     /// Is the set empty?
@@ -158,8 +183,10 @@ impl CapabilitySet {
 impl fmt::Debug for CapabilitySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut list = f.debug_list();
+        // Render the bits actually granted, not the implied view
+        // (`contains`), so a log line shows what the file said.
         for c in ALL_CAPS {
-            if self.contains(c) {
+            if self.0 & c.bit() != 0 {
                 list.entry(&c.as_str());
             }
         }
@@ -188,6 +215,37 @@ mod tests {
         }
         assert!(CapabilitySet::EMPTY.is_empty());
         assert!(!CapabilitySet::ALL.is_empty());
+    }
+
+    #[test]
+    fn submit_roundtrips_and_parses() {
+        assert_eq!(Capability::parse("rpc:submit"), Some(Capability::RpcSubmit));
+        assert_eq!(Capability::RpcSubmit.as_str(), "rpc:submit");
+        let set = CapabilitySet::from_strs(["rpc:submit"]).unwrap();
+        assert!(set.contains(Capability::RpcSubmit));
+    }
+
+    #[test]
+    fn write_implies_submit_but_not_the_converse() {
+        // A pre-existing write token keeps its broadcast ability.
+        let write_only = CapabilitySet::from_strs(["rpc:write"]).unwrap();
+        assert!(write_only.contains(Capability::RpcWrite));
+        assert!(write_only.contains(Capability::RpcSubmit));
+        assert!(!write_only.contains(Capability::RpcRead));
+
+        // A submit token cannot control the node.
+        let submit_only = CapabilitySet::from_strs(["rpc:submit"]).unwrap();
+        assert!(submit_only.contains(Capability::RpcSubmit));
+        assert!(!submit_only.contains(Capability::RpcWrite));
+        assert!(!submit_only.contains(Capability::RpcRead));
+
+        // The implication is a view over the bits, not a stored bit: the
+        // set's emptiness and rendering report only what was granted.
+        assert!(!write_only.is_empty());
+        assert_eq!(format!("{write_only:?}"), r#"["rpc:write"]"#);
+        assert_eq!(format!("{submit_only:?}"), r#"["rpc:submit"]"#);
+        assert!(CapabilitySet::EMPTY.is_empty());
+        assert!(!CapabilitySet::EMPTY.contains(Capability::RpcSubmit));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    DeterministicWallet, TestNode, find_available_port, fresh_test_datadir, get_rpc_str,
-    get_rpc_u64, poll_until, test_timeout,
+    DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir,
+    get_rpc_str, get_rpc_u64, poll_until, test_timeout, write_authfile,
 };
 
 /// #550: test datadirs used to be named after the RPC port, which is redrawn
@@ -541,6 +541,130 @@ fn test_rpc_bearer_token_capability_scoping() {
 
     node.stop();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `rpc:submit` on the JSON-RPC listener: a token holding `rpc:read` +
+/// `rpc:submit` reaches the mempool-submission handlers but is denied node
+/// control; a token holding only `rpc:write` still broadcasts (the write
+/// capability implies submit); a read-only token is denied submission with
+/// an error that names `rpc:submit`.
+#[test]
+fn test_rpc_bearer_submit_capability() {
+    let fixture = write_authfile(&[
+        TokenSpec {
+            id: "ro",
+            token: "satd-test-submit-ro-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "sub",
+            token: "satd-test-submit-only-token-v1",
+            capabilities: &["rpc:read", "rpc:submit"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "rw",
+            token: "satd-test-submit-write-token-v1",
+            capabilities: &["rpc:write"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+    ]);
+
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let call = |bearer: &str, method: &str| -> (u16, serde_json::Value) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": method, "params": [],
+        });
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .bearer_auth(bearer)
+            .send()
+            .unwrap();
+        let status = resp.status().as_u16();
+        let json = resp.json().unwrap_or(serde_json::Value::Null);
+        (status, json)
+    };
+    const DENIED: i64 = -32004;
+
+    // The submit token reads.
+    let (status, json) = call("satd-test-submit-only-token-v1", "getblockcount");
+    assert_eq!(status, 200);
+    assert!(json.get("result").is_some(), "submit token read: {json}");
+
+    // The submit token reaches the submission handlers: with empty params the
+    // handler answers with its own error, which is anything but the
+    // capability denial.
+    for method in ["sendrawtransaction", "submitpackage"] {
+        let (status, json) = call("satd-test-submit-only-token-v1", method);
+        assert_eq!(status, 200, "{method}");
+        assert_ne!(
+            json["error"]["code"], DENIED,
+            "{method} must reach the handler for a submit token: {json}"
+        );
+        assert!(
+            json.get("error").is_some(),
+            "{method} with no params should be a handler error: {json}"
+        );
+    }
+
+    // The submit token is denied node control, before dispatch.
+    for method in ["stop", "addnode", "invalidateblock"] {
+        let (status, json) = call("satd-test-submit-only-token-v1", method);
+        assert_eq!(status, 200, "{method}");
+        assert_eq!(
+            json["error"]["code"], DENIED,
+            "{method} must be denied to a submit token: {json}"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc:write"),
+            "denial names the missing capability: {json}"
+        );
+    }
+
+    // A read-only token is denied submission, and the denial names the
+    // capability that would have admitted it.
+    let (status, json) = call("satd-test-submit-ro-token-v1", "sendrawtransaction");
+    assert_eq!(status, 200);
+    assert_eq!(json["error"]["code"], DENIED, "{json}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rpc:submit"),
+        "denial names rpc:submit: {json}"
+    );
+
+    // A token minted with only `rpc:write` keeps broadcasting.
+    let (status, json) = call("satd-test-submit-write-token-v1", "sendrawtransaction");
+    assert_eq!(status, 200);
+    assert_ne!(
+        json["error"]["code"], DENIED,
+        "rpc:write must still imply rpc:submit: {json}"
+    );
+
+    // The node is still up: the denied `stop` calls did not reach the handler.
+    let info = node.rpc_call("getblockcount").unwrap();
+    assert!(info.get("result").is_some(), "{info}");
+
+    node.stop();
 }
 
 #[test]

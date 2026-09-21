@@ -51,7 +51,8 @@ token does not hold.
 | Capability | String | Grants |
 |---|---|---|
 | RPC read | `rpc:read` | Read-only JSON-RPC methods (classified by the same table the read-only listener uses). |
-| RPC write | `rpc:write` | Mutating, control, and mining JSON-RPC methods, plus any unclassified method (fail-closed). |
+| RPC write | `rpc:write` | Mutating, control, and mining JSON-RPC methods, plus any unclassified method (fail-closed). Implies `rpc:submit`. |
+| RPC submit | `rpc:submit` | Mempool submission: `sendrawtransaction`, `submitpackage`, and the other methods the read-only listener classes as mempool-submit. Lets a broadcaster (a payment processor, a wallet backend) hand transactions to the mempool without holding node control. Implied by `rpc:write`. |
 | Esplora read | `esplora:read` | The Esplora REST + SSE surface. |
 | Stream subscribe | `stream:subscribe` | Open a streaming subscription (events gRPC, `streamws`). |
 | Stream watch | `stream:watch` | Register outpoint/script/descriptor/txid watches, bounded by the token's watch quota. |
@@ -150,7 +151,7 @@ an authfile.
 
 | Surface | Enable flag | Capability gate | Default without the flag |
 |---|---|---|---|
-| JSON-RPC (read/write listeners) | `-rpcauthbearer` | `rpc:read` / `rpc:write` | Core Basic auth (cookie/userpass/rpcauth) |
+| JSON-RPC (read/write listeners) | `-rpcauthbearer` | `rpc:read` / `rpc:submit` / `rpc:write` | Core Basic auth (cookie/userpass/rpcauth) |
 | Esplora REST / SSE | `-esploraauthbearer` | `esplora:read` | `-esploraauth` Basic, loopback-unauth default |
 | events gRPC | `-eventsgrpcauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
 | streaming WS/SSE (`streamws`) | `-streamwsauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
