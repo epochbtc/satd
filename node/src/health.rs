@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use bitcoin::BlockHash;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
@@ -131,10 +132,10 @@ pub mod defaults {
     /// Disabled on regtest, for the same reason as the peer floor and the reorg
     /// depth: regtest blocks exist only when someone calls
     /// `generatetoaddress`, so an idle chain is its resting state and not a
-    /// stall. `last_connect` is seeded at detector start and advanced only by
-    /// `BlockConnected`, so a developer's node left running for an hour while
-    /// they write code — or a harness that mines a fixture and then sits —
-    /// raises a *critical* alert. That pins `getwarnings`, holds `has_errors()`
+    /// stall. The stall clock is seeded at detector start and runs until the
+    /// tip moves, so a developer's node left running for an hour while they
+    /// write code — or a harness that mines a fixture and then sits — raises a
+    /// *critical* alert. That pins `getwarnings`, holds `has_errors()`
     /// true, and puts up the TUI's blocking modal, on a chain that is behaving
     /// exactly as designed.
     ///
@@ -458,6 +459,13 @@ async fn run_detectors(
     // within seconds of starting; seeding from the tip would page the operator
     // for a stall that is really just a restart.
     let mut last_connect = Instant::now();
+    // The tip as of the previous poll, so the poll half can advance
+    // `last_connect` on its own. `BlockConnected` is the fast path, but the
+    // IBD block-download path connects without emitting any chain event (the
+    // same gap that let Stratum serve genesis work, #774), so an event-driven
+    // clock reads "time since this process started" for the whole of a sync.
+    // See `tip_stall_age`.
+    let mut last_tip = chain_state.tip_hash();
     // IBD completion is a one-shot per process, and only meaningful for a node
     // that actually started in IBD — otherwise every restart of a synced node
     // would announce that it finished syncing.
@@ -492,8 +500,12 @@ async fn run_detectors(
             _ = shutdown.changed() => return,
             ev = chain_rx.recv() => {
                 match ev {
-                    Ok(ChainEvent::BlockConnected { height, .. }) => {
+                    Ok(ChainEvent::BlockConnected { hash, height }) => {
                         last_connect = Instant::now();
+                        // Keep the polled half in step, so it does not read
+                        // this same block as a fresh movement one poll later
+                        // and restate an age it already knows is zero.
+                        last_tip = hash;
                         state.last_connect_age_secs.store(0, Ordering::Relaxed);
                         clear_if_active(
                             &state, &warnings, &publisher,
@@ -544,7 +556,12 @@ async fn run_detectors(
                 scan_reorg_log(
                     &warnings, &publisher, &thresholds, &chain_state, &mut reorgs_seen,
                 );
-                let age = last_connect.elapsed().as_secs();
+                let age = tip_stall_age(
+                    &mut last_tip,
+                    &mut last_connect,
+                    chain_state.tip_hash(),
+                    Instant::now(),
+                );
                 state.last_connect_age_secs.store(age, Ordering::Relaxed);
                 check_tip_stall(&state, &warnings, &publisher, &thresholds, &chain_state, age);
                 check_disk(
@@ -778,6 +795,39 @@ fn clear_with_reason(
     );
 }
 
+/// Advance the tip-stall clock if the chain moved, and return its age.
+///
+/// The clock answers one question: how long has it been since the chain last
+/// moved? `ChainEvent::BlockConnected` is the fast path — it resets the clock
+/// the instant a block lands and clears a standing alert with it — but it is
+/// not sufficient on its own, because the IBD block-download path connects
+/// blocks without emitting chain events at all (#774). Left event-driven, the
+/// clock never moves during a sync and `age_secs` degenerates into "time since
+/// this process started", which raises a *critical* `tip_stall` one threshold
+/// into every initial block download on a node that is connecting blocks as
+/// fast as it can (#814).
+///
+/// Polling the tip closes that without an `in_ibd` predicate, which
+/// [`check_tip_stall_values`] rejects for reasons that still hold. It also
+/// preserves the case the detector exists for: a node genuinely wedged
+/// mid-sync connects nothing, so its tip does not move, so the clock keeps
+/// running and it still pages.
+///
+/// Compares the tip *hash*, not its height: a reorg onto a same-height tip is
+/// the chain moving too.
+fn tip_stall_age(
+    last_tip: &mut BlockHash,
+    last_connect: &mut Instant,
+    current_tip: BlockHash,
+    now: Instant,
+) -> u64 {
+    if *last_tip != current_tip {
+        *last_tip = current_tip;
+        *last_connect = now;
+    }
+    now.saturating_duration_since(*last_connect).as_secs()
+}
+
 fn check_tip_stall(
     state: &HealthState,
     warnings: &NodeWarnings,
@@ -831,12 +881,13 @@ fn check_tip_stall_values(
     // permanently — at precisely the moment it should be paging.
     //
     // `age_secs` already encodes the thing worth gating on. A node that is
-    // really syncing connects blocks continuously, which keeps the age far
-    // below any sane threshold and suppresses the alert on its own. A node that
-    // reads as "in IBD" but has connected nothing for the whole threshold is
-    // stalled whether it is wedged mid-sync or wedged at the tip, and both
-    // warrant the page. The message — "no block connected for Ns" — is true
-    // either way.
+    // really syncing moves its tip continuously, which keeps the age far below
+    // any sane threshold and suppresses the alert on its own — see
+    // `tip_stall_age`, which is what makes that true of an IBD, whose connects
+    // emit no chain event. A node that reads as "in IBD" but whose tip has not
+    // moved for the whole threshold is stalled whether it is wedged mid-sync or
+    // wedged at the tip, and both warrant the page. The message — "no block
+    // connected for Ns" — is true either way.
     let _ = in_ibd;
     if age_secs >= threshold {
         raise_if_new(
@@ -1467,6 +1518,7 @@ fn report_reorgs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
     use crate::events::{EdgeIdentity, NodeEventBody};
 
     fn publisher() -> Arc<EventPublisher> {
@@ -1947,6 +1999,88 @@ mod tests {
             drained(&mut rx).is_empty(),
             "blocks are arriving; there is no stall to report"
         );
+    }
+
+    /// The IBD block-download path connects blocks without emitting any chain
+    /// event (#774), so a clock driven by `BlockConnected` alone measures time
+    /// since process start and raises a critical alert one threshold into every
+    /// long sync (#814). Driving it from the polled tip is what makes the
+    /// comment in `check_tip_stall_values` — "a node that is really syncing
+    /// moves its tip continuously" — actually true.
+    #[test]
+    fn an_event_less_sync_does_not_raise_tip_stall() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let on = AlertThresholds::new(3600, 0, 0, 0, 0);
+
+        let start = Instant::now();
+        let mut last_tip = BlockHash::from_byte_array([0; 32]);
+        let mut last_connect = start;
+
+        // Two hours of polling, well past the threshold, with the tip
+        // advancing each time and not one `BlockConnected` delivered.
+        for tick in 1..=(7200 / POLL_INTERVAL.as_secs()) {
+            let now = start + POLL_INTERVAL * tick as u32;
+            let tip = BlockHash::from_byte_array([tick as u8; 32]);
+            let age = tip_stall_age(&mut last_tip, &mut last_connect, tip, now);
+            assert_eq!(age, 0, "the tip moved on this poll");
+            check_tip_stall_values(&state, &warnings, &pubr, &on, true, tick as u32, age);
+        }
+
+        assert!(
+            drained(&mut rx).is_empty(),
+            "a node that is connecting blocks is not stalled, whether or not \
+             those connects emit events"
+        );
+    }
+
+    /// The flip side, and the case the detector exists for: a node wedged
+    /// mid-sync connects nothing, so its tip does not move, so it still pages.
+    /// The poll-driven clock must not have bought silence for this.
+    #[test]
+    fn a_sync_wedged_with_a_frozen_tip_still_raises_tip_stall() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let on = AlertThresholds::new(3600, 0, 0, 0, 0);
+
+        let start = Instant::now();
+        let frozen = BlockHash::from_byte_array([7; 32]);
+        let mut last_tip = frozen;
+        let mut last_connect = start;
+
+        let age = tip_stall_age(
+            &mut last_tip,
+            &mut last_connect,
+            frozen,
+            start + Duration::from_secs(3600),
+        );
+        assert_eq!(age, 3600, "the tip never moved; the clock must keep running");
+        check_tip_stall_values(&state, &warnings, &pubr, &on, true, 100, age);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::TipStall, StatusState::Raised)],
+        );
+    }
+
+    /// A reorg onto a tip of the same height is the chain moving. Comparing
+    /// heights instead of hashes would read it as a frozen tip.
+    #[test]
+    fn a_same_height_reorg_counts_as_the_tip_moving() {
+        let start = Instant::now();
+        let mut last_tip = BlockHash::from_byte_array([1; 32]);
+        let mut last_connect = start;
+
+        let age = tip_stall_age(
+            &mut last_tip,
+            &mut last_connect,
+            BlockHash::from_byte_array([2; 32]),
+            start + Duration::from_secs(3600),
+        );
+        assert_eq!(age, 0);
     }
 
     #[test]
