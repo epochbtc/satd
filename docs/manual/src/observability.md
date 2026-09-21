@@ -329,7 +329,7 @@ keep updating, and the node log carries every one in full.
 | Condition | Severity | Raises when | Clears when |
 |---|---|---|---|
 | `ibd_complete` | info | initial block download finishes | one-shot |
-| `tip_stall` | critical | no block connected for `alerttipstallseconds`, outside IBD | the next block connects, or the threshold no longer considers the tip stalled |
+| `tip_stall` | critical | the tip has not moved for `alerttipstallseconds` | the next block connects, the tip is seen to have moved, or the threshold no longer considers the tip stalled |
 | `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor, or the floor is lowered below the current reading |
 | `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line, or the threshold is raised above the current occupancy |
 | `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
