@@ -4458,7 +4458,9 @@ async fn spawn_tls_surface(
             let allow = allow.clone();
             let mtls_enabled = cfg.mtls_enabled;
             tokio::spawn(async move {
-                let _permit = permit;
+                // `permit` is owned by this task through the handshake and
+                // the mTLS check (an early `return` releases it) and is then
+                // handed to the task that outlives the connection, below.
                 let tls_stream =
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(s)) => s,
@@ -4536,12 +4538,25 @@ async fn spawn_tls_surface(
                 // `-rpcservertimeout` applies here too. jsonrpsee's
                 // `serve_with_graceful_shutdown` takes no timeout, which is
                 // why a TLS connection had none.
-                tokio::spawn(serve_http_connection(
+                //
+                // Hold the permit for the connection's life, not just its
+                // handshake: this task returns as soon as serving starts, so
+                // a permit bound here would drop at that point and the cap
+                // would bound in-flight handshakes only, leaving established
+                // (idle-keepalive) connections uncounted. A separate task
+                // owns the permit and awaits the serve task's JoinHandle,
+                // whose type does not name the service's HRTB lifetime —
+                // the same shape the plain accept loop uses.
+                let serve = tokio::spawn(serve_http_connection(
                     tls_stream,
                     svc,
                     conn_stop.shutdown(),
                     header_read_timeout,
                 ));
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = serve.await;
+                });
             });
         }
     });
@@ -4965,5 +4980,103 @@ mod help_listing_tests {
             .map(|(n, _)| *n)
             .collect();
         assert_eq!(hidden, ["addconnection", "sendmsgtopeer", "generate", "unsubscribemempool"]);
+    }
+}
+
+#[cfg(test)]
+mod tls_surface_tests {
+    use super::*;
+    use tokio_rustls::rustls;
+
+    /// Complete a TLS handshake against `addr`, trusting `cert_der`. The
+    /// returned stream is left idle — no HTTP is sent — so the server holds
+    /// an established connection with nothing to do, which is exactly the
+    /// shape a keepalive flood presents.
+    async fn tls_connect(
+        addr: SocketAddr,
+        cert_der: &rustls::pki_types::CertificateDer<'static>,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out"))?
+    }
+
+    /// The connection cap counts established connections, not just
+    /// in-flight handshakes: with the cap full of idle connections a new
+    /// one is refused, and closing one lets the next through.
+    #[tokio::test]
+    async fn tls_connection_cap_counts_established_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let cert_der = cert.cert.der().clone();
+
+        // A free port; the surface binds it synchronously below.
+        let bind_addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let cfg = RpcTlsConfig {
+            bind_addr,
+            cert_path,
+            key_path,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: vec![],
+            handshake_timeout: Duration::from_secs(5),
+            max_connections: 2,
+        };
+        let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let handle = spawn_tls_surface(
+            cfg,
+            ServerConfig::default(),
+            auth,
+            Methods::new(),
+            ServerListenerStatus::new(),
+            &mut shutdown_rx,
+            AdmissionState::new(4, 16),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tls surface");
+
+        // Two established, idle connections fill the cap.
+        let c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        let _c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+
+        // A third is dropped pre-handshake.
+        assert!(
+            tls_connect(bind_addr, &cert_der).await.is_err(),
+            "third connection must be refused while two are established"
+        );
+
+        // Closing one releases its permit; the next connection gets through.
+        drop(c1);
+        let mut admitted = false;
+        for _ in 0..100 {
+            if tls_connect(bind_addr, &cert_der).await.is_ok() {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "permit must be released when the connection closes");
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.stop();
     }
 }
