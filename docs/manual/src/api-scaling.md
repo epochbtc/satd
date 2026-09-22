@@ -74,10 +74,15 @@ an idle connection holds its slot until the client closes it, so 100 idle
 connections from any client that can reach the listener lock out every other
 client, `sat-cli` on loopback included. Keep the listener private
 (`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on. A peer
-outside `-rpcallowip` is answered `403` and its connection is closed, so a
-denied client cannot hold a slot either. A listener that is shedding logs the
-first few refusals in each minute and then a count, so a flood cannot fill
-the log with the report of itself.
+outside `-rpcallowip` cannot hold a slot: on a plain-HTTP listener it is
+answered `403` and the connection is closed, and on a TLS listener it is
+dropped at accept, before the handshake and before a slot is taken. The two
+listeners read an *empty* `-rpcallowip` differently, though — a plain bind
+falls back to loopback-only, while a TLS bind stays reachable from wherever
+it is bound, gated by TLS/mTLS and RPC auth rather than by source address.
+Set `-rpcallowip` to gate a public `-rpctlsbind` too. A listener that is
+shedding logs the first few refusals in each minute and then a count, so a
+flood cannot fill the log with the report of itself.
 
 `-rpcthreads` and `-rpcworkqueue` are recognized from Bitcoin Core, so a
 Core-shaped config that carries them loads. In-flight calls are capped at

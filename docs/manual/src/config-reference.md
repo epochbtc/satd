@@ -130,7 +130,7 @@ startup error.
 |---|---|---|---|---|
 | `rpcport` | 8332 (network-dependent) | restart | core | RPC server port. Defaults: main 8332, test 18332, testnet4 48332, signet 38332, regtest 18443. |
 | `rpcbind` | `127.0.0.1:<rpcport>` and `[::1]:<rpcport>` | restart | core | Bind plain-HTTP JSON-RPC to address (repeatable). Non-loopback requires `rpcallowip`. With no `rpcbind`, a default that cannot be bound (no IPv6) is skipped. |
-| `rpcallowip` | loopback only | restart | core | Per-request source-IP allowlist for JSON-RPC (repeatable). IPv6 may be bracketed (`[::1]`). |
+| `rpcallowip` | loopback only | restart | core | Per-connection source-IP allowlist for JSON-RPC (repeatable). IPv6 may be bracketed (`[::1]`). Applies to the plain-HTTP binds always, and to `rpctlsbind` only once at least one entry is set (an empty list leaves a TLS bind reachable from wherever it is bound). Loopback is always allowed. |
 | `cjdnsreachable` | false | restart | core | satd has no CJDNS transport; as in Core, an `rpcallowip` in fc00::/8 is refused while it is set. |
 | `rpcuser` | none | hot | core | RPC username. |
 | `rpcpassword` | none | hot | core | RPC password. |

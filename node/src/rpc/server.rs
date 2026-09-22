@@ -4143,6 +4143,7 @@ pub async fn start(
                 bearer.clone(),
                 None,
                 header_read_timeout,
+                allowip.clone(),
             )
             .await?,
         )
@@ -4281,6 +4282,7 @@ async fn spawn_readonly_listeners(
                 None,
                 Some(ReadOnlyLayer::new()),
                 header_read_timeout,
+                allowip,
             )
             .await;
             let _ = tx.send(res);
@@ -4298,6 +4300,14 @@ async fn spawn_readonly_listeners(
 }
 
 /// Bind the TLS listener and spawn the per-connection accept loop.
+///
+/// `allowip` is the surface's source-address allowlist. A TLS bind
+/// enforces it only when the operator configured one; see
+/// [`crate::rpc::allowip::tls_listener_denies`]. A denied peer is dropped
+/// at accept, before the handshake and before a connection-cap permit is
+/// taken, so it costs the listener nothing and holds no slot. (The plain
+/// surface answers `403 Forbidden` instead, because by the time it has a
+/// decision it is already speaking HTTP.)
 ///
 /// The accept loop terminates when the returned [`ServerHandle`] is
 /// stopped — either by the composite [`RpcServerHandle::stop`] call
@@ -4321,6 +4331,11 @@ async fn spawn_tls_surface(
     // identity, matching `spawn_plain_surface`.
     rpc_filter: Option<ReadOnlyLayer>,
     header_read_timeout: Option<Duration>,
+    // The surface's `-rpcallowip` (or `-rpcreadonlyallowip`) list. Enforced
+    // at accept, but only when it is non-empty — see
+    // `allowip::tls_listener_denies` for why an empty list is not
+    // loopback-only on a TLS bind.
+    allowip: Arc<Vec<crate::rpc::allowip::IpAllowEntry>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // mTLS policy: `Required` when the operator opted in via
     // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
@@ -4448,6 +4463,26 @@ async fn spawn_tls_surface(
                 },
                 _ = accept_stop.clone().shutdown() => break,
             };
+
+            // One allow/deny decision per connection, taken BEFORE the
+            // permit: refusing is a source-IP comparison and a close, so a
+            // denied flood costs nothing and must not be able to occupy the
+            // connection cap. (The plain surface takes its permit first
+            // because it answers 403 over a real HTTP connection.) Only a
+            // configured allowlist denies here — see
+            // `allowip::tls_listener_denies`.
+            if crate::rpc::allowip::tls_listener_denies(peer.ip(), &allowip) {
+                static DENIED: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = DENIED.tick() {
+                    tracing::warn!(
+                        peer = %peer,
+                        suppressed,
+                        "RPC TLS connection rejected: source IP not permitted by -rpcallowip",
+                    );
+                }
+                drop(stream);
+                continue;
+            }
 
             // try_acquire_owned: if the semaphore is at capacity,
             // drop the connection here (pre-handshake, so we can't
@@ -5125,6 +5160,7 @@ mod tls_surface_tests {
             None,
             None,
             None,
+            Arc::new(Vec::new()),
         )
         .await
         .expect("tls surface");
@@ -5167,6 +5203,75 @@ mod tls_surface_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(admitted, "permit must be released when the connection closes");
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.stop();
+    }
+
+    /// The TLS accept loop consults `-rpcallowip`, and its loopback
+    /// exemption survives: a listener carrying an allowlist that names only
+    /// a remote CIDR still serves `sat-cli` on the same host. The refusal
+    /// half of the rule cannot be driven through a socket here — every peer
+    /// a test can present from is loopback, which is allowed
+    /// unconditionally — so it is covered by
+    /// `allowip::tests::a_tls_listener_with_an_allowlist_enforces_it`. What
+    /// this test rules out is the accept loop mistaking "an allowlist
+    /// exists" for "deny", which would shut the operator out of their own
+    /// node the moment they set one.
+    #[tokio::test]
+    async fn a_tls_listener_with_an_allowlist_still_serves_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let cert_der = cert.cert.der().clone();
+
+        let cfg = RpcTlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path,
+            key_path,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: vec![],
+            handshake_timeout: Duration::from_secs(5),
+            max_connections: 2,
+        };
+        let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_status = ServerListenerStatus::new();
+        // An allowlist that does not name loopback, which is the ordinary
+        // case: the operator lists the remote clients and relies on the
+        // loopback exemption for their own CLI.
+        let allowip =
+            Arc::new(vec![crate::rpc::allowip::IpAllowEntry::parse("10.0.0.0/8").unwrap()]);
+        let handle = spawn_tls_surface(
+            cfg,
+            ServerConfig::default(),
+            auth,
+            Methods::new(),
+            listener_status.clone(),
+            &mut shutdown_rx,
+            AdmissionState::new(4, 16),
+            None,
+            None,
+            None,
+            allowip,
+        )
+        .await
+        .expect("tls surface");
+        let bind_addr: SocketAddr = listener_status
+            .rpc_tls()
+            .expect("surface reports its bound address")
+            .parse()
+            .unwrap();
+
+        let mut c = tls_connect(bind_addr, &cert_der)
+            .await
+            .expect("loopback must complete the handshake");
+        // Replies (401 from the auth layer) rather than being dropped.
+        probe_http(&mut c).await;
 
         let _ = shutdown_tx.send(true);
         let _ = handle.stop();

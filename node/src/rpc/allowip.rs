@@ -18,6 +18,14 @@
 //! a tower layer couldn't do this. The static "must allowlist before
 //! exposing" validation in `Config::load` is a complementary guard that
 //! refuses to start a non-loopback bind without an allowlist.
+//!
+//! The TLS listeners accept on their own loop too, and apply the
+//! allowlist through [`tls_listener_denies`] — same rule, except that an
+//! empty allowlist leaves the TLS bind reachable from wherever it is
+//! bound rather than collapsing to loopback-only. Neither that startup
+//! guard nor this module has ever covered a TLS bind, so an empty list
+//! there means "the operator never expressed a rule", not "loopback
+//! only". See that function for why.
 
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -83,6 +91,27 @@ pub fn is_allowed(ip: IpAddr, allow: &[IpAllowEntry]) -> bool {
         return true;
     }
     allow.iter().any(|e| e.contains(ip))
+}
+
+/// Does a TLS JSON-RPC listener (`-rpctlsbind`, `-rpcreadonlytlsbind`)
+/// have to refuse `ip`?
+///
+/// The TLS binds honour the allowlist only when the operator configured
+/// one. An empty list does NOT collapse to loopback-only here, the way
+/// it does for a plain-HTTP bind: the startup guard that refuses a
+/// non-loopback `-rpcbind` without an allowlist has never covered a TLS
+/// bind, so a TLS listener on a public interface with no `-rpcallowip`
+/// is a configuration operators are already running. Reading it as
+/// loopback-only would lock every one of those clients out on upgrade.
+/// Once an allowlist exists the operator has said who may reach
+/// JSON-RPC, and that answer covers both transports.
+///
+/// A denied peer is refused before the TLS handshake, so it never takes
+/// a connection-cap permit and never sees a certificate — unlike the
+/// plain-HTTP path, which is already speaking HTTP and can answer
+/// `403 Forbidden`.
+pub fn tls_listener_denies(ip: IpAddr, allow: &[IpAllowEntry]) -> bool {
+    !allow.is_empty() && !is_allowed(ip, allow)
 }
 
 fn ip_is_loopback(ip: IpAddr) -> bool {
@@ -156,5 +185,27 @@ mod tests {
         assert!(is_allowed("127.0.0.1".parse().unwrap(), &allow));
         assert!(is_allowed("::1".parse().unwrap(), &allow));
         assert!(!is_allowed("8.8.8.8".parse().unwrap(), &allow));
+    }
+
+    #[test]
+    fn a_tls_listener_without_an_allowlist_denies_nobody() {
+        let allow: Vec<IpAllowEntry> = Vec::new();
+        assert!(!tls_listener_denies("8.8.8.8".parse().unwrap(), &allow));
+        assert!(!tls_listener_denies("fd00::1".parse().unwrap(), &allow));
+        assert!(!tls_listener_denies("127.0.0.1".parse().unwrap(), &allow));
+        // The same address IS refused on a plain-HTTP bind, where an empty
+        // list means loopback-only. The two rules differ on purpose.
+        assert!(!is_allowed("8.8.8.8".parse().unwrap(), &allow));
+    }
+
+    #[test]
+    fn a_tls_listener_with_an_allowlist_enforces_it() {
+        let allow: Vec<IpAllowEntry> = vec![IpAllowEntry::parse("10.0.0.0/8").unwrap()];
+        assert!(tls_listener_denies("8.8.8.8".parse().unwrap(), &allow));
+        assert!(!tls_listener_denies("10.1.2.3".parse().unwrap(), &allow));
+        // Loopback keeps its exemption, so `sat-cli` over TLS on the same
+        // host works without listing 127.0.0.1.
+        assert!(!tls_listener_denies("127.0.0.1".parse().unwrap(), &allow));
+        assert!(!tls_listener_denies("::1".parse().unwrap(), &allow));
     }
 }
