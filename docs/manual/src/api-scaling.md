@@ -64,6 +64,20 @@ value cannot panic satd at boot.
 | streaming WS/SSE | `-streamwsmaxconns`, `-streamwsmaxsubscriptions`, `-streamwsmaxmessagebytes` | 256 / 256 / 262144 | connection refused / 429 |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP 429 |
 | Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
+| JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection dropped at accept (TCP reset) |
+
+The JSON-RPC socket cap counts every open connection on a listener, idle
+keep-alive connections included, and is taken at accept, before
+authentication. `-rpcservertimeout` (default 30 s) closes a connection that
+sits idle between requests and returns its slot; with `-rpcservertimeout=0`
+an idle connection holds its slot until the client closes it, so 100 idle
+connections from any client that can reach the listener lock out every other
+client, `sat-cli` on loopback included. Keep the listener private
+(`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on. A peer
+outside `-rpcallowip` is answered `403` and its connection is closed, so a
+denied client cannot hold a slot either. A listener that is shedding logs the
+first few refusals in each minute and then a count, so a flood cannot fill
+the log with the report of itself.
 
 `-rpcthreads` and `-rpcworkqueue` are recognized from Bitcoin Core, so a
 Core-shaped config that carries them loads. In-flight calls are capped at

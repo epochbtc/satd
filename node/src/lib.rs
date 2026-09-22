@@ -21,6 +21,7 @@ pub mod time;
 pub mod storage;
 pub mod stratum;
 pub mod validation;
+pub mod warn_budget;
 pub mod warnings;
 
 /// BIP 14 user agent string with no `-uacomment` comments, derived from

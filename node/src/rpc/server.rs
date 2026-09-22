@@ -11,6 +11,7 @@ use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
+use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
 
 use crate::rpc::params::Args;
@@ -273,6 +274,11 @@ impl ServerListenerStatus {
     }
     fn snapshot(&self) -> ServerListenerStatusInner {
         self.inner.read().clone()
+    }
+    /// The TLS RPC listener's bound address, once bound. A caller that
+    /// bound port 0 reads the port the OS assigned from here.
+    pub fn rpc_tls(&self) -> Option<String> {
+        self.inner.read().rpc_tls.clone()
     }
     /// Whether Esplora is bound and serving.
     pub fn esplora_serving(&self) -> bool {
@@ -4035,9 +4041,9 @@ pub async fn start(
         .max_request_body_size(crate::rpc::RPC_MAX_BODY_SIZE as u32)
         .max_response_body_size(crate::rpc::RPC_MAX_RESPONSE_SIZE as u32)
         .build();
-    // Methods is Arc-backed and cheap to clone — one copy is consumed
-    // by each per-bind `Server::start()` call below, plus one to feed
-    // the TLS path's per-connection service builder if TLS is enabled.
+    // Methods is Arc-backed and cheap to clone — one copy feeds each
+    // listener's per-connection service builder below (plain and TLS
+    // alike run their own accept loop; see `spawn_plain_surface`).
     let methods: Methods = module.into();
 
     // Completeness audit for the named-parameter table. A method missing from
@@ -4414,12 +4420,13 @@ async fn spawn_tls_surface(
     // Per-handshake timeout from the cfg (review H2). Matches the
     // shape Electrum/Esplora use, just with a tighter default.
     let handshake_timeout = cfg.handshake_timeout;
-    // Connection cap (review C1). The plain-HTTP RPC path runs
-    // through `Server::start()` which enforces jsonrpsee's
-    // `ServerConfig::max_connections`. The manual accept loop here
-    // bypasses that, so we mirror the cap with a tokio Semaphore.
-    // The permit is held by the per-connection task and released on
-    // drop, so the cap covers handshake + steady-state serving.
+    // Connection cap (review C1). jsonrpsee's `ServerConfig::max_connections`
+    // is a per-*request* guard inside the service; it never bounds raw
+    // sockets. Both accept loops (this one and `spawn_plain_surface`)
+    // therefore take a permit from a tokio Semaphore of the same size at
+    // accept time. The permit is handed to a task that lives as long as
+    // the connection (see the spawn below), so the cap covers the
+    // handshake and steady-state serving, idle keepalive included.
     let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(
         cfg.max_connections.max(1),
     ));
@@ -4449,11 +4456,15 @@ async fn spawn_tls_surface(
             let permit = match conn_cap.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(
-                        peer = %peer,
-                        "RPC TLS at-capacity rejection ({} max)",
-                        max_connections,
-                    );
+                    static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC TLS at-capacity rejection ({} max)",
+                            max_connections,
+                        );
+                    }
                     drop(stream);
                     continue;
                 }
@@ -4714,11 +4725,15 @@ pub async fn spawn_plain_surface(
             let permit = match conn_cap.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(
-                        peer = %peer,
-                        "RPC at-capacity rejection ({} max connections)",
-                        max_connections,
-                    );
+                    static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC at-capacity rejection ({} max connections)",
+                            max_connections,
+                        );
+                    }
                     drop(stream);
                     continue;
                 }
@@ -4730,10 +4745,14 @@ pub async fn spawn_plain_surface(
             // inside a configured CIDR.
             let allowed = crate::rpc::allowip::is_allowed(peer.ip(), &allowip);
             if !allowed {
-                tracing::warn!(
-                    peer = %peer,
-                    "RPC connection rejected: source IP not permitted by -rpcallowip",
-                );
+                static DENIED: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = DENIED.tick() {
+                    tracing::warn!(
+                        peer = %peer,
+                        suppressed,
+                        "RPC connection rejected: source IP not permitted by -rpcallowip",
+                    );
+                }
             }
 
             let rpc_svc = rpc_svc.clone();
@@ -4752,6 +4771,14 @@ pub async fn spawn_plain_surface(
                                 ),
                             );
                             *resp.status_mut() = hyper::StatusCode::FORBIDDEN;
+                            // A denied peer holds a connection permit for as
+                            // long as its socket lives, and a keep-alive
+                            // client would keep it open for free. Close after
+                            // the reply so the slot goes back to the pool.
+                            resp.headers_mut().insert(
+                                hyper::header::CONNECTION,
+                                hyper::header::HeaderValue::from_static("close"),
+                            );
                             return Ok(resp);
                         }
                         tower::Service::<
@@ -5003,9 +5030,8 @@ mod tls_surface_tests {
     use tokio_rustls::rustls;
 
     /// Complete a TLS handshake against `addr`, trusting `cert_der`. The
-    /// returned stream is left idle — no HTTP is sent — so the server holds
-    /// an established connection with nothing to do, which is exactly the
-    /// shape a keepalive flood presents.
+    /// returned stream carries no HTTP yet; see [`probe_http`] for turning it
+    /// into an established, idle keepalive connection.
     async fn tls_connect(
         addr: SocketAddr,
         cert_der: &rustls::pki_types::CertificateDer<'static>,
@@ -5023,6 +5049,42 @@ mod tls_surface_tests {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out"))?
     }
 
+    /// Send one request on an established connection and read the reply,
+    /// which proves the server's serve task is running on it, then leave
+    /// the connection idle — the shape a keepalive flood presents. The
+    /// request carries no credential, so the auth layer answers `401`
+    /// without touching a method, and keeps the connection open.
+    async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("reply within 5s")
+                .unwrap();
+            assert!(n > 0, "server closed the connection instead of replying");
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+            assert!(head.starts_with("http/1.1 401"), "unexpected reply head: {head}");
+            let body_len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if buf.len() >= head_end + 4 + body_len {
+                break;
+            }
+        }
+    }
+
     /// The connection cap counts established connections, not just
     /// in-flight handshakes: with the cap full of idle connections a new
     /// one is refused, and closing one lets the next through.
@@ -5036,13 +5098,11 @@ mod tls_surface_tests {
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         let cert_der = cert.cert.der().clone();
 
-        // A free port; the surface binds it synchronously below.
-        let bind_addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // Port 0: the surface binds synchronously and reports the port the
+        // OS assigned through the listener status, so there is no
+        // probe-then-rebind window for another process to take the port.
         let cfg = RpcTlsConfig {
-            bind_addr,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
             cert_path,
             key_path,
             mtls_enabled: false,
@@ -5053,12 +5113,13 @@ mod tls_surface_tests {
         };
         let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_status = ServerListenerStatus::new();
         let handle = spawn_tls_surface(
             cfg,
             ServerConfig::default(),
             auth,
             Methods::new(),
-            ServerListenerStatus::new(),
+            listener_status.clone(),
             &mut shutdown_rx,
             AdmissionState::new(4, 16),
             None,
@@ -5067,16 +5128,33 @@ mod tls_surface_tests {
         )
         .await
         .expect("tls surface");
+        let bind_addr: SocketAddr = listener_status
+            .rpc_tls()
+            .expect("surface reports its bound address")
+            .parse()
+            .unwrap();
 
-        // Two established, idle connections fill the cap.
-        let c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
-        let _c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+        // Two established connections fill the cap. Each has served a
+        // request, so its serve task — the thing that holds the permit —
+        // is provably running before the third connection is attempted;
+        // without this the refusal could depend on which of the two
+        // server-side handshakes the scheduler finished first.
+        let mut c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        probe_http(&mut c1).await;
+        let mut c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+        probe_http(&mut c2).await;
 
-        // A third is dropped pre-handshake.
-        assert!(
-            tls_connect(bind_addr, &cert_der).await.is_err(),
-            "third connection must be refused while two are established"
-        );
+        // A third is dropped pre-handshake: the client sees the socket
+        // close mid-handshake, not a timeout (a stalled accept loop would
+        // also fail the connect, so a timeout must not count as refusal).
+        match tls_connect(bind_addr, &cert_der).await {
+            Ok(_) => panic!("third connection must be refused while two are established"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut,
+                "refusal must be a closed socket, not a timeout: {e}"
+            ),
+        }
 
         // Closing one releases its permit; the next connection gets through.
         drop(c1);

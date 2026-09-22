@@ -136,7 +136,7 @@ startup error.
 | `rpcpassword` | none | hot | core | RPC password. |
 | `rpcthreads` | 16 | restart | core | Max concurrent in-flight RPC method calls. |
 | `rpcworkqueue` | 64 | restart | core | Max queued RPC requests beyond `rpcthreads` before HTTP 429 (Core returns 503; documented divergence). |
-| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed. 0 disables. |
+| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed. 0 disables. An open connection holds one of the listener's 100 connection slots until it closes, so with 0 an idle client keeps its slot indefinitely; see [Scaling the API surfaces](api-scaling.md). |
 | `apithreads` | `max(2, cores/4)` | restart | satd | Worker threads for the isolated API runtime (Esplora/Electrum/events gRPC/metrics). |
 | `rpcreadonlybind` | none | restart | satd | Bind an opt-in read-only JSON-RPC listener (reads + mempool submit) on the API runtime. |
 | `rpcreadonlyport` | 8330 | restart | satd | Default port for `rpcreadonlybind` entries without an explicit port. |
