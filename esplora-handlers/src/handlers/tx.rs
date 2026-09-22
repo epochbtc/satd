@@ -8,13 +8,14 @@
 //! Outspend (`/tx/:txid/outspend/:vout`, `/tx/:txid/outspends`) and
 //! merkle-proof endpoints land in PR 6.
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::{Extension, Json};
 use axum::http::{HeaderValue, Response};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{Address, Block, BlockHash, Network, Script, Transaction, Txid};
 use node::storage::Store;
+use satd_auth::{Capability, Principal};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EsploraError, EsploraResult};
@@ -102,11 +103,20 @@ pub struct BroadcastQuery {
 
 /// `POST /tx` → broadcast. Body: hex-encoded tx bytes. Returns the
 /// txid as plain text, matching upstream Esplora.
+///
+/// Broadcasting is gated on `rpc:submit`, the same capability
+/// `sendrawtransaction` needs on JSON-RPC, on top of the surface-wide
+/// `esplora:read` the auth middleware already required. `esplora:read`
+/// alone reads; a token that should broadcast holds `rpc:submit` (or
+/// `rpc:write`, which implies it). The operator and loopback principals
+/// hold every capability and are unaffected.
 pub async fn tx_broadcast(
     State(state): State<EsploraState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<BroadcastQuery>,
     body: String,
 ) -> EsploraResult<String> {
+    require_submit(&state, principal.as_deref())?;
     let bytes = hex::decode(body.trim())
         .map_err(|e| EsploraError::BadRequest(format!("bad hex: {e}")))?;
     let tx: Transaction = deserialize(&bytes)
@@ -118,6 +128,27 @@ pub async fn tx_broadcast(
         .submit_and_announce(tx, node::mempool::pool::TxSource::Esplora, q.allowquarantined)
         .map_err(|e| EsploraError::BadRequest(format!("mempool reject: {e}")))?;
     Ok(txid.to_string())
+}
+
+/// The `rpc:submit` gate for `POST /tx`.
+///
+/// With a principal present (auth enabled, request authorized) it must hold
+/// `rpc:submit` (→ 403 naming the capability). With no principal we **fail
+/// closed if auth is enabled**: a request reaching this handler without one
+/// while the `require_auth` layer is installed means the middleware was
+/// bypassed (a routing bug), so refuse rather than broadcast unmetered —
+/// the same rule the SSE watch handlers apply. With auth disabled there is
+/// no identity to check and the loopback-trust default broadcasts as before.
+fn require_submit(state: &EsploraState, principal: Option<&Principal>) -> EsploraResult<()> {
+    let Some(p) = principal else {
+        if crate::auth::esplora_auth_enabled(&state.config.auth, &state.config.auth_bearer) {
+            return Err(EsploraError::Forbidden("authentication required".into()));
+        }
+        return Ok(());
+    };
+    p.require(Capability::RpcSubmit).map_err(|d| {
+        EsploraError::Forbidden(format!("token lacks the {} capability", d.0))
+    })
 }
 
 // ── JSON shapes ──

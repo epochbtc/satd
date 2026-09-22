@@ -25,7 +25,7 @@ Last verified against routes: 2026-05-05.
 
 > **Note.** The Esplora surface defaults to unauthenticated loopback. For Basic
 > auth (`--esploraauth`) or capability-scoped bearer tokens
-> (`--esploraauthbearer`, `esplora:read`), see
+> (`--esploraauthbearer`, `esplora:read`, plus `rpc:submit` to broadcast), see
 > [Authentication & Authorization](authentication.md).
 
 ## Configuration
@@ -84,7 +84,7 @@ address-index docs) and `--txindex=1` (auto-enabled by the reconciliation in
 | GET | `/tx/:txid/status` | JSON: `{confirmed, block_height?, block_hash?, block_time?}`. |
 | GET | `/tx/:txid/hex` | `text/plain`: hex-encoded serialized tx. |
 | GET | `/tx/:txid/raw` | `application/octet-stream`: raw tx bytes. |
-| POST | `/tx` | Body: hex-encoded tx. Returns the txid as plain text on accept. Bad hex or a mempool reject returns 400. |
+| POST | `/tx` | Body: hex-encoded tx. Returns the txid as plain text on accept. Bad hex or a mempool reject returns 400. With bearer auth, the token must hold `rpc:submit` (or `rpc:write`) as well as `esplora:read`; a read-only token gets 403. |
 | GET | `/tx/:txid/outspend/:vout` | JSON: `{spent, txid?, vin?, status?}`. |
 | GET | `/tx/:txid/outspends` | JSON: array of outspends, one per output, vout-ordered. |
 | GET | `/tx/:txid/merkle-proof` | JSON: `{block_height, merkle: [hex...], pos}`. |

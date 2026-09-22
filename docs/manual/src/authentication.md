@@ -45,15 +45,15 @@ credential always resolves to the full-capability operator.
 
 A bearer token carries a set of capabilities, and each surface enforces the
 capability it requires. Enforcement fails closed: an unknown method, or a
-request with no principal, requires the write capability, which a read-only
-token does not hold.
+request with no principal, requires the write capability, which neither a
+read-only nor a submit-only token holds.
 
 | Capability | String | Grants |
 |---|---|---|
 | RPC read | `rpc:read` | Read-only JSON-RPC methods (classified by the same table the read-only listener uses). |
 | RPC write | `rpc:write` | Mutating, control, and mining JSON-RPC methods, plus any unclassified method (fail-closed). Implies `rpc:submit`. |
-| RPC submit | `rpc:submit` | Mempool submission: `sendrawtransaction`, `submitpackage`, and the other methods the read-only listener classes as mempool-submit. Lets a broadcaster (a payment processor, a wallet backend) hand transactions to the mempool without holding node control. Implied by `rpc:write`. |
-| Esplora read | `esplora:read` | The Esplora REST + SSE surface. |
+| RPC submit | `rpc:submit` | Mempool submission: `sendrawtransaction`, `submitpackage`, and the other methods the read-only listener classes as mempool-submit; also Esplora `POST /tx` (with `esplora:read`). Lets a broadcaster (a payment processor, a wallet backend) hand transactions to the mempool without holding node control. Implied by `rpc:write`. |
+| Esplora read | `esplora:read` | The Esplora REST + SSE surface. Reads only: `POST /tx` additionally needs `rpc:submit`. |
 | Stream subscribe | `stream:subscribe` | Open a streaming subscription (events gRPC, `streamws`). |
 | Stream watch | `stream:watch` | Register outpoint/script/descriptor/txid watches, bounded by the token's watch quota. |
 | MCP | `mcp:*` | The MCP server. One capability; there is no per-tool split. |
@@ -70,11 +70,11 @@ only the SHA-256 digest of each token, never the plaintext.
 ```toml
 version = 1
 
-# Read-only integration: REST + Esplora reads, rate-capped.
+# Payment processor: reads plus broadcast, rate-capped. No node control.
 [[token]]
 id = "btcpay"                              # logging/accounting id, not the secret
 hash = "sha256:<64-hex SHA-256 of the token>"
-capabilities = ["rpc:read", "esplora:read"]
+capabilities = ["rpc:read", "rpc:submit", "esplora:read"]
 watch_quota = 50000                        # optional; omit for unlimited
 rate_limit = "200/s"                       # optional; omit for unlimited
 
@@ -134,7 +134,11 @@ never authenticate.
   rate). Requests over budget are shed, never queued, so a slow or abusive
   consumer cannot backpressure the node. JSON-RPC, Esplora, and MCP return
   HTTP **429** with `Retry-After`; events gRPC returns
-  `RESOURCE_EXHAUSTED`; `streamws` throttles at connection time.
+  `RESOURCE_EXHAUSTED`; `streamws` throttles at connection time. A JSON-RPC
+  batch is charged per call, not once per request: a batch of `n` calls
+  costs `n`, and a call that crosses the budget is answered in-band with
+  error `-32005` whose `data.retry_after_secs` matches `Retry-After`. The
+  earlier calls in that batch are still served.
 - **Watch quota.** The streaming watch-set is metered in units. One
   scripthash costs one unit, and prefix watches are priced by coarseness. A
   token holds units through an RAII lease, so a disconnect releases its
@@ -152,7 +156,7 @@ an authfile.
 | Surface | Enable flag | Capability gate | Default without the flag |
 |---|---|---|---|
 | JSON-RPC (read/write listeners) | `-rpcauthbearer` | `rpc:read` / `rpc:submit` / `rpc:write` | Core Basic auth (cookie/userpass/rpcauth) |
-| Esplora REST / SSE | `-esploraauthbearer` | `esplora:read` | `-esploraauth` Basic, loopback-unauth default |
+| Esplora REST / SSE | `-esploraauthbearer` | `esplora:read` (+ `rpc:submit` for `POST /tx`) | `-esploraauth` Basic, loopback-unauth default |
 | events gRPC | `-eventsgrpcauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
 | streaming WS/SSE (`streamws`) | `-streamwsauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
 | MCP (HTTP) | `-mcpauth` | `mcp:*` | loopback-trust |
