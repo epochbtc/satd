@@ -744,6 +744,55 @@ fn test_rpc_bearer_batch_charged_per_entry() {
     node.stop();
 }
 
+/// JSON-RPC 2.0 notifications in a batch are charged like calls, so a
+/// rate-limited token cannot get unmetered dispatch by dropping its ids.
+/// Nine notifications precede one call on a 2/s token: the HTTP layer takes
+/// one unit, entry 0 is free, entry 1 takes the last, and the call at the
+/// end is shed `-32005`. Were the notifications uncharged, the call would
+/// find a unit left and be served. Notifications get no reply, so the reply
+/// array holds the call's entry alone.
+#[test]
+fn test_rpc_bearer_batch_notifications_are_charged() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "satd-test-batch-notif-ratelimit-token-v1",
+        capabilities: &["rpc:read"],
+        rate_limit: Some("2/s"),
+        watch_quota: None,
+    }]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let mut batch: Vec<serde_json::Value> = (0..9)
+        .map(|_| serde_json::json!({"jsonrpc": "2.0", "method": "getblockcount", "params": []}))
+        .collect();
+    batch.push(serde_json::json!({"jsonrpc": "2.0", "id": "last", "method": "getblockcount", "params": []}));
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&batch)
+        .bearer_auth("satd-test-batch-notif-ratelimit-token-v1")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the batch itself is admitted");
+    let replies: Vec<serde_json::Value> = resp.json().unwrap();
+    assert_eq!(replies.len(), 1, "notifications get no reply entry: {replies:?}");
+    assert_eq!(replies[0]["id"], "last", "{replies:?}");
+    assert_eq!(
+        replies[0]["error"]["code"], -32005,
+        "the notifications drained the bucket, so the trailing call is shed: {replies:?}"
+    );
+
+    node.stop();
+}
+
 /// Esplora `POST /tx` broadcasts only for a token holding `rpc:submit` (or
 /// `rpc:write`, which implies it). `esplora:read` alone reads; its
 /// broadcast is refused with 403 naming the capability. A token that holds

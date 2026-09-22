@@ -758,4 +758,47 @@ mod tests {
         assert!(batch_replies(&rp).iter().all(|r| r.get("result").is_some()));
         assert_eq!(dispatched.load(Ordering::SeqCst), 50);
     }
+
+    /// Notifications in a batch are charged like calls. jsonrpsee copies the
+    /// HTTP request's extensions -- the principal included -- onto every
+    /// batch entry, notifications as well as calls, so a notification over
+    /// budget is dropped rather than dispatched. (On satd's listeners a
+    /// client's notification never reaches this arm at all: the compat layer
+    /// gives every id-less request a synthetic id, so it arrives as a call;
+    /// `test_rpc_bearer_batch_notifications_are_charged` covers that path.)
+    #[tokio::test]
+    async fn batch_notifications_are_charged_against_the_rate_limit() {
+        use satd_auth::{LocalAccounting, RatePolicy};
+        let acct: Arc<dyn satd_auth::Accounting> = Arc::new(LocalAccounting::new());
+        let rl = || {
+            Principal::token(
+                Arc::from("rl"),
+                CapabilitySet::EMPTY.with(Capability::RpcSubmit),
+                None,
+                Some(RatePolicy {
+                    burst: 2,
+                    per_sec: 2,
+                }),
+                acct.clone(),
+            )
+        };
+        let notif = |p: Principal| {
+            let mut n = Notification::new("sendrawtransaction".into(), None);
+            n.extensions.insert(p);
+            Ok(BatchEntry::Notification(n))
+        };
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = BatchRateFilter {
+            inner: Recorder {
+                dispatched: dispatched.clone(),
+            },
+        };
+        // Entry 0 is free and the bucket (2) covers entries 1 and 2; the
+        // other seven are over budget.
+        let rp = svc
+            .batch(Batch::from((0..10).map(|_| notif(rl())).collect::<Vec<_>>()))
+            .await;
+        assert!(rp.is_notification(), "an all-notification batch has no reply");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 3);
+    }
 }
