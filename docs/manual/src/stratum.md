@@ -173,7 +173,9 @@ rejections carry the Stratum V2 codes `stale-share`, `difficulty-too-low`,
 `duplicate-share`, `invalid-share`, `invalid-timestamp` and
 `invalid-channel-id`.
 
-A connection must complete the handshake within 10 seconds.
+A connection must complete the handshake within 10 seconds. After that it is
+held to the same limits on silence as a Stratum V1 connection, counting a
+frame on any of its channels; see [Idle connections](#idle-connections).
 
 ## Job Declaration
 
@@ -272,9 +274,13 @@ What the lines point to:
 
 - **No `authorized` line.** The miner is not reaching the listener, or its
   username is refused; the refusal is logged at warn.
-- **Authorized, then disconnected with `reason="idle"` and no shares.** The
-  device connected but is not submitting. Check that the node is issuing work:
-  during initial block download it withholds work and says so once.
+- **Authorized, then disconnected with `reason="idle"` after ten minutes and
+  no shares.** The device connected but is not submitting. Check that the node
+  is issuing work: during initial block download it withholds work and says so
+  once.
+- **Disconnected with `reason="binary data on the Stratum V1 port (a Stratum V2
+  client?)"`.** The miner is set to Stratum V2 but pointed at the V1 port. Point
+  it at the `--stratumv2bind` port, or switch it to Stratum V1.
 - **Every share `low difficulty`, with `share_difficulty` far below
   `difficulty`.** The miner is hashing a different header from the one the
   node rebuilds, so its shares are effectively random. Compare the granted
@@ -378,8 +384,33 @@ Methods served: `mining.configure` (BIP 310 version rolling, mask
   parent may use the minimum difficulty, so a job's difficulty holds only on
   one side of that moment. A share timestamped on the other side from the job
   is stale; the next refresh issues a job with the right difficulty.
-- Lines are limited to 8 KiB, and a connection that sends nothing for 120
-  seconds is closed.
+- Lines are limited to 8 KiB. A connection that sends nothing for too long is
+  closed; see [Idle connections](#idle-connections).
+
+## Idle connections
+
+A miner sends nothing but shares, so how long it can go quiet depends on how
+often it should find one. A connection that has not authorized (Stratum V1) or
+opened a channel (Stratum V2) is closed after **120 seconds** of silence. After
+that:
+
+- Once the miner has four accepted shares, it may go quiet for **twenty
+  expected share intervals** at its current difficulty, but never less than 120
+  seconds and never more than an hour. The expected interval comes from the
+  slower of two hashrate estimates: the last ten minutes, and the whole
+  connection. At vardiff's one share every 30 seconds that is ten minutes.
+- Before that, it may go quiet for **ten minutes**.
+
+The limit is recomputed as the difficulty changes. Shares arrive at random, so
+a gap of twenty expected intervals has a probability of about 2 in a billion.
+A miner that is still hashing is not dropped, and a dead one is found in about
+ten minutes. A Stratum V2 connection counts the share rates of all its
+channels.
+
+The one-hour ceiling matters only for a miner that expects fewer than one
+share every three minutes. Vardiff never sets a difficulty that high, so the
+cause is a `mining.suggest_difficulty` floor above what the device can reach.
+Such a miner can be dropped while it is hashing; lower the floor.
 
 ## When work is withheld
 

@@ -229,6 +229,48 @@ impl Shared {
     }
 }
 
+#[cfg(test)]
+impl Shared {
+    /// Shared state over an empty in-memory regtest chain, for driving a
+    /// session directly. No work is issued until a test sends some.
+    pub(crate) fn for_test(config: StratumConfig) -> Arc<Self> {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-stratum-session-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let chain = ChainState::new(
+            Box::new(InMemoryStore::new()),
+            FlatFileManager::new(&dir.join("blocks")).unwrap(),
+            config.network,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let (work, _) = watch::channel(None);
+        Arc::new(Self {
+            config: Arc::new(config),
+            chain: Arc::new(chain),
+            mempool: Arc::new(Mempool::new(1_000_000, 0)),
+            work,
+            core: tokio::runtime::Handle::current(),
+            stats: Arc::new(StratumStats::default()),
+            listeners: Listeners::default(),
+            next_extranonce1: AtomicU32::new(0),
+        })
+    }
+}
+
 /// A bound Stratum server, ready to [`run`](Self::run).
 pub struct StratumServer {
     listener: TcpListener,

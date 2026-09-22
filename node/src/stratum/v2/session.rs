@@ -33,7 +33,10 @@ use super::noise::{self, TransportError};
 use super::wire;
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::miner::{self, MinerRecord, MinerSlot, format_difficulty, format_hashrate};
+use crate::stratum::miner::{
+    self, MinerRecord, MinerSlot, UNAUTHORIZED_IDLE_TIMEOUT, format_difficulty, format_hashrate,
+    miner_idle_timeout,
+};
 use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{
     ShareResult, effective_share_target, hash_difficulty, network_difficulty, validate_share,
@@ -45,8 +48,6 @@ use crate::stratum::vardiff::Vardiff;
 /// The handshake must finish within this; miner firmware gives up after ten
 /// seconds of its own.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// A connection that sends nothing for this long is dropped.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const VARDIFF_TICK: Duration = Duration::from_secs(10);
 const MAX_SEEN_SHARES: usize = 100_000;
@@ -181,8 +182,9 @@ pub(crate) async fn run(
         declared: VecDeque::new(),
         device: String::new(),
     };
-    let idle = tokio::time::sleep(IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    // The idle limit depends on the channels' difficulties and share rates,
+    // so it is recomputed on every pass rather than set once per frame.
+    let mut last_read = Instant::now();
     let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -190,6 +192,7 @@ pub(crate) async fn run(
     let reason;
     loop {
         let has_channels = !session.channels.is_empty();
+        let idle_at = last_read + session.idle_timeout();
         // New work and the vardiff tick come before the miner's frames, as on
         // the V1 listener: they are rare, and a miner that submits without
         // pause would otherwise never be sent the next job.
@@ -216,7 +219,7 @@ pub(crate) async fn run(
             }
             frame = frames.recv() => match frame {
                 Some(Ok((msg_type, payload))) => {
-                    idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
+                    last_read = Instant::now();
                     session.handle(msg_type, &payload, &mut work_rx).await
                 }
                 Some(Err(e)) => {
@@ -234,7 +237,7 @@ pub(crate) async fn run(
                     break;
                 }
             },
-            _ = &mut idle => {
+            _ = tokio::time::sleep_until(idle_at) => {
                 reason = "idle";
                 break;
             }
@@ -920,6 +923,23 @@ impl Session {
     }
 
     /// The periodic `-debug=stratum` reading for every channel.
+    /// How long this connection may send nothing: short until it opens a
+    /// channel, then scaled to how often shares should arrive on any of
+    /// them. A share on any channel is traffic on the connection, so the
+    /// channels' rates add up.
+    fn idle_timeout(&self) -> Duration {
+        if self.channels.is_empty() {
+            return UNAUTHORIZED_IDLE_TIMEOUT;
+        }
+        let now = std::time::Instant::now();
+        let rates: Vec<f64> = self
+            .channels
+            .values()
+            .filter_map(|ch| ch.miner.lock().tally.share_rate(now, ch.vardiff.difficulty()))
+            .collect();
+        miner_idle_timeout((!rates.is_empty()).then(|| rates.iter().sum()))
+    }
+
     fn log_status(&mut self) {
         let now = std::time::Instant::now();
         for ch in self.channels.values_mut() {
