@@ -481,6 +481,150 @@ mod tests {
         let _ = sd_tx.send(true);
     }
 
+    /// Server-written ticks, one every `every`, `n` in all: the shape of an
+    /// SSE feed or a WebSocket the client only reads.
+    fn ticker(n: usize, every: Duration) -> tokio::sync::mpsc::Receiver<bytes::Bytes> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            for i in 0..n {
+                tokio::time::sleep(every).await;
+                if tx.send(bytes::Bytes::from(format!("tick {i}\n"))).await.is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    }
+
+    struct TickBody(tokio::sync::mpsc::Receiver<bytes::Bytes>);
+
+    impl hyper::body::Body for TickBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            self.0.poll_recv(cx).map(|t| t.map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    /// Read from `c` until `want` ticks have arrived, failing if the server
+    /// closes the connection first. Returns everything read.
+    async fn read_ticks(c: &mut TcpStream, want: usize) -> String {
+        let mut got = String::new();
+        let mut buf = [0u8; 1024];
+        while got.matches("tick ").count() < want {
+            let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+                .await
+                .expect("a tick within 5s")
+                .expect("read");
+            assert!(n > 0, "server closed the connection after: {got:?}");
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        got
+    }
+
+    /// The first-byte deadline guards the wait for a request and nothing
+    /// after it. A connection upgraded by its first request (a WebSocket)
+    /// on which only the server writes outlives the idle budget many times
+    /// over: the upgrade request is read through the deadline wrapper -- the
+    /// version sniff reads it from the socket, not from some other buffer --
+    /// so its first byte disarms the deadline for good.
+    #[tokio::test]
+    async fn an_upgraded_connection_the_client_only_reads_is_not_timed_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/upgrade",
+            get(|mut req: axum::extract::Request| async move {
+                let on_upgrade = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    let mut io = hyper_util::rt::TokioIo::new(on_upgrade.await.expect("upgrade"));
+                    let mut ticks = ticker(10, Duration::from_millis(100));
+                    let mut buf = [0u8; 64];
+                    // Keep a read outstanding the whole time, as a WebSocket
+                    // server does to receive frames and pongs: a deadline
+                    // still armed on the upgraded socket would fire here and
+                    // end the connection.
+                    loop {
+                        tokio::select! {
+                            t = ticks.recv() => match t {
+                                Some(t) => if io.write_all(&t).await.is_err() { return },
+                                None => return,
+                            },
+                            r = io.read(&mut buf) => if !matches!(r, Ok(n) if n > 0) { return },
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .status(101)
+                    .header("connection", "upgrade")
+                    .header("upgrade", "satd-test")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        );
+        let (sd_tx, sd_rx) = watch::channel(false);
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            router,
+            ListenerLimits {
+                max_sockets: 0,
+                idle_timeout: Some(Duration::from_millis(200)),
+            },
+            sd_rx,
+        ));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: satd-test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        // Ten ticks 100 ms apart: a second of server-only traffic against a
+        // 200 ms budget.
+        let got = read_ticks(&mut c, 10).await;
+        assert!(got.starts_with("HTTP/1.1 101"), "{got:?}");
+        let _ = sd_tx.send(true);
+    }
+
+    /// The same for a long-lived streaming response (an SSE feed): once the
+    /// request has arrived, a response the server keeps writing is not cut
+    /// off by the idle budget, however long it runs.
+    #[tokio::test]
+    async fn a_streaming_response_outlives_the_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/stream",
+            get(|| async {
+                axum::body::Body::new(TickBody(ticker(10, Duration::from_millis(100))))
+            }),
+        );
+        let (sd_tx, sd_rx) = watch::channel(false);
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            router,
+            ListenerLimits {
+                max_sockets: 0,
+                idle_timeout: Some(Duration::from_millis(200)),
+            },
+            sd_rx,
+        ));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let got = read_ticks(&mut c, 10).await;
+        assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+        let _ = sd_tx.send(true);
+    }
+
     /// Shutdown stops the accept loop and closes idle connections.
     #[tokio::test]
     async fn shutdown_closes_idle_connections() {
