@@ -34,6 +34,9 @@ pub struct StratumConfig {
     /// The Stratum V2 listener, when configured. Needs the `stratum-v2`
     /// feature; without it, binding fails.
     pub v2: Option<V2Config>,
+    /// Where a block a miner finds is saved before it is submitted (see
+    /// [`found`](super::found)). `None` saves nothing.
+    pub found_block_dir: Option<PathBuf>,
 }
 
 /// The Stratum V2 listener's settings.

@@ -18888,6 +18888,21 @@ fn stratum_v1_mined_share_connects_block() {
     assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner, "coinbase pays the username");
     let mempool = node.rpc_ok("getrawmempool", vec![]);
     assert_eq!(mempool, json!([]), "the mined transaction left the mempool");
+    // The block was saved before it was submitted, byte for byte what the
+    // chain now holds, so it could have gone to another node had this one
+    // refused it.
+    let saved = node
+        .datadir
+        .join("regtest")
+        .join("stratum")
+        .join("found")
+        .join(format!("{submitted_height}-{best}.hex"));
+    let raw = node.rpc_ok("getblock", vec![json!(best), json!(0)]);
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap_or_else(|e| panic!("{}: {e}", saved.display())),
+        format!("{}\n", raw.as_str().unwrap()),
+        "the saved copy is the block"
+    );
 }
 
 /// Work follows a tip the download scheduler reached. That path connects

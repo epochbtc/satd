@@ -3492,6 +3492,7 @@ async fn main() {
             max_conns: config.stratum_max_conns,
             vardiff: Default::default(),
             v2: stratum_v2,
+            found_block_dir: Some(config.network_datadir().join("stratum").join("found")),
         };
         let server = match node::stratum::StratumServer::bind(
             stratum_cfg,

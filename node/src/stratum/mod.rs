@@ -14,6 +14,7 @@
 //! refresh loop.
 
 pub mod config;
+pub mod found;
 pub mod job;
 pub mod miner;
 pub mod server;
