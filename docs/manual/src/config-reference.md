@@ -297,6 +297,7 @@ startup error.
 | `esplorarequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). |
 | `esploramaxconns` | 256 | restart | satd | Hard cap on concurrent in-flight Esplora requests. |
 | `esplorasseconns` | = `esploramaxconns` | restart | satd | Hard cap on simultaneously-open SSE streams (`0` disables SSE). |
+| `esploramaxsockets` | 1024 | restart | satd | Hard cap on open sockets across both Esplora listeners, counted at accept with idle keep-alive connections included; over the cap a socket is dropped. `esploramaxconns` bounds requests in flight and never sees a socket that sends nothing. `0` disables. A keep-alive connection idle for longer than `esplorarequesttimeout` is closed. |
 | `esploraauth` | none | restart | satd | Esplora auth mode: `none`\|`cookie`\|`userpass`. |
 | `esploraauthbearer` | false | restart | satd | Honor bearer tokens (`esplora:read`) on the Esplora server (requires `authfile`). |
 | `esploracookiefile` | shared `.cookie` | restart | satd | Cookie file when `esploraauth=cookie`. |
@@ -399,6 +400,7 @@ Core ZMQ wire-format compatible.)
 | `streamwsallowremote` | false | restart | satd | Permit `streamws` on a non-loopback address (requires `streamwsauth`). |
 | `streamwsauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on `streamws` (requires `authfile`). |
 | `streamwsmaxconns` | 256 | restart | satd | Hard cap on simultaneously-open `streamws` connections. |
+| `streamwsmaxsockets` | 1024 | restart | satd | Hard cap on open sockets on the `streamws` listener, counted at accept before any request is parsed; over the cap a socket is dropped. `streamwsmaxconns` is taken inside the handlers and never sees a socket that sends nothing. `0` disables. A keep-alive connection idle for 30 s between requests is closed (an open `/ws` or `/sse` stream is not idle). |
 | `streamwsmaxsubscriptions` | 256 | restart | satd | Hard cap on watch-set entries per `streamws` connection. |
 | `streamwsmaxmessagebytes` | 262144 | restart | satd | Cap on a single inbound WebSocket message/frame in bytes. |
 | `streammaxresyncblocks` | 10000 (`0` disables) | restart | satd | Max blocks the watch matcher re-scans in one catch-up after lagging. |

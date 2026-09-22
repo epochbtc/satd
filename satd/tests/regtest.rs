@@ -18297,6 +18297,33 @@ fn rpcservertimeout_cuts_an_incomplete_head() {
     node.stop();
 }
 
+/// A client that connects and sends nothing at all is disconnected on the
+/// same budget.
+///
+/// hyper-util's auto builder sniffs the protocol version before HTTP/1's
+/// header timer is armed, so a silent socket used to sit in that sniff
+/// forever — holding one of the listener's connection slots, with
+/// `-rpcservertimeout` unable to touch it.
+#[test]
+fn rpcservertimeout_cuts_a_silent_connection() {
+    let mut node = TestNode::start(&["-rpcservertimeout=2"]);
+    let mut sock = rpc_raw_socket(&node);
+
+    let started = std::time::Instant::now();
+    let _ = read_until_eof(&mut sock, "silent connection");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the connection was closed immediately ({elapsed:?})"
+    );
+    assert!(
+        elapsed <= test_timeout(10),
+        "the silent connection was not cut on the 2s budget (took {elapsed:?})"
+    );
+    node.stop();
+}
+
 /// `verificationprogress` is Bitcoin Core's `GuessVerificationProgress`: the
 /// share of all transactions ever confirmed that the chain holds, and exactly
 /// 1 for a tip within two hours of the clock with no header above it.

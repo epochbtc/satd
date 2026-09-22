@@ -58,6 +58,11 @@ const WS_IDLE_TIMEOUT_SECS: i64 = 90;
 pub struct WsLimits {
     /// Max concurrent `/ws` + `/sse` connections (`streamwsmaxconns`).
     pub max_conns: usize,
+    /// Max open sockets on the listener, counted at accept
+    /// (`streamwsmaxsockets`). `max_conns` is taken inside the handlers,
+    /// after the request is parsed, so it never sees a socket that sends
+    /// nothing or only keep-alive; this one does.
+    pub max_sockets: usize,
     /// Max watch-set entries per connection (`streamwsmaxsubscriptions`).
     pub max_subscriptions: usize,
     /// Max bytes for a single inbound WS message/frame (`streamwsmaxmessagebytes`).
@@ -66,6 +71,13 @@ pub struct WsLimits {
     pub prefix_min_bits: u8,
     pub prefix_max_bits: u8,
 }
+
+/// How long a streamws keep-alive connection may sit between requests
+/// before it is closed, so a client holding sockets open without a
+/// subscription cannot keep them forever. Matches the JSON-RPC default
+/// (`-rpcservertimeout`). An open `/ws` or `/sse` stream is not idle in
+/// this sense: the budget covers only the gap before the next request head.
+const STREAMWS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Construction-time errors for the WS transport.
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +123,8 @@ struct WsState {
 pub struct WsStreamServer {
     addr: SocketAddr,
     listener: TcpListener,
+    /// `streamwsmaxsockets`; 0 ⇒ unlimited.
+    max_sockets: usize,
     state: WsState,
 }
 
@@ -161,6 +175,7 @@ impl WsStreamServer {
         Ok(Self {
             addr: bound,
             listener,
+            max_sockets: limits.max_sockets,
             state: WsState {
                 publisher,
                 watch_registry,
@@ -197,20 +212,29 @@ impl WsStreamServer {
 
     /// Serve until `shutdown` flips. Intended to be spawned on the API
     /// runtime.
-    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
+    pub async fn serve(self, shutdown: watch::Receiver<bool>) {
         let app = Router::new()
             .route("/ws", get(ws_upgrade))
             .route("/sse", get(sse_firehose))
             .with_state(self.state);
         info!(target: "events::ws", addr = %self.addr, "streamws server starting");
-        let result = axum::serve(self.listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.changed().await;
-            })
-            .await;
-        if let Err(e) = result {
-            warn!(target: "events::ws", error = %e, "streamws server exited with error");
-        }
+        // The shared capped loop: a permit per socket, taken at accept, and
+        // an idle budget on keep-alive connections. `axum::serve` bounded
+        // neither, so a client that opened sockets and never closed them was
+        // limited only by the process's file-descriptor table.
+        node::http_serve::serve_http_listener(
+            "streamws",
+            self.listener,
+            node::http_serve::Transport::Plain,
+            app,
+            node::http_serve::ListenerLimits {
+                max_sockets: self.max_sockets,
+                idle_timeout: Some(STREAMWS_IDLE_TIMEOUT),
+            },
+            shutdown,
+        )
+        .await;
+        info!(target: "events::ws", "streamws server stopped");
     }
 }
 

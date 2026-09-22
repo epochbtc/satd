@@ -1,171 +1,74 @@
-//! TLS-aware listener for the Esplora HTTP server.
+//! The Esplora listeners: plain HTTP and TLS, both served through
+//! [`node::http_serve`], which caps open sockets at accept and closes a
+//! keep-alive connection that goes idle.
 //!
-//! Wraps a [`tokio::net::TcpListener`] + [`tokio_rustls::TlsAcceptor`]
-//! and implements [`axum::serve::Listener`] so the same
-//! `axum::serve(listener, router)` call serves either transport. We
-//! retry on accept errors and on handshake failures (logged at
-//! `debug` for handshake errors, `warn` for accept errors) because
-//! the [`axum::serve::Listener`] contract is "yields the next ready
-//! connection", not "yields a `Result`".
-//!
-//! The handshake is bounded by `handshake_timeout` so a half-open
-//! client can't pin the accept loop indefinitely; on timeout the
-//! socket is dropped and we move on. Mirrors the Electrum-server
-//! handshake-timeout guard.
-//!
-//! Known limitation (review M3): `axum::serve::Listener::accept`
-//! returns exactly one ready connection per call, so this listener
-//! completes the TLS handshake inline before yielding to axum. A
-//! slow handshake therefore stalls the accept loop for the duration
-//! of `handshake_timeout`. The timeout caps the worst case but the
-//! single-threaded handshake pipeline is a DoS vector against a
-//! determined attacker. Future work: spawn each handshake into its
-//! own task and feed `accept()` from a bounded MPSC of completed
-//! `(TlsStream, SocketAddr)` pairs. Tracked as follow-up to the
-//! mTLS series.
+//! Esplora used to be served by `axum::serve`, which bounds nothing at the
+//! socket level: `--esploramaxconns` is a per-request concurrency limit
+//! and the SSE cap counts streams, so a client that opened connections and
+//! never closed them was limited only by the process's file-descriptor
+//! table — and `axum::serve` builds hyper without a timer, so an idle
+//! keep-alive connection was never closed. The TLS handshake also ran
+//! inline in the accept loop, so one slow client stalled every other
+//! connection for the handshake budget. The shared loop takes a permit per
+//! socket, runs each handshake on the connection's own task, and applies
+//! `--esplorarequesttimeout` as the idle budget.
 
-use std::io;
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use axum::Router;
+use node::http_serve::{ListenerLimits, TlsTransport, Transport, serve_http_listener};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::server::TlsStream;
 
-/// Listener that completes the TLS handshake before returning each
-/// connection. Yields the inner peer [`SocketAddr`] so downstream
-/// middleware (request tracing, rate limiting) sees the real client
-/// IP rather than the TLS terminator's loopback address.
+/// Serve `router` on the plain listener until `shutdown` flips.
+pub async fn serve_plain(
+    listener: TcpListener,
+    router: Router,
+    limits: ListenerLimits,
+    shutdown: watch::Receiver<bool>,
+) {
+    serve_http_listener("esplora", listener, Transport::Plain, router, limits, shutdown).await
+}
+
+/// Serve `router` on the TLS listener until `shutdown` flips.
 ///
 /// When `mtls_enabled` is `true` the acceptor was built with
-/// `ClientAuthPolicy::Required` and the rustls verifier rejects any
-/// client without a CA-signed cert at handshake time. After the
-/// handshake the listener additionally applies `allow` (case-
-/// insensitive CN / DNS-SAN check); an `is_empty()` allowlist makes
-/// the check a no-op so the CA bundle remains the only gate. Both
-/// reject paths drop the connection silently and continue accepting.
-pub struct TlsListener {
-    inner: TcpListener,
+/// `ClientAuthPolicy::Required`, so rustls refuses any client without a
+/// CA-signed certificate at handshake time; after the handshake the client
+/// is logged and checked against `allow` (case-insensitive CN / DNS-SAN),
+/// which short-circuits when empty so the CA bundle stays the only gate.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls(
+    listener: TcpListener,
     acceptor: TlsAcceptor,
     handshake_timeout: Duration,
     mtls_enabled: bool,
     allow: tls_config::ClientAllowList,
-}
-
-impl TlsListener {
-    /// Backwards-compatible constructor — plain TLS (no mTLS). Kept so
-    /// existing call sites (tests, downstream embedders) don't break.
-    pub fn new(inner: TcpListener, acceptor: TlsAcceptor, handshake_timeout: Duration) -> Self {
-        Self::new_with_mtls(
-            inner,
-            acceptor,
-            handshake_timeout,
-            false,
-            tls_config::ClientAllowList::default(),
-        )
-    }
-
-    /// Construct a listener that also enforces the mTLS allowlist
-    /// after a successful handshake. `mtls_enabled` controls only the
-    /// audit-log "client accepted" line (rustls is what actually
-    /// enforces the handshake gate); the allowlist is applied
-    /// regardless and short-circuits when empty.
-    pub fn new_with_mtls(
-        inner: TcpListener,
-        acceptor: TlsAcceptor,
-        handshake_timeout: Duration,
-        mtls_enabled: bool,
-        allow: tls_config::ClientAllowList,
-    ) -> Self {
-        Self {
-            inner,
-            acceptor,
-            handshake_timeout,
-            mtls_enabled,
-            allow,
-        }
-    }
-}
-
-impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, peer) = match self.inner.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Esplora TLS accept error");
-                    // Mirror axum's built-in TcpListener accept retry:
-                    // brief sleep on transient errors so an EMFILE
-                    // storm doesn't busy-loop.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            };
-            let tls_stream = match tokio::time::timeout(
-                self.handshake_timeout,
-                self.acceptor.accept(stream),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    tracing::debug!(peer = %peer, error = %e, "Esplora TLS handshake failed");
-                    continue;
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        peer = %peer,
-                        timeout_secs = self.handshake_timeout.as_secs(),
-                        "Esplora TLS handshake timed out — closing connection",
-                    );
-                    continue;
-                }
-            };
-            // mTLS post-handshake hooks (audit log + allowlist check)
-            // only run when mTLS is enabled. On a plain-TLS surface
-            // there is no peer cert, so `check_peer_allowed` against
-            // any non-empty allowlist would reject every connection —
-            // review C2. Config-load validation (review C3) already
-            // refuses a non-empty allowlist without mTLS, so this
-            // gate is defense-in-depth.
-            if self.mtls_enabled {
-                let (_, server_conn) = tls_stream.get_ref();
-                if let Some(subject) = tls_config::peer_subject_label(server_conn) {
-                    tracing::info!(
-                        peer = %peer,
-                        subject = %subject,
-                        "Esplora mTLS client accepted",
-                    );
-                }
-                if let Err(rej) = tls_config::check_peer_allowed(server_conn, &self.allow) {
-                    tracing::warn!(
-                        peer = %peer,
-                        subject = %rej.subject_label,
-                        "Esplora mTLS client rejected by allowlist",
-                    );
-                    continue;
-                }
-            }
-            return (tls_stream, peer);
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.inner.local_addr()
-    }
+    router: Router,
+    limits: ListenerLimits,
+    shutdown: watch::Receiver<bool>,
+) {
+    let transport = Transport::Tls(TlsTransport {
+        acceptor,
+        handshake_timeout,
+        mtls_enabled,
+        allow,
+    });
+    serve_http_listener("esplora-tls", listener, transport, router, limits, shutdown).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tls_config::{ClientAuthPolicy, build_acceptor};
-    use axum::Router;
     use axum::routing::get;
     use std::io::Write;
-    use tokio::sync::watch;
+    use tls_config::{ClientAuthPolicy, build_acceptor};
+
+    const NO_LIMITS: ListenerLimits = ListenerLimits {
+        max_sockets: 0,
+        idle_timeout: None,
+    };
 
     fn write_pem(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);
@@ -176,11 +79,14 @@ mod tests {
         p
     }
 
-    /// End-to-end test that proves the `TlsListener` + `axum::serve`
-    /// pairing serves real HTTPS requests. Uses a self-signed cert
-    /// minted in-test and a reqwest client that trusts that root.
-    /// Mirrors the Electrum-server `tls_round_trips_a_request` test
-    /// so future readers see the same shape on both surfaces.
+    fn ping_router() -> Router {
+        Router::new().route("/ping", get(|| async { "pong" }))
+    }
+
+    /// End-to-end: the TLS listener serves real HTTPS requests. Uses a
+    /// self-signed cert minted in-test and a reqwest client that trusts
+    /// that root. Mirrors the Electrum-server `tls_round_trips_a_request`
+    /// test so future readers see the same shape on both surfaces.
     #[tokio::test]
     async fn tls_listener_serves_https_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -190,16 +96,18 @@ mod tests {
         let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled).unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = tcp.local_addr().unwrap();
-        let listener = TlsListener::new(tcp, acceptor, Duration::from_secs(5));
 
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let serve = tokio::spawn(serve_tls(
+            tcp,
+            acceptor,
+            Duration::from_secs(5),
+            false,
+            tls_config::ClientAllowList::default(),
+            ping_router(),
+            NO_LIMITS,
+            sd_rx,
+        ));
 
         // Build a reqwest client that trusts our self-signed cert.
         // `add_root_certificate` is the right knob here — disabling
@@ -220,9 +128,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
     }
 
-    /// A bare TCP connection (no TLS handshake) should be dropped
-    /// after the handshake timeout. The listener must keep accepting
-    /// — a half-open client can't wedge the accept loop.
+    /// A bare TCP connection (no TLS handshake) is dropped after the
+    /// handshake timeout, and — because each handshake runs on its own
+    /// task — a real HTTPS request succeeds *during* the bogus client's
+    /// handshake window, not just after it.
     #[tokio::test]
     async fn tls_listener_drops_bare_tcp_after_handshake_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -232,34 +141,41 @@ mod tests {
         let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled).unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = tcp.local_addr().unwrap();
-        // Short timeout — keep the test fast.
-        let listener = TlsListener::new(tcp, acceptor, Duration::from_millis(200));
 
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let serve = tokio::spawn(serve_tls(
+            tcp,
+            acceptor,
+            Duration::from_secs(2),
+            false,
+            tls_config::ClientAllowList::default(),
+            ping_router(),
+            NO_LIMITS,
+            sd_rx,
+        ));
 
-        // Connect plain TCP and write nothing. Server should time
-        // out the handshake and move on. After the timeout window,
-        // a real HTTPS request must still succeed (proves the accept
-        // loop survived the bogus client).
-        let _bogus = tokio::net::TcpStream::connect(local).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
+        // Connect plain TCP and write nothing. The accept loop must not
+        // wait on that handshake: a real request goes through at once.
+        let mut bogus = tokio::net::TcpStream::connect(local).await.unwrap();
         let cert_pem = cert.cert.pem();
         let root = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
         let client = reqwest::Client::builder()
             .add_root_certificate(root)
+            .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
         let url = format!("https://localhost:{}/ping", local.port());
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
+
+        // After the budget the silent client is gone: its socket reads EOF.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 8];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(5), bogus.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(closed, "silent client must be dropped after the handshake timeout");
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
@@ -295,18 +211,24 @@ mod tests {
         (ca_cert, ca_kp, leaf_cert, leaf_kp)
     }
 
-    /// mTLS happy path: server requires CA-signed client cert; client
-    /// presents a valid leaf via reqwest `Identity`. The HTTPS request
-    /// round-trips end to end.
-    #[tokio::test]
-    async fn mtls_round_trip_with_valid_client_cert() {
+    /// An mTLS server (CA-signed client certs required, optional allowlist)
+    /// bound on a free port, plus a client leaf with the given CN.
+    struct MtlsFixture {
+        local: std::net::SocketAddr,
+        ca_pem: String,
+        client_identity_pem: String,
+        sd_tx: watch::Sender<bool>,
+        serve: tokio::task::JoinHandle<()>,
+    }
+
+    async fn mtls_server(client_cn: &str, allow: Vec<String>) -> MtlsFixture {
         let dir = tempfile::tempdir().unwrap();
         let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost", "server");
         let mut client_params =
-            rcgen::CertificateParams::new(vec!["alice.test".to_string()]).unwrap();
+            rcgen::CertificateParams::new(vec![format!("{client_cn}.test")]).unwrap();
         client_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "alice");
+            .push(rcgen::DnType::CommonName, client_cn);
         let client_kp = rcgen::KeyPair::generate().unwrap();
         let client_cert = client_params
             .signed_by(&client_kp, &ca_cert, &ca_kp)
@@ -318,242 +240,184 @@ mod tests {
         let acceptor = build_acceptor(
             &cert_path,
             &key_path,
-            &ClientAuthPolicy::Required {
-                ca_path: ca_path.clone(),
-            },
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local = tcp.local_addr().unwrap();
-        let listener = TlsListener::new_with_mtls(
-            tcp,
-            acceptor,
-            Duration::from_secs(5),
-            true,
-            tls_config::ClientAllowList::default(),
-        );
-
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
-
-        let mut id_pem = client_cert.pem();
-        id_pem.push_str(&client_kp.serialize_pem());
-        let identity = reqwest::Identity::from_pem(id_pem.as_bytes()).unwrap();
-        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
-        let client = reqwest::Client::builder()
-            // Workspace feature unification can pull in both
-            // native-tls and rustls-tls. Force rustls here because
-            // `Identity::from_pem` is rustls-only — without this the
-            // client backend defaults to native-tls and the identity
-            // is rejected with "incompatible TLS identity type".
-            .use_rustls_tls()
-            .add_root_certificate(root)
-            .identity(identity)
-            .build()
-            .unwrap();
-        let url = format!("https://localhost:{}/ping", local.port());
-        let resp = client.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "pong");
-
-        sd_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
-    }
-
-    /// mTLS rejection: server requires client cert; client presents
-    /// none. The server-side verifier refuses the handshake; reqwest
-    /// surfaces a connection-level error rather than a JSON response.
-    #[tokio::test]
-    async fn mtls_rejects_request_without_client_cert() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca_cert, _ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost", "server");
-        let cert_path = write_pem(dir.path(), "server.pem", &server_cert.pem());
-        let key_path = write_pem(dir.path(), "server.key.pem", &server_kp.serialize_pem());
-        let ca_path = write_pem(dir.path(), "ca.pem", &ca_cert.pem());
-        let acceptor = build_acceptor(
-            &cert_path,
-            &key_path,
             &ClientAuthPolicy::Required { ca_path },
         )
         .unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = tcp.local_addr().unwrap();
-        let listener = TlsListener::new_with_mtls(
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let serve = tokio::spawn(serve_tls(
             tcp,
             acceptor,
             Duration::from_secs(5),
             true,
-            tls_config::ClientAllowList::default(),
-        );
+            tls_config::ClientAllowList::new(allow),
+            ping_router(),
+            NO_LIMITS,
+            sd_rx,
+        ));
+        // The tempdir may go; the acceptor has read the PEM files already.
+        let mut client_identity_pem = client_cert.pem();
+        client_identity_pem.push_str(&client_kp.serialize_pem());
+        MtlsFixture {
+            local,
+            ca_pem: ca_cert.pem(),
+            client_identity_pem,
+            sd_tx,
+            serve,
+        }
+    }
 
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
+    impl MtlsFixture {
+        /// A reqwest client trusting the CA, presenting the client leaf
+        /// when `with_identity`.
+        fn client(&self, with_identity: bool) -> reqwest::Client {
+            let root = reqwest::Certificate::from_pem(self.ca_pem.as_bytes()).unwrap();
+            // Workspace feature unification can pull in both native-tls and
+            // rustls-tls. Force rustls because `Identity::from_pem` is
+            // rustls-only — without this the client backend defaults to
+            // native-tls and the identity is rejected with "incompatible
+            // TLS identity type".
+            let mut b = reqwest::Client::builder()
+                .use_rustls_tls()
+                .add_root_certificate(root)
+                .timeout(Duration::from_secs(2));
+            if with_identity {
+                let identity =
+                    reqwest::Identity::from_pem(self.client_identity_pem.as_bytes()).unwrap();
+                b = b.identity(identity);
+            }
+            b.build().unwrap()
+        }
 
-        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
-        let client = reqwest::Client::builder()
-            // Force rustls for backend consistency with the other
-            // mTLS tests — see the use_rustls_tls comment above.
-            .use_rustls_tls()
-            .add_root_certificate(root)
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let url = format!("https://localhost:{}/ping", local.port());
-        let result = client.get(&url).send().await;
+        fn url(&self) -> String {
+            format!("https://localhost:{}/ping", self.local.port())
+        }
+
+        async fn stop(self) {
+            self.sd_tx.send(true).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.serve).await;
+        }
+    }
+
+    /// mTLS happy path: server requires CA-signed client cert; client
+    /// presents a valid leaf. The HTTPS request round-trips end to end.
+    #[tokio::test]
+    async fn mtls_round_trip_with_valid_client_cert() {
+        let f = mtls_server("alice", vec![]).await;
+        let resp = f.client(true).get(f.url()).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "pong");
+        f.stop().await;
+    }
+
+    /// mTLS rejection: server requires a client cert; client presents
+    /// none. The server-side verifier refuses the handshake; reqwest
+    /// surfaces a connection-level error rather than a JSON response.
+    #[tokio::test]
+    async fn mtls_rejects_request_without_client_cert() {
+        let f = mtls_server("alice", vec![]).await;
+        let result = f.client(false).get(f.url()).send().await;
         assert!(
             result.is_err(),
             "mTLS-required server should refuse client with no cert; got: {result:?}",
         );
-
-        sd_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+        f.stop().await;
     }
 
     /// Allowlist happy path: matching CN passes the post-handshake
     /// check, HTTPS request succeeds.
     #[tokio::test]
     async fn mtls_allowlist_accepts_matching_cn() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost", "server");
-        let mut client_params =
-            rcgen::CertificateParams::new(vec!["alice.test".to_string()]).unwrap();
-        client_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "alice");
-        let client_kp = rcgen::KeyPair::generate().unwrap();
-        let client_cert = client_params
-            .signed_by(&client_kp, &ca_cert, &ca_kp)
-            .unwrap();
-
-        let cert_path = write_pem(dir.path(), "server.pem", &server_cert.pem());
-        let key_path = write_pem(dir.path(), "server.key.pem", &server_kp.serialize_pem());
-        let ca_path = write_pem(dir.path(), "ca.pem", &ca_cert.pem());
-        let acceptor = build_acceptor(
-            &cert_path,
-            &key_path,
-            &ClientAuthPolicy::Required { ca_path },
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local = tcp.local_addr().unwrap();
-        let allow = tls_config::ClientAllowList::new(vec![
-            "alice".to_string(),
-            "bob".to_string(),
-        ]);
-        let listener =
-            TlsListener::new_with_mtls(tcp, acceptor, Duration::from_secs(5), true, allow);
-
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
-
-        let mut id_pem = client_cert.pem();
-        id_pem.push_str(&client_kp.serialize_pem());
-        let identity = reqwest::Identity::from_pem(id_pem.as_bytes()).unwrap();
-        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
-        let client = reqwest::Client::builder()
-            // Workspace feature unification can pull in both
-            // native-tls and rustls-tls. Force rustls here because
-            // `Identity::from_pem` is rustls-only — without this the
-            // client backend defaults to native-tls and the identity
-            // is rejected with "incompatible TLS identity type".
-            .use_rustls_tls()
-            .add_root_certificate(root)
-            .identity(identity)
-            .build()
-            .unwrap();
-        let url = format!("https://localhost:{}/ping", local.port());
-        let resp = client.get(&url).send().await.unwrap();
+        let f = mtls_server("alice", vec!["alice".to_string(), "bob".to_string()]).await;
+        let resp = f.client(true).get(f.url()).send().await.unwrap();
         assert_eq!(resp.status(), 200);
-
-        sd_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+        f.stop().await;
     }
 
-    /// Allowlist rejection: handshake succeeds (CA-signed), but
-    /// CN/SAN aren't in the allowlist. The listener drops the
-    /// connection before yielding it to axum; reqwest gets a
-    /// connection-level error (timeout / reset) rather than HTTP.
+    /// Allowlist rejection: handshake succeeds (CA-signed), but CN/SAN
+    /// aren't in the allowlist. The connection is dropped before any HTTP
+    /// is served; reqwest gets a connection-level error (reset / EOF).
     #[tokio::test]
     async fn mtls_allowlist_drops_unlisted_principal() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca_cert, ca_kp, server_cert, server_kp) = mint_ca_and_leaf("localhost", "server");
-        let mut client_params =
-            rcgen::CertificateParams::new(vec!["mallory.test".to_string()]).unwrap();
-        client_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "mallory");
-        let client_kp = rcgen::KeyPair::generate().unwrap();
-        let client_cert = client_params
-            .signed_by(&client_kp, &ca_cert, &ca_kp)
-            .unwrap();
-
-        let cert_path = write_pem(dir.path(), "server.pem", &server_cert.pem());
-        let key_path = write_pem(dir.path(), "server.key.pem", &server_kp.serialize_pem());
-        let ca_path = write_pem(dir.path(), "ca.pem", &ca_cert.pem());
-        let acceptor = build_acceptor(
-            &cert_path,
-            &key_path,
-            &ClientAuthPolicy::Required { ca_path },
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local = tcp.local_addr().unwrap();
-        let allow = tls_config::ClientAllowList::new(vec![
-            "alice".to_string(),
-            "bob".to_string(),
-        ]);
-        let listener =
-            TlsListener::new_with_mtls(tcp, acceptor, Duration::from_secs(5), true, allow);
-
-        let router = Router::new().route("/ping", get(|| async { "pong" }));
-        let (sd_tx, mut sd_rx) = watch::channel(false);
-        let serve = tokio::spawn(async move {
-            let s = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let _ = sd_rx.changed().await;
-            });
-            let _ = s.await;
-        });
-
-        let mut id_pem = client_cert.pem();
-        id_pem.push_str(&client_kp.serialize_pem());
-        let identity = reqwest::Identity::from_pem(id_pem.as_bytes()).unwrap();
-        let root = reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap();
-        let client = reqwest::Client::builder()
-            // Workspace feature unification can pull in both
-            // native-tls and rustls-tls. Force rustls here because
-            // `Identity::from_pem` is rustls-only — without this the
-            // client backend defaults to native-tls and the identity
-            // is rejected with "incompatible TLS identity type".
-            .use_rustls_tls()
-            .add_root_certificate(root)
-            .identity(identity)
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let url = format!("https://localhost:{}/ping", local.port());
-        let result = client.get(&url).send().await;
+        let f = mtls_server("mallory", vec!["alice".to_string(), "bob".to_string()]).await;
+        let result = f.client(true).get(f.url()).send().await;
         assert!(
             result.is_err(),
             "allowlist should drop unlisted principal; got: {result:?}",
         );
+        f.stop().await;
+    }
+
+    /// The socket cap counts TLS connections that completed their
+    /// handshake and sit idle: the next one is dropped at accept.
+    #[tokio::test]
+    async fn tls_socket_cap_counts_idle_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
+        let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let serve = tokio::spawn(serve_tls(
+            tcp,
+            acceptor,
+            Duration::from_secs(5),
+            false,
+            tls_config::ClientAllowList::default(),
+            ping_router(),
+            ListenerLimits {
+                max_sockets: 2,
+                idle_timeout: None,
+            },
+            sd_rx,
+        ));
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let connect = || async {
+            let tcp = tokio::net::TcpStream::connect(local).await.unwrap();
+            let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+                .await
+                .expect("handshake within 5s")
+        };
+        // Two connections each serve a request and then sit idle.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut s = connect().await.expect("connection within the cap");
+            s.write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+            held.push(s);
+        }
+        // The third is dropped at accept: its handshake fails on a closed
+        // socket rather than timing out.
+        match connect().await {
+            Ok(_) => panic!("third connection must be refused at the socket cap"),
+            Err(e) => assert_ne!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+        }
+        // Closing one admits the next.
+        drop(held.pop());
+        let mut admitted = false;
+        for _ in 0..100 {
+            if connect().await.is_ok() {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "closing a connection must release its slot");
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;

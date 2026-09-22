@@ -752,6 +752,11 @@ pub struct Config {
     pub esplora_request_timeout: u64,
     /// Hard cap on concurrent in-flight Esplora requests.
     pub esplora_max_conns: usize,
+    /// Hard cap on open sockets across both Esplora listeners, counted at
+    /// accept (idle keep-alive connections included). `max_conns` bounds
+    /// requests in flight and never sees a socket that sends nothing;
+    /// this one does. `0` disables the cap.
+    pub esplora_max_sockets: usize,
     /// Hard cap on simultaneously-open SSE streams. Separate from
     /// `esplora_max_conns` because the request concurrency layer
     /// does not bound long-lived streaming bodies (review M2). `0`
@@ -1336,6 +1341,11 @@ pub struct Config {
     /// combined). A new connection beyond the cap is rejected with HTTP 503.
     /// Mirrors `events_grpc_max_conns`. Default: 256.
     pub streamws_max_conns: usize,
+    /// Hard cap on open sockets on the streamws listener, counted at accept.
+    /// `streamws_max_conns` is taken inside the handlers after the request
+    /// is parsed, so it never sees a socket that sends nothing; this one
+    /// does. `0` disables the cap. Default: 1024.
+    pub streamws_max_sockets: usize,
     /// Hard cap on watch-set entries per streamws connection. An add that would
     /// exceed it is shed (the connection stays up). Mirrors
     /// `events_grpc_max_subscriptions` (which is node-wide; this is per-conn).
@@ -3043,6 +3053,10 @@ impl Config {
             .esploramaxconns
             .or_else(|| file_get("esploramaxconns").and_then(|v| v.parse().ok()))
             .unwrap_or(256);
+        let esplora_max_sockets = cli
+            .esploramaxsockets
+            .or_else(|| file_get("esploramaxsockets").and_then(|v| v.parse().ok()))
+            .unwrap_or(1024);
         let esplora_sse_max_conns = cli
             .esplorasseconns
             .or_else(|| file_get("esplorasseconns").and_then(|v| v.parse().ok()))
@@ -3975,6 +3989,7 @@ impl Config {
             esplora_cors,
             esplora_request_timeout,
             esplora_max_conns,
+            esplora_max_sockets,
             esplora_sse_max_conns,
             esplora_auth,
             esplora_cookie_file,
@@ -4440,6 +4455,10 @@ impl Config {
                 .streamws_max_conns
                 .or_else(|| file_get("streamwsmaxconns").and_then(|v| v.parse().ok()))
                 .unwrap_or(256),
+            streamws_max_sockets: cli
+                .streamws_max_sockets
+                .or_else(|| file_get("streamwsmaxsockets").and_then(|v| v.parse().ok()))
+                .unwrap_or(1024),
             streamws_max_subscriptions: cli
                 .streamws_max_subscriptions
                 .or_else(|| file_get("streamwsmaxsubscriptions").and_then(|v| v.parse().ok()))
@@ -5570,6 +5589,13 @@ pub struct CliArgs {
         help = "Hard cap on simultaneously-open Esplora SSE streams (default: same as --esploramaxconns; 0 disables)"
     )]
     pub esplorasseconns: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Hard cap on open sockets across the Esplora listeners, idle keep-alive connections included; over the cap a socket is dropped at accept (default: 1024; 0 disables)"
+    )]
+    pub esploramaxsockets: Option<usize>,
 
     #[arg(
         long,
@@ -6738,6 +6764,13 @@ pub struct CliArgs {
     pub streamws_max_conns: Option<usize>,
 
     #[arg(
+        long = "streamws-max-sockets",
+        value_name = "N",
+        help = "Hard cap on open sockets on the streamws listener, counted at accept before any request is parsed; over the cap a socket is dropped (default: 1024; 0 disables)"
+    )]
+    pub streamws_max_sockets: Option<usize>,
+
+    #[arg(
         long = "streamws-max-subscriptions",
         value_name = "N",
         help = "Hard cap on watch-set entries per streamws connection; an add beyond it is shed without dropping the connection (default: 256)"
@@ -7476,6 +7509,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "esplorarequesttimeout",
         "esploramaxconns",
         "esplorasseconns",
+        "esploramaxsockets",
         "esploraauth",
         "esploraauthbearer",
         "esploracookiefile",
@@ -8244,6 +8278,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "esplorarequesttimeout",
     "esploramaxconns",
     "esplorasseconns",
+    "esploramaxsockets",
     "esploraauth",
     "esploraauthbearer",
     "esploracookiefile",
@@ -8326,6 +8361,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "streamwsallowremote",
     "streamwsauth",
     "streamwsmaxconns",
+    "streamwsmaxsockets",
     "streamwsmaxsubscriptions",
     "streamwsmaxmessagebytes",
     "streammaxresyncblocks",
@@ -10705,6 +10741,7 @@ testactivationheight=bip34@2
             esplorarequesttimeout: None,
             esploramaxconns: None,
             esplorasseconns: None,
+            esploramaxsockets: None,
             esploraauth: None,
             esploracookiefile: None,
             esploraauthbearer: None,
@@ -10851,6 +10888,7 @@ testactivationheight=bip34@2
             streamws_allow_remote: Some(false),
             streamws_auth: None,
             streamws_max_conns: None,
+            streamws_max_sockets: None,
             streamws_max_subscriptions: None,
             streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,
@@ -11017,6 +11055,7 @@ testactivationheight=bip34@2
             esplorarequesttimeout: None,
             esploramaxconns: None,
             esplorasseconns: None,
+            esploramaxsockets: None,
             esploraauth: None,
             esploracookiefile: None,
             esploraauthbearer: None,
@@ -11163,6 +11202,7 @@ testactivationheight=bip34@2
             streamws_allow_remote: Some(false),
             streamws_auth: None,
             streamws_max_conns: None,
+            streamws_max_sockets: None,
             streamws_max_subscriptions: None,
             streamws_max_message_bytes: None,
             stream_max_resync_blocks: None,

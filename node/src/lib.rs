@@ -3,6 +3,7 @@ pub mod chain;
 pub mod diskspace;
 pub mod events;
 pub mod health;
+pub mod http_serve;
 pub mod ibd_eta;
 pub mod index;
 pub mod memstat;

@@ -901,6 +901,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("esplorarequesttimeout", esplora_request_timeout),
         restart!("esploramaxconns", esplora_max_conns),
         restart!("esplorasseconns", esplora_sse_max_conns),
+        restart!("esploramaxsockets", esplora_max_sockets),
         restart!("esploraauth", esplora_auth),
         restart!("esploraauthbearer", esplora_auth_bearer),
         restart!("esploracookiefile", esplora_cookie_file),
@@ -1013,6 +1014,7 @@ fn field_specs() -> Vec<FieldSpec> {
         // Listener caps are bound at WsStreamServer construction (startup), so a
         // change takes effect on restart.
         restart!("streamwsmaxconns", streamws_max_conns),
+        restart!("streamwsmaxsockets", streamws_max_sockets),
         restart!("streamwsmaxsubscriptions", streamws_max_subscriptions),
         restart!("streamwsmaxmessagebytes", streamws_max_message_bytes),
         // The matcher captures this cap when spawned at startup, so a change

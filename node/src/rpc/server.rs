@@ -11,6 +11,7 @@ use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
+use crate::http_serve::serve_http_connection;
 use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
 
@@ -4930,80 +4931,6 @@ pub async fn spawn_plain_surface(
     });
 
     Ok(server_handle)
-}
-
-/// Serve a single HTTP connection under an optional per-request timeout.
-///
-/// This is the plain-HTTP equivalent of jsonrpsee's
-/// [`serve_with_graceful_shutdown`], with one addition: when
-/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1 builder is
-/// configured with a matching `header_read_timeout` (plus the required
-/// timer), so a client that opens a TCP connection but never completes a
-/// request head — including the head of the *next* request on an idle
-/// keep-alive connection — gets disconnected rather than holding a connection
-/// slot forever. HTTP/2 gets the same budget as a keep-alive ping deadline.
-///
-/// The other half of Bitcoin Core's `-rpcservertimeout` is the request body,
-/// which hyper cannot time out; that budget is applied where satd reads the
-/// body, in [`crate::rpc::compat::JsonRpcCompatLayer`].
-async fn serve_http_connection<S, B, I>(
-    io: I,
-    service: S,
-    stopped: impl std::future::Future<Output = ()>,
-    header_read_timeout: Option<Duration>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    // Generic over the transport so the TLS surface gets the same timeouts
-    // as the plain one. It used to be `TcpStream`-only, which is why
-    // `spawn_tls_surface` fell back to jsonrpsee's helper — and so ignored
-    // `-rpcservertimeout` entirely.
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    S: tower::Service<
-            jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
-            Response = jsonrpsee::server::HttpResponse<B>,
-            Error = tower::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    S::Future: Send,
-    B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
-    B::Error: Into<tower::BoxError>,
-{
-    let service = hyper_util::service::TowerToHyperService::new(service);
-    let io = hyper_util::rt::TokioIo::new(io);
-
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    if let Some(timeout) = header_read_timeout {
-        // hyper's timer is armed each time a request head is awaited, so this
-        // covers both the first head and the idle gap before the next request
-        // on a keep-alive connection. It stops once the head is complete: the
-        // body phase is bounded in the compat layer instead, because that is
-        // where satd reads the body and hyper offers no body-read timeout.
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(timeout)
-            // A keep-alive connection that goes quiet is closed on the same
-            // budget, which is what an operator setting this expects.
-            .keep_alive(true);
-        builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(Some(timeout))
-            .keep_alive_timeout(timeout);
-    }
-    let conn = builder.serve_connection_with_upgrades(io, service);
-
-    tokio::pin!(stopped, conn);
-
-    tokio::select! {
-        result = &mut conn => result,
-        () = stopped => {
-            conn.as_mut().graceful_shutdown();
-            conn.await
-        }
-    }
 }
 
 /// Core's `getblocktemplate` long poll: hold the call until the tip moves

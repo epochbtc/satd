@@ -62,13 +62,20 @@ value cannot panic satd at boot.
 | Read-only JSON-RPC | `-rpcreadonlythreads`, `-rpcreadonlyworkqueue` | inherit main | HTTP 429 + `Retry-After` |
 | events gRPC | `-eventsgrpcmaxconns`, `-eventsgrpcmaxsubscriptions` | 64 / 256 | gRPC `RESOURCE_EXHAUSTED` |
 | streaming WS/SSE | `-streamwsmaxconns`, `-streamwsmaxsubscriptions`, `-streamwsmaxmessagebytes` | 256 / 256 / 262144 | connection refused / 429 |
+| streaming WS/SSE sockets | `-streamwsmaxsockets` | 1024 | connection dropped at accept (TCP reset) |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP 429 |
+| Esplora sockets (plain + TLS) | `-esploramaxsockets` | 1024 | connection dropped at accept (TCP reset) |
 | Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
 | JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection dropped at accept (TCP reset) |
 
-The JSON-RPC socket cap counts every open connection on a listener, idle
-keep-alive connections included, and is taken at accept, before
-authentication. `-rpcservertimeout` (default 30 s) closes a connection that
+A socket cap counts every open connection on a listener, idle keep-alive
+connections included, and is taken at accept, before authentication; the
+per-request caps above bound work in flight and never see a socket that
+sends nothing. Esplora and streamws close a keep-alive connection that idles
+for longer than `-esplorarequesttimeout` (30 s by default) and 30 s
+respectively, so an idle client cannot hold a slot; an open SSE or
+WebSocket stream is not idle in that sense. For JSON-RPC the same role is
+played by `-rpcservertimeout` (default 30 s), which closes a connection that
 sits idle between requests and returns its slot; with `-rpcservertimeout=0`
 an idle connection holds its slot until the client closes it, so 100 idle
 connections from any client that can reach the listener lock out every other
