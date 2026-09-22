@@ -333,7 +333,8 @@ impl StratumServer {
             return Err(StratumServerError::V2Unavailable);
         }
         let allow = ClientAllowList::new(config.mtls_client_allow.iter().cloned());
-        let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
+        let semaphore =
+            Arc::new(Semaphore::new(crate::http_serve::clamp_cap(config.max_conns).max(1)));
         let (work, _) = watch::channel(None);
         let listeners = Listeners {
             v1: listener.local_addr().ok(),

@@ -66,13 +66,27 @@ pub struct SocketCap {
 }
 
 impl SocketCap {
-    /// `max` open sockets; `0` is unlimited.
+    /// `max` open sockets, clamped to [`CAP_CEILING`]; `0` is unlimited.
     pub fn new(max: usize) -> Self {
+        let max = clamp_cap(max);
         Self {
             permits: Arc::new(Semaphore::new(if max == 0 { Semaphore::MAX_PERMITS } else { max })),
             max,
         }
     }
+}
+
+/// The largest connection cap satd builds. tokio's `Semaphore::new` panics
+/// above `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`), and every cap option
+/// accepts any `usize`, so an unclamped typo would panic satd at boot. No
+/// host holds this many sockets open on one surface, so the ceiling only
+/// catches mistakes.
+pub const CAP_CEILING: usize = 100_000;
+
+/// `max` clamped to [`CAP_CEILING`]. `0` stays `0`, so a surface that reads
+/// `0` as unlimited still does.
+pub fn clamp_cap(max: usize) -> usize {
+    max.min(CAP_CEILING)
 }
 
 /// A listener's socket cap and idle budget. Cloning shares the socket cap
@@ -519,6 +533,17 @@ mod tests {
     /// Listeners handed clones of one `ListenerLimits` share its socket cap
     /// -- Esplora's plain and TLS listeners are held to one
     /// `-esploramaxsockets` between them, not one each.
+    #[test]
+    fn an_oversized_socket_cap_is_clamped_not_panicking() {
+        // Every cap option accepts any usize; `Semaphore::new` panics above
+        // `usize::MAX >> 3`, so a typo must be clamped before it gets there.
+        let cap = SocketCap::new(usize::MAX);
+        assert_eq!(cap.max, CAP_CEILING);
+        assert_eq!(cap.permits.available_permits(), CAP_CEILING);
+        assert_eq!(clamp_cap(0), 0, "0 stays unlimited");
+        assert_eq!(clamp_cap(7), 7);
+    }
+
     #[tokio::test]
     async fn cloned_limits_share_one_socket_cap() {
         let limits = ListenerLimits {

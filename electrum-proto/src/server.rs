@@ -172,7 +172,8 @@ impl ElectrumServer {
 
         let allow = tls_config::ClientAllowList::new(config.mtls_client_allow.iter().cloned());
 
-        let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
+        let semaphore =
+            Arc::new(Semaphore::new(node::http_serve::clamp_cap(config.max_conns).max(1)));
         Ok(Self {
             listener,
             tls,

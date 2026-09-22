@@ -186,7 +186,7 @@ impl WsStreamServer {
                 conn_sem: Arc::new(Semaphore::new(if limits.max_conns == 0 {
                     Semaphore::MAX_PERMITS
                 } else {
-                    limits.max_conns
+                    node::http_serve::clamp_cap(limits.max_conns)
                 })),
                 max_subscriptions: limits.max_subscriptions,
                 // 0 ⇒ unlimited, mirroring the other two caps. Passing 0 straight

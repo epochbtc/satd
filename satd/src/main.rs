@@ -3104,7 +3104,9 @@ async fn main() {
                 s.add_permits(usize::MAX >> 8);
                 s
             } else {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(config.esplora_sse_max_conns))
+                std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(
+                    config.esplora_sse_max_conns,
+                )))
             };
             let state = esplora_handlers::EsploraState {
                 chain: chain_state.clone(),

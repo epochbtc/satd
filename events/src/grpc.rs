@@ -378,7 +378,7 @@ impl EventSink for GrpcEventSink {
         // owned permit released when the connection (and thus the wrapping
         // `PermittedTcp`) is dropped. `0` disables the cap.
         let conn_sem = if self.limits.max_conns > 0 {
-            Some(Arc::new(Semaphore::new(self.limits.max_conns)))
+            Some(Arc::new(Semaphore::new(node::http_serve::clamp_cap(self.limits.max_conns))))
         } else {
             None
         };
