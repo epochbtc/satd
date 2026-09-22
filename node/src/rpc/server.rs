@@ -4446,6 +4446,11 @@ async fn spawn_tls_surface(
         cfg.max_connections.max(1),
     ));
     let max_connections = cfg.max_connections;
+    // One warning budget per listener, not per function: this function
+    // serves several binds, and a `static` here would let a flood on one
+    // silence the others' reports.
+    let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+    let denied = WarnBudget::new(5, Duration::from_secs(60));
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -4472,8 +4477,7 @@ async fn spawn_tls_surface(
             // configured allowlist denies here — see
             // `allowip::tls_listener_denies`.
             if crate::rpc::allowip::tls_listener_denies(peer.ip(), &allowip) {
-                static DENIED: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
-                if let Some(suppressed) = DENIED.tick() {
+                if let Some(suppressed) = denied.tick() {
                     tracing::warn!(
                         peer = %peer,
                         suppressed,
@@ -4491,8 +4495,7 @@ async fn spawn_tls_surface(
             let permit = match conn_cap.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
-                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                    if let Some(suppressed) = at_capacity.tick() {
                         tracing::warn!(
                             peer = %peer,
                             suppressed,
@@ -4737,6 +4740,11 @@ pub async fn spawn_plain_surface(
     // accept and held for the connection's lifetime.
     let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
 
+    // One warning budget per listener, not per function: this function
+    // serves several binds, and a `static` here would let a flood on one
+    // silence the others' reports.
+    let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+    let denied = WarnBudget::new(5, Duration::from_secs(60));
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -4760,8 +4768,7 @@ pub async fn spawn_plain_surface(
             let permit = match conn_cap.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
-                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                    if let Some(suppressed) = at_capacity.tick() {
                         tracing::warn!(
                             peer = %peer,
                             suppressed,
@@ -4779,15 +4786,14 @@ pub async fn spawn_plain_surface(
             // allowed (keeps sat-cli working); otherwise the IP must fall
             // inside a configured CIDR.
             let allowed = crate::rpc::allowip::is_allowed(peer.ip(), &allowip);
-            if !allowed {
-                static DENIED: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
-                if let Some(suppressed) = DENIED.tick() {
-                    tracing::warn!(
-                        peer = %peer,
-                        suppressed,
-                        "RPC connection rejected: source IP not permitted by -rpcallowip",
-                    );
-                }
+            if !allowed
+                && let Some(suppressed) = denied.tick()
+            {
+                tracing::warn!(
+                    peer = %peer,
+                    suppressed,
+                    "RPC connection rejected: source IP not permitted by -rpcallowip",
+                );
             }
 
             let rpc_svc = rpc_svc.clone();

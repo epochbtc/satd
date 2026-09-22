@@ -9,9 +9,15 @@
 //! first `burst` events in each window are logged, the rest are counted,
 //! and the first line of the next window carries the count it swallowed.
 //!
+//! A budget belongs to one listener. A `static` in the accept function is
+//! only that when the function serves a single listener: one that serves
+//! several binds (the JSON-RPC accept loops) must own an instance per bind,
+//! or a flood on one silences the others' reports.
+//!
 //! ```ignore
-//! static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
-//! if let Some(suppressed) = AT_CAPACITY.tick() {
+//! let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+//! // ... in the accept loop:
+//! if let Some(suppressed) = at_capacity.tick() {
 //!     tracing::warn!(peer = %peer, suppressed, "at-capacity rejection");
 //! }
 //! ```
