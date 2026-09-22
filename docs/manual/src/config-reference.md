@@ -400,7 +400,7 @@ Core ZMQ wire-format compatible.)
 | `streamwsallowremote` | false | restart | satd | Permit `streamws` on a non-loopback address (requires `streamwsauth`). |
 | `streamwsauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on `streamws` (requires `authfile`). |
 | `streamwsmaxconns` | 256 | restart | satd | Hard cap on simultaneously-open `streamws` connections. |
-| `streamwsmaxsockets` | 1024 | restart | satd | Hard cap on open sockets on the `streamws` listener, counted at accept before any request is parsed; over the cap a socket is dropped. `streamwsmaxconns` is taken inside the handlers and never sees a socket that sends nothing. `0` disables. A keep-alive connection idle for 30 s between requests is closed (an open `/ws` or `/sse` stream is not idle). |
+| `streamwsmaxsockets` | 1024 | restart | satd | Hard cap on open sockets on the `streamws` listener, counted at accept before any request is parsed and held until the socket closes, so an open WebSocket keeps its slot; over the cap a socket is dropped. `streamwsmaxconns` is taken inside the handlers and never sees a socket that sends nothing. `0` disables. A keep-alive connection idle for 30 s between requests is closed (an open `/ws` or `/sse` stream is not idle). |
 | `streamwsmaxsubscriptions` | 256 | restart | satd | Hard cap on watch-set entries per `streamws` connection. |
 | `streamwsmaxmessagebytes` | 262144 | restart | satd | Cap on a single inbound WebSocket message/frame in bytes. |
 | `streammaxresyncblocks` | 10000 (`0` disables) | restart | satd | Max blocks the watch matcher re-scans in one catch-up after lagging. |

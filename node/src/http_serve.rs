@@ -54,11 +54,33 @@ pub enum Transport {
     Tls(TlsTransport),
 }
 
-/// A listener's socket cap and idle budget.
-#[derive(Clone, Copy, Debug)]
+/// A cap on open sockets, counted at accept.
+///
+/// Cloning shares the cap: listeners handed clones of one `SocketCap` draw
+/// from the same pool, which is how Esplora's plain and TLS listeners are held
+/// to one `-esploramaxsockets` between them rather than one each.
+#[derive(Clone, Debug)]
+pub struct SocketCap {
+    permits: Arc<Semaphore>,
+    max: usize,
+}
+
+impl SocketCap {
+    /// `max` open sockets; `0` is unlimited.
+    pub fn new(max: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(if max == 0 { Semaphore::MAX_PERMITS } else { max })),
+            max,
+        }
+    }
+}
+
+/// A listener's socket cap and idle budget. Cloning shares the socket cap
+/// (see [`SocketCap`]).
+#[derive(Clone, Debug)]
 pub struct ListenerLimits {
-    /// Open sockets, counted at accept. `0` is unlimited.
-    pub max_sockets: usize,
+    /// Open sockets, counted at accept.
+    pub sockets: SocketCap,
     /// How long a keep-alive connection may sit between requests before it
     /// is closed. `None` leaves an idle connection open until the client
     /// closes it, which with a cap means an idle client keeps its slot.
@@ -89,11 +111,7 @@ pub async fn serve_http_listener<S, B>(
     B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
     B::Error: Into<tower::BoxError>,
 {
-    let cap = Arc::new(Semaphore::new(if limits.max_sockets == 0 {
-        Semaphore::MAX_PERMITS
-    } else {
-        limits.max_sockets
-    }));
+    let cap = limits.sockets.permits.clone();
     let transport = Arc::new(transport);
     // One budget per listener, so a flood on one surface does not silence
     // another's report.
@@ -124,7 +142,7 @@ pub async fn serve_http_listener<S, B>(
                         peer = %peer,
                         suppressed,
                         "at-capacity rejection ({} max sockets)",
-                        limits.max_sockets,
+                        limits.sockets.max,
                     );
                 }
                 drop(stream);
@@ -134,9 +152,10 @@ pub async fn serve_http_listener<S, B>(
         let service = service.clone();
         let transport = transport.clone();
         let mut conn_shutdown = shutdown.clone();
+        // The permit rides with the socket (see `Permitted`), through the
+        // handshake, the HTTP connection, and any upgrade that outlives it.
+        let stream = Permitted::new(stream, permit);
         tokio::spawn(async move {
-            // Held until this task ends, which is when the connection ends.
-            let _permit = permit;
             let stopped = async move {
                 let _ = conn_shutdown.changed().await;
             };
@@ -171,9 +190,9 @@ pub async fn serve_http_listener<S, B>(
 async fn tls_accept(
     surface: &'static str,
     tls: &TlsTransport,
-    stream: TcpStream,
+    stream: Permitted<TcpStream>,
     peer: std::net::SocketAddr,
-) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+) -> Option<tokio_rustls::server::TlsStream<Permitted<TcpStream>>> {
     let tls_stream =
         match tokio::time::timeout(tls.handshake_timeout, tls.acceptor.accept(stream)).await {
             Ok(Ok(s)) => s,
@@ -293,6 +312,75 @@ where
 }
 
 
+/// A socket that carries its listener's connection-cap permit.
+///
+/// The permit has to live exactly as long as the socket, and the only thing
+/// that does is the IO object itself. A task that holds the permit while it
+/// awaits hyper's connection future is not enough: that future completes when
+/// hyper hands the socket to an HTTP upgrade (a WebSocket), and the socket
+/// lives on inside `hyper::upgrade::Upgraded`. Hyper moves the IO into
+/// `Upgraded`, so a permit stored here goes with it and returns to the pool
+/// when the upgraded socket is finally dropped.
+pub struct Permitted<I> {
+    inner: I,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<I> Permitted<I> {
+    pub fn new(inner: I, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            _permit: permit,
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Permitted<I> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Permitted<I> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 /// A transport whose first byte must arrive within a deadline; after it
 /// has, reads are passed through untouched. Writes always pass through.
 struct FirstByteDeadline<I> {
@@ -400,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn socket_cap_counts_idle_keepalive_connections() {
         let (addr, sd_tx) = start(ListenerLimits {
-            max_sockets: 2,
+            sockets: SocketCap::new(2),
             idle_timeout: None,
         })
         .await;
@@ -428,13 +516,48 @@ mod tests {
         let _ = sd_tx.send(true);
     }
 
+    /// Listeners handed clones of one `ListenerLimits` share its socket cap
+    /// -- Esplora's plain and TLS listeners are held to one
+    /// `-esploramaxsockets` between them, not one each.
+    #[tokio::test]
+    async fn cloned_limits_share_one_socket_cap() {
+        let limits = ListenerLimits {
+            sockets: SocketCap::new(1),
+            idle_timeout: None,
+        };
+        let (a, sd_a) = start(limits.clone()).await;
+        let (b, sd_b) = start(limits).await;
+
+        let mut on_a = TcpStream::connect(a).await.unwrap();
+        assert!(ping(&mut on_a).await.unwrap().starts_with("HTTP/1.1 200"));
+        let mut on_b = TcpStream::connect(b).await.unwrap();
+        assert!(
+            ping(&mut on_b).await.is_none(),
+            "the one shared slot is held on the other listener"
+        );
+
+        drop(on_a);
+        let mut admitted = false;
+        for _ in 0..100 {
+            let mut c = TcpStream::connect(b).await.unwrap();
+            if ping(&mut c).await.is_some_and(|r| r.starts_with("HTTP/1.1 200")) {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "a slot freed on one listener serves the other");
+        let _ = sd_a.send(true);
+        let _ = sd_b.send(true);
+    }
+
     /// A keep-alive connection that sends nothing for `idle_timeout` is
     /// closed by the server, which is what frees a slot held by a client
     /// that never hangs up.
     #[tokio::test]
     async fn idle_keepalive_connection_is_closed_after_the_timeout() {
         let (addr, sd_tx) = start(ListenerLimits {
-            max_sockets: 0,
+            sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_millis(200)),
         })
         .await;
@@ -450,7 +573,7 @@ mod tests {
 
         // Without a timeout the same connection stays open.
         let (addr, sd_tx2) = start(ListenerLimits {
-            max_sockets: 0,
+            sockets: SocketCap::new(0),
             idle_timeout: None,
         })
         .await;
@@ -467,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn silent_connection_is_closed_after_the_timeout() {
         let (addr, sd_tx) = start(ListenerLimits {
-            max_sockets: 0,
+            sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_millis(200)),
         })
         .await;
@@ -478,6 +601,106 @@ mod tests {
             Ok(Ok(0)) | Ok(Err(_))
         );
         assert!(closed, "a silent connection must be closed after the timeout");
+        let _ = sd_tx.send(true);
+    }
+
+    /// A router whose `/upgrade` answers 101 and then streams ten ticks, 100
+    /// ms apart, on the upgraded socket while keeping a read outstanding, as a
+    /// WebSocket server does.
+    fn upgrade_router() -> Router {
+        Router::new().route(
+            "/upgrade",
+            get(|mut req: axum::extract::Request| async move {
+                let on_upgrade = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    let mut io = hyper_util::rt::TokioIo::new(on_upgrade.await.expect("upgrade"));
+                    let mut ticks = ticker(10, Duration::from_millis(100));
+                    let mut buf = [0u8; 64];
+                    // Keep a read outstanding the whole time, as a WebSocket
+                    // server does to receive frames and pongs: a deadline
+                    // still armed on the upgraded socket would fire here and
+                    // end the connection.
+                    loop {
+                        tokio::select! {
+                            t = ticks.recv() => match t {
+                                Some(t) => if io.write_all(&t).await.is_err() { return },
+                                None => return,
+                            },
+                            r = io.read(&mut buf) => if !matches!(r, Ok(n) if n > 0) { return },
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .status(101)
+                    .header("connection", "upgrade")
+                    .header("upgrade", "satd-test")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        )
+    }
+
+    async fn upgrade(c: &mut TcpStream) {
+        c.write_all(
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: satd-test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The socket cap counts an upgraded connection for as long as the
+    /// socket lives. Hyper's connection future completes when it hands the
+    /// socket to the upgrade, so a permit tied to that future would go back
+    /// to the pool while the WebSocket stays open -- and `-streamwsmaxsockets`
+    /// would bound only sockets that have not upgraded yet.
+    #[tokio::test]
+    async fn socket_cap_counts_upgraded_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            upgrade_router(),
+            ListenerLimits {
+                sockets: SocketCap::new(1),
+                idle_timeout: None,
+            },
+            sd_rx,
+        ));
+
+        let mut ws = TcpStream::connect(addr).await.unwrap();
+        upgrade(&mut ws).await;
+        // Two ticks: the upgrade has completed and the socket is live.
+        read_ticks(&mut ws, 2).await;
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        upgrade(&mut c).await;
+        let mut buf = [0u8; 64];
+        let refused = matches!(
+            tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(refused, "the upgraded socket must still hold the only slot");
+
+        // The upgraded socket closing returns its slot.
+        drop(ws);
+        let mut admitted = false;
+        for _ in 0..100 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            upgrade(&mut c).await;
+            let mut buf = [0u8; 64];
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await,
+                Ok(Ok(n)) if n > 0
+            ) {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "closing the upgraded socket must release its slot");
         let _ = sd_tx.send(true);
     }
 
@@ -536,36 +759,7 @@ mod tests {
     async fn an_upgraded_connection_the_client_only_reads_is_not_timed_out() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = Router::new().route(
-            "/upgrade",
-            get(|mut req: axum::extract::Request| async move {
-                let on_upgrade = hyper::upgrade::on(&mut req);
-                tokio::spawn(async move {
-                    let mut io = hyper_util::rt::TokioIo::new(on_upgrade.await.expect("upgrade"));
-                    let mut ticks = ticker(10, Duration::from_millis(100));
-                    let mut buf = [0u8; 64];
-                    // Keep a read outstanding the whole time, as a WebSocket
-                    // server does to receive frames and pongs: a deadline
-                    // still armed on the upgraded socket would fire here and
-                    // end the connection.
-                    loop {
-                        tokio::select! {
-                            t = ticks.recv() => match t {
-                                Some(t) => if io.write_all(&t).await.is_err() { return },
-                                None => return,
-                            },
-                            r = io.read(&mut buf) => if !matches!(r, Ok(n) if n > 0) { return },
-                        }
-                    }
-                });
-                axum::response::Response::builder()
-                    .status(101)
-                    .header("connection", "upgrade")
-                    .header("upgrade", "satd-test")
-                    .body(axum::body::Body::empty())
-                    .unwrap()
-            }),
-        );
+        let router = upgrade_router();
         let (sd_tx, sd_rx) = watch::channel(false);
         tokio::spawn(serve_http_listener(
             "test",
@@ -573,18 +767,14 @@ mod tests {
             Transport::Plain,
             router,
             ListenerLimits {
-                max_sockets: 0,
+                sockets: SocketCap::new(0),
                 idle_timeout: Some(Duration::from_millis(200)),
             },
             sd_rx,
         ));
 
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(
-            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: satd-test\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        upgrade(&mut c).await;
         // Ten ticks 100 ms apart: a second of server-only traffic against a
         // 200 ms budget.
         let got = read_ticks(&mut c, 10).await;
@@ -612,7 +802,7 @@ mod tests {
             Transport::Plain,
             router,
             ListenerLimits {
-                max_sockets: 0,
+                sockets: SocketCap::new(0),
                 idle_timeout: Some(Duration::from_millis(200)),
             },
             sd_rx,
@@ -629,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_idle_connections() {
         let (addr, sd_tx) = start(ListenerLimits {
-            max_sockets: 0,
+            sockets: SocketCap::new(0),
             idle_timeout: None,
         })
         .await;

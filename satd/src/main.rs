@@ -3229,11 +3229,12 @@ async fn main() {
                 "Esplora REST listening"
             );
             listener_status.set_esplora(reported_bind);
-            // Both listeners cap open sockets at `--esploramaxsockets` and
-            // close a keep-alive connection that idles for longer than
-            // `--esplorarequesttimeout` (0 leaves idle connections open).
+            // One `--esploramaxsockets` cap shared by both listeners: the
+            // limits are cloned into each, and a clone draws on the same
+            // pool. Both close a keep-alive connection that idles for longer
+            // than `--esplorarequesttimeout` (0 leaves idle connections open).
             let esplora_limits = node::http_serve::ListenerLimits {
-                max_sockets: config.esplora_max_sockets,
+                sockets: node::http_serve::SocketCap::new(config.esplora_max_sockets),
                 idle_timeout: (config.esplora_request_timeout > 0)
                     .then(|| std::time::Duration::from_secs(config.esplora_request_timeout)),
             };
@@ -3243,7 +3244,7 @@ async fn main() {
             api_handle.spawn(esplora_handlers::serve_plain(
                 listener,
                 router.clone(),
-                esplora_limits,
+                esplora_limits.clone(),
                 shutdown_rx.clone(),
             ));
             if let Some((_tls_bind, tls_listener, acceptor)) = tls_setup {

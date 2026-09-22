@@ -65,10 +65,12 @@ mod tests {
     use std::io::Write;
     use tls_config::{ClientAuthPolicy, build_acceptor};
 
-    const NO_LIMITS: ListenerLimits = ListenerLimits {
-        max_sockets: 0,
-        idle_timeout: None,
-    };
+    fn no_limits() -> ListenerLimits {
+        ListenerLimits {
+            sockets: node::http_serve::SocketCap::new(0),
+            idle_timeout: None,
+        }
+    }
 
     fn write_pem(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);
@@ -105,7 +107,7 @@ mod tests {
             false,
             tls_config::ClientAllowList::default(),
             ping_router(),
-            NO_LIMITS,
+            no_limits(),
             sd_rx,
         ));
 
@@ -150,7 +152,7 @@ mod tests {
             false,
             tls_config::ClientAllowList::default(),
             ping_router(),
-            NO_LIMITS,
+            no_limits(),
             sd_rx,
         ));
 
@@ -253,7 +255,7 @@ mod tests {
             true,
             tls_config::ClientAllowList::new(allow),
             ping_router(),
-            NO_LIMITS,
+            no_limits(),
             sd_rx,
         ));
         // The tempdir may go; the acceptor has read the PEM files already.
@@ -369,7 +371,7 @@ mod tests {
             tls_config::ClientAllowList::default(),
             ping_router(),
             ListenerLimits {
-                max_sockets: 2,
+                sockets: node::http_serve::SocketCap::new(2),
                 idle_timeout: None,
             },
             sd_rx,

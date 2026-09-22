@@ -69,7 +69,8 @@ value cannot panic satd at boot.
 | JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection dropped at accept (TCP reset) |
 
 A socket cap counts every open connection on a listener, idle keep-alive
-connections included, and is taken at accept, before authentication; the
+connections and open WebSockets included, and is taken at accept, before
+authentication; the
 per-request caps above bound work in flight and never see a socket that
 sends nothing. Esplora and streamws close a keep-alive connection that idles
 for longer than `-esplorarequesttimeout` (30 s by default) and 30 s

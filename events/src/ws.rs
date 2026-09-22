@@ -228,7 +228,7 @@ impl WsStreamServer {
             node::http_serve::Transport::Plain,
             app,
             node::http_serve::ListenerLimits {
-                max_sockets: self.max_sockets,
+                sockets: node::http_serve::SocketCap::new(self.max_sockets),
                 idle_timeout: Some(STREAMWS_IDLE_TIMEOUT),
             },
             shutdown,
