@@ -213,6 +213,7 @@ fn kind_name(kind: StatusKind) -> String {
         StatusKind::MempoolCongested => "mempool_congested".into(),
         StatusKind::PeerFloor => "peer_floor".into(),
         StatusKind::DeepReorg => "deep_reorg".into(),
+        StatusKind::TemplateInvalid => "template_invalid".into(),
         // A newer node reporting a condition this build predates. The enum is
         // non-exhaustive, so this arm also absorbs variants added later.
         StatusKind::Unknown(v) => format!("unknown({v})"),

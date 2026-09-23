@@ -31,6 +31,8 @@ pub fn generate_blocks(ctx: &McpContext, count: u32, address: &str) -> String {
 
 /// Get a block template for mining.
 pub fn get_block_template(ctx: &McpContext) -> String {
-    let result = rpc::get_block_template(&ctx.chain_state, &ctx.mempool);
-    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    match rpc::get_block_template(&ctx.chain_state, &ctx.mempool) {
+        Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+        Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
+    }
 }

@@ -594,6 +594,23 @@ async fn run_detectors(
 /// An `edge` event pages but records nothing — see the note at the call site.
 /// The registry is for conditions that are true *now* and that something will
 /// later clear; a deep reorg is history, and history has its own log.
+/// Raise or clear a standing condition that is detected outside the detector
+/// task — `template_invalid`, which the template check itself sees. Goes out
+/// exactly as a detector's would: a standing warning (`getwarnings`,
+/// `-alertnotify`), the `satd_alert_active` flag, and the `status` event for
+/// webhooks and stream subscribers. The caller deduplicates; this emits.
+pub fn report_external(
+    health: Option<&HealthState>,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    event: StatusEvent,
+) {
+    if let Some(health) = health {
+        health.set_active(event.kind, event.state == StatusState::Raised);
+    }
+    emit(warnings, publisher, event);
+}
+
 fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent) {
     let id = event.kind.warning_id();
     match event.state {

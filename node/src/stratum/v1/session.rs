@@ -663,7 +663,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::stratum::config::StratumConfig;
     use crate::stratum::miner::{MinerTally, UNESTIMATED_MINER_IDLE_TIMEOUT};
@@ -673,7 +673,7 @@ mod tests {
     const ADDRESS: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     const DIFFICULTY: u64 = 1_000;
 
-    fn config() -> StratumConfig {
+    pub(crate) fn config() -> StratumConfig {
         StratumConfig {
             network: bitcoin::Network::Regtest,
             bind: "127.0.0.1:0".parse().unwrap(),

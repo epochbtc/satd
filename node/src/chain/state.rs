@@ -407,6 +407,9 @@ pub struct ChainState {
     /// Active node warnings (connect failures, storage issues, etc.).
     /// Always present — warnings are a core operational surface.
     warnings: std::sync::Arc<crate::warnings::NodeWarnings>,
+    /// Block-template validity checks: counts and the `template_invalid`
+    /// alert (`mining::validity`).
+    template_validity: std::sync::Arc<crate::mining::validity::TemplateValidity>,
     /// Mempool handle for reorg re-add. Set by `set_mempool` after
     /// construction to avoid a circular Arc cycle (mempool needs
     /// chain_state for UTXO lookups). When unset (test backends),
@@ -672,6 +675,25 @@ impl Drop for ChainMutationGuard<'_> {
 /// generous enough that only a chain advancing continuously exhausts it.
 const COHERENT_READ_ATTEMPTS: usize = 8;
 
+/// One coherent-read attempt's outcome.
+enum Attempt<T> {
+    Read(T),
+    /// The chain moved during the read; the value was discarded.
+    Moved,
+    /// A mutation stayed in flight past the wait budget.
+    Stuck,
+}
+
+/// What a block-template check found. See [`ChainState::check_template_block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateVerdict {
+    Valid,
+    /// The block would be rejected, with Core's reject reason.
+    Invalid(String),
+    /// The chain moved during the check, so it says nothing either way.
+    Superseded,
+}
+
 /// How long [`ChainState::coherent_read`] waits for an in-flight mutation to
 /// finish before giving up.
 ///
@@ -828,6 +850,7 @@ impl ChainState {
                     filter_index,
                     reorg_log: std::sync::OnceLock::new(),
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+                    template_validity: Default::default(),
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
                     chain_gen: AtomicU64::new(0),
@@ -942,6 +965,7 @@ impl ChainState {
             filter_index,
             reorg_log: std::sync::OnceLock::new(),
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+            template_validity: Default::default(),
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
             chain_gen: AtomicU64::new(0),
@@ -1685,6 +1709,11 @@ impl ChainState {
 
     /// Access the shared warnings surface. Always present; use to
     /// record or clear operational issues from anywhere in the node.
+    /// Block-template validity checks (`mining::validity`).
+    pub fn template_validity(&self) -> &crate::mining::validity::TemplateValidity {
+        &self.template_validity
+    }
+
     pub fn warnings(&self) -> &std::sync::Arc<crate::warnings::NodeWarnings> {
         &self.warnings
     }
@@ -1791,6 +1820,27 @@ impl ChainState {
     /// tip is unchanged by construction and so proves nothing.
     pub fn coherent_read<T>(&self, read: impl Fn() -> T) -> Option<T> {
         for _ in 0..COHERENT_READ_ATTEMPTS {
+            match self.coherent_attempt(&read) {
+                Attempt::Read(value) => return Some(value),
+                Attempt::Moved => continue,
+                Attempt::Stuck => return None,
+            }
+        }
+        None
+    }
+
+    /// One attempt of [`coherent_read`](Self::coherent_read): `None` when the
+    /// chain moved during the read, rather than trying again. For a read too
+    /// expensive to repeat, whose caller would rather discard a stale answer.
+    pub fn coherent_read_once<T>(&self, read: impl Fn() -> T) -> Option<T> {
+        match self.coherent_attempt(&read) {
+            Attempt::Read(value) => Some(value),
+            Attempt::Moved | Attempt::Stuck => None,
+        }
+    }
+
+    fn coherent_attempt<T>(&self, read: &impl Fn() -> T) -> Attempt<T> {
+        {
             // Wait out any mutation already in flight before starting a read.
             //
             // The guard is taken before the store commit, so this window is as
@@ -1810,7 +1860,7 @@ impl ChainState {
                     // A mutator has been mid-commit for far longer than any
                     // commit should take. Report "ask again" rather than block
                     // an RPC thread on it indefinitely.
-                    return None;
+                    return Attempt::Stuck;
                 }
                 // Park, don't spin: what is being waited on is a store
                 // commit measured in milliseconds, and a yield loop burns a
@@ -1820,10 +1870,10 @@ impl ChainState {
             };
             let value = read();
             if self.chain_gen.load(Ordering::Acquire) == before {
-                return Some(value);
+                return Attempt::Read(value);
             }
         }
-        None
+        Attempt::Moved
     }
 
     /// Initial-block-download heuristic from a tip timestamp. Matches the
@@ -6297,7 +6347,52 @@ impl ChainState {
         // prevblk test and the connect, and the store this reads is the one
         // `accept_block` writes.
         let _accept_guard = self.accept_lock.lock();
+        self.block_validity_with(block, &*self.script_verifier)
+    }
 
+    /// Judge a block assembled from a block template, as `test_block_validity`
+    /// does, without taking the accept lock: the full check runs for a third
+    /// of a second on a mainnet-sized template, and holding the lock that
+    /// long would delay the next block's connection behind it.
+    ///
+    /// Coherence comes from [`coherent_read_once`](Self::coherent_read_once)
+    /// instead. A check the chain moved under — the tip, or the coins it read
+    /// — says nothing about the template, so it is [`TemplateVerdict::Superseded`],
+    /// never a failure.
+    ///
+    /// `scripts: false` runs every rule `connect_block` applies except script
+    /// execution: the verifier is the only thing `connect_block` hands
+    /// scripts to, so a no-op one skips exactly that and nothing else.
+    /// `scripts: true` uses the node's own verifier, the one block connection
+    /// uses — including a `cpp-shadow` comparison.
+    pub fn check_template_block(&self, block: &Block, scripts: bool) -> TemplateVerdict {
+        let verifier: &dyn crate::validation::script::ScriptVerifier = if scripts {
+            &*self.script_verifier
+        } else {
+            &crate::validation::script::NoopVerifier
+        };
+        match self.coherent_read_once(|| self.block_validity_with(block, verifier)) {
+            None => TemplateVerdict::Superseded,
+            Some(Ok(None)) => TemplateVerdict::Valid,
+            // The tip moved before the check started.
+            Some(Ok(Some(reason))) if reason == "inconclusive-not-best-prevblk" => TemplateVerdict::Superseded,
+            Some(Ok(Some(reason))) => TemplateVerdict::Invalid(reason),
+            // An internal error (a missing parent entry) is not a verdict on
+            // the template.
+            Some(Err(e)) => {
+                tracing::warn!(target: "mining::template", error = %e, "template check could not run");
+                TemplateVerdict::Superseded
+            }
+        }
+    }
+
+    /// The body of [`test_block_validity`](Self::test_block_validity), with
+    /// the script verifier chosen by the caller. Takes no lock.
+    fn block_validity_with(
+        &self,
+        block: &Block,
+        script_verifier: &dyn crate::validation::script::ScriptVerifier,
+    ) -> Result<Option<String>, ChainError> {
         // Core answers from the block index before validating anything
         // (`rpc/mining.cpp`, `LookupBlockIndex` ahead of `TestBlockValidity`):
         // a block it has already judged gets that judgement back rather than a
@@ -6398,7 +6493,7 @@ impl ChainState {
             height,
             parent_chainwork: &parent.chainwork,
             flat_pos: crate::storage::flatfile::FlatFilePos { file_number: 0, data_pos: 0 },
-            script_verifier: &*self.script_verifier,
+            script_verifier,
             median_time_past: mtp,
             network: self.network,
             pre_verified_txs: None,

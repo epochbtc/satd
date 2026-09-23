@@ -143,6 +143,15 @@ with `--stratum=0` exports none of these families.
 | `satd_stratum_blocks_found_total` | counter | — | Blocks found by miners that joined the active chain. |
 | `satd_stratum_hashrate_hashes_per_second` | gauge | — | Estimated hashrate of the connected miners, from the shares accepted over the last ten minutes. |
 
+### Block-template checks
+
+Every block template the node builds is checked before it is used (see
+[Stratum → Template checks](stratum.md#template-checks)).
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `satd_template_checks_total` | counter | `check` = `structural`, `full`; `result` = `valid`, `invalid`, `superseded` | Template checks by tier and result. Any `invalid` is a node bug. `superseded` means the chain moved during the check, which then says nothing either way. |
+
 There are no per-miner series. A worker name is whatever the miner sends, so a
 label on it would let a miner create series without limit; `getstratuminfo`
 lists each miner instead. A miner that stops hashing shows as
@@ -334,6 +343,7 @@ keep updating, and the node log carries every one in full.
 | `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line, or the threshold is raised above the current occupancy |
 | `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
 | `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks (default `3` on mainnet, `10` on test networks, off on regtest) | one-shot |
+| `template_invalid` | critical | a block template the node built failed its validity check — a block found on it would be rejected. This is a node bug; the log line names the reject reason and the offending transaction | a template passes again: the full check, if the full check was the one that failed |
 
 Every standing condition raises **once** on entry and clears **once** on
 recovery — you get a pair of events, not a stream of repeats — and the gap
@@ -342,6 +352,11 @@ sitting on the threshold does not flap your pager. `ibd_complete` and
 `deep_reorg` describe things that happened rather than states that persist, so
 they are one-shot: they never clear, and for the same reason they never enter
 `getwarnings` at all.
+
+`template_invalid` is raised by the template check itself, not by the detector
+poll, and has no threshold to configure. It is evaluated whenever a template is
+built — by `getblocktemplate`, the `generate` RPCs or the Stratum server — so
+after a restart it stands again only once a template fails again.
 
 Thresholds are configured with the `alert*` keys in the
 [Configuration Reference](config-reference.md#health-alerts); all of them are

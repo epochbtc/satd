@@ -1698,7 +1698,8 @@ pub async fn start(
         if let Some(lpval) = request.as_ref().and_then(|r| r.get("longpollid")) {
             wait_for_longpoll(&ctx, lpval).await?;
         }
-        Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
+        mining::get_block_template(&ctx.chain_state, &ctx.mempool)
+            .map_err(|(code, message)| ErrorObjectOwned::owned(code, message, None::<()>))
     })?;
 
     module.register_method("getmininginfo", |_params, ctx, _extensions| {

@@ -91,10 +91,13 @@ const (
 	// StatusKindDeepReorg - a reorg at least the configured depth landed
 	// (one-shot).
 	StatusKindDeepReorg StatusKind = 6
+	// StatusKindTemplateInvalid - a block template the node built failed its
+	// own validity check.
+	StatusKindTemplateInvalid StatusKind = 7
 )
 
 // Known reports whether this build recognizes the kind.
-func (k StatusKind) Known() bool { return k >= StatusKindUnspecified && k <= StatusKindDeepReorg }
+func (k StatusKind) Known() bool { return k >= StatusKindUnspecified && k <= StatusKindTemplateInvalid }
 
 func (k StatusKind) String() string {
 	switch k {
@@ -112,6 +115,8 @@ func (k StatusKind) String() string {
 		return "peer_floor"
 	case StatusKindDeepReorg:
 		return "deep_reorg"
+	case StatusKindTemplateInvalid:
+		return "template_invalid"
 	default:
 		return "unknown(" + strconv.FormatInt(int64(k), 10) + ")"
 	}

@@ -56,6 +56,11 @@ pub enum StatusKind {
     PeerFloor,
     /// A reorg at least `alertreorgdepth` blocks deep was applied (edge).
     DeepReorg,
+    /// A block template this node built failed its own validity check: a
+    /// miner working it would have found a block the node rejects. Raised by
+    /// the template check rather than the detector task; clears when a
+    /// template validates again.
+    TemplateInvalid,
 }
 
 impl StatusKind {
@@ -70,6 +75,7 @@ impl StatusKind {
             StatusKind::MempoolCongested => "mempool_congested",
             StatusKind::PeerFloor => "peer_floor",
             StatusKind::DeepReorg => "deep_reorg",
+            StatusKind::TemplateInvalid => "template_invalid",
         }
     }
 
@@ -80,13 +86,14 @@ impl StatusKind {
     /// `from_str_exact` scans `ALL`, so the alertfile would reject
     /// `kinds = ["the_new_kind"]` as unknown even though the streaming docs
     /// list it, and the metric would never be pre-registered.
-    pub const ALL: [StatusKind; 6] = [
+    pub const ALL: [StatusKind; 7] = [
         StatusKind::IbdComplete,
         StatusKind::TipStall,
         StatusKind::DiskLow,
         StatusKind::MempoolCongested,
         StatusKind::PeerFloor,
         StatusKind::DeepReorg,
+        StatusKind::TemplateInvalid,
     ];
 
     /// Parse a wire name (the inverse of [`as_str`](Self::as_str)). Used by
@@ -106,9 +113,10 @@ impl StatusKind {
     pub const fn severity(self) -> StatusSeverity {
         match self {
             StatusKind::IbdComplete => StatusSeverity::Info,
-            StatusKind::TipStall | StatusKind::DiskLow | StatusKind::DeepReorg => {
-                StatusSeverity::Critical
-            }
+            StatusKind::TipStall
+            | StatusKind::DiskLow
+            | StatusKind::DeepReorg
+            | StatusKind::TemplateInvalid => StatusSeverity::Critical,
             StatusKind::MempoolCongested | StatusKind::PeerFloor => StatusSeverity::Warning,
         }
     }
@@ -134,10 +142,11 @@ const _: () = {
             StatusKind::MempoolCongested => 3,
             StatusKind::PeerFloor => 4,
             StatusKind::DeepReorg => 5,
+            StatusKind::TemplateInvalid => 6,
         }
     }
     // Also pins the array's length to the variant count.
-    assert!(StatusKind::ALL.len() == every_variant_is_in_all(StatusKind::DeepReorg) + 1);
+    assert!(StatusKind::ALL.len() == every_variant_is_in_all(StatusKind::TemplateInvalid) + 1);
 };
 
 /// Level-triggered lifecycle of a condition.

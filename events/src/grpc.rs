@@ -3288,6 +3288,7 @@ fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
         K::MempoolCongested => pb::StatusKind::MempoolCongested,
         K::PeerFloor => pb::StatusKind::PeerFloor,
         K::DeepReorg => pb::StatusKind::DeepReorg,
+        K::TemplateInvalid => pb::StatusKind::TemplateInvalid,
     };
     let state = match ev.state {
         St::Raised => pb::StatusState::Raised,

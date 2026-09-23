@@ -2753,6 +2753,23 @@ async fn main() {
         }
     };
 
+    // Block-template validity (`mining::validity`). A template that fails its
+    // check is a node bug worth paging on, so it goes through the same alert
+    // path as the detectors. The background full check runs on the API
+    // runtime, off the consensus core, and does nothing until a template is
+    // queued for it.
+    chain_state.template_validity().install_alert_sink(node::mining::validity::AlertSink {
+        warnings: chain_state.warnings().clone(),
+        publisher: event_publisher.clone(),
+        health: health_state.clone(),
+    });
+    {
+        let _api_guard = api_handle.enter();
+        chain_state.template_validity().install_full_checker(
+            node::mining::validity::FullChecker::spawn(chain_state.clone(), shutdown_rx.clone()),
+        );
+    }
+
     // Outbound alert webhooks (`alertfile=`). The dispatcher is a plain event-bus
     // consumer: it starts only when a file is configured, so a node without one
     // spawns no tasks and its `/metrics` page is unchanged.

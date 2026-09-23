@@ -1029,7 +1029,8 @@ every other envelope too. Operators consuming health over ZMQ should use the
 ```proto
 message StatusEvent {
   StatusKind     kind     = 1;  // ibd_complete | tip_stall | disk_low |
-                                // mempool_congested | peer_floor | deep_reorg
+                                // mempool_congested | peer_floor | deep_reorg |
+                                // template_invalid
                                 // (0 = unspecified; never emitted by satd)
   StatusState    state    = 2;  // raised | cleared | edge
                                 // (0 = unspecified; never emitted by satd)
@@ -1049,7 +1050,9 @@ a value hovering at the line does not flap. Observations with no recovered state
 replay ring, so a `from_cursor` resume never yields one. Durability comes from
 re-evaluation instead: the detectors re-examine every condition at startup and
 re-raise the ones still standing, which is what makes health alerting
-at-least-once across a restart. A condition that both raised and fully cleared
+at-least-once across a restart. `template_invalid` is the exception: it is
+evaluated when a template is built, so it stands again after a restart only
+once a template fails again. A condition that both raised and fully cleared
 while a consumer was away is stale by definition and is not reconstructed.
 
 **`details` keys by kind.** Values are strings. Most are decimal numbers, but
@@ -1063,6 +1066,7 @@ not all — parse per key rather than assuming the whole map is numeric.
 | `mempool_congested` | `bytes_used`, `bytes_cap`, `threshold_pct`, `mempoolminfee_sat_per_kvb` (raise only) |
 | `peer_floor` | `peers`, `peers_outbound`, `peers_inbound`, `threshold` (raise only) |
 | `deep_reorg` | `depth`, `from_height`, `to_height`, `fork_height` |
+| `template_invalid` | raise: `check` (`structural` or `full`), `origin` (`getblocktemplate`, `generate` or `stratum`), `reason` (Core's reject reason), `height`, and `txid` when the offending transaction was found |
 
 `deep_reorg` figures are exact. Depth, fork height and the reconnected chain
 are read from the reorg log record that `perform_reorg` writes and fsyncs, not

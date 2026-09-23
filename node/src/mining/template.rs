@@ -25,6 +25,7 @@ const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 pub(crate) const COINBASE_SIGOPS_RESERVE: u64 = 400;
 
 /// A selected transaction for the block template.
+#[derive(Clone)]
 pub struct TemplateTx {
     pub tx: Transaction,
     pub fee: u64,
@@ -59,6 +60,7 @@ pub fn last_block_stats() -> Option<(u64, u64)> {
     (txs != u64::MAX && weight != u64::MAX).then_some((txs, weight))
 }
 
+#[derive(Clone)]
 pub struct BlockTemplate {
     pub version: i32,
     pub prev_hash: BlockHash,
@@ -149,6 +151,13 @@ pub fn block_min_tx_fee() -> u64 {
 
 pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
     create_template_with_floor(chain_state, mempool, block_min_tx_fee())
+}
+
+/// A template with no transactions on the current tip: always valid, since
+/// there is nothing in it to be wrong. What the Stratum server hands out while
+/// the node's own templates are failing their validity check.
+pub fn create_coinbase_only_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
+    assemble_template(chain_state, mempool, false, block_min_tx_fee())
 }
 
 /// [`create_template`] with an explicit `-blockmintxfee` floor.
@@ -685,7 +694,7 @@ fn select_transactions(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
@@ -807,6 +816,15 @@ mod tests {
     fn make_funded_template_env(
         coins: &[(bitcoin::OutPoint, crate::storage::coinview::Coin)],
     ) -> (ChainState, Mempool, std::path::PathBuf) {
+        make_funded_template_env_with(coins, Box::new(NoopVerifier))
+    }
+
+    /// A regtest chain at genesis holding `coins`, verifying scripts with
+    /// `verifier`, and an empty mempool.
+    pub(crate) fn make_funded_template_env_with(
+        coins: &[(bitcoin::OutPoint, crate::storage::coinview::Coin)],
+        verifier: Box<dyn crate::validation::script::ScriptVerifier>,
+    ) -> (ChainState, Mempool, std::path::PathBuf) {
         use crate::storage::Store as _;
         let dir = std::env::temp_dir().join(format!(
             "satd-template-test-{}-{}",
@@ -829,7 +847,7 @@ mod tests {
             store,
             flat_files,
             Network::Regtest,
-            Box::new(NoopVerifier),
+            verifier,
             AssumeValid::Disabled,
             450,
         4,
@@ -867,7 +885,7 @@ mod tests {
         assert_eq!(hex.len(), 38 * 2, "OP_RETURN + 36-byte push: {hex}");
 
         // getblocktemplate carries it (segwit is active from 0 on regtest).
-        let gbt = crate::rpc::mining::get_block_template(&cs, &mp);
+        let gbt = crate::rpc::mining::get_block_template(&cs, &mp).unwrap();
         assert_eq!(gbt["default_witness_commitment"].as_str(), Some(hex.as_str()));
     }
 
@@ -912,7 +930,7 @@ mod tests {
 
     // ── Dependency- and finality-aware selection (#588/#589) ──────────
 
-    fn tx_spending(
+    pub(crate) fn tx_spending(
         prev: bitcoin::OutPoint,
         out_value: u64,
         out_tag: u8,
@@ -938,7 +956,7 @@ mod tests {
         }
     }
 
-    fn confirmed_prev(tag: u8) -> bitcoin::OutPoint {
+    pub(crate) fn confirmed_prev(tag: u8) -> bitcoin::OutPoint {
         use bitcoin::hashes::Hash;
         bitcoin::OutPoint {
             txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
