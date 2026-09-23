@@ -138,7 +138,9 @@ never authenticate.
   batch is charged per call, not once per request: a batch of `n` calls
   costs `n`, and a call that crosses the budget is answered in-band with
   error `-32005` whose `data.retry_after_secs` matches `Retry-After`. The
-  earlier calls in that batch are still served.
+  earlier calls in that batch are still served. A WebSocket on the JSON-RPC
+  listener is charged the same way: the upgrade costs one, and so does
+  every call sent over the socket after it.
 - **Watch quota.** The streaming watch-set is metered in units. One
   scripthash costs one unit, and prefix watches are priced by coarseness. A
   token holds units through an RAII lease, so a disconnect releases its
