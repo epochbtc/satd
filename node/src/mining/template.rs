@@ -14,7 +14,7 @@ const COINBASE_MATURITY: u32 = 100;
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 /// Reserve weight for coinbase transaction. Matches Bitcoin Core v30's
 /// `DEFAULT_BLOCK_RESERVED_WEIGHT` (8000 WU).
-const COINBASE_WEIGHT_RESERVE: usize = 8_000;
+pub(crate) const COINBASE_WEIGHT_RESERVE: usize = 8_000;
 
 /// A selected transaction for the block template.
 pub struct TemplateTx {
