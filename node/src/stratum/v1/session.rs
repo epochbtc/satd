@@ -604,7 +604,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         let Some(miner) = self.miner.as_ref().filter(|_| self.payout.is_some()) else {
             return UNAUTHORIZED_IDLE_TIMEOUT;
         };
-        let rate = miner.lock().tally.share_rate(std::time::Instant::now(), self.vardiff.difficulty());
+        let rate = miner.lock().tally.share_rate(self.vardiff.difficulty());
         miner_idle_timeout(rate)
     }
 

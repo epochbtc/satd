@@ -113,6 +113,10 @@ pub struct MinerTally {
     /// sum of the difficulties they were judged at.
     lifetime_shares: usize,
     lifetime_work: f64,
+    /// The window's hashrate as of the last accepted share, once the window
+    /// held enough shares to say. Fixed at the share, so readings taken
+    /// during a later silence (which empty the window) do not change it.
+    window_rate_at_last_share: Option<f64>,
 }
 
 /// A periodic status reading, covering the shares since the last one.
@@ -136,6 +140,7 @@ impl MinerTally {
             last_share: None,
             lifetime_shares: 0,
             lifetime_work: 0.0,
+            window_rate_at_last_share: None,
         }
     }
 
@@ -154,6 +159,8 @@ impl MinerTally {
         self.last_share = Some(now);
         self.lifetime_shares += 1;
         self.lifetime_work += difficulty as f64;
+        let rate = self.hashrate(now);
+        self.window_rate_at_last_share = (self.window.len() >= MIN_ESTIMATE_SHARES).then_some(rate);
     }
 
     /// Count a share that was not accepted.
@@ -212,11 +219,17 @@ impl MinerTally {
     /// still has an answer for a miner whose shares are too rare to fill the
     /// window. The lower rate is the longer expected silence, so neither
     /// estimate's noise can make a hashing miner look dead.
-    pub fn share_rate(&mut self, now: Instant, difficulty: u64) -> Option<f64> {
+    ///
+    /// Both are measured up to the last accepted share, not up to now. The
+    /// idle limit is asked about a silence in progress; measured up to now,
+    /// that silence would lower the rate it is judged by, and the limit would
+    /// grow as fast as the silence did — for a miner with a few shares behind
+    /// it, faster, so it could never be reached.
+    pub fn share_rate(&self, difficulty: u64) -> Option<f64> {
+        let at = self.last_share?;
         let per_share = difficulty.max(1) as f64 * 4_294_967_296.0;
-        let window = self.hashrate(now);
-        let window = (self.window.len() >= MIN_ESTIMATE_SHARES).then_some(window);
-        let span = now.saturating_duration_since(self.connected).as_secs_f64();
+        let window = self.window_rate_at_last_share;
+        let span = at.saturating_duration_since(self.connected).as_secs_f64();
         let lifetime = (self.lifetime_shares >= MIN_ESTIMATE_SHARES && span >= 1.0)
             .then(|| self.lifetime_work * 4_294_967_296.0 / span);
         let hashrate = match (window, lifetime) {
@@ -458,17 +471,17 @@ mod tests {
         for i in 1..MIN_ESTIMATE_SHARES as u64 {
             tally.accept(secs(30 * i), 1_000, 1_000.0);
         }
-        assert_eq!(tally.share_rate(secs(120), 1_000), None, "too few shares to say");
+        assert_eq!(tally.share_rate(1_000), None, "too few shares to say");
 
         // One share every 30 s at the current difficulty: a rate of 1/30.
         let mut tally = MinerTally::new(t0);
         for i in 1..=20 {
             tally.accept(secs(30 * i), 1_000, 1_000.0);
         }
-        let rate = tally.share_rate(secs(600), 1_000).unwrap();
+        let rate = tally.share_rate(1_000).unwrap();
         assert!((rate - 1.0 / 30.0).abs() < 1e-9, "{rate}");
         // The same hashrate at four times the difficulty: a quarter the rate.
-        let rate = tally.share_rate(secs(600), 4_000).unwrap();
+        let rate = tally.share_rate(4_000).unwrap();
         assert!((rate - 1.0 / 120.0).abs() < 1e-9, "{rate}");
 
         // Shares too rare to fill the window: the whole connection answers.
@@ -476,20 +489,58 @@ mod tests {
         for i in 1..=10 {
             tally.accept(secs(300 * i), 1_000, 1_000.0);
         }
-        let rate = tally.share_rate(secs(3_000), 1_000).unwrap();
+        let rate = tally.share_rate(1_000).unwrap();
         assert!((rate - 1.0 / 300.0).abs() < 1e-9, "{rate}");
 
         // A miner that slowed down: the recent window is slower, and wins.
         let mut tally = MinerTally::new(t0);
-        for i in 1..=100 {
+        for i in 1..=99 {
             tally.accept(secs(10 * i), 1_000, 1_000.0);
         }
         for i in 1..=10 {
             tally.accept(secs(1_000 + 60 * i), 1_000, 1_000.0);
         }
-        // One second past the fast run, so its last share has left the window.
-        let rate = tally.share_rate(secs(1_601), 1_000).unwrap();
+        // The window ends at the last share (1,600 s) and so starts after the
+        // fast run's last share (990 s).
+        let rate = tally.share_rate(1_000).unwrap();
         assert!((rate - 1.0 / 60.0).abs() < 1e-9, "{rate}");
+    }
+
+    /// The limit for a silence in progress must not grow with that silence:
+    /// the estimate stops at the last share. A miner with ten shares at one
+    /// every 30 s is allowed twenty intervals, 600 s, whether asked at its
+    /// last share or 700 s into the silence. Measured up to now, the window
+    /// would be empty by then and the whole connection's rate would have
+    /// fallen to ten shares in 1,000 s, a limit of 2,000 s still growing.
+    #[test]
+    fn the_permitted_silence_does_not_grow_with_the_silence() {
+        let t0 = Instant::now();
+        let secs = |s: u64| t0 + Duration::from_secs(s);
+        let mut tally = MinerTally::new(t0);
+        for i in 1..=10 {
+            tally.accept(secs(30 * i), 1_000, 1_000.0);
+        }
+        let at_last_share = miner_idle_timeout(tally.share_rate(1_000));
+        assert_eq!(at_last_share, Duration::from_secs(600));
+        // Status readings during the silence evict the window; the limit
+        // must not move.
+        let _ = tally.hashrate(secs(1_000));
+        assert_eq!(miner_idle_timeout(tally.share_rate(1_000)), at_last_share);
+
+        // A miner that slowed before going quiet: the window (one share a
+        // minute) is slower than the whole connection, so it sets the limit,
+        // and still does after the silence has emptied it.
+        let mut tally = MinerTally::new(t0);
+        for i in 1..=99 {
+            tally.accept(secs(10 * i), 1_000, 1_000.0);
+        }
+        for i in 1..=10 {
+            tally.accept(secs(1_000 + 60 * i), 1_000, 1_000.0);
+        }
+        let at_last_share = miner_idle_timeout(tally.share_rate(1_000));
+        assert_eq!(at_last_share, Duration::from_secs(1_200));
+        let _ = tally.hashrate(secs(1_600 + 900));
+        assert_eq!(miner_idle_timeout(tally.share_rate(1_000)), at_last_share);
     }
 
     #[test]

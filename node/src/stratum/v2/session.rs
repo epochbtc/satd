@@ -922,7 +922,6 @@ impl Session {
         }
     }
 
-    /// The periodic `-debug=stratum` reading for every channel.
     /// How long this connection may send nothing: short until it opens a
     /// channel, then scaled to how often shares should arrive on any of
     /// them. A share on any channel is traffic on the connection, so the
@@ -931,15 +930,15 @@ impl Session {
         if self.channels.is_empty() {
             return UNAUTHORIZED_IDLE_TIMEOUT;
         }
-        let now = std::time::Instant::now();
         let rates: Vec<f64> = self
             .channels
             .values()
-            .filter_map(|ch| ch.miner.lock().tally.share_rate(now, ch.vardiff.difficulty()))
+            .filter_map(|ch| ch.miner.lock().tally.share_rate(ch.vardiff.difficulty()))
             .collect();
         miner_idle_timeout((!rates.is_empty()).then(|| rates.iter().sum()))
     }
 
+    /// The periodic `-debug=stratum` reading for every channel.
     fn log_status(&mut self) {
         let now = std::time::Instant::now();
         for ch in self.channels.values_mut() {

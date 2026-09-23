@@ -397,8 +397,10 @@ that:
 - Once the miner has four accepted shares, it may go quiet for **twenty
   expected share intervals** at its current difficulty, but never less than 120
   seconds and never more than an hour. The expected interval comes from the
-  slower of two hashrate estimates: the last ten minutes, and the whole
-  connection. At vardiff's one share every 30 seconds that is ten minutes.
+  slower of two hashrate estimates: the ten minutes before its last accepted
+  share, and the whole connection up to that share. Both stop at the last
+  share, so the silence being timed does not stretch its own limit. At
+  vardiff's one share every 30 seconds the limit is ten minutes.
 - Before that, it may go quiet for **ten minutes**.
 
 The limit is recomputed as the difficulty changes. Shares arrive at random, so
