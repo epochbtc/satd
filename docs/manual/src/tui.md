@@ -193,8 +193,11 @@ Mempool (left half):
   is full and is evicting low-fee txs. New txs need at least this rate
   to enter.
 - **Tx Rate**: recent tx-entry rate from `getchaintxstats` (tx/s).
-- **Size distribution**: sparkline of vbyte buckets (0, 100, 250, 500,
-  1k, 5k, 10k, 50k+).
+- **Size distribution**: bar chart of transactions per vbyte bucket (0,
+  100, 250, 500, 1k, 5k, 10k, 50k+), each bar labelled with its lower edge
+  and its count. The bar heights are on a log scale, so a bucket of a few
+  transactions stays visible next to one of tens of thousands; read the
+  counts, not the heights, to compare buckets.
 
 Fees (right half), fee tier estimates from `estimatefees`
 (mempool.space convention):
@@ -215,8 +218,15 @@ UTXO (left half):
 - **UTXOs**: total unspent outputs.
 - **Total**: sum of UTXO values (BTC).
 - **Supply**: fraction of the 21M cap. Asymptotic; never reaches 100%.
-- **Age distribution**: sparkline by UTXO age: <1h, 1h–1d, 1d–1w,
-  1w–1m, 1m–3m, 3m–1y, 1y–3y, 3y+.
+- **Age distribution**: bar chart of UTXOs by age, from
+  `gettxoutsetinfo`: <1h, 1h–1d, 1d–1w, 1w–1mo, 1mo–6mo, 6mo–1y, 1y–3y,
+  3y+. Log-scaled heights with the count on each bar, as above. The four
+  youngest buckets are exact counts. The four older ones are estimated from
+  1000-block chunks, so they can be off by up to a chunk's worth of coins
+  at each edge. After upgrading an existing datadir the node builds its
+  exact counts with a one-time background scan; until it finishes, the
+  heading reads **Age Distribution: (est.)** and the four youngest bars are
+  yellow.
 
 Network (right half):
 

@@ -35,9 +35,8 @@ pub fn format_hash(h: &str) -> String {
     }
 }
 
-/// Format duration in seconds to human-readable.
 /// Compact vbyte label for a histogram bucket edge: `0`, `250`, `1k`, `50k`.
-/// Keeps the axis under a sparkline that is only ~16 columns wide.
+/// Fits the three-column bars of the mempool size chart.
 pub fn format_vsize_edge(vsize: u64) -> String {
     if vsize >= 1_000 && vsize.is_multiple_of(1_000) {
         format!("{}k", vsize / 1_000)
@@ -46,6 +45,42 @@ pub fn format_vsize_edge(vsize: u64) -> String {
     }
 }
 
+/// Bar height for a histogram count on a log scale: `100 * log10(count) + 1`,
+/// and 0 for an empty bucket. 1 -> 1, 10 -> 101, 71M -> 786.
+///
+/// The histograms span several decades. Drawn linearly, the tallest bucket
+/// flattens everything within two orders of magnitude of it to nothing, and a
+/// tail of a few transactions or a few thousand coins disappears. A log scale
+/// keeps every non-empty bucket visible; the exact count is printed on the bar.
+pub fn log_bar(count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        (count as f64).log10().mul_add(100.0, 1.0) as u64
+    }
+}
+
+/// A count in at most three characters, to print on a three-column bar:
+/// `999`, `99k`, `.1M` .. `.9M`, `1M` .. `99M`, `.1G` .. `.9G`, then `1G` ..
+/// `99G`. Rounds down.
+pub fn format_count3(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 100_000 {
+        format!("{}k", n / 1_000)
+    } else if n < 1_000_000 {
+        format!(".{}M", n / 100_000)
+    } else if n < 100_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n < 1_000_000_000 {
+        format!(".{}G", n / 100_000_000)
+    } else {
+        // Three characters up to 99G, which no histogram here will reach.
+        format!("{}G", n / 1_000_000_000)
+    }
+}
+
+/// Format duration in seconds to human-readable.
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{}s", secs)
@@ -281,5 +316,45 @@ pub fn render_loading_panel(f: &mut ratatui::Frame, area: ratatui::layout::Rect,
             Style::default().fg(Color::DarkGray),
         )));
         f.render_widget(loading, inner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_bar_edges() {
+        assert_eq!(log_bar(0), 0, "an empty bucket draws nothing");
+        assert_eq!(log_bar(1), 1, "a single item still draws");
+        assert_eq!(log_bar(10), 101);
+        assert_eq!(log_bar(71_216_488), 786);
+        assert!(log_bar(3) > log_bar(1) && log_bar(10_399) > log_bar(932));
+    }
+
+    #[test]
+    fn format_count3_never_exceeds_three_chars() {
+        for (n, want) in [
+            (0, "0"),
+            (9, "9"),
+            (99, "99"),
+            (999, "999"),
+            (1_000, "1k"),
+            (9_999, "9k"),
+            (99_999, "99k"),
+            (100_000, ".1M"),
+            (999_999, ".9M"),
+            (1_000_000, "1M"),
+            (71_216_488, "71M"),
+            (99_999_999, "99M"),
+            (100_000_000, ".1G"),
+            (999_999_999, ".9G"),
+            (1_000_000_000, "1G"),
+            (99_999_999_999, "99G"),
+        ] {
+            let got = format_count3(n);
+            assert_eq!(got, want, "{n}");
+            assert!(got.chars().count() <= 3, "{n} -> {got}");
+        }
     }
 }
