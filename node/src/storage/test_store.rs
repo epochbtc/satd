@@ -307,6 +307,15 @@ impl Store for ControllableStore {
     fn utxo_height_hist(&self) -> Vec<u64> {
         self.inner.utxo_height_hist()
     }
+    fn utxo_recent_heights(&self) -> Option<crate::storage::RecentHeightWindow> {
+        self.inner.utxo_recent_heights()
+    }
+    fn build_recent_window(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::storage::RecentWindowBuild, StoreError> {
+        self.inner.build_recent_window(cancel)
+    }
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
         self.inner.get_tx_location(txid)
     }

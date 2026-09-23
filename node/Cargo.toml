@@ -89,6 +89,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Log capture for tests that pin a warning, in their own test binaries so
+# the global subscriber never touches the library's unit tests.
+tracing-subscriber = { workspace = true }
 # The vendored BIP 370 / 375 vectors, so the PSBT surface tests referee
 # themselves against the BIPs' own bytes rather than satd's idea of them.
 satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::{Coin, outpoint_to_key};
 use crate::storage::profile::StorageTuning;
+use crate::storage::recent_window::{RecentHeightWindow, RecentWindowBuild};
 use crate::storage::undo::UndoData;
 use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 use node_index::TxSeq;
@@ -164,6 +165,11 @@ const UTXO_COUNT_KEY: &[u8] = b"utxo_count";
 const TOTAL_AMOUNT_KEY: &[u8] = b"total_amount";
 const UTXO_HEIGHT_HIST_KEY: &[u8] = b"utxo_height_hist";
 const HEIGHT_HIST_BUCKET: u32 = 1000;
+/// Exact per-height counts for the most recent heights
+/// ([`RecentHeightWindow`], bincode). Additive, not a schema step: a binary
+/// that does not know it leaves it alone, and a binary that does rebuilds it
+/// when it is missing or its `tip_hash` no longer matches `TIP_KEY`.
+const UTXO_RECENT_HEIGHTS_KEY: &[u8] = b"utxo_recent_heights";
 const SCHEMA_KEY: &[u8] = b"schema_version";
 /// `outpoint_spend.complete` metadata flag. `b"\x01"` when the
 /// outpoint_spend CF holds rows for every input on the active chain
@@ -449,6 +455,32 @@ fn backfill_temp_key(op: &OutPoint) -> [u8; 36] {
 
 type DB = DBWithThreadMode<MultiThreaded>;
 
+/// Where the recent-height window stands. Held under
+/// [`RocksDbStore::recent_window`].
+enum RecentWindowState {
+    /// No usable window. Batch deltas are dropped; a build has not started
+    /// or was cancelled. A store nothing ever builds (the AssumeUTXO
+    /// background chainstate) stays here.
+    Absent,
+    /// A build is scanning a snapshot. Deltas committed after the snapshot
+    /// accumulate in `pending` and are folded in when the scan finishes.
+    /// There is at most one build at a time.
+    Building {
+        pending: std::collections::HashMap<u32, i64>,
+    },
+    /// The window is authoritative. The value is exactly what the metadata
+    /// key holds; every batch with coin deltas or a tip updates both.
+    Live(RecentHeightWindow),
+}
+
+/// Set once the first negative recent-window count is clamped, so a
+/// chainstate that keeps producing them warns once rather than per batch.
+static RECENT_WINDOW_CLAMP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Coins between two checks of a recent-window build's cancel flag.
+const RECENT_WINDOW_CANCEL_STRIDE: u64 = 65_536;
+
 /// RocksDB storage backend with compression and bloom filters.
 pub struct RocksDbStore {
     db: DB,
@@ -486,6 +518,20 @@ pub struct RocksDbStore {
     /// the DB was opened with (matters for `clear_chainstate` and
     /// reindex flows).
     tuning: StorageTuning,
+    /// The recent-height window's state. Every batch that carries coin
+    /// deltas or a tip holds this across its `db.write`, which is what
+    /// makes a build's snapshot-then-`Building` step atomic with respect
+    /// to batches: each batch is either in the snapshot or in `pending`,
+    /// never neither and never both.
+    recent_window: parking_lot::Mutex<RecentWindowState>,
+    /// Test hook: when set, a build signals the sender once its snapshot is
+    /// taken and waits on the receiver before scanning, so a test can land
+    /// writes in exactly that gap through a layer (a `CoinCache`) that owns
+    /// this store.
+    #[cfg(test)]
+    recent_window_test_pause: parking_lot::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    >,
 }
 
 impl RocksDbStore {
@@ -883,7 +929,11 @@ impl RocksDbStore {
             block_cache: parking_lot::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
             tuning,
+            recent_window: parking_lot::Mutex::new(RecentWindowState::Absent),
+            #[cfg(test)]
+            recent_window_test_pause: parking_lot::Mutex::new(None),
         };
+        *store.recent_window.lock() = store.load_recent_window();
         // outpoint_spend completeness marker (review H6 round 2).
         //
         // Three reachable open-time states for the marker:
@@ -1463,6 +1513,247 @@ impl RocksDbStore {
             })
             .unwrap_or(0)
     }
+
+    /// The persisted tip as raw bytes, all zeroes when there is none. This
+    /// is what a live window's `tip_hash` is compared against.
+    fn tip_bytes_for_window(&self) -> Result<[u8; 32], StoreError> {
+        let cf = self.cf(CF_METADATA);
+        let raw = self
+            .db
+            .get_cf(&cf, TIP_KEY)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(raw
+            .and_then(|v| <[u8; 32]>::try_from(&v[..]).ok())
+            .unwrap_or([0; 32]))
+    }
+
+    /// Decide the window's state on open: live if the persisted window is
+    /// well formed and was written at the store's current tip, otherwise
+    /// absent until a build runs.
+    fn load_recent_window(&self) -> RecentWindowState {
+        let cf = self.cf(CF_METADATA);
+        let raw = match self.db.get_cf(&cf, UTXO_RECENT_HEIGHTS_KEY) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                tracing::info!(
+                    target: "storage",
+                    "utxo recent-height window missing; it will be built from the coins"
+                );
+                return RecentWindowState::Absent;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "storage",
+                    error = %e,
+                    "utxo recent-height window unreadable; it will be rebuilt"
+                );
+                return RecentWindowState::Absent;
+            }
+        };
+        let window = match bincode::deserialize::<RecentHeightWindow>(&raw) {
+            Ok(w) if w.is_well_formed() => w,
+            _ => {
+                tracing::info!(
+                    target: "storage",
+                    "utxo recent-height window malformed; it will be rebuilt"
+                );
+                return RecentWindowState::Absent;
+            }
+        };
+        match self.tip_bytes_for_window() {
+            Ok(tip) if tip == window.tip_hash => RecentWindowState::Live(window),
+            _ => {
+                tracing::info!(
+                    target: "storage",
+                    "utxo recent-height window stale (written at a different tip); \
+                     it will be rebuilt"
+                );
+                RecentWindowState::Absent
+            }
+        }
+    }
+
+    fn encode_recent_window(window: &RecentHeightWindow) -> Result<Vec<u8>, StoreError> {
+        bincode::serialize(window).map_err(|e| StoreError::Serialization(e.to_string()))
+    }
+
+    /// Log a clamped recent-window count, once per process.
+    fn warn_recent_window_clamp(clamped: &[u32]) {
+        if clamped.is_empty() {
+            return;
+        }
+        if !RECENT_WINDOW_CLAMP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "storage",
+                height = clamped[0],
+                heights = clamped.len(),
+                "utxo recent-height window: a coin was removed that the window never \
+                 counted, and the count was clamped to zero. The exact recent UTXO age \
+                 buckets in gettxoutsetinfo may be off. Further occurrences are not logged."
+            );
+        }
+    }
+
+    /// Put an exact empty window in place after a clear. The coins are gone,
+    /// so all-zero counts are the right answer, and a build that was
+    /// scanning the pre-clear coins is superseded. Caller holds the lock.
+    fn reset_recent_window_locked(&self, state: &mut RecentWindowState) -> Result<(), StoreError> {
+        let window = RecentHeightWindow::empty(self.tip_bytes_for_window()?);
+        let cf = self.cf(CF_METADATA);
+        self.db
+            .put_cf(&cf, UTXO_RECENT_HEIGHTS_KEY, Self::encode_recent_window(&window)?)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        *state = RecentWindowState::Live(window);
+        Ok(())
+    }
+
+    /// Build step 1: under the lock, take the snapshot the scan will read
+    /// and switch to `Building`. From here on every committed batch's deltas
+    /// land in `pending`; everything before is in the snapshot.
+    fn recent_window_begin(
+        &self,
+    ) -> Result<rocksdb::SnapshotWithThreadMode<'_, DB>, RecentWindowBuild> {
+        let mut state = self.recent_window.lock();
+        match *state {
+            RecentWindowState::Live(_) => return Err(RecentWindowBuild::AlreadyLive),
+            RecentWindowState::Building { .. } => return Err(RecentWindowBuild::InProgress),
+            RecentWindowState::Absent => {}
+        }
+        let snapshot = self.db.snapshot();
+        *state = RecentWindowState::Building {
+            pending: std::collections::HashMap::new(),
+        };
+        Ok(snapshot)
+    }
+
+    /// Build step 2: count every coin in the snapshot by creation height.
+    /// Returns `None` if `cancel` was set. Runs without the lock.
+    fn recent_window_scan(
+        &self,
+        snapshot: &rocksdb::SnapshotWithThreadMode<'_, DB>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<(RecentHeightWindow, u64)>, StoreError> {
+        let cf_coins = self.cf(CF_COINS);
+        // A full walk must not evict the block cache's hot set.
+        let mut readopts = rocksdb::ReadOptions::default();
+        readopts.fill_cache(false);
+        let mut iter = snapshot.raw_iterator_cf_opt(&cf_coins, readopts);
+        iter.seek_to_first();
+        let mut window = RecentHeightWindow::empty([0; 32]);
+        let mut scanned = 0u64;
+        while iter.valid() {
+            if scanned.is_multiple_of(RECENT_WINDOW_CANCEL_STRIDE)
+                && cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(None);
+            }
+            let value = iter.value().unwrap_or_default();
+            let height = Coin::peek_height(value).ok_or_else(|| {
+                StoreError::Serialization(format!(
+                    "corrupt coin record ({} bytes) in the recent-window scan",
+                    value.len()
+                ))
+            })?;
+            window.add_one(height);
+            scanned += 1;
+            iter.next();
+        }
+        iter.status()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(Some((window, scanned)))
+    }
+
+    /// Build step 3: fold in what was written during the scan, stamp the
+    /// tip and go live. Returns `None` if a clear superseded this build: the
+    /// clear already installed the exact (empty) window, and what this build
+    /// counted describes coins that no longer exist.
+    fn recent_window_finish(
+        &self,
+        mut window: RecentHeightWindow,
+    ) -> Result<Option<usize>, StoreError> {
+        let mut state = self.recent_window.lock();
+        let pending = match &mut *state {
+            RecentWindowState::Building { pending } => std::mem::take(pending),
+            _ => return Ok(None),
+        };
+        let clamped = window.apply(&pending);
+        Self::warn_recent_window_clamp(&clamped);
+        // Read under the lock: every batch that moves the tip holds it, so
+        // this is exactly the tip the window now describes.
+        window.tip_hash = match self.tip_bytes_for_window() {
+            Ok(tip) => tip,
+            Err(e) => {
+                *state = RecentWindowState::Absent;
+                return Err(e);
+            }
+        };
+        let cf = self.cf(CF_METADATA);
+        let written = Self::encode_recent_window(&window).and_then(|bytes| {
+            self.db
+                .put_cf(&cf, UTXO_RECENT_HEIGHTS_KEY, bytes)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        });
+        if let Err(e) = written {
+            *state = RecentWindowState::Absent;
+            return Err(e);
+        }
+        *state = RecentWindowState::Live(window);
+        Ok(Some(pending.len()))
+    }
+
+    /// Drop a build that did not finish, unless a clear already replaced
+    /// it with a live window.
+    fn recent_window_abandon(&self) {
+        let mut state = self.recent_window.lock();
+        if matches!(*state, RecentWindowState::Building { .. }) {
+            *state = RecentWindowState::Absent;
+        }
+    }
+
+    fn build_recent_window_inner(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<RecentWindowBuild, StoreError> {
+        let started = std::time::Instant::now();
+        let snapshot = match self.recent_window_begin() {
+            Ok(snapshot) => snapshot,
+            Err(outcome) => return Ok(outcome),
+        };
+        #[cfg(test)]
+        if let Some((began, resume)) = self.recent_window_test_pause.lock().take() {
+            let _ = began.send(());
+            let _ = resume.recv();
+        }
+        let scanned = self.recent_window_scan(&snapshot, cancel);
+        drop(snapshot);
+        let (window, coins_scanned) = match scanned {
+            Ok(Some(done)) => done,
+            Ok(None) => {
+                self.recent_window_abandon();
+                return Ok(RecentWindowBuild::Cancelled);
+            }
+            Err(e) => {
+                self.recent_window_abandon();
+                return Err(e);
+            }
+        };
+        let Some(pending_heights) = self.recent_window_finish(window)? else {
+            return Ok(RecentWindowBuild::Superseded);
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            target: "storage",
+            coins_scanned,
+            elapsed_ms,
+            pending_heights,
+            "utxo recent-height window built"
+        );
+        Ok(RecentWindowBuild::Built {
+            coins_scanned,
+            elapsed_ms,
+            pending_heights,
+        })
+    }
 }
 
 impl RocksDbStore {
@@ -1638,6 +1929,9 @@ impl RocksDbStore {
         // puts-then-removes; InMemoryStore does too.
         let mut hist_deltas: std::collections::HashMap<usize, i64> =
             std::collections::HashMap::new();
+        // Same deltas at exact height, for the recent-height window.
+        let mut recent_deltas: std::collections::HashMap<u32, i64> =
+            std::collections::HashMap::new();
         let mut count_delta: i64 = 0;
         let mut amount_delta: i64 = 0;
 
@@ -1649,6 +1943,7 @@ impl RocksDbStore {
             amount_delta += coin.amount as i64;
             let bucket = (coin.height / HEIGHT_HIST_BUCKET) as usize;
             *hist_deltas.entry(bucket).or_default() += 1;
+            *recent_deltas.entry(coin.height).or_default() += 1;
         }
 
         for (outpoint, spent_amount, spent_height) in &batch.coin_removes {
@@ -1657,6 +1952,9 @@ impl RocksDbStore {
             amount_delta -= *spent_amount as i64;
             let bucket = (*spent_height / HEIGHT_HIST_BUCKET) as usize;
             *hist_deltas.entry(bucket).or_default() -= 1;
+            // `spent_height` is the coin's creation height, not the height
+            // of the spend: it is the key the coin was counted under.
+            *recent_deltas.entry(*spent_height).or_default() -= 1;
             wb.delete_cf(&cf_coins, key);
         }
 
@@ -1997,6 +2295,28 @@ impl RocksDbStore {
             wb.put_cf(&cf_meta, TOTAL_AMOUNT_KEY, new_amount.to_le_bytes());
         }
 
+        // Metadata: recent-height window. Taken last, just before the write,
+        // and held across it: see `RocksDbStore::recent_window`. A batch with
+        // neither coin deltas nor a tip cannot change the window or the tip
+        // it is stamped with, so it never takes the lock.
+        let mut recent_guard = (!recent_deltas.is_empty() || batch.tip.is_some())
+            .then(|| self.recent_window.lock());
+        let mut next_window: Option<RecentHeightWindow> = None;
+        if let Some(RecentWindowState::Live(window)) = recent_guard.as_deref() {
+            let mut next = window.clone();
+            let clamped = next.apply(&recent_deltas);
+            Self::warn_recent_window_clamp(&clamped);
+            if let Some(hash) = &batch.tip {
+                next.tip_hash = hash.to_byte_array();
+            }
+            wb.put_cf(
+                &cf_meta,
+                UTXO_RECENT_HEIGHTS_KEY,
+                Self::encode_recent_window(&next)?,
+            );
+            next_window = Some(next);
+        }
+
         // Atomic commit across all column families.
         // In BulkLoad mode we skip the WAL — the writer (connect loop during
         // IBD) is responsible for calling `flush_durable` periodically so the
@@ -2020,6 +2340,25 @@ impl RocksDbStore {
         self.db
             .write_opt(wb, &wopts)
             .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Only now that the batch is committed does it belong in the
+        // window: a failed write must leave neither the live window nor a
+        // build's `pending` describing coins that never landed.
+        if let Some(state) = recent_guard.as_deref_mut() {
+            match state {
+                RecentWindowState::Absent => {}
+                RecentWindowState::Building { pending, .. } => {
+                    for (height, delta) in recent_deltas {
+                        *pending.entry(height).or_default() += delta;
+                    }
+                }
+                RecentWindowState::Live(window) => {
+                    if let Some(next) = next_window {
+                        *window = next;
+                    }
+                }
+            }
+        }
+        drop(recent_guard);
         if funding_put_count > 0 {
             crate::index::address::stats::add_funding_rows(funding_put_count);
         }
@@ -2299,6 +2638,20 @@ impl Store for RocksDbStore {
         self.read_u64_meta(TOTAL_AMOUNT_KEY)
     }
 
+    fn utxo_recent_heights(&self) -> Option<RecentHeightWindow> {
+        match &*self.recent_window.lock() {
+            RecentWindowState::Live(window) => Some(window.clone()),
+            _ => None,
+        }
+    }
+
+    fn build_recent_window(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<RecentWindowBuild, StoreError> {
+        self.build_recent_window_inner(cancel)
+    }
+
     fn utxo_height_hist(&self) -> Vec<u64> {
         let cf = self.cf(CF_METADATA);
         self.db
@@ -2393,6 +2746,9 @@ impl Store for RocksDbStore {
     }
 
     fn clear_chainstate(&self) -> Result<(), StoreError> {
+        // Held across the whole clear so no coin batch can land between
+        // dropping the coins and installing the empty window.
+        let mut recent = self.recent_window.lock();
         let mut cfs = vec![CF_COINS, CF_UNDO, CF_METADATA];
         // The transaction-ordinal families ride the same gate as their
         // writes: either index populates them, so either index's node
@@ -2455,10 +2811,13 @@ impl Store for RocksDbStore {
         // resets this to false on the first connect (same as the filter
         // marker), so re-stamping true here is safe either way.
         self.write_silent_payment_index_complete(true)?;
+        self.reset_recent_window_locked(&mut recent)?;
         Ok(())
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
+        // See `clear_chainstate`.
+        let mut recent = self.recent_window.lock();
         // Only the cfg-gated filter-CF pushes below mutate this.
         #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut all_cfs: Vec<&str> = vec![
@@ -2498,6 +2857,7 @@ impl Store for RocksDbStore {
         #[cfg(feature = "block-filter-index")]
         self.write_block_filter_index_complete(true)?;
         self.write_silent_payment_index_complete(true)?;
+        self.reset_recent_window_locked(&mut recent)?;
         Ok(())
     }
 
@@ -4243,6 +4603,474 @@ mod tests {
         let hist = store.utxo_height_hist();
         assert_eq!(hist[0], 2); // two coins in bucket 0
         assert_eq!(hist[1], 1); // one coin in bucket 1
+    }
+
+    // ---- recent-height window ----
+
+    fn recent_live(store: &RocksDbStore) -> crate::storage::RecentHeightWindow {
+        store
+            .utxo_recent_heights()
+            .expect("the recent-height window must be live here")
+    }
+
+    fn recent_build(store: &RocksDbStore) -> crate::storage::RecentWindowBuild {
+        store
+            .build_recent_window(&std::sync::atomic::AtomicBool::new(false))
+            .unwrap()
+    }
+
+    fn coin_at(height: u32) -> Coin {
+        make_coin(1_000, height)
+    }
+
+    fn puts(coins: &[(OutPoint, u32)]) -> StoreBatch {
+        let mut batch = StoreBatch::default();
+        for (op, height) in coins {
+            batch.coin_puts.push((*op, coin_at(*height)));
+        }
+        batch
+    }
+
+    /// Every coin on disk, counted by creation height straight from the
+    /// coins CF — independent of the window's own code.
+    fn recount_by_height(store: &RocksDbStore) -> std::collections::HashMap<u32, u64> {
+        let cf = store.cf(CF_COINS);
+        let mut counts = std::collections::HashMap::new();
+        for kv in store.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (_, value) = kv.unwrap();
+            let coin = Coin::deserialize_compact(&value).unwrap();
+            *counts.entry(coin.height).or_insert(0u64) += 1;
+        }
+        counts
+    }
+
+    /// The live window agrees with a recount at every height it holds, and
+    /// no coin sits above its top.
+    fn assert_recent_window_exact(store: &RocksDbStore) {
+        let window = recent_live(store);
+        let counts = recount_by_height(store);
+        for height in window.base..=window.top() {
+            assert_eq!(
+                window.count_at(height),
+                Some(counts.get(&height).copied().unwrap_or(0)),
+                "recent window disagrees with the coins at height {height}"
+            );
+        }
+        if let Some(max) = counts.keys().max() {
+            assert!(
+                *max <= window.top(),
+                "a coin at {max} lives above the window's top {}",
+                window.top()
+            );
+        }
+    }
+
+    fn persisted_recent_window(store: &RocksDbStore) -> Option<crate::storage::RecentHeightWindow> {
+        let cf = store.cf(CF_METADATA);
+        store
+            .db
+            .get_cf(&cf, UTXO_RECENT_HEIGHTS_KEY)
+            .unwrap()
+            .map(|raw| bincode::deserialize(&raw).unwrap())
+    }
+
+    /// Deterministic spread of coins: `n` outpoints at pseudo-random heights
+    /// below `max_height`, keyed so they never collide with each other.
+    fn scattered_coins(n: u32, max_height: u32, salt: u8) -> Vec<(OutPoint, u32)> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ u64::from(salt);
+        (0..n)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((make_outpoint(salt, i)), ((x >> 33) as u32) % max_height)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recent_window_live_tracks_puts_and_removes() {
+        use crate::storage::{RECENT_WINDOW_LEN, RecentWindowBuild};
+        let (store, _dir) = temp_store(false);
+        assert!(
+            store.utxo_recent_heights().is_none(),
+            "a store nothing has built yet has no window"
+        );
+        assert!(matches!(
+            recent_build(&store),
+            RecentWindowBuild::Built { coins_scanned: 0, .. }
+        ));
+        assert_eq!(recent_build(&store), RecentWindowBuild::AlreadyLive);
+
+        let top = RECENT_WINDOW_LEN - 1;
+        store
+            .write_batch(puts(&[
+                (make_outpoint(0x01, 0), 0),
+                (make_outpoint(0x01, 1), 5),
+                (make_outpoint(0x01, 2), 5),
+                (make_outpoint(0x01, 3), top),
+            ]))
+            .unwrap();
+        let window = recent_live(&store);
+        assert_eq!(window.base, 0);
+        assert_eq!(window.count_at(0), Some(1));
+        assert_eq!(window.count_at(5), Some(2));
+        assert_eq!(window.count_at(top), Some(1));
+
+        // A spend at 5, and a coin created and spent inside one batch at 7:
+        // the pair nets to nothing, like the coarse histogram's pair.
+        let mut batch = puts(&[(make_outpoint(0x01, 4), 7)]);
+        batch.coin_removes.push((make_outpoint(0x01, 1), 1_000, 5));
+        batch.coin_removes.push((make_outpoint(0x01, 4), 1_000, 7));
+        store.write_batch(batch).unwrap();
+        let window = recent_live(&store);
+        assert_eq!(window.count_at(5), Some(1));
+        assert_eq!(window.count_at(7), Some(0));
+        assert_recent_window_exact(&store);
+        assert_eq!(
+            persisted_recent_window(&store),
+            Some(window),
+            "the metadata key must hold exactly the live window"
+        );
+    }
+
+    #[test]
+    fn recent_window_slides_forward_and_never_back() {
+        use crate::storage::RECENT_WINDOW_LEN;
+        let (store, _dir) = temp_store(false);
+        recent_build(&store);
+        store
+            .write_batch(puts(&[
+                (make_outpoint(0x02, 0), 0),
+                (make_outpoint(0x02, 1), 10),
+            ]))
+            .unwrap();
+        // One coin just above the top moves the window up by one.
+        store
+            .write_batch(puts(&[(make_outpoint(0x02, 2), RECENT_WINDOW_LEN)]))
+            .unwrap();
+        let window = recent_live(&store);
+        assert_eq!(window.base, 1);
+        assert_eq!(window.count_at(0), None, "height 0 slid out");
+        assert_eq!(window.count_at(10), Some(1));
+        assert_eq!(window.count_at(RECENT_WINDOW_LEN), Some(1));
+
+        // Disconnect-shaped batch: the coin at the top is removed and an old
+        // coin is restored from undo. The window stays where it is.
+        let mut batch = puts(&[(make_outpoint(0x02, 3), 3)]);
+        batch
+            .coin_removes
+            .push((make_outpoint(0x02, 2), 1_000, RECENT_WINDOW_LEN));
+        store.write_batch(batch).unwrap();
+        let window = recent_live(&store);
+        assert_eq!(window.base, 1, "a reorg never slides the window back");
+        assert_eq!(window.count_at(RECENT_WINDOW_LEN), Some(0));
+        assert_eq!(window.count_at(3), Some(1));
+        assert_recent_window_exact(&store);
+    }
+
+    #[test]
+    fn recent_window_build_matches_brute_force() {
+        use crate::storage::RecentWindowBuild;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            // Written while no window exists: these deltas are dropped, and
+            // only the build can account for the coins.
+            let coins = scattered_coins(5_000, 6_000, 0x03);
+            for chunk in coins.chunks(700) {
+                store.write_batch(puts(chunk)).unwrap();
+            }
+            let mut spend = StoreBatch::default();
+            for (op, height) in coins.iter().step_by(3) {
+                spend.coin_removes.push((*op, 1_000, *height));
+            }
+            spend.tip = Some(BlockHash::from_byte_array([0x33; 32]));
+            store.write_batch(spend).unwrap();
+            assert!(store.utxo_recent_heights().is_none());
+            assert!(persisted_recent_window(&store).is_none());
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        assert!(store.utxo_recent_heights().is_none(), "no key on disk: absent");
+        let total: u64 = recount_by_height(&store).values().sum();
+        match recent_build(&store) {
+            RecentWindowBuild::Built {
+                coins_scanned,
+                pending_heights,
+                ..
+            } => {
+                assert_eq!(coins_scanned, total);
+                assert_eq!(pending_heights, 0);
+            }
+            other => panic!("expected a build, got {other:?}"),
+        }
+        assert_recent_window_exact(&store);
+        assert_eq!(recent_live(&store).tip_hash, [0x33; 32]);
+    }
+
+    #[test]
+    fn recent_window_build_folds_writes_during_scan() {
+        use crate::storage::RECENT_WINDOW_LEN;
+        let (store, _dir) = temp_store(false);
+        let before = scattered_coins(3_000, 5_000, 0x04);
+        store.write_batch(puts(&before)).unwrap();
+        let snapshot_max = before.iter().map(|(_, h)| *h).max().unwrap();
+
+        let snapshot = store.recent_window_begin().expect("not live yet");
+        // Everything below commits after the snapshot, so only `pending`
+        // can carry it into the window.
+        let above = snapshot_max + 300;
+        let inside = snapshot_max - 200;
+        let below_final_base = above - RECENT_WINDOW_LEN - 10;
+        let spent_inside = *before
+            .iter()
+            .find(|(_, h)| *h > above - RECENT_WINDOW_LEN + 50)
+            .unwrap();
+        let spent_below = *before.iter().find(|(_, h)| *h < below_final_base).unwrap();
+        let mut batch = puts(&[
+            (make_outpoint(0x05, 0), above),
+            (make_outpoint(0x05, 1), inside),
+            (make_outpoint(0x05, 2), inside),
+            (make_outpoint(0x05, 3), below_final_base),
+        ]);
+        batch
+            .coin_removes
+            .push((spent_inside.0, 1_000, spent_inside.1));
+        batch.coin_removes.push((spent_below.0, 1_000, spent_below.1));
+        store.write_batch(batch).unwrap();
+        assert!(
+            persisted_recent_window(&store).is_none(),
+            "nothing is persisted while the build is scanning"
+        );
+
+        let (window, scanned) = store
+            .recent_window_scan(&snapshot, &std::sync::atomic::AtomicBool::new(false))
+            .unwrap()
+            .expect("not cancelled");
+        drop(snapshot);
+        assert_eq!(scanned, before.len() as u64, "the scan reads the snapshot only");
+        let pending = store
+            .recent_window_finish(window)
+            .unwrap()
+            .expect("not superseded");
+        assert!(pending > 0);
+        assert_eq!(recent_live(&store).top(), above);
+        assert_recent_window_exact(&store);
+    }
+
+    #[test]
+    fn recent_window_stale_tip_is_discarded_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let tip = BlockHash::from_byte_array([0x06; 32]);
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            recent_build(&store);
+            let mut batch = puts(&[(make_outpoint(0x06, 0), 1)]);
+            batch.tip = Some(tip);
+            store.write_batch(batch).unwrap();
+        }
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            assert_eq!(
+                recent_live(&store).tip_hash,
+                tip.to_byte_array(),
+                "same tip on reopen: the window is trusted"
+            );
+            // What a binary that does not maintain the window leaves
+            // behind: the tip moved on, the window did not.
+            let cf = store.cf(CF_METADATA);
+            store.db.put_cf(&cf, TIP_KEY, [0x07; 32]).unwrap();
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        assert!(
+            store.utxo_recent_heights().is_none(),
+            "a window written at another tip must be rebuilt, not served"
+        );
+    }
+
+    #[test]
+    fn recent_window_tip_only_batch_keeps_the_window_current() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            recent_build(&store);
+            store
+                .write_batch(puts(&[(make_outpoint(0x08, 0), 1)]))
+                .unwrap();
+            // Moves the tip with no coin deltas, as adopting an AssumeUTXO
+            // base or resetting to genesis does.
+            let batch = StoreBatch {
+                tip: Some(BlockHash::from_byte_array([0x08; 32])),
+                ..Default::default()
+            };
+            store.write_batch(batch).unwrap();
+        }
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        assert_eq!(recent_live(&store).tip_hash, [0x08; 32]);
+    }
+
+    #[test]
+    fn recent_window_cancel_leaves_no_key() {
+        use crate::storage::RecentWindowBuild;
+        let (store, _dir) = temp_store(false);
+        store
+            .write_batch(puts(&scattered_coins(100, 900, 0x09)))
+            .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            store.build_recent_window(&cancel).unwrap(),
+            RecentWindowBuild::Cancelled
+        );
+        assert!(store.utxo_recent_heights().is_none());
+        assert!(persisted_recent_window(&store).is_none());
+        // Deltas are dropped again rather than piling up in a dead build.
+        store
+            .write_batch(puts(&[(make_outpoint(0x09, 1_000), 3)]))
+            .unwrap();
+        assert!(matches!(recent_build(&store), RecentWindowBuild::Built { .. }));
+        assert_recent_window_exact(&store);
+    }
+
+    #[test]
+    fn recent_window_negative_count_is_clamped() {
+        let (store, _dir) = temp_store(false);
+        recent_build(&store);
+        store
+            .write_batch(puts(&[(make_outpoint(0x0a, 0), 9)]))
+            .unwrap();
+        // Two removes at a height the window counted once.
+        let mut batch = StoreBatch::default();
+        batch.coin_removes.push((make_outpoint(0x0a, 0), 1_000, 9));
+        batch.coin_removes.push((make_outpoint(0x0a, 1), 1_000, 9));
+        store.write_batch(batch).unwrap();
+        assert_eq!(recent_live(&store).count_at(9), Some(0), "clamped, not wrapped");
+        store
+            .write_batch(puts(&[(make_outpoint(0x0a, 2), 9)]))
+            .unwrap();
+        assert_eq!(recent_live(&store).count_at(9), Some(1));
+    }
+
+    #[test]
+    fn recent_window_clear_installs_an_exact_empty_window() {
+        use crate::storage::RecentWindowBuild;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+            recent_build(&store);
+            store
+                .write_batch(puts(&scattered_coins(50, 300, 0x0b)))
+                .unwrap();
+            store.clear_chainstate().unwrap();
+            let window = recent_live(&store);
+            assert!(window.counts.iter().all(|c| *c == 0));
+            assert_eq!(persisted_recent_window(&store), Some(window));
+
+            // A build that was scanning the coins when a clear dropped them
+            // must not install what it counted. (A scan already under way
+            // holds the old family's handle and keeps reading it, so its
+            // result is a real pre-clear count; fabricate one.)
+            *store.recent_window.lock() = RecentWindowState::Absent;
+            let snapshot = store.recent_window_begin().unwrap();
+            assert_eq!(
+                store.recent_window_begin().err(),
+                Some(RecentWindowBuild::InProgress),
+                "one build at a time"
+            );
+            store.clear_all().unwrap();
+            drop(snapshot);
+            let mut stale = crate::storage::RecentHeightWindow::empty([0; 32]);
+            stale.add_one(5);
+            assert_eq!(store.recent_window_finish(stale).unwrap(), None);
+            assert!(recent_live(&store).counts.iter().all(|c| *c == 0));
+            store.recent_window_abandon();
+            assert!(
+                store.utxo_recent_heights().is_some(),
+                "abandoning a superseded build must not discard the clear's window"
+            );
+            assert_eq!(recent_build(&store), RecentWindowBuild::AlreadyLive);
+        }
+        // Cleared stores have no tip, and the empty window was stamped with
+        // none, so it survives a restart.
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        assert!(store.utxo_recent_heights().is_some());
+    }
+
+    #[test]
+    fn recent_window_matches_the_in_memory_store() {
+        use crate::storage::RECENT_WINDOW;
+        use crate::storage::db::InMemoryStore;
+        let (rocks, _dir) = temp_store(false);
+        let mem = InMemoryStore::new();
+        recent_build(&rocks);
+        let coins = scattered_coins(2_000, 9_000, 0x0d);
+        let tip = coins.iter().map(|(_, h)| *h).max().unwrap();
+        for chunk in coins.chunks(500) {
+            rocks.write_batch(puts(chunk)).unwrap();
+            mem.write_batch(puts(chunk)).unwrap();
+        }
+        let mut spend = StoreBatch::default();
+        for (op, height) in coins.iter().step_by(4) {
+            spend.coin_removes.push((*op, 1_000, *height));
+        }
+        let spend_mem = StoreBatch {
+            coin_removes: spend.coin_removes.clone(),
+            ..Default::default()
+        };
+        rocks.write_batch(spend).unwrap();
+        mem.write_batch(spend_mem).unwrap();
+
+        let r = recent_live(&rocks);
+        let m = mem.utxo_recent_heights().expect("in-memory window is always live");
+        for height in tip - (RECENT_WINDOW - 1)..=tip {
+            assert_eq!(r.count_at(height), m.count_at(height), "height {height}");
+        }
+    }
+
+    #[test]
+    fn recent_window_counts_a_cached_coin_flushed_mid_build_once() {
+        use crate::storage::RecentWindowBuild;
+        use crate::storage::coin_cache::CoinCache;
+        let (store, _dir) = temp_store(false);
+        let (began_tx, began_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *store.recent_window_test_pause.lock() = Some((began_tx, resume_rx));
+        let cache = Arc::new(CoinCache::new(Box::new(store), 16));
+
+        // One coin already on disk, one still dirty in the cache when the
+        // build takes its snapshot.
+        cache
+            .write_batch(puts(&[(make_outpoint(0x0e, 0), 20)]))
+            .unwrap();
+        cache.flush().unwrap();
+        cache
+            .write_batch(puts(&[(make_outpoint(0x0e, 1), 20)]))
+            .unwrap();
+
+        let build = std::thread::spawn({
+            let cache = cache.clone();
+            move || {
+                cache
+                    .build_recent_window(&std::sync::atomic::AtomicBool::new(false))
+                    .unwrap()
+            }
+        });
+        began_rx.recv().unwrap();
+        cache.flush().unwrap();
+        resume_tx.send(()).unwrap();
+        match build.join().unwrap() {
+            RecentWindowBuild::Built {
+                coins_scanned,
+                pending_heights,
+                ..
+            } => {
+                assert_eq!(coins_scanned, 1, "only the flushed coin is in the snapshot");
+                assert_eq!(pending_heights, 1, "the late flush lands in pending");
+            }
+            other => panic!("expected a build, got {other:?}"),
+        }
+        assert_eq!(
+            cache.utxo_recent_heights().unwrap().count_at(20),
+            Some(2),
+            "each coin counted exactly once"
+        );
     }
 
     #[test]

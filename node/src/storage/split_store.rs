@@ -244,6 +244,17 @@ impl Store for SplitStore {
         self.coins_store.utxo_height_hist()
     }
 
+    fn utxo_recent_heights(&self) -> Option<crate::storage::RecentHeightWindow> {
+        self.coins_store.utxo_recent_heights()
+    }
+
+    fn build_recent_window(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::storage::RecentWindowBuild, StoreError> {
+        self.coins_store.build_recent_window(cancel)
+    }
+
     fn for_each_coin_snapshot(
         &self,
         f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,

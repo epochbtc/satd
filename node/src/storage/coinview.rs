@@ -129,6 +129,16 @@ impl Coin {
         Some(coin)
     }
 
+    /// The creation height of a compact-encoded coin, decoding nothing
+    /// else. The height is the leading varint (packed with the coinbase
+    /// flag), so a full UTXO-set walk that only needs heights skips the
+    /// script copy [`Coin::deserialize_compact`] makes. `None` for the same
+    /// out-of-range heights `deserialize_compact` rejects.
+    pub fn peek_height(data: &[u8]) -> Option<u32> {
+        let (height_cb, _) = decode_varint(data)?;
+        u32::try_from(height_cb >> 1).ok()
+    }
+
     /// Streaming variant of [`Coin::deserialize_compact`]: returns the
     /// decoded coin and the number of bytes consumed, so the caller can
     /// pack multiple coins back-to-back without an outer length prefix.
@@ -176,6 +186,26 @@ impl Coin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_height_reads_the_height_of_a_compact_coin() {
+        for (height, coinbase) in [(0u32, false), (1, true), (967_000, false), (u32::MAX, true)] {
+            let coin = Coin {
+                amount: 5_000,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                height,
+                coinbase,
+                txseq: 42,
+            };
+            let bytes = coin.serialize_compact();
+            assert_eq!(Coin::peek_height(&bytes), Some(height));
+            assert_eq!(
+                Coin::deserialize_compact(&bytes).map(|c| c.height),
+                Some(height)
+            );
+        }
+        assert_eq!(Coin::peek_height(&[]), None);
+    }
 
     #[test]
     fn test_outpoint_key_roundtrip() {
