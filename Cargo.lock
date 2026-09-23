@@ -2963,6 +2963,7 @@ version = "0.6.0-pre"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bincode",
  "bip324",

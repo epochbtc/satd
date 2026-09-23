@@ -1768,6 +1768,7 @@ async fn main() {
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
             satd_events::WsLimits {
                 max_conns: config.streamws_max_conns,
+                max_sockets: config.streamws_max_sockets,
                 max_subscriptions: config.streamws_max_subscriptions,
                 max_message_bytes: config.streamws_max_message_bytes,
                 prefix_min_bits: prefix_min_bits_cfg,
@@ -3103,7 +3104,9 @@ async fn main() {
                 s.add_permits(usize::MAX >> 8);
                 s
             } else {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(config.esplora_sse_max_conns))
+                std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(
+                    config.esplora_sse_max_conns,
+                )))
             };
             let state = esplora_handlers::EsploraState {
                 chain: chain_state.clone(),
@@ -3228,46 +3231,38 @@ async fn main() {
                 "Esplora REST listening"
             );
             listener_status.set_esplora(reported_bind);
-            let mut esplora_shutdown = shutdown_rx.clone();
+            // One `--esploramaxsockets` cap shared by both listeners: the
+            // limits are cloned into each, and a clone draws on the same
+            // pool. Both close a keep-alive connection that idles for longer
+            // than `--esplorarequesttimeout` (0 leaves idle connections open).
+            let esplora_limits = node::http_serve::ListenerLimits {
+                sockets: node::http_serve::SocketCap::new(config.esplora_max_sockets),
+                idle_timeout: (config.esplora_request_timeout > 0)
+                    .then(|| std::time::Duration::from_secs(config.esplora_request_timeout)),
+            };
             // The plain and TLS arms share the same `router` (axum's
             // Router is Clone-cheap). They observe the same shutdown
-            // watch, so SIGTERM gracefully drains both surfaces.
-            let plain_router = router.clone();
-            api_handle.spawn(async move {
-                let serve =
-                    axum::serve(listener, plain_router).with_graceful_shutdown(async move {
-                        let _ = esplora_shutdown.changed().await;
-                    });
-                if let Err(e) = serve.await {
-                    tracing::error!(error = %e, "Esplora server error");
-                }
-            });
-            if let Some((tls_bind, tls_listener, acceptor)) = tls_setup {
-                let tls_router = router.clone();
-                let mut tls_shutdown = shutdown_rx.clone();
+            // watch, so SIGTERM stops both surfaces.
+            api_handle.spawn(esplora_handlers::serve_plain(
+                listener,
+                router.clone(),
+                esplora_limits.clone(),
+                shutdown_rx.clone(),
+            ));
+            if let Some((_tls_bind, tls_listener, acceptor)) = tls_setup {
                 let allow = esplora_handlers::ClientAllowList::new(
                     config.esplora_mtls_client_allow.iter().cloned(),
                 );
-                let tls_wrap = esplora_handlers::TlsListener::new_with_mtls(
+                api_handle.spawn(esplora_handlers::serve_tls(
                     tls_listener,
                     acceptor,
                     tls_handshake_timeout,
                     config.esplora_mtls,
                     allow,
-                );
-                api_handle.spawn(async move {
-                    let serve = axum::serve(tls_wrap, tls_router)
-                        .with_graceful_shutdown(async move {
-                            let _ = tls_shutdown.changed().await;
-                        });
-                    if let Err(e) = serve.await {
-                        tracing::error!(
-                            error = %e,
-                            %tls_bind,
-                            "Esplora TLS server error",
-                        );
-                    }
-                });
+                    router.clone(),
+                    esplora_limits,
+                    shutdown_rx.clone(),
+                ));
             }
         }
     }

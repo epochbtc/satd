@@ -52,8 +52,8 @@ Every remotely-consumed surface bounds its concurrency and backlog, and sheds
 work that is over budget. Nothing queues without bound; an unbounded queue
 would let a consumer backpressure the node. Shedding runs ahead of
 authentication and request-body buffering, so a flood is bounded before it does
-work, authenticated or not. Each option is clamped to a ceiling, so a mistyped
-value cannot panic satd at boot.
+work, authenticated or not. Every connection and socket cap is clamped to
+100,000, so a mistyped value cannot panic satd at boot.
 
 | Surface | Options | Default | Over-budget response |
 |---|---|---|---|
@@ -62,13 +62,24 @@ value cannot panic satd at boot.
 | Read-only JSON-RPC | `-rpcreadonlythreads`, `-rpcreadonlyworkqueue` | inherit main | HTTP 429 + `Retry-After` |
 | events gRPC | `-eventsgrpcmaxconns`, `-eventsgrpcmaxsubscriptions` | 64 / 256 | gRPC `RESOURCE_EXHAUSTED` |
 | streaming WS/SSE | `-streamwsmaxconns`, `-streamwsmaxsubscriptions`, `-streamwsmaxmessagebytes` | 256 / 256 / 262144 | connection refused / 429 |
+| streaming WS/SSE sockets | `--streamws-max-sockets` | 1024 | connection closed at accept |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP 429 |
+| Esplora sockets (plain + TLS) | `-esploramaxsockets` | 1024 | connection closed at accept |
 | Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
-| JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection dropped at accept (TCP reset) |
+| JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection closed at accept |
 
-The JSON-RPC socket cap counts every open connection on a listener, idle
-keep-alive connections included, and is taken at accept, before
-authentication. `-rpcservertimeout` (default 30 s) closes a connection that
+A socket cap counts every open connection on a listener, idle keep-alive
+connections and open WebSockets included, and is taken at accept, before
+authentication; the
+per-request caps above bound work in flight and never see a socket that
+sends nothing. Esplora and streamws close a keep-alive connection that idles
+for longer than `-esplorarequesttimeout` (30 s by default) and 30 s
+respectively, so an idle client cannot hold a slot; an open SSE or
+WebSocket stream is not idle in that sense. These listeners, like the
+JSON-RPC ones, serve HTTP/1.1 only, and the idle budget runs from a
+connection's first byte, so a client cannot dodge it by sending a partial
+request head or by starting HTTP/2. For JSON-RPC the same role is
+played by `-rpcservertimeout` (default 30 s), which closes a connection that
 sits idle between requests and returns its slot; with `-rpcservertimeout=0`
 an idle connection holds its slot until the client closes it, so 100 idle
 connections from any client that can reach the listener lock out every other

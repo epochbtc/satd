@@ -88,6 +88,7 @@ stratum-v2 = ["dep:stratum-core"]
 libc = "0.2"
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tempfile = "3"
 # The vendored BIP 370 / 375 vectors, so the PSBT surface tests referee
 # themselves against the BIPs' own bytes rather than satd's idea of them.

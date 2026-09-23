@@ -11,6 +11,7 @@ use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
+use crate::http_serve::serve_http_connection;
 use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
 
@@ -4508,15 +4509,17 @@ async fn spawn_tls_surface(
                 }
             };
 
+            // The permit rides with the socket for its whole life: the
+            // handshake, the HTTP connection, and a WebSocket upgrade that
+            // outlives both (see `http_serve::Permitted`). An early `return`
+            // below drops the socket and so releases it.
+            let stream = crate::http_serve::Permitted::new(stream, permit);
             let acceptor = acceptor.clone();
             let rpc_svc = rpc_svc.clone();
             let conn_stop = accept_stop.clone();
             let allow = allow.clone();
             let mtls_enabled = cfg.mtls_enabled;
             tokio::spawn(async move {
-                // `permit` is owned by this task through the handshake and
-                // the mTLS check (an early `return` releases it) and is then
-                // handed to the task that outlives the connection, below.
                 let tls_stream =
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(s)) => s,
@@ -4595,24 +4598,17 @@ async fn spawn_tls_surface(
                 // `serve_with_graceful_shutdown` takes no timeout, which is
                 // why a TLS connection had none.
                 //
-                // Hold the permit for the connection's life, not just its
-                // handshake: this task returns as soon as serving starts, so
-                // a permit bound here would drop at that point and the cap
-                // would bound in-flight handshakes only, leaving established
-                // (idle-keepalive) connections uncounted. A separate task
-                // owns the permit and awaits the serve task's JoinHandle,
-                // whose type does not name the service's HRTB lifetime —
-                // the same shape the plain accept loop uses.
-                let serve = tokio::spawn(serve_http_connection(
+                // Spawned directly (see the plain accept loop on the HRTB
+                // quirk). The permit is inside `tls_stream`, so it is held
+                // until the socket closes -- a task awaiting this serve
+                // future would release it when hyper hands a WebSocket
+                // upgrade the socket, which is when that future completes.
+                tokio::spawn(serve_http_connection(
                     tls_stream,
                     svc,
                     conn_stop.shutdown(),
                     header_read_timeout,
                 ));
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = serve.await;
-                });
             });
         }
     });
@@ -4910,100 +4906,21 @@ pub async fn spawn_plain_surface(
 
             // Spawn the serve future DIRECTLY (no wrapping async block) —
             // wrapping it bites an HRTB-inference quirk on the service's
-            // request lifetime (the TLS path documents the same). To hold
-            // the connection permit for the connection's lifetime without
-            // re-triggering that quirk, a separate task owns the permit
-            // and awaits the serve task's JoinHandle (whose type doesn't
-            // name the service's HRTB lifetime); the permit drops when the
-            // connection ends.
-            let serve = tokio::spawn(serve_http_connection(
-                stream,
+            // request lifetime (the TLS path documents the same). The
+            // connection permit travels inside the socket
+            // (`http_serve::Permitted`), so it is held until the socket
+            // closes, including after a WebSocket upgrade, when this serve
+            // future has already completed.
+            tokio::spawn(serve_http_connection(
+                crate::http_serve::Permitted::new(stream, permit),
                 svc,
                 conn_stop.shutdown(),
                 header_read_timeout,
             ));
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = serve.await;
-            });
         }
     });
 
     Ok(server_handle)
-}
-
-/// Serve a single HTTP connection under an optional per-request timeout.
-///
-/// This is the plain-HTTP equivalent of jsonrpsee's
-/// [`serve_with_graceful_shutdown`], with one addition: when
-/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1 builder is
-/// configured with a matching `header_read_timeout` (plus the required
-/// timer), so a client that opens a TCP connection but never completes a
-/// request head — including the head of the *next* request on an idle
-/// keep-alive connection — gets disconnected rather than holding a connection
-/// slot forever. HTTP/2 gets the same budget as a keep-alive ping deadline.
-///
-/// The other half of Bitcoin Core's `-rpcservertimeout` is the request body,
-/// which hyper cannot time out; that budget is applied where satd reads the
-/// body, in [`crate::rpc::compat::JsonRpcCompatLayer`].
-async fn serve_http_connection<S, B, I>(
-    io: I,
-    service: S,
-    stopped: impl std::future::Future<Output = ()>,
-    header_read_timeout: Option<Duration>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    // Generic over the transport so the TLS surface gets the same timeouts
-    // as the plain one. It used to be `TcpStream`-only, which is why
-    // `spawn_tls_surface` fell back to jsonrpsee's helper — and so ignored
-    // `-rpcservertimeout` entirely.
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    S: tower::Service<
-            jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
-            Response = jsonrpsee::server::HttpResponse<B>,
-            Error = tower::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    S::Future: Send,
-    B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
-    B::Error: Into<tower::BoxError>,
-{
-    let service = hyper_util::service::TowerToHyperService::new(service);
-    let io = hyper_util::rt::TokioIo::new(io);
-
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    if let Some(timeout) = header_read_timeout {
-        // hyper's timer is armed each time a request head is awaited, so this
-        // covers both the first head and the idle gap before the next request
-        // on a keep-alive connection. It stops once the head is complete: the
-        // body phase is bounded in the compat layer instead, because that is
-        // where satd reads the body and hyper offers no body-read timeout.
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(timeout)
-            // A keep-alive connection that goes quiet is closed on the same
-            // budget, which is what an operator setting this expects.
-            .keep_alive(true);
-        builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(Some(timeout))
-            .keep_alive_timeout(timeout);
-    }
-    let conn = builder.serve_connection_with_upgrades(io, service);
-
-    tokio::pin!(stopped, conn);
-
-    tokio::select! {
-        result = &mut conn => result,
-        () = stopped => {
-            conn.as_mut().graceful_shutdown();
-            conn.await
-        }
-    }
 }
 
 /// Core's `getblocktemplate` long poll: hold the call until the tip moves
@@ -5275,6 +5192,91 @@ mod tls_surface_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(admitted, "permit must be released when the connection closes");
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.stop();
+    }
+
+    /// A WebSocket upgrade on a JSON-RPC listener holds its connection slot
+    /// for as long as the socket lives. jsonrpsee serves WebSocket as well as
+    /// HTTP by default, and hyper's connection future completes when it hands
+    /// the socket to the upgrade, so a permit tied to that future went back to
+    /// the pool while the WebSocket stayed open, uncounted.
+    #[tokio::test]
+    async fn tls_connection_cap_counts_upgraded_websockets() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let cfg = RpcTlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path,
+            key_path,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: vec![],
+            handshake_timeout: Duration::from_secs(5),
+            max_connections: 1,
+        };
+        let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_status = ServerListenerStatus::new();
+        let handle = spawn_tls_surface(
+            cfg,
+            ServerConfig::default(),
+            auth,
+            Methods::new(),
+            listener_status.clone(),
+            &mut shutdown_rx,
+            AdmissionState::new(4, 16),
+            None,
+            None,
+            None,
+            Arc::new(Vec::new()),
+        )
+        .await
+        .expect("tls surface");
+        let bind_addr: SocketAddr = listener_status.rpc_tls().unwrap().parse().unwrap();
+
+        // "u:p" in Basic auth; a fixed RFC 6455 sample key.
+        const UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dTpw\r\n\
+            Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        let mut ws = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        ws.write_all(UPGRADE).await.unwrap();
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(5), ws.read(&mut buf))
+            .await
+            .expect("upgrade reply within 5s")
+            .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        assert!(head.starts_with("HTTP/1.1 101"), "the RPC listener upgrades: {head}");
+        // Give hyper the moment it takes to hand the socket over and finish
+        // the connection future -- the point at which a permit tied to that
+        // future used to be released.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The open WebSocket holds the only slot: a second connection is
+        // dropped at accept, so its handshake fails.
+        assert!(
+            tls_connect(bind_addr, &cert_der).await.is_err(),
+            "an open WebSocket must hold its connection slot"
+        );
+
+        drop(ws);
+        let mut admitted = false;
+        for _ in 0..100 {
+            if tls_connect(bind_addr, &cert_der).await.is_ok() {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "closing the WebSocket must release its slot");
 
         let _ = shutdown_tx.send(true);
         let _ = handle.stop();
