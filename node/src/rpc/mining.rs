@@ -137,6 +137,9 @@ pub fn generate_block(
 /// Handle the `getblocktemplate` RPC call.
 pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value {
     let template = create_template(chain_state, mempool);
+    let pre_segwit =
+        !crate::validation::block::segwit_active_at(chain_state.network, template.height);
+    let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
 
     let txs: Vec<Value> = template
         .transactions
@@ -147,6 +150,10 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
                 "data": hex::encode(&raw),
                 "txid": ttx.tx.compute_txid().to_string(),
                 "fee": ttx.fee,
+                // Core reports each transaction's sigop cost so a client that
+                // builds its own block can keep to `sigoplimit`; pre-segwit,
+                // both are unscaled (`src/rpc/mining.cpp`).
+                "sigops": if pre_segwit { ttx.sigop_cost / scale } else { ttx.sigop_cost },
                 "weight": ttx.weight,
             })
         })
@@ -163,8 +170,6 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
     // witness commitment (#548). Stock regtest activates segwit at genesis;
     // `-testactivationheight=segwit@N` is what makes the pre-segwit shape
     // reachable.
-    let pre_segwit =
-        !crate::validation::block::segwit_active_at(chain_state.network, template.height);
     let rules: Vec<&str> = if pre_segwit {
         vec!["csv"]
     } else {
@@ -172,8 +177,6 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         // rule must not use the template as-is (BIP 9 / BIP 22).
         vec!["csv", "!segwit", "taproot"]
     };
-    let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
-
     let mut result = json!({
         "version": template.version,
         "rules": rules,

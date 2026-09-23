@@ -15,12 +15,22 @@ const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 /// Reserve weight for coinbase transaction. Matches Bitcoin Core v30's
 /// `DEFAULT_BLOCK_RESERVED_WEIGHT` (8000 WU).
 pub(crate) const COINBASE_WEIGHT_RESERVE: usize = 8_000;
+/// The block sigop-cost limit `connect_block` enforces (`bad-blk-sigops`),
+/// Core's `MAX_BLOCK_SIGOPS_COST` (`src/consensus/consensus.h`).
+const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+/// Sigop cost set aside for the coinbase, Core's
+/// `DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS` (`src/policy/policy.h`).
+/// The Stratum server's coinbase costs at most 4 — one legacy sigop, for a
+/// P2PKH payout (`stratum::template` tests every payout type).
+pub(crate) const COINBASE_SIGOPS_RESERVE: u64 = 400;
 
 /// A selected transaction for the block template.
 pub struct TemplateTx {
     pub tx: Transaction,
     pub fee: u64,
     pub weight: usize,
+    /// Signature-operation cost, counted as `connect_block` counts it.
+    pub sigop_cost: u64,
 }
 
 /// Block template ready for mining.
@@ -224,6 +234,13 @@ fn assemble_template(
     let mut included: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
     let mut transactions = Vec::new();
     let mut total_weight = COINBASE_WEIGHT_RESERVE;
+    // Weight is not the only block limit. A mempool dense in sigops (bare
+    // multisig outputs count 20 each) fills 80,000 in a fraction of a block's
+    // weight, and a template that crosses it is a block `connect_block`
+    // refuses as `bad-blk-sigops`. Core's `BlockAssembler` starts from the
+    // coinbase's reserve and refuses a transaction that would bring the
+    // total to the limit or past it (`TestChunkBlockLimits`, `>=`).
+    let mut total_sigops = COINBASE_SIGOPS_RESERVE;
     let mut total_fees = 0u64;
 
     let mut remaining = entries;
@@ -300,6 +317,9 @@ fn assemble_template(
             if total_weight + entry.weight > MAX_BLOCK_WEIGHT {
                 continue; // weight only grows; this can never fit later
             }
+            if total_sigops.saturating_add(entry.sigop_cost) >= MAX_BLOCK_SIGOPS_COST {
+                continue; // nor do sigops
+            }
             // `-blockmintxfee`: Core's `addPackageTxs` compares
             // `chunk_feerate_vsize` against `blockMinFeeRate`
             // (`src/node/miner.cpp`) and skips the chunk when it falls short.
@@ -326,12 +346,14 @@ fn assemble_template(
                 continue;
             }
             total_weight += entry.weight;
+            total_sigops += entry.sigop_cost;
             total_fees += entry.fee;
             included.insert(txid);
             transactions.push(TemplateTx {
                 tx: entry.tx,
                 fee: entry.fee,
                 weight: entry.weight,
+                sigop_cost: entry.sigop_cost,
             });
             progressed = true;
         }
@@ -818,6 +840,34 @@ mod tests {
             coinbase: false,
             txseq: node_index::TXSEQ_UNKNOWN,
         }
+    }
+
+    /// Sigops are a block limit alongside weight: 400 of the 80,000 are
+    /// reserved for the coinbase, and a transaction that would bring the total
+    /// to 80,000 — not only past it — is left out, as in Core's
+    /// `TestChunkBlockLimits`. The higher-fee transaction here would land on
+    /// exactly 80,000; the lower-fee one lands one under.
+    #[test]
+    fn a_template_keeps_to_the_block_sigop_limit() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xB1), coin_at(0)),
+            (confirmed_prev(0xB2), coin_at(0)),
+        ]);
+        let exact = tx_spending(confirmed_prev(0xB1), 50_000, 0x41, 0xffff_ffff, 0);
+        let exact = mp.insert_tx_weighted_for_test(exact, 50_000, 400, QuarantineScope::acting());
+        mp.set_sigop_cost_for_test(&exact, MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE);
+        let under = tx_spending(confirmed_prev(0xB2), 50_000, 0x42, 0xffff_ffff, 0);
+        let under = mp.insert_tx_weighted_for_test(under, 40_000, 400, QuarantineScope::acting());
+        mp.set_sigop_cost_for_test(&under, MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE - 1);
+
+        let template = create_template(&cs, &mp);
+        let txids: Vec<_> = template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        assert_eq!(txids, vec![under], "only the transaction that stays under 80,000 fits");
+        let total: u64 = template.transactions.iter().map(|t| t.sigop_cost).sum();
+        assert!(total + COINBASE_SIGOPS_RESERVE < MAX_BLOCK_SIGOPS_COST);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

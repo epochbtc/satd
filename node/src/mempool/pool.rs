@@ -6327,6 +6327,12 @@ impl Mempool {
         self.sync_unbroadcast_len(&inner);
     }
 
+    /// Test-only: set an entry's sigop cost, which `insert_tx_weighted_for_test`
+    /// leaves at zero.
+    pub(crate) fn set_sigop_cost_for_test(&self, txid: &Txid, sigop_cost: u64) {
+        self.inner.write().entries.get_mut(txid).expect("entry").sigop_cost = sigop_cost;
+    }
+
     /// Test-only: insert a fully-formed entry for `tx` with the given fee,
     /// weight and quarantine `scope`, bypassing admission. Template tests
     /// use this to stage shapes admission would refuse (#588) or fee-rate

@@ -36,6 +36,8 @@ const MAX_TOKENS: usize = 1024;
 /// A token not used within this long is forgotten.
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+/// The block sigop-cost limit `connect_block` enforces (`bad-blk-sigops`).
+const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 
 /// A declared job: what `SetCustomMiningJob` and `PushSolution` are checked
 /// against.
@@ -55,6 +57,8 @@ pub struct DeclaredJob {
     /// The most the coinbase may claim: subsidy plus the declared fees.
     pub max_coinbase_value: u64,
     pub fees: u64,
+    /// The declared transactions' sigop cost, without a coinbase.
+    pub tx_sigops: u64,
 }
 
 enum TokenState {
@@ -234,8 +238,8 @@ impl WtxidIndex {
 #[derive(Default)]
 pub struct MempoolView {
     /// The declared transactions this node holds and would mine, by wtxid:
-    /// `(transaction, fee, weight)`.
-    pub by_wtxid: HashMap<bitcoin::Wtxid, (Transaction, u64, u64)>,
+    /// `(transaction, fee, weight, sigop cost)`.
+    pub by_wtxid: HashMap<bitcoin::Wtxid, (Transaction, u64, u64, u64)>,
     /// Inputs of those transactions that spend another mempool transaction,
     /// eligible or not: the parents a block must include first.
     pub txids: HashSet<Txid>,
@@ -271,7 +275,8 @@ impl MempoolView {
                         view.txids.insert(parent);
                     }
                 }
-                view.by_wtxid.insert(*wtxid, (entry.tx.clone(), entry.fee, entry.weight as u64));
+                view.by_wtxid
+                    .insert(*wtxid, (entry.tx.clone(), entry.fee, entry.weight as u64, entry.sigop_cost));
             }
             view
         })
@@ -286,7 +291,7 @@ pub fn check_declaration(
     subsidy: u64,
     mempool: &MempoolView,
 ) -> Result<DeclaredJob, Refusal> {
-    let (coinbase, extranonce_len) = decode_split_coinbase(&msg.coinbase_tx_prefix, &msg.coinbase_tx_suffix)
+    let (coinbase, extranonce_len, hole_at) = decode_split_coinbase(&msg.coinbase_tx_prefix, &msg.coinbase_tx_suffix)
         .ok_or_else(|| refuse("invalid-job-param-value-coinbase_tx_prefix", "the coinbase does not decode"))?;
     if !commits_to_height(coinbase.input.first().map_or(&[][..], |i| i.script_sig.as_bytes()), work.height) {
         return Err(refuse(
@@ -305,10 +310,11 @@ pub fn check_declaration(
     let mut included: HashSet<Txid> = HashSet::with_capacity(msg.wtxid_list.len());
     let mut fees = 0u64;
     let mut weight = coinbase.weight().to_wu();
+    let mut tx_sigops = 0u64;
     let mut missing = 0usize;
     for raw in &msg.wtxid_list {
         let wtxid = bitcoin::Wtxid::from_byte_array(*raw);
-        let Some((tx, fee, tx_weight)) = mempool.by_wtxid.get(&wtxid) else {
+        let Some((tx, fee, tx_weight, tx_sigop_cost)) = mempool.by_wtxid.get(&wtxid) else {
             missing += 1;
             continue;
         };
@@ -327,6 +333,7 @@ pub fn check_declaration(
         }
         fees = fees.saturating_add(*fee);
         weight = weight.saturating_add(*tx_weight);
+        tx_sigops = tx_sigops.saturating_add(*tx_sigop_cost);
         txdata.push(tx.clone());
     }
     if missing > 0 {
@@ -337,6 +344,19 @@ pub fn check_declaration(
     }
     if weight > MAX_BLOCK_WEIGHT {
         return Err(refuse("invalid-job-param-value-wtxid_list", format!("the block would weigh {weight} WU")));
+    }
+    // Sigops are a block limit too: a declaration inside the weight limit
+    // can still make a block `connect_block` refuses as `bad-blk-sigops`.
+    // This coinbase is the one a `PushSolution` completes.
+    let sigops = tx_sigops.saturating_add(coinbase_sigop_cost_bound(
+        &coinbase,
+        hole_at..hole_at + extranonce_len,
+    ));
+    if sigops > MAX_BLOCK_SIGOPS_COST {
+        return Err(refuse(
+            "invalid-job-param-value-wtxid_list",
+            format!("the block could carry {sigops} sigop cost, above the limit of {MAX_BLOCK_SIGOPS_COST}"),
+        ));
     }
 
     let max_coinbase_value = subsidy.saturating_add(fees);
@@ -364,6 +384,7 @@ pub fn check_declaration(
         txdata,
         max_coinbase_value,
         fees,
+        tx_sigops,
     })
 }
 
@@ -450,6 +471,18 @@ pub fn check_custom_job(
     bytes.extend_from_slice(&coinbase_suffix);
     let coinbase: Transaction = bitcoin::consensus::deserialize(&bytes)
         .map_err(|_| refuse("invalid-job-param-value-coinbase_tx_outputs", "the coinbase does not assemble"))?;
+    // The custom job's coinbase is its own — any outputs that pay the token's
+    // address — so the declared transactions' sigops are checked again with
+    // it. The extranonce ends the scriptSig here.
+    let sigops = job
+        .tx_sigops
+        .saturating_add(coinbase_sigop_cost_bound(&coinbase, msg.coinbase_prefix.len()..script_len));
+    if sigops > MAX_BLOCK_SIGOPS_COST {
+        return Err(refuse(
+            "invalid-job-param-value-coinbase_tx_outputs",
+            format!("the block could carry {sigops} sigop cost, above the limit of {MAX_BLOCK_SIGOPS_COST}"),
+        ));
+    }
     let block = block_with(coinbase, &job.txdata, &custom);
     if !block.check_witness_commitment() {
         return Err(refuse(
@@ -524,7 +557,7 @@ fn check_outputs(outputs: &[TxOut], payout: &ScriptBuf, max_value: u64) -> Resul
 
 /// Find the extranonce length that makes `prefix ++ zeros ++ suffix` exactly
 /// one coinbase transaction with the hole inside its scriptSig.
-fn decode_split_coinbase(prefix: &[u8], suffix: &[u8]) -> Option<(Transaction, usize)> {
+fn decode_split_coinbase(prefix: &[u8], suffix: &[u8]) -> Option<(Transaction, usize, usize)> {
     for len in 0..=crate::stratum::template::MAX_EXTRANONCE_LEN {
         let mut bytes = Vec::with_capacity(prefix.len() + len + suffix.len());
         bytes.extend_from_slice(prefix);
@@ -542,7 +575,7 @@ fn decode_split_coinbase(prefix: &[u8], suffix: &[u8]) -> Option<(Transaction, u
         let script = tx.input[0].script_sig.as_bytes();
         let start = 4 + if segwit { 2 } else { 0 } + 1 + 36 + VarInt(script.len() as u64).size();
         if prefix.len() >= start && prefix.len() + len <= start + script.len() {
-            return Some((tx, len));
+            return Some((tx, len, prefix.len() - start));
         }
     }
     None
@@ -555,6 +588,42 @@ fn decode_split_coinbase(prefix: &[u8], suffix: &[u8]) -> Option<(Transaction, u
 /// refused by the network as `bad-cb-height`.
 fn commits_to_height(script: &[u8], height: u32) -> bool {
     script.starts_with(&crate::validation::block::bip34_height_prefix(height))
+}
+
+/// The most sigop cost a coinbase can carry whatever extranonce fills
+/// `hole` (a byte range of its scriptSig), counted as `connect_block` counts
+/// a coinbase's: legacy sigops in the scriptSig and outputs, times four.
+///
+/// When one push's data covers the whole hole, every extranonce parses the
+/// same way and the count is exact. Otherwise the extranonce's bytes are
+/// opcodes whose count cannot be known in advance, and the scriptSig is
+/// bounded at 20 per byte, the most any opcode counts (`OP_CHECKMULTISIG`).
+fn coinbase_sigop_cost_bound(coinbase: &Transaction, hole: std::ops::Range<usize>) -> u64 {
+    let outputs: usize = coinbase.output.iter().map(|o| o.script_pubkey.count_sigops_legacy()).sum();
+    let script = &coinbase.input[0].script_sig;
+    let script_sigops = if hole.is_empty() || hole_inside_one_push(script, &hole) {
+        script.count_sigops_legacy()
+    } else {
+        20 * script.len()
+    };
+    4 * (outputs + script_sigops) as u64
+}
+
+/// Whether a single push's data covers all of `hole`.
+fn hole_inside_one_push(script: &bitcoin::Script, hole: &std::ops::Range<usize>) -> bool {
+    let bytes = script.as_bytes();
+    script.instruction_indices().map_while(Result::ok).any(|(at, op)| {
+        let bitcoin::script::Instruction::PushBytes(data) = op else { return false };
+        // Opcode, then the length bytes of OP_PUSHDATA1/2/4.
+        let header = match bytes[at] {
+            0x4c => 2,
+            0x4d => 3,
+            0x4e => 5,
+            _ => 1,
+        };
+        let start = at + header;
+        start <= hole.start && hole.end <= start + data.len()
+    })
 }
 
 fn block_with(mut coinbase: Transaction, txdata: &[Transaction], work: &Work) -> Block {
@@ -620,14 +689,17 @@ mod tests {
             min_time: 1_699_999_000,
             transactions: txs
                 .iter()
-                .map(|t| TemplateTx { tx: t.clone(), fee: FEE, weight: t.weight().to_wu() as usize })
+                .map(|t| TemplateTx { tx: t.clone(), fee: FEE, weight: t.weight().to_wu() as usize, sigop_cost: 0 })
                 .collect(),
             coinbase_value: SUBSIDY + FEE * txs.len() as u64,
         };
         let mempool = MempoolView {
             by_wtxid: txs
                 .iter()
-                .map(|t| (t.compute_wtxid(), (t.clone(), FEE, t.weight().to_wu())))
+                .map(|t| {
+                    let sigops = t.total_sigop_cost(|_| None) as u64;
+                    (t.compute_wtxid(), (t.clone(), FEE, t.weight().to_wu(), sigops))
+                })
                 .collect(),
             txids: txs.iter().map(|t| t.compute_txid()).collect(),
             over_weight: false,
@@ -861,6 +933,93 @@ mod tests {
         assert_eq!(check_custom_job(&bad, &declared, &work, hole).err().unwrap().code, "invalid-job-param-value-coinbase_tx_outputs");
     }
 
+    /// Give each declared transaction's mempool entry `cost` sigops.
+    fn with_sigops(mempool: &mut MempoolView, cost: u64) {
+        for entry in mempool.by_wtxid.values_mut() {
+            entry.3 = cost;
+        }
+    }
+
+    /// A bare 1-of-1 `OP_CHECKMULTISIG`, which counts 20 legacy sigops: 80
+    /// sigop cost as an output.
+    fn bare_multisig() -> ScriptBuf {
+        ScriptBuf::from_bytes([&[0x51, 0x21][..], &[2; 33], &[0x51, 0xae]].concat())
+    }
+
+    /// A declaration within the weight limit can still carry more sigops than
+    /// a block may: `connect_block` would refuse whatever block it yields as
+    /// `bad-blk-sigops`, so the declaration is refused instead. One sigop
+    /// under the limit is accepted.
+    #[test]
+    fn a_declaration_over_the_block_sigop_limit_is_refused() {
+        let txs = three_txs();
+        let (work, mut mempool) = setup(txs.clone());
+        let msg = declaration(&work, &payout(1), wtxids(&txs));
+
+        with_sigops(&mut mempool, MAX_BLOCK_SIGOPS_COST / 3 + 1);
+        let err = check_declaration(&msg, payout(1), &work, SUBSIDY, &mempool).unwrap_err();
+        assert_eq!(err.code, "invalid-job-param-value-wtxid_list");
+        assert!(err.details.contains("sigop cost"), "{err:?}");
+
+        with_sigops(&mut mempool, MAX_BLOCK_SIGOPS_COST / 3);
+        let declared = check_declaration(&msg, payout(1), &work, SUBSIDY, &mempool).expect("79,998 fits");
+        assert_eq!(declared.tx_sigops, 3 * (MAX_BLOCK_SIGOPS_COST / 3));
+    }
+
+    /// A custom job brings its own coinbase, and its outputs count: a declared
+    /// set 20 under the limit is refused once the custom coinbase adds an
+    /// 80-cost bare multisig output.
+    #[test]
+    fn a_custom_job_whose_coinbase_crosses_the_sigop_limit_is_refused() {
+        let txs = three_txs();
+        let (work, mut mempool) = setup(txs.clone());
+        with_sigops(&mut mempool, (MAX_BLOCK_SIGOPS_COST - 20) / 3);
+        let declared = check_declaration(&declaration(&work, &payout(1), wtxids(&txs)), payout(1), &work, SUBSIDY, &mempool).unwrap();
+        let hole = 8;
+        let mut msg = custom_job_msg(&work, &declared, declared.max_coinbase_value, true);
+        // The reference client's layout: the extranonce inside a push.
+        msg.coinbase_prefix.push(hole as u8);
+        check_custom_job(&msg, &declared, &work, hole).expect("the plain coinbase fits");
+
+        let mut outputs: Vec<TxOut> = bitcoin::consensus::deserialize(&msg.coinbase_tx_outputs).unwrap();
+        outputs.push(TxOut { value: Amount::ZERO, script_pubkey: bare_multisig() });
+        msg.coinbase_tx_outputs = bitcoin::consensus::serialize(&outputs);
+        let err = check_custom_job(&msg, &declared, &work, hole).err().unwrap();
+        assert_eq!(err.code, "invalid-job-param-value-coinbase_tx_outputs");
+        assert!(err.details.contains("sigop cost"), "{err:?}");
+    }
+
+    /// An extranonce inside a push is data whatever its bytes: the count is
+    /// exact. One outside any push is opcodes chosen later, so the scriptSig
+    /// is bounded at the most any opcode counts, 20 per byte.
+    #[test]
+    fn a_coinbase_sigop_bound_holds_for_any_extranonce() {
+        let coinbase = |script: Vec<u8>| Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: bare_multisig() }],
+        };
+        // height push, then an 8-byte push whose data is the hole.
+        let pushed = [&[0x02, 0x41, 0x01, 0x08][..], &[0; 8]].concat();
+        assert_eq!(coinbase_sigop_cost_bound(&coinbase(pushed.clone()), 4..12), 80, "the output's 20, exactly");
+        // Filled with OP_CHECKMULTISIG bytes it still counts only the output.
+        let filled = [&pushed[..4], &[0xae; 8]].concat();
+        assert_eq!(coinbase(filled).total_sigop_cost(|_| None), 80);
+
+        // The same hole with no push around it: 12 bytes of scriptSig at 20.
+        let raw = [&[0x02, 0x41, 0x01][..], &[0; 8], &[0x51]].concat();
+        let bound = coinbase_sigop_cost_bound(&coinbase(raw.clone()), 3..11);
+        assert_eq!(bound, 80 + 4 * 20 * 12);
+        let worst = [&raw[..3], &[0xae; 8], &raw[11..]].concat();
+        assert!(coinbase(worst).total_sigop_cost(|_| None) as u64 <= bound, "the bound holds for the worst filling");
+    }
+
     #[test]
     fn a_pushed_solution_assembles_the_declared_block() {
         let txs = three_txs();
@@ -971,6 +1130,7 @@ mod tests {
             merkle_branch: Vec::new(),
             max_coinbase_value: SUBSIDY,
             fees: 0,
+            tx_sigops: 0,
         }
     }
 

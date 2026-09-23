@@ -1789,6 +1789,105 @@ fn test_getblocktemplate_fields() {
     node.stop();
 }
 
+/// Mempool transactions that together exceed the block sigop limit, while
+/// weighing a fraction of a block: 7 transactions of 190 bare 1-of-3 multisig
+/// outputs each. A bare `OP_CHECKMULTISIG` in an output counts 20 legacy
+/// sigops, scaled by 4, so each transaction costs 190 × 80 + 1 (its P2WPKH
+/// input) = 15,201 — under the 16,000 per-transaction relay limit — and the
+/// seven cost 106,407 against a block limit of 80,000, in about 610,000 WU.
+fn fill_mempool_past_the_block_sigop_limit(node: &TestNode) -> (usize, u64) {
+    use bitcoin::blockdata::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_3};
+    use bitcoin::script::Builder;
+
+    const TXS: u64 = 7;
+    const OUTPUTS: usize = 190;
+    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
+    let addr = wallet.address.to_string();
+    sp_generate_to(node, TXS + 100, &addr);
+
+    let keys: Vec<_> = [0x71u8, 0x72, 0x73]
+        .iter()
+        .map(|b| DeterministicWallet::from_secret([*b; 32]).pk)
+        .collect();
+    let multisig = Builder::new()
+        .push_opcode(OP_PUSHNUM_1)
+        .push_key(&keys[0])
+        .push_key(&keys[1])
+        .push_key(&keys[2])
+        .push_opcode(OP_PUSHNUM_3)
+        .push_opcode(OP_CHECKMULTISIG)
+        .into_script();
+    let outputs = vec![multisig; OUTPUTS];
+    for h in 1..=TXS {
+        let (raw, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+            node,
+            &[(h, &wallet)],
+            &outputs,
+            100_000,
+        );
+        sp_send_raw(node, &raw);
+    }
+    let per_tx = OUTPUTS as u64 * 20 * 4 + 1;
+    (TXS as usize, per_tx)
+}
+
+/// The sigop cost of a template transaction, counted the way `connect_block`
+/// counts it. Every input in the fixture above spends a P2WPKH coinbase.
+fn template_tx_sigop_cost(tx: &bitcoin::Transaction) -> u64 {
+    let p2wpkh = DeterministicWallet::from_secret([0x5c; 32]).address.script_pubkey();
+    tx.total_sigop_cost(|_| {
+        Some(bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh.clone() })
+    }) as u64
+}
+
+/// A template must stay under the block sigop limit. `create_template`
+/// capped weight only, so a mempool dense in sigops produced a block that
+/// `connect_block` refuses as `bad-blk-sigops`: a miner who found it would
+/// have found nothing. Core budgets 400 of the 80,000 for the coinbase and
+/// refuses a transaction that would bring the total to 80,000 or more
+/// (`src/node/miner.cpp`, `TestChunkBlockLimits`).
+#[test]
+fn getblocktemplate_stays_under_the_block_sigop_limit() {
+    let mut node = TestNode::start(&["-permitbaremultisig=1"]);
+    let (txs, per_tx) = fill_mempool_past_the_block_sigop_limit(&node);
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    assert_eq!(info["result"]["size"], serde_json::json!(txs), "{info}");
+    assert!(txs as u64 * per_tx > 80_000, "the fixture must exceed the limit");
+
+    let gbt = node.rpc_call("getblocktemplate").unwrap();
+    let entries = gbt["result"]["transactions"].as_array().expect("transactions").clone();
+    let costs: Vec<u64> = entries
+        .iter()
+        .map(|e| {
+            let raw = hex::decode(e["data"].as_str().unwrap()).unwrap();
+            template_tx_sigop_cost(&bitcoin::consensus::deserialize(&raw).unwrap())
+        })
+        .collect();
+    let total: u64 = costs.iter().sum();
+    assert!(
+        total + 400 < 80_000,
+        "template carries {total} sigop cost in {} transactions; with the coinbase's 400 that must stay under 80,000",
+        entries.len()
+    );
+    assert_eq!(entries.len(), 5, "five of seven fit: 5 × {per_tx} + 400 < 80,000, a sixth would not");
+    for (e, cost) in entries.iter().zip(&costs) {
+        assert_eq!(e["sigops"].as_u64(), Some(*cost), "per-transaction sigops, as Core reports them: {e}");
+    }
+
+    // And the block built from it connects.
+    let before = get_rpc_u64(&node, "getblockcount").unwrap();
+    let addr = DeterministicWallet::from_secret([0x5d; 32]).address.to_string();
+    let mined = node
+        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)])
+        .expect("generatetoaddress");
+    assert!(mined["error"].is_null(), "the template's block must connect: {mined}");
+    assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), before + 1);
+    let left = node.rpc_call("getmempoolinfo").unwrap();
+    assert_eq!(left["result"]["size"], serde_json::json!(txs - 5), "the two that did not fit wait: {left}");
+
+    node.stop();
+}
+
 /// A JSON-RPC 2.0 request with no `id` is a notification: the method runs and
 /// nothing comes back. satd injected `"id": null` into every request that
 /// lacked one, so jsonrpsee never saw a notification and the node always
