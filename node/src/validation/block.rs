@@ -16,6 +16,38 @@ pub const WITNESS_SCALE_FACTOR: usize = 4;
 /// BIP 141 witness commitment header (OP_RETURN + push 36 bytes + magic).
 const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
+/// The bytes a coinbase scriptSig must start with at `height` under BIP 34:
+/// exactly Bitcoin Core's `CScript() << nHeight`.
+///
+/// Core checks the scriptSig *prefix* against that serialization, byte for
+/// byte (`validation.cpp`, `ContextualCheckBlock`, `bad-cb-height`), so only
+/// the minimal encoding is valid. `CScript::push_int64` (`script.h`) writes
+/// `OP_0` for 0 and `OP_1`..`OP_16` for 1..16; any other height is a direct
+/// push of `CScriptNum::serialize`: little-endian, shortest form, plus a
+/// `0x00` byte when the top bit of the last byte is set (heights are never
+/// negative). A height pushed any other way — a data push for 1..16, padding
+/// bytes, a sign byte that is not needed, `OP_PUSHDATA1` — carries the right
+/// number and is still invalid.
+pub fn bip34_height_prefix(height: u32) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + height as u8],
+        _ => {
+            let mut num: Vec<u8> = height.to_le_bytes().to_vec();
+            while num.last() == Some(&0) {
+                num.pop();
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0x00);
+            }
+            let mut prefix = Vec::with_capacity(num.len() + 1);
+            prefix.push(num.len() as u8);
+            prefix.extend_from_slice(&num);
+            prefix
+        }
+    }
+}
+
 /// Validate a block's structure and its BIP 141 witness data.
 ///
 /// This is Bitcoin Core's `CheckBlock` (structure, merkle root, CVE-2012-2459
@@ -443,6 +475,53 @@ fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bip34_height_prefix` against Bitcoin Core's serialization, written out
+    /// by hand from `CScript::push_int64` and `CScriptNum::serialize`
+    /// (`script.h`) at every place the encoding changes shape.
+    #[test]
+    fn bip34_height_prefix_is_cores_minimal_push() {
+        let cases: &[(u32, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x51]),
+            (16, &[0x60]),
+            (17, &[0x01, 0x11]),
+            (127, &[0x01, 0x7f]),
+            (128, &[0x02, 0x80, 0x00]),
+            (255, &[0x02, 0xff, 0x00]),
+            (256, &[0x02, 0x00, 0x01]),
+            (32_767, &[0x02, 0xff, 0x7f]),
+            (32_768, &[0x03, 0x00, 0x80, 0x00]),
+            (65_535, &[0x03, 0xff, 0xff, 0x00]),
+            (65_536, &[0x03, 0x00, 0x00, 0x01]),
+            (227_931, &[0x03, 0x5b, 0x7a, 0x03]),
+            (8_388_607, &[0x03, 0xff, 0xff, 0x7f]),
+            (8_388_608, &[0x04, 0x00, 0x00, 0x80, 0x00]),
+            (968_181, &[0x03, 0xf5, 0xc5, 0x0e]),
+            (0x7fff_ffff, &[0x04, 0xff, 0xff, 0xff, 0x7f]),
+            (0x8000_0000, &[0x05, 0x00, 0x00, 0x00, 0x80, 0x00]),
+            (u32::MAX, &[0x05, 0xff, 0xff, 0xff, 0xff, 0x00]),
+        ];
+        for (height, expected) in cases {
+            assert_eq!(bip34_height_prefix(*height), *expected, "height {height}");
+        }
+    }
+
+    /// The node's own coinbase builders write the height with rust-bitcoin's
+    /// `push_int`; the consensus check must accept exactly what they write.
+    #[test]
+    fn bip34_height_prefix_matches_push_int() {
+        let mut heights: Vec<u32> = (0..70_000).collect();
+        heights.extend((0..32).flat_map(|b| {
+            let p = 1u64 << b;
+            [p - 1, p, p + 1].map(|h| h.min(u64::from(u32::MAX)) as u32)
+        }));
+        for h in heights {
+            let script = bitcoin::script::Builder::new().push_int(i64::from(h)).into_script();
+            assert_eq!(bip34_height_prefix(h), script.as_bytes(), "height {h}");
+        }
+    }
+
     use bitcoin::Network;
 
     #[test]

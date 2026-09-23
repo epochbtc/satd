@@ -121,37 +121,6 @@ impl ConnectError {
     }
 }
 
-/// Decode the block height from a BIP 34 coinbase scriptSig.
-///
-/// BIP 34 requires the coinbase scriptSig to start with a CScript push of the
-/// block height. The push opcode specifies how many bytes follow. We interpret
-/// those bytes as a little-endian integer. Early BIP 34 blocks sometimes used
-/// non-minimal pushes (e.g., 4-byte push for a 3-byte height), so we only
-/// compare the decoded value, not the encoding length.
-pub(crate) fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
-    // Callers guard against an empty scriptSig, but return None rather than
-    // index-panic so this helper is safe to call on any input.
-    let first = *bytes.first()?;
-    match first {
-        0x00 => Some(0), // OP_0
-        0x51..=0x60 => Some((first - 0x50) as u32), // OP_1..OP_16
-        0x01..=0x08 => {
-            // Data push: first byte = number of bytes to push
-            let num_bytes = first as usize;
-            if 1 + num_bytes > bytes.len() {
-                return None;
-            }
-            // Read as little-endian, but cap to u32 (only use first 4 bytes)
-            let mut height: u32 = 0;
-            for i in 0..num_bytes.min(4) {
-                height |= (bytes[1 + i] as u32) << (8 * i);
-            }
-            Some(height)
-        }
-        _ => None,
-    }
-}
-
 /// Compute median time past (MTP) for a given height using the store directly.
 /// MTP is the median of the timestamps of the previous 11 blocks.
 pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> u32 {
@@ -639,18 +608,18 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             }
         }
 
-        // BIP 34: verify coinbase encodes the correct block height
-        if is_coinbase && height >= bip34_activation_height(network) {
-            let script = &tx.input[0].script_sig;
-            let bytes = script.as_bytes();
-            if bytes.is_empty() {
-                return Err(ConnectError::BadCoinbaseHeight);
-            }
-            let encoded_height = decode_coinbase_height(bytes)
-                .ok_or(ConnectError::BadCoinbaseHeight)?;
-            if encoded_height != height {
-                return Err(ConnectError::BadCoinbaseHeight);
-            }
+        // BIP 34: the coinbase scriptSig starts with exactly
+        // `CScript() << nHeight`, Core's minimal encoding. Core compares the
+        // bytes, not the decoded number, so a non-minimal push of the right
+        // height is `bad-cb-height` too.
+        if is_coinbase
+            && height >= bip34_activation_height(network)
+            && !tx.input[0]
+                .script_sig
+                .as_bytes()
+                .starts_with(&crate::validation::block::bip34_height_prefix(height))
+        {
+            return Err(ConnectError::BadCoinbaseHeight);
         }
 
         // Spend inputs (skip for coinbase which has no real inputs)
@@ -1460,48 +1429,6 @@ mod tests {
         // Regtest/signet: P2SH active from genesis, so the witness-aware
         // path is taken even at height 0 (same cost here — no P2SH data).
         assert_eq!(transaction_sigop_cost(&cb, Network::Regtest, 0, &empty), 800);
-    }
-
-    // ── decode_coinbase_height tests ──────────────────────────────────
-
-    #[test]
-    fn test_decode_coinbase_height_op_0() {
-        assert_eq!(decode_coinbase_height(&[0x00]), Some(0));
-    }
-
-    #[test]
-    fn test_decode_coinbase_height_op_1_through_16() {
-        for h in 1u32..=16 {
-            assert_eq!(decode_coinbase_height(&[0x50 + h as u8]), Some(h));
-        }
-    }
-
-    #[test]
-    fn test_decode_coinbase_height_data_push() {
-        assert_eq!(decode_coinbase_height(&[0x01, 0x11]), Some(17));
-        assert_eq!(decode_coinbase_height(&[0x01, 0xff]), Some(255));
-        assert_eq!(decode_coinbase_height(&[0x02, 0x00, 0x01]), Some(256));
-        assert_eq!(decode_coinbase_height(&[0x02, 0xe8, 0x03]), Some(1000));
-        assert_eq!(
-            decode_coinbase_height(&[0x03, 0xa0, 0x86, 0x01]),
-            Some(100_000)
-        );
-    }
-
-    #[test]
-    fn test_decode_coinbase_height_invalid() {
-        // Push 1 byte but no data following
-        assert_eq!(decode_coinbase_height(&[0x01]), None);
-        // Push size 0x09+ is out of range
-        assert_eq!(
-            decode_coinbase_height(&[0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            None
-        );
-        // 5-byte push is valid (extra nonce bytes, height in first 4)
-        assert_eq!(
-            decode_coinbase_height(&[0x05, 0x01, 0x00, 0x00, 0x00, 0x00]),
-            Some(1)
-        );
     }
 
     // ── helpers for connect_block tests ───────────────────────────────
@@ -3230,6 +3157,115 @@ mod tests {
         );
     }
 
+    /// BIP 34 as Bitcoin Core enforces it: the coinbase scriptSig must START
+    /// WITH exactly `CScript() << nHeight` (`validation.cpp`
+    /// `ContextualCheckBlock`, `bad-cb-height`), the minimal encoding —
+    /// `OP_1`..`OP_16` for 1–16, otherwise the shortest little-endian push with
+    /// a sign byte only when the top bit is set (`script.h` `push_int64`,
+    /// `CScriptNum::serialize`). A block that encodes the right VALUE any other
+    /// way is invalid to Core, so a node that accepts it follows a chain the
+    /// network rejects.
+    #[test]
+    fn test_bip34_height_must_be_the_minimal_push() {
+        fn connect_with(height: u32, script_sig: Vec<u8>) -> Result<(), ConnectError> {
+            let (store, outpoint, _) = make_test_store_with_coin(10, false);
+            let coinbase = Transaction {
+                version: Version(2),
+                lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: bitcoin::ScriptBuf::from_bytes(script_sig),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            };
+            let spending_tx = Transaction {
+                version: Version(2),
+                lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: outpoint,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_000_000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            };
+            let mut block = Block {
+                header: Header {
+                    version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                    prev_blockhash: BlockHash::all_zeros(),
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: 1_700_000_000,
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce: 0,
+                },
+                txdata: vec![coinbase, spending_tx],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            connect_block(&ConnectParams {
+                replay_plan: None,
+                store: &store,
+                block: &block,
+                height,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+                precomputed_txids: None,
+                address_index: &Default::default(),
+                sp_index: &Default::default(),
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &Default::default(),
+                phase_tracker: None,
+            })
+            .map(|_| ())
+        }
+        // A trailing OP_0 keeps every scriptSig at the 2-byte minimum.
+        let tail = |mut v: Vec<u8>| {
+            v.push(0x00);
+            v
+        };
+
+        // Controls: Core's own encoding connects.
+        for (height, minimal) in [(1u32, vec![0x51]), (16, vec![0x60]), (101, vec![0x01, 0x65]), (128, vec![0x02, 0x80, 0x00])] {
+            let r = connect_with(height, tail(minimal.clone()));
+            assert!(r.is_ok(), "minimal push {minimal:02x?} for {height} must connect: {r:?}");
+        }
+
+        // The right value, encoded any way but Core's: bad-cb-height.
+        let mut accepted = Vec::new();
+        for (height, script) in [
+            (1u32, vec![0x01, 0x01]),              // a push where Core uses OP_1
+            (16, vec![0x01, 0x10]),                // a push where Core uses OP_16
+            (101, vec![0x02, 0x65, 0x00]),         // padded to two bytes
+            (101, vec![0x04, 0x65, 0x00, 0x00, 0x00]), // padded to four
+            (101, vec![0x05, 0x65, 0x00, 0x00, 0x00, 0x00]), // five bytes, top one ignored
+            (128, vec![0x03, 0x80, 0x00, 0x00]),   // extra zero after the sign byte
+            (128, vec![0x01, 0x80]),               // no sign byte: a negative zero to Core
+            (101, vec![0x08, 0x65, 0, 0, 0, 0, 0, 0, 0]), // eight bytes
+            (101, vec![0x4c, 0x01, 0x65]),         // OP_PUSHDATA1, one byte
+            (128, vec![0x4c, 0x02, 0x80, 0x00]),   // OP_PUSHDATA1, the minimal bytes
+            (17, vec![0x61]),                      // OP_NOP, not a height at all
+            (101, vec![0x01, 0x64]),               // minimal, but the wrong height
+        ] {
+            let r = connect_with(height, tail(script.clone()));
+            if !matches!(r, Err(ConnectError::BadCoinbaseHeight)) {
+                accepted.push(format!("{height}: {script:02x?} -> {r:?}"));
+            }
+        }
+        assert!(accepted.is_empty(), "non-minimal height pushes must be bad-cb-height:\n{}", accepted.join("\n"));
+    }
+
     #[test]
     fn test_output_overflow() {
         // Spending tx outputs exceed inputs -> BadAmounts.
@@ -3557,42 +3593,6 @@ mod tests {
             result.is_ok(),
             "BIP 68 should not be enforced before activation height on mainnet, got {:?}",
             result.err(),
-        );
-    }
-
-    #[test]
-    fn test_coinbase_height_nonminimal_push() {
-        // Early BIP 34 blocks sometimes used non-minimal pushes: 4-byte push
-        // for a height that fits in 3 bytes. decode_coinbase_height should
-        // decode the value correctly regardless.
-        // Height 100,000 = 0x0186A0, fits in 3 bytes.
-        // Non-minimal: encoded as 4-byte push (0x04) with a trailing zero byte.
-        let bytes = [0x04, 0xA0, 0x86, 0x01, 0x00];
-        assert_eq!(
-            decode_coinbase_height(&bytes),
-            Some(100_000),
-            "Non-minimal 4-byte push for 3-byte height should decode correctly",
-        );
-    }
-
-    #[test]
-    fn test_coinbase_height_5_byte_push() {
-        // 5-byte push: decode_coinbase_height uses only the first 4 bytes for
-        // the height (u32), so the 5th byte is extra nonce / padding.
-        // Height = 1 (0x01), encoded as 5-byte push.
-        let bytes = [0x05, 0x01, 0x00, 0x00, 0x00, 0xFF];
-        assert_eq!(
-            decode_coinbase_height(&bytes),
-            Some(1),
-            "5-byte push should decode height from first 4 bytes",
-        );
-
-        // Height = 0x01020304 = 16,909,060
-        let bytes2 = [0x05, 0x04, 0x03, 0x02, 0x01, 0xAB];
-        assert_eq!(
-            decode_coinbase_height(&bytes2),
-            Some(0x01020304),
-            "5-byte push should decode height from first 4 bytes (larger value)",
         );
     }
 

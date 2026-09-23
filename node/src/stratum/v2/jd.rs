@@ -288,7 +288,7 @@ pub fn check_declaration(
 ) -> Result<DeclaredJob, Refusal> {
     let (coinbase, extranonce_len) = decode_split_coinbase(&msg.coinbase_tx_prefix, &msg.coinbase_tx_suffix)
         .ok_or_else(|| refuse("invalid-job-param-value-coinbase_tx_prefix", "the coinbase does not decode"))?;
-    if coinbase_height(&coinbase) != Some(work.height) {
+    if !commits_to_height(coinbase.input.first().map_or(&[][..], |i| i.script_sig.as_bytes()), work.height) {
         return Err(refuse(
             "invalid-job-param-value-coinbase_tx_prefix",
             format!("the coinbase does not commit to height {}, the next block on the current tip", work.height),
@@ -400,7 +400,7 @@ pub fn check_custom_job(
     // extranonce's push opcode there, and the reference server takes it; the
     // bound that matters is the scriptSig's own 100 bytes.
     let script_len = msg.coinbase_prefix.len() + hole_len;
-    if !(2..=100).contains(&script_len) || script_height(&msg.coinbase_prefix) != Some(work.height) {
+    if !(2..=100).contains(&script_len) || !commits_to_height(&msg.coinbase_prefix, work.height) {
         return Err(refuse(
             "invalid-job-param-value-coinbase_prefix",
             "the coinbase prefix must start with the block height and leave the scriptSig at most 100 bytes",
@@ -548,27 +548,13 @@ fn decode_split_coinbase(prefix: &[u8], suffix: &[u8]) -> Option<(Transaction, u
     None
 }
 
-/// The BIP 34 height a coinbase commits to.
-fn coinbase_height(tx: &Transaction) -> Option<u32> {
-    script_height(tx.input.first()?.script_sig.as_bytes())
-}
-
-/// The height pushed at the start of a coinbase scriptSig (possibly
-/// truncated after the push).
-fn script_height(script: &[u8]) -> Option<u32> {
-    let op = *script.first()?;
-    match op {
-        0x51..=0x60 => Some(u32::from(op - 0x50)),
-        1..=4 => {
-            let n = usize::from(op);
-            let bytes = script.get(1..1 + n)?;
-            let mut buf = [0u8; 4];
-            buf[..n].copy_from_slice(bytes);
-            // A sign bit would make the number negative, which no height is.
-            (bytes[n - 1] & 0x80 == 0).then(|| u32::from_le_bytes(buf))
-        }
-        _ => None,
-    }
+/// Whether a coinbase scriptSig (or the prefix of one) starts with the BIP 34
+/// commitment to `height` exactly as consensus requires: Bitcoin Core's
+/// minimal `CScript() << nHeight`, compared byte for byte. A non-minimal push
+/// of the right number would pass a decode-and-compare check here and then be
+/// refused by the network as `bad-cb-height`.
+fn commits_to_height(script: &[u8], height: u32) -> bool {
+    script.starts_with(&crate::validation::block::bip34_height_prefix(height))
 }
 
 fn block_with(mut coinbase: Transaction, txdata: &[Transaction], work: &Work) -> Block {
@@ -730,6 +716,47 @@ mod tests {
         let err = check_declaration(&declaration(&work, &payout(1), doubled), payout(1), &work, SUBSIDY, &mempool)
             .unwrap_err();
         assert_eq!(err.code, "invalid-job-param-value-wtxid_list");
+    }
+
+    /// BIP 34 as consensus checks it: the scriptSig must start with exactly
+    /// the minimal push of the height. A coinbase that pushes the right
+    /// number any other way would pass a decode-and-compare check here, be
+    /// mined, and then be refused by every Bitcoin Core node as
+    /// `bad-cb-height`, so it is refused before anyone hashes on it.
+    #[test]
+    fn a_non_minimal_height_push_is_refused() {
+        let txs = three_txs();
+        let (work, mempool) = setup(txs.clone());
+        let minimal = [0x02, 0x41, 0x01]; // 321
+        let good = declaration(&work, &payout(1), wtxids(&txs));
+        // version (4) | input count (1) | prevout (36) | scriptSig length (1)
+        assert_eq!(&good.coinbase_tx_prefix[42..45], minimal, "fixture height push");
+        check_declaration(&good, payout(1), &work, SUBSIDY, &mempool).expect("the minimal push is accepted");
+
+        for non_minimal in [
+            vec![0x03, 0x41, 0x01, 0x00],       // padded
+            vec![0x04, 0x41, 0x01, 0x00, 0x00], // padded twice
+            vec![0x4c, 0x02, 0x41, 0x01],       // OP_PUSHDATA1
+        ] {
+            let mut msg = good.clone();
+            let mut prefix = msg.coinbase_tx_prefix[..41].to_vec();
+            prefix.push(msg.coinbase_tx_prefix[41] + (non_minimal.len() - minimal.len()) as u8);
+            prefix.extend_from_slice(&non_minimal);
+            prefix.extend_from_slice(&msg.coinbase_tx_prefix[45..]);
+            msg.coinbase_tx_prefix = prefix;
+            let err = check_declaration(&msg, payout(1), &work, SUBSIDY, &mempool).unwrap_err();
+            assert_eq!(err.code, "invalid-job-param-value-coinbase_tx_prefix", "{non_minimal:02x?}: {err:?}");
+        }
+
+        // The same rule on a custom job's scriptSig prefix.
+        let declared = check_declaration(&good, payout(1), &work, SUBSIDY, &mempool).unwrap();
+        let hole = 12;
+        let mut msg = custom_job_msg(&work, &declared, declared.max_coinbase_value, true);
+        assert_eq!(msg.coinbase_prefix, minimal);
+        check_custom_job(&msg, &declared, &work, hole).expect("the minimal push is accepted");
+        msg.coinbase_prefix = vec![0x03, 0x41, 0x01, 0x00];
+        let err = check_custom_job(&msg, &declared, &work, hole).err().unwrap();
+        assert_eq!(err.code, "invalid-job-param-value-coinbase_prefix");
     }
 
     #[test]
