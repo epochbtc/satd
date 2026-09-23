@@ -688,6 +688,7 @@ mod tests {
             max_conns: 4,
             vardiff: VardiffConfig::default(),
             v2: None,
+            found_block_dir: None,
         }
     }
 
