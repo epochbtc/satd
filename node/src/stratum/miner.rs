@@ -34,11 +34,24 @@ pub const UNAUTHORIZED_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The shortest silence that drops a miner, however fast it submits.
 pub const MIN_MINER_IDLE_TIMEOUT: Duration = UNAUTHORIZED_IDLE_TIMEOUT;
 
-/// The silence that drops a miner before its share rate is known.
-pub const UNESTIMATED_MINER_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// The longest silence a miner is allowed, however slowly it submits.
-pub const MAX_MINER_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+///
+/// A difficulty is a whole number, so no miner can be given shares easier
+/// than difficulty 1, which takes `2^32` hashes on average: over an hour for
+/// a miner below about 1.2 MH/s, the ESP32-class "lottery" devices many solo
+/// miners run. A day is twenty such intervals for a miner of about 1 MH/s.
+///
+/// This is a backstop, not the way a dead miner is found. The node writes a
+/// job to every miner at least every 30 seconds, so the operating system's
+/// TCP retransmission gives up on a peer that has gone away, and the session
+/// ends on the read error, whatever the idle limit says.
+pub const MAX_MINER_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+/// The silence that drops a miner before its share rate is known: the same
+/// backstop. Until a miner has submitted, its silence says nothing — a new
+/// lottery device at the default difficulty can go hours before vardiff has
+/// lowered it far enough to find a first share.
+pub const UNESTIMATED_MINER_IDLE_TIMEOUT: Duration = MAX_MINER_IDLE_TIMEOUT;
 
 /// How many expected share intervals of silence drop a miner.
 ///
@@ -46,7 +59,7 @@ pub const MAX_MINER_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// happens with probability `e^-k`. At vardiff's one share per 30 seconds a
 /// miner has about 2,900 gaps a day; at `k = 20` (`e^-20` ≈ 2·10⁻⁹) a
 /// hashing miner is dropped by chance about once in four centuries, and
-/// about once a week if the rate estimate were twice the truth (`e^-10`). A dead miner is found after about ten minutes.
+/// about once a week if the rate estimate were twice the truth (`e^-10`).
 pub const IDLE_SHARE_INTERVALS: f64 = 20.0;
 
 /// Shares an estimate needs before it is trusted for the idle limit.

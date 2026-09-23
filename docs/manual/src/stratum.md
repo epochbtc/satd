@@ -274,10 +274,12 @@ What the lines point to:
 
 - **No `authorized` line.** The miner is not reaching the listener, or its
   username is refused; the refusal is logged at warn.
-- **Authorized, then disconnected with `reason="idle"` after ten minutes and
-  no shares.** The device connected but is not submitting. Check that the node
-  is issuing work: during initial block download it withholds work and says so
-  once.
+- **Authorized, then no shares for a long time.** A device far slower than
+  the starting difficulty needs several minutes for vardiff to lower it, and a
+  sub-MH/s device over an hour for its first share at difficulty 1 (see
+  [Slow miners](#difficulty-and-vardiff)). If a fast device shows no shares
+  after several minutes, check that the node is issuing work: during initial
+  block download it withholds work and says so once.
 - **Disconnected with `reason="binary data on the Stratum V1 port (a Stratum V2
   client?)"`.** The miner is set to Stratum V2 but pointed at the V1 port. Point
   it at the `--stratumv2bind` port, or switch it to Stratum V1.
@@ -353,7 +355,12 @@ difficulty only when the shares since the last change are clearly off target:
   alone rarely gets through); or
 - once at least 40 shares were expected since the last change, when that
   probability is below 1 in 1,000, so that a moderate error is still
-  corrected, on enough shares to land close to the target.
+  corrected, on enough shares to land close to the target; or
+- for a miner that has not had a share accepted since it connected, when that
+  probability is below 1 in 100. Its difficulty is only a starting guess, and
+  a slow device can be lowered from the default to difficulty 1 in about
+  twelve minutes instead of half an hour. A fast miner lowered too far by
+  this floods shares and is raised again within a minute.
 
 Even then, a rate within 15% of the target is left alone. A change moves the
 difficulty to where the observed rate says it should be, by at most a factor
@@ -361,18 +368,40 @@ of eight, never below the `mining.suggest_difficulty` floor and never above
 the network difficulty. Shares are counted for the difficulty they were
 judged at, so a share on an older job still counts for its work.
 
-In practice, measured over simulated miners from 100 GH/s to 100 TH/s:
+In practice, measured over 300 simulated six-hour runs of miners from 100 GH/s
+to 100 TH/s:
 
 - A miner whose difficulty is ten times too low (shares far too fast) is
   within a factor of two of its best difficulty within a minute and a half.
-- A miner whose difficulty is ten times too high needs its rarer shares to
-  show it, and is within a factor of two of its best difficulty in about seven
-  minutes, at worst about half an hour.
-- Once settled, the difficulty stays within a factor of two, changing at most
-  a few times in five hours, and the mean share interval stays within 20% of
-  30 seconds.
-- A miner that goes quiet has its difficulty lowered after about eleven
-  expected share intervals without a share.
+- A miner whose difficulty is ten times too high is within a factor of two of
+  its best difficulty in about two and a half minutes, at worst about forty.
+- Once settled, the difficulty of 95% of miners stays within a factor of two,
+  changing at most four times in five hours, with the mean share interval
+  within 20% of 30 seconds. The check runs every ten seconds, so now and then
+  luck passes even a 1-in-100,000 test; such a miner makes one excursion of
+  no more than one step and is corrected within minutes.
+- A miner that has submitted before and goes quiet has its difficulty lowered
+  after about eleven expected share intervals without a share.
+
+**Slow miners.** Difficulty is a whole number, so no miner gets shares easier
+than difficulty 1, which takes `2^32` hashes (about 4.3 billion) on average. A
+device's share interval at difficulty 1 is `2^32 / hashrate` seconds: about 72
+minutes at 1 MH/s and about a day at 50 kH/s. Simulated from the mainnet
+default difficulty of 10,000, without `mining.suggest_difficulty`:
+
+| Device | First share (median) | Shares a day | Idle disconnects a day |
+|---|---|---|---|
+| 1.2 TH/s | 22 s | ~2,900 | 0 |
+| 100 GH/s | 2.6 min | ~2,900 | 0 |
+| 1 GH/s | 7.5 min | ~2,800 | 0 |
+| 7 MH/s | 19 min | ~140 | 0 |
+| 1 MH/s | 76 min | ~19 | 0 |
+| 50 kH/s | 16 h | ~1 | about one |
+
+A device below about 1 MH/s cannot find twenty difficulty-1 shares a day, so
+it now and then outlasts the one-day idle limit ([below](#idle-connections))
+and reconnects. That costs it nothing but the reconnect: its chance of finding
+a block does not depend on its shares, and every connection gets current work.
 
 A difficulty change is sent as `mining.set_difficulty` followed by a new job
 (Stratum V1) or `SetTarget` (Stratum V2); shares for the previous job are
@@ -426,24 +455,32 @@ that:
 
 - Once the miner has four accepted shares, it may go quiet for **twenty
   expected share intervals** at its current difficulty, but never less than 120
-  seconds and never more than an hour. The expected interval comes from the
+  seconds and never more than a day. The expected interval comes from the
   slower of two hashrate estimates: the ten minutes before its last accepted
   share, and the whole connection up to that share. Both stop at the last
   share, so the silence being timed does not stretch its own limit. At
   vardiff's one share every 30 seconds the limit is ten minutes.
-- Before that, it may go quiet for **ten minutes**.
+- Before that, it may go quiet for **a day**. A new miner's silence says
+  nothing yet: a slow device at the default difficulty can take over an hour
+  to find its first share, most of it after vardiff has lowered it as far as
+  it goes.
 
 The limit is recomputed as the difficulty changes. Shares arrive at random, so
 a gap of twenty expected intervals has a probability of about 2 in a billion.
-A miner that is still hashing is not dropped, and a dead one is found in about
-ten minutes. A Stratum V2 connection counts the share rates of all its
-channels.
+A Stratum V2 connection counts the share rates of all its channels.
 
-The one-hour ceiling matters only for a miner that expects fewer than one
-share every three minutes. Vardiff aims at one share every 30 seconds, so a
-miner held there is almost always one whose `mining.suggest_difficulty` floor
-is above what the device can reach. Such a miner can be dropped while it is
-hashing; lower the floor.
+The idle limit is a backstop, not how a miner that has gone away is noticed.
+The node sends every miner a job at least every 30 seconds, so a peer that is
+switched off or unplugged stops acknowledging them, the operating system's TCP
+retransmission gives up on the connection (after about fifteen minutes with
+Linux defaults), and the session ends with a read or write error.
+
+The one-day ceiling matters for a miner that expects fewer than one share
+every 72 minutes: a device slower than about 1 MH/s even at difficulty 1 (see
+[Slow miners](#difficulty-and-vardiff)), or one whose
+`mining.suggest_difficulty` floor is above what it can reach. Such a miner is
+now and then dropped while it is hashing and reconnects; lower the floor if
+you set one.
 
 When vardiff lowers the difficulty of a miner that has gone quiet, the idle
 limit is still judged at the difficulty of the miner's last share, so the

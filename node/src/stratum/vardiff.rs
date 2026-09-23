@@ -60,11 +60,26 @@ pub struct VardiffConfig {
     /// How many shares must have been expected since the last change before
     /// [`VardiffConfig::fine_significance`] applies.
     pub fine_min_shares: f64,
+    /// The significance for lowering the difficulty of a miner that has not
+    /// had one share accepted since it connected. Its difficulty is only a
+    /// guess, so a wrong guess is cheap to correct: a miner that was lowered
+    /// too far floods shares and is raised again within a minute. A right
+    /// one matters: a slow device at the default difficulty would otherwise
+    /// take hours to reach a difficulty at which it can find a share.
+    pub first_significance: f64,
 }
 
 impl Default for VardiffConfig {
     fn default() -> Self {
-        Self { target_interval: Duration::from_secs(30), significance: 1e-5, fine_significance: 1e-3, deadband: 1.15, max_step: 8, fine_min_shares: 40.0 }
+        Self {
+            target_interval: Duration::from_secs(30),
+            significance: 1e-5,
+            fine_significance: 1e-3,
+            deadband: 1.15,
+            max_step: 8,
+            fine_min_shares: 40.0,
+            first_significance: 1e-2,
+        }
     }
 }
 
@@ -83,12 +98,14 @@ pub struct Vardiff {
     /// judged at over the current difficulty: a share judged at the old
     /// difficulty after a change still counts for the work it proves.
     shares: f64,
+    /// Whether any share has been accepted since the miner connected.
+    ever_accepted: bool,
 }
 
 impl Vardiff {
     pub fn new(config: VardiffConfig, initial: u64, now: Instant) -> Self {
         let initial = initial.max(1);
-        Self { config, difficulty: initial, floor: 1, since: now, shares: 0.0 }
+        Self { config, difficulty: initial, floor: 1, since: now, shares: 0.0, ever_accepted: false }
     }
 
     pub fn difficulty(&self) -> u64 {
@@ -98,6 +115,7 @@ impl Vardiff {
     /// Count an accepted share judged at `judged_at`.
     pub fn record_share(&mut self, judged_at: u64) {
         self.shares += judged_at.max(1) as f64 / self.difficulty as f64;
+        self.ever_accepted = true;
     }
 
     /// A miner's `suggest_difficulty`: clamp it to `[1, 2^48]`, adopt it now
@@ -135,7 +153,9 @@ impl Vardiff {
         let strong = off_at(self.config.significance);
         let established =
             expected >= self.config.fine_min_shares && off_at(self.config.fine_significance);
-        if !strong && !established {
+        // With no share yet this can only lower the difficulty.
+        let first = !self.ever_accepted && off_at(self.config.first_significance);
+        if !strong && !established && !first {
             return None;
         }
         let band = self.config.deadband.max(1.0);
@@ -245,9 +265,44 @@ mod tests {
     #[test]
     fn a_silent_miner_has_its_difficulty_lowered() {
         let t0 = Instant::now();
+        // A miner that has submitted: forty shares in twenty seconds raise it.
+        let mut v = with_shares(40, 1_000, t0);
+        assert_eq!(v.retarget(secs(t0, 20), u64::MAX), Some(8_000));
+        // Then silence.
+        assert_eq!(v.retarget(secs(t0, 20 + 340), u64::MAX), None);
+        assert_eq!(v.retarget(secs(t0, 20 + 350), u64::MAX), Some(1_000));
+    }
+
+    /// A miner with no share yet is lowered on much less silence: its
+    /// difficulty is a guess. At the default first-share significance that
+    /// is about 4.6 expected shares (e^-4.6 ≈ 1e-2), so a device far too
+    /// slow for the default difficulty reaches difficulty 1 in minutes.
+    #[test]
+    fn a_miner_with_no_share_yet_is_lowered_quickly() {
+        let t0 = Instant::now();
         let mut v = with_shares(0, 10_000, t0);
-        assert_eq!(v.retarget(secs(t0, 340), u64::MAX), None);
-        assert_eq!(v.retarget(secs(t0, 350), u64::MAX), Some(1_250));
+        assert_eq!(v.retarget(secs(t0, 130), u64::MAX), None);
+        assert_eq!(v.retarget(secs(t0, 140), u64::MAX), Some(1_250));
+        let mut t = 140;
+        // 1,250 / 8 = 156.25, / 8 = 19.5 → 20, / 8 = 2.5 → 3, then the floor.
+        for want in [156, 20, 3, 1] {
+            t += 140;
+            assert_eq!(v.retarget(secs(t0, t), u64::MAX), Some(want), "at {t} s");
+        }
+    }
+
+    /// The quick descent is for a miner that has never submitted: after its
+    /// first share, a silence is judged at the strict significance.
+    #[test]
+    fn the_quick_descent_ends_with_the_first_share() {
+        let t0 = Instant::now();
+        let mut v = with_shares(1, 10_000, t0);
+        // One share where 6.7 were expected: p ≈ 0.0098, enough for the
+        // first-share significance, nowhere near the strict one.
+        assert_eq!(v.retarget(secs(t0, 200), u64::MAX), None);
+        // Without the share, the same silence lowers it.
+        let mut v = with_shares(0, 10_000, t0);
+        assert_eq!(v.retarget(secs(t0, 200), u64::MAX), Some(1_250));
     }
 
     /// One retarget moves the difficulty by at most `max_step`, however far
@@ -415,51 +470,155 @@ mod tests {
     }
 
     /// Six simulated hours at three hashrates, from a difficulty ten times too
-    /// high and ten times too low, sixteen seeds each. A miner whose shares
-    /// come too fast is within a factor of two of its best difficulty in
-    /// [`CONVERGE_FAST_SECS`]; one whose shares are too rare, in
-    /// [`CONVERGE_SLOW_SECS`] (its evidence arrives at its slow rate). From
-    /// the second hour on the difficulty holds within a factor of two and
-    /// changes at most five times, with the mean share interval within 20%
-    /// of 30 seconds.
+    /// high and ten times too low, fifty seeds each (300 runs).
+    ///
+    /// Every run is within a factor of two of its best difficulty in
+    /// [`CONVERGE_FAST_SECS`] when its shares start ten times too fast, and in
+    /// [`CONVERGE_SLOW_SECS`] when they start ten times too rare. From the
+    /// second hour on, the difficulty of 95% of runs stays within a factor of
+    /// two and changes at most four times, with the mean share interval within
+    /// 20% of 30 seconds. Checking every ten seconds means a 1-in-100,000 test
+    /// is passed by luck now and then, so a few runs make one excursion and
+    /// correct it; none moves by more than one step (a factor of eight).
     #[test]
     fn simulated_miners_converge_and_then_hold_steady() {
         let mut failures = Vec::new();
         let mut report = Vec::new();
+        let (mut bands, mut retargets, mut intervals) = (Vec::new(), Vec::new(), Vec::new());
         for (label, start, limit) in [("10x too high", 10.0f64, CONVERGE_SLOW_SECS), ("10x too low", 0.1, CONVERGE_FAST_SECS)] {
-            let (mut converge, mut worst_band, mut worst_interval, mut most_retargets) = (Vec::new(), 1.0f64, 0.0f64, 0u32);
+            let mut converge = Vec::new();
             for hashrate in [100e9, 1.2e12, 100e12] {
                 let optimal = hashrate * 30.0 / 4_294_967_296.0;
                 let initial = ((optimal * start).round() as u64).max(1);
-                for seed in 1..=16u64 {
+                for seed in 1..=50u64 {
                     let run = simulate(hashrate, initial, 6.0, 3_600.0, seed * 7_919 + hashrate as u64);
                     let converged = run.converged_secs.unwrap_or(f64::INFINITY);
                     converge.push(converged);
-                    worst_band = worst_band.max(run.band);
-                    worst_interval = worst_interval.max((run.mean_interval - 30.0).abs());
-                    most_retargets = most_retargets.max(run.retargets_after_settling);
-                    if converged > limit
-                        || run.band > 2.0
-                        || (run.mean_interval - 30.0).abs() > 6.0
-                        || run.retargets_after_settling > 5
-                    {
+                    bands.push(run.band);
+                    retargets.push(run.retargets_after_settling as f64);
+                    intervals.push((run.mean_interval - 30.0).abs());
+                    if converged > limit || run.band > 8.0 {
                         failures.push(format!(
-                            "{hashrate:e} H/s, {label}, seed {seed}: converged {converged:.0} s, band x{:.2}, \
-                             mean interval {:.1} s, {} retargets",
-                            run.band, run.mean_interval, run.retargets_after_settling
+                            "{hashrate:e} H/s, {label}, seed {seed}: converged {converged:.0} s, band x{:.2}",
+                            run.band
                         ));
                     }
                 }
             }
             converge.sort_by(f64::total_cmp);
             report.push(format!(
-                "{label}: converged median {:.0} s, worst {:.0} s; hours 1-6 band x{worst_band:.2}, \
-                 mean interval off by at most {worst_interval:.1} s, at most {most_retargets} retargets",
+                "{label}: within x2 after median {:.0} s, worst {:.0} s",
                 converge[converge.len() / 2],
                 converge[converge.len() - 1]
             ));
         }
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        let (band95, band_max) = (pct(&mut bands, 0.95), pct(&mut bands, 1.0));
+        let (rt95, rt_max) = (pct(&mut retargets, 0.95), pct(&mut retargets, 1.0));
+        let (iv95, iv_max) = (pct(&mut intervals, 0.95), pct(&mut intervals, 1.0));
+        report.push(format!(
+            "hours 1-6: band p50 x{:.2}, p95 x{band95:.2}, max x{band_max:.2}; changes p95 {rt95}, max {rt_max}; \
+             mean interval off by p95 {iv95:.1} s, max {iv_max:.1} s",
+            pct(&mut bands, 0.5)
+        ));
         println!("{}", report.join("\n"));
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(band95 <= 2.0, "95th-percentile band x{band95:.2}");
+        assert!(rt95 <= 4.0, "95th-percentile changes {rt95}");
+        assert!(iv95 <= 6.0, "95th-percentile mean-interval error {iv95:.1} s");
     }
+
+    struct Connection {
+        /// Seconds from the first connection to the first accepted share.
+        first_share_secs: Option<f64>,
+        /// Times the idle limit closed the connection.
+        drops: u32,
+        accepted: u64,
+    }
+
+    /// A miner at `hashrate` H/s that connects at `initial` difficulty,
+    /// sends nothing but shares, and reconnects one second after being
+    /// dropped — at `initial` again, as a real reconnect does. The session is
+    /// modelled as the Stratum V1 session runs it: a vardiff check every
+    /// [`TICK`], and the idle limit of
+    /// [`crate::stratum::miner::miner_idle_timeout`] on the tally's share rate,
+    /// counted from the last message the miner sent.
+    fn simulate_connection(hashrate: f64, initial: u64, hours: f64, seed: u64) -> Connection {
+        use crate::stratum::miner::{MinerTally, miner_idle_timeout};
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        let rate = |d: u64| hashrate / (d as f64 * 4_294_967_296.0);
+        let mut rng = Rng(seed);
+        let end = hours * 3_600.0;
+        let mut now = 0.0;
+        let (mut first, mut drops, mut accepted) = (None, 0u32, 0u64);
+        'connect: while now < end {
+            let mut v = Vardiff::new(VardiffConfig::default(), initial, at(now));
+            let mut tally = MinerTally::new(at(now));
+            let mut last_read = now;
+            let mut next_share = now + rng.exp(rate(v.difficulty()));
+            let mut next_tick = now + TICK;
+            while now < end {
+                if next_share < next_tick {
+                    now = next_share;
+                    tally.accept(at(now), v.difficulty(), v.difficulty() as f64);
+                    v.record_share(v.difficulty());
+                    last_read = now;
+                    accepted += 1;
+                    first.get_or_insert(now);
+                    next_share = now + rng.exp(rate(v.difficulty()));
+                } else {
+                    now = next_tick;
+                    next_tick += TICK;
+                    if v.retarget(at(now), u64::MAX).is_some() {
+                        next_share = now + rng.exp(rate(v.difficulty()));
+                    }
+                    let limit = miner_idle_timeout(tally.share_rate(v.difficulty()));
+                    if now - last_read > limit.as_secs_f64() {
+                        drops += 1;
+                        now += 1.0;
+                        continue 'connect;
+                    }
+                }
+            }
+        }
+        Connection { first_share_secs: first, drops, accepted }
+    }
+
+    /// An ESP32-class "lottery" miner at 1 MH/s, connecting at the mainnet
+    /// default difficulty of 10,000 without `mining.suggest_difficulty`. At
+    /// that difficulty its first share is ten months away. It must be lowered
+    /// to difficulty 1 (a share every ~72 minutes) and kept connected there:
+    /// before the idle backstop, it was dropped after ten minutes and started
+    /// again at 10,000, and never submitted a share.
+    #[test]
+    fn a_1_mhs_miner_at_the_default_difficulty_gets_shares_and_is_never_dropped() {
+        for seed in 1..=16u64 {
+            let run = simulate_connection(1e6, 10_000, 48.0, seed * 104_729);
+            let first = run.first_share_secs.expect("a first share within 48 hours");
+            assert!(first <= 8.0 * 3_600.0, "seed {seed}: first share after {first:.0} s");
+            assert_eq!(run.drops, 0, "seed {seed}: dropped");
+            assert!(run.accepted >= 20, "seed {seed}: only {} shares in 48 hours", run.accepted);
+        }
+    }
+
+    /// The same for the classes between: a 7 MH/s device, a 1 GH/s one, a
+    /// sub-TH device and a Bitaxe, all from the default difficulty. None is
+    /// dropped, and the first share arrives within minutes for all but the
+    /// slowest.
+    #[test]
+    fn miners_from_mhs_to_ths_at_the_default_difficulty_are_never_dropped() {
+        for (hashrate, first_within) in [(7e6, 3.0 * 3_600.0), (1e9, 1_200.0), (100e9, 600.0), (1.2e12, 300.0)] {
+            for seed in 1..=16u64 {
+                let run = simulate_connection(hashrate, 10_000, 24.0, seed * 7_919);
+                let first = run.first_share_secs.unwrap_or(f64::INFINITY);
+                assert!(first <= first_within, "{hashrate:e} H/s, seed {seed}: first share after {first:.0} s");
+                assert_eq!(run.drops, 0, "{hashrate:e} H/s, seed {seed}: dropped {} times", run.drops);
+            }
+        }
+    }
+
 }
