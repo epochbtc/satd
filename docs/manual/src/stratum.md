@@ -410,6 +410,46 @@ The miner's submit is answered `true` whatever the outcome — the miner did its
 part. A block that is valid but does not join the active chain, or that is
 rejected, is logged at `warn`.
 
+### The saved copy
+
+Before a found block is submitted, it is written to
+
+```
+<datadir>/stratum/found/<height>-<hash>.hex
+```
+
+(under the network subdirectory on a test network, like the rest of the
+datadir). The file is the serialized block as a single line of hex, exactly
+what `submitblock` takes. It is written to a temporary file, synced and renamed
+into place, so it either holds the whole block or is absent. The node logs
+
+```
+Stratum found block saved; submitting it height=... hash=... path=...
+```
+
+and the `warn` for a refused block names the file again in `saved=`.
+
+The copy is there for the case the node itself gets wrong. If this node
+refuses a block — a bug, a disk error part way through connecting it — the
+block is still worth broadcasting, and any other node will take it. A full
+block is megabytes of hex, more than a single command-line argument can carry,
+so pass it on standard input:
+
+```sh
+sat-cli -stdin submitblock < <datadir>/stratum/found/968181-<hash>.hex
+bitcoin-cli -stdin submitblock < <datadir>/stratum/found/968181-<hash>.hex
+```
+
+A block that was refused as invalid (`bad-cb-amount`, `bad-txns-...`) will be
+refused everywhere; one refused for a reason that is this node's own is not.
+Submit it promptly: a block is only worth anything until the network builds
+another one at its height.
+
+Files are kept after a successful submission too, as a record of the blocks
+found. There is one per block, so the directory does not grow in practice.
+Only a header that meets its block target is ever saved. If the directory
+cannot be written, the node logs an error and submits the block anyway.
+
 ## Networks
 
 - **mainnet, testnet3, testnet4, regtest**: supported.

@@ -59,6 +59,7 @@ item below is (or will be) written up in full in the in-development
 - **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC (#751).
 - `getstratuminfo` lists each connected miner (device, difficulty, share counts, best share, last share, estimated hashrate) and a node-wide hashrate; the metrics endpoint exports `satd_stratum_*` connections, miners, shares by result, blocks found and hashrate.
 - `-debug=stratum`: the Stratum server's per-miner debug lines (device, version-rolling mask, every share with the difficulty it achieved, a five-minute status line with estimated hashrate). Always logged: a disconnect summary per miner, and every refused share with its reason.
+- A block found through the Stratum server is saved to `<datadir>/stratum/found/<height>-<hash>.hex` before it is submitted, so a block the node refuses, or a submission that panics, can still be sent to another node with `submitblock`.
 
 ### Fixed
 

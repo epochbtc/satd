@@ -655,7 +655,26 @@ pub(crate) async fn submit_found_block(
     let hash = block.block_hash();
     let chain = shared.chain.clone();
     let mempool = shared.mempool.clone();
-    let outcome = shared.core.spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
+    // Every caller builds a block only from a header that meets its target;
+    // checked again here so no path can fill the directory with blocks that
+    // are not blocks.
+    let dir = shared
+        .config
+        .found_block_dir
+        .clone()
+        .filter(|_| crate::validation::pow::check_proof_of_work(&block.header).is_ok());
+    // Where the copy lands. Worked out here rather than returned from the
+    // blocking task, because a task that panics returns nothing.
+    let expected = dir.as_deref().map(|d| super::found::found_block_path(d, height, &block));
+    // Saved on the same blocking thread, ahead of the submission, so a panic
+    // in `accept_block` cannot take the only copy with it.
+    let outcome = shared
+        .core
+        .spawn_blocking(move || {
+            super::found::save_then_submit(dir.as_deref(), height, &block, |b| submit_block(&chain, &mempool, b)).1
+        })
+        .await;
+    let saved = expected.filter(|p| p.exists()).map(|p| p.display().to_string()).unwrap_or_default();
     let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
     match outcome {
         Ok(Ok(true)) => {
@@ -676,16 +695,39 @@ pub(crate) async fn submit_found_block(
             target: "node::stratum",
             height,
             %hash,
+            saved,
             "Stratum block was valid but did not join the active chain"
+        ),
+        // Point at the saved copy only when there is one: when the save
+        // failed (logged above) or no directory is configured, there is none.
+        Ok(Err(e)) if saved.is_empty() => tracing::warn!(
+            target: "node::stratum",
+            height,
+            %hash,
+            error = %e,
+            "Stratum block was not accepted, and no copy of it was saved"
         ),
         Ok(Err(e)) => tracing::warn!(
             target: "node::stratum",
             height,
             %hash,
             error = %e,
-            "Stratum block was not accepted"
+            saved,
+            "Stratum block was not accepted; the saved copy can be submitted to another node"
         ),
-        Err(e) => tracing::error!(target: "node::stratum", %hash, error = %e, "Stratum block submission panicked"),
+        Err(e) if saved.is_empty() => tracing::error!(
+            target: "node::stratum",
+            %hash,
+            error = %e,
+            "Stratum block submission panicked, and no copy of it was saved"
+        ),
+        Err(e) => tracing::error!(
+            target: "node::stratum",
+            %hash,
+            error = %e,
+            saved,
+            "Stratum block submission panicked; the saved copy can be submitted to another node"
+        ),
     }
 }
 
