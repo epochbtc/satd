@@ -500,12 +500,17 @@ impl StratumServer {
     }
 
     fn at_capacity(&self, peer: SocketAddr) {
-        tracing::warn!(
-            target: "node::stratum",
-            %peer,
-            max = self.shared.config.max_conns,
-            "Stratum connection refused: at --stratummaxconns"
-        );
+        static AT_CAPACITY: crate::warn_budget::WarnBudget =
+            crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+        if let Some(suppressed) = AT_CAPACITY.tick() {
+            tracing::warn!(
+                target: "node::stratum",
+                %peer,
+                suppressed,
+                max = self.shared.config.max_conns,
+                "Stratum connection refused: at --stratummaxconns"
+            );
+        }
     }
 }
 

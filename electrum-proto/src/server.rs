@@ -22,7 +22,9 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use node::warn_budget::WarnBudget;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -259,11 +261,15 @@ impl ElectrumServer {
                 });
             }
             Err(_) => {
-                tracing::warn!(
-                    peer = %peer,
-                    "Electrum at-capacity rejection ({} max)",
-                    self.config.max_conns
-                );
+                static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = AT_CAPACITY.tick() {
+                    tracing::warn!(
+                        peer = %peer,
+                        suppressed,
+                        "Electrum at-capacity rejection ({} max)",
+                        self.config.max_conns
+                    );
+                }
                 tokio::spawn(async move {
                     let _ = reject_overflow(stream).await;
                 });
@@ -354,11 +360,15 @@ impl ElectrumServer {
                 });
             }
             Err(_) => {
-                tracing::warn!(
-                    peer = %peer,
-                    "Electrum TLS at-capacity rejection ({} max)",
-                    self.config.max_conns
-                );
+                static AT_CAPACITY: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = AT_CAPACITY.tick() {
+                    tracing::warn!(
+                        peer = %peer,
+                        suppressed,
+                        "Electrum TLS at-capacity rejection ({} max)",
+                        self.config.max_conns
+                    );
+                }
                 tokio::spawn(async move {
                     // Same plain-text rejection over an unencrypted
                     // TCP stream — the client hasn't completed the

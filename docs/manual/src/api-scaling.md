@@ -64,6 +64,28 @@ value cannot panic satd at boot.
 | streaming WS/SSE | `-streamwsmaxconns`, `-streamwsmaxsubscriptions`, `-streamwsmaxmessagebytes` | 256 / 256 / 262144 | connection refused / 429 |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP 429 |
 | Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
+| JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection dropped at accept (TCP reset) |
+
+The JSON-RPC socket cap counts every open connection on a listener, idle
+keep-alive connections included, and is taken at accept, before
+authentication. `-rpcservertimeout` (default 30 s) closes a connection that
+sits idle between requests and returns its slot; with `-rpcservertimeout=0`
+an idle connection holds its slot until the client closes it, so 100 idle
+connections from any client that can reach the listener lock out every other
+client, `sat-cli` on loopback included. Keep the listener private
+(`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on. A peer
+outside the listener's allowlist (`-rpcallowip`, or `-rpcreadonlyallowip`
+on the read-only listeners) never takes a slot: the allowlist is checked at
+accept, before the cap. On a plain-HTTP listener the peer is answered `403`
+and the connection closed within a few seconds, from a separate pool of 16
+refusals in flight, past which it is dropped at accept; on a TLS listener it
+is dropped at accept, before the handshake. The two listeners read an
+*empty* allowlist differently, though — a plain bind falls back to
+loopback-only, while a TLS bind stays reachable from wherever it is bound,
+gated by TLS/mTLS and RPC auth rather than by source address. Set the
+allowlist to gate a public TLS bind too. A listener that is
+shedding logs the first few refusals in each minute and then a count, so a
+flood cannot fill the log with the report of itself.
 
 `-rpcthreads` and `-rpcworkqueue` are recognized from Bitcoin Core, so a
 Core-shaped config that carries them loads. In-flight calls are capped at

@@ -751,10 +751,15 @@ pub async fn serve_http(
                 let permit = match conn_cap.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        tracing::warn!(
-                            peer = %addr,
-                            "MCP at-capacity rejection ({MCP_MAX_CONNECTIONS} max)",
-                        );
+                        static AT_CAPACITY: node::warn_budget::WarnBudget =
+                            node::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+                        if let Some(suppressed) = AT_CAPACITY.tick() {
+                            tracing::warn!(
+                                peer = %addr,
+                                suppressed,
+                                "MCP at-capacity rejection ({MCP_MAX_CONNECTIONS} max)",
+                            );
+                        }
                         drop(stream);
                         continue;
                     }

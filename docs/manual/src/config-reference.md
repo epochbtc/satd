@@ -130,13 +130,13 @@ startup error.
 |---|---|---|---|---|
 | `rpcport` | 8332 (network-dependent) | restart | core | RPC server port. Defaults: main 8332, test 18332, testnet4 48332, signet 38332, regtest 18443. |
 | `rpcbind` | `127.0.0.1:<rpcport>` and `[::1]:<rpcport>` | restart | core | Bind plain-HTTP JSON-RPC to address (repeatable). Non-loopback requires `rpcallowip`. With no `rpcbind`, a default that cannot be bound (no IPv6) is skipped. |
-| `rpcallowip` | loopback only | restart | core | Per-request source-IP allowlist for JSON-RPC (repeatable). IPv6 may be bracketed (`[::1]`). |
+| `rpcallowip` | loopback only | restart | core | Per-connection source-IP allowlist for JSON-RPC (repeatable). IPv6 may be bracketed (`[::1]`). Applies to the plain-HTTP binds always, and to `rpctlsbind` only once at least one entry is set (an empty list leaves a TLS bind reachable from wherever it is bound). Loopback is always allowed. |
 | `cjdnsreachable` | false | restart | core | satd has no CJDNS transport; as in Core, an `rpcallowip` in fc00::/8 is refused while it is set. |
 | `rpcuser` | none | hot | core | RPC username. |
 | `rpcpassword` | none | hot | core | RPC password. |
 | `rpcthreads` | 16 | restart | core | Max concurrent in-flight RPC method calls. |
 | `rpcworkqueue` | 64 | restart | core | Max queued RPC requests beyond `rpcthreads` before HTTP 429 (Core returns 503; documented divergence). |
-| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed. 0 disables. |
+| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed. 0 disables. An open connection holds one of the listener's 100 connection slots until it closes, so with 0 an idle client keeps its slot indefinitely; see [Scaling the API surfaces](api-scaling.md). |
 | `apithreads` | `max(2, cores/4)` | restart | satd | Worker threads for the isolated API runtime (Esplora/Electrum/events gRPC/metrics). |
 | `rpcreadonlybind` | none | restart | satd | Bind an opt-in read-only JSON-RPC listener (reads + mempool submit) on the API runtime. |
 | `rpcreadonlyport` | 8330 | restart | satd | Default port for `rpcreadonlybind` entries without an explicit port. |

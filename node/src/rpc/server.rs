@@ -11,6 +11,7 @@ use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
+use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
 
 use crate::rpc::params::Args;
@@ -273,6 +274,11 @@ impl ServerListenerStatus {
     }
     fn snapshot(&self) -> ServerListenerStatusInner {
         self.inner.read().clone()
+    }
+    /// The TLS RPC listener's bound address, once bound. A caller that
+    /// bound port 0 reads the port the OS assigned from here.
+    pub fn rpc_tls(&self) -> Option<String> {
+        self.inner.read().rpc_tls.clone()
     }
     /// Whether Esplora is bound and serving.
     pub fn esplora_serving(&self) -> bool {
@@ -4035,9 +4041,9 @@ pub async fn start(
         .max_request_body_size(crate::rpc::RPC_MAX_BODY_SIZE as u32)
         .max_response_body_size(crate::rpc::RPC_MAX_RESPONSE_SIZE as u32)
         .build();
-    // Methods is Arc-backed and cheap to clone — one copy is consumed
-    // by each per-bind `Server::start()` call below, plus one to feed
-    // the TLS path's per-connection service builder if TLS is enabled.
+    // Methods is Arc-backed and cheap to clone — one copy feeds each
+    // listener's per-connection service builder below (plain and TLS
+    // alike run their own accept loop; see `spawn_plain_surface`).
     let methods: Methods = module.into();
 
     // Completeness audit for the named-parameter table. A method missing from
@@ -4137,6 +4143,7 @@ pub async fn start(
                 bearer.clone(),
                 None,
                 header_read_timeout,
+                allowip.clone(),
             )
             .await?,
         )
@@ -4275,6 +4282,7 @@ async fn spawn_readonly_listeners(
                 None,
                 Some(ReadOnlyLayer::new()),
                 header_read_timeout,
+                allowip,
             )
             .await;
             let _ = tx.send(res);
@@ -4292,6 +4300,14 @@ async fn spawn_readonly_listeners(
 }
 
 /// Bind the TLS listener and spawn the per-connection accept loop.
+///
+/// `allowip` is the surface's source-address allowlist. A TLS bind
+/// enforces it only when the operator configured one; see
+/// [`crate::rpc::allowip::tls_listener_denies`]. A denied peer is dropped
+/// at accept, before the handshake and before a connection-cap permit is
+/// taken, so it costs the listener nothing and holds no slot. (The plain
+/// surface answers `403 Forbidden` instead, because by the time it has a
+/// decision it is already speaking HTTP.)
 ///
 /// The accept loop terminates when the returned [`ServerHandle`] is
 /// stopped — either by the composite [`RpcServerHandle::stop`] call
@@ -4315,6 +4331,11 @@ async fn spawn_tls_surface(
     // identity, matching `spawn_plain_surface`.
     rpc_filter: Option<ReadOnlyLayer>,
     header_read_timeout: Option<Duration>,
+    // The surface's `-rpcallowip` (or `-rpcreadonlyallowip`) list. Enforced
+    // at accept, but only when it is non-empty — see
+    // `allowip::tls_listener_denies` for why an empty list is not
+    // loopback-only on a TLS bind.
+    allowip: Arc<Vec<crate::rpc::allowip::IpAllowEntry>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // mTLS policy: `Required` when the operator opted in via
     // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
@@ -4414,16 +4435,22 @@ async fn spawn_tls_surface(
     // Per-handshake timeout from the cfg (review H2). Matches the
     // shape Electrum/Esplora use, just with a tighter default.
     let handshake_timeout = cfg.handshake_timeout;
-    // Connection cap (review C1). The plain-HTTP RPC path runs
-    // through `Server::start()` which enforces jsonrpsee's
-    // `ServerConfig::max_connections`. The manual accept loop here
-    // bypasses that, so we mirror the cap with a tokio Semaphore.
-    // The permit is held by the per-connection task and released on
-    // drop, so the cap covers handshake + steady-state serving.
+    // Connection cap (review C1). jsonrpsee's `ServerConfig::max_connections`
+    // is a per-*request* guard inside the service; it never bounds raw
+    // sockets. Both accept loops (this one and `spawn_plain_surface`)
+    // therefore take a permit from a tokio Semaphore of the same size at
+    // accept time. The permit is handed to a task that lives as long as
+    // the connection (see the spawn below), so the cap covers the
+    // handshake and steady-state serving, idle keepalive included.
     let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(
         cfg.max_connections.max(1),
     ));
     let max_connections = cfg.max_connections;
+    // One warning budget per listener, not per function: this function
+    // serves several binds, and a `static` here would let a flood on one
+    // silence the others' reports.
+    let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+    let denied = WarnBudget::new(5, Duration::from_secs(60));
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -4442,6 +4469,25 @@ async fn spawn_tls_surface(
                 _ = accept_stop.clone().shutdown() => break,
             };
 
+            // One allow/deny decision per connection, taken BEFORE the
+            // permit: refusing is a source-IP comparison and a close, so a
+            // denied flood costs nothing and must not be able to occupy the
+            // connection cap. (The plain surface takes its permit first
+            // because it answers 403 over a real HTTP connection.) Only a
+            // configured allowlist denies here — see
+            // `allowip::tls_listener_denies`.
+            if crate::rpc::allowip::tls_listener_denies(peer.ip(), &allowip) {
+                if let Some(suppressed) = denied.tick() {
+                    tracing::warn!(
+                        peer = %peer,
+                        suppressed,
+                        "RPC TLS connection rejected: source IP not in the listener's allowlist",
+                    );
+                }
+                drop(stream);
+                continue;
+            }
+
             // try_acquire_owned: if the semaphore is at capacity,
             // drop the connection here (pre-handshake, so we can't
             // even send a JSON-RPC error body — TLS hasn't started).
@@ -4449,11 +4495,14 @@ async fn spawn_tls_surface(
             let permit = match conn_cap.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(
-                        peer = %peer,
-                        "RPC TLS at-capacity rejection ({} max)",
-                        max_connections,
-                    );
+                    if let Some(suppressed) = at_capacity.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC TLS at-capacity rejection ({} max)",
+                            max_connections,
+                        );
+                    }
                     drop(stream);
                     continue;
                 }
@@ -4571,6 +4620,72 @@ async fn spawn_tls_surface(
     Ok(server_handle)
 }
 
+/// Refusals a plain RPC listener writes at once to peers outside its
+/// allowlist. A peer past this is dropped at accept.
+pub const DENIED_IN_FLIGHT: usize = 16;
+
+/// How long a refused peer has to send its request before the `403` is
+/// written anyway, and to read it before the socket closes. Fixed, not
+/// `-rpcservertimeout`: that can be `0`, and a refused peer gets no
+/// indefinite hold.
+const DENIED_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What a plain RPC listener does with an accepted socket.
+enum PlainAdmit {
+    /// Allowlisted: serve it under a slot of the connection cap.
+    Serve(tokio::sync::OwnedSemaphorePermit),
+    /// Outside the allowlist: answer `403` under a refusal slot.
+    Refuse(tokio::sync::OwnedSemaphorePermit),
+    /// No slot free in the pool the socket needed.
+    Drop { denied: bool },
+}
+
+/// Decide on a plain RPC socket from its source IP. The allowlist is
+/// checked first, and a denied peer draws only on `denied_cap`, so no
+/// number of denied peers can exhaust `conn_cap`.
+fn admit_plain(
+    ip: std::net::IpAddr,
+    allowip: &[crate::rpc::allowip::IpAllowEntry],
+    conn_cap: &Arc<tokio::sync::Semaphore>,
+    denied_cap: &Arc<tokio::sync::Semaphore>,
+) -> PlainAdmit {
+    if crate::rpc::allowip::is_allowed(ip, allowip) {
+        match conn_cap.clone().try_acquire_owned() {
+            Ok(p) => PlainAdmit::Serve(p),
+            Err(_) => PlainAdmit::Drop { denied: false },
+        }
+    } else {
+        match denied_cap.clone().try_acquire_owned() {
+            Ok(p) => PlainAdmit::Refuse(p),
+            Err(_) => PlainAdmit::Drop { denied: true },
+        }
+    }
+}
+
+/// Answer a peer outside the allowlist with `403 Forbidden` and close,
+/// without HTTP parsing. It waits up to [`DENIED_DEADLINE`] for the
+/// request to arrive, so the reply follows it the way Core's does, then
+/// writes the reply and closes whether or not anything came.
+async fn refuse_forbidden<S>(mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const BODY: &str = "403 Forbidden: source IP not permitted\n";
+    let reply = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{BODY}",
+        BODY.len(),
+    );
+    let mut buf = [0u8; 4096];
+    let _ = tokio::time::timeout(DENIED_DEADLINE, stream.read(&mut buf)).await;
+    let _ = tokio::time::timeout(DENIED_DEADLINE, async {
+        stream.write_all(reply.as_bytes()).await?;
+        stream.shutdown().await
+    })
+    .await;
+}
+
 /// Bind one plain-HTTP RPC listener and spawn its accept loop, enforcing
 /// the `-rpcallowip` source-address allowlist at accept time.
 ///
@@ -4581,19 +4696,21 @@ async fn spawn_tls_surface(
 /// Instead we mirror the TLS surface's manual loop: accept the TCP
 /// connection (where the peer addr IS known), decide allow/deny once for
 /// the whole connection, and either serve the real RPC stack or answer
-/// every request on that connection with `403 Forbidden`.
+/// `403 Forbidden` and close (see [`admit_plain`] and [`refuse_forbidden`]).
 ///
 /// Batch limits, WebSocket upgrades and graceful shutdown are preserved
 /// because the per-connection service is the same `to_service_builder()
 /// .build()` stack jsonrpsee uses internally. That stack's inner
 /// `ConnectionGuard` only acquires a permit per *request*, though, so it
-/// does NOT bound raw sockets that are denied (403), idle, or slow before
-/// a request is dispatched. To make `rpcallowip`-on-a-public-bind actually
-/// safe we add an accept-level `Semaphore` (sized `max_connections`,
-/// mirroring the TLS surface): the permit is taken at accept — before the
-/// allow/deny decision and before any serve task is spawned — and held
-/// for the whole connection, so floods of denied/idle connections can't
-/// exhaust fds/tasks. At capacity the socket is dropped (TCP reset).
+/// does NOT bound raw sockets that are idle or slow before a request is
+/// dispatched. We add an accept-level `Semaphore` (sized `max_connections`,
+/// mirroring the TLS surface): the permit is taken at accept, before any
+/// serve task is spawned, and held for the whole connection, so a flood of
+/// idle connections can't exhaust fds/tasks. At capacity the socket is
+/// dropped. A denied peer never draws on that pool: the allowlist is
+/// decided first, and the `403` is written from a small pool of its own
+/// ([`DENIED_IN_FLIGHT`]) under a fixed deadline, so peers outside the
+/// allowlist cannot fill the slots allowlisted clients and `sat-cli` need.
 ///
 /// `max_connections` MUST match `server_cfg`'s connection cap; callers
 /// pass [`RPC_MAX_CONNECTIONS`], which `server_cfg` is also built from.
@@ -4690,7 +4807,15 @@ pub async fn spawn_plain_surface(
     // never reach the per-request ConnectionGuard). Permit is acquired at
     // accept and held for the connection's lifetime.
     let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
+    // Refusals in flight for peers outside the allowlist; separate from
+    // `conn_cap` so they never take an allowlisted client's slot.
+    let denied_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(DENIED_IN_FLIGHT));
 
+    // One warning budget per listener, not per function: this function
+    // serves several binds, and a `static` here would let a flood on one
+    // silence the others' reports.
+    let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+    let denied = WarnBudget::new(5, Duration::from_secs(60));
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -4707,34 +4832,52 @@ pub async fn spawn_plain_surface(
                 _ = accept_stop.clone().shutdown() => break,
             };
 
-            // Take a connection permit BEFORE the allow/deny check, so a
-            // flood of non-allowlisted (or idle) sockets is bounded too.
-            // At capacity we drop the socket (the client sees a TCP
-            // reset) rather than queueing unbounded work.
-            let permit = match conn_cap.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(
-                        peer = %peer,
-                        "RPC at-capacity rejection ({} max connections)",
-                        max_connections,
-                    );
+            // One allow/deny decision per connection — the source IP is
+            // fixed for the connection's lifetime. Loopback is always
+            // allowed (keeps sat-cli working); otherwise the IP must fall
+            // inside a configured CIDR. Decided before a slot is taken, so
+            // a denied peer never holds one.
+            let permit = match admit_plain(peer.ip(), &allowip, &conn_cap, &denied_cap) {
+                PlainAdmit::Serve(p) => p,
+                PlainAdmit::Refuse(p) => {
+                    if let Some(suppressed) = denied.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC connection rejected: source IP not in the listener's allowlist",
+                        );
+                    }
+                    tokio::spawn(async move {
+                        let _permit = p;
+                        refuse_forbidden(stream).await;
+                    });
+                    continue;
+                }
+                PlainAdmit::Drop { denied: false } => {
+                    if let Some(suppressed) = at_capacity.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC at-capacity rejection ({} max connections)",
+                            max_connections,
+                        );
+                    }
+                    drop(stream);
+                    continue;
+                }
+                PlainAdmit::Drop { denied: true } => {
+                    if let Some(suppressed) = denied.tick() {
+                        tracing::warn!(
+                            peer = %peer,
+                            suppressed,
+                            "RPC connection dropped: source IP not in the listener's allowlist \
+                             and {DENIED_IN_FLIGHT} refusals already in flight",
+                        );
+                    }
                     drop(stream);
                     continue;
                 }
             };
-
-            // One allow/deny decision per connection — the source IP is
-            // fixed for the connection's lifetime. Loopback is always
-            // allowed (keeps sat-cli working); otherwise the IP must fall
-            // inside a configured CIDR.
-            let allowed = crate::rpc::allowip::is_allowed(peer.ip(), &allowip);
-            if !allowed {
-                tracing::warn!(
-                    peer = %peer,
-                    "RPC connection rejected: source IP not permitted by -rpcallowip",
-                );
-            }
 
             let rpc_svc = rpc_svc.clone();
             let conn_stop = accept_stop.clone();
@@ -4745,15 +4888,6 @@ pub async fn spawn_plain_surface(
                 move |req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
                     let mut rpc_svc = rpc_svc.clone();
                     Box::pin(async move {
-                        if !allowed {
-                            let mut resp = jsonrpsee::server::HttpResponse::new(
-                                jsonrpsee::server::HttpBody::from(
-                                    "403 Forbidden: source IP not permitted by -rpcallowip\n",
-                                ),
-                            );
-                            *resp.status_mut() = hyper::StatusCode::FORBIDDEN;
-                            return Ok(resp);
-                        }
                         tower::Service::<
                             jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
                         >::call(&mut rpc_svc, req)
@@ -5003,9 +5137,8 @@ mod tls_surface_tests {
     use tokio_rustls::rustls;
 
     /// Complete a TLS handshake against `addr`, trusting `cert_der`. The
-    /// returned stream is left idle — no HTTP is sent — so the server holds
-    /// an established connection with nothing to do, which is exactly the
-    /// shape a keepalive flood presents.
+    /// returned stream carries no HTTP yet; see [`probe_http`] for turning it
+    /// into an established, idle keepalive connection.
     async fn tls_connect(
         addr: SocketAddr,
         cert_der: &rustls::pki_types::CertificateDer<'static>,
@@ -5023,6 +5156,42 @@ mod tls_surface_tests {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out"))?
     }
 
+    /// Send one request on an established connection and read the reply,
+    /// which proves the server's serve task is running on it, then leave
+    /// the connection idle — the shape a keepalive flood presents. The
+    /// request carries no credential, so the auth layer answers `401`
+    /// without touching a method, and keeps the connection open.
+    async fn probe_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("reply within 5s")
+                .unwrap();
+            assert!(n > 0, "server closed the connection instead of replying");
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+            assert!(head.starts_with("http/1.1 401"), "unexpected reply head: {head}");
+            let body_len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if buf.len() >= head_end + 4 + body_len {
+                break;
+            }
+        }
+    }
+
     /// The connection cap counts established connections, not just
     /// in-flight handshakes: with the cap full of idle connections a new
     /// one is refused, and closing one lets the next through.
@@ -5036,13 +5205,11 @@ mod tls_surface_tests {
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         let cert_der = cert.cert.der().clone();
 
-        // A free port; the surface binds it synchronously below.
-        let bind_addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // Port 0: the surface binds synchronously and reports the port the
+        // OS assigned through the listener status, so there is no
+        // probe-then-rebind window for another process to take the port.
         let cfg = RpcTlsConfig {
-            bind_addr,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
             cert_path,
             key_path,
             mtls_enabled: false,
@@ -5053,30 +5220,49 @@ mod tls_surface_tests {
         };
         let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_status = ServerListenerStatus::new();
         let handle = spawn_tls_surface(
             cfg,
             ServerConfig::default(),
             auth,
             Methods::new(),
-            ServerListenerStatus::new(),
+            listener_status.clone(),
             &mut shutdown_rx,
             AdmissionState::new(4, 16),
             None,
             None,
             None,
+            Arc::new(Vec::new()),
         )
         .await
         .expect("tls surface");
+        let bind_addr: SocketAddr = listener_status
+            .rpc_tls()
+            .expect("surface reports its bound address")
+            .parse()
+            .unwrap();
 
-        // Two established, idle connections fill the cap.
-        let c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
-        let _c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+        // Two established connections fill the cap. Each has served a
+        // request, so its serve task — the thing that holds the permit —
+        // is provably running before the third connection is attempted;
+        // without this the refusal could depend on which of the two
+        // server-side handshakes the scheduler finished first.
+        let mut c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        probe_http(&mut c1).await;
+        let mut c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+        probe_http(&mut c2).await;
 
-        // A third is dropped pre-handshake.
-        assert!(
-            tls_connect(bind_addr, &cert_der).await.is_err(),
-            "third connection must be refused while two are established"
-        );
+        // A third is dropped pre-handshake: the client sees the socket
+        // close mid-handshake, not a timeout (a stalled accept loop would
+        // also fail the connect, so a timeout must not count as refusal).
+        match tls_connect(bind_addr, &cert_der).await {
+            Ok(_) => panic!("third connection must be refused while two are established"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut,
+                "refusal must be a closed socket, not a timeout: {e}"
+            ),
+        }
 
         // Closing one releases its permit; the next connection gets through.
         drop(c1);
@@ -5089,6 +5275,139 @@ mod tls_surface_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(admitted, "permit must be released when the connection closes");
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.stop();
+    }
+
+    /// The TLS accept loop consults `-rpcallowip`, and its loopback
+    /// exemption survives: a listener carrying an allowlist that names only
+    /// a remote CIDR still serves `sat-cli` on the same host. The refusal
+    /// half of the rule cannot be driven through a socket here — every peer
+    /// a test can present from is loopback, which is allowed
+    /// unconditionally — so it is covered by
+    /// `allowip::tests::a_tls_listener_with_an_allowlist_enforces_it`. What
+    /// this test rules out is the accept loop mistaking "an allowlist
+    /// exists" for "deny", which would shut the operator out of their own
+    /// node the moment they set one.
+    /// Peers outside the allowlist draw on the refusal pool, never on the
+    /// connection cap: however many arrive, an allowlisted client still
+    /// gets a slot, and past the refusal pool a denied peer is dropped.
+    #[test]
+    fn denied_peers_never_take_a_connection_slot() {
+        use crate::rpc::allowip::IpAllowEntry;
+        let allow = vec![IpAllowEntry::parse("10.0.0.0/8").unwrap()];
+        let outside: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let inside: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let conn_cap = Arc::new(tokio::sync::Semaphore::new(1));
+        let denied_cap = Arc::new(tokio::sync::Semaphore::new(DENIED_IN_FLIGHT));
+
+        let mut refused = Vec::new();
+        for _ in 0..DENIED_IN_FLIGHT {
+            match admit_plain(outside, &allow, &conn_cap, &denied_cap) {
+                PlainAdmit::Refuse(p) => refused.push(p),
+                _ => panic!("a denied peer is refused while the refusal pool has room"),
+            }
+        }
+        assert!(matches!(
+            admit_plain(outside, &allow, &conn_cap, &denied_cap),
+            PlainAdmit::Drop { denied: true }
+        ));
+        assert_eq!(conn_cap.available_permits(), 1, "no denied peer took the slot");
+        let served = match admit_plain(inside, &allow, &conn_cap, &denied_cap) {
+            PlainAdmit::Serve(p) => p,
+            _ => panic!("the allowlisted client gets the slot"),
+        };
+        assert!(matches!(
+            admit_plain("127.0.0.1".parse().unwrap(), &allow, &conn_cap, &denied_cap),
+            PlainAdmit::Drop { denied: false }
+        ));
+        drop((served, refused));
+    }
+
+    /// A refused peer is answered `403` with `Connection: close` and the
+    /// socket is closed, with no HTTP stack involved; one that sends
+    /// nothing still gets the reply after the fixed deadline.
+    #[tokio::test]
+    async fn a_refused_peer_gets_a_403_and_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(refuse_forbidden(server));
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        task.await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply}");
+        assert!(reply.contains("Connection: close\r\n"), "{reply}");
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+        assert!(head.contains(&format!("Content-Length: {}", body.len())), "{reply}");
+
+        tokio::time::pause();
+        let (mut silent, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(refuse_forbidden(server));
+        let mut reply = String::new();
+        silent.read_to_string(&mut reply).await.unwrap();
+        task.await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_tls_listener_with_an_allowlist_still_serves_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let cert_der = cert.cert.der().clone();
+
+        let cfg = RpcTlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path,
+            key_path,
+            mtls_enabled: false,
+            mtls_client_ca: None,
+            mtls_client_allow: vec![],
+            handshake_timeout: Duration::from_secs(5),
+            max_connections: 2,
+        };
+        let auth = Arc::new(RpcAuth::from_user_pass("u".into(), "p".into()));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let listener_status = ServerListenerStatus::new();
+        // An allowlist that does not name loopback, which is the ordinary
+        // case: the operator lists the remote clients and relies on the
+        // loopback exemption for their own CLI.
+        let allowip =
+            Arc::new(vec![crate::rpc::allowip::IpAllowEntry::parse("10.0.0.0/8").unwrap()]);
+        let handle = spawn_tls_surface(
+            cfg,
+            ServerConfig::default(),
+            auth,
+            Methods::new(),
+            listener_status.clone(),
+            &mut shutdown_rx,
+            AdmissionState::new(4, 16),
+            None,
+            None,
+            None,
+            allowip,
+        )
+        .await
+        .expect("tls surface");
+        let bind_addr: SocketAddr = listener_status
+            .rpc_tls()
+            .expect("surface reports its bound address")
+            .parse()
+            .unwrap();
+
+        let mut c = tls_connect(bind_addr, &cert_der)
+            .await
+            .expect("loopback must complete the handshake");
+        // Replies (401 from the auth layer) rather than being dropped.
+        probe_http(&mut c).await;
 
         let _ = shutdown_tx.send(true);
         let _ = handle.stop();

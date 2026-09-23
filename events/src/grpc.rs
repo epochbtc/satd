@@ -437,11 +437,16 @@ impl EventSink for GrpcEventSink {
                             Some(sem) => match sem.clone().try_acquire_owned() {
                                 Ok(p) => Some(p),
                                 Err(_) => {
-                                    warn!(
-                                        target: "events::grpc",
-                                        max_conns,
-                                        "events gRPC at-capacity rejection (dropping connection)",
-                                    );
+                                    static AT_CAPACITY: node::warn_budget::WarnBudget =
+                                        node::warn_budget::WarnBudget::new(5, Duration::from_secs(60));
+                                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                                        warn!(
+                                            target: "events::grpc",
+                                            max_conns,
+                                            suppressed,
+                                            "events gRPC at-capacity rejection (dropping connection)",
+                                        );
+                                    }
                                     continue;
                                 }
                             },
@@ -526,11 +531,16 @@ impl EventSink for GrpcEventSink {
                                 _permit: Some(permit),
                             }))),
                             Err(_) => {
-                                warn!(
-                                    target: "events::grpc",
-                                    max_conns,
-                                    "events gRPC at-capacity rejection (dropping connection)",
-                                );
+                                static AT_CAPACITY: node::warn_budget::WarnBudget =
+                                    node::warn_budget::WarnBudget::new(5, Duration::from_secs(60));
+                                if let Some(suppressed) = AT_CAPACITY.tick() {
+                                    warn!(
+                                        target: "events::grpc",
+                                        max_conns,
+                                        suppressed,
+                                        "events gRPC at-capacity rejection (dropping connection)",
+                                    );
+                                }
                                 None
                             }
                         },

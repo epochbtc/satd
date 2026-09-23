@@ -1299,10 +1299,15 @@ pub async fn serve_metrics_https(
                     }
                 };
                 let Ok(permit) = conn_cap.clone().try_acquire_owned() else {
-                    tracing::warn!(
-                        %peer,
-                        "Metrics HTTPS at-capacity rejection ({METRICS_TLS_MAX_CONNECTIONS} max)",
-                    );
+                    static AT_CAPACITY: crate::warn_budget::WarnBudget =
+                        crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+                    if let Some(suppressed) = AT_CAPACITY.tick() {
+                        tracing::warn!(
+                            %peer,
+                            suppressed,
+                            "Metrics HTTPS at-capacity rejection ({METRICS_TLS_MAX_CONNECTIONS} max)",
+                        );
+                    }
                     continue;
                 };
                 let ctx = ctx.clone();
