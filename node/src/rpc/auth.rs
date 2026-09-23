@@ -223,6 +223,19 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Marks a request whose rate-limit unit the HTTP layer has already taken.
+///
+/// [`AuthMiddleware`] charges one unit per HTTP request and inserts this
+/// marker on every request except a WebSocket upgrade. jsonrpsee copies the
+/// HTTP request's extensions onto each call it parses, so a call from an
+/// HTTP body carries the marker and a call from a WebSocket frame does not:
+/// the upgrade was charged once, but each frame after it was not.
+/// [`BatchRateLayer`](crate::rpc::capability::BatchRateLayer) charges every
+/// call that arrives without it. A missing marker over-charges, never
+/// under-charges.
+#[derive(Clone, Copy, Debug)]
+pub struct HttpCharged;
+
 /// Tower middleware layer for HTTP auth. Authenticates a request and stashes the
 /// resolved [`satd_auth::Principal`] in the request extensions (for the RPC-layer
 /// capability filter and method handlers).
@@ -339,6 +352,9 @@ where
                         return Ok(response);
                     }
                     req.extensions_mut().insert(p);
+                    if !jsonrpsee::server::ws::is_upgrade_request(&req) {
+                        req.extensions_mut().insert(HttpCharged);
+                    }
                     inner.call(req).await
                 }
                 None => {

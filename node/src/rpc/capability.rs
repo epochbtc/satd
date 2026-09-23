@@ -26,6 +26,7 @@ use jsonrpsee::types::{ErrorObjectOwned, Request};
 use satd_auth::{Capability, Principal};
 
 use crate::rpc::access::{RpcAccess, classify};
+use crate::rpc::auth::HttpCharged;
 
 /// JSON-RPC error code for a method the authenticated principal lacks the
 /// capability to call. In the implementation-defined server-error range
@@ -89,11 +90,11 @@ fn rate_limited_error(method: &str, retry_after_secs: u32) -> ErrorObjectOwned {
     )
 }
 
-/// Charge a batch entry against the principal's rate limit. The first entry
-/// rides on the unit the HTTP layer already charged; every later one costs
-/// one. Returns the shed reply's `retry_after_secs` for an entry over budget.
-fn charge_batch_entry(principal: Option<&Principal>, index: usize) -> Result<(), u32> {
-    if index == 0 {
+/// Charge one call against the principal's rate limit, unless it rides on a
+/// unit the HTTP layer already took. Returns the shed reply's
+/// `retry_after_secs` for a call over budget.
+fn charge(principal: Option<&Principal>, prepaid: bool) -> Result<(), u32> {
+    if prepaid {
         return Ok(());
     }
     match principal.map(|p| p.check_rate()) {
@@ -107,17 +108,22 @@ fn charge_batch_entry(principal: Option<&Principal>, index: usize) -> Result<(),
 ///
 /// The HTTP-layer [`AuthLayer`](crate::rpc::auth::AuthLayer) charges one
 /// unit per HTTP request before the body is parsed, so it cannot see how
-/// many calls a batch carries; without this a `rate_limit = "1/s"` token
-/// could submit thousands of calls per second in one body. This layer sits
+/// many calls a batch carries, and a WebSocket connection pays it once at
+/// the upgrade however many frames follow; without this a
+/// `rate_limit = "1/s"` token could submit thousands of calls per second in
+/// one body or over one socket. This layer sits
 /// **outermost** in the RPC middleware chain, because the layers inside it
 /// (named-parameter rewrite, active-command tracking, the method filters)
 /// each answer a batch by splitting it into single `call`s on the layer
 /// beneath, so no inner layer's `batch` ever runs in production. Here the
-/// batch is still whole: entry `0` rides on the unit the HTTP layer took,
-/// each later entry costs one, and an entry over budget is answered
-/// in-band with [`RATE_LIMITED_CODE`] (a notification is dropped). A batch
-/// of `n` calls therefore costs exactly `n`, the same as `n` single
-/// requests. Single calls and notifications pass through untouched.
+/// batch is still whole. A call from an HTTP body carries
+/// [`HttpCharged`](crate::rpc::auth::HttpCharged): the first call or
+/// notification of that body rides on the unit the HTTP layer took, and
+/// every other one costs one, so a batch of `n` costs exactly `n`, the same
+/// as `n` single requests. A malformed entry is answered but never charged.
+/// A call without the marker -- every frame on a WebSocket -- costs one,
+/// single or batched. A call over budget is answered in-band with
+/// [`RATE_LIMITED_CODE`]; a notification over budget is dropped.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BatchRateLayer;
 
@@ -157,8 +163,18 @@ where
     type NotificationResponse = MethodResponse;
 
     fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        // A single request was charged by the HTTP layer.
-        self.inner.call(req)
+        let inner = self.inner.clone();
+        async move {
+            let prepaid = req.extensions.get::<HttpCharged>().is_some();
+            match charge(req.extensions.get::<Principal>(), prepaid) {
+                Ok(()) => inner.call(req).await,
+                Err(retry_after_secs) => {
+                    let err = rate_limited_error(req.method_name(), retry_after_secs);
+                    MethodResponse::error(req.id.clone(), err)
+                        .with_extensions(req.extensions.clone())
+                }
+            }
+        }
     }
 
     fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
@@ -166,11 +182,23 @@ where
         async move {
             let mut builder = BatchResponseBuilder::new_with_limit(RESPONSE_BODY_LIMIT);
             let mut got_notification = false;
+            // The HTTP layer's unit covers one call of the body: the first
+            // one dispatched, not whatever sits at index 0.
+            let mut http_unit_spent = false;
+            let mut prepaid = |ext: &jsonrpsee::types::Extensions| {
+                if !http_unit_spent && ext.get::<HttpCharged>().is_some() {
+                    http_unit_spent = true;
+                    true
+                } else {
+                    false
+                }
+            };
 
-            for (index, entry) in batch.into_iter().enumerate() {
+            for entry in batch.into_iter() {
                 match entry {
                     Ok(BatchEntry::Call(req)) => {
-                        let charge = charge_batch_entry(req.extensions.get::<Principal>(), index);
+                        let free = prepaid(&req.extensions);
+                        let charge = charge(req.extensions.get::<Principal>(), free);
                         let rp = match charge {
                             Ok(()) => inner.call(req).await,
                             Err(retry_after_secs) => {
@@ -185,7 +213,8 @@ where
                     }
                     Ok(BatchEntry::Notification(n)) => {
                         got_notification = true;
-                        if charge_batch_entry(n.extensions.get::<Principal>(), index).is_ok() {
+                        let free = prepaid(&n.extensions);
+                        if charge(n.extensions.get::<Principal>(), free).is_ok() {
                             inner.notification(n).await;
                         }
                     }
@@ -211,7 +240,14 @@ where
         &self,
         n: Notification<'a>,
     ) -> impl Future<Output = MethodResponse> + Send + 'a {
-        self.inner.notification(n)
+        let inner = self.inner.clone();
+        async move {
+            let prepaid = n.extensions.get::<HttpCharged>().is_some();
+            match charge(n.extensions.get::<Principal>(), prepaid) {
+                Ok(()) => inner.notification(n).await,
+                Err(_) => MethodResponse::notification(),
+            }
+        }
     }
 }
 
@@ -648,6 +684,12 @@ mod tests {
         assert!(rp.as_json().get().contains("rpc:read"), "{}", rp.as_json().get());
     }
 
+    /// A call as parsed from an HTTP body, whose unit the HTTP layer took.
+    fn http(mut r: Request<'static>) -> Request<'static> {
+        r.extensions.insert(HttpCharged);
+        r
+    }
+
     fn batch_of(reqs: Vec<Request<'static>>) -> Batch<'static> {
         Batch::from(reqs.into_iter().map(|r| Ok(BatchEntry::Call(r))).collect())
     }
@@ -717,10 +759,10 @@ mod tests {
         let svc = rate_filter(&dispatched);
         let rp = svc
             .batch(batch_of(vec![
-                req_with("getblockcount", Some(rl())),
-                req_with("getblockcount", Some(rl())),
-                req_with("getblockcount", Some(rl())),
-                req_with("getblockcount", Some(rl())),
+                http(req_with("getblockcount", Some(rl()))),
+                http(req_with("getblockcount", Some(rl()))),
+                http(req_with("getblockcount", Some(rl()))),
+                http(req_with("getblockcount", Some(rl()))),
             ]))
             .await;
         let replies = batch_replies(&rp);
@@ -736,11 +778,12 @@ mod tests {
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 3);
 
-        // A single call is not charged here (the HTTP layer did that).
+        // A single call from an HTTP body is not charged here (the HTTP
+        // layer did that).
         let dispatched = Arc::new(AtomicUsize::new(0));
         let svc = rate_filter(&dispatched);
         for _ in 0..5 {
-            let rp = svc.call(req_with("getblockcount", Some(rl()))).await;
+            let rp = svc.call(http(req_with("getblockcount", Some(rl())))).await;
             assert!(rp.is_success(), "{}", rp.as_json().get());
         }
         assert_eq!(dispatched.load(Ordering::SeqCst), 5);
@@ -785,6 +828,7 @@ mod tests {
         let notif = |p: Principal| {
             let mut n = Notification::new("sendrawtransaction".into(), None);
             n.extensions.insert(p);
+            n.extensions.insert(HttpCharged);
             Ok(BatchEntry::Notification(n))
         };
         let dispatched = Arc::new(AtomicUsize::new(0));
@@ -800,5 +844,91 @@ mod tests {
             .await;
         assert!(rp.is_notification(), "an all-notification batch has no reply");
         assert_eq!(dispatched.load(Ordering::SeqCst), 3);
+    }
+
+    fn rate_limited(acct: &Arc<dyn satd_auth::Accounting>) -> Principal {
+        Principal::token(
+            Arc::from("rl"),
+            CapabilitySet::EMPTY.with(Capability::RpcSubmit),
+            None,
+            Some(satd_auth::RatePolicy {
+                burst: 2,
+                per_sec: 2,
+            }),
+            acct.clone(),
+        )
+    }
+
+    /// A WebSocket frame carries the upgrade request's principal but not
+    /// [`HttpCharged`]: the upgrade paid once, the frames did not. Every
+    /// frame -- single call, notification, or batch entry, the first one
+    /// included -- costs one.
+    #[tokio::test]
+    async fn websocket_frames_are_charged_against_the_rate_limit() {
+        let acct: Arc<dyn satd_auth::Accounting> =
+            Arc::new(satd_auth::LocalAccounting::new());
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = BatchRateFilter {
+            inner: Recorder {
+                dispatched: dispatched.clone(),
+            },
+        };
+
+        let mut shed = 0;
+        for _ in 0..5 {
+            let rp = svc.call(req_with("sendrawtransaction", Some(rate_limited(&acct)))).await;
+            if !rp.is_success() {
+                let reply: serde_json::Value = serde_json::from_str(rp.as_json().get()).unwrap();
+                assert_eq!(reply["error"]["code"], RATE_LIMITED_CODE, "{reply}");
+                shed += 1;
+            }
+        }
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2, "burst 2 admits two frames");
+        assert_eq!(shed, 3);
+
+        // The bucket is empty: a notification frame is dropped, and a batch
+        // frame's first entry is charged like the rest.
+        let mut n = Notification::new("sendrawtransaction".into(), None);
+        n.extensions.insert(rate_limited(&acct));
+        svc.notification(n).await;
+        let rp = svc
+            .batch(batch_of(vec![req_with("sendrawtransaction", Some(rate_limited(&acct)))]))
+            .await;
+        assert_eq!(batch_replies(&rp)[0]["error"]["code"], RATE_LIMITED_CODE);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+    }
+
+    /// The HTTP layer's unit pays for the first call a body dispatches, not
+    /// for whatever sits at index 0: a malformed entry there is answered
+    /// without spending it, so the call after it is still free.
+    #[tokio::test]
+    async fn a_malformed_first_entry_does_not_spend_the_http_unit() {
+        use jsonrpsee::server::middleware::rpc::BatchEntryErr;
+        let acct: Arc<dyn satd_auth::Accounting> =
+            Arc::new(satd_auth::LocalAccounting::new());
+        // Drain the bucket so any charge at all would shed the call.
+        let p = rate_limited(&acct);
+        while matches!(p.check_rate(), satd_auth::RateDecision::Allow) {}
+
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = BatchRateFilter {
+            inner: Recorder {
+                dispatched: dispatched.clone(),
+            },
+        };
+        let junk = BatchEntryErr::new(
+            Id::Null,
+            jsonrpsee::types::ErrorObject::owned(-32600, "Invalid request", None::<()>),
+        );
+        let rp = svc
+            .batch(Batch::from(vec![
+                Err(junk),
+                Ok(BatchEntry::Call(http(req_with("getblockcount", Some(rate_limited(&acct)))))),
+            ]))
+            .await;
+        let replies = batch_replies(&rp);
+        assert_eq!(replies[0]["error"]["code"], -32600, "{}", replies[0]);
+        assert!(replies[1].get("result").is_some(), "the call is prepaid: {}", replies[1]);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 }

@@ -793,6 +793,56 @@ fn test_rpc_bearer_batch_notifications_are_charged() {
     node.stop();
 }
 
+/// A WebSocket on the JSON-RPC listener pays the token's rate limit per
+/// frame, not once at the upgrade. With a `2/s` token, ten back-to-back
+/// frames on one socket get at most a burst's worth of results; the rest are
+/// answered `-32005`.
+#[test]
+fn test_rpc_bearer_websocket_frames_are_charged() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "satd-test-ws-ratelimit-token-v1",
+        capabilities: &["rpc:read"],
+        rate_limit: Some("2/s"),
+        watch_quota: None,
+    }]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let port = node.rpcport;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (ok, shed) = rt.block_on(async move {
+        let mut ws = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-ratelimit-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        for i in 0..10 {
+            ws.send_control(serde_json::json!({
+                "jsonrpc": "2.0", "id": i, "method": "getblockcount", "params": []
+            }))
+            .await;
+        }
+        let (mut ok, mut shed) = (0, 0);
+        for _ in 0..10 {
+            let reply = ws.next_json(10).await;
+            if reply.get("result").is_some() {
+                ok += 1;
+            } else {
+                assert_eq!(reply["error"]["code"], -32005, "{reply}");
+                shed += 1;
+            }
+        }
+        (ok, shed)
+    });
+    assert!(ok <= 3, "a 2/s token served {ok} of 10 frames at once");
+    assert_eq!(ok + shed, 10);
+
+    node.stop();
+}
+
 /// Esplora `POST /tx` broadcasts only for a token holding `rpc:submit` (or
 /// `rpc:write`, which implies it). `esplora:read` alone reads; its
 /// broadcast is refused with 403 naming the capability. A token that holds
