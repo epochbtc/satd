@@ -29,8 +29,9 @@ use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
 
 pub use recent_window::{
-    RECENT_WINDOW, RECENT_WINDOW_LEN, RECENT_WINDOW_REORG_MARGIN, RecentHeightWindow,
-    RecentWindowBuild,
+    RECENT_WINDOW, RECENT_WINDOW_BUILD_RETRY_DELAYS, RECENT_WINDOW_LEN,
+    RECENT_WINDOW_REORG_MARGIN, RecentHeightWindow, RecentWindowBuild,
+    build_recent_window_with_retries,
 };
 
 /// Self-consistent base captured during [`Store::for_each_coin_snapshot`].

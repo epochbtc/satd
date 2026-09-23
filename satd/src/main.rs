@@ -2431,14 +2431,19 @@ async fn main() {
     // connect normally meanwhile; the store folds their writes in at the
     // end. A fresh or just-reindexed datadir is already live and returns at
     // once. Until it lands, the RPC reports the young buckets as an
-    // estimate (`exact: false`).
+    // estimate (`exact: false`). A failed scan is retried a few times with
+    // growing waits, then left until the next start.
     let recent_window_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let recent_window_thread = {
         let chain = chain_state.clone();
         let cancel = recent_window_cancel.clone();
         std::thread::Builder::new()
             .name("utxo-recent-window".into())
-            .spawn(move || match chain.build_recent_window(&cancel) {
+            .spawn(move || match node::storage::build_recent_window_with_retries(
+                || chain.build_recent_window(&cancel),
+                &cancel,
+                &node::storage::RECENT_WINDOW_BUILD_RETRY_DELAYS,
+            ) {
                 Ok(node::storage::RecentWindowBuild::Cancelled) => {
                     tracing::info!(
                         "utxo recent-height window build cancelled by shutdown; \
@@ -2449,8 +2454,10 @@ async fn main() {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "utxo recent-height window build failed; gettxoutsetinfo \
-                         reports the recent age buckets as estimates until the next start"
+                        attempts = node::storage::RECENT_WINDOW_BUILD_RETRY_DELAYS.len() + 1,
+                        "utxo recent-height window build failed on every attempt; \
+                         gettxoutsetinfo reports the recent age buckets as estimates \
+                         until the next start"
                     );
                 }
             })
@@ -4038,8 +4045,9 @@ async fn main() {
         }
     }
 
-    // Stop the recent-height window build, if it is still scanning. It
-    // checks the flag every 64k coins, so this is milliseconds; the wait is
+    // Stop the recent-height window build, if it is still scanning or
+    // waiting to retry a failed scan. It checks the flag every 64k coins and
+    // every 50ms of a retry wait, so this is milliseconds; the wait is
     // bounded anyway, and a scan that somehow outlives it holds nothing the
     // flush below needs (it reads a snapshot and persists nothing when
     // cancelled).

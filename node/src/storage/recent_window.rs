@@ -15,6 +15,10 @@
 //! is rebuilt with a single scan of the coins.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use super::StoreError;
 
 /// Heights the four youngest age buckets span: the `<1mo` edge (4320 blocks
 /// = 30 days at ten minutes a block).
@@ -191,6 +195,68 @@ pub enum RecentWindowBuild {
     Unsupported,
 }
 
+/// How long the startup build waits before each retry of a failed build.
+/// A database error can be transient, so a failure is retried rather than
+/// leaving the young age buckets estimated for the whole uptime. After the
+/// last delay the build gives up until the next start.
+pub const RECENT_WINDOW_BUILD_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(10 * 60),
+    Duration::from_secs(60 * 60),
+];
+
+/// How often a retry wait checks the cancel flag.
+const RETRY_WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// Run `build` and, while it fails, run it again after each of `delays` in
+/// turn. Returns the first outcome that is not an error, the last error once
+/// the delays run out, or [`RecentWindowBuild::Cancelled`] if `cancel` is
+/// set during a wait.
+///
+/// A failed build leaves the store with no window and no build in progress,
+/// so each retry starts a fresh scan.
+pub fn build_recent_window_with_retries(
+    mut build: impl FnMut() -> Result<RecentWindowBuild, StoreError>,
+    cancel: &AtomicBool,
+    delays: &[Duration],
+) -> Result<RecentWindowBuild, StoreError> {
+    let mut delays = delays.iter();
+    loop {
+        let error = match build() {
+            Err(error) => error,
+            done => return done,
+        };
+        let Some(&delay) = delays.next() else {
+            return Err(error);
+        };
+        tracing::warn!(
+            target: "storage",
+            error = %error,
+            retry_in_secs = delay.as_secs(),
+            "utxo recent-height window build failed; retrying"
+        );
+        if !wait_unless_cancelled(cancel, delay) {
+            return Ok(RecentWindowBuild::Cancelled);
+        }
+    }
+}
+
+/// Sleep for `delay`, waking early if `cancel` is set. Returns `false` if
+/// it was.
+fn wait_unless_cancelled(cancel: &AtomicBool, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(RETRY_WAIT_SLICE));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +332,108 @@ mod tests {
         assert_eq!(scanned.count_at(9000), Some(2));
         assert_eq!(scanned.count_at(4700), Some(1));
         assert_eq!(scanned.count_at(4400), None);
+    }
+
+    fn built() -> RecentWindowBuild {
+        RecentWindowBuild::Built {
+            coins_scanned: 0,
+            elapsed_ms: 0,
+            pending_heights: 0,
+        }
+    }
+
+    fn db_error() -> StoreError {
+        StoreError::Database("injected".into())
+    }
+
+    #[test]
+    fn a_failed_build_is_retried_until_it_succeeds() {
+        let cancel = AtomicBool::new(false);
+        let mut attempts = 0;
+        let outcome = build_recent_window_with_retries(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(db_error())
+                } else {
+                    Ok(built())
+                }
+            },
+            &cancel,
+            &[Duration::ZERO; 3],
+        );
+        assert_eq!(outcome.unwrap(), built());
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn a_build_that_keeps_failing_gives_up_after_the_last_delay() {
+        let cancel = AtomicBool::new(false);
+        let mut attempts = 0;
+        let outcome = build_recent_window_with_retries(
+            || {
+                attempts += 1;
+                assert!(attempts <= 3, "retried past the last delay");
+                Err(db_error())
+            },
+            &cancel,
+            &[Duration::ZERO; 2],
+        );
+        assert!(matches!(outcome, Err(StoreError::Database(_))));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn only_a_failed_build_is_retried() {
+        let cancel = AtomicBool::new(false);
+        for done in [
+            built(),
+            RecentWindowBuild::AlreadyLive,
+            RecentWindowBuild::InProgress,
+            RecentWindowBuild::Cancelled,
+            RecentWindowBuild::Superseded,
+            RecentWindowBuild::Unsupported,
+        ] {
+            let mut attempts = 0;
+            let outcome = build_recent_window_with_retries(
+                || {
+                    attempts += 1;
+                    Ok(done.clone())
+                },
+                &cancel,
+                &[Duration::ZERO; 3],
+            );
+            assert_eq!(outcome.unwrap(), done);
+            assert_eq!(attempts, 1, "{done:?} was retried");
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_a_retry_wait_ends_it_early() {
+        let cancel = AtomicBool::new(false);
+        let mut attempts = 0;
+        let started = Instant::now();
+        let outcome = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            build_recent_window_with_retries(
+                || {
+                    attempts += 1;
+                    Err(db_error())
+                },
+                &cancel,
+                &[Duration::from_secs(30)],
+            )
+        });
+        assert_eq!(outcome.unwrap(), RecentWindowBuild::Cancelled);
+        assert_eq!(attempts, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ignored the cancel for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

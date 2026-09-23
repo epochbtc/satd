@@ -4930,6 +4930,38 @@ mod tests {
     }
 
     #[test]
+    fn recent_window_build_retries_after_a_failed_scan() {
+        use crate::storage::{RecentWindowBuild, build_recent_window_with_retries};
+        let (store, _dir) = temp_store(false);
+        store
+            .write_batch(puts(&scattered_coins(100, 900, 0x0c)))
+            .unwrap();
+        // A record the scan cannot read fails the first build.
+        let cf = store.cf(CF_COINS);
+        let unreadable = outpoint_to_key(&make_outpoint(0x0c, 5_000));
+        store.db.put_cf(&cf, unreadable, b"").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut attempts = 0;
+        let outcome = build_recent_window_with_retries(
+            || {
+                attempts += 1;
+                let outcome = store.build_recent_window(&cancel);
+                if outcome.is_err() {
+                    assert!(store.utxo_recent_heights().is_none());
+                    assert!(persisted_recent_window(&store).is_none());
+                    store.db.delete_cf(&cf, unreadable).unwrap();
+                }
+                outcome
+            },
+            &cancel,
+            &[std::time::Duration::ZERO],
+        );
+        assert!(matches!(outcome.unwrap(), RecentWindowBuild::Built { .. }));
+        assert_eq!(attempts, 2);
+        assert_recent_window_exact(&store);
+    }
+
+    #[test]
     fn recent_window_negative_count_is_clamped() {
         let (store, _dir) = temp_store(false);
         recent_build(&store);
