@@ -335,7 +335,7 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
 fn a_found_blocks_coinbase_commits_to_heights_no_test_chain_reaches() {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let payouts = payouts(&secp);
-    let mut rng = StdRng::seed_from_u64(0xb1_7c01);
+    let mut rng = StdRng::seed_from_u64(0x00b1_7c01);
     for height in [32_767u32, 32_768, 65_535, 65_536, 8_388_607, 8_388_608, 968_181] {
         let template = crate::mining::template::BlockTemplate {
             version: 0x2000_0000,
@@ -370,7 +370,7 @@ fn a_found_blocks_coinbase_commits_to_heights_no_test_chain_reaches() {
 fn a_reconstructed_block_is_the_block_the_miners_parts_describe() {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let payouts = payouts(&secp);
-    let mut rng = StdRng::seed_from_u64(0xdec0_de);
+    let mut rng = StdRng::seed_from_u64(0x00de_c0de);
     for round in 0..500 {
         let n_txs = rng.gen_range(0..12);
         let transactions = (0..n_txs)
