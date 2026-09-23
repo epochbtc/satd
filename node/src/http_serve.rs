@@ -251,9 +251,15 @@ async fn tls_accept(
 /// timer), so a client that opens a TCP connection but never completes a
 /// request head — including the head of the *next* request on an idle
 /// keep-alive connection — gets disconnected rather than holding a connection
-/// slot forever. HTTP/2 gets the same budget as a keep-alive ping deadline.
-/// The same budget bounds the wait for the connection's very first byte,
-/// which hyper's timer does not cover (see [`FirstByteDeadline`]).
+/// slot forever.
+///
+/// It serves HTTP/1.1 only. hyper-util's auto builder, which also serves
+/// HTTP/2, first sniffs the connection for the HTTP/2 preface and only then
+/// arms HTTP/1's header timer, so a client that sent one byte of the preface
+/// (`P`) and stopped sat in the sniff with no deadline; and an HTTP/2
+/// connection has no idle timeout at all, only a ping liveness check any
+/// client answers. None of these listeners offers HTTP/2 over TLS (ALPN), so
+/// only a client that assumed it unasked could reach that path.
 ///
 /// The other half of Bitcoin Core's `-rpcservertimeout` is the request body,
 /// which hyper cannot time out; that budget is applied where satd reads the
@@ -282,47 +288,34 @@ where
     B::Error: Into<tower::BoxError>,
 {
     let service = hyper_util::service::TowerToHyperService::new(service);
-    // hyper-util's auto builder sniffs the protocol version before HTTP/1's
-    // header timer is armed, so a socket that never sends a byte would sit
-    // in that sniff forever, holding its connection slot. The first byte
-    // gets the same budget as a request head.
-    let io = hyper_util::rt::TokioIo::new(FirstByteDeadline {
-        inner: io,
-        deadline: header_read_timeout.map(|t| Box::pin(tokio::time::sleep(t))),
-    });
+    let io = hyper_util::rt::TokioIo::new(io);
 
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.keep_alive(true);
     if let Some(timeout) = header_read_timeout {
-        // hyper's timer is armed each time a request head is awaited, so this
-        // covers both the first head and the idle gap before the next request
-        // on a keep-alive connection. It stops once the head is complete: the
-        // body phase is bounded in the compat layer instead, because that is
-        // where satd reads the body and hyper offers no body-read timeout.
+        // hyper's timer is armed each time a request head is awaited, the
+        // first one included, so this covers a connection that sends
+        // nothing, a request head that stalls part-way, and the idle gap
+        // before the next request on a keep-alive connection. It stops once
+        // the head is complete: the body phase is bounded in the compat
+        // layer instead, because that is where satd reads the body and
+        // hyper offers no body-read timeout.
         builder
-            .http1()
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(timeout)
-            // A keep-alive connection that goes quiet is closed on the same
-            // budget, which is what an operator setting this expects.
-            .keep_alive(true);
-        builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(Some(timeout))
-            .keep_alive_timeout(timeout);
+            .header_read_timeout(timeout);
     }
-    let conn = builder.serve_connection_with_upgrades(io, service);
+    let conn = builder.serve_connection(io, service).with_upgrades();
 
     tokio::pin!(stopped, conn);
 
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut conn => result,
         () = stopped => {
             conn.as_mut().graceful_shutdown();
             conn.await
         }
-    }
+    };
+    Ok(result?)
 }
 
 
@@ -360,74 +353,6 @@ impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Permitted<I> {
 }
 
 impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Permitted<I> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-}
-
-/// A transport whose first byte must arrive within a deadline; after it
-/// has, reads are passed through untouched. Writes always pass through.
-struct FirstByteDeadline<I> {
-    inner: I,
-    /// `None` once the first byte has arrived (or when no budget applies).
-    deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByteDeadline<I> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::future::Future;
-        if let Some(sleep) = self.deadline.as_mut()
-            && sleep.as_mut().poll(cx).is_ready()
-        {
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "no request arrived within the idle budget",
-            )));
-        }
-        let before = buf.filled().len();
-        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(res, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.deadline = None;
-        }
-        res
-    }
-}
-
-impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FirstByteDeadline<I> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -629,6 +554,51 @@ mod tests {
         let _ = sd_tx.send(true);
     }
 
+    /// Send `bytes`, then nothing: the connection must be closed within the
+    /// 200 ms budget rather than held.
+    async fn closed_after_sending(bytes: &[u8]) -> bool {
+        let (addr, sd_tx) = start(ListenerLimits {
+            sockets: SocketCap::new(0),
+            idle_timeout: Some(Duration::from_millis(200)),
+        })
+        .await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(bytes).await.unwrap();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let closed = loop {
+            match tokio::time::timeout_at(deadline, c.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(_)) => continue,
+                Err(_) => break false,
+            }
+        };
+        let _ = sd_tx.send(true);
+        closed
+    }
+
+    /// One byte that could begin the HTTP/2 preface buys no time: the
+    /// budget covers a request head from its first byte to its last.
+    #[tokio::test]
+    async fn a_partial_http2_preface_is_closed_after_the_timeout() {
+        assert!(closed_after_sending(b"P").await, "a lone `P` held its slot");
+        assert!(
+            closed_after_sending(b"PRI * HTTP/2.0").await,
+            "a partial preface held its slot"
+        );
+    }
+
+    /// These listeners serve HTTP/1.1 only, so an HTTP/2 client that skips
+    /// negotiation gets no HTTP/2 connection, and with it no way around the
+    /// idle budget.
+    #[tokio::test]
+    async fn an_http2_preface_is_not_served_as_http2() {
+        assert!(
+            closed_after_sending(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await,
+            "a full HTTP/2 preface was kept open"
+        );
+    }
+
     /// A router whose `/upgrade` answers 101 and then streams ten ticks, 100
     /// ms apart, on the upgraded socket while keeping a read outstanding, as a
     /// WebSocket server does.
@@ -774,12 +744,10 @@ mod tests {
         got
     }
 
-    /// The first-byte deadline guards the wait for a request and nothing
-    /// after it. A connection upgraded by its first request (a WebSocket)
-    /// on which only the server writes outlives the idle budget many times
-    /// over: the upgrade request is read through the deadline wrapper -- the
-    /// version sniff reads it from the socket, not from some other buffer --
-    /// so its first byte disarms the deadline for good.
+    /// The idle budget guards the wait for a request head and nothing after
+    /// it. A connection upgraded by its first request (a WebSocket) on which
+    /// only the server writes outlives the budget many times over, with a
+    /// read held outstanding the whole time.
     #[tokio::test]
     async fn an_upgraded_connection_the_client_only_reads_is_not_timed_out() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

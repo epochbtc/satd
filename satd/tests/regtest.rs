@@ -843,6 +843,51 @@ fn test_rpc_bearer_websocket_frames_are_charged() {
     node.stop();
 }
 
+/// Every connection-cap option accepts any `usize`, and tokio's semaphore
+/// panics above `usize::MAX >> 3`. A node given the largest value for each
+/// cap still starts and serves: the caps are clamped, not handed through.
+#[test]
+fn test_oversized_connection_caps_do_not_panic_at_boot() {
+    let huge = usize::MAX.to_string();
+    let esplora_port = find_available_port();
+    let electrum_port = find_available_port();
+    let stratum_port = find_available_port();
+    let args: Vec<String> = vec![
+        "--esplora=1".into(),
+        format!("--esplorabind=127.0.0.1:{esplora_port}"),
+        format!("--esploramaxconns={huge}"),
+        format!("--esploramaxsockets={huge}"),
+        format!("--esplorasseconns={huge}"),
+        "--electrum=1".into(),
+        format!("--electrumbind=127.0.0.1:{electrum_port}"),
+        "--txindex=1".into(),
+        format!("--electrummaxconns={huge}"),
+        "--stratum=1".into(),
+        format!("--stratumbind=127.0.0.1:{stratum_port}"),
+        format!("--stratummaxconns={huge}"),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut node = TestNode::start(&args);
+
+    let height = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{esplora_port}/blocks/tip/height"))
+        .send()
+        .unwrap();
+    assert_eq!(height.status().as_u16(), 200, "Esplora serves under a clamped cap");
+    for (name, port) in [("electrum", electrum_port), ("stratum", stratum_port)] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "{name} never started listening");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    node.stop();
+}
+
 /// Esplora `POST /tx` broadcasts only for a token holding `rpc:submit` (or
 /// `rpc:write`, which implies it). `esplora:read` alone reads; its
 /// broadcast is refused with 403 naming the capability. A token that holds

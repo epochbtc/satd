@@ -152,7 +152,9 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
     };
 
     let routes = if cfg.max_concurrency > 0 {
-        routes.layer(ConcurrencyLimitLayer::new(cfg.max_concurrency))
+        routes.layer(ConcurrencyLimitLayer::new(node::http_serve::clamp_cap(
+            cfg.max_concurrency,
+        )))
     } else {
         routes
     };
