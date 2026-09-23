@@ -145,8 +145,9 @@ pub async fn serve_http_listener<S, B>(
             _ = shutdown.changed() => break,
         };
         // The permit is taken before the handshake and before any HTTP is
-        // parsed. At capacity the socket is dropped (the client sees a TCP
-        // reset) rather than queued: queuing would let a flood hold memory.
+        // parsed. At capacity the socket is closed (the client sees EOF, or
+        // a reset if it had already sent data) rather than queued: queuing
+        // would let a flood hold memory.
         let permit = match cap.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {

@@ -42,7 +42,7 @@ Last verified against routes: 2026-05-05.
 | `--esplorarequesttimeout=<seconds>` | `30` | Per-request timeout; also the TLS handshake budget and how long a keep-alive connection may sit idle between requests before it is closed. |
 | `--esploramaxconns=<n>` | `256` | Cap on concurrent in-flight requests. `0` disables the cap. Does not bound long-lived SSE streams; see [Live updates](#live-updates-server-sent-events). |
 | `--esplorasseconns=<n>` | same as `--esploramaxconns` | Hard cap on simultaneously open SSE streams (`/blocks/sse`, `/address/:addr/sse`, `/scripthash/:hash/sse`). Each open stream holds a permit until the client disconnects; over-cap connections receive 503. `0` disables the cap. |
-| `--esploramaxsockets=<n>` | `1024` | Hard cap on open sockets across both Esplora listeners, counted at accept, idle keep-alive connections included. Over the cap a socket is dropped (the client sees a reset). `--esploramaxconns` bounds requests in flight and never sees a socket that sends nothing; this does. `0` disables. A keep-alive connection idle for longer than `--esplorarequesttimeout` is closed. |
+| `--esploramaxsockets=<n>` | `1024` | Hard cap on open sockets across both Esplora listeners, counted at accept, idle keep-alive connections included. Over the cap a socket is closed at accept. `--esploramaxconns` bounds requests in flight and never sees a socket that sends nothing; this does. `0` disables. A keep-alive connection idle for longer than `--esplorarequesttimeout` is closed. |
 
 `POST /tx` has a fixed 1 MiB body limit at the route layer. A witness-heavy
 400 KB raw transaction hex-encodes to about 800 KB, so 1 MiB leaves margin and
