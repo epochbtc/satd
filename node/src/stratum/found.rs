@@ -9,7 +9,7 @@
 //! `<dir>/<height>-<hash>.hex`, the consensus serialization as one line of hex,
 //! which is exactly what `submitblock` takes.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -35,8 +35,11 @@ pub fn save_found_block(dir: &Path, height: u32, block: &Block) -> io::Result<Pa
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
-    // The rename is durable only once the directory entry is.
-    File::open(dir)?.sync_all()?;
+    // The rename is durable only once the directory entry is. Only Unix can
+    // open a directory as a `File` to sync it; elsewhere the rename is left to
+    // the filesystem, as Bitcoin Core's `DirectoryCommit` does.
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
     Ok(path)
 }
 

@@ -698,6 +698,15 @@ pub(crate) async fn submit_found_block(
             saved,
             "Stratum block was valid but did not join the active chain"
         ),
+        // Point at the saved copy only when there is one: when the save
+        // failed (logged above) or no directory is configured, there is none.
+        Ok(Err(e)) if saved.is_empty() => tracing::warn!(
+            target: "node::stratum",
+            height,
+            %hash,
+            error = %e,
+            "Stratum block was not accepted, and no copy of it was saved"
+        ),
         Ok(Err(e)) => tracing::warn!(
             target: "node::stratum",
             height,
@@ -705,6 +714,12 @@ pub(crate) async fn submit_found_block(
             error = %e,
             saved,
             "Stratum block was not accepted; the saved copy can be submitted to another node"
+        ),
+        Err(e) if saved.is_empty() => tracing::error!(
+            target: "node::stratum",
+            %hash,
+            error = %e,
+            "Stratum block submission panicked, and no copy of it was saved"
         ),
         Err(e) => tracing::error!(
             target: "node::stratum",
