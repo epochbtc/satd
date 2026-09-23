@@ -592,7 +592,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             self.seen.clear();
         }
         self.seen.insert(key);
-        self.vardiff.record_share();
+        self.vardiff.record_share(difficulty);
         if let Some(miner) = &self.miner {
             miner.lock().tally.accept(std::time::Instant::now(), difficulty, hash_difficulty);
         }

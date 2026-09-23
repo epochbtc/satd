@@ -117,6 +117,8 @@ pub struct MinerTally {
     /// held enough shares to say. Fixed at the share, so readings taken
     /// during a later silence (which empty the window) do not change it.
     window_rate_at_last_share: Option<f64>,
+    /// The difficulty the last accepted share was judged at.
+    last_share_difficulty: u64,
 }
 
 /// A periodic status reading, covering the shares since the last one.
@@ -141,6 +143,7 @@ impl MinerTally {
             lifetime_shares: 0,
             lifetime_work: 0.0,
             window_rate_at_last_share: None,
+            last_share_difficulty: 0,
         }
     }
 
@@ -157,6 +160,7 @@ impl MinerTally {
             self.best_share = hash_difficulty;
         }
         self.last_share = Some(now);
+        self.last_share_difficulty = difficulty;
         self.lifetime_shares += 1;
         self.lifetime_work += difficulty as f64;
         let rate = self.hashrate(now);
@@ -225,9 +229,16 @@ impl MinerTally {
     /// that silence would lower the rate it is judged by, and the limit would
     /// grow as fast as the silence did — for a miner with a few shares behind
     /// it, faster, so it could never be reached.
+    ///
+    /// For the same reason the rate is taken at the higher of `difficulty`
+    /// and the difficulty the last share was judged at. Vardiff lowers the
+    /// difficulty of a miner that has gone quiet; judged at the lowered
+    /// difficulty, the silence already endured could exceed the new limit at
+    /// once, and a miner that was only unlucky would be dropped just as it
+    /// was given easier shares to find.
     pub fn share_rate(&self, difficulty: u64) -> Option<f64> {
         let at = self.last_share?;
-        let per_share = difficulty.max(1) as f64 * 4_294_967_296.0;
+        let per_share = difficulty.max(self.last_share_difficulty).max(1) as f64 * 4_294_967_296.0;
         let window = self.window_rate_at_last_share;
         let span = at.saturating_duration_since(self.connected).as_secs_f64();
         let lifetime = (self.lifetime_shares >= MIN_ESTIMATE_SHARES && span >= 1.0)
@@ -541,6 +552,24 @@ mod tests {
         assert_eq!(at_last_share, Duration::from_secs(1_200));
         let _ = tally.hashrate(secs(1_600 + 900));
         assert_eq!(miner_idle_timeout(tally.share_rate(1_000)), at_last_share);
+    }
+
+    /// Vardiff lowering the difficulty during a silence does not shorten the
+    /// limit that silence is judged by.
+    #[test]
+    fn a_lowered_difficulty_does_not_shorten_the_idle_limit() {
+        let t0 = Instant::now();
+        let secs = |s: u64| t0 + Duration::from_secs(s);
+        let mut tally = MinerTally::new(t0);
+        for i in 1..=10 {
+            tally.accept(secs(30 * i), 8_000, 8_000.0);
+        }
+        let before = miner_idle_timeout(tally.share_rate(8_000));
+        assert_eq!(before, Duration::from_secs(600));
+        // Vardiff divides the difficulty by eight after a long silence.
+        assert_eq!(miner_idle_timeout(tally.share_rate(1_000)), before);
+        // Raised, the limit grows: shares at the new difficulty are rarer.
+        assert_eq!(miner_idle_timeout(tally.share_rate(16_000)), Duration::from_secs(1_200));
     }
 
     #[test]

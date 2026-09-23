@@ -341,12 +341,42 @@ script that will be paid.
 ## Difficulty and vardiff
 
 A connection starts at `--stratumdifficulty` (or the per-network default) and
-vardiff steers it toward one share every 30 seconds. Every 90 seconds the
-difficulty is scaled by how far the observed share rate is from that target,
-by at most a factor of four per step, and never above the network difficulty.
-A difficulty change is sent as `mining.set_difficulty` followed by a new job;
-shares for the previous job are still judged at the difficulty that job was
-issued with.
+vardiff steers it toward one share every 30 seconds.
+
+Shares arrive at random, so a few minutes of them say little about a miner's
+speed: at the target rate, seven shares in 90 seconds where three were
+expected happens about 3% of the time. Vardiff therefore changes the
+difficulty only when the shares since the last change are clearly off target:
+
+- when a miner exactly on target would produce a count that far off with
+  probability below 1 in 100,000 (checked every 10 seconds, so that luck
+  alone rarely gets through); or
+- once at least 40 shares were expected since the last change, when that
+  probability is below 1 in 1,000, so that a moderate error is still
+  corrected, on enough shares to land close to the target.
+
+Even then, a rate within 15% of the target is left alone. A change moves the
+difficulty to where the observed rate says it should be, by at most a factor
+of eight, never below the `mining.suggest_difficulty` floor and never above
+the network difficulty. Shares are counted for the difficulty they were
+judged at, so a share on an older job still counts for its work.
+
+In practice, measured over simulated miners from 100 GH/s to 100 TH/s:
+
+- A miner whose difficulty is ten times too low (shares far too fast) is
+  within a factor of two of its best difficulty within a minute and a half.
+- A miner whose difficulty is ten times too high needs its rarer shares to
+  show it, and is within a factor of two of its best difficulty in about seven
+  minutes, at worst about half an hour.
+- Once settled, the difficulty stays within a factor of two, changing at most
+  a few times in five hours, and the mean share interval stays within 20% of
+  30 seconds.
+- A miner that goes quiet has its difficulty lowered after about eleven
+  expected share intervals without a share.
+
+A difficulty change is sent as `mining.set_difficulty` followed by a new job
+(Stratum V1) or `SetTarget` (Stratum V2); shares for the previous job are
+still judged at the difficulty that job was issued with.
 
 `mining.suggest_difficulty` sets the connection's difficulty and makes it the
 floor vardiff will not go below. It is clamped to `[1, 2^48]`.
@@ -410,9 +440,14 @@ ten minutes. A Stratum V2 connection counts the share rates of all its
 channels.
 
 The one-hour ceiling matters only for a miner that expects fewer than one
-share every three minutes. Vardiff never sets a difficulty that high, so the
-cause is a `mining.suggest_difficulty` floor above what the device can reach.
-Such a miner can be dropped while it is hashing; lower the floor.
+share every three minutes. Vardiff aims at one share every 30 seconds, so a
+miner held there is almost always one whose `mining.suggest_difficulty` floor
+is above what the device can reach. Such a miner can be dropped while it is
+hashing; lower the floor.
+
+When vardiff lowers the difficulty of a miner that has gone quiet, the idle
+limit is still judged at the difficulty of the miner's last share, so the
+lowering itself cannot make a silence already endured exceed the limit.
 
 ## When work is withheld
 
