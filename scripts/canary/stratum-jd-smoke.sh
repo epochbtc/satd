@@ -173,4 +173,11 @@ PAID="$(sat_cli getblock "$MINED" 2 | jq -r --arg a "$STRATUM_PAYOUT_ADDR" \
 [[ "$PAID" -ge 1 ]] || { echo "block $MINED does not pay $STRATUM_PAYOUT_ADDR" >&2; exit 1; }
 echo "ok: the declared job's block $MINED mined $TXID and pays $STRATUM_PAYOUT_ADDR"
 
+# ── Bitcoin Core accepts it ──
+# The block was built from a coinbase the JD client declared, so Core's
+# verdict is the one that matters: a coinbase satd's checks passed and the
+# network refuses would be a block lost.
+assert_core_accepted "$MINED" core_cli
+core_follows_satd 60 core_cli
+
 echo "stratum job declaration canary: PASS"

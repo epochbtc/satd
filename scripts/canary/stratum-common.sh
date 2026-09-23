@@ -75,3 +75,103 @@ require_mining_device() {
         return 1
     fi
 }
+
+# ── A Bitcoin Core peer, the judge of every block the Stratum server finds ──
+#
+# A block satd accepts is only worth anything if the network accepts it too.
+# The canaries peer a Bitcoin Core node (CORE_IMAGE in PINS) with satd over
+# P2P and require every Stratum-found block to be on Core's active chain.
+
+CORE_PEER_CONTAINER=""
+CORE_PEER_RPC_PORT=""
+CORE_PEER_RPCUSER="canary"
+CORE_PEER_RPCPASSWORD="canary"
+
+core_peer_cli() {
+    docker exec "$CORE_PEER_CONTAINER" bitcoin-cli -regtest -rpcport="$CORE_PEER_RPC_PORT" \
+        -rpcuser="$CORE_PEER_RPCUSER" -rpcpassword="$CORE_PEER_RPCPASSWORD" "$@"
+}
+
+# start_core_peer <container name> <rpc port> <satd p2p port>
+start_core_peer() {
+    CORE_PEER_CONTAINER="$1"
+    CORE_PEER_RPC_PORT="$2"
+    pull_with_retries "$CORE_IMAGE"
+    docker run -d --name "$CORE_PEER_CONTAINER" --network=host "$CORE_IMAGE" \
+        -regtest -server -listen=0 -connect="127.0.0.1:$3" -rpcport="$CORE_PEER_RPC_PORT" \
+        -rpcuser="$CORE_PEER_RPCUSER" -rpcpassword="$CORE_PEER_RPCPASSWORD" -rpcallowip=127.0.0.1 \
+        -fallbackfee=0.0001 >/dev/null
+    local deadline=$(($(date +%s) + 60))
+    until core_peer_cli getblockchaininfo >/dev/null 2>&1; do
+        [[ $(date +%s) -lt $deadline ]] || { echo "Bitcoin Core RPC never came up" >&2; docker logs "$CORE_PEER_CONTAINER" 2>&1 | tail -20 >&2; return 1; }
+        sleep 1
+    done
+    deadline=$(($(date +%s) + 60))
+    until [[ "$(core_peer_cli getconnectioncount)" -ge 1 ]]; do
+        [[ $(date +%s) -lt $deadline ]] || { echo "Bitcoin Core never connected to satd" >&2; return 1; }
+        sleep 1
+    done
+    echo "Bitcoin Core $(core_peer_cli getnetworkinfo | jq -r .subversion) peered with satd"
+}
+
+stop_core_peer() {
+    if [[ -n "$CORE_PEER_CONTAINER" ]]; then
+        docker logs "$CORE_PEER_CONTAINER" > "${WORK:-/tmp}/core.log" 2>&1 || true
+        docker rm -f "$CORE_PEER_CONTAINER" >/dev/null 2>&1 || true
+    fi
+}
+
+# Every block satd logged as found through Stratum, oldest first.
+stratum_found_hashes() {
+    grep 'Stratum miner found a block' "$SATD_LOG" | grep -o 'hash=[0-9a-f]\{64\}' | cut -d= -f2
+}
+
+# core_follows_satd <budget secs> [cli function]: Core's best block must
+# reach satd's within the budget.
+core_follows_satd() {
+    local budget="$1" cli="${2:-core_peer_cli}"
+    local deadline=$(($(date +%s) + budget)) best
+    while [[ $(date +%s) -lt $deadline ]]; do
+        best="$(sat_cli getbestblockhash)"
+        [[ "$("$cli" getbestblockhash 2>/dev/null)" == "$best" ]] && return 0
+        sleep 1
+    done
+    echo "Bitcoin Core did not reach satd's tip $best (Core is at $("$cli" getbestblockhash 2>/dev/null))" >&2
+    return 1
+}
+
+# assert_core_accepted <hash> [cli function]: the block is on Bitcoin Core's
+# active chain, and by Core's own decoding its coinbase pays the payout
+# address. A block only satd accepted would be orphaned: nothing else here
+# can tell.
+assert_core_accepted() {
+    local hash="$1" cli="${2:-core_peer_cli}"
+    local deadline=$(($(date +%s) + 60)) confirmations="-1"
+    while [[ $(date +%s) -lt $deadline ]]; do
+        confirmations="$("$cli" getblockheader "$hash" 2>/dev/null | jq -r '.confirmations // -1')"
+        [[ "$confirmations" -ge 1 ]] && break
+        sleep 1
+    done
+    if [[ "$confirmations" -lt 1 ]]; then
+        echo "Bitcoin Core does not have Stratum-found block $hash on its active chain (confirmations=$confirmations)" >&2
+        "$cli" getchaintips >&2 || true
+        return 1
+    fi
+    local paid
+    paid="$("$cli" getblock "$hash" 2 | jq -r --arg a "$STRATUM_PAYOUT_ADDR" \
+        '[.tx[0].vout[] | select(.scriptPubKey.address == $a and .value > 0)] | length')"
+    [[ "$paid" -ge 1 ]] || { echo "by Bitcoin Core's decoding, block $hash does not pay $STRATUM_PAYOUT_ADDR" >&2; return 1; }
+    echo "ok: Bitcoin Core accepted Stratum-found block $hash, paying $STRATUM_PAYOUT_ADDR"
+}
+
+# Every block found so far must be on Core's chain, and Core at satd's tip.
+assert_core_accepted_all_found() {
+    local cli="${1:-core_peer_cli}" n=0 hash
+    while read -r hash; do
+        assert_core_accepted "$hash" "$cli"
+        n=$((n + 1))
+    done < <(stratum_found_hashes)
+    [[ "$n" -ge 1 ]] || { echo "satd logged no Stratum-found block" >&2; return 1; }
+    core_follows_satd 60 "$cli"
+    echo "ok: Bitcoin Core accepted all $n Stratum-found blocks and is at satd's tip"
+}
