@@ -74,13 +74,16 @@ an idle connection holds its slot until the client closes it, so 100 idle
 connections from any client that can reach the listener lock out every other
 client, `sat-cli` on loopback included. Keep the listener private
 (`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on. A peer
-outside `-rpcallowip` cannot hold a slot: on a plain-HTTP listener it is
-answered `403` and the connection is closed, and on a TLS listener it is
-dropped at accept, before the handshake and before a slot is taken. The two
-listeners read an *empty* `-rpcallowip` differently, though — a plain bind
-falls back to loopback-only, while a TLS bind stays reachable from wherever
-it is bound, gated by TLS/mTLS and RPC auth rather than by source address.
-Set `-rpcallowip` to gate a public `-rpctlsbind` too. A listener that is
+outside the listener's allowlist (`-rpcallowip`, or `-rpcreadonlyallowip`
+on the read-only listeners) never takes a slot: the allowlist is checked at
+accept, before the cap. On a plain-HTTP listener the peer is answered `403`
+and the connection closed within a few seconds, from a separate pool of 16
+refusals in flight, past which it is dropped at accept; on a TLS listener it
+is dropped at accept, before the handshake. The two listeners read an
+*empty* allowlist differently, though — a plain bind falls back to
+loopback-only, while a TLS bind stays reachable from wherever it is bound,
+gated by TLS/mTLS and RPC auth rather than by source address. Set the
+allowlist to gate a public TLS bind too. A listener that is
 shedding logs the first few refusals in each minute and then a count, so a
 flood cannot fill the log with the report of itself.
 

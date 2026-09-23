@@ -87,6 +87,10 @@ fn strip_brackets(host: &str) -> &str {
 /// Bitcoin Core's `IsLocal()` exemption); otherwise the IP must fall in
 /// at least one configured CIDR. An empty list means loopback-only.
 pub fn is_allowed(ip: IpAddr, allow: &[IpAllowEntry]) -> bool {
+    // A dual-stack `[::]` bind reports an IPv4 peer as `::ffff:a.b.c.d`;
+    // judge it as the IPv4 address it is, or 127.0.0.1 would miss the
+    // loopback exemption and no IPv4 entry could ever match.
+    let ip = ip.to_canonical();
     if ip_is_loopback(ip) {
         return true;
     }
@@ -124,6 +128,20 @@ fn ip_is_loopback(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a dual-stack `[::]` bind an IPv4 peer arrives IPv4-mapped. It is
+    /// judged as IPv4: loopback stays exempt and IPv4 entries match.
+    #[test]
+    fn ipv4_mapped_peers_are_judged_as_ipv4() {
+        let mapped = |v4: Ipv4Addr| IpAddr::V6(v4.to_ipv6_mapped());
+        let allow = vec![IpAllowEntry::parse("10.0.0.0/8").unwrap()];
+        assert!(is_allowed(mapped(Ipv4Addr::LOCALHOST), &allow));
+        assert!(is_allowed(mapped(Ipv4Addr::new(10, 1, 2, 3)), &allow));
+        assert!(!is_allowed(mapped(Ipv4Addr::new(192, 0, 2, 1)), &allow));
+        assert!(!tls_listener_denies(mapped(Ipv4Addr::LOCALHOST), &allow));
+        assert!(!tls_listener_denies(mapped(Ipv4Addr::new(10, 1, 2, 3)), &allow));
+        assert!(tls_listener_denies(mapped(Ipv4Addr::new(192, 0, 2, 1)), &allow));
+    }
 
     #[test]
     fn parse_bare_ipv4() {

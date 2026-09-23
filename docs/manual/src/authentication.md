@@ -203,10 +203,11 @@ TLS-terminating proxy fronts it — prefer the loopback bind plus a proxy.
 For a proxy-terminated or mTLS-terminated deployment, bind to loopback and
 omit the `*-allow-remote` flag. JSON-RPC remote exposure is governed by
 Core's existing `-rpcbind`/`-rpcallowip`; there is no separate allow-remote
-flag for it. `-rpcallowip` also gates `-rpctlsbind` and
-`-rpcreadonlytlsbind`, but only once it has at least one entry: an empty
-allowlist means loopback-only on a plain bind and "no source-address rule"
-on a TLS bind, which is gated by TLS/mTLS and RPC auth instead.
+flag for it. `-rpcallowip` also gates `-rpctlsbind`, and
+`-rpcreadonlyallowip` gates `-rpcreadonlytlsbind`, but only once the list
+has at least one entry: an empty allowlist means loopback-only on a plain
+bind and "no source-address rule" on a TLS bind, which is gated by TLS/mTLS
+and RPC auth instead.
 
 ## Transport TLS / mTLS
 
