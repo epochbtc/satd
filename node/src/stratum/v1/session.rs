@@ -24,7 +24,10 @@ use super::{
 };
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::miner::{self, MinerRecord, MinerSlot, format_difficulty, format_hashrate};
+use crate::stratum::miner::{
+    self, MinerRecord, MinerSlot, UNAUTHORIZED_IDLE_TIMEOUT, format_difficulty, format_hashrate,
+    miner_idle_timeout,
+};
 use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{
     ShareResult, effective_share_target, hash_difficulty, network_difficulty, validate_share,
@@ -32,8 +35,6 @@ use crate::stratum::share::{
 use crate::stratum::template::{ActiveTemplate, Work};
 use crate::stratum::vardiff::Vardiff;
 
-/// A connection that sends nothing for this long is dropped.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A write that cannot complete in this long drops the connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often vardiff is reconsidered, independent of share arrival — a
@@ -122,8 +123,9 @@ pub(crate) async fn run<S>(
         user_agent: None,
         miner: None,
     };
-    let idle = tokio::time::sleep(IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    // The idle limit depends on the miner's difficulty and share rate, so it
+    // is recomputed on every pass rather than set once per line.
+    let mut last_read = Instant::now();
     let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -131,6 +133,7 @@ pub(crate) async fn run<S>(
     let reason;
     loop {
         let authorized = session.payout.is_some();
+        let idle_at = last_read + session.idle_timeout();
         // New work and the vardiff tick come before the miner's own lines.
         // They are rare, so they cannot starve the reader; the other way
         // round, a miner that submits without pause (on regtest every share
@@ -165,10 +168,10 @@ pub(crate) async fn run<S>(
                     }
                 };
                 buf.clear();
-                idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
+                last_read = Instant::now();
                 session.handle_line(&line, &mut work_rx).await
             }
-            _ = &mut idle => {
+            _ = tokio::time::sleep_until(idle_at) => {
                 reason = "idle";
                 break;
             }
@@ -213,7 +216,10 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    String::from_utf8(buf.clone()).map_err(|_| "invalid UTF-8")
+    // Stratum V1 is JSON text. Bytes that are not text are almost always a
+    // Stratum V2 miner (its first message is a Noise handshake) pointed at
+    // the V1 port.
+    String::from_utf8(buf.clone()).map_err(|_| "binary data on the Stratum V1 port (a Stratum V2 client?)")
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
@@ -592,6 +598,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         }
     }
 
+    /// How long this connection may send nothing: short until it
+    /// authorizes, then scaled to how often its shares should arrive.
+    fn idle_timeout(&self) -> Duration {
+        let Some(miner) = self.miner.as_ref().filter(|_| self.payout.is_some()) else {
+            return UNAUTHORIZED_IDLE_TIMEOUT;
+        };
+        let rate = miner.lock().tally.share_rate(self.vardiff.difficulty());
+        miner_idle_timeout(rate)
+    }
+
     fn worker(&self) -> &str {
         self.payout.as_ref().and_then(|p| p.worker.as_deref()).unwrap_or("")
     }
@@ -643,5 +659,132 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             %hashrate,
             "Stratum miner disconnected"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stratum::config::StratumConfig;
+    use crate::stratum::miner::{MinerTally, UNESTIMATED_MINER_IDLE_TIMEOUT};
+    use crate::stratum::vardiff::VardiffConfig;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    const ADDRESS: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    const DIFFICULTY: u64 = 1_000;
+
+    fn config() -> StratumConfig {
+        StratumConfig {
+            network: bitcoin::Network::Regtest,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls_bind: None,
+            tls_cert: None,
+            tls_key: None,
+            mtls: false,
+            mtls_client_ca: None,
+            mtls_client_allow: Vec::new(),
+            fallback_address: None,
+            initial_difficulty: DIFFICULTY,
+            max_conns: 4,
+            vardiff: VardiffConfig::default(),
+            v2: None,
+            found_block_dir: None,
+        }
+    }
+
+    /// A session on one end of an in-memory pipe; the other end is the miner.
+    fn start() -> (Arc<Shared>, DuplexStream, watch::Sender<bool>) {
+        let shared = Shared::for_test(config());
+        let (server_io, client_io) = tokio::io::duplex(1 << 16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer = "127.0.0.1:1".parse().unwrap();
+        tokio::spawn(run(server_io, peer, shared.clone(), shutdown_rx));
+        (shared, client_io, shutdown_tx)
+    }
+
+    async fn send(client: &mut DuplexStream, line: &str) {
+        client.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    }
+
+    /// Whether the server closes the connection within `wait`, discarding
+    /// anything it writes meanwhile. Time is paused, so `wait` passes as soon
+    /// as nothing else is runnable.
+    async fn closes_within(client: &mut DuplexStream, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut buf = [0u8; 4096];
+        loop {
+            match tokio::time::timeout_at(deadline, client.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    async fn authorize(client: &mut DuplexStream) {
+        send(client, r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#).await;
+        send(client, &format!(r#"{{"id":2,"method":"mining.authorize","params":["{ADDRESS}.w","x"]}}"#)).await;
+    }
+
+    /// A socket that never authorizes is still reaped at the short limit.
+    #[tokio::test(start_paused = true)]
+    async fn an_unauthorized_connection_is_dropped_after_two_minutes_of_silence() {
+        let (_shared, mut client, _shutdown) = start();
+        send(&mut client, r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#).await;
+        assert!(!closes_within(&mut client, UNAUTHORIZED_IDLE_TIMEOUT - Duration::from_secs(5)).await);
+        assert!(closes_within(&mut client, Duration::from_secs(10)).await, "reaped at the limit");
+    }
+
+    /// An authorized miner whose rate is not known yet is allowed the fixed
+    /// allowance, not the two minutes an unauthorized socket gets.
+    #[tokio::test(start_paused = true)]
+    async fn an_authorized_miner_outlasts_the_unauthorized_idle_limit() {
+        let (_shared, mut client, _shutdown) = start();
+        authorize(&mut client).await;
+        assert!(
+            !closes_within(&mut client, UNESTIMATED_MINER_IDLE_TIMEOUT - Duration::from_secs(10)).await,
+            "an authorized miner was dropped before its share rate was known"
+        );
+        assert!(closes_within(&mut client, Duration::from_secs(20)).await, "and is dropped after it");
+    }
+
+    /// A miner whose shares are due every 150 s is allowed twenty of those
+    /// intervals of silence — here about 50 minutes — and then dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_miner_with_rare_shares_is_allowed_twenty_intervals() {
+        let (shared, mut client, _shutdown) = start();
+        authorize(&mut client).await;
+        assert!(!closes_within(&mut client, Duration::from_secs(1)).await);
+
+        // Its record: twenty shares at the session's difficulty over the last
+        // 3,000 s, one every 150 s.
+        let records = shared.stats.miners.records();
+        assert_eq!(records.len(), 1, "the authorized miner is registered");
+        {
+            let now = std::time::Instant::now();
+            let start = now - Duration::from_secs(3_000);
+            let mut record = records[0].lock();
+            record.tally = MinerTally::new(start);
+            for i in 1..=20 {
+                record.tally.accept(start + Duration::from_secs(150 * i), DIFFICULTY, DIFFICULTY as f64);
+            }
+        }
+        let allowed = Duration::from_secs(20 * 150);
+        assert!(
+            !closes_within(&mut client, allowed - Duration::from_secs(60)).await,
+            "a miner with rare shares was dropped before twenty intervals"
+        );
+        assert!(closes_within(&mut client, Duration::from_secs(120)).await, "and is dropped after them");
+    }
+
+    /// A Stratum V2 miner pointed at the V1 port is named in the reason.
+    #[tokio::test]
+    async fn binary_data_on_the_v1_port_names_the_likely_cause() {
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        writer.write_all(&[0xff, 0xfe, 0x00, b'\n']).await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        let why = read_line_bounded(&mut reader, &mut buf).await.unwrap_err();
+        assert!(why.contains("Stratum V2"), "{why}");
     }
 }
