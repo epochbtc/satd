@@ -10,7 +10,7 @@ use crate::rpc::amounts::{
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
-use crate::rpc::capability::CapabilityLayer;
+use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
 use crate::rpc::named_params::NamedParamsLayer;
 
 use crate::rpc::params::Args;
@@ -4364,6 +4364,9 @@ async fn spawn_tls_surface(
     // tokens are gated per method; the operator principal has all
     // capabilities, so this is a no-op for legacy clients.
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
+    // Charges a batch per call against the token's rate limit; must sit
+    // outside every layer that splits a batch (see `BatchRateLayer`).
+    let batch_rate = bearer.as_ref().map(|_| BatchRateLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
@@ -4377,9 +4380,13 @@ async fn spawn_tls_surface(
         .set_http_middleware(tls_middleware)
         .set_rpc_middleware(
             RpcServiceBuilder::new()
-                // Outermost: object `params` becomes positional `params`
-                // before anything downstream inspects them, so the filters and
-                // every handler see one shape.
+                // Outermost, and only on a bearer surface: the per-call rate
+                // charge for a batch, which has to see the batch whole.
+                .option_layer(batch_rate)
+                // Object `params` becomes positional `params` before
+                // anything downstream inspects them, so the filters and
+                // every handler see one shape. Answers a batch by splitting
+                // it into single calls on the layers beneath.
                 .layer(NamedParamsLayer::new())
                 // Inside the rewrite but outside the filters: a request that
                 // is about to be *rejected* is not executing, so it has no
@@ -4630,6 +4637,9 @@ pub async fn spawn_plain_surface(
     let (stop_handle, server_handle) = stop_channel();
 
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
+    // Charges a batch per call against the token's rate limit; must sit
+    // outside every layer that splits a batch (see `BatchRateLayer`).
+    let batch_rate = bearer.as_ref().map(|_| BatchRateLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
@@ -4645,9 +4655,13 @@ pub async fn spawn_plain_surface(
         // (after jsonrpsee has parsed the method + split batches).
         .set_rpc_middleware(
             RpcServiceBuilder::new()
-                // Outermost: object `params` becomes positional `params`
-                // before anything downstream inspects them, so the filters and
-                // every handler see one shape.
+                // Outermost, and only on a bearer surface: the per-call rate
+                // charge for a batch, which has to see the batch whole.
+                .option_layer(batch_rate)
+                // Object `params` becomes positional `params` before
+                // anything downstream inspects them, so the filters and
+                // every handler see one shape. Answers a batch by splitting
+                // it into single calls on the layers beneath.
                 .layer(NamedParamsLayer::new())
                 // See the TLS builder above for the placement.
                 .layer(crate::rpc::active_commands::ActiveCommandsLayer::new())

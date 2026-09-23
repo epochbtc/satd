@@ -70,6 +70,12 @@ impl WsClient {
             .expect("ws connect (query)")
     }
 
+    /// Upgrade the JSON-RPC listener's `/` to a WebSocket, presenting a
+    /// bearer token. jsonrpsee serves JSON-RPC over the socket.
+    pub async fn connect_rpc(port: u16, token: &str) -> Result<Self, String> {
+        Self::connect_path(port, "/", Some(token)).await
+    }
+
     async fn connect_path(
         port: u16,
         path: &str,

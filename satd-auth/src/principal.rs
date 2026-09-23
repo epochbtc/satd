@@ -200,15 +200,10 @@ mod tests {
     fn operator_has_all_caps() {
         let op = Principal::operator();
         assert_eq!(op.id(), "operator");
-        for c in [
-            Capability::RpcRead,
-            Capability::RpcWrite,
-            Capability::EsploraRead,
-            Capability::StreamSubscribe,
-            Capability::StreamWatch,
-            Capability::McpAll,
-        ] {
-            assert!(op.require(c).is_ok());
+        // The whole vocabulary, so a capability added later cannot be
+        // left out of the operator's set unnoticed.
+        for c in crate::capability::ALL_CAPS {
+            assert!(op.require(c).is_ok(), "operator lacks {}", c.as_str());
         }
     }
 

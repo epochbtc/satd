@@ -667,6 +667,273 @@ fn test_rpc_bearer_submit_capability() {
     node.stop();
 }
 
+/// A batch is charged against the token's rate limit per entry. The HTTP
+/// layer charges one unit per request before it can see the body, so
+/// without the per-entry charge a `1/s` token could carry any number of
+/// calls in one batch. The first entry rides on the HTTP unit; each later
+/// entry costs one; an entry over budget is answered `-32005` in-band with
+/// `retry_after_secs`.
+#[test]
+fn test_rpc_bearer_batch_charged_per_entry() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "satd-test-batch-ratelimit-token-v1",
+        capabilities: &["rpc:read"],
+        rate_limit: Some("2/s"),
+        watch_quota: None,
+    }]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    // Ten reads in one batch against a bucket of two: the HTTP layer takes
+    // one, entry 0 is free, entry 1 takes the last, and the rest are shed
+    // (unless the bucket refills mid-batch, which is why the tail is
+    // asserted as "at least one shed" rather than an exact count).
+    let batch: Vec<serde_json::Value> = (0..10)
+        .map(|i| serde_json::json!({"jsonrpc": "2.0", "id": i, "method": "getblockcount", "params": []}))
+        .collect();
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&batch)
+        .bearer_auth("satd-test-batch-ratelimit-token-v1")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the batch itself is admitted");
+    let replies: Vec<serde_json::Value> = resp.json().unwrap();
+    assert_eq!(replies.len(), 10);
+    assert!(replies[0].get("result").is_some(), "entry 0 is free: {}", replies[0]);
+    assert!(replies[1].get("result").is_some(), "entry 1 within budget: {}", replies[1]);
+    let shed: Vec<&serde_json::Value> = replies
+        .iter()
+        .filter(|r| r["error"]["code"] == -32005)
+        .collect();
+    assert!(!shed.is_empty(), "a 10-entry batch on a 2/s token must shed: {replies:?}");
+    for r in &shed {
+        assert!(
+            r["error"]["data"]["retry_after_secs"].is_u64(),
+            "shed entry carries retry_after_secs: {r}"
+        );
+    }
+    // Every entry is either served or shed; nothing else.
+    assert!(
+        replies
+            .iter()
+            .all(|r| r.get("result").is_some() || r["error"]["code"] == -32005),
+        "{replies:?}"
+    );
+
+    // The operator is unlimited: a long batch is served in full.
+    let batch: Vec<serde_json::Value> = (0..50)
+        .map(|i| serde_json::json!({"jsonrpc": "2.0", "id": i, "method": "getblockcount", "params": []}))
+        .collect();
+    let replies = node
+        .rpc_call_raw_body(&serde_json::Value::Array(batch).to_string())
+        .unwrap();
+    let replies = replies.as_array().expect("operator batch reply is an array");
+    assert_eq!(replies.len(), 50);
+    assert!(replies.iter().all(|r| r.get("result").is_some()), "{replies:?}");
+
+    node.stop();
+}
+
+/// JSON-RPC 2.0 notifications in a batch are charged like calls, so a
+/// rate-limited token cannot get unmetered dispatch by dropping its ids.
+/// Nine notifications precede one call on a 2/s token: the HTTP layer takes
+/// one unit, entry 0 is free, entry 1 takes the last, and the call at the
+/// end is shed `-32005`. Were the notifications uncharged, the call would
+/// find a unit left and be served. Notifications get no reply, so the reply
+/// array holds the call's entry alone.
+#[test]
+fn test_rpc_bearer_batch_notifications_are_charged() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "satd-test-batch-notif-ratelimit-token-v1",
+        capabilities: &["rpc:read"],
+        rate_limit: Some("2/s"),
+        watch_quota: None,
+    }]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let mut batch: Vec<serde_json::Value> = (0..9)
+        .map(|_| serde_json::json!({"jsonrpc": "2.0", "method": "getblockcount", "params": []}))
+        .collect();
+    batch.push(serde_json::json!({"jsonrpc": "2.0", "id": "last", "method": "getblockcount", "params": []}));
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&batch)
+        .bearer_auth("satd-test-batch-notif-ratelimit-token-v1")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the batch itself is admitted");
+    let replies: Vec<serde_json::Value> = resp.json().unwrap();
+    assert_eq!(replies.len(), 1, "notifications get no reply entry: {replies:?}");
+    assert_eq!(replies[0]["id"], "last", "{replies:?}");
+    assert_eq!(
+        replies[0]["error"]["code"], -32005,
+        "the notifications drained the bucket, so the trailing call is shed: {replies:?}"
+    );
+
+    node.stop();
+}
+
+/// A WebSocket on the JSON-RPC listener pays the token's rate limit per
+/// frame, not once at the upgrade. With a `2/s` token, ten back-to-back
+/// frames on one socket get at most a burst's worth of results; the rest are
+/// answered `-32005`.
+#[test]
+fn test_rpc_bearer_websocket_frames_are_charged() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "satd-test-ws-ratelimit-token-v1",
+        capabilities: &["rpc:read"],
+        rate_limit: Some("2/s"),
+        watch_quota: None,
+    }]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let port = node.rpcport;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (ok, shed) = rt.block_on(async move {
+        let mut ws = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-ratelimit-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        for i in 0..10 {
+            ws.send_control(serde_json::json!({
+                "jsonrpc": "2.0", "id": i, "method": "getblockcount", "params": []
+            }))
+            .await;
+        }
+        let (mut ok, mut shed) = (0, 0);
+        for _ in 0..10 {
+            let reply = ws.next_json(10).await;
+            if reply.get("result").is_some() {
+                ok += 1;
+            } else {
+                assert_eq!(reply["error"]["code"], -32005, "{reply}");
+                shed += 1;
+            }
+        }
+        (ok, shed)
+    });
+    assert!(ok <= 3, "a 2/s token served {ok} of 10 frames at once");
+    assert_eq!(ok + shed, 10);
+
+    node.stop();
+}
+
+/// Esplora `POST /tx` broadcasts only for a token holding `rpc:submit` (or
+/// `rpc:write`, which implies it). `esplora:read` alone reads; its
+/// broadcast is refused with 403 naming the capability. A token that holds
+/// the capability reaches the handler (a decode error on a junk body, not
+/// a 403).
+#[test]
+fn test_esplora_broadcast_requires_submit_capability() {
+    let fixture = write_authfile(&[
+        TokenSpec {
+            id: "ro",
+            token: "satd-test-esplora-bcast-ro-v1",
+            capabilities: &["esplora:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "sub",
+            token: "satd-test-esplora-bcast-sub-v1",
+            capabilities: &["esplora:read", "rpc:submit"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "rw",
+            token: "satd-test-esplora-bcast-rw-v1",
+            capabilities: &["esplora:read", "rpc:write"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "subonly",
+            token: "satd-test-esplora-bcast-subonly-v1",
+            capabilities: &["rpc:submit"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+    ]);
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&[
+        "--esplora=1",
+        &bind,
+        "--esploraauthbearer=1",
+        &format!("--authfile={}", fixture.authfile.display()),
+    ]);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let post_tx = |bearer: Option<&str>| -> (u16, String) {
+        let mut req = client
+            .post(format!("http://127.0.0.1:{}/tx", esplora_port))
+            .body("00");
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().unwrap();
+        (resp.status().as_u16(), resp.text().unwrap_or_default())
+    };
+
+    // The read token still reads.
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+        .bearer_auth("satd-test-esplora-bcast-ro-v1")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // ...but cannot broadcast, and the refusal names the capability.
+    let (status, body) = post_tx(Some("satd-test-esplora-bcast-ro-v1"));
+    assert_eq!(status, 403, "esplora:read alone must not broadcast: {body}");
+    assert!(body.contains("rpc:submit"), "refusal names rpc:submit: {body}");
+
+    // Submit and write tokens reach the handler: a junk body is a 400 decode
+    // error, not a capability refusal.
+    for tok in ["satd-test-esplora-bcast-sub-v1", "satd-test-esplora-bcast-rw-v1"] {
+        let (status, body) = post_tx(Some(tok));
+        assert_eq!(status, 400, "{tok} must reach the broadcast handler: {body}");
+        assert!(!body.contains("rpc:submit"), "{tok}: {body}");
+    }
+
+    // The surface-wide gate is unchanged: no `esplora:read` means no
+    // Esplora at all, even with `rpc:submit`; and no credential is 401.
+    let (status, _) = post_tx(Some("satd-test-esplora-bcast-subonly-v1"));
+    assert_eq!(status, 401, "rpc:submit without esplora:read is refused at the surface");
+    let (status, _) = post_tx(None);
+    assert_eq!(status, 401);
+
+    node.stop();
+}
+
 #[test]
 fn test_getbestblockhash() {
     let mut node = TestNode::start(&[]);

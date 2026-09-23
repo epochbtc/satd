@@ -18,7 +18,7 @@ surface from the extensions described here.
 
 > **Note.** JSON-RPC keeps Bitcoin Core's cookie / `rpcuser` / `rpcauth`
 > credentials by default. Capability-scoped bearer tokens (`-rpcauthbearer`,
-> `rpc:read` / `rpc:write`) are an opt-in addition. See
+> `rpc:read` / `rpc:submit` / `rpc:write`) are an opt-in addition. See
 > [Authentication & Authorization](authentication.md).
 
 ## Satoshis-as-integers

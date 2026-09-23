@@ -60,7 +60,7 @@ pub enum Capability {
 
 /// Every capability, in bit order. The single source of truth used to derive
 /// [`CapabilitySet::ALL`] and to render a set for logging.
-const ALL_CAPS: [Capability; 9] = [
+pub(crate) const ALL_CAPS: [Capability; 9] = [
     Capability::RpcRead,
     Capability::RpcWrite,
     Capability::RpcSubmit,
@@ -210,9 +210,20 @@ mod tests {
 
     #[test]
     fn all_set_covers_every_capability() {
+        // Test the bits, not `contains`: the write⇒submit implication would
+        // make `ALL.contains(RpcSubmit)` true even with the submit bit
+        // missing from `ALL`, and `Debug` renders the bits.
         for c in ALL_CAPS {
-            assert!(CapabilitySet::ALL.contains(c), "{} missing from ALL", c.as_str());
+            assert!(
+                CapabilitySet::ALL.0 & c.bit() != 0,
+                "{} missing from ALL",
+                c.as_str()
+            );
         }
+        let folded = ALL_CAPS
+            .into_iter()
+            .fold(CapabilitySet::EMPTY, |s, c| s.with(c));
+        assert_eq!(folded.0, CapabilitySet::ALL.0, "ALL and ALL_CAPS disagree");
         assert!(CapabilitySet::EMPTY.is_empty());
         assert!(!CapabilitySet::ALL.is_empty());
     }
