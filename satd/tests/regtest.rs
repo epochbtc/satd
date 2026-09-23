@@ -22313,8 +22313,6 @@ impl BlockFiller {
 }
 
 struct FillMarkers {
-    /// The CPFP pair: read once block templates select by package fee rate.
-    #[allow(dead_code)]
     cpfp: (String, String),
     taproot: String,
     multi: String,
@@ -22356,6 +22354,8 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
         let txids: std::collections::HashSet<&str> =
             block["tx"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
         for (kind, txid) in [
+            ("CPFP parent", markers.cpfp.0.as_str()),
+            ("CPFP child", markers.cpfp.1.as_str()),
             ("taproot spend", markers.taproot.as_str()),
             ("multi-input spend", markers.multi.as_str()),
         ] {
