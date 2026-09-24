@@ -62,6 +62,18 @@ fn main() {
         raw_block(vec![cb])
     };
 
+    // BIP 34 compares the scriptSig's first bytes with Core's minimal
+    // `CScript() << height`; height 1 is `OP_1`. The same number pushed any
+    // other way is `bad-cb-height` to Core. Byte mutations of a minimal seed
+    // rarely land on one of these, so they are seeds of their own.
+    let with_height_push = |push: &[u8]| {
+        let mut cb = coinbase(1, SUBSIDY, op_true());
+        let mut script = push.to_vec();
+        script.push(0x00);
+        cb.input[0].script_sig = ScriptBuf::from(script);
+        raw_block(vec![cb])
+    };
+
     let seeds: Vec<(&str, Block)> = vec![
         ("valid_coinbase", raw_block(vec![coinbase(1, SUBSIDY, op_true())])),
         (
@@ -76,6 +88,9 @@ fn main() {
         ),
         ("bad_version", bad_version),
         ("oversize_output", oversize_output),
+        ("height_push_one_byte", with_height_push(&[0x01, 0x01])),
+        ("height_push_padded", with_height_push(&[0x02, 0x01, 0x00])),
+        ("height_push_pushdata1", with_height_push(&[0x4c, 0x01, 0x01])),
     ];
 
     for (name, block) in seeds {
