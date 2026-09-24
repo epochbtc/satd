@@ -886,7 +886,7 @@ impl Session {
                 ch.seen.clear();
             }
             ch.seen.insert(key);
-            ch.vardiff.record_share();
+            ch.vardiff.record_share(job.difficulty);
             ch.miner.lock().tally.accept(std::time::Instant::now(), job.difficulty, hash_difficulty);
         };
         match result {
