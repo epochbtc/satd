@@ -259,6 +259,9 @@ pub struct UtxoSetInfo {
     pub total_amount_sat: u64,
     /// UTXO creation-height histogram (1000-block buckets).
     pub height_hist: Vec<u64>,
+    /// Exact per-height counts for the most recent heights, `None` until
+    /// the store's window is live (see [`ChainState::build_recent_window`]).
+    pub recent: Option<crate::storage::RecentHeightWindow>,
 }
 
 /// See `ChainState::set_pow_valid_block_hook`.
@@ -3404,7 +3407,22 @@ impl ChainState {
             txouts: self.store.coin_count(),
             total_amount_sat: self.store.coin_total_amount(),
             height_hist: self.store.utxo_height_hist(),
+            recent: self.store.utxo_recent_heights(),
         })
+    }
+
+    /// Build the store's recent-height window if it is not live yet: one
+    /// blocking scan of the coins, run once at startup on its own thread.
+    /// Blocks keep connecting while it scans; what they write is folded in
+    /// at the end. Returns [`RecentWindowBuild::Cancelled`] soon after
+    /// `cancel` is set.
+    ///
+    /// [`RecentWindowBuild::Cancelled`]: crate::storage::RecentWindowBuild::Cancelled
+    pub fn build_recent_window(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::storage::RecentWindowBuild, StoreError> {
+        self.store.build_recent_window(cancel)
     }
 
     /// Walk every coin in one RocksDB point-in-time view, as

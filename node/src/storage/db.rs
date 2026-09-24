@@ -426,6 +426,28 @@ impl Store for InMemoryStore {
         hist
     }
 
+    /// Computed from the coins on every call, like the histogram above, so
+    /// it is always live. The window's top is the highest coin height.
+    fn utxo_recent_heights(&self) -> Option<crate::storage::RecentHeightWindow> {
+        use bitcoin::hashes::Hash as _;
+        let tip = self
+            .get_tip()
+            .map(|h| h.to_byte_array())
+            .unwrap_or([0; 32]);
+        let mut window = crate::storage::RecentHeightWindow::empty(tip);
+        for coin in self.coins.read().values() {
+            window.add_one(coin.height);
+        }
+        Some(window)
+    }
+
+    fn build_recent_window(
+        &self,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::storage::RecentWindowBuild, StoreError> {
+        Ok(crate::storage::RecentWindowBuild::AlreadyLive)
+    }
+
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
         let seq = self.get_tx_seq(txid)?;
         let (_first, height) = self.block_of_seq(seq)?;

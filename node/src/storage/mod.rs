@@ -6,6 +6,7 @@ pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
 pub mod profile;
+pub mod recent_window;
 pub mod rocksdb_store;
 pub mod split_store;
 #[cfg(test)]
@@ -26,6 +27,12 @@ use node_index::SpentRow;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
+
+pub use recent_window::{
+    RECENT_WINDOW, RECENT_WINDOW_BUILD_RETRY_DELAYS, RECENT_WINDOW_LEN,
+    RECENT_WINDOW_REORG_MARGIN, RecentHeightWindow, RecentWindowBuild,
+    build_recent_window_with_retries,
+};
 
 /// Self-consistent base captured during [`Store::for_each_coin_snapshot`].
 ///
@@ -590,6 +597,28 @@ pub trait Store: Send + Sync {
     /// UTXO creation height histogram. Each element is the count of UTXOs created
     /// in a 1000-block range: index 0 = heights 0-999, index 1 = 1000-1999, etc.
     fn utxo_height_hist(&self) -> Vec<u64>;
+    /// Exact per-height counts for the most recent heights, or `None` while
+    /// the store has no live window (never built, being built, or a backend
+    /// that does not keep one). See [`RecentHeightWindow`].
+    ///
+    /// Like [`utxo_height_hist`](Self::utxo_height_hist) this describes the
+    /// durable coins only; a caching layer must be flushed first for it to
+    /// cover coins still in the cache.
+    fn utxo_recent_heights(&self) -> Option<RecentHeightWindow> {
+        None
+    }
+    /// Build the recent-height window from one scan of the coins if it is
+    /// not already live. Blocking, and minutes long on a large chainstate;
+    /// run it on its own thread. Writes that land while it scans are folded
+    /// in when it finishes, so the chain keeps moving meanwhile. Checks
+    /// `cancel` periodically and returns [`RecentWindowBuild::Cancelled`]
+    /// when it is set, persisting nothing.
+    fn build_recent_window(
+        &self,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<RecentWindowBuild, StoreError> {
+        Ok(RecentWindowBuild::Unsupported)
+    }
     /// Look up which block contains a transaction (txindex).
     /// Returns None if txindex is disabled or the txid is not found.
     ///

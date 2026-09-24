@@ -1499,6 +1499,21 @@ impl Store for CoinCache {
         self.inner.utxo_height_hist()
     }
 
+    // No overlay for the dirty coins, same as the histogram above: readers
+    // flush first. The build needs no flush either. A dirty coin is not in
+    // the build's snapshot, and reaches the store in a later batch, which
+    // lands in the build's pending deltas, so it is counted exactly once.
+    fn utxo_recent_heights(&self) -> Option<crate::storage::RecentHeightWindow> {
+        self.inner.utxo_recent_heights()
+    }
+
+    fn build_recent_window(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::storage::RecentWindowBuild, StoreError> {
+        self.inner.build_recent_window(cancel)
+    }
+
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
         // A faithful view of the inner store: the LRU is only populated when
         // the inner store actually writes the index (see `write_batch`), so
