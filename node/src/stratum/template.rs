@@ -333,7 +333,7 @@ pub(crate) mod tests {
             cur_time: 1_700_000_000,
             min_time: 1_699_999_000,
             transactions: (0..n)
-                .map(|i| TemplateTx { tx: tx(i as u8 + 1), fee: 100, weight: 400 })
+                .map(|i| TemplateTx { tx: tx(i as u8 + 1), fee: 100, weight: 400, sigop_cost: 0 })
                 .collect(),
             coinbase_value: 50 * 100_000_000 + 100 * n as u64,
         };
@@ -366,6 +366,41 @@ pub(crate) mod tests {
         assert!(block.check_witness_commitment(), "witness commitment");
         assert_eq!(block.txdata[0].output[0].script_pubkey, payout());
         assert_eq!(block.bip34_block_height().unwrap(), 1_234);
+    }
+
+    /// The template leaves the coinbase 8,000 WU and 400 sigop cost. The
+    /// Stratum coinbase must fit both whatever it pays and however it is
+    /// filled: every standard payout type (P2PKH is the one with a sigop), the
+    /// longest witness program an address can name, the largest extranonce
+    /// hole and a five-byte height push.
+    #[test]
+    fn the_coinbase_fits_the_templates_weight_and_sigop_reserves() {
+        use crate::mining::template::{COINBASE_SIGOPS_RESERVE, COINBASE_WEIGHT_RESERVE};
+        let payouts = [
+            ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([9; 20])),
+            ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array([9; 20])),
+            payout(),
+            ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
+            ScriptBuf::from_bytes([&[0x51, 0x20][..], &[9; 32]].concat()),
+            ScriptBuf::from_bytes([&[0x60, 0x28][..], &[9; 40]].concat()),
+        ];
+        let mut template = Arc::try_unwrap(work_with(3, 0x207fffff)).ok().unwrap();
+        template.height = 0x7fff_ffff;
+        let work = Arc::new(template);
+        for payout in payouts {
+            let job = ActiveTemplate::build(work.clone(), 1, payout.clone(), MAX_EXTRANONCE_LEN).unwrap();
+            let coinbase = job.reassemble_coinbase(&[0xae; MAX_EXTRANONCE_LEN]);
+            let weight = coinbase.weight().to_wu() as usize;
+            assert!(weight <= COINBASE_WEIGHT_RESERVE, "{payout}: {weight} WU");
+            // A coinbase's sigop cost, as `connect_block` counts it.
+            let sigops = coinbase.total_sigop_cost(|_| None) as u64;
+            assert!(sigops <= COINBASE_SIGOPS_RESERVE, "{payout}: {sigops} sigop cost");
+            if payout.is_p2pkh() {
+                assert_eq!(sigops, 4, "the P2PKH payout's OP_CHECKSIG counts, and nothing else");
+            } else {
+                assert_eq!(sigops, 0, "{payout}: the extranonce is pushed data, never opcodes");
+            }
+        }
     }
 
     #[test]

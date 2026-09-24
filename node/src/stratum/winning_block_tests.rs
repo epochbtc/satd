@@ -273,7 +273,7 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
             for (tx, fee) in [(parent, 1_000u64), (child, 5_000)] {
                 template.coinbase_value += fee;
                 let weight = tx.weight().to_wu() as usize;
-                template.transactions.push(TemplateTx { tx, fee, weight });
+                template.transactions.push(TemplateTx { tx, fee, weight, sigop_cost: 0 });
             }
         }
         let prev_time = chain.get_block(&chain.tip_hash()).unwrap().header.time;
@@ -377,7 +377,7 @@ fn a_reconstructed_block_is_the_block_the_miners_parts_describe() {
             .map(|i| {
                 let coin = OutPoint::new(bitcoin::Txid::from_byte_array(rng.r#gen()), rng.gen_range(0..4));
                 let tx = spend(coin, 100_000 + i, rng.gen_range(1..4), 500);
-                TemplateTx { weight: tx.weight().to_wu() as usize, tx, fee: 500 }
+                TemplateTx { weight: tx.weight().to_wu() as usize, tx, fee: 500, sigop_cost: 0 }
             })
             .collect::<Vec<_>>();
         let height = rng.gen_range(1..2_000_000);

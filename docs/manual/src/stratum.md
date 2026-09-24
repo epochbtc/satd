@@ -201,14 +201,20 @@ fetched:
   with `invalid-job-param-value-wtxid_list`; the server never asks for missing
   transactions.
 - A transaction that spends an unconfirmed parent must be listed after it, and
-  the set must fit in a block.
+  the set must fit in a block: its weight, and its signature-operation cost
+  together with the coinbase's, at most 80,000. When the extranonce sits
+  outside any push in the coinbase scriptSig, its bytes are opcodes the miner
+  chooses later, so the scriptSig is counted at 20 per byte, the most any
+  opcode costs; putting the extranonce inside a push, as the reference client
+  does, makes the count exact.
 - The coinbase must commit to the next height on the current tip, pay the
   address the token was issued for, claim no more than the subsidy plus the
   declared fees, and carry a witness commitment that matches the declared
   transactions.
 - The custom job must name the current tip and difficulty, a merkle path that
   matches the declaration, a coinbase prefix of at most eight bytes starting
-  with the height, and outputs that satisfy the same payout and value rules.
+  with the height, and outputs that satisfy the same payout and value rules
+  and keep the block within the sigop limit.
 
 Refusals use the Stratum V2 codes `invalid-mining-job-token` and
 `invalid-job-param-value-<field>`, with a human-readable reason in
