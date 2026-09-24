@@ -22024,3 +22024,509 @@ fn bip375_end_to_end_with_the_sat_cli_signer() {
 
     node.stop();
 }
+
+// --- The Stratum winning-block path, on a full mempool ---
+
+/// A deterministic wallet of P2WPKH and taproot key-path coins, for filling a
+/// mempool with the shapes real blocks carry.
+struct BlockFiller {
+    secp: bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    wpkh: DeterministicWallet,
+    tr: bitcoin::secp256k1::Keypair,
+    tr_spk: bitcoin::ScriptBuf,
+    coins: std::collections::VecDeque<FillerCoin>,
+}
+
+#[derive(Clone, Copy)]
+struct FillerCoin {
+    outpoint: bitcoin::OutPoint,
+    value: u64,
+    taproot: bool,
+}
+
+impl BlockFiller {
+    fn new() -> Self {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (tr, tr_spk) = common::p2tr_keypath_output(&secp, [0x72; 32]);
+        Self { secp, wpkh: DeterministicWallet::from_secret([0x71; 32]), tr, tr_spk, coins: Default::default() }
+    }
+
+    fn spk(&self, taproot: bool) -> bitcoin::ScriptBuf {
+        if taproot { self.tr_spk.clone() } else { self.wpkh.address.script_pubkey() }
+    }
+
+    /// Sign and build a transaction spending `inputs` into `outputs`
+    /// (`(taproot, value)`); returns it and its new coins.
+    fn build(&self, inputs: &[FillerCoin], outputs: &[(bool, u64)]) -> (bitcoin::Transaction, Vec<FillerCoin>) {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::key::TapTweak;
+        use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+        let mut tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|c| bitcoin::TxIn {
+                    previous_output: c.outpoint,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                })
+                .collect(),
+            output: outputs
+                .iter()
+                .map(|(taproot, value)| bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(*value),
+                    script_pubkey: self.spk(*taproot),
+                })
+                .collect(),
+        };
+        let prevouts: Vec<bitcoin::TxOut> = inputs
+            .iter()
+            .map(|c| bitcoin::TxOut { value: bitcoin::Amount::from_sat(c.value), script_pubkey: self.spk(c.taproot) })
+            .collect();
+        let mut witnesses = Vec::with_capacity(inputs.len());
+        {
+            let mut cache = SighashCache::new(&tx);
+            for (i, coin) in inputs.iter().enumerate() {
+                let mut witness = bitcoin::Witness::new();
+                if coin.taproot {
+                    let sighash = cache
+                        .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+                        .unwrap();
+                    let sig = self.secp.sign_schnorr_no_aux_rand(
+                        &bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
+                        &self.tr.tap_tweak(&self.secp, None).to_keypair(),
+                    );
+                    witness.push(sig.as_ref());
+                } else {
+                    let sighash = cache
+                        .p2wpkh_signature_hash(i, &self.spk(false), bitcoin::Amount::from_sat(coin.value), EcdsaSighashType::All)
+                        .unwrap();
+                    let sig = self
+                        .secp
+                        .sign_ecdsa(&bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()), &self.wpkh.sk);
+                    let mut der = sig.serialize_der().to_vec();
+                    der.push(EcdsaSighashType::All as u8);
+                    witness.push(der);
+                    witness.push(self.wpkh.pk.to_bytes());
+                }
+                witnesses.push(witness);
+            }
+        }
+        for (input, witness) in tx.input.iter_mut().zip(witnesses) {
+            input.witness = witness;
+        }
+        let txid = tx.compute_txid();
+        let coins = outputs
+            .iter()
+            .enumerate()
+            .map(|(vout, (taproot, value))| FillerCoin {
+                outpoint: bitcoin::OutPoint::new(txid, vout as u32),
+                value: *value,
+                taproot: *taproot,
+            })
+            .collect();
+        (tx, coins)
+    }
+
+    fn take(&mut self, n: usize) -> Vec<FillerCoin> {
+        assert!(self.coins.len() >= n, "the filler ran out of coins");
+        self.coins.drain(..n).collect()
+    }
+
+    /// Fund the filler: mine `blocks` coinbases to its P2WPKH key, then fan
+    /// each mature one out to `per_coinbase` coins, alternately P2WPKH and
+    /// taproot, and confirm the fan-outs.
+    fn fund(&mut self, node: &TestNode, coinbases: u64, per_coinbase: u64) {
+        use serde_json::json;
+        node.rpc_ok("generatetoaddress", vec![json!(coinbases + 100), json!(self.wpkh.address.to_string())]);
+        for height in 1..=coinbases {
+            let txid: bitcoin::Txid = common::coinbase_txid_at(node, height).parse().unwrap();
+            let coinbase = FillerCoin {
+                outpoint: bitcoin::OutPoint::new(txid, 0),
+                value: 50 * 100_000_000,
+                taproot: false,
+            };
+            let each = (coinbase.value - 100_000) / per_coinbase;
+            let outputs: Vec<(bool, u64)> = (0..per_coinbase).map(|i| (i % 2 == 1, each)).collect();
+            let (tx, coins) = self.build(&[coinbase], &outputs);
+            node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(bitcoin::consensus::serialize(&tx)))]);
+            self.coins.extend(coins);
+        }
+        node.rpc_ok("generatetoaddress", vec![json!(1), json!(self.wpkh.address.to_string())]);
+        assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([]), "the fan-outs confirmed");
+    }
+
+    /// Broadcast more transactions than one block holds, in every shape a
+    /// block commonly carries. Returns txids worth finding in the block: a
+    /// taproot key-path spend and a mixed-type multi-input spend, and a
+    /// low-fee parent with its high-fee child (CPFP). Whether a full block
+    /// takes the CPFP pair depends on package selection, which block
+    /// templates do not do yet; the pair is in the mempool either way.
+    fn fill(&mut self, node: &TestNode) -> FillMarkers {
+        use serde_json::json;
+        let send = |tx: &bitcoin::Transaction| {
+            node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(bitcoin::consensus::serialize(tx)))]);
+            tx.compute_txid().to_string()
+        };
+        // Wide fan-outs, about 32,000 WU each: 130 of them are over a block.
+        for coin in self.take(130) {
+            let each = (coin.value - 40_000) / 250;
+            let outs: Vec<(bool, u64)> = (0..250).map(|i| (i % 5 == 0, each)).collect();
+            send(&self.build(&[coin], &outs).0);
+        }
+        // CPFP: a parent near the relay floor, a child paying for both.
+        let mut cpfp = None;
+        for coin in self.take(100) {
+            let (parent, out) = self.build(&[coin], &[(false, coin.value - 150)]);
+            let (child, _) = self.build(&out, &[(true, out[0].value - 20_000)]);
+            let ids = (send(&parent), send(&child));
+            cpfp.get_or_insert(ids);
+        }
+        // Taproot key-path spends, one output to each type.
+        let mut taproot = None;
+        let tr_coins: Vec<FillerCoin> = self.coins.iter().copied().filter(|c| c.taproot).take(200).collect();
+        self.coins.retain(|c| !tr_coins.iter().any(|t| t.outpoint == c.outpoint));
+        for coin in tr_coins {
+            let half = (coin.value - 3_000) / 2;
+            let id = send(&self.build(&[coin], &[(true, half), (false, half)]).0);
+            taproot.get_or_insert(id);
+        }
+        // Multi-input spends mixing both types.
+        let mut multi = None;
+        for inputs in self.take(300).chunks(3) {
+            let total: u64 = inputs.iter().map(|c| c.value).sum();
+            let id = send(&self.build(inputs, &[(false, total - 5_000)]).0);
+            multi.get_or_insert(id);
+        }
+        // Chains five deep.
+        for coin in self.take(20) {
+            let mut coins = vec![coin];
+            for _ in 0..5 {
+                let (tx, out) = self.build(&coins, &[(coins[0].taproot, coins[0].value - 2_000)]);
+                send(&tx);
+                coins = out;
+            }
+        }
+        FillMarkers { cpfp: cpfp.unwrap(), taproot: taproot.unwrap(), multi: multi.unwrap() }
+    }
+}
+
+struct FillMarkers {
+    /// The CPFP pair: read once block templates select by package fee rate.
+    #[allow(dead_code)]
+    cpfp: (String, String),
+    taproot: String,
+    multi: String,
+}
+
+/// A block found through Stratum on a full mempool is a full block, and a
+/// second node accepts it over P2P. Once through Stratum V1 and once through a
+/// Stratum V2 extended channel, each on a mempool holding more than a block:
+/// wide fan-outs, CPFP pairs, taproot key-path spends, mixed multi-input
+/// spends and chains. (Whether the CPFP pairs make it in is package
+/// selection's question, asserted with that change, not here.)
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
+    use bitcoin::hashes::{Hash, sha256d};
+    use serde_json::json;
+    use stratum_core::binary_sv2::{self, B032};
+    use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
+
+    let p2p = find_available_port();
+    let (node, v1_port, v2_port) = start_stratum_v2_node(&[&format!("--port={p2p}")]);
+    let peer = TestNode::start(&[&format!("--connect=127.0.0.1:{p2p}")]);
+    poll_until(
+        || get_rpc_u64(&peer, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(20),
+        "the second node connects",
+    );
+    let mut filler = BlockFiller::new();
+    filler.fund(&node, 25, 100);
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    // After each found block: the block is full, holds each kind of
+    // transaction, pays the miner, was saved byte for byte, and the second
+    // node follows it.
+    let check = |hash: &str, markers: &FillMarkers, what: &str| {
+        let block = node.rpc_ok("getblock", vec![json!(hash), json!(1)]);
+        let weight = block["weight"].as_u64().unwrap();
+        assert!(weight > 3_900_000, "{what}: the template should be full, weight {weight}");
+        let txids: std::collections::HashSet<&str> =
+            block["tx"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        for (kind, txid) in [
+            ("taproot spend", markers.taproot.as_str()),
+            ("multi-input spend", markers.multi.as_str()),
+        ] {
+            assert!(txids.contains(txid), "{what}: the block does not carry the {kind} {txid}");
+        }
+        assert!(
+            !node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().is_empty(),
+            "{what}: the mempool held more than the block"
+        );
+        let full = node.rpc_ok("getblock", vec![json!(hash), json!(2)]);
+        assert_eq!(full["tx"][0]["vout"][0]["scriptPubKey"]["address"], miner, "{what}");
+        let height = block["height"].as_u64().unwrap();
+        let saved = node.datadir.join("regtest").join("stratum").join("found").join(format!("{height}-{hash}.hex"));
+        let raw = node.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+        assert_eq!(
+            std::fs::read_to_string(&saved).unwrap_or_else(|e| panic!("{what}: {}: {e}", saved.display())),
+            format!("{}\n", raw.as_str().unwrap()),
+            "{what}: the saved copy is the block"
+        );
+        poll_until(
+            || get_rpc_str(&peer, "getbestblockhash").as_deref() == Some(hash),
+            test_timeout(30),
+            &format!("{what}: the second node accepts the block"),
+        );
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Stratum V1.
+    let markers = filler.fill(&node);
+    let found_v1 = rt.block_on(async {
+        let mut client = plain_stratum_client(v1_port);
+        let (extranonce1, _) = client.handshake(&format!("{miner}.full")).await;
+        // A new tip, so the next job is built from the full mempool now
+        // rather than at the 30-second refresh.
+        tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(miner), json!([])]));
+        let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
+        let params = loop {
+            let n = client.notification("mining.notify", Duration::from_secs(30)).await;
+            if notify_prevhash(&n["params"]) == best {
+                break n["params"].clone();
+            }
+        };
+        assert!(params[4].as_array().unwrap().len() >= 10, "a full block's merkle branch: {params}");
+        let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
+        let reply = client
+            .call(
+                "mining.submit",
+                json!([
+                    format!("{miner}.full"),
+                    params[0],
+                    hex::encode(extranonce2),
+                    format!("{ntime:08x}"),
+                    format!("{nonce:08x}")
+                ]),
+            )
+            .await;
+        assert_eq!(reply["result"], true, "{reply}");
+        notify_height(&params)
+    });
+    poll_until(|| get_rpc_u64(&node, "getblockcount") == Some(found_v1), test_timeout(20), "the V1 block connects");
+    check(&get_rpc_str(&node, "getbestblockhash").unwrap(), &markers, "Stratum V1");
+
+    // Stratum V2, extended channel, on a mempool filled again.
+    let markers = filler.fill(&node);
+    let found_v2 = rt.block_on(async {
+        let mut miner_conn = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner_conn.setup().await;
+        let (channel_id, prefix, size) = miner_conn.open_extended(&miner, 8).await;
+        tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(miner), json!([])]));
+        let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
+        let next = tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1;
+        let (job, prev, min_ntime, nbits) = loop {
+            let mut payload = miner_conn.expect(0x1f, Duration::from_secs(30)).await;
+            let job: NewExtendedMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
+            let job = (
+                job.job_id,
+                job.version,
+                job.merkle_path.inner_as_ref().iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
+                job.coinbase_tx_prefix.inner_as_ref().to_vec(),
+                job.coinbase_tx_suffix.inner_as_ref().to_vec(),
+            );
+            let (activated, prev, min_ntime, nbits) = miner_conn.set_new_prev_hash(Duration::from_secs(30)).await;
+            assert_eq!(activated, job.0);
+            if prev == best {
+                break (job, prev, min_ntime, nbits);
+            }
+        };
+        let (job_id, version, path, cb_prefix, cb_suffix) = job;
+        assert!(path.len() >= 10, "a full block's merkle path");
+        let miner_extranonce: Vec<u8> = (0..size).map(|i| 0x30 + i as u8).collect();
+        let mut coinbase = cb_prefix;
+        coinbase.extend_from_slice(&prefix);
+        coinbase.extend_from_slice(&miner_extranonce);
+        coinbase.extend_from_slice(&cb_suffix);
+        let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
+        for sibling in &path {
+            let mut buf = root.to_vec();
+            buf.extend_from_slice(sibling);
+            root = sha256d::Hash::hash(&buf).to_byte_array();
+        }
+        let nonce = sv2::grind(version, sv2::internal(&prev), root, min_ntime, nbits);
+        miner_conn
+            .send(
+                0x1b,
+                SubmitSharesExtended {
+                    channel_id,
+                    sequence_number: 1,
+                    job_id,
+                    nonce,
+                    ntime: min_ntime,
+                    version,
+                    extranonce: B032::try_from(miner_extranonce).unwrap(),
+                },
+            )
+            .await;
+        let mut payload = miner_conn.expect(0x1c, Duration::from_secs(10)).await;
+        let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!(ok.last_sequence_number, 1);
+        next
+    });
+    poll_until(|| get_rpc_u64(&node, "getblockcount") == Some(found_v2), test_timeout(20), "the V2 block connects");
+    check(&get_rpc_str(&node, "getbestblockhash").unwrap(), &markers, "Stratum V2 extended");
+}
+
+/// Blocks found through Stratum V1 at the heights where the BIP 34 push
+/// changes shape on a chain a test can mine: the last `OP_16` (16), the first
+/// data push (17), and the first that needs a sign byte (128). Each must
+/// connect, and its coinbase must start with Bitcoin Core's encoding.
+#[test]
+fn stratum_v1_found_blocks_cross_bip34_push_boundaries() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for (height, push) in [(16u64, "60"), (17, "0111"), (127, "017f"), (128, "028000")] {
+        let tip = get_rpc_u64(&node, "getblockcount").unwrap();
+        if tip + 1 < height {
+            node.rpc_ok("generatetoaddress", vec![json!(height - 1 - tip), json!(miner)]);
+        }
+        rt.block_on(async {
+            let mut client = plain_stratum_client(port);
+            let (extranonce1, _) = client.handshake(&format!("{miner}.bip34")).await;
+            let params = loop {
+                let n = client.notification("mining.notify", Duration::from_secs(30)).await;
+                if notify_height(&n["params"]) == height {
+                    break n["params"].clone();
+                }
+            };
+            let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
+            let reply = client
+                .call(
+                    "mining.submit",
+                    json!([
+                        format!("{miner}.bip34"),
+                        params[0],
+                        hex::encode(extranonce2),
+                        format!("{ntime:08x}"),
+                        format!("{nonce:08x}")
+                    ]),
+                )
+                .await;
+            assert_eq!(reply["result"], true, "height {height}: {reply}");
+        });
+        poll_until(
+            || get_rpc_u64(&node, "getblockcount") == Some(height),
+            test_timeout(20),
+            &format!("the Stratum block at height {height} connects"),
+        );
+        let hash = get_rpc_str(&node, "getbestblockhash").unwrap();
+        let block = node.rpc_ok("getblock", vec![json!(hash), json!(2)]);
+        let script_sig = block["tx"][0]["vin"][0]["coinbase"].as_str().unwrap();
+        assert!(script_sig.starts_with(push), "height {height}: scriptSig {script_sig} must start with {push}");
+    }
+}
+
+/// `PushSolution`: a Job Declaration client that finds a block on its declared
+/// job hands the solution straight to the Job Declarator. The block connects.
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_jd_push_solution_connects_block() {
+    use bitcoin::hashes::{Hash, sha256d};
+    use serde_json::json;
+    use stratum_core::binary_sv2::{self, B032, B064K, B0255, Seq064K, Str0255, U256};
+    use stratum_core::common_messages_sv2::Protocol;
+    use stratum_core::job_declaration_sv2::{
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobSuccess, PushSolution,
+    };
+    let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
+    let funder = DeterministicWallet::from_secret([0x8b; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    let dest = DeterministicWallet::from_secret([0x8c; 32]);
+    let (raw_hex, txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &funder, dest.address.script_pubkey(), 2_000);
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex.clone())]);
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
+    let height = 102u32;
+    let reward = 50 * 100_000_000 + 2_000;
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"].as_u64().unwrap() as u32;
+    let hole = 8;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
+        jdc.send(
+            0x50,
+            AllocateMiningJobToken { user_identifier: Str0255::try_from(miner.address.to_string()).unwrap(), request_id: 1 },
+        )
+        .await;
+        let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
+        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let (prefix, suffix, _) =
+            sv2_declared_coinbase(height, &miner.address.script_pubkey(), reward, std::slice::from_ref(&tx), hole);
+        jdc.send(
+            0x57,
+            DeclareMiningJob {
+                request_id: 2,
+                mining_job_token: B0255::try_from(allocated.mining_job_token.inner_as_ref().to_vec()).unwrap(),
+                version: 0x2000_0000,
+                coinbase_tx_prefix: B064K::try_from(prefix.clone()).unwrap(),
+                coinbase_tx_suffix: B064K::try_from(suffix.clone()).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(tx.compute_wtxid().to_raw_hash().to_byte_array())]).unwrap(),
+                excess_data: B064K::try_from(Vec::new()).unwrap(),
+            },
+        )
+        .await;
+        let mut payload = jdc.expect(0x58, Duration::from_secs(10)).await;
+        let _: DeclareMiningJobSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+
+        // The solution: the declared coinbase with the client's extranonce in
+        // its hole, the declared transaction beside it, ground to the target.
+        let extranonce: Vec<u8> = (1..=hole as u8).collect();
+        let mut coinbase = prefix;
+        coinbase.extend_from_slice(&extranonce);
+        coinbase.extend_from_slice(&suffix);
+        let mut buf = sha256d::Hash::hash(&coinbase).to_byte_array().to_vec();
+        buf.extend_from_slice(&tx.compute_txid().to_raw_hash().to_byte_array());
+        let root = sha256d::Hash::hash(&buf).to_byte_array();
+        let prev = sv2::internal(&best);
+        let ntime = tip_time + 1;
+        let nonce = sv2::grind(0x2000_0000, prev, root, ntime, 0x207fffff);
+        jdc.send(
+            0x60,
+            PushSolution {
+                extranonce: B032::try_from(extranonce).unwrap(),
+                prev_hash: U256::from(prev),
+                ntime,
+                nonce,
+                nbits: 0x207fffff,
+                version: 0x2000_0000,
+            },
+        )
+        .await;
+    });
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(u64::from(height)),
+        test_timeout(10),
+        "the pushed solution connects",
+    );
+    let hash = get_rpc_str(&node, "getbestblockhash").unwrap();
+    let block = node.rpc_ok("getblock", vec![json!(hash), json!(2)]);
+    let txs = block["tx"].as_array().unwrap();
+    assert_eq!(txs.len(), 2, "{block}");
+    assert_eq!(txs[1]["txid"], txid);
+    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner.address.to_string());
+    let saved = node.datadir.join("regtest").join("stratum").join("found").join(format!("{height}-{hash}.hex"));
+    let raw = node.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), format!("{}\n", raw.as_str().unwrap()));
+}

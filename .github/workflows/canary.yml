@@ -948,6 +948,7 @@ jobs:
           name: stratum-v1-canary-logs
           path: |
             /tmp/satd-canary-stratum-v1.*/satd.log
+            /tmp/satd-canary-stratum-v1.*/core.log
             /tmp/satd-canary-stratum-v1.*/minerd.log
           if-no-files-found: ignore
           retention-days: 7
@@ -1001,6 +1002,7 @@ jobs:
           name: stratum-v2-canary-logs
           path: |
             /tmp/satd-canary-stratum-v2.*/satd.log
+            /tmp/satd-canary-stratum-v2.*/core.log
             /tmp/satd-canary-stratum-v2.*/*.log
           if-no-files-found: ignore
           retention-days: 7

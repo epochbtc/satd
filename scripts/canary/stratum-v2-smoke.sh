@@ -12,6 +12,8 @@
 #   - block after block: the job for each tip reaches a miner that is
 #     submitting continuously (on regtest every share is a block)
 #   - the found blocks' coinbase pays the channel's user identity
+#   - Bitcoin Core, peered over P2P, accepts every block found and decodes
+#     each coinbase as paying the channel's user identity
 #
 # SRI publishes no image for mining_device; the workflow builds it from the
 # pinned sv2-apps tag and passes its path as SRI_MINING_DEVICE.
@@ -30,12 +32,14 @@ DEVICE_PID=""
 
 cleanup() {
     if [[ -n "$DEVICE_PID" ]]; then kill "$DEVICE_PID" 2>/dev/null || true; fi
+    stop_core_peer
     stop_satd
 }
 trap cleanup EXIT
 
 # shellcheck disable=SC2046 # word splitting is the point
 boot_satd "$WORK" 18960 $(stratum_satd_args)
+start_core_peer "satd-canary-stratum-v2-core-$$" 18965 18961
 sat_cli generatetoaddress 1 "$STRATUM_PAYOUT_ADDR" >/dev/null
 V2="$(stratum_listener v2)"
 KEY="$(stratum_authority_base58)"
@@ -81,5 +85,11 @@ prevhashes="$(grep -c "Received SetNewPrevHash" "$WORK/mining-device.log" || tru
 sat_cli getstratuminfo | jq -e '.shares.rejected == 0' >/dev/null \
     || { echo "shares were rejected:" >&2; sat_cli getstratuminfo | jq .shares >&2; grep -o 'reason="[a-z-]*"' "$SATD_LOG" | sort | uniq -c >&2; exit 1; }
 echo "ok: mining_device found $(sat_cli getstratuminfo | jq .blocks_found) blocks across $prevhashes tips"
+
+# ── 3. Bitcoin Core accepts every one ──
+kill "$DEVICE_PID" 2>/dev/null || true
+wait "$DEVICE_PID" 2>/dev/null || true
+DEVICE_PID=""
+assert_core_accepted_all_found
 
 echo "stratum v2 canary: PASS"
