@@ -641,6 +641,7 @@ enum_namer!(status_kind_name, satd_events_client::StatusKind, pb::StatusKind, {
     MempoolCongested => MempoolCongested,
     PeerFloor => PeerFloor,
     DeepReorg => DeepReorg,
+    TemplateInvalid => TemplateInvalid,
 });
 
 enum_namer!(status_state_name, satd_events_client::StatusState, pb::StatusState, {

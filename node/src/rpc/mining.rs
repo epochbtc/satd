@@ -135,8 +135,20 @@ pub fn generate_block(
 }
 
 /// Handle the `getblocktemplate` RPC call.
-pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value {
+///
+/// The template is checked before it is returned, as Core's `CreateNewBlock`
+/// does, and a template that fails is an error with Core's message rather
+/// than work for a miner (`mining::validity`). The script-level check follows
+/// in the background, once per tip.
+pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Result<Value, (i32, String)> {
+    use crate::mining::validity::{Check, CheckOrigin};
     let template = create_template(chain_state, mempool);
+    let outcome = crate::mining::validity::check_template(chain_state, &template, Check::Structural);
+    chain_state.template_validity().record(Check::Structural, &outcome, CheckOrigin::GetBlockTemplate);
+    if let crate::chain::state::TemplateVerdict::Invalid(reason) = &outcome.verdict {
+        return Err((-1, format!("TestBlockValidity failed: {reason}")));
+    }
+    chain_state.template_validity().queue_full_check_for_gbt(&template);
     let pre_segwit =
         !crate::validation::block::segwit_active_at(chain_state.network, template.height);
     let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
@@ -209,7 +221,7 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
             crate::mining::template::compute_witness_commitment_hex(&template.transactions),
         );
     }
-    result
+    Ok(result)
 }
 
 /// `getmininginfo.next`: the block after `tip` as Core's

@@ -6327,6 +6327,16 @@ impl Mempool {
         self.sync_unbroadcast_len(&inner);
     }
 
+    /// Test-only: drop an entry inserted by `insert_tx_weighted_for_test`.
+    pub(crate) fn remove_for_test(&self, txid: &Txid) {
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.remove(txid) {
+            for input in &entry.tx.input {
+                inner.spends.remove(&input.previous_output);
+            }
+        }
+    }
+
     /// Test-only: set an entry's sigop cost, which `insert_tx_weighted_for_test`
     /// leaves at zero.
     pub(crate) fn set_sigop_cost_for_test(&self, txid: &Txid, sigop_cost: u64) {

@@ -1888,6 +1888,70 @@ fn getblocktemplate_stays_under_the_block_sigop_limit() {
     node.stop();
 }
 
+/// Every template is checked before it is used (`mining::validity`). On a
+/// node in `-consensus=cpp-shadow`, a template carrying a real signed
+/// transaction passes the structural check `getblocktemplate` runs, then the
+/// background full check through the shadow verifier, and `generatetoaddress`
+/// mines it — with no invalid result and no `template_invalid` alert.
+#[test]
+fn template_checks_pass_a_valid_template_under_cpp_shadow() {
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start(&["--consensus=cpp-shadow", &format!("--metricsport={metrics_port}")]);
+    let wallet = DeterministicWallet::from_secret([0x5e; 32]);
+    sp_generate_to(&node, 101, &wallet.address.to_string());
+    let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbase(
+        &node,
+        &wallet,
+        1,
+        wallet.address.script_pubkey(),
+        10_000,
+    );
+    sp_send_raw(&node, &raw);
+
+    let gbt = node.rpc_call("getblocktemplate").unwrap();
+    assert!(gbt["error"].is_null(), "{gbt}");
+    let txs = gbt["result"]["transactions"].as_array().unwrap();
+    assert!(txs.iter().any(|t| t["txid"] == txid.as_str()), "{gbt}");
+
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    let metrics = || {
+        client
+            .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+            .send()
+            .ok()
+            .and_then(|r| r.text().ok())
+            .unwrap_or_default()
+    };
+    let line = |check: &str, result: &str| {
+        format!("satd_template_checks_total{{check=\"{check}\",result=\"{result}\"}}")
+    };
+    poll_until(
+        || metrics().contains(&format!("{} 1", line("full", "valid"))),
+        test_timeout(30),
+        "the background full check to pass the template",
+    );
+    let text = metrics();
+    for check in ["structural", "full"] {
+        assert!(text.contains(&format!("{} 0", line(check, "invalid"))), "{text}");
+    }
+    assert!(text.contains("satd_alert_active{kind=\"template_invalid\"} 0"), "{text}");
+
+    let mined = node
+        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(wallet.address.to_string())])
+        .unwrap();
+    assert!(mined["error"].is_null(), "{mined}");
+    let block = node.rpc_call_with_params("getblock", vec![mined["result"][0].clone(), serde_json::json!(1)]).unwrap();
+    assert!(block["result"]["tx"].as_array().unwrap().iter().any(|t| t == txid.as_str()), "{block}");
+    assert!(
+        metrics().contains(&format!("{} 0", line("structural", "invalid"))),
+        "generate's check passed too"
+    );
+    let warnings = node.rpc_call("getwarnings").unwrap_or_default();
+    assert!(!warnings.to_string().contains("template_invalid"), "{warnings}");
+
+    node.stop();
+}
+
 /// A JSON-RPC 2.0 request with no `id` is a notification: the method runs and
 /// nothing comes back. satd injected `"id": null` into every request that
 /// lacked one, so jsonrpsee never saw a notification and the node always

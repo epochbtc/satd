@@ -151,6 +151,8 @@ pub enum StatusKind {
     PeerFloor,
     /// A reorg at least the configured depth landed (one-shot).
     DeepReorg,
+    /// A block template the node built failed its own validity check.
+    TemplateInvalid,
     /// A condition this client build does not recognize.
     Unknown(i32),
 }
@@ -165,6 +167,7 @@ impl StatusKind {
             Ok(pb::StatusKind::MempoolCongested) => StatusKind::MempoolCongested,
             Ok(pb::StatusKind::PeerFloor) => StatusKind::PeerFloor,
             Ok(pb::StatusKind::DeepReorg) => StatusKind::DeepReorg,
+            Ok(pb::StatusKind::TemplateInvalid) => StatusKind::TemplateInvalid,
             _ => StatusKind::Unknown(v),
         }
     }

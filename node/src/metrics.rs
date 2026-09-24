@@ -615,6 +615,7 @@ impl MetricsContext {
 
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());
+        self.chain_state.template_validity().render_metrics(&mut out);
 
         // Webhook delivery counters, rendered only when a hook is configured.
         render_webhook_metrics(&mut out, self.webhooks.as_deref());

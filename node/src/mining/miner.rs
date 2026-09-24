@@ -21,6 +21,11 @@ pub enum MineError {
     Rejected(String),
     #[error("gave up: exhausted the nonce budget without solving a block")]
     TriesExhausted,
+    /// The block failed the validity check it gets before any work goes into
+    /// it — Core's `TestBlockValidity` in `CreateNewBlock`, with Core's
+    /// wording.
+    #[error("TestBlockValidity failed: {0}")]
+    TemplateInvalid(String),
 }
 
 /// Core's `DEFAULT_MAX_TRIES` (`src/rpc/mining.h`): how many nonces a mining
@@ -116,6 +121,9 @@ pub fn build_block_to_script_within(
     // `use_mempool = false` (`src/rpc/mining.cpp`), so its coinbase carries
     // the subsidy alone before the caller's transactions are appended; the
     // fees those transactions pay are simply not claimed. Match that.
+    // Only a block of the node's own choosing speaks to the node's health: a
+    // caller's explicit list failing is the caller's problem.
+    let from_mempool = txs.is_none();
     let (other_txs, coinbase_value) = match txs {
         Some(explicit) => (
             explicit,
@@ -127,45 +135,14 @@ pub fn build_block_to_script_within(
         ),
     };
 
-    let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
+    let mut block = unsolved_block(chain_state, &template, &coinbase_script, coinbase_value, other_txs);
+    check_before_solving(chain_state, &block, template.height, from_mempool)?;
 
-    if needs_witness_commitment(chain_state, template.height, &other_txs) {
-        let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
-        let witness_nonce = [0u8; 32];
-        let mut commitment_preimage = [0u8; 64];
-        commitment_preimage[..32].copy_from_slice(&witness_root);
-        commitment_preimage[32..].copy_from_slice(&witness_nonce);
-        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
-
-        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-        commitment_script.extend_from_slice(&commitment.to_byte_array());
-        coinbase_tx.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(commitment_script),
-        });
-
-        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
-    }
-
-    let mut txdata = vec![coinbase_tx];
-    txdata.extend(other_txs);
-
-    let merkle_root = compute_merkle_root(&txdata);
-
-    let mut header = Header {
-        version: Version::from_consensus(template.version),
-        prev_blockhash: template.prev_hash,
-        merkle_root,
-        time: template.cur_time,
-        bits: template.bits,
-        nonce: 0,
-    };
-
-    if !solve(&mut header, budget) {
+    if !solve(&mut block.header, budget) {
         return Ok(None);
     }
 
-    Ok(Some(Block { header, txdata }))
+    Ok(Some(block))
 }
 
 /// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
@@ -226,46 +203,18 @@ pub fn mine_block_only(
 
     let coinbase_script = resolve_output_descriptor(output, chain_state.network)?;
 
-    let mut coinbase_tx =
-        build_coinbase(template.height, template.coinbase_value, &coinbase_script);
-
     let other_txs: Vec<Transaction> =
         template.transactions.iter().map(|t| t.tx.clone()).collect();
-    if needs_witness_commitment(chain_state, template.height, &other_txs) {
-        let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
-        let witness_nonce = [0u8; 32];
-        let mut commitment_preimage = [0u8; 64];
-        commitment_preimage[..32].copy_from_slice(&witness_root);
-        commitment_preimage[32..].copy_from_slice(&witness_nonce);
-        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
-        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-        commitment_script.extend_from_slice(&commitment.to_byte_array());
-        coinbase_tx.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(commitment_script),
-        });
-        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
-    }
-
-    let mut txdata = vec![coinbase_tx];
-    txdata.extend(other_txs);
-    let merkle_root = compute_merkle_root(&txdata);
-
-    let mut header = Header {
-        version: Version::from_consensus(template.version),
-        prev_blockhash: template.prev_hash,
-        merkle_root,
-        time: template.cur_time,
-        bits: template.bits,
-        nonce: 0,
-    };
+    let mut block =
+        unsolved_block(chain_state, &template, &coinbase_script, template.coinbase_value, other_txs);
+    check_before_solving(chain_state, &block, template.height, true)?;
 
     let mut budget = DEFAULT_MAX_TRIES;
-    if !solve(&mut header, &mut budget) {
+    if !solve(&mut block.header, &mut budget) {
         return Err(MineError::TriesExhausted);
     }
 
-    Ok(Block { header, txdata })
+    Ok(block)
 }
 
 /// Purge the mempool for a freshly mined block — but only if it connected.
@@ -332,45 +281,15 @@ pub fn build_solved_block(
         }
     };
 
-    let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
-
-    if needs_witness_commitment(chain_state, template.height, &explicit_txs) {
-        let witness_root = compute_witness_root(&coinbase_tx, &explicit_txs);
-        let witness_nonce = [0u8; 32];
-        let mut commitment_preimage = [0u8; 64];
-        commitment_preimage[..32].copy_from_slice(&witness_root);
-        commitment_preimage[32..].copy_from_slice(&witness_nonce);
-        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
-
-        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-        commitment_script.extend_from_slice(&commitment.to_byte_array());
-        coinbase_tx.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(commitment_script),
-        });
-        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
-    }
-
-    let mut txdata = vec![coinbase_tx];
-    txdata.extend(explicit_txs);
-
-    let merkle_root = compute_merkle_root(&txdata);
-
-    let mut header = Header {
-        version: Version::from_consensus(template.version),
-        prev_blockhash: template.prev_hash,
-        merkle_root,
-        time: template.cur_time,
-        bits: template.bits,
-        nonce: 0,
-    };
+    let mut block = unsolved_block(chain_state, &template, &coinbase_script, coinbase_value, explicit_txs);
+    check_before_solving(chain_state, &block, template.height, false)?;
 
     let mut budget = DEFAULT_MAX_TRIES;
-    if !solve(&mut header, &mut budget) {
+    if !solve(&mut block.header, &mut budget) {
         return Err(MineError::TriesExhausted);
     }
 
-    Ok(Block { header, txdata })
+    Ok(block)
 }
 
 /// Mine multiple blocks, returning their hashes.
@@ -446,6 +365,67 @@ fn resolve_output_descriptor(
 /// `GenerateCoinbaseCommitment` adds one to every block once segwit is
 /// active, witness transactions or not; a signet solution (BIP 325) lives in
 /// that output, so an empty block without it can never satisfy a challenge.
+/// The block a template describes, coinbase paying `value` to `script`, with
+/// the witness commitment when one is due. Unsolved: the nonce is zero.
+pub(crate) fn unsolved_block(
+    chain_state: &ChainState,
+    template: &crate::mining::template::BlockTemplate,
+    script: &ScriptBuf,
+    value: u64,
+    txs: Vec<Transaction>,
+) -> Block {
+    let mut coinbase_tx = build_coinbase(template.height, value, script);
+    if needs_witness_commitment(chain_state, template.height, &txs) {
+        let witness_root = compute_witness_root(&coinbase_tx, &txs);
+        let witness_nonce = [0u8; 32];
+        let mut commitment_preimage = [0u8; 64];
+        commitment_preimage[..32].copy_from_slice(&witness_root);
+        commitment_preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment.to_byte_array());
+        coinbase_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(commitment_script),
+        });
+        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
+    }
+
+    let mut txdata = vec![coinbase_tx];
+    txdata.extend(txs);
+    let merkle_root = compute_merkle_root(&txdata);
+    let header = Header {
+        version: Version::from_consensus(template.version),
+        prev_blockhash: template.prev_hash,
+        merkle_root,
+        time: template.cur_time,
+        bits: template.bits,
+        nonce: 0,
+    };
+    Block { header, txdata }
+}
+
+/// The structural check every generated block gets before it is solved (see
+/// [`crate::mining::validity`]). `from_mempool` records the outcome against
+/// the node's template health: a block of the caller's own transactions is
+/// the caller's to get right.
+fn check_before_solving(
+    chain_state: &ChainState,
+    block: &Block,
+    height: u32,
+    from_mempool: bool,
+) -> Result<(), MineError> {
+    use crate::mining::validity::{Check, CheckOrigin};
+    let outcome = crate::mining::validity::check_block(chain_state, block, height, Check::Structural);
+    if from_mempool {
+        chain_state.template_validity().record(Check::Structural, &outcome, CheckOrigin::Generate);
+    }
+    match outcome.verdict {
+        crate::chain::state::TemplateVerdict::Invalid(reason) => Err(MineError::TemplateInvalid(reason)),
+        _ => Ok(()),
+    }
+}
+
 fn needs_witness_commitment(chain_state: &ChainState, height: u32, txs: &[Transaction]) -> bool {
     crate::validation::block::segwit_active_at(chain_state.network, height)
         || txs.iter().any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))

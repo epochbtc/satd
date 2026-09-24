@@ -20,6 +20,10 @@ use crate::net::manager::PeerManager;
 /// How often work is rebuilt when the tip has not moved, so new mempool
 /// transactions reach the miners.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// How often a refresh on an unchanged tip queues another full template
+/// check. Every new tip gets one; in between, a mempool that changes every
+/// refresh would otherwise buy a full script check every 30 seconds.
+const FULL_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How often the tip is checked directly, independent of chain events.
 ///
@@ -144,6 +148,9 @@ pub(crate) struct Shared {
     pub stats: Arc<StratumStats>,
     listeners: Listeners,
     next_extranonce1: AtomicU32,
+    /// Jobs are coinbase-only because a template failed its validity check
+    /// (`mining::validity`), until one passes the full check again.
+    pub(crate) coinbase_only: std::sync::atomic::AtomicBool,
 }
 
 /// A read handle on a running server, for `getstratuminfo`.
@@ -171,6 +178,9 @@ impl StratumHandle {
                 "job_id": format!("{:x}", w.id),
                 "prev_hash": w.prev_hash.to_string(),
                 "template_txs": w.txdata.len(),
+                // A template failed its validity check, so this job carries
+                // no transactions until one passes (`mining::validity`).
+                "coinbase_only": shared.coinbase_only.load(Ordering::Relaxed),
                 "template_fees": w.fees,
             })
         });
@@ -234,6 +244,28 @@ impl Shared {
     /// Shared state over an empty in-memory regtest chain, for driving a
     /// session directly. No work is issued until a test sends some.
     pub(crate) fn for_test(config: StratumConfig) -> Arc<Self> {
+        let chain = Self::test_chain(config.network);
+        Self::for_test_with(config, chain, Mempool::new(1_000_000, 0))
+    }
+
+    /// A server state over a given chain and mempool, for tests that need
+    /// coins or transactions.
+    pub(crate) fn for_test_with(config: StratumConfig, chain: ChainState, mempool: Mempool) -> Arc<Self> {
+        let (work, _) = watch::channel(None);
+        Arc::new(Self {
+            config: Arc::new(config),
+            chain: Arc::new(chain),
+            mempool: Arc::new(mempool),
+            work,
+            core: tokio::runtime::Handle::current(),
+            stats: Arc::new(StratumStats::default()),
+            listeners: Listeners::default(),
+            next_extranonce1: AtomicU32::new(0),
+            coinbase_only: Default::default(),
+        })
+    }
+
+    fn test_chain(network: Network) -> ChainState {
         use crate::chain::state::AssumeValid;
         use crate::storage::db::InMemoryStore;
         use crate::storage::flatfile::FlatFileManager;
@@ -244,10 +276,10 @@ impl Shared {
             std::process::id(),
             rand::random::<u64>()
         ));
-        let chain = ChainState::new(
+        ChainState::new(
             Box::new(InMemoryStore::new()),
             FlatFileManager::new(&dir.join("blocks")).unwrap(),
-            config.network,
+            network,
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
@@ -256,18 +288,7 @@ impl Shared {
             Default::default(),
             Default::default(),
         )
-        .unwrap();
-        let (work, _) = watch::channel(None);
-        Arc::new(Self {
-            config: Arc::new(config),
-            chain: Arc::new(chain),
-            mempool: Arc::new(Mempool::new(1_000_000, 0)),
-            work,
-            core: tokio::runtime::Handle::current(),
-            stats: Arc::new(StratumStats::default()),
-            listeners: Listeners::default(),
-            next_extranonce1: AtomicU32::new(0),
-        })
+        .unwrap()
     }
 }
 
@@ -357,6 +378,7 @@ impl StratumServer {
             stats: Arc::new(StratumStats::default()),
             listeners,
             next_extranonce1: AtomicU32::new(rand::random()),
+            coinbase_only: Default::default(),
         });
         Ok(Self {
             listener,
@@ -574,6 +596,9 @@ async fn refresh_loop(
     let mut no_peers_warned = false;
     let mut next_work_id = 1u64;
     let network = shared.config.network;
+    let mut verdicts = shared.chain.template_validity().full_checker().map(|c| c.verdicts());
+    // The tip and time of the last full check queued, for FULL_RECHECK_INTERVAL.
+    let mut last_full_check: Option<(bitcoin::BlockHash, std::time::Instant)> = None;
 
     loop {
         // The first `refresh` tick completes immediately, which builds the
@@ -601,6 +626,25 @@ async fn refresh_loop(
                 // and rebuilds the same work again.
                 polled_tip = shared.chain.tip_snapshot();
             }
+            // A background full check failed the template miners are working
+            // on this tip: every job goes coinbase-only now, not at the next
+            // refresh.
+            verdict = next_verdict(&mut verdicts) => {
+                let Some(verdict) = verdict else {
+                    verdicts = None;
+                    continue;
+                };
+                let current = shared.work.borrow().as_ref().map(|w| w.prev_hash);
+                if !matches!(verdict.verdict, crate::chain::state::TemplateVerdict::Invalid(_))
+                    || current != Some(verdict.prev_hash)
+                    || shared.coinbase_only.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                shared.coinbase_only.store(true, Ordering::Relaxed);
+                polled_tip = shared.chain.tip_snapshot();
+                refresh.reset();
+            }
             // Polled even while events flow: the download scheduler connects
             // blocks without emitting chain events, so a node that catches up
             // that way would otherwise hand out work on an old tip until the
@@ -617,16 +661,18 @@ async fn refresh_loop(
 
         let chain = shared.chain.clone();
         let mempool = shared.mempool.clone();
+        let was_coinbase_only = shared.coinbase_only.load(Ordering::Relaxed);
         let built = tokio::task::spawn_blocking(move || {
             if !should_issue_work(network, chain.is_initial_block_download()) {
                 return None;
             }
-            let template = crate::mining::template::create_template(&chain, &mempool);
+            let checked = checked_template(&chain, &mempool, was_coinbase_only);
             let prev_time = chain
-                .get_block_index(&template.prev_hash)
+                .get_block_index(&checked.template.prev_hash)
                 .map(|e| e.header.time)
                 .unwrap_or(0);
-            Some(Work::new(template, network, prev_time))
+            let work = Work::new(checked.template, network, prev_time);
+            Some((work, checked.full_check, checked.coinbase_only))
         })
         .await;
         let work = match built {
@@ -647,9 +693,34 @@ async fn refresh_loop(
                 }
                 shared.work.send_if_modified(|w| w.take().is_some());
             }
-            Some(mut work) => {
+            Some((mut work, full_check, coinbase_only)) => {
                 work.id = next_work_id;
                 next_work_id += 1;
+                if coinbase_only != was_coinbase_only {
+                    if coinbase_only {
+                        tracing::error!(
+                            target: "node::stratum",
+                            height = work.height,
+                            "Stratum jobs are coinbase-only: this node's block template failed its validity check"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "node::stratum",
+                            height = work.height,
+                            "a block template passed its full validity check; Stratum jobs carry transactions again"
+                        );
+                    }
+                }
+                shared.coinbase_only.store(coinbase_only, Ordering::Relaxed);
+                if let (Some(template), Some(checker)) =
+                    (full_check, shared.chain.template_validity().full_checker())
+                {
+                    let now = std::time::Instant::now();
+                    if full_check_due(last_full_check, template.prev_hash, now) {
+                        last_full_check = Some((template.prev_hash, now));
+                        checker.submit(work.id, template, crate::mining::validity::CheckOrigin::Stratum);
+                    }
+                }
                 if withheld_warned {
                     tracing::info!(target: "node::stratum", "stratum: initial block download finished; issuing work");
                     withheld_warned = false;
@@ -673,6 +744,79 @@ async fn refresh_loop(
                 );
                 shared.work.send_replace(Some(Arc::new(work)));
             }
+        }
+    }
+}
+
+/// A template, checked for the Stratum server.
+struct CheckedTemplate {
+    template: crate::mining::template::BlockTemplate,
+    /// The template to queue for the background full check, when it has not
+    /// had one.
+    full_check: Option<Arc<crate::mining::template::BlockTemplate>>,
+    /// The template is coinbase-only because the node's own failed.
+    coinbase_only: bool,
+}
+
+/// Build the next template and check it (`mining::validity`).
+///
+/// Every template gets the structural check here; one that fails is replaced
+/// by a coinbase-only template, which is always valid. While a full check has
+/// failed (`coinbase_only`), a template must pass the full check here too
+/// before any miner sees it: until then miners keep coinbase-only work, so
+/// issuing work never waits on the check. Otherwise the full check runs in
+/// the background.
+fn checked_template(chain: &ChainState, mempool: &Mempool, coinbase_only: bool) -> CheckedTemplate {
+    use crate::chain::state::TemplateVerdict;
+    use crate::mining::validity::{Check, CheckOrigin, check_template};
+    let validity = chain.template_validity();
+    let template = crate::mining::template::create_template(chain, mempool);
+    let fallback = || CheckedTemplate {
+        template: crate::mining::template::create_coinbase_only_template(chain, mempool),
+        full_check: None,
+        coinbase_only: true,
+    };
+    let structural = check_template(chain, &template, Check::Structural);
+    validity.record(Check::Structural, &structural, CheckOrigin::Stratum);
+    if matches!(structural.verdict, TemplateVerdict::Invalid(_)) {
+        return fallback();
+    }
+    if coinbase_only {
+        let full = check_template(chain, &template, Check::Full);
+        validity.record(Check::Full, &full, CheckOrigin::Stratum);
+        return match full.verdict {
+            TemplateVerdict::Valid => CheckedTemplate { template, full_check: None, coinbase_only: false },
+            _ => fallback(),
+        };
+    }
+    // A template with no transactions has nothing a full check could find.
+    let full_check = (!template.transactions.is_empty()).then(|| Arc::new(template.clone()));
+    CheckedTemplate { template, full_check, coinbase_only: false }
+}
+
+/// Whether a template on `tip` should be queued for a full check, given the
+/// tip and time of the last one queued: always for a new tip, otherwise once
+/// [`FULL_RECHECK_INTERVAL`] has passed.
+fn full_check_due(
+    last: Option<(bitcoin::BlockHash, std::time::Instant)>,
+    tip: bitcoin::BlockHash,
+    now: std::time::Instant,
+) -> bool {
+    last.is_none_or(|(last_tip, at)| last_tip != tip || now.saturating_duration_since(at) >= FULL_RECHECK_INTERVAL)
+}
+
+/// The next background full-check verdict, or `None` when the checker is
+/// gone. Never resolves when there is no checker.
+async fn next_verdict(
+    verdicts: &mut Option<watch::Receiver<Option<crate::mining::validity::FullVerdict>>>,
+) -> Option<crate::mining::validity::FullVerdict> {
+    let Some(rx) = verdicts.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        rx.changed().await.ok()?;
+        if let Some(verdict) = rx.borrow_and_update().clone() {
+            return Some(verdict);
         }
     }
 }
@@ -794,4 +938,122 @@ pub fn submit_block(chain: &ChainState, mempool: &Mempool, block: &Block) -> Res
         mempool.remove_for_block(block, height);
     }
     Ok(acceptance.connected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mining::validity::tests::{admit, funded, spend};
+    use crate::mining::validity::{Check, FullChecker};
+    use crate::validation::script::RustVerifier;
+
+    fn rust() -> Box<dyn crate::validation::script::ScriptVerifier> {
+        Box::new(RustVerifier::new(Network::Regtest))
+    }
+
+    /// A structural failure gets a coinbase-only template, and nothing is
+    /// queued for a full check. The transaction is not evicted.
+    #[test]
+    fn a_template_failing_the_structural_check_is_replaced_by_a_coinbase_only_one() {
+        let (cs, mp, dir) = funded(rust());
+        let bad = admit(&mp, spend(0xA2, 200_000, 2), 1_000);
+        let checked = checked_template(&cs, &mp, false);
+        assert!(checked.template.transactions.is_empty());
+        assert!(checked.coinbase_only);
+        assert!(checked.full_check.is_none());
+        assert!(cs.template_validity().is_failing());
+        assert!(mp.get(&bad).is_some(), "left in the mempool, where the bug stays visible");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A template that passes is issued and queued for its full check.
+    #[test]
+    fn a_passing_template_is_issued_and_queued_for_a_full_check() {
+        let (cs, mp, dir) = funded(rust());
+        admit(&mp, spend(0xA1, 90_000, 1), 10_000);
+        let checked = checked_template(&cs, &mp, false);
+        assert_eq!(checked.template.transactions.len(), 1);
+        assert!(!checked.coinbase_only);
+        assert_eq!(checked.full_check.map(|t| t.transactions.len()), Some(1));
+        assert!(!cs.template_validity().is_failing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a full check failed, a template must pass one before a miner sees
+    /// it; until then the jobs stay coinbase-only.
+    #[test]
+    fn while_coinbase_only_a_template_must_pass_the_full_check() {
+        let (cs, mp, dir) = funded(rust());
+        admit(&mp, spend(0xA1, 90_000, 1), 10_000);
+        let bad = admit(&mp, spend(0xB1, 90_000, 2), 10_000);
+        let checked = checked_template(&cs, &mp, true);
+        assert!(checked.template.transactions.is_empty(), "the script failure keeps it coinbase-only");
+        assert!(checked.coinbase_only);
+        assert_eq!(cs.template_validity().count(Check::Full, "invalid"), 1);
+
+        // The offending transaction leaves the mempool (mined elsewhere, or
+        // evicted): the next template passes and carries transactions again.
+        mp.remove_for_test(&bad);
+        let checked = checked_template(&cs, &mp, true);
+        assert_eq!(checked.template.transactions.len(), 1);
+        assert!(!checked.coinbase_only);
+        assert!(checked.full_check.is_none(), "it just had its full check");
+        assert!(!cs.template_validity().is_failing(), "the alert cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every new tip gets a full check; the same tip, once two minutes pass.
+    #[test]
+    fn a_full_check_is_due_on_each_new_tip_and_every_two_minutes() {
+        use bitcoin::hashes::Hash as _;
+        let a = bitcoin::BlockHash::from_byte_array([1; 32]);
+        let b = bitcoin::BlockHash::from_byte_array([2; 32]);
+        let t0 = std::time::Instant::now();
+        assert!(full_check_due(None, a, t0));
+        assert!(!full_check_due(Some((a, t0)), a, t0 + FULL_RECHECK_INTERVAL - std::time::Duration::from_secs(1)));
+        assert!(full_check_due(Some((a, t0)), a, t0 + FULL_RECHECK_INTERVAL));
+        assert!(full_check_due(Some((a, t0)), b, t0), "a new tip");
+        assert_eq!(FULL_RECHECK_INTERVAL, std::time::Duration::from_secs(120), "the manual says two minutes");
+    }
+
+    async fn next_work(rx: &mut watch::Receiver<Option<Arc<Work>>>) -> Arc<Work> {
+        loop {
+            tokio::time::timeout(std::time::Duration::from_secs(30), rx.changed()).await.unwrap().unwrap();
+            if let Some(work) = rx.borrow_and_update().clone() {
+                return work;
+            }
+        }
+    }
+
+    /// The whole loop: a script failure passes the structural check, so miners
+    /// get the template; the background full check fails it, and every job
+    /// goes coinbase-only without waiting for the next refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_background_full_check_failure_makes_every_job_coinbase_only() {
+        let (cs, mp, dir) = funded(rust());
+        admit(&mp, spend(0xB1, 90_000, 2), 10_000);
+        let shared = Shared::for_test_with(crate::stratum::v1::session::tests::config(), cs, mp);
+        let (_stop, shutdown) = watch::channel(false);
+        shared
+            .chain
+            .template_validity()
+            .install_full_checker(FullChecker::spawn(shared.chain.clone(), shutdown.clone()));
+        let mut rx = shared.work.subscribe();
+        tokio::spawn(refresh_loop(shared.clone(), None, shutdown));
+
+        let first = next_work(&mut rx).await;
+        assert_eq!(first.txdata.len(), 1, "the structural check passes it");
+        let second = next_work(&mut rx).await;
+        assert!(second.txdata.is_empty(), "coinbase-only after the full check failed");
+        assert_eq!(second.prev_hash, first.prev_hash);
+        assert!(shared.coinbase_only.load(Ordering::Relaxed));
+        let info = StratumHandle { shared: shared.clone() }.info();
+        assert_eq!(info["current_job"]["coinbase_only"], true, "{info}");
+        assert_eq!(info["current_job"]["template_txs"], 0, "{info}");
+        assert!(shared.chain.template_validity().is_failing());
+        // Once in the background; once more when the rebuild offered the
+        // same template again and it had to pass before any miner saw it.
+        assert_eq!(shared.chain.template_validity().count(Check::Full, "invalid"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

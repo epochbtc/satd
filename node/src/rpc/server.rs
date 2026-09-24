@@ -1635,9 +1635,15 @@ pub async fn start(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        // Core's `generateblock` runs `TestBlockValidity` itself and answers
+        // a failure with RPC_VERIFY_ERROR (-25, `rpc/mining.cpp`); the check
+        // now runs while the block is built, so keep that code for it.
         let block = crate::mining::miner::build_block_to_script(
             &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,
-        ).map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        ).map_err(|e| {
+            let code = if matches!(e, crate::mining::miner::MineError::TemplateInvalid(_)) { -25 } else { -1 };
+            ErrorObjectOwned::owned(code, e.to_string(), None::<()>)
+        })?;
 
         let hash = block.block_hash().to_string();
 
@@ -1698,7 +1704,8 @@ pub async fn start(
         if let Some(lpval) = request.as_ref().and_then(|r| r.get("longpollid")) {
             wait_for_longpoll(&ctx, lpval).await?;
         }
-        Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
+        mining::get_block_template(&ctx.chain_state, &ctx.mempool)
+            .map_err(|(code, message)| ErrorObjectOwned::owned(code, message, None::<()>))
     })?;
 
     module.register_method("getmininginfo", |_params, ctx, _extensions| {

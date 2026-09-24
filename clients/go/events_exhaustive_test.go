@@ -445,6 +445,7 @@ func TestEnumConstantsMatchTheProto(t *testing.T) {
 		{"StatusKindMempoolCongested", int32(StatusKindMempoolCongested), int32(eventspb.StatusKind_STATUS_KIND_MEMPOOL_CONGESTED)},
 		{"StatusKindPeerFloor", int32(StatusKindPeerFloor), int32(eventspb.StatusKind_STATUS_KIND_PEER_FLOOR)},
 		{"StatusKindDeepReorg", int32(StatusKindDeepReorg), int32(eventspb.StatusKind_STATUS_KIND_DEEP_REORG)},
+		{"StatusKindTemplateInvalid", int32(StatusKindTemplateInvalid), int32(eventspb.StatusKind_STATUS_KIND_TEMPLATE_INVALID)},
 
 		{"StatusStateUnspecified", int32(StatusStateUnspecified), int32(eventspb.StatusState_STATUS_STATE_UNSPECIFIED)},
 		{"StatusStateRaised", int32(StatusStateRaised), int32(eventspb.StatusState_STATUS_STATE_RAISED)},

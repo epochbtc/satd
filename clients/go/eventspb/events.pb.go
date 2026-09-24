@@ -110,6 +110,10 @@ const (
 	StatusKind_STATUS_KIND_PEER_FLOOR StatusKind = 5
 	// A reorg at least `alertreorgdepth` blocks deep was applied (edge).
 	StatusKind_STATUS_KIND_DEEP_REORG StatusKind = 6
+	// A block template this node built failed its own validity check: a miner
+	// working it would have found a block the node rejects. Clears when a
+	// template validates again.
+	StatusKind_STATUS_KIND_TEMPLATE_INVALID StatusKind = 7
 )
 
 // Enum value maps for StatusKind.
@@ -122,6 +126,7 @@ var (
 		4: "STATUS_KIND_MEMPOOL_CONGESTED",
 		5: "STATUS_KIND_PEER_FLOOR",
 		6: "STATUS_KIND_DEEP_REORG",
+		7: "STATUS_KIND_TEMPLATE_INVALID",
 	}
 	StatusKind_value = map[string]int32{
 		"STATUS_KIND_UNSPECIFIED":       0,
@@ -131,6 +136,7 @@ var (
 		"STATUS_KIND_MEMPOOL_CONGESTED": 4,
 		"STATUS_KIND_PEER_FLOOR":        5,
 		"STATUS_KIND_DEEP_REORG":        6,
+		"STATUS_KIND_TEMPLATE_INVALID":  7,
 	}
 )
 
@@ -5927,7 +5933,7 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x13EVICT_REASON_EXPIRY\x10\x02\x12\x1f\n" +
 	"\x1bEVICT_REASON_BLOCK_CONFLICT\x10\x03\x12\x17\n" +
 	"\x13EVICT_REASON_POLICY\x10\x04\x12\x16\n" +
-	"\x12EVICT_REASON_REORG\x10\x05*\xd7\x01\n" +
+	"\x12EVICT_REASON_REORG\x10\x05*\xf9\x01\n" +
 	"\n" +
 	"StatusKind\x12\x1b\n" +
 	"\x17STATUS_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
@@ -5936,7 +5942,8 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x14STATUS_KIND_DISK_LOW\x10\x03\x12!\n" +
 	"\x1dSTATUS_KIND_MEMPOOL_CONGESTED\x10\x04\x12\x1a\n" +
 	"\x16STATUS_KIND_PEER_FLOOR\x10\x05\x12\x1a\n" +
-	"\x16STATUS_KIND_DEEP_REORG\x10\x06*u\n" +
+	"\x16STATUS_KIND_DEEP_REORG\x10\x06\x12 \n" +
+	"\x1cSTATUS_KIND_TEMPLATE_INVALID\x10\a*u\n" +
 	"\vStatusState\x12\x1c\n" +
 	"\x18STATUS_STATE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13STATUS_STATE_RAISED\x10\x01\x12\x18\n" +

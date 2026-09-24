@@ -492,6 +492,43 @@ When vardiff lowers the difficulty of a miner that has gone quiet, the idle
 limit is still judged at the difficulty of the miner's last share, so the
 lowering itself cannot make a silence already endured exceed the limit.
 
+## Template checks
+
+Every block template is checked before a miner gets it, as Bitcoin Core checks
+the templates it builds (`TestBlockValidity`). A template that would make a
+block the node rejects is a node bug — the mempool admitted a transaction
+consensus refuses — and the check exists so that a miner who finds a block
+has not found it on a template that was never valid.
+
+The check has two tiers:
+
+- **Structural**, on every template, before it is issued: every rule block
+  connection applies except running scripts — size and weight, sigops, the
+  BIP 34 height, lock times and sequence locks, the coinbase value, the witness
+  commitment, and inputs that are missing or already spent.
+- **Full**, which adds the scripts, run through the same verifier the node
+  connects blocks with (under `-consensus=cpp-shadow`, the shadow comparison
+  included). It runs in the background, never delaying work: for each new tip,
+  and at most every two minutes while the tip stands still. It costs about as
+  much as connecting a block, since satd has no script-execution cache: a few
+  CPU-seconds for a full mainnet template.
+
+A template that fails either check is replaced by a **coinbase-only** job on
+the same tip, which is always valid, and every miner switches to it at once.
+`getstratuminfo` shows `"coinbase_only": true` on the current job. While that
+lasts, each new template must pass the full check before it is issued; the
+first one that does brings transactions back. The failure is logged at error
+with Core's reject reason and the offending transaction, counted in
+`satd_template_checks_total`, and raised as the `template_invalid` alert (see
+[Observability](observability.md#node-health-alerts)). The transaction is not
+evicted from the mempool: Core does not do that either, and the bug that let it
+in should stay visible.
+
+`getblocktemplate` runs the structural check too and answers an invalid
+template with `TestBlockValidity failed: <reason>`, as Core does; the full
+check for its template follows in the background once per tip. The `generate`
+RPCs refuse such a block the same way before solving it.
+
 ## When work is withheld
 
 During initial block download the server accepts connections and answers

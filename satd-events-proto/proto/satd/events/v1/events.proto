@@ -727,6 +727,10 @@ enum StatusKind {
   STATUS_KIND_PEER_FLOOR = 5;
   // A reorg at least `alertreorgdepth` blocks deep was applied (edge).
   STATUS_KIND_DEEP_REORG = 6;
+  // A block template this node built failed its own validity check: a miner
+  // working it would have found a block the node rejects. Clears when a
+  // template validates again.
+  STATUS_KIND_TEMPLATE_INVALID = 7;
 }
 
 // Level-triggered lifecycle of a condition.
