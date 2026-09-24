@@ -133,7 +133,9 @@ pub fn check_block(chain_state: &ChainState, block: &Block, height: u32, check: 
 /// claims the subsidy alone, which is always within what the block may claim.
 ///
 /// `None` when every prefix is valid (the fault is in the coinbase or the fee
-/// total, not a transaction), or when the chain moved while looking.
+/// total, not a transaction), when the empty prefix is already invalid (the
+/// fault is in the header, and no transaction is to blame), or when the chain
+/// moved while looking.
 fn offending_transaction(chain_state: &ChainState, block: &Block, height: u32, check: Check) -> Option<Txid> {
     let txs = &block.txdata[1..];
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, height);
@@ -161,7 +163,7 @@ fn offending_transaction(chain_state: &ChainState, block: &Block, height: u32, c
             TemplateVerdict::Superseded => None,
         }
     };
-    if !invalid(txs.len())? {
+    if txs.is_empty() || !invalid(txs.len())? || invalid(0)? {
         return None;
     }
     // Invariant: the prefix of `lo` transactions is valid, of `hi` invalid.
@@ -489,6 +491,34 @@ pub(crate) mod tests {
         assert_eq!(outcome.verdict, TemplateVerdict::Invalid("bad-txns-in-belowout".into()));
         assert_eq!(outcome.offending_txid, Some(bad));
         assert_eq!(outcome.height, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fault in the header is blamed on no transaction, and a block with
+    /// none to blame does not panic looking for one.
+    #[test]
+    fn a_header_fault_names_no_transaction() {
+        let (cs, mp, dir) = funded(rust());
+        for with_tx in [false, true] {
+            if with_tx {
+                admit(&mp, spend(0xA1, 90_000, 1), 10_000);
+            }
+            let t = template(&cs, &mp);
+            assert_eq!(t.transactions.len(), usize::from(with_tx));
+            let mut block = crate::mining::miner::unsolved_block(
+                &cs,
+                &t,
+                &check_script(),
+                t.coinbase_value,
+                t.transactions.iter().map(|e| e.tx.clone()).collect(),
+            );
+            block.header.bits = bitcoin::CompactTarget::from_consensus(block.header.bits.to_consensus() - 1);
+            for check in Check::ALL {
+                let outcome = check_block(&cs, &block, t.height, check);
+                assert!(matches!(outcome.verdict, TemplateVerdict::Invalid(_)), "{with_tx} {check:?}: {:?}", outcome.verdict);
+                assert_eq!(outcome.offending_txid, None, "{with_tx} {check:?}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
