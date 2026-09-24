@@ -450,6 +450,10 @@ pub struct AppState {
     pub utxo_count: Option<u64>,
     pub utxo_total_amount: Option<f64>,
     pub utxo_age_dist: Option<[u64; 8]>,
+    /// `utxo_age_distribution.exact`: whether the four youngest age buckets
+    /// are exact counts. `Some(false)` while the node is still building its
+    /// per-height window; `None` from a node that predates the field.
+    pub utxo_age_exact: Option<bool>,
     pub network_hash_ps: Option<f64>,
     pub tx_rate: Option<f64>,
     pub uptime_secs: Option<u64>,
@@ -695,6 +699,7 @@ impl AppState {
             utxo_count: None,
             utxo_total_amount: None,
             utxo_age_dist: None,
+            utxo_age_exact: None,
             network_hash_ps: None,
             tx_rate: None,
             uptime_secs: None,
@@ -1028,6 +1033,10 @@ impl AppState {
                     None
                 }
             });
+        self.utxo_age_exact = v
+            .get("utxo_age_distribution")
+            .and_then(|d| d.get("exact"))
+            .and_then(|e| e.as_bool());
     }
 
     /// Update from getmininginfo response.
@@ -1874,6 +1883,29 @@ mod tests {
         assert_eq!(dist[1].max_vsize, Some(250));
         assert_eq!(dist[1].count, 1);
         assert_eq!(dist[3].max_vsize, None, "top bucket stays open-ended");
+    }
+
+    #[test]
+    fn update_utxo_info_reads_the_exact_flag_and_tolerates_its_absence() {
+        let counts = json!([391947, 0, 997122, 2014141, 9811843, 10483379, 70283989, 71216488]);
+        let mut st = AppState::new();
+        st.update_utxo_info(&json!({
+            "txouts": 165_198_909u64,
+            "utxo_age_distribution": {"counts": counts, "exact": false},
+        }));
+        assert_eq!(st.utxo_age_exact, Some(false));
+        assert_eq!(st.utxo_age_dist.unwrap()[7], 71_216_488);
+
+        st.update_utxo_info(&json!({
+            "utxo_age_distribution": {"counts": counts, "exact": true},
+        }));
+        assert_eq!(st.utxo_age_exact, Some(true));
+
+        // A node that predates the field: no marker either way, and the
+        // counts still read.
+        st.update_utxo_info(&json!({"utxo_age_distribution": {"counts": counts}}));
+        assert_eq!(st.utxo_age_exact, None);
+        assert!(st.utxo_age_dist.is_some());
     }
 
     #[test]
