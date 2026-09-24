@@ -182,186 +182,17 @@ fn assemble_template(
     let height = tip_entry.height + 1;
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, height);
 
-    // Select transactions from mempool by effective fee rate (includes
-    // fee_delta). Template assembly is scope-filtered: transactions
-    // quarantined `on template` are held but never mined by this node
-    // (design §2.4/§3), so they are excluded here.
-    let mut entries = if include_mempool { mempool.get_template_entries() } else { Vec::new() };
-    entries.sort_by(|a, b| {
-        // Saturating add: a corrupt persisted mempool could carry an
-        // extreme fee_delta; it must not overflow the effective-fee sum
-        // (which would mis-order block-template selection).
-        let eff_a = (a.1.fee as i64).saturating_add(a.1.fee_delta).max(0) as u64 * 1000
-            / a.1.weight.max(1) as u64;
-        let eff_b = (b.1.fee as i64).saturating_add(b.1.fee_delta).max(0) as u64 * 1000
-            / b.1.weight.max(1) as u64;
-        eff_b.cmp(&eff_a)
-    });
-
-    // Effective fee and weight per txid, built before the selection loop
-    // consumes `entries`. Only the `-blockmintxfee` check below reads them.
-    let weight_by_txid: std::collections::HashMap<bitcoin::Txid, u64> =
-        entries.iter().map(|(txid, e)| (*txid, e.weight as u64)).collect();
-    let effective_fee_by_txid: std::collections::HashMap<bitcoin::Txid, u64> = entries
-        .iter()
-        .map(|(txid, e)| {
-            (
-                *txid,
-                (e.fee as i64).saturating_add(e.fee_delta).max(0) as u64,
-            )
-        })
-        .collect();
-
     // The (height, MTP) this block will be validated under — the MTP
     // context of `height` is the 11 blocks strictly below it, i.e. the
     // tip's MTP.
     let template_mtp = chain_state.get_median_time_past(height);
 
-    // Dependency- and finality-aware selection (#588/#589). A transaction
-    // is includable only when it is final for this block (Core's miner
-    // re-checks `IsFinalTx` exactly like this — admission normally
-    // guarantees it, but a reorg can lower the tip after admission, and a
-    // persisted mempool may predate the admission check), its sequence
-    // locks are satisfiable at this (height, MTP), and every input
-    // resolves to a confirmed coin or an output of a transaction already
-    // included. Greedy by effective fee rate over the ready set; a child
-    // deferred behind its parent lands in a later pass, which is what
-    // yields parent-before-child order in the emitted list. A child whose
-    // parent never makes it in — weight cap, template quarantine — is
-    // dropped with it: without this, CPFP's fee-rate inversion put
-    // children *before* their parents and the mined block was invalid.
-    let in_mempool = mempool.all_txids();
-    let mut included: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
-    let mut transactions = Vec::new();
-    let mut total_weight = COINBASE_WEIGHT_RESERVE;
-    // Weight is not the only block limit. A mempool dense in sigops (bare
-    // multisig outputs count 20 each) fills 80,000 in a fraction of a block's
-    // weight, and a template that crosses it is a block `connect_block`
-    // refuses as `bad-blk-sigops`. Core's `BlockAssembler` starts from the
-    // coinbase's reserve and refuses a transaction that would bring the
-    // total to the limit or past it (`TestChunkBlockLimits`, `>=`).
-    let mut total_sigops = COINBASE_SIGOPS_RESERVE;
-    let mut total_fees = 0u64;
-
-    let mut remaining = entries;
-    loop {
-        let mut deferred = Vec::with_capacity(remaining.len());
-        let mut progressed = false;
-        for (txid, entry) in remaining {
-            if !tx_is_final_at(&entry.tx, height, template_mtp) {
-                continue; // never includable in this block
-            }
-            // Resolve every input against the UTXO set, not mempool
-            // membership: a parent evicted after this child was admitted
-            // (expiry, RBF, block-connect conflict) is in neither the
-            // mempool nor the UTXO set, and treating "not in mempool" as
-            // "confirmed" would mine the orphaned child →
-            // bad-txns-inputs-missingorspent. An input creates one of
-            // four cases: already included in this template (the coin is
-            // born at `height`), a confirmed coin, a mempool parent that
-            // may still be included (defer to a later pass), or nothing
-            // anywhere (drop — unminable). Resolved coin heights feed the
-            // BIP 68 re-check, which mirrors the absolute one above: a
-            // reorg or persisted mempool can hold sequence-locked
-            // transactions admission never re-judged.
-            let bip68_enforced = (entry.tx.version.0 as u32) >= 2;
-            let mut awaits_parent = false;
-            let mut minable = true;
-            for input in &entry.tx.input {
-                let parent = input.previous_output.txid;
-                let prev_height = if included.contains(&parent) {
-                    height
-                } else if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                    // Coinbase maturity, re-checked here for the same reason
-                    // BIP 68 is: admission judged this spend against the tip it
-                    // saw, and a reorg can leave a transaction in the mempool
-                    // spending a coinbase that is no longer mature at the
-                    // height being built. `remove_for_reorg` makes that rare,
-                    // but a spend accepted between the reorg and the sweep is
-                    // not covered by it, and `connect_block` answers
-                    // `bad-txns-premature-spend-of-coinbase` for the whole
-                    // block. Core checks it in the assembler for the same
-                    // reason.
-                    if coin.coinbase && height - coin.height < COINBASE_MATURITY {
-                        minable = false;
-                        break;
-                    }
-                    coin.height
-                } else if in_mempool.contains(&parent) {
-                    awaits_parent = true;
-                    continue;
-                } else {
-                    minable = false;
-                    break;
-                };
-                if bip68_enforced
-                    && !Mempool::bip68_satisfied(
-                        chain_state,
-                        input.sequence.0,
-                        prev_height,
-                        height,
-                        template_mtp,
-                    )
-                {
-                    minable = false;
-                    break;
-                }
-            }
-            if !minable {
-                continue; // never includable in this block
-            }
-            if awaits_parent {
-                deferred.push((txid, entry));
-                continue;
-            }
-            if total_weight + entry.weight > MAX_BLOCK_WEIGHT {
-                continue; // weight only grows; this can never fit later
-            }
-            if total_sigops.saturating_add(entry.sigop_cost) >= MAX_BLOCK_SIGOPS_COST {
-                continue; // nor do sigops
-            }
-            // `-blockmintxfee`: Core's `addPackageTxs` compares
-            // `chunk_feerate_vsize` against `blockMinFeeRate`
-            // (`src/node/miner.cpp`) and skips the chunk when it falls short.
-            //
-            // The comparison is on the *chunk* (package) feerate, never the
-            // individual one, so a zero-fee parent rides in on its child's fee
-            // (CPFP) and only a package paying nothing is skipped. Judging it
-            // per-transaction dropped the parent here and then stranded the
-            // paying child, which defers forever behind a parent that is never
-            // included — so CPFP lost *both* transactions rather than mining
-            // both. At the default floor this subsumes the "a zero-fee
-            // transaction needs a paying descendant" rule it replaces, since a
-            // zero feerate is below any non-zero floor.
-            let effective_fee = (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64;
-            if !meets_block_min_fee(
-                mempool,
-                &effective_fee_by_txid,
-                &weight_by_txid,
-                &txid,
-                effective_fee,
-                entry.weight as u64,
-                block_min_tx_fee,
-            ) {
-                continue;
-            }
-            total_weight += entry.weight;
-            total_sigops += entry.sigop_cost;
-            total_fees += entry.fee;
-            included.insert(txid);
-            transactions.push(TemplateTx {
-                tx: entry.tx,
-                fee: entry.fee,
-                weight: entry.weight,
-                sigop_cost: entry.sigop_cost,
-            });
-            progressed = true;
-        }
-        if !progressed || deferred.is_empty() {
-            break;
-        }
-        remaining = deferred;
-    }
+    // Template assembly is scope-filtered: transactions quarantined `on
+    // template` are held but never mined by this node (design §2.4/§3), so
+    // they are not candidates.
+    let entries = if include_mempool { mempool.get_template_entries() } else { Vec::new() };
+    let Selection { transactions, total_weight, total_fees } =
+        select_transactions(chain_state, entries, height, template_mtp, block_min_tx_fee);
 
     // Timestamp: max of current time and MTP + 1. Core's `UpdateTime` uses
     // `max(GetAdjustedTime(), pindexPrev->GetMedianTimePast() + 1)` — the
@@ -525,47 +356,332 @@ pub fn compute_witness_commitment(txs: &[TemplateTx]) -> [u8; 32] {
     bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array()
 }
 
-/// Whether anything spending `txid` pays a fee — the CPFP half of Core's
-/// chunk-feerate test.
-///
-/// Core excludes a package whose *whole chunk* earns less than
-/// `blockMinFeeRate`; the case that matters in practice is a zero-fee
-/// transaction with no paying descendant. Only consulted when the
-/// transaction's own effective fee is zero, so the mempool read costs
-/// nothing on the common path.
-/// Whether a transaction clears the `-blockmintxfee` floor, on its own or as
-/// part of the package a miner would take it in.
-///
-/// Core reads the floor off the chunk the cluster linearisation hands the block
-/// builder. satd has no cluster machinery, so the package here is the
-/// transaction plus its in-mempool descendants — the CPFP shape the floor
-/// exists to accommodate. A transaction that clears the floor by itself is
-/// never dragged below it by a cheap descendant, which is what makes this
-/// equivalent to Core's chunk for the shapes the floor can decide.
-fn meets_block_min_fee(
-    mempool: &Mempool,
-    effective_fee_by_txid: &std::collections::HashMap<bitcoin::Txid, u64>,
-    weight_by_txid: &std::collections::HashMap<bitcoin::Txid, u64>,
-    txid: &bitcoin::Txid,
-    effective_fee: u64,
+/// Core's `MAX_CONSECUTIVE_FAILURES` (`src/node/miner.cpp`, v29.0:316): once
+/// the block is within the coinbase reserve of full, this many packages in a
+/// row that do not fit end the selection.
+const MAX_CONSECUTIVE_FAILURES: usize = 1000;
+
+/// The transactions [`select_transactions`] chose, in block order, and the
+/// totals the template reports.
+struct Selection {
+    transactions: Vec<TemplateTx>,
+    /// Including the coinbase reserve.
+    total_weight: usize,
+    /// Actual fees (not `prioritisetransaction`-modified): what the coinbase
+    /// may claim.
+    total_fees: u64,
+}
+
+/// A candidate's package: itself plus its in-mempool ancestors not yet in the
+/// block. Core's `CTxMemPoolModifiedEntry` state (`nSizeWithAncestors`,
+/// `nModFeesWithAncestors`, `nSigOpCostWithAncestors`), kept for every
+/// candidate rather than only the modified ones.
+#[derive(Clone, Copy)]
+struct Package {
+    /// Modified fee (fee + `fee_delta`, floored at zero per transaction).
+    fee: u64,
     weight: u64,
+    sigops: u64,
+}
+
+/// A heap key: a candidate's package score when it was pushed. `version`
+/// matches the candidate's current version only while its package is
+/// unchanged; a stale key is skipped when popped.
+struct Ranked {
+    fee: u64,
+    weight: u64,
+    txid: bitcoin::Txid,
+    idx: usize,
+    version: u32,
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked {
+    /// Higher package feerate is greater. Ties go to the smaller txid, as in
+    /// Core's `CompareTxMemPoolEntryByAncestorFee` (`src/txmempool.h`), so the
+    /// result does not depend on hash-map iteration order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let a = self.fee as u128 * other.weight as u128;
+        let b = other.fee as u128 * self.weight as u128;
+        a.cmp(&b)
+            .then_with(|| other.txid.cmp(&self.txid))
+            .then_with(|| other.version.cmp(&self.version))
+    }
+}
+
+/// Choose the block's transactions: Bitcoin Core's ancestor-score package
+/// selection (`BlockAssembler::addPackageTxs`, `src/node/miner.cpp` in v29.0,
+/// lines 299-438, the algorithm Core used until cluster mempool).
+///
+/// Every candidate is ranked by the feerate of its *package* — itself plus its
+/// in-mempool ancestors not yet in the block — and the best package goes in
+/// whole, ancestors first. A child paying for a cheap parent (CPFP, a
+/// Lightning anchor, a zero-fee ephemeral-dust parent) therefore lifts the
+/// parent in with it, where ranking each transaction by its own feerate left
+/// the child waiting on a parent that never made the cut. After a package goes
+/// in, each of its in-mempool descendants drops the included transactions from
+/// its own package and is re-ranked (Core's `UpdatePackagesForAdded`).
+///
+/// A package is skipped when it would take the block past its weight or sigop
+/// limit (Core's `TestPackage`, sigops with `>=` and the coinbase's reserve
+/// counted from the start, v29.0:206-217), and selection stops at the first
+/// package paying less than `-blockmintxfee` — it is the best one left, so
+/// nothing after it pays more (v29.0:381-384).
+///
+/// Whether a transaction can be in this block at all does not change as
+/// others are chosen, so it is decided once, up front: it must be final at
+/// (`height`, `template_mtp`) and every input must resolve to a mature
+/// confirmed coin whose BIP 68 lock is satisfied, or to another candidate
+/// (which the package brings along). A transaction that fails, and everything
+/// that spends it, is never a candidate (#588/#589). Core applies the finality
+/// half per package (`TestPackageTransactions`); the rest it gets from its
+/// mempool's own invariants, which satd re-checks here because a reorg or a
+/// persisted mempool can hold a transaction admission never re-judged.
+fn select_transactions(
+    chain_state: &ChainState,
+    entries: Vec<(bitcoin::Txid, crate::mempool::pool::MempoolEntry)>,
+    height: u32,
+    template_mtp: u32,
     block_min_tx_fee: u64,
-) -> bool {
-    if block_min_tx_fee == 0 {
-        return true;
+) -> Selection {
+    use std::collections::{BinaryHeap, HashMap};
+
+    let n = entries.len();
+    let index: HashMap<bitcoin::Txid, usize> =
+        entries.iter().enumerate().map(|(i, (txid, _))| (*txid, i)).collect();
+
+    // Parents among the candidates, and whether each candidate can be mined
+    // at all if its parents are.
+    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut minable = vec![true; n];
+    for (i, (_, entry)) in entries.iter().enumerate() {
+        if !tx_is_final_at(&entry.tx, height, template_mtp) {
+            minable[i] = false;
+            continue;
+        }
+        let bip68_enforced = (entry.tx.version.0 as u32) >= 2;
+        for input in &entry.tx.input {
+            let parent = input.previous_output.txid;
+            // Resolve against the candidates first, then the UTXO set. A
+            // parent that is neither — evicted after this child was admitted,
+            // or held in quarantine `on template` — cannot be in this block,
+            // and treating it as confirmed would mine an orphan
+            // (bad-txns-inputs-missingorspent).
+            let prev_height = if let Some(&p) = index.get(&parent) {
+                if p != i && !parents[i].contains(&p) {
+                    parents[i].push(p);
+                    children[p].push(i);
+                }
+                // Born in this block.
+                height
+            } else if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                // Coinbase maturity and BIP 68 are re-checked for the same
+                // reason finality is: admission judged them against the tip
+                // it saw. `connect_block` answers
+                // bad-txns-premature-spend-of-coinbase for the whole block.
+                if coin.coinbase && height - coin.height < COINBASE_MATURITY {
+                    minable[i] = false;
+                    break;
+                }
+                coin.height
+            } else {
+                minable[i] = false;
+                break;
+            };
+            if bip68_enforced
+                && !Mempool::bip68_satisfied(chain_state, input.sequence.0, prev_height, height, template_mtp)
+            {
+                minable[i] = false;
+                break;
+            }
+        }
     }
-    if crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee, weight) >= block_min_tx_fee {
-        return true;
+
+    // Topological order (Kahn). A candidate left out — only a cycle, which a
+    // valid mempool cannot hold — is never mined.
+    let mut pending: Vec<usize> = parents.iter().map(Vec::len).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| pending[i] == 0).collect();
+    let mut head = 0;
+    while head < order.len() {
+        let i = order[head];
+        head += 1;
+        for &c in &children[i] {
+            pending[c] -= 1;
+            if pending[c] == 0 {
+                order.push(c);
+            }
+        }
     }
-    let mut package_fee = effective_fee;
-    let mut package_weight = weight;
-    for d in mempool.get_descendants(txid).into_iter().flatten() {
-        package_fee =
-            package_fee.saturating_add(effective_fee_by_txid.get(&d).copied().unwrap_or(0));
-        package_weight =
-            package_weight.saturating_add(weight_by_txid.get(&d).copied().unwrap_or(0));
+    let mut ordered = vec![false; n];
+    for &i in &order {
+        ordered[i] = true;
     }
-    crate::mempool::policy::fee_rate_sat_per_kvb(package_fee, package_weight) >= block_min_tx_fee
+
+    // Ancestor sets, and unminability passed down to every descendant.
+    let mut ancestors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &i in &order {
+        let mut set: Vec<usize> = Vec::new();
+        for &p in &parents[i] {
+            if !minable[p] {
+                minable[i] = false;
+            }
+            set.push(p);
+            set.extend_from_slice(&ancestors[p]);
+        }
+        set.sort_unstable();
+        set.dedup();
+        ancestors[i] = set;
+    }
+    for i in 0..n {
+        if !ordered[i] {
+            minable[i] = false;
+        }
+    }
+
+    let own = |i: usize| -> Package {
+        let e = &entries[i].1;
+        Package {
+            fee: (e.fee as i64).saturating_add(e.fee_delta).max(0) as u64,
+            weight: e.weight as u64,
+            sigops: e.sigop_cost,
+        }
+    };
+    let mut package: Vec<Package> = (0..n)
+        .map(|i| {
+            let mut p = own(i);
+            for &a in &ancestors[i] {
+                let q = own(a);
+                p.fee = p.fee.saturating_add(q.fee);
+                p.weight = p.weight.saturating_add(q.weight);
+                p.sigops = p.sigops.saturating_add(q.sigops);
+            }
+            p
+        })
+        .collect();
+
+    let mut version = vec![0u32; n];
+    let mut heap: BinaryHeap<Ranked> = (0..n)
+        .filter(|&i| minable[i])
+        .map(|i| Ranked { fee: package[i].fee, weight: package[i].weight, txid: entries[i].0, idx: i, version: 0 })
+        .collect();
+
+    let mut in_block = vec![false; n];
+    let mut selected: Vec<usize> = Vec::new();
+    let mut total_weight = COINBASE_WEIGHT_RESERVE;
+    // Weight is not the only block limit. A mempool dense in sigops (bare
+    // multisig outputs count 20 each) fills 80,000 in a fraction of a block's
+    // weight, and a template that crosses it is a block `connect_block`
+    // refuses as `bad-blk-sigops`. Core's `BlockAssembler` starts from the
+    // coinbase's reserve and refuses a package that would bring the total to
+    // the limit or past it (`>=`).
+    let mut total_sigops = COINBASE_SIGOPS_RESERVE;
+    let mut consecutive_failed = 0usize;
+    // Descendant walks mark what they have visited with the walk's number.
+    let mut visited = vec![0u32; n];
+    let mut walk = 0u32;
+
+    while let Some(top) = heap.pop() {
+        let i = top.idx;
+        if in_block[i] || top.version != version[i] {
+            continue;
+        }
+        let pkg = package[i];
+        // `-blockmintxfee`, on the package: a zero-fee parent rides in on its
+        // child's fee, and only a package paying nothing is left out. This is
+        // the best package left, so nothing after it clears the floor either.
+        if block_min_tx_fee > 0
+            && crate::mempool::policy::fee_rate_sat_per_kvb(pkg.fee, pkg.weight) < block_min_tx_fee
+        {
+            break;
+        }
+        if total_weight as u64 + pkg.weight > MAX_BLOCK_WEIGHT as u64
+            || total_sigops.saturating_add(pkg.sigops) >= MAX_BLOCK_SIGOPS_COST
+        {
+            // Not failed for good: if an ancestor goes in with another
+            // package, this one shrinks and is ranked again.
+            consecutive_failed += 1;
+            if consecutive_failed > MAX_CONSECUTIVE_FAILURES
+                && total_weight > MAX_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE
+            {
+                break;
+            }
+            continue;
+        }
+        consecutive_failed = 0;
+
+        // The package, ancestors first. An ancestor has strictly fewer
+        // ancestors than its descendant, so ordering by ancestor count is a
+        // valid block order (Core's `SortForBlock`); the txid breaks ties so
+        // the order is deterministic.
+        let mut members: Vec<usize> = ancestors[i].iter().copied().filter(|&a| !in_block[a]).collect();
+        members.push(i);
+        members.sort_by(|&a, &b| {
+            ancestors[a].len().cmp(&ancestors[b].len()).then_with(|| entries[a].0.cmp(&entries[b].0))
+        });
+        for &m in &members {
+            in_block[m] = true;
+            let p = own(m);
+            total_weight += entries[m].1.weight;
+            total_sigops = total_sigops.saturating_add(p.sigops);
+            selected.push(m);
+        }
+
+        // Every descendant of what just went in drops it from its package
+        // and is ranked again (Core's `UpdatePackagesForAdded`).
+        for &m in &members {
+            let p = own(m);
+            walk += 1;
+            let mut stack: Vec<usize> = children[m].clone();
+            while let Some(d) = stack.pop() {
+                if visited[d] == walk {
+                    continue;
+                }
+                visited[d] = walk;
+                stack.extend_from_slice(&children[d]);
+                if in_block[d] {
+                    continue;
+                }
+                let q = &mut package[d];
+                q.fee = q.fee.saturating_sub(p.fee);
+                q.weight = q.weight.saturating_sub(p.weight);
+                q.sigops = q.sigops.saturating_sub(p.sigops);
+                version[d] = version[d].wrapping_add(1);
+                if minable[d] {
+                    heap.push(Ranked {
+                        fee: q.fee,
+                        weight: q.weight,
+                        txid: entries[d].0,
+                        idx: d,
+                        version: version[d],
+                    });
+                }
+            }
+        }
+    }
+
+    let mut total_fees = 0u64;
+    let mut entries: Vec<Option<(bitcoin::Txid, crate::mempool::pool::MempoolEntry)>> =
+        entries.into_iter().map(Some).collect();
+    let transactions = selected
+        .into_iter()
+        .map(|m| {
+            let (_, e) = entries[m].take().expect("each candidate is selected once");
+            total_fees += e.fee;
+            TemplateTx { tx: e.tx, fee: e.fee, weight: e.weight, sigop_cost: e.sigop_cost }
+        })
+        .collect();
+    Selection { transactions, total_weight, total_fees }
 }
 
 #[cfg(test)]
@@ -1267,6 +1383,257 @@ mod tests {
             template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
         assert!(mined.contains(&parent_txid), "the zero-fee parent was dropped");
         assert!(mined.contains(&child_txid), "the paying child was stranded");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Ancestor-score package selection ────────────────────────────────
+    //
+    // Mirrors the package cases of Core's `miner_tests` (`src/test/miner_tests.cpp`,
+    // `TestPackageSelection`) on satd's assembler. Weights here are chosen so
+    // the block's 3,992,000 WU after the coinbase reserve fills exactly.
+
+    /// Room for transactions: the block less the coinbase reserve.
+    const ROOM: usize = MAX_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE;
+
+    /// Insert a transaction spending `prev` with the given fee, weight and
+    /// sigop cost; returns its txid.
+    fn put(mp: &Mempool, prev: bitcoin::OutPoint, tag: u8, fee: u64, weight: usize, sigops: u64) -> bitcoin::Txid {
+        use crate::mempool::pool::QuarantineScope;
+        let tx = tx_spending(prev, 10_000, tag, 0xffff_ffff, 0);
+        let txid = mp.insert_tx_weighted_for_test(tx, fee, weight, QuarantineScope::acting());
+        if sigops > 0 {
+            mp.set_sigop_cost_for_test(&txid, sigops);
+        }
+        txid
+    }
+
+    fn out0(txid: bitcoin::Txid) -> bitcoin::OutPoint {
+        bitcoin::OutPoint { txid, vout: 0 }
+    }
+
+    fn mined(template: &BlockTemplate) -> Vec<bitcoin::Txid> {
+        template.transactions.iter().map(|t| t.tx.compute_txid()).collect()
+    }
+
+    /// Every transaction in the template comes after each of its parents that
+    /// is also in the template.
+    fn assert_topological(template: &BlockTemplate) {
+        let order = mined(template);
+        for (i, t) in template.transactions.iter().enumerate() {
+            for input in &t.tx.input {
+                if let Some(p) = order.iter().position(|x| *x == input.previous_output.txid) {
+                    assert!(p < i, "{} precedes its parent {}", order[i], order[p]);
+                }
+            }
+        }
+    }
+
+    /// The bug this selection fixes: a high-fee child of a low-fee parent
+    /// (CPFP) waited behind the parent's own fee rate, and a block filled by
+    /// middling transactions left both out. Ranked by package, the pair
+    /// (62.5 sat/WU) beats the fillers (10 sat/WU) and goes in first.
+    #[test]
+    fn a_cpfp_child_lifts_its_parent_into_a_full_block() {
+        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x60 + i), coin_at(0))).collect();
+        let mut coins = fillers.clone();
+        coins.push((confirmed_prev(0x6F), coin_at(0)));
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+
+        let parent = put(&mp, confirmed_prev(0x6F), 0x70, 1, 400, 0);
+        let child = put(&mp, out0(parent), 0x71, 50_000, 400, 0);
+        for (i, (prev, _)) in fillers.iter().enumerate() {
+            put(&mp, *prev, 0x72 + i as u8, 9_980_000, ROOM / 4, 0);
+        }
+
+        let template = create_template(&cs, &mp);
+        let txs = mined(&template);
+        assert!(txs.contains(&parent), "the low-fee parent was left out");
+        assert!(txs.contains(&child), "the high-fee child was left out");
+        assert_eq!(txs.len(), 5, "the pair and three of the four fillers fit");
+        assert_topological(&template);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rank is the package's, not the transaction's own. The child pays
+    /// 125 sat/WU itself, but taking it means taking its heavy, nearly free
+    /// parent: the pair pays 0.025 sat/WU, below the 10 sat/WU fillers. The
+    /// fillers take the block; ranked by its own rate the child would have
+    /// brought in half a block of the parent and pushed three fillers out.
+    #[test]
+    fn a_rich_child_of_a_heavy_cheap_parent_ranks_by_its_package() {
+        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x50 + i), coin_at(0))).collect();
+        let mut coins = fillers.clone();
+        coins.push((confirmed_prev(0x5F), coin_at(0)));
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+
+        let parent = put(&mp, confirmed_prev(0x5F), 0x58, 1, ROOM / 2, 0);
+        let child = put(&mp, out0(parent), 0x59, 50_000, 400, 0);
+        let mut filler_txids = Vec::new();
+        for (i, (prev, _)) in fillers.iter().enumerate() {
+            filler_txids.push(put(&mp, *prev, 0x5A + i as u8, 9_980_000, ROOM / 4, 0));
+        }
+
+        let template = create_template(&cs, &mp);
+        let txs = mined(&template);
+        assert!(!txs.contains(&parent) && !txs.contains(&child), "the poor package displaced fillers");
+        for t in &filler_txids {
+            assert!(txs.contains(t), "filler {t} left out");
+        }
+        assert_eq!(template.coinbase_value - crate::chain::connect::block_subsidy(Network::Regtest, 1), 4 * 9_980_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ephemeral dust / anchor shape: a parent paying nothing at all, mined
+    /// only because its child pays for both. Under the default floor the
+    /// package clears `-blockmintxfee`; the parent alone would not.
+    #[test]
+    fn a_zero_fee_parent_and_its_paying_child_are_both_mined_in_a_full_block() {
+        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x80 + i), coin_at(0))).collect();
+        let mut coins = fillers.clone();
+        coins.push((confirmed_prev(0x8F), coin_at(0)));
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+
+        let parent = put(&mp, confirmed_prev(0x8F), 0x90, 0, 400, 0);
+        let child = put(&mp, out0(parent), 0x91, 40_000, 400, 0);
+        for (i, (prev, _)) in fillers.iter().enumerate() {
+            put(&mp, *prev, 0x92 + i as u8, 9_980_000, ROOM / 4, 0);
+        }
+
+        let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
+        let txs = mined(&template);
+        assert!(txs.contains(&parent) && txs.contains(&child), "the anchor pair was left out: {txs:?}");
+        assert_topological(&template);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cheap child does not ride on its well-paying parent: once the parent
+    /// is in, the child's package is the child alone, ranked on its own fee.
+    /// With the block full it loses to the fillers.
+    #[test]
+    fn a_low_fee_child_is_not_dragged_in_by_its_parent() {
+        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0xA0 + i), coin_at(0))).collect();
+        let mut coins = fillers.clone();
+        coins.push((confirmed_prev(0xAF), coin_at(0)));
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+
+        let parent = put(&mp, confirmed_prev(0xAF), 0xB0, 40_000, 400, 0);
+        let child = put(&mp, out0(parent), 0xB1, 4, 400, 0);
+        // Exactly the room the parent leaves.
+        for (i, (prev, _)) in fillers.iter().enumerate() {
+            put(&mp, *prev, 0xB2 + i as u8, 9_979_000, (ROOM - 400) / 4, 0);
+        }
+
+        let txs = mined(&create_template(&cs, &mp));
+        assert!(txs.contains(&parent));
+        assert!(!txs.contains(&child), "the 0.01 sat/WU child displaced a filler");
+        assert_eq!(txs.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a package goes in, its descendants are ranked on what is left of
+    /// theirs (Core's `UpdatePackagesForAdded`). The child ranks 52.5 sat/WU
+    /// while its parent is out, but 5 once the parent is in, so the 20 sat/WU
+    /// transaction comes before it.
+    #[test]
+    fn a_descendant_is_reranked_once_its_ancestor_is_in() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xC0), coin_at(0)),
+            (confirmed_prev(0xC1), coin_at(0)),
+        ]);
+        let parent = put(&mp, confirmed_prev(0xC0), 0xC2, 40_000, 400, 0);
+        let child = put(&mp, out0(parent), 0xC3, 2_000, 400, 0);
+        let middle = put(&mp, confirmed_prev(0xC1), 0xC4, 8_000, 400, 0);
+
+        let txs = mined(&create_template(&cs, &mp));
+        assert_eq!(txs, vec![parent, middle, child]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A package too heavy for what is left is skipped, not the end of
+    /// selection: lighter, cheaper transactions still fill the block.
+    #[test]
+    fn a_package_too_heavy_to_fit_is_skipped_and_lighter_ones_fill() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xD0), coin_at(0)),
+            (confirmed_prev(0xD1), coin_at(0)),
+            (confirmed_prev(0xD2), coin_at(0)),
+        ]);
+        // Each half fits; the package does not.
+        let heavy_parent = put(&mp, confirmed_prev(0xD0), 0xD3, 1, ROOM / 2 + 1_000, 0);
+        let heavy_child = put(&mp, out0(heavy_parent), 0xD4, 900_000_000, ROOM / 2 + 1_000, 0);
+        let light = put(&mp, confirmed_prev(0xD1), 0xD5, 1_000, 400, 0);
+        let light2 = put(&mp, confirmed_prev(0xD2), 0xD6, 1_000, 400, 0);
+
+        let txs = mined(&create_template(&cs, &mp));
+        assert!(!txs.contains(&heavy_child), "a package over the block weight was mined");
+        assert!(txs.contains(&light) && txs.contains(&light2), "selection stopped at the heavy package");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sigops are counted per package: a pair that together crosses 80,000
+    /// is refused as a pair even though each half fits. The parent can still
+    /// go in on its own; the child then cannot.
+    #[test]
+    fn a_package_over_the_sigop_limit_is_skipped() {
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xE0), coin_at(0))]);
+        let parent = put(&mp, confirmed_prev(0xE0), 0xE1, 1_000, 400, 40_000);
+        let child = put(&mp, out0(parent), 0xE2, 90_000, 400, 39_700);
+
+        let template = create_template(&cs, &mp);
+        let total: u64 = template.transactions.iter().map(|t| t.sigop_cost).sum();
+        assert!(total + COINBASE_SIGOPS_RESERVE < MAX_BLOCK_SIGOPS_COST, "template carries {total} sigop cost");
+        let txs = mined(&template);
+        assert!(txs.contains(&parent));
+        assert!(!txs.contains(&child));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Chains and diamonds whose fee rates rise toward the leaves still come
+    /// out parents first.
+    #[test]
+    fn packages_are_emitted_in_topological_order() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xF0), coin_at(0)),
+            (confirmed_prev(0xF1), coin_at(0)),
+        ]);
+        let a = put(&mp, confirmed_prev(0xF0), 0xF2, 1, 400, 0);
+        let b = put(&mp, out0(a), 0xF3, 2, 400, 0);
+        let c = put(&mp, out0(b), 0xF4, 90_000, 400, 0);
+        // A diamond: e pays two outputs, f and g spend one each, d spends
+        // f and g.
+        let two_outputs = |prev, tag| {
+            let mut tx = tx_spending(prev, 5_000, tag, 0xffff_ffff, 0);
+            tx.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(4_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            });
+            tx
+        };
+        let acting = crate::mempool::pool::QuarantineScope::acting;
+        let e = mp.insert_tx_weighted_for_test(two_outputs(confirmed_prev(0xF1), 0xF5), 1, 400, acting());
+        let f = put(&mp, out0(e), 0xF6, 1, 400, 0);
+        let g = put(&mp, bitcoin::OutPoint { txid: e, vout: 1 }, 0xF8, 1, 400, 0);
+        let d_tx = {
+            let mut tx = tx_spending(out0(f), 1_000, 0xF7, 0xffff_ffff, 0);
+            tx.input.push(bitcoin::TxIn { previous_output: out0(g), ..tx.input[0].clone() });
+            tx
+        };
+        let d = mp.insert_tx_weighted_for_test(d_tx, 80_000, 400, acting());
+
+        let template = create_template(&cs, &mp);
+        let txs = mined(&template);
+        for t in [a, b, c, d, e, f, g] {
+            assert!(txs.contains(&t), "{t} missing");
+        }
+        assert_topological(&template);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
