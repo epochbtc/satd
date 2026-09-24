@@ -1398,7 +1398,77 @@ fn test_gettxoutsetinfo() {
         "bestblock must be the active-chain hash at the reported height"
     );
 
+    // The four youngest buckets are exact once the node's recent-height
+    // window is live (built at startup; instant on a regtest datadir).
+    // Check `<1h` and `<1d` against the blocks themselves: `<1h` holds the
+    // outputs of the last six blocks, `<1d` those of the 138 before them.
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(200), serde_json::json!(addr)],
+    )
+    .unwrap();
+    let result = poll_exact_txoutsetinfo(&node);
+    let tip = result["height"].as_u64().unwrap();
+    let counts: Vec<u64> = result["utxo_age_distribution"]["counts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    let outputs_in = |heights: std::ops::RangeInclusive<u64>| -> u64 {
+        heights
+            .map(|h| {
+                let hash = node
+                    .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+                    .unwrap()["result"]
+                    .clone();
+                let block = node
+                    .rpc_call_with_params("getblock", vec![hash, serde_json::json!(2)])
+                    .unwrap();
+                block["result"]["tx"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|tx| tx["vout"].as_array().unwrap().iter())
+                    .filter(|out| out["scriptPubKey"]["type"] != "nulldata")
+                    .count() as u64
+            })
+            .sum()
+    };
+    assert_eq!(counts[0], outputs_in(tip - 5..=tip), "<1h: ages 0..=5");
+    assert_eq!(counts[1], outputs_in(tip - 143..=tip - 6), "<1d: ages 6..=143");
+    assert_eq!(
+        counts.iter().sum::<u64>(),
+        result["txouts"].as_u64().unwrap(),
+        "histogram must account for every txout"
+    );
+    // 206 blocks of one spendable coinbase output each: the example the
+    // Operator Manual's JSON-RPC extensions chapter prints.
+    assert_eq!(tip, 206);
+    assert_eq!(counts, vec![6, 138, 62, 0, 0, 0, 0, 0]);
+
     node.stop();
+}
+
+/// `gettxoutsetinfo` once its age buckets report `exact: true`. The window
+/// behind them is built on a background thread at startup, which on a
+/// regtest datadir takes milliseconds; bounded so a build that never lands
+/// fails the test instead of hanging it.
+fn poll_exact_txoutsetinfo(node: &TestNode) -> serde_json::Value {
+    for _ in 0..100 {
+        let response = node.rpc_call("gettxoutsetinfo").unwrap();
+        let result = response["result"].clone();
+        if result["utxo_age_distribution"]["exact"] == serde_json::json!(true) {
+            return result;
+        }
+        assert_eq!(
+            result["utxo_age_distribution"]["exact"],
+            serde_json::json!(false),
+            "`exact` must always be a boolean"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("gettxoutsetinfo never reported exact age buckets");
 }
 
 #[test]
@@ -4634,6 +4704,11 @@ fn test_gettxoutsetinfo_at_genesis() {
     assert_eq!(
         result["txouts"], 0,
         "Genesis UTXO set should have 0 spendable outputs"
+    );
+    let result = poll_exact_txoutsetinfo(&node);
+    assert_eq!(
+        result["utxo_age_distribution"]["counts"],
+        serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0])
     );
 
     node.stop();

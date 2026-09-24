@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
-use crate::storage::Store;
+use crate::storage::{RecentHeightWindow, Store};
 use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
 
 /// True when the active chain holds exactly `hash` at `height`.
@@ -892,10 +892,12 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Result<Value, (i32, Stri
     let unit = default_unit();
     let total = format_amount(info.total_amount_sat, unit);
 
-    // Compute age distribution from height histogram
-    // Buckets: <1h (6 blk), <1d (144), <1w (1008), <1mo (4320),
-    //          <6mo (25920), <1y (51840), <3y (155520), 3y+
-    let age_buckets = height_hist_to_age_buckets(&info.height_hist, info.height);
+    // Eight age buckets: <1h (6 blocks), <1d (144), <1w (1008), <1mo (4320),
+    // <6mo (25920), <1y (51840), <3y (155520), 3y+. The four youngest come
+    // from the exact per-height window when the store has one; see
+    // `height_hist_to_age_buckets`.
+    let (age_buckets, exact) =
+        height_hist_to_age_buckets(&info.height_hist, info.height, info.recent.as_ref());
 
     let mut response = json!({
         "height": info.height,
@@ -907,48 +909,140 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Result<Value, (i32, Stri
         "utxo_age_distribution": {
             "labels": ["<1h", "<1d", "<1w", "<1mo", "<6mo", "<1y", "<3y", "3y+"],
             "counts": age_buckets,
+            "exact": exact,
         },
     });
     annotate_units(&mut response, unit);
     Ok(response)
 }
 
-/// Convert a height histogram (1000-block buckets) into 8 age-based buckets
-/// relative to the current tip height.
-fn height_hist_to_age_buckets(hist: &[u64], tip_height: u32) -> [u64; 8] {
-    // Age thresholds in blocks (boundaries between buckets)
-    let thresholds = [6u32, 144, 1008, 4320, 25920, 51840, 155520];
-    let mut buckets = [0u64; 8];
+/// Upper age edge, in blocks, of every age bucket but the open-ended last.
+const AGE_BUCKET_EDGES: [u32; 7] = [6, 144, 1008, 4320, 25920, 51840, 155520];
 
-    for (i, &count) in hist.iter().enumerate() {
+/// The age bucket a coin `age` blocks old falls in.
+fn age_bucket(age: u32) -> usize {
+    AGE_BUCKET_EDGES
+        .iter()
+        .position(|&edge| age < edge)
+        .unwrap_or(AGE_BUCKET_EDGES.len())
+}
+
+/// How many heights in `lo..=hi` fall in age bucket `bucket` at `tip`.
+fn heights_in_age_bucket(lo: u32, hi: u32, tip: u32, bucket: usize) -> u64 {
+    // Bucket `b` holds ages `[min_age, max_age)`, i.e. heights
+    // `(tip - max_age, tip - min_age]`. Signed so neither end underflows.
+    let min_age = if bucket == 0 { 0 } else { i64::from(AGE_BUCKET_EDGES[bucket - 1]) };
+    let top = i64::from(tip) - min_age;
+    let bottom = match AGE_BUCKET_EDGES.get(bucket) {
+        Some(&max_age) => i64::from(tip) - i64::from(max_age) + 1,
+        None => i64::MIN,
+    };
+    let from = bottom.max(i64::from(lo));
+    let to = top.min(i64::from(hi));
+    if from > to { 0 } else { (to - from + 1) as u64 }
+}
+
+/// Add `count` coins spread evenly over heights `lo..=hi` to `buckets`.
+/// Integer shares, with the remainder going to the youngest heights, so the
+/// buckets gain exactly `count`.
+fn spread_over_heights(buckets: &mut [u64; 8], count: u64, lo: u32, hi: u32, tip: u32) {
+    let span = u64::from(hi - lo) + 1;
+    let share = count / span;
+    let extra = count % span;
+    // `extra < span`, so the youngest `extra` heights start at or above `lo`.
+    let extra_lo = (u64::from(hi) + 1 - extra) as u32;
+    for (bucket, total) in buckets.iter_mut().enumerate() {
+        *total += share * heights_in_age_bucket(lo, hi, tip, bucket);
+        if extra > 0 {
+            *total += heights_in_age_bucket(extra_lo, hi, tip, bucket);
+        }
+    }
+}
+
+/// Convert the UTXO creation-height counts into the eight
+/// `utxo_age_distribution` buckets at `tip_height`. Returns the buckets and
+/// whether the four youngest are exact.
+///
+/// `hist` counts coins per 1000-block chunk. `recent`, when the store has a
+/// live window, counts them per height for the most recent heights. Every
+/// height from the window's `base` up to the tip takes its exact count. Each
+/// chunk's remaining coins (its count less the exact heights inside it) are
+/// spread evenly over the chunk's other heights up to the tip, so the older
+/// buckets are estimates to within one chunk at their edges. Without a
+/// window every chunk is spread that way, and the youngest buckets are
+/// estimates too.
+///
+/// The counts sum to the histogram's total, which is `txouts`, as long as
+/// the window and the histogram agree. `exact` is true only when the window
+/// covers the whole `<1mo` range: after a reorg deeper than the window's
+/// margin the oldest recent heights fall back to the estimate until the
+/// chain regrows past its old tip.
+fn height_hist_to_age_buckets(
+    hist: &[u64],
+    tip_height: u32,
+    recent: Option<&RecentHeightWindow>,
+) -> ([u64; 8], bool) {
+    let mut buckets = [0u64; 8];
+    // Heights `exact_from..=tip_height` take exact counts from the window.
+    let exact_from = recent.map(|w| w.base).filter(|&base| base <= tip_height);
+    if let (Some(window), Some(from)) = (recent, exact_from) {
+        for height in from..=tip_height {
+            buckets[age_bucket(tip_height - height)] += window.count_at(height).unwrap_or(0);
+        }
+    }
+
+    for (chunk, &count) in hist.iter().enumerate() {
         if count == 0 {
             continue;
         }
-        // This histogram bucket covers heights [i*1000 .. (i+1)*1000)
-        // Use the midpoint to estimate age
-        let mid_height = i as u32 * 1000 + 500;
-        let age = tip_height.saturating_sub(mid_height);
-
-        let bucket = if age < thresholds[0] {
-            0
-        } else if age < thresholds[1] {
-            1
-        } else if age < thresholds[2] {
-            2
-        } else if age < thresholds[3] {
-            3
-        } else if age < thresholds[4] {
-            4
-        } else if age < thresholds[5] {
-            5
-        } else if age < thresholds[6] {
-            6
-        } else {
-            7
+        let Ok(lo) = u32::try_from(chunk as u64 * 1000) else {
+            break;
         };
-        buckets[bucket] += count;
+        if lo > tip_height {
+            // Coins above the tip: residue a consistent chainstate never
+            // has. Count them as the youngest so the total still adds up.
+            buckets[0] += count;
+            continue;
+        }
+        let hi = lo.saturating_add(999).min(tip_height);
+        let (Some(window), Some(from)) = (recent, exact_from) else {
+            spread_over_heights(&mut buckets, count, lo, hi, tip_height);
+            continue;
+        };
+        let exact_in_chunk: u64 = (from.max(lo)..=hi)
+            .map(|height| window.count_at(height).unwrap_or(0))
+            .sum();
+        let remainder = count.checked_sub(exact_in_chunk).unwrap_or_else(|| {
+            tracing::debug!(
+                chunk,
+                count,
+                exact_in_chunk,
+                "utxo age buckets: the recent window counts more coins than the \
+                 height histogram for this chunk"
+            );
+            0
+        });
+        if remainder == 0 {
+            continue;
+        }
+        if from > lo {
+            // Heights `lo..from` are the chunk's heights the window lacks.
+            spread_over_heights(&mut buckets, remainder, lo, (from - 1).min(hi), tip_height);
+        } else {
+            // The window covers the whole chunk, yet the histogram counts
+            // more: drift. Keep the total by spreading it over the chunk.
+            tracing::debug!(
+                chunk,
+                remainder,
+                "utxo age buckets: the height histogram counts coins the recent \
+                 window does not"
+            );
+            spread_over_heights(&mut buckets, remainder, lo, hi, tip_height);
+        }
     }
-    buckets
+
+    let exact = recent.is_some_and(|w| w.covers_recent_range(tip_height));
+    (buckets, exact)
 }
 
 /// `getdifficulty` — return current proof-of-work difficulty.
@@ -1843,6 +1937,166 @@ pub fn load_txout_set(
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
+
+    // ---- utxo_age_distribution ----
+
+    /// `(height, count)` coins as the store would hold them: the coarse
+    /// 1000-block histogram and, if `window` is set, a live recent window
+    /// fed the same coins.
+    fn age_inputs(coins: &[(u32, u64)]) -> (Vec<u64>, RecentHeightWindow) {
+        let mut hist = Vec::new();
+        let mut window = RecentHeightWindow::empty([0; 32]);
+        for &(height, count) in coins {
+            let chunk = (height / 1000) as usize;
+            if hist.len() <= chunk {
+                hist.resize(chunk + 1, 0);
+            }
+            hist[chunk] += count;
+            for _ in 0..count {
+                window.add_one(height);
+            }
+        }
+        (hist, window)
+    }
+
+    fn total(coins: &[(u32, u64)]) -> u64 {
+        coins.iter().map(|(_, c)| c).sum()
+    }
+
+    #[test]
+    fn age_buckets_are_exact_with_a_window() {
+        let tip = 10_000;
+        // Exactly on both sides of every young edge, with a distinct count
+        // each so a coin landing in the neighbouring bucket shows.
+        let recent = [
+            (tip, 1),        // age 0      -> <1h
+            (tip - 5, 2),    // age 5      -> <1h
+            (tip - 6, 4),    // age 6      -> <1d
+            (tip - 143, 8),  // age 143    -> <1d
+            (tip - 144, 16), // age 144    -> <1w
+            (tip - 1007, 32), // age 1007  -> <1w
+            (tip - 1008, 64), // age 1008  -> <1mo
+            (tip - 4319, 128), // age 4319 -> <1mo
+        ];
+        // Older coins in the same chunks as the young ones and below the
+        // window: they must not leak into the young buckets.
+        let older = [(tip - 4320, 256), (tip - 4600, 512), (1_500, 1_024), (3, 2_048)];
+        let coins: Vec<(u32, u64)> = recent.iter().chain(older.iter()).copied().collect();
+        let (hist, window) = age_inputs(&coins);
+
+        let (buckets, exact) = height_hist_to_age_buckets(&hist, tip, Some(&window));
+        assert!(exact);
+        assert_eq!(buckets[0], 1 + 2);
+        assert_eq!(buckets[1], 4 + 8);
+        assert_eq!(buckets[2], 16 + 32);
+        assert_eq!(buckets[3], 64 + 128);
+        // Ages 4320 and 4600 are exact too (the window's margin holds
+        // them), and every older coin is at most 10k blocks old.
+        assert_eq!(buckets[4], 256 + 512 + 1_024 + 2_048);
+        assert_eq!(buckets.iter().sum::<u64>(), total(&coins), "every coin once");
+    }
+
+    #[test]
+    fn age_buckets_without_a_window_spread_each_chunk_evenly() {
+        // One chunk, heights 10000..=10999, one coin per height.
+        let tip = 10_999;
+        let hist: Vec<u64> = (0..=10).map(|c| if c == 10 { 1_000 } else { 0 }).collect();
+        let (buckets, exact) = height_hist_to_age_buckets(&hist, tip, None);
+        assert!(!exact);
+        // The midpoint rule put all 1000 in <1h and left <1d empty. Spread
+        // evenly, each bucket gets the heights it spans.
+        assert_eq!(buckets[0], 6);
+        assert_eq!(buckets[1], 138);
+        assert_eq!(buckets[2], 856);
+        assert_eq!(buckets.iter().sum::<u64>(), 1_000);
+    }
+
+    #[test]
+    fn age_buckets_give_a_chunk_remainder_to_its_youngest_heights() {
+        // 1003 coins over the 1000 heights 0..=999 at tip 999: one each,
+        // and the three left over go to heights 997..=999 (ages 0..=2).
+        let (buckets, exact) = height_hist_to_age_buckets(&[1_003], 999, None);
+        assert!(!exact);
+        assert_eq!(buckets[0], 6 + 3);
+        assert_eq!(buckets.iter().sum::<u64>(), 1_003);
+    }
+
+    #[test]
+    fn age_buckets_ignore_window_counts_above_the_tip() {
+        // The chain was at 20_010 and three blocks were disconnected. The
+        // window does not slide back; a count left above the tip (drift, or
+        // a height a disconnect has not zeroed) must not be served.
+        let tip = 20_007;
+        let (hist, mut window) = age_inputs(&[(tip, 1), (tip - 10, 1), (5, 7)]);
+        window.add_one(tip + 3);
+        let (buckets, exact) = height_hist_to_age_buckets(&hist, tip, Some(&window));
+        assert!(exact, "a 3-block reorg is inside the margin");
+        assert_eq!(buckets[0], 1);
+        assert_eq!(buckets[1], 1);
+        assert_eq!(buckets.iter().sum::<u64>(), 9);
+    }
+
+    #[test]
+    fn age_buckets_after_a_reorg_deeper_than_the_margin_are_estimates() {
+        let old_tip = 30_000;
+        let tip = old_tip - 1_000;
+        let (hist, mut window) = age_inputs(&[(tip, 1), (tip - 4_000, 1), (100, 5)]);
+        window.add_one(old_tip);
+        window.apply(&std::collections::HashMap::from([(old_tip, -1)]));
+        assert_eq!(window.top(), old_tip);
+        assert!(window.base > tip - (crate::storage::RECENT_WINDOW - 1));
+        assert!(window.base < tip, "the window still reaches the tip");
+        let (buckets, exact) = height_hist_to_age_buckets(&hist, tip, Some(&window));
+        assert!(!exact, "the oldest recent heights are below the window");
+        assert_eq!(buckets[0], 1);
+        assert_eq!(buckets.iter().sum::<u64>(), 7);
+    }
+
+    #[test]
+    fn age_buckets_keep_the_total_when_the_histogram_reaches_past_the_tip() {
+        // A whole chunk above the tip is residue a consistent chainstate
+        // never has; it is counted as youngest rather than dropped, so the
+        // buckets still sum to the histogram.
+        let hist = [4u64, 0, 3];
+        for recent in [None, Some(RecentHeightWindow::empty([0; 32]))] {
+            let (buckets, _) = height_hist_to_age_buckets(&hist, 1_500, recent.as_ref());
+            assert_eq!(buckets.iter().sum::<u64>(), 7);
+            assert!(buckets[0] >= 3);
+        }
+    }
+
+    #[test]
+    fn age_buckets_at_genesis_are_empty() {
+        let window = RecentHeightWindow::empty([0; 32]);
+        assert_eq!(height_hist_to_age_buckets(&[], 0, None), ([0; 8], false));
+        assert_eq!(height_hist_to_age_buckets(&[], 0, Some(&window)), ([0; 8], true));
+    }
+
+    #[test]
+    fn spreading_matches_a_per_height_loop() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % bound
+        };
+        for _ in 0..500 {
+            let tip = next(400_000) as u32;
+            let lo = next(u64::from(tip) + 1) as u32;
+            let hi = lo + next(u64::from(tip - lo).min(999) + 1) as u32;
+            let count = next(5_000);
+            let mut fast = [0u64; 8];
+            spread_over_heights(&mut fast, count, lo, hi, tip);
+            let span = u64::from(hi - lo) + 1;
+            let mut slow = [0u64; 8];
+            for height in lo..=hi {
+                let youngest_extra = u64::from(hi - height) < count % span;
+                slow[age_bucket(tip - height)] += count / span + u64::from(youngest_extra);
+            }
+            assert_eq!(fast, slow, "tip {tip} heights {lo}..={hi} count {count}");
+        }
+    }
 
     /// A partial `invalidateblock` keeps Core's error *code* and changes only
     /// the message. Operators and client libraries branch on the code, so a

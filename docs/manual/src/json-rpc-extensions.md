@@ -131,6 +131,28 @@ the `getrawmempool verbose` entry they derive from: `ancestorcount` and
 from the response rather than hardcoding edges; the top bucket's `max_vsize` is
 `null`. The method is read-only.
 
+## UTXO age distribution
+
+`gettxoutsetinfo` adds `utxo_age_distribution`, the UTXO set counted by age in
+blocks relative to the reply's `height`. On a regtest chain of 206 blocks, each
+with one spendable coinbase output:
+
+```json
+"utxo_age_distribution": {
+  "labels": ["<1h", "<1d", "<1w", "<1mo", "<6mo", "<1y", "<3y", "3y+"],
+  "counts": [6, 138, 62, 0, 0, 0, 0, 0],
+  "exact": true
+}
+```
+
+The bucket edges are 6, 144, 1008, 4320, 25920, 51840 and 155520 blocks. The
+counts sum to `txouts`. When `exact` is `true` the first four buckets are exact
+counts. The last four are estimated from a per-1000-block histogram, to within
+one 1000-block chunk at each edge. `exact` is `false` while the node is still
+building its per-height window, a one-time background scan of the coins after
+upgrading an existing datadir. Until then the first four buckets are estimated
+the same way.
+
 ## Silent-payment block data
 
 `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` returns the
