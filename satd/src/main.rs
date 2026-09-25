@@ -3273,9 +3273,10 @@ async fn main() {
         // The TLS listener is set up before the plain one is spawned, and
         // every failure in it is fatal: an operator who asked for a
         // LAN-facing encrypted scrape endpoint must not get a node that came
-        // up without one. The certificate was loaded, fatally, at startup
-        // (`start_metrics_startup`); the listener is the startup status
-        // server's, or bound here if that bind failed.
+        // up without one. The certificate was loaded, and the listener bound,
+        // fatally at startup (`start_metrics_startup`); the listener is the
+        // startup status server's, bound again here only if its accept loop
+        // was lost.
         if let Some(tls) = metrics.tls {
             let tls_listener = match tls.listener {
                 Some(l) => l,
