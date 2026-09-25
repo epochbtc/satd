@@ -1012,7 +1012,8 @@ pub struct Config {
     #[allow(dead_code)]
     pub onlynet: Vec<String>,
     // Mining
-    #[allow(dead_code)]
+    /// `-blockmaxweight`: the cap on a block template's weight, the coinbase
+    /// reserve included. Never above `MAX_BLOCK_WEIGHT` (refused at load).
     pub blockmaxweight: usize,
     #[allow(dead_code)]
     pub blockmintxfee: u64,
@@ -2894,6 +2895,33 @@ impl Config {
         }
         .unwrap_or(node::mining::template::DEFAULT_BLOCK_MIN_TX_FEE);
 
+        // `-blockmaxweight` caps block templates. It used to go through
+        // `.parse().ok()`, so `blockmaxweight=abc` became the default without
+        // a word; an unparseable value now stops the node, as `-blockmintxfee`
+        // does. (Core reads a non-number as 0 and clamps it up to the coinbase
+        // reserve, i.e. empty templates; refusing is kinder to a typo.) A value
+        // above the consensus maximum is Core's `InitError`, word for word
+        // (`src/init.cpp`, `AppInitParameterInteraction`).
+        let blockmaxweight = match cli.blockmaxweight {
+            Some(v) => v,
+            None => match file_get("blockmaxweight") {
+                Some(v) => v.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "blockmaxweight in config file: {v:?} is not a block weight \
+                         (a whole number of weight units)"
+                    )
+                })?,
+                None => node::mining::template::MAX_BLOCK_WEIGHT,
+            },
+        };
+        if blockmaxweight > node::mining::template::MAX_BLOCK_WEIGHT {
+            return Err(format!(
+                "Specified -blockmaxweight ({}) exceeds consensus maximum block weight ({})",
+                blockmaxweight,
+                node::mining::template::MAX_BLOCK_WEIGHT
+            ));
+        }
+
         // Core v31 changed the default from 83 (MAX_OP_RETURN_RELAY, the
         // historical value) to MAX_STANDARD_TX_WEIGHT / 4 = 100 000,
         // making the relay cap effectively uncapped.  Match that default
@@ -4180,10 +4208,7 @@ impl Config {
                 }
                 nets
             },
-            blockmaxweight: cli
-                .blockmaxweight
-                .or_else(|| file_get("blockmaxweight").and_then(|v| v.parse().ok()))
-                .unwrap_or(4_000_000),
+            blockmaxweight,
             blockmintxfee,
             blockversion: cli
                 .blockversion
@@ -6079,7 +6104,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "WU",
-        help = "Maximum block weight for templates (default: 4000000)"
+        help = "Maximum block weight for templates, coinbase reserve included (Core -blockmaxweight; default: 4000000). Above 4000000 is refused at startup; below the 8000 WU coinbase reserve is raised to it"
     )]
     pub blockmaxweight: Option<usize>,
 
@@ -9312,6 +9337,48 @@ mod tests {
         let args = normalize_args(vec!["satd".to_string(), "-blockfilterindex=0".to_string()]);
         let cli = CliArgs::try_parse_from(args).expect("explicit 0 must still parse");
         assert_eq!(cli.blockfilterindex, Some(false));
+    }
+
+    /// `-blockmaxweight` (#836): the consensus maximum is accepted and is the
+    /// default, one above it is refused with Core's `InitError` whether it
+    /// comes from the command line or the file, and an unparseable file value
+    /// stops the node instead of becoming the default. A value below the
+    /// coinbase reserve is accepted here; the block assembler raises it.
+    #[test]
+    fn blockmaxweight_is_refused_above_the_consensus_maximum_and_when_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build = |body: &str, extra: &[&str]| {
+            let conf = dir.path().join("weight.conf");
+            std::fs::write(&conf, body).unwrap();
+            let mut args = vec![
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+        };
+        let core_refusal = "Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)";
+
+        assert_eq!(build("", &[]).unwrap().blockmaxweight, 4_000_000, "Core's default is the consensus maximum");
+        assert_eq!(build("blockmaxweight=4000000\n", &[]).unwrap().blockmaxweight, 4_000_000);
+        assert_eq!(build("blockmaxweight=100000\n", &[]).unwrap().blockmaxweight, 100_000);
+        assert_eq!(build("blockmaxweight=100\n", &[]).unwrap().blockmaxweight, 100);
+        assert_eq!(build("", &["--blockmaxweight=4000000"]).unwrap().blockmaxweight, 4_000_000);
+        assert_eq!(
+            build("blockmaxweight=4000001\n", &[]).expect_err("above the maximum in the file"),
+            core_refusal
+        );
+        assert_eq!(
+            build("", &["--blockmaxweight=4000001"]).expect_err("above the maximum on the command line"),
+            core_refusal
+        );
+        let err = build("blockmaxweight=abc\n", &[]).expect_err("garbage must not be accepted");
+        assert!(err.contains("blockmaxweight in config file") && err.contains("\"abc\""), "unhelpful error: {err}");
+        let err = build("blockmaxweight=-1\n", &[]).expect_err("a negative weight must not be accepted");
+        assert!(err.contains("blockmaxweight"), "unhelpful error: {err}");
     }
 
     /// A Core-spelled fee rate in a dropped-in `bitcoin.conf` must take effect,
