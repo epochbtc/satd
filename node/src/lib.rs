@@ -13,6 +13,7 @@ pub mod status;
 pub mod mining;
 pub mod net;
 pub mod perf;
+pub mod rebuild_marker;
 pub mod rpc;
 pub mod shutdown;
 pub mod sp_serve;

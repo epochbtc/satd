@@ -68,6 +68,25 @@ pub enum StoreError {
     Serialization(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The chainstate on disk was written at another schema version and
+    /// this binary will not read it. `stored` is `None` for a datadir that
+    /// has coins but no version stamp (a pre-versioning layout).
+    #[error("{}", schema_mismatch_message(*stored, *expected))]
+    SchemaMismatch { stored: Option<u32>, expected: u32 },
+}
+
+/// The refusal an operator sees, worded as it was before the variant was
+/// typed: packaging and the manual quote it.
+fn schema_mismatch_message(stored: Option<u32>, expected: u32) -> String {
+    match stored {
+        Some(v) => format!(
+            "database error: Chainstate schema version mismatch: DB has v{v}, binary expects \
+             v{expected}. Run with --reindex-chainstate to rebuild from existing block files."
+        ),
+        None => "database error: Existing chainstate has no schema version (pre-compact \
+                 format). Run with --reindex-chainstate to rebuild from existing block files."
+            .to_string(),
+    }
 }
 
 /// Atomic batch of writes for a single block connection/disconnection.

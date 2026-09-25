@@ -959,6 +959,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("fastprune", fastprune),
         restart!("reindex", reindex),
         restart!("reindexchainstate", reindex_chainstate),
+        restart!("upgradechainstate", upgradechainstate),
         restart!("checkblockindex", check_block_index),
         restart!("blocksxor", blocksxor),
         restart!("dbcache", dbcache),
