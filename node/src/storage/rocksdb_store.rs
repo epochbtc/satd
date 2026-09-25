@@ -244,8 +244,10 @@ const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height
 // A chainstate stamped at any earlier version is refused: the binary
 // cannot read rows in a layout it no longer knows, and there is no
 // in-place upgrade because the new families have to be built from the
-// blocks. `-reindex-chainstate` rebuilds them in one pass.
-const CURRENT_SCHEMA_VERSION: u32 = 7;
+// blocks. `-reindex-chainstate` rebuilds them in one pass, and
+// `-upgradechainstate` runs that rebuild unprompted for an older stamp.
+/// The chainstate schema version this binary reads and writes.
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Column families this binary no longer creates or reads. Discovered on
 /// open, declared bare so RocksDB will mount the DB at all, and dropped
@@ -855,11 +857,10 @@ impl RocksDbStore {
                         // the new families have to be built from the
                         // blocks, which is exactly what
                         // `-reindex-chainstate` does.
-                        return Err(StoreError::Database(format!(
-                            "Chainstate schema version mismatch: DB has v{}, binary expects v{}. \
-                             Run with --reindex-chainstate to rebuild from existing block files.",
-                            stored, CURRENT_SCHEMA_VERSION
-                        )));
+                        return Err(StoreError::SchemaMismatch {
+                            stored: Some(stored),
+                            expected: CURRENT_SCHEMA_VERSION,
+                        });
                     }
                 }
                 Ok(None) => {
@@ -869,11 +870,10 @@ impl RocksDbStore {
                         .next()
                         .is_some();
                     if has_coins {
-                        return Err(StoreError::Database(
-                            "Existing chainstate has no schema version (pre-compact format). \
-                             Run with --reindex-chainstate to rebuild from existing block files."
-                                .to_string(),
-                        ));
+                        return Err(StoreError::SchemaMismatch {
+                            stored: None,
+                            expected: CURRENT_SCHEMA_VERSION,
+                        });
                     }
                     Self::stamp_schema(&db, CURRENT_SCHEMA_VERSION)?;
                 }
@@ -889,20 +889,20 @@ impl RocksDbStore {
             // write_schema_version below handles the re-stamp after clear).
         }
 
-        // Drop the legacy address-history CFs now that the schema
-        // check has either confirmed the chainstate is at the current
-        // version (so any leftover legacy CFs are empty residue from a
-        // prior optimization-stack migration) or `--reindex` was
-        // requested (chainstate is about to be wiped anyway). Doing
-        // this AFTER the schema check ensures a v2 chainstate with
-        // populated legacy CFs is rejected before we can discard the
-        // rows it still depends on.
-        for legacy in RETIRED_CF_NAMES {
-            if db.cf_handle(legacy).is_some() {
-                db.drop_cf(legacy).map_err(|e| {
-                    StoreError::Database(format!("Failed to drop legacy CF '{}': {}", legacy, e))
-                })?;
-            }
+        // Drop the retired CFs once the schema check has confirmed the
+        // chainstate is at the current version (so any leftover ones are
+        // empty residue from a prior migration). Doing this AFTER the
+        // schema check ensures an older chainstate with populated retired
+        // CFs is rejected before we can discard the rows it still depends
+        // on.
+        //
+        // Opening for a rebuild does NOT drop them: `clear_chainstate` /
+        // `clear_all` do, as the rebuild starts. A rebuild refused between
+        // the open and the clear (the replay feasibility check, a pruned
+        // node under `-upgradechainstate`) must leave a datadir the release
+        // that wrote it can still read -- its `tx_index` included.
+        if !reindex {
+            Self::drop_retired_cfs(&db)?;
         }
 
         let store = Self {
@@ -1449,6 +1449,18 @@ impl RocksDbStore {
     }
 
     /// Write schema version to the metadata CF.
+    /// Drop every column family in [`RETIRED_CF_NAMES`] that exists.
+    fn drop_retired_cfs(db: &DB) -> Result<(), StoreError> {
+        for legacy in RETIRED_CF_NAMES {
+            if db.cf_handle(legacy).is_some() {
+                db.drop_cf(legacy).map_err(|e| {
+                    StoreError::Database(format!("Failed to drop legacy CF '{}': {}", legacy, e))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn stamp_schema(db: &DB, version: u32) -> Result<(), StoreError> {
         let cf_meta = db.cf_handle(CF_METADATA).expect("metadata CF missing");
         let mut wb = WriteBatch::default();
@@ -2788,6 +2800,9 @@ impl Store for RocksDbStore {
         // any in-flight backfill cursor in metadata is also gone, so
         // leaving the temp CF would orphan its data.
         self.drop_backfill_temp_cf()?;
+        // The rebuild starts now, so the previous layout's families go
+        // (see the note where `open_at` skips this for a rebuild).
+        Self::drop_retired_cfs(&self.db)?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
         // Re-stamp outpoint_spend.complete + tx_loc.complete +
@@ -2846,6 +2861,8 @@ impl Store for RocksDbStore {
         // Backfill temp CF: drop without recreate (lazy create on first
         // backfill start). See clear_chainstate.
         self.drop_backfill_temp_cf()?;
+        // See clear_chainstate.
+        Self::drop_retired_cfs(&self.db)?;
         // Re-stamp schema version after metadata CF was recreated
         Self::stamp_schema(&self.db, CURRENT_SCHEMA_VERSION)?;
         // Same completeness markers as `clear_chainstate` —
@@ -6074,15 +6091,31 @@ mod tests {
     /// silently answer "not found" on a chain that has the transaction.
     #[test]
     fn a_prior_schema_datadir_is_refused_with_the_reindex_chainstate_message() {
-        for stored in [2u32, 3] {
+        for stored in 2u32..CURRENT_SCHEMA_VERSION {
             let (path, _dir) = synth_prior_datadir(stored, false);
             let err = RocksDbStore::open(&path, false, 16, false, -1)
                 .err()
                 .unwrap_or_else(|| panic!("open should refuse a v{stored} chainstate"));
-            let msg = match err {
-                StoreError::Database(s) => s,
-                other => panic!("expected Database error, got {:?}", other),
-            };
+            // Typed, so `satd` can tell an upgrade from any other open
+            // failure without matching on text.
+            assert!(
+                matches!(
+                    err,
+                    StoreError::SchemaMismatch { stored: Some(v), expected }
+                        if v == stored && expected == CURRENT_SCHEMA_VERSION
+                ),
+                "expected SchemaMismatch for v{stored}, got {err:?}"
+            );
+            let msg = err.to_string();
+            // The wording is unchanged from before the variant was typed.
+            assert_eq!(
+                msg,
+                format!(
+                    "database error: Chainstate schema version mismatch: DB has v{stored}, \
+                     binary expects v{CURRENT_SCHEMA_VERSION}. Run with --reindex-chainstate \
+                     to rebuild from existing block files."
+                )
+            );
             assert!(
                 msg.contains(&format!("DB has v{stored}")),
                 "error should name the stored version: {msg}"
@@ -6101,16 +6134,90 @@ mod tests {
         }
     }
 
+    /// A datadir with coins and no version stamp is a mismatch with no
+    /// stored version, which `-upgradechainstate` treats as older.
     #[test]
-    fn reindex_open_drops_legacy_cfs_even_with_rows() {
-        // Reindex flow: chainstate is about to be wiped anyway, so
-        // non-empty legacy CFs are not a refusal — they get dropped
-        // as part of opening for the reindex.
-        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
-        let store = RocksDbStore::open(&path, false, 16, true, -1)
-            .expect("reindex open should succeed regardless of schema or legacy CFs");
-        assert!(store.db.cf_handle("addr_funding").is_none());
-        assert!(store.db.cf_handle("addr_spending").is_none());
+    fn an_unversioned_datadir_with_coins_is_a_mismatch_with_no_stored_version() {
+        let (path, _dir) = synth_prior_datadir(0, false);
+        {
+            // Strip the stamp and leave a coin behind.
+            let opts = Options::default();
+            let cfs: Vec<_> = DB::list_cf(&opts, path.join("chainstate"))
+                .unwrap()
+                .into_iter()
+                .map(|n| ColumnFamilyDescriptor::new(n, Options::default()))
+                .collect();
+            let db = DB::open_cf_descriptors(&opts, path.join("chainstate"), cfs).unwrap();
+            db.delete_cf(&db.cf_handle(CF_METADATA).unwrap(), SCHEMA_KEY).unwrap();
+            db.put_cf(&db.cf_handle(CF_COINS).unwrap(), b"coin", b"x").unwrap();
+        }
+        let err = RocksDbStore::open(&path, false, 16, false, -1)
+            .err()
+            .expect("an unversioned chainstate with coins is refused");
+        assert!(
+            matches!(
+                err,
+                StoreError::SchemaMismatch { stored: None, expected: CURRENT_SCHEMA_VERSION }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "database error: Existing chainstate has no schema version (pre-compact format). \
+             Run with --reindex-chainstate to rebuild from existing block files."
+        );
+        assert_eq!(read_schema_version_raw(&path), None, "nothing was stamped");
+    }
+
+    /// A newer stamp (a downgraded binary) is the same typed refusal, with
+    /// the stored version above the expected one.
+    #[test]
+    fn a_newer_schema_datadir_is_a_mismatch_above_the_expected_version() {
+        let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION + 1, false);
+        let err = RocksDbStore::open(&path, false, 16, false, -1)
+            .err()
+            .expect("a newer chainstate is refused");
+        assert!(
+            matches!(err, StoreError::SchemaMismatch { stored: Some(v), .. } if v == CURRENT_SCHEMA_VERSION + 1),
+            "{err:?}"
+        );
+        assert_eq!(read_schema_version_raw(&path), Some(CURRENT_SCHEMA_VERSION + 1));
+    }
+
+    /// Reindex flow: an older chainstate with populated retired CFs opens
+    /// for a rebuild, and the retired CFs go when the rebuild's clear runs
+    /// -- not at the open. A rebuild refused between the two (the replay
+    /// feasibility check, a pruned node under `-upgradechainstate`) must
+    /// leave the datadir as the previous release wrote it, so that release
+    /// can still open it and read those rows.
+    ///
+    /// Perturbation: drop the retired CFs at the open again, unconditionally,
+    /// and the first half fails.
+    #[test]
+    fn a_rebuild_drops_the_retired_cfs_at_the_clear_not_at_the_open() {
+        for clear_all in [false, true] {
+            let (path, _dir) = synth_prior_datadir(CURRENT_SCHEMA_VERSION - 1, true);
+            let store = RocksDbStore::open(&path, false, 16, true, -1)
+                .expect("reindex open should succeed regardless of schema or legacy CFs");
+            assert!(store.db.cf_handle("addr_funding").is_some());
+            drop(store);
+            // Refused after the open: nothing changed on disk.
+            assert_eq!(read_schema_version_raw(&path), Some(CURRENT_SCHEMA_VERSION - 1));
+            let cfs = DB::list_cf(&Options::default(), path.join("chainstate")).unwrap();
+            assert!(cfs.iter().any(|c| c == "addr_funding"), "{cfs:?}");
+            assert!(cfs.iter().any(|c| c == "addr_spending"), "{cfs:?}");
+
+            let store = RocksDbStore::open(&path, false, 16, true, -1).unwrap();
+            if clear_all {
+                store.clear_all().unwrap();
+            } else {
+                store.clear_chainstate().unwrap();
+            }
+            assert!(store.db.cf_handle("addr_funding").is_none());
+            assert!(store.db.cf_handle("addr_spending").is_none());
+            drop(store);
+            assert_eq!(read_schema_version_raw(&path), Some(CURRENT_SCHEMA_VERSION));
+        }
     }
 
     /// `flush_durable` must persist WAL-less (BulkLoad) writes in EVERY

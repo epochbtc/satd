@@ -591,6 +591,23 @@ impl Drop for SnapshotLoadActive<'_> {
     }
 }
 
+/// How far [`ChainState::reindex_chainstate`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    /// The height the replay left the chainstate at.
+    pub tip_height: u32,
+    /// The tip of the chain it set out to rebuild.
+    pub plan_tip_height: u32,
+}
+
+impl ReplayOutcome {
+    /// Whether the replay rebuilt the whole planned chain (`-stopatheight`
+    /// did not cut it short).
+    pub fn is_complete(&self) -> bool {
+        self.tip_height >= self.plan_tip_height
+    }
+}
+
 /// What [`ChainState::accept_block`] did with a block it did not reject.
 ///
 /// The distinction is load-bearing and used to be invisible: `accept_block`
@@ -5027,12 +5044,16 @@ impl ChainState {
     /// `satd` additionally runs the same coverage check *before* clearing, so
     /// a datadir that cannot be rebuilt is rejected with the chainstate still
     /// intact. The check here is defence in depth and covers other callers.
+    ///
+    /// Returns how far the replay got: short of the plan's tip when
+    /// `stop_at` cut it off, which `satd` reads to decide whether the
+    /// rebuild is finished.
     pub fn reindex_chainstate(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
         prev_tip: Option<(BlockHash, u32)>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<ReplayOutcome, ChainError> {
         // Decide which chain to replay before touching anything. Selecting by
         // chainwork over the block index, rather than walking the height→hash
         // index, is what keeps a polluted index from splicing two branches into
@@ -5171,6 +5192,7 @@ impl ChainState {
         // restored on EVERY exit path (including the `?` error paths in the
         // inner replay), so BulkLoad semantics never leak into steady state.
         self.set_write_mode(crate::storage::WriteMode::BulkLoad);
+        let plan_tip_height = plan.tip_height();
         let result = self.reindex_replay(plan, stop_at, progress);
         let flush_result = self.flush_durable();
         self.set_write_mode(crate::storage::WriteMode::Normal);
@@ -5186,7 +5208,10 @@ impl ChainState {
             // vanish on exit — the exact shape of the 952914-rollback bug.
             return result.and(Err(ChainError::Storage(e)));
         }
-        result
+        result.map(|()| ReplayOutcome {
+            tip_height: self.tip_height(),
+            plan_tip_height,
+        })
     }
 
     /// Inner replay loop for [`Self::reindex_chainstate`]. Runs under

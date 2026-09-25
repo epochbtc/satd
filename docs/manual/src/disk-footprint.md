@@ -395,10 +395,21 @@ datadir never grows beyond its current size during the rebuild. It is a
 single pass over the chain; budget roughly what an `-assumevalid` sync of the
 same chain costs on your hardware.
 
+With `upgradechainstate=1` in the configuration, satd runs that rebuild by
+itself on the first start, and restarts it if it is interrupted; the app-store
+packages and the reference stack set it. See "Upgrading the chainstate
+unprompted" in [Initial Block Download & Fast Sync](ibd.md).
+
+A rebuild that is refused before it starts (a pruned node, the replay's
+coverage check) leaves the chainstate as it was: the previous release can
+still open the datadir. Once the rebuild has started there is no way back but another
+rebuild: 0.5.x refuses a schema 7 chainstate as this release refuses theirs.
+
 Two cases need more than that:
 
 - **Pruned nodes.** The replay needs every block, and a pruned node does not
-  have them. Such a node has to resync.
+  have them. Such a node has to resync; `-upgradechainstate` says so and
+  refuses rather than starting a rebuild it cannot finish.
 - **AssumeUTXO nodes.** Unchanged from before: run `backfillindex address`
   once background validation has reached the snapshot base, as the
   snapshot's own coins carry no history behind them.

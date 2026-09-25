@@ -98,6 +98,151 @@ fn index_refuses_incomplete_chain_tx(complete: bool, txindex: bool, addressindex
     !complete && (txindex || addressindex)
 }
 
+/// What to do at startup about the marker an unfinished rebuild left behind
+/// (see `node::rebuild_marker`).
+#[derive(Debug, PartialEq, Eq)]
+enum InterruptedRebuild {
+    /// An explicit `-reindex` / `-reindex-chainstate` starts a new rebuild,
+    /// which clears whatever the old one left.
+    Proceed,
+    /// `-upgradechainstate`: restart the chainstate rebuild from genesis.
+    RestartChainstateRebuild,
+    /// Refuse to start, with this message.
+    Refuse(String),
+}
+
+/// Decide what a start does with an unfinished rebuild's marker. A plain
+/// start refuses: the UTXO set and indexes on disk end wherever the last
+/// durable flush reached, but were stamped complete before the rebuild
+/// began, so nothing else would stop them being served as whole.
+///
+/// A full `-reindex` can only be finished by another one: the block index
+/// itself was being rebuilt, and a chainstate rebuild trusts the block
+/// index. An unreadable marker says a rebuild did not finish without saying
+/// which, so only an explicit flag (the operator's call) gets past it.
+fn interrupted_rebuild_action(
+    found: &node::rebuild_marker::Found,
+    reindex: bool,
+    reindex_chainstate: bool,
+    upgradechainstate: bool,
+    now_unix: u64,
+) -> InterruptedRebuild {
+    use node::rebuild_marker::{Found, RebuildKind};
+    match found {
+        Found::Marker(m) if m.kind == RebuildKind::Full => {
+            if reindex {
+                InterruptedRebuild::Proceed
+            } else {
+                InterruptedRebuild::Refuse(format!(
+                    "Error: a full -reindex started by satd {} {} was interrupted before it \
+                     finished, so the block index and the chainstate are both incomplete. \
+                     Restart with --reindex to rebuild them from the block files. \
+                     -reindex-chainstate and -upgradechainstate cannot finish it: they rebuild \
+                     from the block index.",
+                    m.satd_version,
+                    describe_ago(now_unix.saturating_sub(m.started_unix)),
+                ))
+            }
+        }
+        Found::Marker(m) => {
+            if reindex || reindex_chainstate {
+                InterruptedRebuild::Proceed
+            } else if upgradechainstate {
+                InterruptedRebuild::RestartChainstateRebuild
+            } else {
+                let prev = m
+                    .prev_tip_height
+                    .map(|h| format!(" (the tip was at height {h})"))
+                    .unwrap_or_default();
+                InterruptedRebuild::Refuse(format!(
+                    "Error: a chainstate rebuild started by satd {} {}{prev} did not finish: it \
+                     was interrupted, or -stopatheight stopped it short of the chain's tip. The \
+                     UTXO set and indexes on disk end partway, and satd cannot connect the rest \
+                     by itself, so it will not serve them. Restart with --reindex-chainstate to \
+                     rebuild them, or set upgradechainstate=1 to let satd restart an unfinished \
+                     rebuild by itself.",
+                    m.satd_version,
+                    describe_ago(now_unix.saturating_sub(m.started_unix)),
+                ))
+            }
+        }
+        Found::Unreadable(e) => {
+            if reindex || reindex_chainstate {
+                InterruptedRebuild::Proceed
+            } else {
+                InterruptedRebuild::Refuse(format!(
+                    "Error: the rebuild marker {} exists, so a rebuild did not finish, but it \
+                     cannot be read ({e}). Restart with --reindex-chainstate to rebuild the \
+                     chainstate, or with --reindex if the unfinished rebuild was a full one.",
+                    node::rebuild_marker::MARKER_FILENAME,
+                ))
+            }
+        }
+    }
+}
+
+/// Record that a rebuild is starting, before its wipe. Fails closed: a
+/// rebuild whose marker cannot be written does not start, since an
+/// interruption would then leave nothing to say the result is partial.
+///
+/// The previous tip height is carried over from an earlier unfinished
+/// rebuild's marker when that one saw a higher tip: a restarted rebuild
+/// starts from the partial tip the interrupted one left, and the height the
+/// operator had before any of this is the useful one to report.
+fn write_rebuild_marker(
+    net_datadir: &std::path::Path,
+    kind: node::rebuild_marker::RebuildKind,
+    prev_tip_height: Option<u32>,
+    unfinished: Option<&node::rebuild_marker::Found>,
+    auth: &node::rpc::auth::RpcAuth,
+) {
+    let earlier = match unfinished {
+        Some(node::rebuild_marker::Found::Marker(m)) => m.prev_tip_height,
+        _ => None,
+    };
+    let marker = node::rebuild_marker::RebuildMarker::now(
+        kind,
+        env!("CARGO_PKG_VERSION"),
+        node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION,
+        prev_tip_height.max(earlier),
+    );
+    if let Err(e) = node::rebuild_marker::write(net_datadir, &marker) {
+        eprintln!(
+            "Error: cannot write the rebuild marker {} ({e}); not starting the rebuild. \
+             Nothing has been cleared.",
+            node::rebuild_marker::path(net_datadir).display()
+        );
+        auth.cleanup();
+        std::process::exit(1);
+    }
+}
+
+/// The rebuild finished: remove its marker. Fails closed, like the write:
+/// a marker left behind would make the next start refuse a good datadir, so
+/// say so now rather than then.
+fn remove_rebuild_marker(net_datadir: &std::path::Path, auth: &node::rpc::auth::RpcAuth) {
+    if let Err(e) = node::rebuild_marker::remove(net_datadir) {
+        eprintln!(
+            "Error: the rebuild finished, but its marker {} cannot be removed ({e}). Remove \
+             it by hand, then start satd again.",
+            node::rebuild_marker::path(net_datadir).display()
+        );
+        auth.cleanup();
+        std::process::exit(1);
+    }
+}
+
+/// "3 hours ago", for a message about something that started `secs` ago.
+fn describe_ago(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..=119 => return "moments ago".to_string(),
+        120..=7_199 => (secs / 60, "minutes"),
+        7_200..=172_799 => (secs / 3_600, "hours"),
+        _ => (secs / 86_400, "days"),
+    };
+    format!("{n} {unit} ago")
+}
+
 fn report_ancestry_damage(
     audit: &node::chain::tip_ancestry::TipAncestryAudit,
     prune_mb: u64,
@@ -413,20 +558,115 @@ async fn main() {
     let rocksdb_cache_mb = config.dbcache / 3;
     let coincache_mb = config.dbcache - rocksdb_cache_mb;
 
-    let reindex = config.reindex || config.reindex_chainstate;
+    // The effective `-reindex-chainstate`. `-upgradechainstate` can turn it
+    // on below, so everything from here on reads this, never
+    // `config.reindex_chainstate`.
+    let mut reindex_chainstate = config.reindex_chainstate;
+    let explicit_rebuild = config.reindex || config.reindex_chainstate;
+
+    // A rebuild that did not finish. Its wipe stamped the schema and marked
+    // every index complete before the replay connected a block, so without
+    // this check the truncated state would start as if it were whole.
+    let unfinished_rebuild = node::rebuild_marker::read(&net_datadir);
+    match &unfinished_rebuild {
+        None => {}
+        Some(_) if !net_datadir.join("chainstate").is_dir() => {
+            // The chainstate it described is gone (removed to resync), so
+            // there is nothing partial left to protect.
+            if let Err(e) = node::rebuild_marker::remove(&net_datadir) {
+                eprintln!("Error removing a stale rebuild marker: {e}");
+                std::process::exit(1);
+            }
+            tracing::info!(
+                "Removed a rebuild marker left by a chainstate that no longer exists"
+            );
+        }
+        Some(found) => match interrupted_rebuild_action(
+            found,
+            config.reindex,
+            config.reindex_chainstate,
+            config.upgradechainstate,
+            node::time::now_secs(),
+        ) {
+            InterruptedRebuild::Proceed => {}
+            InterruptedRebuild::RestartChainstateRebuild => {
+                tracing::warn!(
+                    "A chainstate rebuild was interrupted before it finished; restarting it \
+                     from genesis (upgradechainstate=1). Nothing is downloaded."
+                );
+                reindex_chainstate = true;
+            }
+            InterruptedRebuild::Refuse(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        },
+    }
+
     let storage_tuning = node::storage::profile::StorageTuning::for_profile(config.storage_profile)
         .with_background_jobs(config.rocksdb_background_jobs)
         .with_subcompactions(config.rocksdb_subcompactions)
         .with_wal_mb(config.rocksdb_wal_mb);
-    let raw_store = match RocksDbStore::open_with_tuning(
-        &net_datadir,
-        config.txindex,
-        rocksdb_cache_mb,
-        reindex,
-        config.max_open_files,
-        storage_tuning,
-    ) {
+    let open_store = |reindex: bool| {
+        RocksDbStore::open_with_tuning(
+            &net_datadir,
+            config.txindex,
+            rocksdb_cache_mb,
+            reindex,
+            config.max_open_files,
+            storage_tuning,
+        )
+    };
+    let raw_store = match open_store(config.reindex || reindex_chainstate) {
         Ok(s) => s,
+        // `-upgradechainstate`: an older schema is rebuilt, unprompted, by
+        // the `-reindex-chainstate` path below. Only when older: a newer
+        // stamp is a downgrade, which is never automatic. And not when the
+        // operator already asked for a rebuild (that open skipped the check).
+        Err(node::storage::StoreError::SchemaMismatch { stored, expected })
+            if config.upgradechainstate
+                && !explicit_rebuild
+                && stored.is_none_or(|v| v < expected) =>
+        {
+            let stored_desc = stored.map_or("an unversioned".to_string(), |v| format!("v{v}"));
+            // The replay needs every block, and a pruned node has deleted
+            // some. The refusing open above changed nothing on disk, so the
+            // datadir stays as the release that wrote it left it.
+            if config.prune > 0 || config.prune_manual {
+                eprintln!(
+                    "Error: this datadir's chainstate is {stored_desc} schema and this satd \
+                     needs v{expected}, but the node is pruned (-prune), so the UTXO set \
+                     cannot be rebuilt from its block files. A pruned node must resync: stop \
+                     satd, remove {} and {}, and start again. The chainstate was not changed.",
+                    net_datadir.join("chainstate").display(),
+                    config.blocks_dir().display(),
+                );
+                std::process::exit(1);
+            }
+            tracing::warn!(
+                "Chainstate is {stored_desc} schema, older than this satd's v{expected}; \
+                 rebuilding the UTXO set from the block files (upgradechainstate=1). Nothing \
+                 is downloaded. This takes about as long as an assumevalid sync of this chain."
+            );
+            reindex_chainstate = true;
+            match open_store(true) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error opening chain database: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e @ node::storage::StoreError::SchemaMismatch { stored: Some(v), expected })
+            if config.upgradechainstate && v > expected =>
+        {
+            eprintln!(
+                "Error opening chain database: {e}\nThis datadir was written by a newer satd. \
+                 -upgradechainstate never downgrades a chainstate; run with \
+                 --reindex-chainstate to rebuild it at this version."
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
             std::process::exit(1);
@@ -600,12 +840,22 @@ async fn main() {
     if config.reindex {
         startup_progress.set_phase("clearing_db", "Clearing chain database for reindex...");
         tracing::info!("Reindexing: clearing database, will rebuild from block files");
+        let prev_height = store
+            .get_tip()
+            .and_then(|h| store.get_block_index(&h).map(|e| e.height));
+        write_rebuild_marker(
+            &net_datadir,
+            node::rebuild_marker::RebuildKind::Full,
+            prev_height,
+            unfinished_rebuild.as_ref(),
+            &auth,
+        );
         if let Err(e) = store.clear_all() {
             eprintln!("Error clearing database for reindex: {}", e);
             auth.cleanup();
             std::process::exit(1);
         }
-    } else if config.reindex_chainstate {
+    } else if reindex_chainstate {
         // Handle -reindex-chainstate: clear UTXO/undo, keep block index.
         //
         // Capture the tip BEFORE clearing: it lives in the metadata column
@@ -666,6 +916,13 @@ async fn main() {
         tracing::info!(
             prev_height = ?prev_chainstate_tip.map(|(_, h)| h),
             "Reindexing chainstate: clearing UTXO set, will rebuild from block files"
+        );
+        write_rebuild_marker(
+            &net_datadir,
+            node::rebuild_marker::RebuildKind::Chainstate,
+            prev_chainstate_tip.map(|(_, h)| h),
+            unfinished_rebuild.as_ref(),
+            &auth,
         );
         if let Err(e) = store.clear_chainstate() {
             eprintln!("Error clearing chainstate for reindex: {}", e);
@@ -1174,6 +1431,10 @@ async fn main() {
             auth.cleanup();
             std::process::exit(1);
         }
+        // Finished, even when `-stopatheight` cut the connect short: the
+        // block index then ends where the chainstate does, which is an
+        // ordinary node P2P can extend.
+        remove_rebuild_marker(&net_datadir, &auth);
         // Mirror PR #185's IBD behavior: when `-stopatheight` is set
         // and reindex halts at the target, exit cleanly. The operator's
         // intent is "bring the chainstate to height H and stop"; if we
@@ -1189,16 +1450,32 @@ async fn main() {
             auth.cleanup();
             return;
         }
-    } else if config.reindex_chainstate {
+    } else if reindex_chainstate {
         startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
-        if let Err(e) = chain_state.reindex_chainstate(
+        let outcome = match chain_state.reindex_chainstate(
             config.stopatheight,
             Some(startup_progress.clone()),
             prev_chainstate_tip,
         ) {
-            eprintln!("Error during chainstate reindex: {}", e);
-            auth.cleanup();
-            std::process::exit(1);
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("Error during chainstate reindex: {}", e);
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
+        // Only a replay that reached the chain's tip is finished. One that
+        // `-stopatheight` cut short is the truncated state the marker exists
+        // to catch: the blocks above it read as connected in the block index,
+        // so nothing would ever connect them.
+        if outcome.is_complete() {
+            remove_rebuild_marker(&net_datadir, &auth);
+        } else {
+            tracing::info!(
+                tip_height = outcome.tip_height,
+                chain_tip_height = outcome.plan_tip_height,
+                "Chainstate rebuild stopped short of the chain's tip; it is not finished"
+            );
         }
         if config.stopatheight.is_some() {
             tracing::info!(
@@ -1214,7 +1491,7 @@ async fn main() {
     // touches the in-memory best-header pointer (seeded at genesis when the
     // index started empty). Re-seed it from the rebuilt tip before the audit
     // below, so the pointer is never left behind the active chain.
-    if config.reindex || config.reindex_chainstate {
+    if config.reindex || reindex_chainstate {
         chain_state.refresh_best_header_to_tip();
 
         // Re-run the ancestry audit on what the replay actually rebuilt, for
@@ -4846,5 +5123,83 @@ mod startup_tests {
         assert!(index_refuses_incomplete_chain_tx(false, true, false));
         assert!(index_refuses_incomplete_chain_tx(false, false, true));
         assert!(index_refuses_incomplete_chain_tx(false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod interrupted_rebuild_tests {
+    use super::{describe_ago, interrupted_rebuild_action, InterruptedRebuild};
+    use node::rebuild_marker::{Found, RebuildKind, RebuildMarker};
+
+    const NOW: u64 = 1_790_000_000;
+
+    fn marker(kind: RebuildKind) -> Found {
+        Found::Marker(RebuildMarker {
+            kind,
+            started_unix: NOW - 3 * 3_600,
+            satd_version: "0.6.0".into(),
+            schema: 7,
+            prev_tip_height: Some(967_870),
+        })
+    }
+
+    fn act(found: &Found, reindex: bool, chainstate: bool, upgrade: bool) -> InterruptedRebuild {
+        interrupted_rebuild_action(found, reindex, chainstate, upgrade, NOW)
+    }
+
+    /// The matrix in the manual's "Reindexing" section, row by row.
+    #[test]
+    fn an_interrupted_chainstate_rebuild_refuses_a_plain_start_only() {
+        let m = marker(RebuildKind::Chainstate);
+        match act(&m, false, false, false) {
+            InterruptedRebuild::Refuse(msg) => {
+                assert!(msg.contains("did not finish"), "{msg}");
+                assert!(msg.contains("--reindex-chainstate"), "{msg}");
+                assert!(msg.contains("upgradechainstate=1"), "{msg}");
+                assert!(msg.contains("satd 0.6.0 3 hours ago"), "{msg}");
+                assert!(msg.contains("height 967870"), "{msg}");
+            }
+            other => panic!("a plain start must refuse, got {other:?}"),
+        }
+        assert_eq!(act(&m, false, false, true), InterruptedRebuild::RestartChainstateRebuild);
+        assert_eq!(act(&m, false, true, false), InterruptedRebuild::Proceed);
+        assert_eq!(act(&m, false, true, true), InterruptedRebuild::Proceed);
+        assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
+    }
+
+    #[test]
+    fn an_interrupted_full_reindex_needs_reindex() {
+        let m = marker(RebuildKind::Full);
+        for (chainstate, upgrade) in [(false, false), (true, false), (false, true), (true, true)] {
+            match act(&m, false, chainstate, upgrade) {
+                InterruptedRebuild::Refuse(msg) => {
+                    assert!(msg.contains("Restart with --reindex to"), "{msg}")
+                }
+                other => panic!(
+                    "only --reindex may pass (chainstate={chainstate} upgrade={upgrade}), got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
+        assert_eq!(act(&m, true, false, true), InterruptedRebuild::Proceed);
+    }
+
+    /// An unreadable marker does not say which rebuild it was, so the flag
+    /// that restarts rebuilds unprompted must not guess.
+    #[test]
+    fn an_unreadable_marker_needs_an_explicit_flag() {
+        let m = Found::Unreadable("expected value".into());
+        assert!(matches!(act(&m, false, false, false), InterruptedRebuild::Refuse(_)));
+        assert!(matches!(act(&m, false, false, true), InterruptedRebuild::Refuse(_)));
+        assert_eq!(act(&m, false, true, false), InterruptedRebuild::Proceed);
+        assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
+    }
+
+    #[test]
+    fn describe_ago_rounds_to_a_readable_unit() {
+        assert_eq!(describe_ago(5), "moments ago");
+        assert_eq!(describe_ago(600), "10 minutes ago");
+        assert_eq!(describe_ago(3 * 3_600 + 59), "3 hours ago");
+        assert_eq!(describe_ago(5 * 86_400), "5 days ago");
     }
 }

@@ -614,26 +614,28 @@ impl TestNode {
             cmd.env(k, v);
         }
 
-        // Opt-in stderr capture: `SATD_TEST_STDERR_DIR` directs logs to a
-        // stable path for debugging. Default null matches prior behavior;
-        // see `start` for the I/O-cost rationale on CI.
-        let env_dir = std::env::var("SATD_TEST_STDERR_DIR").ok();
-        let (stderr_target, stderr_log) = match env_dir {
-            Some(dir) => {
-                let _ = std::fs::create_dir_all(&dir);
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let path = std::path::PathBuf::from(&dir)
-                    .join(format!("satd-{}-{}.stderr.log", rpcport, stamp));
-                let f = std::fs::File::create(&path).expect("create stderr log");
-                (std::process::Stdio::from(f), path)
-            }
-            None => (std::process::Stdio::null(), PathBuf::new()),
+        // Capture the log, as `start_inner` does: satd logs to stdout, so
+        // stdout and stderr share one file, in the datadir unless
+        // `SATD_TEST_STDERR_DIR` names a stable place for debugging. One file
+        // per start, so a restart test can tell which run logged a line.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let log_dir = std::env::var("SATD_TEST_STDERR_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| datadir.to_path_buf());
+        let _ = std::fs::create_dir_all(&log_dir);
+        let stderr_log = log_dir.join(format!("satd-{}-{}.stderr.log", rpcport, stamp));
+        let (stdout_target, stderr_target) = match std::fs::File::create(&stderr_log) {
+            Ok(f) => match f.try_clone() {
+                Ok(out) => (std::process::Stdio::from(out), std::process::Stdio::from(f)),
+                Err(_) => (std::process::Stdio::null(), std::process::Stdio::from(f)),
+            },
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
         };
         let mut process = cmd
-            .stdout(std::process::Stdio::null())
+            .stdout(stdout_target)
             .stderr(stderr_target)
             .spawn()
             .expect("Failed to start satd");
@@ -1958,4 +1960,84 @@ pub fn get_rpc_str(node: &TestNode, method: &str) -> Option<String> {
     node.rpc_call(method)
         .ok()
         .and_then(|r| r["result"].as_str().map(|s| s.to_string()))
+}
+
+/// Overwrite the chainstate schema stamp in a stopped regtest node's datadir,
+/// so a test can present a datadir as one another release wrote. The rows
+/// stay in the current layout; only the stamp moves, which is all the open
+/// path reads before deciding to refuse or rebuild.
+pub fn stamp_chainstate_schema(datadir: &std::path::Path, version: u32) {
+    use rocksdb::{Options, DB};
+
+    let path = datadir.join("regtest").join("chainstate");
+    let opts = Options::default();
+    let cfs = DB::list_cf(&opts, &path)
+        .unwrap_or_else(|e| panic!("list column families at {}: {e}", path.display()));
+    let db = DB::open_cf(&opts, &path, &cfs).expect("open chainstate");
+    let meta = db.cf_handle("metadata").expect("metadata column family");
+    db.put_cf(&meta, b"schema_version", version.to_le_bytes())
+        .expect("write schema stamp");
+    db.flush_cf(&meta).expect("flush metadata");
+}
+
+/// Read the chainstate schema stamp of a stopped regtest node's datadir.
+pub fn read_chainstate_schema(datadir: &std::path::Path) -> Option<u32> {
+    use rocksdb::{Options, DB};
+
+    let path = datadir.join("regtest").join("chainstate");
+    let opts = Options::default();
+    let cfs = DB::list_cf(&opts, &path).ok()?;
+    let db = DB::open_cf_for_read_only(&opts, &path, &cfs, false).ok()?;
+    let meta = db.cf_handle("metadata")?;
+    let raw = db.get_cf(&meta, b"schema_version").ok()??;
+    Some(u32::from_le_bytes(raw[..].try_into().ok()?))
+}
+
+/// Run satd against `datadir` until it exits on its own, and return its exit
+/// status and stderr. For startup refusals, which exit before RPC is up.
+pub fn run_satd_until_exit(
+    datadir: &std::path::Path,
+    extra_args: &[&str],
+    timeout: std::time::Duration,
+) -> (std::process::ExitStatus, String) {
+    let satd_bin = env!("CARGO_BIN_EXE_satd");
+    let stderr_path = datadir.join(format!(
+        "satd-exit-{}.stderr",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
+    let mut child = Command::new(satd_bin)
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .args(extra_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn satd");
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "satd did not exit within {timeout:?}: {}",
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                );
+            }
+            Err(e) => panic!("waiting for satd: {e}"),
+        }
+    };
+    let text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stderr_path);
+    (status, text)
 }

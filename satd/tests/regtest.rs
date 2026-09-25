@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 mod common;
 use common::{
     DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir,
-    get_rpc_str, get_rpc_u64, poll_until, test_timeout, write_authfile,
+    get_rpc_str, get_rpc_u64, poll_until, read_chainstate_schema, run_satd_until_exit,
+    stamp_chainstate_schema, test_timeout, write_authfile,
 };
 
 /// #550: test datadirs used to be named after the RPC port, which is redrawn
@@ -5510,21 +5511,300 @@ fn test_reindex_chainstate_stopatheight_exits() {
         "satd should exit cleanly after reindex hits stopatheight; got {exit_status:?}"
     );
 
-    // Phase 3: restart normally (regtest has no seed peers, so IBD
-    // won't advance past the stopped tip on its own). Chainstate
-    // should be at height 5, with the block index still carrying
-    // entries 6..10 (reindex only stopped replay; it didn't drop
-    // block-index rows).
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
-    let height = node.rpc_call("getblockcount").unwrap()["result"]
-        .as_u64()
-        .unwrap();
-    assert_eq!(
-        height, 5,
-        "after stopped reindex, chainstate tip must be at the stop target"
+    // Phase 3: the replay stopped short of the chain's tip, so the rebuild
+    // is not finished and its marker stays. This used to restart normally at
+    // height 5 with the tx and address indexes stamped complete, and could
+    // never advance: blocks 6..10 read as connected in the block index, so
+    // no connect path would take them (#839). A plain start now refuses.
+    assert!(
+        datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        "a replay cut short by -stopatheight leaves the rebuild marker"
     );
+    let (status, stderr) = run_satd_until_exit(&datadir, &[], test_timeout(60));
+    assert!(!status.success(), "a plain start must refuse: {stderr}");
+    assert!(stderr.contains("did not finish"), "{stderr}");
+    assert!(stderr.contains("--reindex-chainstate"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A stopped, indexed regtest datadir at height 10, and what
+/// `gettxoutsetinfo` reported for it before the stop. Built with the
+/// transaction and address indexes so a rebuild covers the ordinal families.
+fn stopped_indexed_datadir(tag: &str) -> (std::path::PathBuf, u16, serde_json::Value) {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir(tag);
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1", "--addressindex=1"]);
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![
+            serde_json::json!(10),
+            serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
+        ],
+    )
+    .unwrap();
+    let utxos = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    node.stop();
+    // Hand the datadir to the caller: dropping a `TestNode` removes it.
+    node.datadir = std::path::PathBuf::new();
+    (datadir, rpcport, utxos)
+}
+
+/// The parts of `gettxoutsetinfo` that describe the UTXO set itself.
+fn utxo_summary(v: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!([v["height"], v["bestblock"], v["txouts"], v["total_amount"]])
+}
+
+/// The same datadir after `-reindex-chainstate -stopatheight=5`: a rebuild
+/// that did not finish, as an interruption would leave it.
+fn datadir_with_an_unfinished_chainstate_rebuild(
+    tag: &str,
+) -> (std::path::PathBuf, u16, serde_json::Value) {
+    let (datadir, rpcport, utxos) = stopped_indexed_datadir(tag);
+    let (status, stderr) = run_satd_until_exit(
+        &datadir,
+        &["--txindex=1", "--addressindex=1", "--reindex-chainstate", "--stopatheight=5"],
+        test_timeout(60),
+    );
+    assert!(status.success(), "the stopped rebuild exits cleanly: {stderr}");
+    assert!(datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    (datadir, rpcport, utxos)
+}
+
+/// The log line a rebuild writes as it starts clearing the chainstate.
+const CHAINSTATE_REBUILD_LOG: &str = "Reindexing chainstate: clearing UTXO set";
+
+/// The app-store path: a datadir an older release wrote (stamped one schema
+/// back) is rebuilt by `-upgradechainstate` without being asked, comes back
+/// with the same UTXO set and working indexes, and the flag is a no-op on
+/// every start after that.
+///
+/// Perturbations: drop the reopen in main's upgrade arm and the flagged start
+/// refuses; drop `remove_rebuild_marker` after the replay and the plain start
+/// at the end refuses.
+#[test]
+fn upgradechainstate_rebuilds_an_older_schema_datadir_and_is_then_a_no_op() {
+    let (datadir, rpcport, before) = stopped_indexed_datadir("satd-upgradecs");
+    let prior = node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION - 1;
+    stamp_chainstate_schema(&datadir, prior);
+    let marker = datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME);
+    let flags = ["--txindex=1", "--addressindex=1", "--upgradechainstate=1"];
+
+    // Without the flag: the refusal an operator has always seen, and nothing
+    // on disk changes.
+    let (status, stderr) =
+        run_satd_until_exit(&datadir, &["--txindex=1", "--addressindex=1"], test_timeout(60));
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains(&format!("DB has v{prior}")), "{stderr}");
+    assert_eq!(read_chainstate_schema(&datadir), Some(prior));
+
+    // With it: rebuilt, unprompted, from the block files.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &flags);
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert!(log.contains("rebuilding the UTXO set from the block files"), "{log}");
+    assert!(log.contains(CHAINSTATE_REBUILD_LOG), "{log}");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    // The transaction index was rebuilt with it.
+    let hash5 = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(5)]).unwrap()
+        ["result"]
+        .clone();
+    let block5 =
+        node.rpc_call_with_params("getblock", vec![hash5, serde_json::json!(1)]).unwrap();
+    let coinbase5 = block5["result"]["tx"][0].clone();
+    let raw = node.rpc_call_with_params("getrawtransaction", vec![coinbase5]).unwrap();
+    assert!(raw["result"].is_string(), "txindex must answer after the rebuild: {raw}");
+    assert!(!marker.exists(), "a finished rebuild removes its marker");
+    node.stop();
+    assert_eq!(
+        read_chainstate_schema(&datadir),
+        Some(node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION)
+    );
+
+    // Again with the flag: current schema, no marker, nothing to do.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &flags);
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert!(!log.contains(CHAINSTATE_REBUILD_LOG), "the flag must be a no-op now: {log}");
+    let again = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&again), utxo_summary(&before));
     node.stop();
 
+    // And without it: an ordinary start.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1"]);
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    node.stop();
+
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// `-upgradechainstate` restarts a rebuild that did not finish, from genesis.
+///
+/// Perturbation: drop the marker write before `clear_chainstate` and the
+/// fixture's marker assertion fails; route `RestartChainstateRebuild` to
+/// `Proceed` and the node starts at height 5.
+#[test]
+fn upgradechainstate_restarts_an_interrupted_chainstate_rebuild() {
+    let (datadir, rpcport, before) =
+        datadir_with_an_unfinished_chainstate_rebuild("satd-upgradecs-restart");
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--txindex=1", "--addressindex=1", "--upgradechainstate=1"],
+    );
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert!(log.contains("restarting it from genesis"), "{log}");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// The explicit flag still finishes what an earlier run left: the marker
+/// never blocks `-reindex-chainstate` itself.
+#[test]
+fn reindex_chainstate_itself_restarts_an_interrupted_rebuild() {
+    let (datadir, rpcport, before) =
+        datadir_with_an_unfinished_chainstate_rebuild("satd-reindexcs-restart");
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--txindex=1", "--addressindex=1", "--reindex-chainstate"],
+    );
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A pruned node cannot rebuild its UTXO set from block files it deleted.
+/// `-upgradechainstate` says so and changes nothing, rather than starting a
+/// rebuild the replay's feasibility check would then refuse.
+///
+/// Perturbation: drop the pruned branch and the refusal is the feasibility
+/// check's instead, without "resync".
+#[test]
+fn upgradechainstate_refuses_to_rebuild_a_pruned_datadir() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-upgradecs-pruned");
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--prune=550"]);
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![
+            serde_json::json!(10),
+            serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
+        ],
+    )
+    .unwrap();
+    node.stop();
+    let prior = node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION - 1;
+    stamp_chainstate_schema(&datadir, prior);
+
+    let (status, stderr) = run_satd_until_exit(
+        &datadir,
+        &["--prune=550", "--upgradechainstate=1"],
+        test_timeout(60),
+    );
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("pruned"), "{stderr}");
+    assert!(stderr.contains("must resync"), "{stderr}");
+    assert!(stderr.contains("The chainstate was not changed"), "{stderr}");
+    assert_eq!(read_chainstate_schema(&datadir), Some(prior));
+    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A chainstate a newer satd wrote is refused with the flag on too: the flag
+/// upgrades, it never downgrades.
+///
+/// Perturbation: drop the `v < expected` guard and the flagged start rebuilds
+/// the datadir at this binary's version.
+#[test]
+fn upgradechainstate_never_downgrades() {
+    let (datadir, _rpcport, _) = stopped_indexed_datadir("satd-upgradecs-newer");
+    let newer = node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION + 1;
+    stamp_chainstate_schema(&datadir, newer);
+    let (status, stderr) = run_satd_until_exit(
+        &datadir,
+        &["--txindex=1", "--addressindex=1", "--upgradechainstate=1"],
+        test_timeout(60),
+    );
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains(&format!("DB has v{newer}")), "{stderr}");
+    assert!(stderr.contains("never downgrades"), "{stderr}");
+    assert_eq!(read_chainstate_schema(&datadir), Some(newer));
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A full `-reindex` that did not finish rebuilt the block index only
+/// partway, so only another `-reindex` can finish it; a chainstate rebuild
+/// trusts the block index. (`-reindex -stopatheight` is a finished reindex,
+/// so the marker is written by hand, as an interruption leaves it.)
+#[test]
+fn an_interrupted_full_reindex_is_refused_until_reindex_is_given() {
+    let (datadir, rpcport, before) = stopped_indexed_datadir("satd-reindex-interrupted");
+    let net = datadir.join("regtest");
+    node::rebuild_marker::write(
+        &net,
+        &node::rebuild_marker::RebuildMarker::now(
+            node::rebuild_marker::RebuildKind::Full,
+            "0.6.0",
+            node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION,
+            Some(10),
+        ),
+    )
+    .unwrap();
+
+    for flags in [
+        &["--txindex=1"][..],
+        &["--txindex=1", "--reindex-chainstate"],
+        &["--txindex=1", "--upgradechainstate=1"],
+    ] {
+        let (status, stderr) = run_satd_until_exit(&datadir, flags, test_timeout(60));
+        assert!(!status.success(), "{flags:?}: {stderr}");
+        assert!(stderr.contains("Restart with --reindex to"), "{flags:?}: {stderr}");
+    }
+
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--txindex=1", "--addressindex=1", "--reindex"],
+    );
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    assert!(!net.join(node::rebuild_marker::MARKER_FILENAME).exists());
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A marker whose chainstate is gone (removed to resync) protects nothing;
+/// the start removes it and proceeds as a fresh node.
+#[test]
+fn a_rebuild_marker_without_a_chainstate_is_removed() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-rebuild-marker-stale");
+    let net = datadir.join("regtest");
+    std::fs::create_dir_all(&net).unwrap();
+    node::rebuild_marker::write(
+        &net,
+        &node::rebuild_marker::RebuildMarker::now(
+            node::rebuild_marker::RebuildKind::Chainstate,
+            "0.6.0",
+            node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION,
+            Some(10),
+        ),
+    )
+    .unwrap();
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 0);
+    assert!(!net.join(node::rebuild_marker::MARKER_FILENAME).exists());
+    node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 

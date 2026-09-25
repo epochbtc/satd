@@ -919,6 +919,11 @@ pub struct Config {
     pub prune_manual: bool,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    /// satd's `-upgradechainstate`: rebuild the chainstate from the block
+    /// files, unprompted, when its schema is older than this binary's or a
+    /// previous rebuild did not finish; otherwise nothing. Never downgrades,
+    /// and refuses a pruned node. See `node::rebuild_marker`.
+    pub upgradechainstate: bool,
     /// Core's `-fastprune`: a 64 KiB block-file size, so pruning a short
     /// test chain actually deletes something.
     pub fastprune: bool,
@@ -4035,6 +4040,14 @@ impl Config {
             prune_manual,
             reindex: cli.reindex.unwrap_or(false),
             reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
+            // Read from the config file as well as the command line: the
+            // app-store packages turn it on in the `bitcoin.conf` they
+            // generate, and a key that is accepted and ignored there would
+            // be the silent failure `reindex=1` is (#840).
+            upgradechainstate: cli
+                .upgradechainstate
+                .or_else(|| file_get("upgradechainstate").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
             // Three-state on purpose: unset ≠ 0. Unset honors an existing
             // xor.dat (the Core v28+ blocks-dir reuse path needs no config);
             // an explicit 0 is Core's "demand plaintext" and hard-fails on
@@ -5824,6 +5837,19 @@ pub struct CliArgs {
     )]
     pub reindex_chainstate: Option<bool>,
 
+    #[arg(
+        long = "upgradechainstate",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Rebuild the UTXO set from the block files automatically when this satd's \
+                chainstate schema is newer than the datadir's, or when a previous rebuild was \
+                interrupted. A no-op otherwise. Never downgrades; a pruned node is refused \
+                instead"
+    )]
+    pub upgradechainstate: Option<bool>,
+
     /// Bitcoin Core's `-blocksxor` (v28+). Unset: honor an existing
     /// `blocks/xor.dat` key and keep fresh dirs plaintext.
     #[arg(
@@ -7389,6 +7415,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "reindex-chainstate",
     "checkblockindex",
     "fastprune",
+    "upgradechainstate",
     "mcp",
     "mcpmtls",
     "mcpauth",
@@ -7551,6 +7578,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex-chainstate",
         "checkblockindex",
         "fastprune",
+        "upgradechainstate",
         "maxconnections",
         "maxinboundperip",
         "blockreconstructionextratxn",
@@ -8322,6 +8350,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "reindexchainstate",
     "checkblockindex",
     "fastprune",
+    "upgradechainstate",
     "blocksxor",
     "dbcache",
     "storageprofile",
@@ -10773,6 +10802,7 @@ testactivationheight=bip34@2
             blocksxor: None,
             checkblockindex: None,
             fastprune: None,
+            upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,
@@ -11087,6 +11117,7 @@ testactivationheight=bip34@2
             blocksxor: None,
             checkblockindex: None,
             fastprune: None,
+            upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,

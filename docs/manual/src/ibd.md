@@ -218,6 +218,52 @@ A reindex on a synced mainnet node runs for hours. The shipped `systemd` unit
 handles this without tripping the start timeout; see "Reindex resilience" in
 [Packaging](packaging.md).
 
+### A rebuild that does not finish
+
+Both rebuilds start by wiping what they rebuild, and the wipe marks the
+chainstate current and every index complete before the first block is
+replayed. A rebuild cut short, by a kill, a power cut, a container stop, or
+`-stopatheight` below the chain's tip, therefore leaves a UTXO set and indexes
+that end partway while reading as finished; and satd cannot connect the rest
+by itself, because the block index already records those blocks as connected.
+
+So satd writes a marker, `.chainstate_rebuild` in the network datadir, before
+the wipe, and removes it only once the rebuild has reached the chain's tip. A
+start that finds it refuses, naming the flag that finishes the job:
+
+| Unfinished rebuild | Plain start | `-upgradechainstate=1` | `-reindex-chainstate` | `-reindex` |
+|---|---|---|---|---|
+| `-reindex-chainstate` (or an upgrade) | refuses | restarts it from genesis | restarts it | runs |
+| `-reindex` | refuses | refuses | refuses | restarts it |
+
+A full `-reindex` that did not finish also left the block index partway, and a
+chainstate rebuild trusts the block index, so only `-reindex` finishes it.
+Nothing resumes where it stopped: each restart replays from genesis. If the
+chainstate directory itself is gone (removed to resync), the marker protects
+nothing and is removed at the next start.
+
+`-reindex-chainstate -stopatheight=H` stops short on purpose and is refused
+all the same on the next plain start: the node could never advance past H.
+
+### Upgrading the chainstate unprompted
+
+`-upgradechainstate=1` runs `-reindex-chainstate` by itself when it is
+needed and does nothing when it is not, so it can stay on for every start:
+
+- the chainstate was written at an older schema (a release that changed the
+  storage format, such as 0.6.0's schema 7): satd logs one warning and
+  rebuilds the UTXO set and every enabled index from the block files, as
+  `-reindex-chainstate` would; nothing is downloaded;
+- a chainstate rebuild did not finish: satd restarts it from genesis.
+
+It never downgrades (a chainstate a newer satd wrote is refused, as without
+the flag), and it refuses a pruned node, which does not have the blocks a
+rebuild needs and must resync. An AssumeUTXO node's background chainstate is
+not covered: finish or discard background validation before upgrading. The
+app-store packages and the reference stack set `upgradechainstate=1` in the
+configuration they generate, which is how an app-store node crosses a schema
+change without a shell.
+
 ### Driving a reorg by hand
 
 `invalidateblock` and `reconsiderblock` work as in Bitcoin Core, and reach the
