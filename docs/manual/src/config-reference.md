@@ -207,7 +207,7 @@ startup error.
 | `timeout` | 5000 ms | hot | core | P2P connection timeout in milliseconds (accepts `5s`/`5000ms`). |
 | `onlynet` | all | restart | core | Restrict to network types: `ipv4`, `ipv6`, `onion`. |
 | `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
-| `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). |
+| `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). Without it satd runs the default signet and verifies every block against its challenge. |
 
 > **Note.** satd answers a peer's BIP35 `mempool` message (a request to
 > announce our entire mempool) only for peers granted the `mempool` net

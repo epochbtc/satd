@@ -18031,6 +18031,48 @@ fn addconnection_is_refused_off_regtest() {
     );
 }
 
+/// A default-signet node verifies block solutions on `submitblock`, as Core
+/// does in `CheckBlock` on every signet (#767). The blocks are the public
+/// default signet's first two, as Core's `feature_signet.py` carries them;
+/// the bad one is block 2 with one signature byte flipped and its merkle root
+/// and nonce redone, so only the solution check can refuse it (see
+/// `the_bad_solution_fixture_differs_from_block_2_only_in_its_signature`).
+///
+/// The real block 2 is submitted last: it proves the refusal was the
+/// solution, not the block's position.
+#[test]
+fn submitblock_on_the_default_signet_checks_the_solution() {
+    const BLOCKS: &str =
+        include_str!("../../node/src/validation/testdata/default_signet_blocks_1_to_10.hex");
+    const BAD_BLOCK_2: &str =
+        include_str!("../../node/src/validation/testdata/default_signet_block_2_bad_solution.hex");
+    let block = |height: usize| BLOCKS.lines().nth(height - 1).unwrap().trim().to_string();
+
+    let node =
+        TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
+    let info = node.rpc_call("getblockchaininfo").unwrap();
+    assert_eq!(info["result"]["chain"], serde_json::json!("signet"), "{info}");
+
+    let submit = |hex: &str| {
+        node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap()["result"]
+            .clone()
+    };
+
+    assert_eq!(submit(&block(1)), serde_json::Value::Null, "real block 1 is accepted");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
+
+    assert_eq!(
+        submit(BAD_BLOCK_2.trim()),
+        serde_json::json!("bad-signet-blksig"),
+        "a bad default-signet solution must be refused for its solution"
+    );
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
+
+    assert_eq!(submit(&block(2)), serde_json::Value::Null, "real block 2 is accepted");
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 2);
+}
+
 /// Bitcoin Core spells "open no outbound connections" as `-connect=0`, and
 /// every functional test starts its node that way. satd parsed the `0` as a
 /// peer address and dialled `0.0.0.0:8333` at startup -- which burned peer id

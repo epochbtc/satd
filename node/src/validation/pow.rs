@@ -114,8 +114,10 @@ where
     let height = prev.height + 1;
 
     match network {
-        // Signet consensus is enforced by block signing, not PoW difficulty.
+        // Signet consensus is enforced by block signing, which satd verifies
+        // on every signet (`check_signet_block_solution`), not PoW difficulty.
         // Accept whatever bits are set (PoW check still validates hash <= target).
+        // Core also checks signet `nBits` against the retarget schedule (#838).
         Network::Signet => return Ok(()),
         // Testnet4 adds the BIP 94 timewarp guard: the first block of each
         // retarget period must not be timestamped more than MAX_TIMEWARP
