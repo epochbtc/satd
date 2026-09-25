@@ -153,9 +153,15 @@ broken while it is working correctly. Use `/healthz`, or the image's own
 `satd-healthcheck`, which probes JSON-RPC liveness by default and is what
 every deployment in `contrib/` uses.
 
+The listener answers from the moment the startup RPC does, including through
+a `-reindex-chainstate` that runs for hours: `/healthz` is 200 and `/readyz`
+503 (`not ready: starting: <what the node is doing>`) throughout, and
+`/metrics` carries the `satd_startup_*` gauges. So `/healthz` says the process
+is up, not that startup has finished.
+
 The shipped `Type=notify` unit (see the systemd section) signals startup
-with `sd_notify(READY=1)`. Supervisors without notify support can poll
-`/healthz`.
+with `sd_notify(READY=1)`. Supervisors without notify support can poll the
+JSON-RPC, which answers `-28` (warming up) until the node is running.
 
 ## Configuration
 
