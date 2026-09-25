@@ -19284,6 +19284,145 @@ fn statuspage_without_metricsport_is_a_startup_error() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// The metrics listener answers while the node is still starting (#841),
+/// from the startup progress: `/healthz` 200, `/readyz` 503, the startup
+/// gauges on `/metrics`, and a status page that says what the node is doing.
+///
+/// To hold the node in startup for as long as the test needs, it is given a
+/// `--fast-start` snapshot that is a FIFO: checking the file's SHA-256 opens
+/// it, which blocks until a writer appears. The test then writes one byte,
+/// the digest mismatches, and satd exits by itself — which also proves the
+/// answers above came from a node that had not yet started.
+#[test]
+fn the_metrics_listener_answers_while_the_node_is_still_starting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("snapshot.fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(made.success(), "mkfifo failed");
+    let datadir = fresh_test_datadir("satd-startup-listener");
+    let log_path = tmp.path().join("satd.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let metrics_port = find_available_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .arg(format!("--metricsport={metrics_port}"))
+        .arg("--statuspage=1")
+        .arg(format!("--fast-start={}", fifo.display()))
+        .arg(format!("--fast-start-sha256={}", "00".repeat(32)))
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("spawn satd");
+
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{metrics_port}");
+    let get = |path: &str| client.get(format!("{base}{path}")).send();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while get("/healthz").map(|r| r.status().as_u16()).ok() != Some(200) {
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            panic!(
+                "the metrics listener never answered during startup: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let r = get("/readyz").unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    let reason = r.text().unwrap();
+    assert!(reason.starts_with("not ready: starting: "), "{reason}");
+
+    let metrics = get("/metrics").unwrap().text().unwrap();
+    assert!(metrics.contains("satd_startup_phase{phase=\""), "{metrics}");
+    assert!(metrics.contains("satd_build_info{"), "{metrics}");
+    assert!(!metrics.contains("satd_tip_height"), "no chain metrics before there is a chain: {metrics}");
+
+    let body: serde_json::Value = get("/status.json").unwrap().json().unwrap();
+    assert!(body.get("snapshot").is_none(), "{body}");
+    assert_eq!(body["startup"]["started"], false, "{body}");
+    assert_eq!(body["view"]["text"]["phase.label"], "starting", "{body}");
+    assert_eq!(body["view"]["show"]["chain"], false, "{body}");
+    let page = get("/status").unwrap().text().unwrap();
+    assert!(page.contains(">starting<"), "the page's top line says starting");
+    assert!(page.contains("<script src=\"status.js\""));
+    assert_eq!(get("/status.js").unwrap().status().as_u16(), 200);
+
+    // Release the node: one byte, a digest that cannot match, and satd
+    // exits by itself.
+    std::fs::write(&fifo, b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("satd did not exit after the snapshot digest mismatched");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let combined = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!status.success(), "{combined}");
+    assert!(combined.contains("--fast-start-sha256 mismatch"), "the node was held in startup: {combined}");
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// After a `-reindex-chainstate`, the metrics listener the startup status
+/// server held is the running node's (#841): the status page carries the
+/// chain, `/readyz` is 200 and the startup gauges are gone. A hand-over that
+/// left the startup server answering, or a listener that could not rebind,
+/// fails here.
+#[test]
+fn the_status_page_is_served_after_a_chainstate_rebuild() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-status-after-rebuild");
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    node.mine_blocks(10, "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202");
+    node.stop();
+
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &[
+            "--reindex-chainstate",
+            &format!("--metricsport={metrics_port}"),
+            "--statuspage=1",
+        ],
+    );
+    let (client, base) = metrics_client(metrics_port);
+    // The full RPC answered before `start_with_datadir` returned, and the
+    // startup server stops before the full RPC starts: every request from
+    // here on reaches the running node's listener.
+    for _ in 0..3 {
+        let body: serde_json::Value =
+            client.get(format!("{base}/status.json")).send().unwrap().json().unwrap();
+        assert!(body.get("startup").is_none(), "the startup server is still answering: {body}");
+        assert_eq!(body["snapshot"]["sync"]["blocks"], 10, "{body}");
+        assert_eq!(body["snapshot"]["ready"], true, "{body}");
+        let label = body["view"]["text"]["phase.label"].as_str().unwrap();
+        assert!(!["starting", "rebuilding chainstate"].contains(&label), "{body}");
+        assert_eq!(body["view"]["show"]["startup"], false, "{body}");
+    }
+    let r = client.get(format!("{base}/readyz")).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let metrics = client.get(format!("{base}/metrics")).send().unwrap().text().unwrap();
+    assert!(metrics.lines().any(|l| l == "satd_tip_height 10"), "{metrics}");
+    assert!(!metrics.contains("satd_startup_phase"), "{metrics}");
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn statusadvertise_rejects_unknown_surface_at_startup() {
     let datadir = fresh_test_datadir("satd-statusadvertise-bad");

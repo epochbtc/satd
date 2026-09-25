@@ -53,19 +53,34 @@ struct JsonBody<'a> {
     poll_ms: u64,
     stale_after_ms: u64,
     view: &'a View,
-    snapshot: &'a StatusSnapshot,
+    /// The running node's snapshot. Absent while the node starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<&'a StatusSnapshot>,
+    /// `getstartupinfo`'s object, while the node starts ([`super::startup`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup: Option<serde_json::Value>,
 }
 
 /// The `/status.json` body. `<`, `>` and `&` are written as `\u` escapes, so
 /// no peer-supplied string can close a tag even if the body were ever
 /// mistaken for HTML.
 pub fn json(snapshot: &StatusSnapshot, view: &View) -> String {
+    encode_json(view, Some(snapshot), None)
+}
+
+/// The envelope both `/status.json` bodies share, escaped as [`json`] says.
+pub(super) fn encode_json(
+    view: &View,
+    snapshot: Option<&StatusSnapshot>,
+    startup: Option<serde_json::Value>,
+) -> String {
     let body = serde_json::to_string(&JsonBody {
         stability: "unstable: internal to the status page; any field may change in any release",
         poll_ms: POLL_MS,
         stale_after_ms: STALE_AFTER_MS,
         view,
         snapshot,
+        startup,
     })
     .unwrap_or_else(|_| "{}".to_string());
     // Outside strings, JSON never contains these characters, so replacing
@@ -75,7 +90,7 @@ pub fn json(snapshot: &StatusSnapshot, view: &View) -> String {
         .replace('&', "\\u0026")
 }
 
-fn thousands(n: u64) -> String {
+pub(super) fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
@@ -96,7 +111,7 @@ pub fn duration(secs: u64) -> String {
     }
 }
 
-fn bytes(n: usize) -> String {
+pub(super) fn bytes(n: usize) -> String {
     let n = n as f64;
     if n < 1e3 {
         format!("{n} B")
@@ -109,7 +124,7 @@ fn bytes(n: usize) -> String {
     }
 }
 
-fn percent(f: f64) -> String {
+pub(super) fn percent(f: f64) -> String {
     format!("{:.1}%", (f * 100.0).clamp(0.0, 100.0))
 }
 
@@ -293,6 +308,12 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
     v.show.insert("warnings", !s.warnings.is_empty() || s.unclean_shutdown);
     v.show.insert("connect", !s.connect.is_empty());
     v.show.insert("eta", s.sync.eta_secs.is_some());
+    // The cards that are always on for a running node. They carry `data-s`
+    // only so the startup view can hide them.
+    for card in ["chain", "wallets", "peers"] {
+        v.show.insert(card, true);
+    }
+    super::startup::blank(&mut v);
 
     v.state.insert("phase", tone);
     v.state.insert("wallets", wallets.1);
@@ -461,13 +482,42 @@ pub fn html(v: &View) -> String {
     p.t("span", "uptime");
     p.raw("</span></header>");
 
+    // While the node starts: what it is doing, and how far along it is.
+    // Hidden once the running node serves the page.
+    p.section("section", "startup", "card");
+    p.raw("<h2>Startup</h2>");
+    p.t("p", "startup.message");
+    p.raw("<p class=\"mute\" data-t=\"startup.note\">");
+    let note = v.text.get("startup.note").map(String::as_str).unwrap_or("");
+    p.raw(&escape(note));
+    p.raw("</p>");
+    p.section("div", "startup.progress", "");
+    p.raw("<div class=\"kv\"><span>Progress</span>");
+    p.t("span", "startup.progress");
+    p.raw("</div>");
+    p.section("div", "startup.bar", "");
+    p.bar("startup.bar");
+    p.raw("</div>");
+    p.section("div", "startup.rate", "kv");
+    p.raw("<span>Rate</span>");
+    p.t("span", "startup.rate");
+    p.raw("</div></div>");
+    p.raw("<div class=\"kv\"><span>Elapsed</span>");
+    p.t("span", "startup.elapsed");
+    p.raw("</div>");
+    p.section("div", "startup.eta", "kv");
+    p.raw("<span>Remaining</span>");
+    p.t("span", "startup.eta");
+    p.raw("</div></section>");
+
     p.section("section", "warnings", "card");
     p.raw("<h2>Warnings</h2>");
     p.list("warnings");
     p.raw("</section>");
 
     // Where the node is.
-    p.raw("<section class=\"card\"><h2>Chain</h2>");
+    p.section("section", "chain", "card");
+    p.raw("<h2>Chain</h2>");
     p.t("p", "phase.note");
     p.section("div", "sync", "");
     p.raw("<div class=\"kv\"><span>Blocks</span><span>");
@@ -530,7 +580,8 @@ pub fn html(v: &View) -> String {
     p.raw("</section>");
 
     // What a wallet can use.
-    p.raw("<section class=\"card\"><h2>Wallets</h2>");
+    p.section("section", "wallets", "card");
+    p.raw("<h2>Wallets</h2>");
     let wtone = v.state.get("wallets").copied().unwrap_or(WAIT);
     let _ = write!(
         p.out,
@@ -545,7 +596,8 @@ pub fn html(v: &View) -> String {
     p.list("connect");
     p.raw("</section>");
 
-    p.raw("<section class=\"card\"><h2>Peers</h2><div class=\"kv\"><span>Connected</span>");
+    p.section("section", "peers", "card");
+    p.raw("<h2>Peers</h2><div class=\"kv\"><span>Connected</span>");
     p.t("span", "peers.total");
     p.raw("</div>");
     p.list("peers.clients");

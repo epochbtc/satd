@@ -24,6 +24,7 @@
 pub mod advertise;
 pub mod indexes;
 pub mod render;
+pub mod startup;
 
 pub use advertise::{Advertised, Surface};
 
@@ -312,7 +313,8 @@ impl Rates {
     }
 }
 
-fn network_label(n: Network) -> &'static str {
+/// The network as the status page names it.
+pub fn network_label(n: Network) -> &'static str {
     match n {
         Network::Bitcoin => "mainnet",
         Network::Testnet => "testnet3",
