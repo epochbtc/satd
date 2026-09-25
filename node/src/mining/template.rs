@@ -10,8 +10,10 @@ use crate::mempool::pool::Mempool;
 /// private to the consensus path.
 const COINBASE_MATURITY: u32 = 100;
 
-/// Maximum block weight (4 million weight units).
-const MAX_BLOCK_WEIGHT: usize = 4_000_000;
+/// The consensus maximum block weight (Core's `MAX_BLOCK_WEIGHT`, 4 million
+/// weight units): what a block may weigh, and the ceiling `-blockmaxweight`
+/// may not exceed.
+pub const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 /// Reserve weight for coinbase transaction. Matches Bitcoin Core v30's
 /// `DEFAULT_BLOCK_RESERVED_WEIGHT` (8000 WU).
 pub(crate) const COINBASE_WEIGHT_RESERVE: usize = 8_000;
@@ -149,15 +151,49 @@ pub fn block_min_tx_fee() -> u64 {
     BLOCK_MIN_TX_FEE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The `-blockmaxweight` cap on a template, the coinbase reserve included.
+///
+/// Restart-only, like `-blockmintxfee`, so it is a process-wide value set once
+/// at startup (see [`BLOCK_MIN_TX_FEE`]). Defaults to Core's
+/// `DEFAULT_BLOCK_MAX_WEIGHT`, which is the consensus maximum
+/// (`src/policy/policy.h`).
+static BLOCK_MAX_WEIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_BLOCK_WEIGHT);
+
+/// Record the configured `-blockmaxweight`. Called once during startup;
+/// returns the value applied.
+///
+/// Clamped to `[COINBASE_WEIGHT_RESERVE, MAX_BLOCK_WEIGHT]` as Core's
+/// `BlockAssembler` clamps `nBlockMaxWeight` to `[block_reserved_weight,
+/// MAX_BLOCK_WEIGHT]` (`ClampOptions`, `src/node/miner.cpp`). A cap below the
+/// reserve leaves no room for a transaction, so the template is coinbase-only.
+/// A value above the consensus maximum never reaches here: the config refuses
+/// it at startup with Core's message.
+pub fn set_block_max_weight(weight: usize) -> usize {
+    let applied = clamp_block_max_weight(weight);
+    BLOCK_MAX_WEIGHT.store(applied, std::sync::atomic::Ordering::Relaxed);
+    applied
+}
+
+/// Core's clamp on `-blockmaxweight`; see [`set_block_max_weight`].
+pub fn clamp_block_max_weight(weight: usize) -> usize {
+    weight.clamp(COINBASE_WEIGHT_RESERVE, MAX_BLOCK_WEIGHT)
+}
+
+/// The configured `-blockmaxweight`, clamped.
+pub fn block_max_weight() -> usize {
+    BLOCK_MAX_WEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
-    create_template_with_floor(chain_state, mempool, block_min_tx_fee())
+    create_template_with_limits(chain_state, mempool, block_min_tx_fee(), block_max_weight())
 }
 
 /// A template with no transactions on the current tip: always valid, since
 /// there is nothing in it to be wrong. What the Stratum server hands out while
 /// the node's own templates are failing their validity check.
 pub fn create_coinbase_only_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
-    assemble_template(chain_state, mempool, false, block_min_tx_fee())
+    assemble_template(chain_state, mempool, false, block_min_tx_fee(), block_max_weight())
 }
 
 /// [`create_template`] with an explicit `-blockmintxfee` floor.
@@ -166,9 +202,21 @@ pub fn create_template_with_floor(
     mempool: &Mempool,
     block_min_tx_fee: u64,
 ) -> BlockTemplate {
-    if let Some(template) = chain_state
-        .coherent_read(|| assemble_template(chain_state, mempool, true, block_min_tx_fee))
-    {
+    create_template_with_limits(chain_state, mempool, block_min_tx_fee, block_max_weight())
+}
+
+/// [`create_template`] with an explicit `-blockmintxfee` floor and
+/// `-blockmaxweight` cap, so tests need not depend on, or disturb, the
+/// process-wide values.
+pub fn create_template_with_limits(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    block_min_tx_fee: u64,
+    block_max_weight: usize,
+) -> BlockTemplate {
+    if let Some(template) = chain_state.coherent_read(|| {
+        assemble_template(chain_state, mempool, true, block_min_tx_fee, block_max_weight)
+    }) {
         return template;
     }
     tracing::warn!(
@@ -176,7 +224,7 @@ pub fn create_template_with_floor(
         "chain advanced during every template assembly attempt; \
          emitting a coinbase-only template rather than one assembled across two chains"
     );
-    assemble_template(chain_state, mempool, false, block_min_tx_fee)
+    assemble_template(chain_state, mempool, false, block_min_tx_fee, block_max_weight)
 }
 
 /// One assembly pass. `include_mempool` false yields a coinbase-only template.
@@ -185,6 +233,7 @@ fn assemble_template(
     mempool: &Mempool,
     include_mempool: bool,
     block_min_tx_fee: u64,
+    block_max_weight: usize,
 ) -> BlockTemplate {
     let tip_hash = chain_state.tip_hash();
     let tip_entry = chain_state.get_block_index(&tip_hash).unwrap();
@@ -200,8 +249,14 @@ fn assemble_template(
     // template` are held but never mined by this node (design §2.4/§3), so
     // they are not candidates.
     let entries = if include_mempool { mempool.get_template_entries() } else { Vec::new() };
-    let Selection { transactions, total_weight, total_fees } =
-        select_transactions(chain_state, entries, height, template_mtp, block_min_tx_fee);
+    let Selection { transactions, total_weight, total_fees } = select_transactions(
+        chain_state,
+        entries,
+        height,
+        template_mtp,
+        block_min_tx_fee,
+        block_max_weight,
+    );
 
     // Timestamp: max of current time and MTP + 1. Core's `UpdateTime` uses
     // `max(GetAdjustedTime(), pindexPrev->GetMedianTimePast() + 1)` — the
@@ -365,10 +420,16 @@ pub fn compute_witness_commitment(txs: &[TemplateTx]) -> [u8; 32] {
     bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array()
 }
 
-/// Core's `MAX_CONSECUTIVE_FAILURES` (`src/node/miner.cpp`, v29.0:316): once
-/// the block is within the coinbase reserve of full, this many packages in a
-/// row that do not fit end the selection.
+/// Core's `MAX_CONSECUTIVE_FAILURES` (`src/node/miner.cpp`, v30.0:318): once
+/// the block is within [`BLOCK_FULL_ENOUGH_WEIGHT_DELTA`] of its cap, this many
+/// packages in a row that do not fit end the selection.
 const MAX_CONSECUTIVE_FAILURES: usize = 1000;
+
+/// Core's `BLOCK_FULL_ENOUGH_WEIGHT_DELTA` (`src/node/miner.cpp`, v30.0:319):
+/// how close to its cap a block must be before a run of failures ends the
+/// selection. Core v29 used the coinbase reserve here (`nBlockWeight >
+/// nBlockMaxWeight - block_reserved_weight`); v30 made it a fixed 4,000 WU.
+const BLOCK_FULL_ENOUGH_WEIGHT_DELTA: usize = 4_000;
 
 /// The transactions [`select_transactions`] chose, in block order, and the
 /// totals the template reports.
@@ -441,11 +502,15 @@ impl Ord for Ranked {
 /// in, each of its in-mempool descendants drops the included transactions from
 /// its own package and is re-ranked (Core's `UpdatePackagesForAdded`).
 ///
-/// A package is skipped when it would take the block past its weight or sigop
-/// limit (Core's `TestPackage`, sigops with `>=` and the coinbase's reserve
-/// counted from the start, v29.0:206-217), and selection stops at the first
-/// package paying less than `-blockmintxfee` — it is the best one left, so
-/// nothing after it pays more (v29.0:381-384).
+/// A package is skipped when it would bring the block to its weight cap
+/// (`block_max_weight`, `-blockmaxweight`) or its sigop limit, or past either:
+/// Core refuses on `>=` for both, with the coinbase's reserves counted from the
+/// start (`TestPackage`, v29.0:206-217; `TestChunkBlockLimits` since). A run of
+/// [`MAX_CONSECUTIVE_FAILURES`] such packages ends the selection once the block
+/// is within [`BLOCK_FULL_ENOUGH_WEIGHT_DELTA`] of the cap (v30.0:398-404).
+/// Selection also stops at the first package paying less than
+/// `-blockmintxfee` — it is the best one left, so nothing after it pays more
+/// (v29.0:381-384).
 ///
 /// Whether a transaction can be in this block at all does not change as
 /// others are chosen, so it is decided once, up front: it must be final at
@@ -462,6 +527,7 @@ fn select_transactions(
     height: u32,
     template_mtp: u32,
     block_min_tx_fee: u64,
+    block_max_weight: usize,
 ) -> Selection {
     use std::collections::{BinaryHeap, HashMap};
 
@@ -614,14 +680,17 @@ fn select_transactions(
         {
             break;
         }
-        if total_weight as u64 + pkg.weight > MAX_BLOCK_WEIGHT as u64
+        // Both limits refuse a package that would *reach* them, not only one
+        // that would pass them: Core's `TestChunkBlockLimits` tests `>=`, so
+        // the heaviest template it builds is one weight unit under the cap.
+        if total_weight as u64 + pkg.weight >= block_max_weight as u64
             || total_sigops.saturating_add(pkg.sigops) >= MAX_BLOCK_SIGOPS_COST
         {
             // Not failed for good: if an ancestor goes in with another
             // package, this one shrinks and is ranked again.
             consecutive_failed += 1;
             if consecutive_failed > MAX_CONSECUTIVE_FAILURES
-                && total_weight > MAX_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE
+                && total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > block_max_weight
             {
                 break;
             }
@@ -774,8 +843,8 @@ pub(crate) mod tests {
         let tx = tx_spending(confirmed_prev(0xA1), 50_000, 0x31, 0xffff_ffff, 0);
         mp.insert_tx_weighted_for_test(tx, 100, 400, QuarantineScope::acting());
 
-        let full = assemble_template(&cs, &mp, true, DEFAULT_BLOCK_MIN_TX_FEE);
-        let fallback = assemble_template(&cs, &mp, false, DEFAULT_BLOCK_MIN_TX_FEE);
+        let full = assemble_template(&cs, &mp, true, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
+        let fallback = assemble_template(&cs, &mp, false, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
 
         // Without this the comparison below is vacuous: an empty mempool makes
         // both templates transaction-free and the fallback proves nothing.
@@ -1409,10 +1478,15 @@ pub(crate) mod tests {
     //
     // Mirrors the package cases of Core's `miner_tests` (`src/test/miner_tests.cpp`,
     // `TestPackageSelection`) on satd's assembler. Weights here are chosen so
-    // the block's 3,992,000 WU after the coinbase reserve fills exactly.
+    // the room below fills to within a few weight units.
 
-    /// Room for transactions: the block less the coinbase reserve.
-    const ROOM: usize = MAX_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE;
+    /// Room for transactions: the block less the coinbase reserve, less one.
+    /// Core refuses a package that would bring the block *to* its cap (`>=`),
+    /// so the heaviest block it assembles is one weight unit under it. These
+    /// fixtures filled the full 3,992,000 WU while satd tested `>`; at Core's
+    /// boundary that last filler is refused, which would let the cheap child
+    /// in `a_low_fee_child_is_not_dragged_in_by_its_parent` take its place.
+    const ROOM: usize = MAX_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE - 1;
 
     /// Insert a transaction spending `prev` with the given fee, weight and
     /// sigop cost; returns its txid.
@@ -1652,6 +1726,128 @@ pub(crate) mod tests {
             assert!(txs.contains(&t), "{t} missing");
         }
         assert_topological(&template);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── -blockmaxweight (#836) ───────────────────────────────────────────
+
+    /// `select_transactions` on the mempool's current candidates at the next
+    /// height, with the default floor and the given cap: the selection's
+    /// `total_weight` is what the cap is judged against.
+    fn select_with_cap(cs: &ChainState, mp: &Mempool, block_max_weight: usize) -> Selection {
+        let height = cs.tip_height() + 1;
+        let mtp = cs.get_median_time_past(height);
+        select_transactions(
+            cs,
+            mp.get_template_entries(),
+            height,
+            mtp,
+            DEFAULT_BLOCK_MIN_TX_FEE,
+            block_max_weight,
+        )
+    }
+
+    /// `-blockmaxweight` caps the template, the coinbase reserve included. It
+    /// was parsed and read nowhere, so every template filled to 4,000,000 WU.
+    /// Three 60,000 WU transactions fit under 200,000 with the 8,000 reserve
+    /// (188,000); a fourth would make 248,000.
+    #[test]
+    fn a_template_keeps_to_a_configured_block_max_weight() {
+        let coins: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x20 + i), coin_at(0))).collect();
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+        for (i, (prev, _)) in coins.iter().enumerate() {
+            // Distinct fees give a deterministic order; all well above the floor.
+            put(&mp, *prev, 0x30 + i as u8, 600_000 - i as u64 * 1_000, 60_000, 0);
+        }
+
+        let capped = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, 200_000);
+        assert_eq!(capped.transactions.len(), 3, "three fit under the cap, a fourth does not");
+        let weight: usize = capped.transactions.iter().map(|t| t.weight).sum();
+        assert!(weight + COINBASE_WEIGHT_RESERVE < 200_000, "template weighs {weight} + the reserve");
+        assert_eq!(select_with_cap(&cs, &mp, 200_000).total_weight, COINBASE_WEIGHT_RESERVE + 180_000);
+
+        // The same mempool at the default cap takes all four: the three above
+        // are the cap's doing, not some other rule's.
+        let uncapped = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
+        assert_eq!(uncapped.transactions.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A package that would bring the template *to* the cap is refused, as
+    /// Core's `TestChunkBlockLimits` refuses on `nBlockWeight + size >=
+    /// nBlockMaxWeight`; satd refused only one that went past it. The
+    /// higher-fee transaction here lands exactly on the cap, the lower-fee one
+    /// a weight unit under it, and the two do not fit together.
+    #[test]
+    fn the_block_max_weight_boundary_is_exclusive_like_cores() {
+        const CAP: usize = 100_000;
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0x24), coin_at(0)),
+            (confirmed_prev(0x25), coin_at(0)),
+        ]);
+        let exact = put(&mp, confirmed_prev(0x24), 0x34, 920_000, CAP - COINBASE_WEIGHT_RESERVE, 0);
+        let under = put(&mp, confirmed_prev(0x25), 0x35, 900_000, CAP - COINBASE_WEIGHT_RESERVE - 1, 0);
+
+        let txs = mined(&create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, CAP));
+        assert_eq!(txs, vec![under], "only the transaction that stays under the cap fits, not {exact}");
+        assert_eq!(select_with_cap(&cs, &mp, CAP).total_weight, CAP - 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cap below the coinbase reserve is raised to it, as Core's
+    /// `ClampOptions` raises `nBlockMaxWeight` to `block_reserved_weight`, and
+    /// leaves no room for any transaction: the template is coinbase-only. One
+    /// above the consensus maximum is lowered to it (the config refuses such a
+    /// value before it gets here, with Core's message).
+    #[test]
+    fn a_block_max_weight_below_the_reserve_yields_a_coinbase_only_template() {
+        assert_eq!(clamp_block_max_weight(100), COINBASE_WEIGHT_RESERVE);
+        assert_eq!(clamp_block_max_weight(0), COINBASE_WEIGHT_RESERVE);
+        assert_eq!(clamp_block_max_weight(200_000), 200_000);
+        assert_eq!(clamp_block_max_weight(MAX_BLOCK_WEIGHT + 1), MAX_BLOCK_WEIGHT);
+
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0x26), coin_at(0))]);
+        put(&mp, confirmed_prev(0x26), 0x36, 50_000, 400, 0);
+        let cap = clamp_block_max_weight(100);
+        let template = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, cap);
+        assert!(template.transactions.is_empty(), "a 400 WU transaction fit under a 100 WU cap");
+        assert_eq!(template.coinbase_value, crate::chain::connect::block_subsidy(Network::Regtest, 1));
+        assert_eq!(select_with_cap(&cs, &mp, cap).total_weight, COINBASE_WEIGHT_RESERVE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core v30 ends the selection after 1,000 consecutive packages that do
+    /// not fit only once the block is within `BLOCK_FULL_ENOUGH_WEIGHT_DELTA`
+    /// (4,000 WU) of its cap; v29, which satd copied, did so within the
+    /// coinbase reserve (8,000 WU). Here the block stands 6,000 WU short of
+    /// its cap after the first transaction, then 1,001 packages too heavy for
+    /// the room are followed by a light one that fits. Under v30 selection
+    /// carries on and mines it; under v29 it would have given up first.
+    #[test]
+    fn selection_gives_up_after_1000_failures_at_cores_delta() {
+        const CAP: usize = 100_000;
+        const HEAVY: u32 = 1_001;
+        let outpoint = |tag: u8, vout: u32| bitcoin::OutPoint { txid: confirmed_prev(tag).txid, vout };
+        let mut coins = vec![(outpoint(0x27, 0), coin_at(0)), (outpoint(0x28, 0), coin_at(0))];
+        coins.extend((0..HEAVY).map(|v| (outpoint(0x29, v), coin_at(0))));
+        let (cs, mp, dir) = make_funded_template_env(&coins);
+
+        // 8,000 + 86,000 = 94,000: past v29's `100,000 - 8,000` but not
+        // v30's `100,000 - 4,000`.
+        let filler = put(&mp, outpoint(0x27, 0), 0x37, 860_000, 86_000, 0);
+        // 7,000 WU each, at 5 sat/WU: 94,000 + 7,000 reaches the cap.
+        for v in 0..HEAVY {
+            put(&mp, outpoint(0x29, v), 0x39, 35_000 + v as u64, 7_000, 0);
+        }
+        // 400 WU at 2.5 sat/WU: ranked last, and fits.
+        let light = put(&mp, outpoint(0x28, 0), 0x38, 1_000, 400, 0);
+
+        let txs = mined(&create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, CAP));
+        assert_eq!(txs, vec![filler, light], "selection gave up before the package that fits");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

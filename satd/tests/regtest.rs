@@ -1889,6 +1889,123 @@ fn getblocktemplate_stays_under_the_block_sigop_limit() {
     node.stop();
 }
 
+/// `-blockmaxweight` caps the templates `getblocktemplate` hands out and the
+/// blocks `generatetoaddress` builds (#836). It was parsed and read nowhere, so
+/// every template filled to 4,000,000 WU.
+///
+/// Ten transactions of about 18,900 WU each (150 P2WPKH outputs apiece) weigh
+/// about 189,000 WU. Under a 100,000 WU cap, with the 8,000 WU coinbase
+/// reserve, some fit and one more would reach the cap, which Core refuses
+/// (`>=`). `weightlimit` still reports the consensus limit, as Core's does.
+#[test]
+fn getblocktemplate_honours_blockmaxweight() {
+    const CAP: u64 = 100_000;
+    const RESERVE: u64 = 8_000;
+    const TXS: u64 = 10;
+    let mut node = TestNode::start(&[&format!("-blockmaxweight={CAP}")]);
+    let wallet = DeterministicWallet::from_secret([0x6a; 32]);
+    sp_generate_to(&node, TXS + 100, &wallet.address.to_string());
+
+    let outputs = vec![wallet.address.script_pubkey(); 150];
+    let mut weights = std::collections::HashMap::new();
+    for h in 1..=TXS {
+        let (raw, txid) =
+            common::build_signed_p2wpkh_spend_of_coinbases(&node, &[(h, &wallet)], &outputs, 100_000);
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw).unwrap()).unwrap();
+        weights.insert(txid, tx.weight().to_wu());
+        sp_send_raw(&node, &raw);
+    }
+    let info = node.rpc_call("getmempoolinfo").unwrap();
+    assert_eq!(info["result"]["size"], serde_json::json!(TXS), "{info}");
+    assert!(weights.values().sum::<u64>() > CAP, "the fixture must exceed the cap");
+
+    let gbt = node.rpc_call("getblocktemplate").unwrap();
+    assert!(gbt["error"].is_null(), "{gbt}");
+    assert_eq!(gbt["result"]["weightlimit"], serde_json::json!(4_000_000), "Core reports the consensus limit");
+    let entries = gbt["result"]["transactions"].as_array().expect("transactions").clone();
+    let chosen: Vec<String> = entries.iter().map(|e| e["txid"].as_str().unwrap().to_string()).collect();
+    let total: u64 = entries.iter().map(|e| e["weight"].as_u64().expect("weight")).sum();
+    assert!(!chosen.is_empty(), "the cap leaves room for some: {gbt}");
+    assert!(
+        (chosen.len() as u64) < TXS,
+        "the template took the whole mempool, {total} WU, under a {CAP} WU cap"
+    );
+    assert!(total + RESERVE < CAP, "{total} WU plus the reserve must stay under {CAP}");
+    let lightest_left = weights
+        .iter()
+        .filter(|(txid, _)| !chosen.contains(txid))
+        .map(|(_, w)| *w)
+        .min()
+        .unwrap();
+    assert!(
+        total + RESERVE + lightest_left >= CAP,
+        "a {lightest_left} WU transaction was left out with room for it: the cap, not something else, must be why"
+    );
+
+    // The block built on it connects and keeps to the cap, coinbase and all.
+    let before = get_rpc_u64(&node, "getblockcount").unwrap();
+    let mined = node
+        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(wallet.address.to_string())])
+        .expect("generatetoaddress");
+    assert!(mined["error"].is_null(), "the capped block must connect: {mined}");
+    assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), before + 1);
+    let block = node
+        .rpc_call_with_params("getblock", vec![mined["result"][0].clone(), serde_json::json!(1)])
+        .unwrap();
+    let block_weight = block["result"]["weight"].as_u64().expect("block weight");
+    assert!(block_weight < CAP, "the mined block weighs {block_weight} WU against a {CAP} WU cap");
+    assert_eq!(block["result"]["tx"].as_array().unwrap().len(), chosen.len() + 1, "{block}");
+    let left = node.rpc_call("getmempoolinfo").unwrap();
+    assert_eq!(left["result"]["size"], serde_json::json!(TXS - chosen.len() as u64), "{left}");
+
+    node.stop();
+}
+
+/// A `-blockmaxweight` above the consensus maximum stops the node, with Bitcoin
+/// Core's `InitError` word for word. satd accepted it and, since the option was
+/// read nowhere, carried on at 4,000,000.
+#[test]
+fn blockmaxweight_above_the_consensus_limit_is_refused_at_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .args(["--regtest", &format!("--datadir={}", dir.path().display()), "--blockmaxweight=4000001"])
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "satd must refuse -blockmaxweight=4000001");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+/// An unparseable `blockmaxweight` in the config file stops the node. It used
+/// to go through `.parse().ok()`, so `blockmaxweight=abc` became 4,000,000
+/// without a word. (On the command line clap already refused it.)
+#[test]
+fn a_malformed_blockmaxweight_in_the_config_file_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("bitcoin.conf"), "regtest=1\nblockmaxweight=abc\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg(format!("--datadir={}", dir.path().display()))
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "satd must refuse blockmaxweight=abc");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("blockmaxweight in config file") && stderr.contains("\"abc\""),
+        "unexpected stderr: {stderr}"
+    );
+
+    let clean = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .args(["--regtest", &format!("--datadir={}", clean.path().display()), "--blockmaxweight=abc"])
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "satd must refuse --blockmaxweight=abc");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("blockmaxweight"));
+}
+
 /// Every template is checked before it is used (`mining::validity`). On a
 /// node in `-consensus=cpp-shadow`, a template carrying a real signed
 /// transaction passes the structural check `getblocktemplate` runs, then the

@@ -1597,6 +1597,18 @@ async fn main() {
     // value recorded once here rather than carrying it through every mining
     // entry point.
     node::mining::template::set_block_min_tx_fee(config.blockmintxfee);
+    // `-blockmaxweight` likewise. Core clamps a cap below the coinbase reserve
+    // up to the reserve, which leaves no room for any transaction; say so, or
+    // an operator who typed `100` gets empty templates with no reason given.
+    let block_max_weight = node::mining::template::set_block_max_weight(config.blockmaxweight);
+    if block_max_weight != config.blockmaxweight {
+        tracing::info!(
+            configured = config.blockmaxweight,
+            applied = block_max_weight,
+            "-blockmaxweight is below the coinbase reserve and was raised to it; \
+             block templates will carry no transactions"
+        );
+    }
     // Core applies `-blockversion` only under `MineBlocksOnDemand()`, which is
     // regtest alone: it exists to test forking scenarios, and honouring it on a
     // live network would signal for deployments the node knows nothing about.

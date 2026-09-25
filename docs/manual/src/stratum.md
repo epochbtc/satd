@@ -529,6 +529,9 @@ template with `TestBlockValidity failed: <reason>`, as Core does; the full
 check for its template follows in the background once per tip. The `generate`
 RPCs refuse such a block the same way before solving it.
 
+Stratum jobs come from the same block assembler as `getblocktemplate`, so
+`-blockmaxweight` and `-blockmintxfee` shape them too.
+
 ## When work is withheld
 
 During initial block download the server accepts connections and answers

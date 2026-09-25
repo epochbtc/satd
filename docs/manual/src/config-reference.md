@@ -372,7 +372,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `blockmaxweight` | 4000000 | restart | core | Maximum block weight for templates. |
+| `blockmaxweight` | 4000000 | restart | core | Maximum block weight for templates, coinbase reserve included (Core's `-blockmaxweight`). Applies to `getblocktemplate`, `generatetoaddress` / `generatetodescriptor` and Stratum jobs (not to `generateblock`, whose caller lists the transactions, as in Core); a transaction package that would bring the template to the cap is left out, as in Core. Above 4,000,000 is refused at startup; below the 8,000 WU coinbase reserve is raised to it, which leaves room for no transactions. `getblocktemplate`'s `weightlimit` still reports the consensus limit, as Core's does. |
 | `blockmintxfee` | 1 sat/kvB | restart | core | Minimum fee rate for a transaction (judged with its package) to enter the block template. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `par` | unset | restart | core | Script-verification threads (Core name). When `shadowworkers` is unset, a positive value sets the shadow-verification worker count. It does not size the connect path. |
 
