@@ -332,12 +332,6 @@ pub(crate) mod fixtures {
         parse(BLOCKS_1_TO_10.lines().nth(height - 1).expect("fixture line"))
     }
 
-    /// Hex of the default-signet block at `height` (1 to 10).
-    pub(crate) fn default_signet_block_hex(height: usize) -> &'static str {
-        assert!((1..=10).contains(&height), "fixtures cover heights 1 to 10");
-        BLOCKS_1_TO_10.lines().nth(height - 1).expect("fixture line").trim()
-    }
-
     /// Default-signet block 2 carrying an invalid solution (see
     /// `BLOCK_2_BAD_SOLUTION`).
     pub(crate) fn default_signet_block_2_with_a_bad_solution() -> Block {
