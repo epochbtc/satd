@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# satd-init's status-page switch, against stub binaries.
+# satd-init's guarded keys (status page, metrics over TLS, chainstate
+# upgrades), against stub binaries.
 #
-# The switch must write the page's keys for a satd that has them and nothing
-# for one that does not: satd refuses an unknown config key, so the second
-# case is the difference between no page and a node that will not start.
+# Each must be written for a satd that has the key and not for one that does
+# not: satd refuses an unknown config key, so the second case is the
+# difference between a missing feature and a node that will not start.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,7 @@ bad() { printf '  FAIL  %s\n' "$1"; fail=1; }
 
 # A satd whose --help does, or does not, list the flag.
 mkdir -p "$WORK/new" "$WORK/old"
-printf '#!/bin/sh\necho "  --statuspage [<BOOL>]  Serve a status page"\necho "  --metricstlsbind <ADDR:PORT>"\n' > "$WORK/new/satd"
+printf '#!/bin/sh\necho "  --statuspage [<BOOL>]  Serve a status page"\necho "  --metricstlsbind <ADDR:PORT>"\necho "  --upgradechainstate [<BOOL>]"\n' > "$WORK/new/satd"
 printf '#!/bin/sh\necho "  --metricsport <PORT>"\n' > "$WORK/old/satd"
 chmod +x "$WORK/new/satd" "$WORK/old/satd"
 
@@ -62,6 +63,20 @@ if grep -q '^metricstls' "$WORK/b/bitcoin.conf"; then
     bad "wrote metrics TLS keys for a satd without them"
 else
     ok "writes nothing for a satd without them"
+fi
+
+echo "== satd-init: chainstate upgrades =="
+# On by default for a satd that has the key: a package update that changes the
+# chainstate format must not need a shell.
+if grep -qx 'upgradechainstate=1' "$WORK/c/bitcoin.conf"; then
+    ok "writes upgradechainstate=1 for a satd that has it"
+else
+    bad "no upgradechainstate=1: $(grep upgradechainstate "$WORK/c/bitcoin.conf" || true)"
+fi
+if grep -q '^upgradechainstate' "$WORK/b/bitcoin.conf"; then
+    bad "wrote upgradechainstate for a satd without it"
+else
+    ok "writes nothing for a satd without it"
 fi
 
 echo

@@ -163,6 +163,19 @@ docker compose exec satd sh -c 'mkdir -p /var/lib/satd/conf.d && \
 docker compose restart satd
 ```
 
+## Upgrades that change the chainstate format
+
+A satd release can change how the chainstate is stored (0.6.0 moves it from
+schema 3 to 7), and satd then refuses the old datadir until the chainstate is
+rebuilt from the block files. `satd-init` writes `upgradechainstate=1` for a
+satd that has the flag, so the first start after such an update does that by
+itself: it replays the blocks already on disk, downloads nothing, and shows the
+progress on the status page. A rebuild interrupted by a stop or a power cut
+starts again on the next start. On a mainnet node the rebuild takes hours.
+
+It does nothing when the chainstate is already current, never downgrades
+one, and refuses a pruned node, which must resync.
+
 ## Using the CLI and the TUI
 
 ```sh
