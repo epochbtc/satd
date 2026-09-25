@@ -23099,11 +23099,19 @@ fn stratum_v1_found_blocks_cross_bip34_push_boundaries() {
         }
         rt.block_on(async {
             let mut client = plain_stratum_client(port);
-            let (extranonce1, _) = client.handshake(&format!("{miner}.bip34")).await;
-            let params = loop {
-                let n = client.notification("mining.notify", Duration::from_secs(30)).await;
-                if notify_height(&n["params"]) == height {
-                    break n["params"].clone();
+            let (extranonce1, first) = client.handshake(&format!("{miner}.bip34")).await;
+            // The handshake's job is usually already for `height`: the blocks
+            // mined above rebuilt the work before this client connected. The
+            // next job after that comes from the 30-second refresh, which a
+            // 30-second wait only just outlasts.
+            let params = if notify_height(&first) == height {
+                first
+            } else {
+                loop {
+                    let n = client.notification("mining.notify", Duration::from_secs(30)).await;
+                    if notify_height(&n["params"]) == height {
+                        break n["params"].clone();
+                    }
                 }
             };
             let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
