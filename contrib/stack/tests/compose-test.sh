@@ -134,6 +134,76 @@ sys.exit(1 if failed else 0)
 PY
 then :; else fail=1; fi
 
+echo "== a package whose pin changes the chainstate format can upgrade it =="
+# A satd whose chainstate schema differs from the last release's refuses the
+# datadir the last release wrote until it is rebuilt, and an app-store user
+# cannot run --reindex-chainstate. The packages get through a schema change
+# only because satd-init writes `upgradechainstate=1`, and they run the
+# satd-init baked into the image they pin. So a pin whose schema differs from
+# the release before it must name an image whose satd-init has the switch;
+# otherwise the update crash-loops on every install.
+#
+# Self-ordering: the rule compares schemas, so it passes today (the pins are
+# schema 3, as is v0.5.2) and fails the moment a pin moves past a schema
+# change without the switch, whichever lands first.
+if python3 - "$UMBREL/docker-compose.yml" "$ROOT/contrib/packaging/startos/startos/manifest/index.ts" \
+    "$ROOT" <<'PY'
+import re, subprocess, sys
+umbrel, manifest = (open(p).read() for p in sys.argv[1:3])
+root = sys.argv[3]
+failed = False
+def git(*args):
+    return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
+def schema_at(rev):
+    src = git("show", f"{rev}:node/src/storage/rocksdb_store.rs").stdout
+    m = re.search(r"^(?:pub )?const CURRENT_SCHEMA_VERSION: u32 = (\d+);", src, re.M)
+    return int(m.group(1)) if m else None
+def release_before(rev):
+    r = git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", rev)
+    return r.stdout.strip() if r.returncode == 0 else None
+def resolve(text):
+    m = re.search(r"ghcr\.io/epochbtc/satd:sha-([0-9a-f]{7,40})@sha256:[0-9a-f]{64}", text)
+    if m:
+        full = git("rev-parse", "--verify", "--quiet", f"{m.group(1)}^{{commit}}").stdout.strip()
+        return (f"sha-{m.group(1)}", full or None, "HEAD")
+    m = re.search(r"ghcr\.io/epochbtc/satd:([0-9]+\.[0-9]+\.[0-9]+)@", text)
+    if m:
+        tag = f"v{m.group(1)}"
+        full = git("rev-parse", "--verify", "--quiet", f"{tag}^{{commit}}").stdout.strip()
+        # The release a user upgrades from is the one before the pinned one.
+        return (m.group(1), full or None, f"{tag}^")
+    return (None, None, None)
+for name, text in [("Umbrel", umbrel), ("StartOS", manifest)]:
+    label, commit, base = resolve(text)
+    if label is None:
+        print(f"  FAIL  {name}: no satd image pin found")
+        failed = True
+        continue
+    if commit is None:
+        print(f"  FAIL  {name} pins {label}, which names no commit in this checkout")
+        failed = True
+        continue
+    prev = release_before(base)
+    if prev is None:
+        print(f"  FAIL  {name} pins {label}, and there is no earlier release tag to compare with")
+        failed = True
+        continue
+    pinned, released = schema_at(commit), schema_at(prev)
+    if pinned is None or released is None:
+        print(f"  FAIL  {name}: cannot read the chainstate schema of {label} or {prev}")
+        failed = True
+    elif pinned == released:
+        print(f"  ok    {name} pins {label}, at {prev}'s chainstate schema (v{pinned})")
+    elif "upgradechainstate" in git("show", f"{commit}:contrib/stack/satd/satd-init").stdout:
+        print(f"  ok    {name} pins {label} (schema v{pinned}, {prev} is v{released}); its satd-init turns on upgradechainstate")
+    else:
+        print(f"  FAIL  {name} pins {label}, whose chainstate schema (v{pinned}) differs from "
+              f"{prev}'s (v{released}) but whose satd-init cannot turn on upgradechainstate")
+        failed = True
+sys.exit(1 if failed else 0)
+PY
+then :; else fail=1; fi
+
 echo "== Umbrel backups leave the chain out, as StartOS's do =="
 # Umbrel backs up the whole app data directory unless told otherwise, and the
 # package used to say nothing, so a user with backups on backed up the chain.

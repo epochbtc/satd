@@ -235,6 +235,23 @@ if "$SATD_BIN" --help 2>/dev/null | grep -q -- '--metricstlsbind'; then
     } >> "$CONF.new"
 fi
 
+# Chainstate upgrades. A release that changes the chainstate format (0.6.0's
+# schema 7) would otherwise refuse to start until someone ran
+# --reindex-chainstate by hand, which an app-store user has no way to do.
+# With this, satd rebuilds the chainstate from the block files it already has
+# on the first start after such an update, restarts a rebuild that a power
+# cut interrupted, and otherwise does nothing; nothing is downloaded, and the
+# status page shows the progress. Guarded like the keys above: an older satd
+# refuses a key it does not know.
+if "$SATD_BIN" --help 2>/dev/null | grep -q -- '--upgradechainstate'; then
+    {
+        printf '\n# --- chainstate upgrades ---------------------------------------------------\n'
+        printf '# Rebuild the chainstate from the block files when a release changes its\n'
+        printf '# format, or when a rebuild was interrupted. A no-op otherwise.\n'
+        printf 'upgradechainstate=1\n'
+    } >> "$CONF.new"
+fi
+
 # Operator additions, appended last so they win where satd takes the last
 # value. Documented in the README; absent by default.
 LOCAL_CONF="$DATADIR/conf.d/local.conf"
