@@ -14,6 +14,14 @@
 //! over TLS on a second listener ([`serve_metrics_https`]), where a client
 //! certificate (`--metricsmtls`) is the access control Prometheus supports.
 //!
+//! The listener answers from the moment the startup RPC does. Until the
+//! chain state exists — for hours during a `-reindex-chainstate` — a startup
+//! status server ([`serve_startup_http`], [`serve_startup_https`]) serves the
+//! same paths from the startup progress: `/healthz` 200, `/readyz` 503, the
+//! `satd_startup_*` gauges, and the status page showing the phase. It hands
+//! the bound listener to the running node's server, so the port never
+//! closes in between.
+//!
 //! Metric schema: `satd_*` prefix, Prometheus conventions (`_bytes` /
 //! `_seconds` / `_total` / `_ratio`). The schema is a stability commitment —
 //! once emitted, metric names and label dimensions should not change in
@@ -1175,7 +1183,40 @@ fn parse_kib_line(rest: &str) -> Option<u64> {
     Some(kib.saturating_mul(1024))
 }
 
-/// Run the metrics HTTP server until the shutdown signal fires.
+/// What a metrics listener answers from.
+#[derive(Clone)]
+enum Answerer {
+    /// The running node.
+    Node(MetricsContext),
+    /// The node while it starts: before the chain state exists, and through
+    /// a `-reindex` or `-reindex-chainstate` rebuild.
+    Startup(Arc<StartupStatus>),
+}
+
+impl Answerer {
+    /// The startup server's connections carry one request each and end when
+    /// it is stopped, so a status page polling through the hand-over reaches
+    /// the running node's listener on its next request rather than riding a
+    /// kept-alive connection to a server that no longer answers for the node.
+    fn one_request_per_connection(&self) -> bool {
+        matches!(self, Answerer::Startup(_))
+    }
+}
+
+/// What the startup status server answers from: the startup progress
+/// `getstartupinfo` reads, and the static facts about the node. Nothing
+/// else exists yet.
+pub struct StartupStatus {
+    pub progress: Arc<crate::startup_progress::StartupProgress>,
+    pub version: &'static str,
+    pub network: Network,
+    /// `statuspage=1`. Without it `/status`, `/status.json` and `/status.js`
+    /// are this listener's 404, as they are the running node's.
+    pub status_page: bool,
+}
+
+/// Run the metrics HTTP server on `listener` until the shutdown signal
+/// fires.
 ///
 /// Uses plain hyper (already in the dependency tree via jsonrpsee) — no new
 /// server framework, no Prometheus client library. The endpoints are:
@@ -1183,30 +1224,74 @@ fn parse_kib_line(rest: &str) -> Option<u64> {
 /// - `GET /healthz`  → 200 `OK`
 /// - `GET /readyz`   → 200 `OK` when ready, 503 when not
 /// - anything else   → 404
+///
+/// The listener is bound by the caller — usually the startup status server
+/// ([`serve_startup_http`]) has held it while the node started, and hands it
+/// over here.
 pub async fn serve_metrics_http(
     ctx: MetricsContext,
-    bind_addr: std::net::SocketAddr,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    listener: tokio::net::TcpListener,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let bind_addr = listener.local_addr()?;
     tracing::info!(%bind_addr, "Metrics/health HTTP server listening");
+    accept_http(listener, Answerer::Node(ctx), shutdown_rx).await;
+    tracing::info!("Metrics HTTP server shutting down");
+    Ok(())
+}
 
+/// The metrics listener while the node starts (#841). Serves `/healthz`
+/// (200), `/readyz` (503, `not ready: starting: …`), `/metrics` (the
+/// `satd_startup_*` gauges) and, with `statuspage=1`, the status page
+/// showing the startup phase and its progress.
+///
+/// Runs until `stop` fires, then returns the listener so the running
+/// node's [`serve_metrics_http`] can take it over without the port ever
+/// closing: a connection made in between waits in the listen backlog.
+pub async fn serve_startup_http(
+    status: Arc<StartupStatus>,
+    listener: tokio::net::TcpListener,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::net::TcpListener {
+    if let Ok(bind_addr) = listener.local_addr() {
+        tracing::info!(%bind_addr, "Metrics/health HTTP server answering for startup");
+    }
+    accept_http(listener, Answerer::Startup(status), stop).await
+}
+
+/// Wait for `stop` to read `true` (or for its sender to go away).
+/// Wrapped so the non-Send `watch::Ref` is dropped before the caller's
+/// select arm runs, keeping the accept loops `Send` (their callers spawn
+/// them).
+async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|v| *v).await;
+}
+
+/// The plain listener's accept loop, returning the listener when `stop`
+/// fires.
+async fn accept_http(
+    listener: tokio::net::TcpListener,
+    answerer: Answerer,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::net::TcpListener {
+    let one_request = answerer.one_request_per_connection();
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
-                        let ctx = ctx.clone();
+                        let answerer = answerer.clone();
+                        let conn_stop = stop.clone();
                         tokio::spawn(async move {
                             let io = hyper_util::rt::TokioIo::new(stream);
                             let svc = hyper::service::service_fn(move |req| {
-                                let ctx = ctx.clone();
-                                async move { Ok::<_, std::convert::Infallible>(handle_request(&ctx, req).await) }
+                                let answerer = answerer.clone();
+                                async move { Ok::<_, std::convert::Infallible>(respond(&answerer, req)) }
                             });
-                            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, svc)
-                                .await
-                            {
+                            let conn = hyper::server::conn::http1::Builder::new()
+                                .keep_alive(!one_request)
+                                .serve_connection(io, svc);
+                            if let Err(e) = serve_until(conn, one_request, conn_stop).await {
                                 tracing::debug!("Metrics HTTP connection error: {}", e);
                             }
                         });
@@ -1216,14 +1301,29 @@ pub async fn serve_metrics_http(
                     }
                 }
             }
-            _ = shutdown_rx.wait_for(|v| *v) => {
-                tracing::info!("Metrics HTTP server shutting down");
-                break;
-            }
+            _ = stopped(&mut stop) => break,
         }
     }
+    listener
+}
 
-    Ok(())
+/// Serve one connection. A startup-server connection is also dropped when
+/// the startup server stops, so nothing it accepted outlives the hand-over.
+async fn serve_until<F>(
+    conn: F,
+    end_at_stop: bool,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), hyper::Error>
+where
+    F: std::future::Future<Output = Result<(), hyper::Error>>,
+{
+    if !end_at_stop {
+        return conn.await;
+    }
+    tokio::select! {
+        r = conn => r,
+        _ = stopped(&mut stop) => Ok(()),
+    }
 }
 
 /// Most TLS connections the metrics TLS listener serves at once. A scraper
@@ -1239,7 +1339,10 @@ const METRICS_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// done. Without it a client dribbling header bytes pins a connection slot.
 const METRICS_TLS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Native TLS for the metrics listener (`--metricstlsbind`).
+/// Native TLS for the metrics listener (`--metricstlsbind`). Built once at
+/// startup and shared by the startup status server and the running node's
+/// listener, so the certificate is loaded, and registered for SIGUSR1
+/// reload, once.
 pub struct MetricsTls {
     acceptor: tls_config::TlsAcceptor,
     allow: tls_config::ClientAllowList,
@@ -1278,12 +1381,38 @@ impl MetricsTls {
 pub async fn serve_metrics_https(
     ctx: MetricsContext,
     listener: tokio::net::TcpListener,
-    tls: MetricsTls,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    tls: Arc<MetricsTls>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = listener.local_addr()?;
     tracing::info!(%bind_addr, mtls = tls.mtls_enabled, "Metrics/health HTTPS server listening");
-    let tls = Arc::new(tls);
+    accept_https(listener, tls, Answerer::Node(ctx), shutdown_rx).await;
+    tracing::info!("Metrics HTTPS server shutting down");
+    Ok(())
+}
+
+/// [`serve_startup_http`] over TLS, with the TLS listener's connection cap,
+/// handshake and header-read timeouts and mTLS allowlist.
+pub async fn serve_startup_https(
+    status: Arc<StartupStatus>,
+    listener: tokio::net::TcpListener,
+    tls: Arc<MetricsTls>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::net::TcpListener {
+    if let Ok(bind_addr) = listener.local_addr() {
+        tracing::info!(%bind_addr, mtls = tls.mtls_enabled, "Metrics/health HTTPS server answering for startup");
+    }
+    accept_https(listener, tls, Answerer::Startup(status), stop).await
+}
+
+/// The TLS listener's accept loop, returning the listener when `stop` fires.
+async fn accept_https(
+    listener: tokio::net::TcpListener,
+    tls: Arc<MetricsTls>,
+    answerer: Answerer,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::net::TcpListener {
+    let one_request = answerer.one_request_per_connection();
     let conn_cap = Arc::new(tokio::sync::Semaphore::new(METRICS_TLS_MAX_CONNECTIONS));
 
     loop {
@@ -1311,8 +1440,9 @@ pub async fn serve_metrics_https(
                     }
                     continue;
                 };
-                let ctx = ctx.clone();
+                let answerer = answerer.clone();
                 let tls = tls.clone();
+                let conn_stop = stop.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let tls_stream = match tokio::time::timeout(
@@ -1344,52 +1474,40 @@ pub async fn serve_metrics_https(
                     }
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let svc = hyper::service::service_fn(move |req| {
-                        let ctx = ctx.clone();
-                        async move { Ok::<_, std::convert::Infallible>(handle_request(&ctx, req).await) }
+                        let answerer = answerer.clone();
+                        async move { Ok::<_, std::convert::Infallible>(respond(&answerer, req)) }
                     });
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    let conn = hyper::server::conn::http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(METRICS_TLS_HEADER_READ_TIMEOUT)
-                        .serve_connection(io, svc)
-                        .await
-                    {
+                        .keep_alive(!one_request)
+                        .serve_connection(io, svc);
+                    if let Err(e) = serve_until(conn, one_request, conn_stop).await {
                         tracing::debug!("Metrics HTTPS connection error: {}", e);
                     }
                 });
             }
-            // Wrapped so the non-Send `watch::Ref` is dropped before the arm
-            // body, keeping this future `Send` (the caller spawns it).
-            _ = async { let _ = shutdown_rx.wait_for(|v| *v).await; } => {
-                tracing::info!("Metrics HTTPS server shutting down");
-                break;
-            }
+            _ = stopped(&mut stop) => break,
         }
     }
-
-    Ok(())
+    listener
 }
 
-async fn handle_request(
-    ctx: &MetricsContext,
-    req: hyper::Request<hyper::body::Incoming>,
-) -> hyper::Response<String> {
+fn respond(answerer: &Answerer, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<String> {
     if req.method() != hyper::Method::GET {
         return plain_response(405, "method not allowed\n");
     }
-    match req.uri().path() {
-        "/metrics" => {
-            let body = ctx.render_prometheus();
-            hyper::Response::builder()
-                .status(200)
-                .header(
-                    hyper::header::CONTENT_TYPE,
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )
-                .body(body)
-                .unwrap()
-        }
+    match answerer {
+        Answerer::Node(ctx) => node_response(ctx, req.uri().path()),
+        Answerer::Startup(status) => startup_response(status, req.uri().path()),
+    }
+}
+
+fn node_response(ctx: &MetricsContext, path: &str) -> hyper::Response<String> {
+    match path {
+        "/metrics" => prometheus_response(ctx.render_prometheus()),
         "/status" | "/status.json" | "/status.js" if ctx.status.is_some() => {
-            status_response(ctx, req.uri().path())
+            status_response(ctx, path)
         }
         "/healthz" => plain_response(200, "ok\n"),
         "/readyz" => match ctx.is_ready() {
@@ -1398,6 +1516,113 @@ async fn handle_request(
         },
         _ => plain_response(404, "not found\n"),
     }
+}
+
+/// The startup status server's routes: the running node's paths, answered
+/// from the startup progress. `/healthz` is 200 (the process is up and
+/// working), `/readyz` is 503 throughout.
+fn startup_response(status: &StartupStatus, path: &str) -> hyper::Response<String> {
+    let snap = status.progress.snapshot();
+    match path {
+        "/metrics" => prometheus_response(render_startup_prometheus(status, &snap)),
+        "/status" | "/status.json" | "/status.js" if status.status_page => {
+            let network = crate::status::network_label(status.network);
+            match path {
+                "/status.js" => page_response(
+                    "text/javascript; charset=utf-8",
+                    crate::status::render::SCRIPT.to_string(),
+                ),
+                "/status.json" => {
+                    let view = crate::status::startup::view(&snap, status.version, network);
+                    page_response("application/json", crate::status::startup::json(&snap, &view))
+                }
+                _ => {
+                    let view = crate::status::startup::view(&snap, status.version, network);
+                    page_response("text/html; charset=utf-8", crate::status::render::html(&view))
+                }
+            }
+        }
+        "/healthz" => plain_response(200, "ok\n"),
+        "/readyz" => plain_response(
+            503,
+            &format!("not ready: {}\n", crate::status::startup::not_ready_reason(&snap)),
+        ),
+        _ => plain_response(404, "not found\n"),
+    }
+}
+
+/// `/metrics` while the node starts: the build info every scrape of a
+/// running node carries, and the startup phase with its progress. The
+/// running node's families appear once it serves them.
+fn render_startup_prometheus(
+    status: &StartupStatus,
+    snap: &crate::startup_progress::StartupSnapshot,
+) -> String {
+    let mut out = String::with_capacity(1024);
+    metric(
+        &mut out,
+        "satd_build_info",
+        "Build metadata. Always 1; inspect labels for version and network.",
+        "gauge",
+        &[("version", status.version), ("network", network_label(status.network))],
+        1,
+    );
+    metric(
+        &mut out,
+        "satd_startup_phase",
+        "The startup phase the node is in (1 on the current phase's series). \
+         Served only while the node starts, before it answers for the chain.",
+        "gauge",
+        &[("phase", snap.phase.as_str())],
+        1,
+    );
+    metric(
+        &mut out,
+        "satd_startup_progress_current",
+        "Items done in the current startup phase: blocks, or bytes for a snapshot download.",
+        "gauge",
+        &[],
+        snap.current,
+    );
+    metric(
+        &mut out,
+        "satd_startup_progress_total",
+        "Items the current startup phase is working towards (the -stopatheight \
+         target when one applies); 0 when unknown.",
+        "gauge",
+        &[],
+        snap.target(),
+    );
+    metric(
+        &mut out,
+        "satd_startup_elapsed_seconds",
+        "Seconds spent in the current startup phase.",
+        "gauge",
+        &[],
+        snap.elapsed_secs,
+    );
+    if let Some(eta) = snap.eta_secs {
+        metric(
+            &mut out,
+            "satd_startup_eta_seconds",
+            "Estimated seconds left in the current startup phase. Absent when unknown.",
+            "gauge",
+            &[],
+            eta,
+        );
+    }
+    out
+}
+
+fn prometheus_response(body: String) -> hyper::Response<String> {
+    hyper::Response::builder()
+        .status(200)
+        .header(
+            hyper::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(body)
+        .unwrap()
 }
 
 /// The status page's policy. No external assets, no inline script, and the
@@ -1429,6 +1654,11 @@ fn status_response(ctx: &MetricsContext, path: &str) -> hyper::Response<String> 
             }
         }
     };
+    page_response(content_type, body)
+}
+
+/// A status-page response, with the page's security headers.
+fn page_response(content_type: &str, body: String) -> hyper::Response<String> {
     hyper::Response::builder()
         .status(200)
         .header(hyper::header::CONTENT_TYPE, content_type)
@@ -1945,5 +2175,176 @@ mod tests {
         render_policy_metrics(&mut out3, &mp);
         assert!(out3.contains("satd_policy_evaluations_total"));
         assert!(out3.contains("satd_policy_quarantined_total{rule=\"spam\",scope=\"relay+template\"}"));
+    }
+    /// A rebuilding node's startup status, for the startup listener tests.
+    fn startup_status(status_page: bool) -> Arc<StartupStatus> {
+        let progress = crate::startup_progress::StartupProgress::new();
+        progress.set_phase("reindex_chainstate", "Replaying UTXO set");
+        progress.set_total(967_870);
+        progress.set_current(412_930);
+        Arc::new(StartupStatus {
+            progress,
+            version: "0.6.0-pre",
+            network: Network::Bitcoin,
+            status_page,
+        })
+    }
+
+    /// One HTTP/1.1 GET on a fresh connection: (status, head, body). Reads to
+    /// EOF, which the startup server's one-request connections reach.
+    async fn get(addr: std::net::SocketAddr, path: &str) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: satd\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut raw))
+            .await
+            .expect("the startup server closes its connection after one response")
+            .unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status = head[9..12].parse().unwrap();
+        (status, head.to_ascii_lowercase(), body.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_startup_listener_serves_status_healthz_readyz_and_metrics() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(serve_startup_http(startup_status(true), listener, stop_rx));
+
+        let (code, _, body) = get(addr, "/healthz").await;
+        assert_eq!((code, body.as_str()), (200, "ok\n"));
+
+        let (code, _, body) = get(addr, "/readyz").await;
+        assert_eq!(code, 503);
+        assert_eq!(body, "not ready: starting: Replaying UTXO set\n");
+
+        let (code, head, body) = get(addr, "/metrics").await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: text/plain; version=0.0.4"), "{head}");
+        for line in [
+            "satd_build_info{version=\"0.6.0-pre\",network=\"mainnet\"} 1",
+            "satd_startup_phase{phase=\"reindex_chainstate\"} 1",
+            "satd_startup_progress_current 412930",
+            "satd_startup_progress_total 967870",
+        ] {
+            assert!(body.lines().any(|l| l == line), "no `{line}` in:\n{body}");
+        }
+        assert!(body.lines().any(|l| l.starts_with("satd_startup_elapsed_seconds ")), "{body}");
+        // No ETA is known yet, so the series is absent rather than zero.
+        assert!(!body.contains("satd_startup_eta_seconds"), "{body}");
+        // One HELP/TYPE pair per family: a strict parser drops the whole page
+        // on a repeat.
+        for family in body.lines().filter_map(|l| l.strip_prefix("# HELP ")) {
+            let name = family.split(' ').next().unwrap();
+            assert_eq!(body.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+        }
+
+        let (code, head, page) = get(addr, "/status").await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: text/html"), "{head}");
+        assert!(head.contains(&format!("content-security-policy: {}", STATUS_CSP.to_ascii_lowercase())), "{head}");
+        assert!(head.contains("connection: close"), "one request per connection: {head}");
+        assert!(page.contains(">rebuilding chainstate<"), "the top line");
+        assert!(page.contains("412,930 of 967,870 blocks (42.7%)"), "the progress");
+        assert!(page.contains("data-s=\"chain\" hidden"), "the chain card is hidden");
+
+        let (code, head, body) = get(addr, "/status.json").await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: application/json"), "{head}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(body.get("snapshot").is_none(), "{body}");
+        assert_eq!(body["startup"]["phase"], "reindex_chainstate");
+        assert_eq!(body["startup"]["current"], 412_930);
+        assert_eq!(body["view"]["text"]["phase.label"], "rebuilding chainstate");
+
+        let (code, head, script) = get(addr, "/status.js").await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: text/javascript"), "{head}");
+        assert_eq!(script, crate::status::render::SCRIPT);
+
+        let (code, _, _) = get(addr, "/nope").await;
+        assert_eq!(code, 404);
+
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Without `statuspage=1` the page's routes are this listener's 404, as
+    /// they are the running node's; the rest of the listener still answers,
+    /// so the 404 is the routes being off, not the listener refusing.
+    #[tokio::test]
+    async fn the_startup_listener_keeps_the_status_page_off_unless_asked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(serve_startup_http(startup_status(false), listener, stop_rx));
+        for path in ["/status", "/status.json", "/status.js"] {
+            let (code, _, body) = get(addr, path).await;
+            assert_eq!((code, body.as_str()), (404, "not found\n"), "{path}");
+        }
+        assert_eq!(get(addr, "/healthz").await.0, 200);
+        assert_eq!(get(addr, "/metrics").await.0, 200);
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    /// The hand-over: stopping the startup server returns its listener still
+    /// bound, so a client connecting in between is not refused — it waits in
+    /// the backlog and is answered by whichever server takes the listener
+    /// over. Here a second startup server stands in for the running node's.
+    #[tokio::test]
+    async fn the_startup_listener_hands_its_port_over_without_closing_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let first = tokio::spawn(serve_startup_http(startup_status(true), listener, stop_rx));
+        assert_eq!(get(addr, "/healthz").await.0, 200);
+
+        stop.send(true).unwrap();
+        let listener = first.await.unwrap();
+        assert_eq!(listener.local_addr().unwrap(), addr, "the same socket comes back");
+
+        // Nothing is accepting now; the connection still succeeds.
+        let waiting = tokio::spawn(get(addr, "/readyz"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "answered while no server held the listener");
+
+        let next = startup_status(true);
+        next.progress.set_phase("chain_init", "Initializing chain state...");
+        let (stop2, stop_rx2) = tokio::sync::watch::channel(false);
+        let second = tokio::spawn(serve_startup_http(next, listener, stop_rx2));
+        let (code, _, body) = waiting.await.unwrap();
+        assert_eq!(code, 503);
+        assert_eq!(body, "not ready: starting: Initializing chain state...\n", "the new server answered");
+        stop2.send(true).unwrap();
+        second.await.unwrap();
+    }
+
+    /// A connection the startup server accepted but that never sends a
+    /// request does not outlive the hand-over.
+    #[tokio::test]
+    async fn an_idle_startup_connection_ends_at_the_hand_over() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(serve_startup_http(startup_status(true), listener, stop_rx));
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Let the server accept it.
+        assert_eq!(get(addr, "/healthz").await.0, 200);
+        stop.send(true).unwrap();
+        let _listener = task.await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), idle.read(&mut buf))
+            .await
+            .expect("the idle connection was closed at the hand-over")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "EOF, not a response");
     }
 }

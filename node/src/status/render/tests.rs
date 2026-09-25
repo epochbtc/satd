@@ -202,3 +202,53 @@ fn a_syncing_view_hides_the_synced_panels() {
     let page = html(&v);
     assert!(page.contains("data-s=\"synced\" hidden"), "server render hides it too");
 }
+
+/// Every card on the page carries `data-s`, so a view can hide it. The
+/// startup view relies on that to show only its own card; a card built
+/// without it would sit on the startup page empty.
+#[test]
+fn every_card_on_the_page_can_be_hidden() {
+    let page = html(&view(&snapshot(), 1_780_000_300));
+    let cards: Vec<&str> = page.split("<section ").skip(1).collect();
+    assert!(cards.len() >= 6, "found only {} cards", cards.len());
+    for card in cards {
+        let open = &card[..card.find('>').unwrap()];
+        assert!(open.contains("data-s=\""), "a card that no view can hide: <section {open}>");
+    }
+
+    let startup = crate::status::startup::view(
+        &crate::startup_progress::StartupSnapshot {
+            phase: "reindex_chainstate".to_string(),
+            message: "Replaying UTXO set".to_string(),
+            ..Default::default()
+        },
+        "0.6.0-pre",
+        "mainnet",
+    );
+    let page = html(&startup);
+    for card in page.split("<section ").skip(1) {
+        let open = &card[..card.find('>').unwrap()];
+        let shown = !open.ends_with(" hidden");
+        assert_eq!(shown, open.contains("data-s=\"startup\""), "during startup: <section {open}>");
+    }
+}
+
+/// The running node's view shows the three cards that are always on, and
+/// hides the startup card, in the first paint and in the view the script
+/// applies.
+#[test]
+fn the_real_view_shows_every_card() {
+    let v = view(&snapshot(), 1_780_000_300);
+    for card in ["chain", "wallets", "peers"] {
+        assert!(v.show[card], "{card}");
+    }
+    // The fixture has a warning and an advertised connection, so the two
+    // conditional cards show too: every card of a running node is up.
+    assert!(v.show["warnings"] && v.show["connect"]);
+    assert!(!v.show["startup"]);
+    let page = html(&v);
+    for card in ["chain", "wallets", "peers", "warnings", "connect"] {
+        assert!(page.contains(&format!("data-s=\"{card}\">")), "{card} is hidden in the first paint");
+    }
+    assert!(page.contains("data-s=\"startup\" hidden"));
+}

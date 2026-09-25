@@ -801,6 +801,13 @@ async fn main() {
         )
         .await
     };
+    // The metrics listener answers from here on (#841). Until the node is
+    // running — for hours during a `-reindex-chainstate` — a startup status
+    // server serves `/healthz`, `/readyz`, `/metrics` and the status page
+    // from `startup_progress`, then hands its listeners to the running
+    // node's server below.
+    let mut metrics_startup =
+        start_metrics_startup(&config, &auth, &api_handle, &startup_progress).await;
 
     // Service-manager heartbeat. On systemd this prevents the unit from
     // hitting TimeoutStartSec during long-running startup phases like
@@ -2463,6 +2470,15 @@ async fn main() {
         }
     }
 
+    // Stop the startup status server before the full RPC answers, so a client
+    // that has seen the node come up reaches the running node's metrics
+    // listener: its connection waits in the listen backlog until that
+    // listener starts, below, rather than reaching the startup server.
+    let metrics_listeners = match metrics_startup.take() {
+        Some(m) => Some(m.stop().await),
+        None => None,
+    };
+
     // Stop the startup RPC server and start the real one on the same port
     startup_handle.stop().expect("Failed to stop startup RPC");
     // Give the port a moment to be released
@@ -3221,16 +3237,7 @@ async fn main() {
 
     // Start metrics/health HTTP server if enabled (unauthenticated — bind to
     // loopback by default, or firewall externally).
-    if let Some(metricsport) = config.metricsport {
-        let metrics_bind: SocketAddr =
-            match crate::config::parse_p2p_bind(&config.metricsbind, metricsport) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("Error: -metricsbind/-metricsport: {e}");
-                    auth.cleanup();
-                    std::process::exit(1);
-                }
-            };
+    if let Some(metrics) = metrics_listeners {
         let metrics_ctx = node::metrics::MetricsContext {
             chain_state: chain_state.clone(),
             mempool: mempool.clone(),
@@ -3266,65 +3273,54 @@ async fn main() {
         // The TLS listener is set up before the plain one is spawned, and
         // every failure in it is fatal: an operator who asked for a
         // LAN-facing encrypted scrape endpoint must not get a node that came
-        // up without one. Config::load already refused partial settings.
-        if let Some(addr_str) = config.metrics_tls_bind.as_ref() {
-            let (Some(cert), Some(key)) =
-                (config.metrics_tls_cert.as_ref(), config.metrics_tls_key.as_ref())
-            else {
-                eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
-                auth.cleanup();
-                std::process::exit(1);
-            };
-            let tls_bind: SocketAddr = match addr_str.parse() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Error: invalid --metricstlsbind {addr_str:?}: {e}");
-                    auth.cleanup();
-                    std::process::exit(1);
-                }
-            };
-            let client_ca = if config.metrics_mtls {
-                config.metrics_mtls_client_ca.as_deref()
-            } else {
-                None
-            };
-            let tls = match node::metrics::MetricsTls::new(
-                cert,
-                key,
-                client_ca,
-                config.metrics_mtls_client_allow.iter().cloned(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Error: metrics TLS config: {e}");
-                    auth.cleanup();
-                    std::process::exit(1);
-                }
-            };
-            let tls_listener = match tokio::net::TcpListener::bind(tls_bind).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Error: metrics TLS listener could not bind to {tls_bind}: {e}");
-                    auth.cleanup();
-                    std::process::exit(1);
-                }
+        // up without one. The certificate was loaded, and the listener bound,
+        // fatally at startup (`start_metrics_startup`); the listener is the
+        // startup status server's, bound again here only if its accept loop
+        // was lost.
+        if let Some(tls) = metrics.tls {
+            let tls_listener = match tls.listener {
+                Some(l) => l,
+                None => match tokio::net::TcpListener::bind(tls.bind).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!(
+                            "Error: metrics TLS listener could not bind to {}: {e}",
+                            tls.bind
+                        );
+                        auth.cleanup();
+                        std::process::exit(1);
+                    }
+                },
             };
             let tls_ctx = metrics_ctx.clone();
             let rx = shutdown_rx.clone();
+            let acceptor = tls.acceptor;
             api_handle.spawn(async move {
                 if let Err(e) =
-                    node::metrics::serve_metrics_https(tls_ctx, tls_listener, tls, rx).await
+                    node::metrics::serve_metrics_https(tls_ctx, tls_listener, acceptor, rx).await
                 {
                     tracing::error!("Metrics HTTPS server error: {}", e);
                 }
             });
         }
-        let rx = shutdown_rx.clone();
-        api_handle.spawn(async move {
-            if let Err(e) = node::metrics::serve_metrics_http(metrics_ctx, metrics_bind, rx).await {
-                tracing::error!("Metrics HTTP server error: {}", e);
-            }
-        });
+        let plain_listener = match metrics.plain {
+            Some(l) => Some(l),
+            None => match tokio::net::TcpListener::bind(metrics.plain_bind).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::error!("Metrics HTTP server error: {}", e);
+                    None
+                }
+            },
+        };
+        if let Some(listener) = plain_listener {
+            let rx = shutdown_rx.clone();
+            api_handle.spawn(async move {
+                if let Err(e) = node::metrics::serve_metrics_http(metrics_ctx, listener, rx).await {
+                    tracing::error!("Metrics HTTP server error: {}", e);
+                }
+            });
+        }
     }
 
     // Start the Esplora REST server if enabled. Refuses to bind when
@@ -4529,6 +4525,176 @@ async fn main() {
     tracing::info!("satd stopped");
 }
 
+/// The metrics listener's binds, resolved once at startup, and the startup
+/// status server holding them until the running node's listener takes them
+/// over (#841).
+struct MetricsStartup {
+    plain_bind: SocketAddr,
+    tls: Option<(SocketAddr, Arc<node::metrics::MetricsTls>)>,
+    stop: tokio::sync::watch::Sender<bool>,
+    plain_task: Option<tokio::task::JoinHandle<tokio::net::TcpListener>>,
+    tls_task: Option<tokio::task::JoinHandle<tokio::net::TcpListener>>,
+}
+
+/// What the startup status server hands the running node's listener. A
+/// `None` listener is one the startup server could not bind (plain only) or
+/// lost to a panicked accept loop; the running node's listener binds it
+/// itself, with its own failure semantics.
+struct MetricsListeners {
+    plain_bind: SocketAddr,
+    plain: Option<tokio::net::TcpListener>,
+    tls: Option<MetricsTlsListener>,
+}
+
+struct MetricsTlsListener {
+    bind: SocketAddr,
+    acceptor: Arc<node::metrics::MetricsTls>,
+    listener: Option<tokio::net::TcpListener>,
+}
+
+impl MetricsStartup {
+    /// Stop the startup status server, and wait until both accept loops have
+    /// returned their listeners. The listeners stay bound throughout, so a
+    /// connection made before the running node's server starts waits in the
+    /// backlog instead of being refused.
+    async fn stop(self) -> MetricsListeners {
+        let _ = self.stop.send(true);
+        let plain = match self.plain_task {
+            Some(task) => task.await.ok(),
+            None => None,
+        };
+        let tls_listener = match self.tls_task {
+            Some(task) => task.await.ok(),
+            None => None,
+        };
+        MetricsListeners {
+            plain_bind: self.plain_bind,
+            plain,
+            tls: self.tls.map(|(bind, acceptor)| MetricsTlsListener {
+                bind,
+                acceptor,
+                listener: tls_listener,
+            }),
+        }
+    }
+}
+
+/// Resolve the metrics listener's binds and start the startup status server
+/// on them. `None` without `-metricsport`.
+///
+/// A malformed bind, an unusable TLS certificate and a TLS bind failure are
+/// fatal here, as they always were for the metrics listener, only now before
+/// the node spends hours loading rather than after. A plain bind failure is
+/// a warning, as it always was: the running node's listener tries the bind
+/// again when it starts, and logs its own failure.
+async fn start_metrics_startup(
+    config: &Config,
+    auth: &RpcAuth,
+    api: &tokio::runtime::Handle,
+    progress: &Arc<node::startup_progress::StartupProgress>,
+) -> Option<MetricsStartup> {
+    let metricsport = config.metricsport?;
+    let plain_bind: SocketAddr =
+        match crate::config::parse_p2p_bind(&config.metricsbind, metricsport) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Error: -metricsbind/-metricsport: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
+    // Config::load already refused partial TLS settings; these checks are
+    // the listener's own, kept where the certificate is loaded.
+    let tls = match config.metrics_tls_bind.as_ref() {
+        None => None,
+        Some(addr_str) => {
+            let (Some(cert), Some(key)) =
+                (config.metrics_tls_cert.as_ref(), config.metrics_tls_key.as_ref())
+            else {
+                eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
+                auth.cleanup();
+                std::process::exit(1);
+            };
+            let tls_bind: SocketAddr = match addr_str.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: invalid --metricstlsbind {addr_str:?}: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            let client_ca = if config.metrics_mtls {
+                config.metrics_mtls_client_ca.as_deref()
+            } else {
+                None
+            };
+            let acceptor = match node::metrics::MetricsTls::new(
+                cert,
+                key,
+                client_ca,
+                config.metrics_mtls_client_allow.iter().cloned(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: metrics TLS config: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            Some((tls_bind, Arc::new(acceptor)))
+        }
+    };
+
+    let status = Arc::new(node::metrics::StartupStatus {
+        progress: progress.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+        network: config.network,
+        status_page: config.statuspage,
+    });
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let plain_task = match tokio::net::TcpListener::bind(plain_bind).await {
+        Ok(listener) => Some(api.spawn(node::metrics::serve_startup_http(
+            status.clone(),
+            listener,
+            stop_rx.clone(),
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                %plain_bind,
+                error = %e,
+                "Metrics listener could not bind while starting; it binds again once the node is running"
+            );
+            None
+        }
+    };
+    // The TLS listener's bind stays fatal, as it always was: an operator who
+    // asked for a LAN-facing encrypted endpoint must not get a node that
+    // spends hours rebuilding and then comes up without one.
+    let tls_task = match &tls {
+        None => None,
+        Some((tls_bind, acceptor)) => match tokio::net::TcpListener::bind(tls_bind).await {
+            Ok(listener) => Some(api.spawn(node::metrics::serve_startup_https(
+                status.clone(),
+                listener,
+                acceptor.clone(),
+                stop_rx.clone(),
+            ))),
+            Err(e) => {
+                eprintln!("Error: metrics TLS listener could not bind to {tls_bind}: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        },
+    };
+    Some(MetricsStartup {
+        plain_bind,
+        tls,
+        stop,
+        plain_task,
+        tls_task,
+    })
+}
+
 /// Composite handle returned by `start_startup_rpc` — one handle per
 /// `--rpcbind` value. `.stop()` fires every handle (ignoring already-
 /// stopped errors so a half-stopped state never propagates).
@@ -4586,32 +4752,7 @@ async fn start_startup_rpc(
 
     module
         .register_method("getstartupinfo", |_params, ctx, _extensions| {
-            let snap = ctx.snapshot();
-            // Prefer `stop_height` as the percent denominator when set:
-            // the operator's goal is to reach the stop target, not the
-            // file tip, so the gauge should fill from 0..stop_height.
-            let percent_denom = snap.stop_height.unwrap_or(snap.total);
-            let percent = if percent_denom > 0 {
-                Some(((snap.current as f64 / percent_denom as f64) * 100.0 * 10.0).round() / 10.0)
-            } else {
-                None
-            };
-            Ok::<_, ErrorObjectOwned>(serde_json::json!({
-                "started": false,
-                "status": snap.message,
-                "phase": snap.phase,
-                "current": snap.current,
-                "total": snap.total,
-                "stop_height": snap.stop_height,
-                "percent": percent,
-                // Daemon-computed timing so clients render it instantly and
-                // consistently across reconnects, rather than each deriving
-                // it from a cold local sample window.
-                "elapsed_secs": snap.elapsed_secs,
-                "total_elapsed_secs": snap.total_elapsed_secs,
-                "rate": snap.rate,
-                "eta_secs": snap.eta_secs,
-            }))
+            Ok::<_, ErrorObjectOwned>(ctx.snapshot().startup_info())
         })
         .unwrap();
 

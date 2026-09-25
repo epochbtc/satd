@@ -190,6 +190,16 @@ What the top line means:
 | **validating history** | Serving from an AssumeUTXO snapshot while the history behind it validates. |
 | **building indexes** | At the tip, with an enabled index still incomplete, so Electrum and Esplora answers that read through it are partial. |
 | **ready** | At the tip, every enabled index complete. |
+| **starting** | The node is still loading, before it has a chain to show. `/readyz` is 503; the page shows what the node is doing, and nothing else is served yet. |
+| **rebuilding chainstate** | A `-reindex-chainstate` or `-reindex` is rebuilding from the block files on disk. `/readyz` is 503; the page shows the rebuild's progress, rate and ETA, and nothing else is served until it finishes. |
+
+The last two come from a startup server that holds the metrics listener from
+the moment the startup RPC answers, so the page, `/healthz` (200), `/readyz`
+(503) and `/metrics` (`satd_build_info` and the `satd_startup_*` gauges)
+answer through a rebuild that takes hours. It hands the bound port to the
+running node's listener before the full RPC starts; an open tab switches to
+the running node's view on its next refresh. During startup `/status.json`
+carries `getstartupinfo`'s object as `startup` instead of `snapshot`.
 
 The page says **ready** only when `/readyz` is 200. Sync progress is weighted
 by how much work each part of the chain takes, so it trails the plain

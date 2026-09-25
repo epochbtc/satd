@@ -103,6 +103,44 @@ pub struct StartupSnapshot {
     pub eta_secs: Option<u64>,
 }
 
+impl StartupSnapshot {
+    /// The count the phase is working towards: the `-stopatheight` target
+    /// when one applies, else `total`. `0` when unknown.
+    pub fn target(&self) -> u64 {
+        self.stop_height.unwrap_or(self.total)
+    }
+
+    /// Share of the phase done, as a percentage rounded to one decimal, or
+    /// `None` when the phase has no known [`target`](Self::target).
+    pub fn percent(&self) -> Option<f64> {
+        let target = self.target();
+        (target > 0).then(|| ((self.current as f64 / target as f64) * 100.0 * 10.0).round() / 10.0)
+    }
+
+    /// The `getstartupinfo` result. The status page's `/status.json` carries
+    /// the same object while the node starts, so the two cannot disagree.
+    pub fn startup_info(&self) -> serde_json::Value {
+        serde_json::json!({
+            "started": false,
+            "status": self.message,
+            "phase": self.phase,
+            "current": self.current,
+            "total": self.total,
+            "stop_height": self.stop_height,
+            // `stop_height` is the denominator when set: the operator's goal
+            // is the stop target, not the file tip.
+            "percent": self.percent(),
+            // Daemon-computed timing so clients render it instantly and
+            // consistently across reconnects, rather than each deriving it
+            // from a cold local sample window.
+            "elapsed_secs": self.elapsed_secs,
+            "total_elapsed_secs": self.total_elapsed_secs,
+            "rate": self.rate,
+            "eta_secs": self.eta_secs,
+        })
+    }
+}
+
 impl StartupProgress {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
