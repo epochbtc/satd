@@ -10,6 +10,7 @@ import {
   satCliArgs,
   satdMounts,
 } from './utils'
+import { describeStartup, type GetStartupInfo } from './startup'
 
 export const main = sdk.setupMain(async ({ effects }) => {
   /**
@@ -195,7 +196,29 @@ export const main = sdk.setupMain(async ({ effects }) => {
         }),
         fn: async () => {
           const res = await probe<GetBlockchainInfo>('getblockchaininfo')
-          if ('health' in res) return res.health
+          if ('health' in res) {
+            // Not answering yet. satd's startup RPC still answers
+            // `getstartupinfo`, so say what it is doing: after an update that
+            // changes the chainstate format, the first start rebuilds it from
+            // the block files for hours, and "starting" for all of that reads
+            // as a hang.
+            if (res.health.result !== 'starting') return res.health
+            const startup = await probe<GetStartupInfo>('getstartupinfo')
+            if ('health' in startup || startup.value.started !== false)
+              return res.health
+            const m = describeStartup(startup.value)
+            return {
+              result: 'loading' as const,
+              message:
+                m.kind === 'rebuilding'
+                  ? i18n('Rebuilding chainstate: ${current} of ${total} blocks (${percent}%)', {
+                      current: m.current,
+                      total: m.total,
+                      percent: m.percent,
+                    })
+                  : i18n('Starting: ${status}', { status: m.status }),
+            }
+          }
           const info = res.value
 
           if (!info.initialblockdownload)
