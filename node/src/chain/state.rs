@@ -489,8 +489,13 @@ pub struct ChainState {
     /// `-signetchallenge`. When present (signet only), every accepted
     /// block's signet solution is verified against it and the P2P magic
     /// is derived from it. `None` for all other networks and for the
-    /// default signet (which satd does not solution-check today).
+    /// default signet, whose blocks are verified against
+    /// `DEFAULT_SIGNET_CHALLENGE` instead (see [`Self::signet_challenge`]).
     signet_challenge: Option<Vec<u8>>,
+    /// This network's genesis hash, which the signet solution check
+    /// exempts. Cached so the per-block check does not rebuild the genesis
+    /// block.
+    genesis_hash: BlockHash,
     /// Serializes every mutation of this (primary) chainstate so that at
     /// most one thread writes the `CoinCache` and `tip` at a time.
     ///
@@ -879,6 +884,7 @@ impl ChainState {
                     ),
                     background: RwLock::new(None),
                     signet_challenge: None,
+                    genesis_hash,
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
                     pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
@@ -994,6 +1000,7 @@ impl ChainState {
             ),
             background: RwLock::new(None),
             signet_challenge: None,
+            genesis_hash,
             accept_lock: std::sync::Arc::new(Mutex::new(())),
             pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
@@ -1009,7 +1016,8 @@ impl ChainState {
 
     /// Set the custom signet challenge (BIP 325). Call once, before the
     /// `ChainState` is shared (wrapped in an `Arc`). On signet this
-    /// enables block-solution validation and custom P2P magic.
+    /// replaces the default challenge for block-solution validation and
+    /// derives a custom P2P magic.
     pub fn set_signet_challenge(&mut self, challenge: Option<Vec<u8>>) {
         self.signet_challenge = challenge;
     }
@@ -1049,13 +1057,13 @@ impl ChainState {
         }
     }
 
-    /// Verify a block's signet solution when a custom challenge is
-    /// configured (BIP 325). No-op on every other network and on the
-    /// default signet (no challenge set).
+    /// Verify a block's signet solution (BIP 325) against this node's
+    /// challenge: `-signetchallenge` on a custom signet, the default
+    /// signet's otherwise. No-op off signet. Core checks it in `CheckBlock`
+    /// on every signet whenever it checks proof of work, assumevalid or not.
     fn check_signet_solution(&self, block: &Block) -> Result<(), crate::validation::ValidationError> {
-        if let Some(ch) = &self.signet_challenge {
-            let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
-            validation::signet::check_signet_block_solution(block, ch, genesis_hash)?;
+        if let Some(challenge) = self.signet_challenge() {
+            validation::signet::check_signet_block_solution(block, challenge, self.genesis_hash)?;
         }
         Ok(())
     }
@@ -4572,7 +4580,7 @@ impl ChainState {
             |h| store_ref.get_block_index(h),
         )?;
 
-        // Signet block-solution check (BIP 325), custom signet only.
+        // Signet block-solution check (BIP 325): every signet, default or custom.
         self.check_signet_solution(block)?;
 
         // Checkpoint validation
@@ -5561,6 +5569,11 @@ impl ChainState {
         if !pre.context_free_checked {
             validation::block::check_block(&pre.block, self.network, pre.height)?;
         }
+        // Core's `ConnectBlock` re-runs `CheckBlock`, signet solution
+        // included, on every block it connects from disk. So a chainstate
+        // rebuilt from the block files verifies every signet block once,
+        // including those stored before the default signet was checked (#767).
+        self.check_signet_solution(&pre.block)?;
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier =
@@ -5643,6 +5656,9 @@ impl ChainState {
         // header still hashes to the planned block. Only re-deriving the block
         // from its own bytes catches it (issue #505).
         validation::block::check_block(&block, self.network, height)?;
+        // As on the prefetched path: Core verifies a signet solution on every
+        // connect from disk.
+        self.check_signet_solution(&block)?;
         let parent = self
             .store
             .get_block_index(&block.header.prev_blockhash)
@@ -6061,6 +6077,12 @@ impl ChainState {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
             }
+            // Core's `-reindex` runs `CheckBlock` on every block it loads, so
+            // a signet solution is verified here as on every other path.
+            if let Err(e) = self.check_signet_solution(&block) {
+                halted = Some((hash, height, format!("fails validation: {e}")));
+                break;
+            }
 
             let use_noop = self.should_skip_scripts(height);
             let noop = NoopVerifier;
@@ -6325,6 +6347,16 @@ impl ChainState {
                     height,
                     error = %e,
                     "reindex: side-chain block fails context-free validation; not indexing"
+                );
+                skipped += 1;
+                continue;
+            }
+            if let Err(e) = self.check_signet_solution(&block) {
+                tracing::warn!(
+                    block = %hash,
+                    height,
+                    error = %e,
+                    "reindex: side-chain block fails its signet solution; not indexing"
                 );
                 skipped += 1;
                 continue;
@@ -6666,7 +6698,7 @@ impl ChainState {
             return Err(e.into());
         }
 
-        // Signet block-solution check (BIP 325), custom signet only.
+        // Signet block-solution check (BIP 325): every signet, default or custom.
         self.check_signet_solution(block)?;
 
         // Checkpoint validation
@@ -18435,6 +18467,196 @@ pub(crate) mod tests {
         assert_eq!(outcome.holes_found, 0);
         assert_eq!(outcome.repaired, 0);
         assert_eq!(outcome.still_missing, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A default-signet node (no `-signetchallenge`) verifies block solutions
+    /// on the accept path, as Core does in `CheckBlock` on every signet. It
+    /// once verified only a custom challenge, so the default signet followed
+    /// any block that met signet's trivial proof of work (#767).
+    ///
+    /// Perturbation: key `check_signet_solution` on the configured challenge
+    /// again (`&self.signet_challenge`) and the bad-solution block connects.
+    #[test]
+    fn default_signet_blocks_are_solution_checked_at_accept() {
+        use crate::validation::signet::fixtures::{
+            default_signet_block, default_signet_block_2_with_a_bad_solution,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "satd-chain-test-signet-accept-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let cs = ChainState::new(
+            Box::new(InMemoryStore::new()),
+            FlatFileManager::new(&dir.join("blocks")).unwrap(),
+            Network::Signet,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(cs.signet_challenge.is_none(), "premise: no -signetchallenge");
+
+        let block1 = default_signet_block(1);
+        cs.accept_block(&block1).expect("real default-signet block 1 is accepted");
+        assert_eq!(cs.tip_hash(), block1.block_hash());
+
+        // Block 2 with one signature byte flipped: its merkle root and proof
+        // of work are valid (the fixture test proves it), so only the
+        // solution check can refuse it.
+        let bad2 = default_signet_block_2_with_a_bad_solution();
+        match cs.accept_block(&bad2) {
+            Err(ChainError::Validation(crate::validation::ValidationError::BadSignetSolution)) => {}
+            other => panic!("a bad default-signet solution must be refused, got {other:?}"),
+        }
+        assert_eq!(cs.tip_hash(), block1.block_hash(), "the tip must not move");
+
+        // The real block 2 still connects, so the refusal above was the
+        // solution and not the block's position.
+        let block2 = default_signet_block(2);
+        cs.accept_block(&block2).expect("real default-signet block 2 is accepted");
+        assert_eq!(cs.tip_hash(), block2.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signet `ChainState` whose blocks were stored without a real solution
+    /// check: they are accepted under an `OP_TRUE` challenge, which any
+    /// solution satisfies, and the node is then switched to the default
+    /// challenge. This is the datadir a default-signet node built before #767
+    /// leaves on disk, and the one a rebuild from block files starts from.
+    fn signet_chain_stored_unchecked(blocks: &[Block]) -> (ChainState, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "satd-chain-test-signet-unchecked-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cs = signet_chain_state_over(&dir);
+        cs.set_signet_challenge(Some(vec![0x51])); // OP_TRUE
+        for b in blocks {
+            cs.accept_block(b).expect("stored under OP_TRUE");
+        }
+        cs.set_signet_challenge(None);
+        cs.flush_coin_cache().expect("flush");
+        cs.store.flush().unwrap();
+        (cs, dir)
+    }
+
+    /// A default-signet `ChainState` with an empty database over `dir`'s
+    /// block files: what `-reindex` starts from.
+    fn signet_chain_state_over(dir: &std::path::Path) -> ChainState {
+        ChainState::new(
+            Box::new(InMemoryStore::new()),
+            FlatFileManager::new(&dir.join("blocks")).unwrap(),
+            Network::Signet,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    /// Core's `ConnectBlock` re-runs `CheckBlock`, signet solution included,
+    /// on every block it connects from disk, so `-reindex-chainstate`
+    /// verifies each signet block again. satd's rebuild must too: it is
+    /// where blocks stored before the default signet was checked get checked.
+    ///
+    /// Perturbation: drop `check_signet_solution` from
+    /// `reindex_connect_prefetched` and `reindex_connect_direct` and the
+    /// replay connects the bad block.
+    #[test]
+    fn a_chainstate_rebuild_verifies_signet_solutions_read_from_disk() {
+        use crate::validation::signet::fixtures::{
+            default_signet_block, default_signet_block_2_with_a_bad_solution,
+        };
+        let bad2 = default_signet_block_2_with_a_bad_solution();
+        let (cs, dir) = signet_chain_stored_unchecked(&[default_signet_block(1), bad2.clone()]);
+        assert_eq!(cs.tip_hash(), bad2.block_hash(), "premise: stored and connected unchecked");
+
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = cs.genesis_hash;
+            tip.height = 0;
+        }
+        match cs.reindex_chainstate(None, None, Some((bad2.block_hash(), 2))) {
+            Err(ChainError::Validation(crate::validation::ValidationError::BadSignetSolution)) => {}
+            other => panic!("the rebuild must refuse the bad solution, got {other:?}"),
+        }
+        assert_eq!(cs.tip_height(), 1, "block 1 verifies and stays connected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's `-reindex` runs `CheckBlock` on every block it loads. A bad
+    /// signet solution on the main chain stops satd's flat-file replay there,
+    /// as any block that fails validation does (#542).
+    ///
+    /// Perturbation: drop the connect-path `check_signet_solution` in
+    /// `reindex_from_flat_files` and the tip reaches 2.
+    #[test]
+    fn a_full_reindex_stops_at_a_bad_signet_solution() {
+        use crate::validation::signet::fixtures::{
+            default_signet_block, default_signet_block_2_with_a_bad_solution,
+        };
+        let bad2 = default_signet_block_2_with_a_bad_solution();
+        let (_cs, dir) = signet_chain_stored_unchecked(&[default_signet_block(1), bad2.clone()]);
+
+        let re = signet_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None)
+            .expect("an unreplayable block stops the reindex, it does not fail it");
+        assert_eq!(re.tip_height(), 1);
+        assert_eq!(re.tip_hash(), default_signet_block(1).block_hash());
+        assert!(re.store.get_block_index(&bad2.block_hash()).is_none());
+        assert!(re.warnings().list().iter().any(|w| w.id == "reindex.halted"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The side-chain half of `-reindex`: a stale block with a bad signet
+    /// solution is not indexed, as Core's `AcceptBlock` would refuse it.
+    ///
+    /// Perturbation: drop the `check_signet_solution` in
+    /// `index_reindex_side_chain` and the bad block is indexed as stored.
+    #[test]
+    fn a_full_reindex_does_not_index_a_side_block_with_a_bad_signet_solution() {
+        use crate::validation::signet::fixtures::{
+            default_signet_block, default_signet_block_2_with_a_bad_solution,
+        };
+        // Main chain 1-2-3; the bad block is block 2's sibling, so a stale
+        // side block below the tip.
+        let bad2 = default_signet_block_2_with_a_bad_solution();
+        let (cs, dir) = signet_chain_stored_unchecked(&[
+            default_signet_block(1),
+            default_signet_block(2),
+            default_signet_block(3),
+            bad2.clone(),
+        ]);
+        assert_eq!(cs.tip_hash(), default_signet_block(3).block_hash());
+        assert!(cs.store.get_block_index(&bad2.block_hash()).is_some(), "premise: stored");
+
+        let re = signet_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), default_signet_block(3).block_hash());
+        assert!(
+            re.store.get_block_index(&bad2.block_hash()).is_none(),
+            "a side block with a bad solution must not be indexed"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

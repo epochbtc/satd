@@ -3,8 +3,9 @@
 //! Signet replaces proof-of-work difficulty with a block signature: each
 //! block carries a "signet solution" in its coinbase that must satisfy a
 //! network-wide *challenge* script. This module implements Bitcoin Core's
-//! `CheckSignetBlockSolution` so satd can run a custom/private signet
-//! specified with `-signetchallenge`.
+//! `CheckSignetBlockSolution`. satd verifies every block on every signet:
+//! against `-signetchallenge` on a custom signet, against
+//! [`DEFAULT_SIGNET_CHALLENGE`] on the default one.
 //!
 //! The solution is verified by reconstructing the two virtual
 //! transactions BIP 325 defines — `to_spend` (whose single output is the
@@ -211,7 +212,11 @@ impl SignetTxs {
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
+                // BIP 325 / Core `signet.cpp`: `OP_0 PUSH72[block_data]`.
+                // The `OP_0` is part of the txid `to_sign` spends, so
+                // without it no solution signed by Core's tooling verifies.
                 script_sig: Builder::new()
+                    .push_opcode(bitcoin::opcodes::OP_0)
                     .push_slice::<&bitcoin::script::PushBytes>(
                         block_data.as_slice().try_into().ok()?,
                     )

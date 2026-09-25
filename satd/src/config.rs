@@ -423,7 +423,8 @@ pub struct Config {
     /// Custom signet challenge script (BIP 325), parsed from the
     /// `-signetchallenge` hex. `Some` only on signet; when set, the node
     /// validates each block's signet solution against it and derives the
-    /// P2P magic from it. `None` = default signet (or non-signet).
+    /// P2P magic from it. `None` = default signet, whose blocks are
+    /// validated against the default challenge (or non-signet).
     pub signet_challenge: Option<Vec<u8>>,
     pub rpcport: u16,
     /// Concrete socket addresses the JSON-RPC HTTP listener binds to.
@@ -4918,7 +4919,8 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "HEX",
-        help = "Custom signet challenge script, hex (BIP 325). Signet only."
+        help = "Custom signet challenge script, hex (BIP 325). Signet only. Without it satd \
+                runs the default signet and verifies every block against its challenge."
     )]
     pub signetchallenge: Vec<String>,
 
