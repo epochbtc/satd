@@ -50,6 +50,8 @@ const dict = {
   'Syncing block headers: ${count}': 33,
   'Syncing block headers…': 34,
   'Syncing blocks: ${blocks} of ${headers}': 42,
+  'Rebuilding chainstate: ${current} of ${total} blocks (${percent}%)': 45,
+  'Starting: ${status}': 46,
 } as const
 
 export type LangDict = typeof dict

@@ -21,8 +21,9 @@ export const manifest = setupManifest({
         //
         // Between releases this pins a master commit's `sha-` image, which
         // docker.yml publishes unsigned for this purpose: the status page the
-        // UI opens onto first ships in 0.6.0. sync-store.sh refuses a `sha-`
-        // pin, so it cannot be published. The digest pins the OCI index, which
+        // UI opens onto, and the `upgradechainstate` switch satd-init writes,
+        // first ship in 0.6.0. sync-store.sh refuses a `sha-` pin, so it
+        // cannot be published. The digest pins the OCI index, which
         // resolves per architecture, so one pin covers amd64 and arm64.
         //
         // The `.s9pk` that was installed on a StartOS server was packed from
@@ -31,7 +32,7 @@ export const manifest = setupManifest({
         //
         // Pinning the 0.6.0 release, with versions/current.ts, is a step in the
         // release checklist.
-        dockerTag: 'ghcr.io/epochbtc/satd:sha-7d15a9c@sha256:ffd413c0ab277f69015de4f119a40343e051fc7d9fe3c75dc3d7b68722018285',
+        dockerTag: 'ghcr.io/epochbtc/satd:sha-5e73b1d@sha256:f1d65419241d2ee7efc56b46f6651a27a9657bd35059619c71dcaf809dc64b36',
       },
       // The image publishes linux/amd64 and linux/arm64 and nothing else, so
       // there is no riscv64 here and nothing to emulate it from.
