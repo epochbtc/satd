@@ -333,7 +333,7 @@ impl BackgroundChainState {
                 let block_data = serialize(block);
                 let mut flat = self.flat_files.lock();
                 let pos = flat
-                    .write_block(&block_data, network_magic(self.network))
+                    .write_block(&block_data, network_magic(self.network), new_height)
                     .map_err(|e| ChainError::FlatFile(e.to_string()))?;
                 // Same "data before the pointer" ordering
                 // `ChainState::write_block_durable` enforces, and for the same

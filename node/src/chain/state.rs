@@ -925,7 +925,7 @@ impl ChainState {
         } else {
             let block_data = serialize(&genesis);
             let pos = flat_files
-                .write_block(&block_data, network_magic(network))
+                .write_block(&block_data, network_magic(network), 0)
                 .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             // Same data-before-pointer ordering `write_block_durable`
             // enforces on the steady-state paths. This one runs once per
@@ -3630,10 +3630,14 @@ impl ChainState {
     /// means deferring `block_index` writes until the record they reference
     /// has been synced — Bitcoin Core's model — which is a larger change than
     /// this fix and is tracked separately.
-    fn write_block_durable(&self, block_data: &[u8]) -> Result<FlatFilePos, ChainError> {
+    fn write_block_durable(
+        &self,
+        block_data: &[u8],
+        height: u32,
+    ) -> Result<FlatFilePos, ChainError> {
         let mut flat = self.flat_files.lock();
         let pos = flat
-            .write_block(block_data, network_magic(self.network))
+            .write_block(block_data, network_magic(self.network), height)
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
         flat.sync_all()
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
@@ -4593,7 +4597,7 @@ impl ChainState {
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data)?;
+        let flat_pos = self.write_block_durable(&block_data, new_height)?;
 
         // Store block index entry as DataStored
         let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
@@ -4802,7 +4806,7 @@ impl ChainState {
         // while writing its batch *after* releasing that mutex — acquiring
         // them in the other order here would invert the pairing.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data)?;
+        let flat_pos = self.write_block_durable(&block_data, height)?;
 
         let _accept_guard = self.accept_lock.lock();
 
@@ -6725,7 +6729,7 @@ impl ChainState {
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data)?;
+        let flat_pos = self.write_block_durable(&block_data, new_height)?;
 
         // Check if this extends the current tip or is a side chain
         let current_tip = self.tip_hash();
@@ -8773,6 +8777,16 @@ impl ChainState {
 
     /// Delete the block files holding only blocks at or below `prune_below`,
     /// the target `pruneblockchain` names. Returns how many files went.
+    ///
+    /// A file goes only when *every* block stored in it is at or below the
+    /// cut: Core's rule, which compares each file's `nHeightLast` (the
+    /// highest height ever written to it) against the cut in
+    /// `FindFilesToPrune`. The heights come from the whole block index, not
+    /// from the active chain. IBD stores blocks as they arrive, far ahead of
+    /// the tip, so one file can hold blocks below the cut next to blocks the
+    /// connector has not reached yet. Planning from the active chain's
+    /// height rows saw only the first kind and deleted the file, and the
+    /// connector then retried the next block's vanished record forever.
     pub fn prune_up_to(&self, prune_below: u32) -> u32 {
         // One consistent snapshot of the tip the plan below is computed
         // against. The mutation section revalidates this exact (hash,
@@ -8785,33 +8799,44 @@ impl ChainState {
             return 0;
         }
 
-        // Collect file_numbers used by pruneable blocks (height <= prune_below)
-        let mut pruneable_files: std::collections::HashMap<u32, Vec<(BlockHash, u32)>> =
+        // Per file: the highest height of any block whose record is in it,
+        // and those blocks, whose entries are rewritten if it goes.
+        let mut files: std::collections::HashMap<u32, (u32, Vec<BlockHash>)> =
             std::collections::HashMap::new();
-        for h in 0..=prune_below {
-            if let Some(hash) = self.store.get_block_hash_by_height(h)
-                && let Some(entry) = self.store.get_block_index(&hash)
-                && entry.status == BlockStatus::Valid
-            {
-                pruneable_files
-                    .entry(entry.file_number)
-                    .or_default()
-                    .push((hash, h));
+        let scan = self.store.for_each_block_index(&mut |hash, entry| {
+            match entry.status {
+                BlockStatus::DataStored | BlockStatus::Valid => {}
+                // An invalidated block that was stored keeps its record for
+                // `reconsiderblock`, so it holds its file. One that never got
+                // past its header has no record: `num_tx` 0 and the
+                // placeholder file 0.
+                BlockStatus::Invalid if entry.num_tx > 0 => {}
+                _ => return,
             }
-        }
-
-        // Collect file_numbers used by recent blocks (must NOT be deleted)
-        let mut keep_files: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for h in (prune_below + 1)..=tip_height {
-            if let Some(hash) = self.store.get_block_hash_by_height(h)
-                && let Some(entry) = self.store.get_block_index(&hash)
-            {
-                keep_files.insert(entry.file_number);
+            let file = files.entry(entry.file_number).or_default();
+            file.0 = file.0.max(entry.height);
+            file.1.push(hash);
+        });
+        match scan {
+            Ok(stats) if stats.skipped_bad_key == 0 && stats.skipped_bad_value == 0 => {}
+            // A row that did not decode could be a block above the cut in
+            // any file, so no file can be shown safe to delete.
+            Ok(stats) => {
+                tracing::warn!(
+                    skipped_bad_key = stats.skipped_bad_key,
+                    skipped_bad_value = stats.skipped_bad_value,
+                    "block index has undecodable rows; not pruning"
+                );
+                return 0;
+            }
+            Err(e) => {
+                tracing::warn!("block index scan failed; not pruning: {}", e);
+                return 0;
             }
         }
 
         let mut deleted = 0u32;
-        // The walk above is read-only and ran unlocked, so by the time the
+        // The scan above is read-only and ran unlocked, so by the time the
         // mutation below — deleting block files and stamping `Pruned` — gets
         // the lock, the plan can be stale. Hold `accept_lock` for the whole
         // mutation section so it cannot interleave with a reorg reading old
@@ -8824,17 +8849,16 @@ impl ChainState {
 
         // Revalidate the plan now that the chain can no longer move. A tip
         // that *advanced* along the same chain keeps the plan conservative —
-        // new blocks land at heights above the walk's range, in the current
-        // append file (which `delete_file` refuses) or a newer one that is in
-        // neither list. But a reorg that *retreated* the tip while the walk
-        // ran — an `invalidateblock` deeper than `keep_blocks` — falsifies
-        // `keep_files`: the new, shorter chain's recent blocks can sit in
-        // `pruneable_files`, and executing the plan would delete the active
-        // chain's own files and stamp its blocks `Pruned`. The planned tip
-        // still sitting at its planned height on the active chain proves the
-        // whole ancestry the plan was computed from is unchanged (a block
-        // hash pins every ancestor below it); anything else means the plan
-        // is stale — skip this round and let the next prune cycle re-plan.
+        // new blocks land above the cut, and the flat-file check below keeps
+        // whatever file they went to. But a reorg that *retreated* the tip
+        // while the scan ran — an `invalidateblock` deeper than `keep_blocks`
+        // — leaves the cut above the new, shorter chain's recent blocks, and
+        // executing the plan would delete the active chain's own files and
+        // stamp its blocks `Pruned`. The planned tip still sitting at its
+        // planned height on the active chain proves the whole ancestry the
+        // plan was computed from is unchanged (a block hash pins every
+        // ancestor below it); anything else means the plan is stale — skip
+        // this round and let the next prune cycle re-plan.
         if self.store.get_block_hash_by_height(tip_height) != Some(planned_tip) {
             tracing::info!(
                 planned_height = tip_height,
@@ -8845,9 +8869,18 @@ impl ChainState {
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
 
-        for (file_num, blocks) in &pruneable_files {
-            // Only delete files that have NO recent blocks in them
-            if keep_files.contains(file_num) {
+        for (file_num, (highest, blocks)) in &files {
+            if *highest > prune_below {
+                continue;
+            }
+            // A block this process wrote after the scan read the index, or
+            // whose entry was still uncommitted when it did, is invisible to
+            // the plan. The flat-file manager recorded its height under the
+            // lock held here.
+            if flat_files
+                .highest_height_written(*file_num)
+                .is_some_and(|h| h > prune_below)
+            {
                 continue;
             }
             // Only delete if the file actually exists (not already pruned)
@@ -8858,13 +8891,37 @@ impl ChainState {
                 tracing::warn!(file = file_num, "Failed to delete block file: {}", e);
                 continue;
             }
-            // Mark all blocks in this file as Pruned
-            for (hash, height) in blocks {
-                if let Some(mut entry) = self.store.get_block_index(hash) {
-                    entry.status = BlockStatus::Pruned;
-                    batch.block_index_puts.push((*hash, entry));
+            // Rewrite the file's entries, re-reading each under the lock: the
+            // scan's view can be stale. One `repair_block_data` rewrote into
+            // another file still has its data and is left alone, and the
+            // status is the one it has now (an `invalidateblock` or
+            // `reconsiderblock` in between moved it).
+            for hash in blocks {
+                let Some(mut entry) = self.store.get_block_index(hash) else {
+                    continue;
+                };
+                if entry.file_number != *file_num {
+                    continue;
                 }
-                tracing::debug!(file = file_num, height, "Block data pruned");
+                match entry.status {
+                    BlockStatus::DataStored | BlockStatus::Valid => {
+                        entry.status = BlockStatus::Pruned;
+                    }
+                    // `Pruned` would drop the rejection. Keep `Invalid` and
+                    // drop the record instead, in the form a header-only
+                    // invalid entry has: `get_block` then answers "no data"
+                    // rather than reporting the deleted record as corruption,
+                    // and `reconsiderblock` restores it as `HeaderOnly`, a
+                    // block to download, not `DataStored` over nothing.
+                    BlockStatus::Invalid if entry.num_tx > 0 => {
+                        entry.num_tx = 0;
+                        entry.file_number = 0;
+                        entry.data_pos = 0;
+                    }
+                    _ => continue,
+                }
+                tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
+                batch.block_index_puts.push((*hash, entry));
             }
             deleted += 1;
             tracing::info!(file = file_num, "Deleted block file");
@@ -11646,6 +11703,325 @@ pub(crate) mod tests {
             cs.get_block_index(&hashes[3]).unwrap().status,
             BlockStatus::Pruned,
             "no Pruned stamp lands from a stale plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blocks 1..=n on regtest genesis, built but not accepted.
+    fn unaccepted_chain(n: u32) -> Vec<Block> {
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        (1..=n)
+            .map(|i| {
+                let block = build_test_block(parent, i, 1_300_000_000 + i);
+                parent = block.block_hash();
+                block
+            })
+            .collect()
+    }
+
+    /// IBD stores blocks as they arrive, far ahead of the tip, so one file
+    /// can hold blocks below the prune cut next to blocks the connector has
+    /// not reached. The plan used to come from the active chain's height
+    /// rows, which see only the first kind: it deleted the file, and the
+    /// connector then retried the next block's vanished record forever
+    /// ("failed to read stored block"). A pruned signet node in IBD stuck
+    /// that way at height 224153, after a prune at 224000 deleted seven files
+    /// that held blocks above the tip.
+    ///
+    /// Perturbation: count only the blocks at or below the tip toward a
+    /// file's height (what the height-row walk saw) and file 0 goes, taking
+    /// blocks 9 and 10 with it.
+    #[test]
+    fn prune_keeps_a_file_holding_blocks_stored_above_the_tip() {
+        let (cs, dir) = make_chain_state();
+        let blocks = unaccepted_chain(12);
+        // Headers first, as IBD has them, so blocks above the tip can be
+        // stored before their parents are.
+        for b in &blocks {
+            cs.accept_header(&b.header).expect("header");
+        }
+
+        // File 0: blocks 1..=4 connected, then 9 and 10 stored ahead of the tip.
+        for b in &blocks[..4] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        for b in &blocks[8..10] {
+            cs.store_block(b).expect("store ahead of the tip");
+        }
+
+        // Rotate the append file the way a restart after rotation would (see
+        // `a_stale_prune_plan_is_skipped_not_executed`). A fresh manager also
+        // forgets what this process wrote, so the block index is the plan's
+        // only source here, as it is on a restarted node.
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+
+        // File 1: blocks 5..=8 connected.
+        for b in &blocks[4..8] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        assert_eq!(cs.tip_height(), 8, "blocks 9 and 10 are stored, not connected");
+
+        // Every block at or below the cut is in file 0, and no connected
+        // block above it is: the height rows alone call file 0 deletable.
+        assert_eq!(cs.prune_up_to(4), 0, "file 0 holds blocks 9 and 10, above the tip");
+        assert!(cs.flat_files.lock().file_exists(0));
+
+        // The connector takes them from their records.
+        for b in &blocks[8..10] {
+            cs.connect_stored_block(&b.block_hash())
+                .expect("connects from its record in file 0");
+        }
+        for b in &blocks[10..] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        assert_eq!(cs.tip_height(), 12);
+
+        // Once the cut passes every block in it, file 0 goes, and all of its
+        // blocks are stamped `Pruned`, the ones stored ahead included.
+        assert_eq!(cs.prune_up_to(10), 1, "file 0 is deletable now");
+        assert!(!cs.flat_files.lock().file_exists(0));
+        for b in &blocks[..4] {
+            assert!(cs.is_pruned(&b.block_hash()));
+        }
+        for b in &blocks[8..10] {
+            assert!(cs.is_pruned(&b.block_hash()));
+        }
+        assert!(cs.flat_files.lock().file_exists(1), "file 1 holds blocks 11 and 12");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer commits a block's index entry only after its bytes are in and
+    /// the flat-file lock is released. A block in that window is on disk but
+    /// not in the index, so a scan-based plan calls its file deletable. The
+    /// flat-file manager's own record of the heights it wrote, updated under
+    /// the lock the prune holds, keeps the file.
+    ///
+    /// Perturbation: drop the `highest_height_written` check from
+    /// `prune_up_to` and file 0 is deleted under block 9's record.
+    #[test]
+    fn prune_keeps_a_file_holding_a_record_the_index_has_not_committed() {
+        let (cs, dir) = make_chain_state();
+        let blocks = unaccepted_chain(9);
+        let magic = network_magic(Network::Regtest);
+
+        // File 0: blocks 1..=4 connected, then block 9's bytes, with no entry.
+        for b in &blocks[..4] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        cs.flat_files
+            .lock()
+            .write_block(&serialize(&blocks[8]), magic, 9)
+            .expect("write block 9's record");
+
+        // Roll the append file past file 0 without replacing the manager: a
+        // record that does not fit a fast-prune file lands in file 1, and the
+        // next write rolls again.
+        {
+            let mut flat = cs.flat_files.lock();
+            flat.set_fast_prune(true);
+            let filler = vec![0u8; crate::storage::flatfile::FAST_PRUNE_FILE_SIZE as usize];
+            let pos = flat.write_block(&filler, magic, 0).expect("filler");
+            assert_eq!(pos.file_number, 1);
+        }
+        for b in &blocks[4..8] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        assert_eq!(cs.tip_height(), 8);
+        assert_eq!(
+            cs.get_block_index(&blocks[4].block_hash()).unwrap().file_number,
+            2,
+            "blocks 5..=8 are past file 0"
+        );
+
+        // The index shows file 0 holding blocks 0..=4 only.
+        assert_eq!(cs.prune_up_to(4), 0, "block 9's record is in file 0");
+        assert!(cs.flat_files.lock().file_exists(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block-index scan that fails, or skips rows it cannot decode, cannot
+    /// show that any file is free of blocks above the cut. Prune nothing.
+    ///
+    /// Perturbation: plan from whatever the scan visited before it failed and
+    /// file 0 is deleted.
+    #[test]
+    fn prune_deletes_nothing_when_the_block_index_scan_fails() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let blocks = unaccepted_chain(8);
+
+        // Blocks 1..=6 in file 0, 7..=8 in file 1: file 0 is deletable at a
+        // cut of 6.
+        for b in &blocks[..6] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for b in &blocks[6..] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+
+        controls.fail_block_index_scans(true);
+        assert_eq!(cs.prune_up_to(6), 0, "a failed scan proves nothing deletable");
+        assert!(cs.flat_files.lock().file_exists(0));
+
+        controls.fail_block_index_scans(false);
+        assert_eq!(cs.prune_up_to(6), 1, "the same prune goes ahead once the scan reads");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An invalidated block that was stored keeps its record for
+    /// `reconsiderblock`, so it holds its file like any other. One that never
+    /// got past its header has no record (`num_tx` 0, the placeholder file 0)
+    /// and must not hold file 0 hostage.
+    ///
+    /// Perturbations: skip `Invalid` entries and file 0 goes at a cut of 3,
+    /// under block 4's record; count every `Invalid` entry and file 0 stays
+    /// at a cut of 4, held by the header-only blocks 9 and 10; keep the
+    /// invalidated block's record pointer when its file goes and reading it
+    /// reports corruption.
+    #[test]
+    fn prune_counts_an_invalidated_block_only_if_it_was_stored() {
+        let (cs, dir) = make_chain_state();
+        let blocks = unaccepted_chain(10);
+
+        // File 0: blocks 1..=3, then a competing block 4 that connects and is
+        // invalidated, leaving its record behind.
+        for b in &blocks[..3] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        let fork = build_test_block(blocks[2].block_hash(), 4, 1_300_000_999);
+        assert!(cs.accept_block(&fork).expect("accept fork").connected());
+        cs.invalidate_block(fork.block_hash()).expect("invalidate the fork");
+        assert_eq!(cs.tip_height(), 3);
+
+        // File 1: blocks 4..=8.
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for b in &blocks[3..8] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        assert_eq!(cs.tip_height(), 8);
+
+        // Blocks 9 and 10 as headers only, then invalidated.
+        for b in &blocks[8..] {
+            cs.accept_header(&b.header).expect("header");
+        }
+        cs.invalidate_block(blocks[8].block_hash()).expect("invalidate the headers");
+        for b in &blocks[8..] {
+            let entry = cs.get_block_index(&b.block_hash()).unwrap();
+            assert_eq!(entry.status, BlockStatus::Invalid);
+            assert_eq!((entry.num_tx, entry.file_number), (0, 0), "no record");
+        }
+
+        assert_eq!(cs.prune_up_to(3), 0, "the invalidated block 4 is stored in file 0");
+        assert!(cs.get_block(&fork.block_hash()).is_some());
+
+        assert_eq!(cs.prune_up_to(4), 1, "headers alone do not hold file 0");
+        assert!(!cs.flat_files.lock().file_exists(0));
+        assert_eq!(
+            cs.get_block_index(&fork.block_hash()).unwrap().status,
+            BlockStatus::Invalid,
+            "an invalidated block keeps its status when its file goes"
+        );
+
+        // Its record went with the file, and it says so: a read is "no data",
+        // not local corruption, and reconsidering it asks for the block
+        // rather than claiming it is stored.
+        assert!(cs.get_block(&fork.block_hash()).is_none());
+        let corrupt = format!("blockdata.corrupt.{}", fork.block_hash());
+        assert!(
+            cs.warnings().list().iter().all(|w| w.id != corrupt),
+            "a pruned record is not corruption"
+        );
+        cs.reconsider_block(fork.block_hash()).expect("reconsider the fork");
+        assert_eq!(
+            cs.get_block_index(&fork.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The plan names each file's blocks as the scan saw them; the entries
+    /// are rewritten under `accept_lock`, later, from what they say then. One
+    /// repointed into another file (what `repair_block_data` does) still has
+    /// its record there and is left alone. One invalidated in between keeps
+    /// `Invalid` and loses its record. One that was stored `Invalid` at the
+    /// scan and reconsidered in between claims data again, and must be
+    /// stamped `Pruned` like any other.
+    ///
+    /// Perturbations: stamp every planned hash without re-reading it and
+    /// blocks 2 and 3 come back `Pruned`; leave stored `Invalid` entries out
+    /// of the plan's list and block 4 comes back `DataStored` over a deleted
+    /// file.
+    #[test]
+    fn prune_stamps_only_the_blocks_still_recorded_in_the_deleted_file() {
+        let (cs, dir) = make_chain_state();
+        let blocks = unaccepted_chain(8);
+        for b in &blocks[..6] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for b in &blocks[6..] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+
+        let (h1, h2, h3) = (blocks[0].block_hash(), blocks[1].block_hash(), blocks[2].block_hash());
+        let h4 = blocks[3].block_hash();
+        // Block 4 as the scan will see it: stored, and marked invalid.
+        let mut stored_invalid = cs.get_block_index(&h4).unwrap();
+        stored_invalid.status = BlockStatus::Invalid;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((h4, stored_invalid));
+        cs.store.write_batch(batch).unwrap();
+
+        let deleted = std::thread::scope(|s| {
+            // Hold the lock the mutation section needs, so the prune plans
+            // (the scan takes no lock) and then waits.
+            let guard = cs.accept_lock.lock();
+            let prune = s.spawn(|| cs.prune_up_to(6));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            let mut batch = crate::storage::StoreBatch::default();
+            let mut repaired = cs.get_block_index(&h2).unwrap();
+            repaired.file_number = 1;
+            batch.block_index_puts.push((h2, repaired));
+            let mut invalidated = cs.get_block_index(&h3).unwrap();
+            invalidated.status = BlockStatus::Invalid;
+            batch.block_index_puts.push((h3, invalidated));
+            // What `reconsiderblock` does to a stored invalid block.
+            let mut reconsidered = cs.get_block_index(&h4).unwrap();
+            reconsidered.status = BlockStatus::DataStored;
+            batch.block_index_puts.push((h4, reconsidered));
+            cs.store.write_batch(batch).unwrap();
+
+            drop(guard);
+            prune.join().unwrap()
+        });
+
+        assert_eq!(deleted, 1);
+        assert!(!cs.flat_files.lock().file_exists(0));
+        assert!(cs.is_pruned(&h1));
+        assert_eq!(
+            cs.get_block_index(&h2).unwrap().status,
+            BlockStatus::Valid,
+            "block 2's record is in file 1 now"
+        );
+        let e3 = cs.get_block_index(&h3).unwrap();
+        assert_eq!(e3.status, BlockStatus::Invalid);
+        assert_eq!(e3.num_tx, 0, "block 3's record went with the file");
+        assert!(
+            cs.is_pruned(&h4),
+            "block 4 claimed data in the deleted file again: {:?}",
+            cs.get_block_index(&h4).unwrap().status
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -16801,6 +17177,7 @@ pub(crate) mod tests {
             .write_block(
                 &bitcoin::consensus::serialize(&sibling),
                 network_magic(Network::Regtest),
+                2,
             )
             .expect("write corrupt sibling record");
 
@@ -17396,6 +17773,7 @@ pub(crate) mod tests {
             .write_block(
                 &bitcoin::consensus::serialize(block),
                 network_magic(Network::Regtest),
+                height,
             )
             .expect("write block record");
         let parent = cs
@@ -17473,6 +17851,7 @@ pub(crate) mod tests {
             .write_block(
                 &bitcoin::consensus::serialize(&corrupted),
                 network_magic(Network::Regtest),
+                2,
             )
             .expect("write corrupted record");
         cs.flush_coin_cache().expect("flush before clearing");
@@ -17936,8 +18315,8 @@ pub(crate) mod tests {
         // the duplicate records a real datadir accumulates.
         {
             let mut flat = cs.flat_files.lock();
-            for b in &blocks[1..3] {
-                flat.write_block(&serialize(b), network_magic(Network::Regtest))
+            for (b, height) in blocks[1..3].iter().zip(2..) {
+                flat.write_block(&serialize(b), network_magic(Network::Regtest), height)
                     .expect("write duplicate record");
             }
         }

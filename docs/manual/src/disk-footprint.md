@@ -358,6 +358,12 @@ them. A block you hold only the header for is not repaired either — it is
 downloaded through the normal path, which applies the checkpoint and signet
 checks and connects it.
 
+A pruned node cannot repair a block above its tip: in prune mode
+`getblockfrompeer` refuses any block the node has not synced past, as Core's
+does. If initial sync stops on such a block with `failed to read stored block`,
+the node has to resync. Before 0.6.0, pruning could cause exactly that by
+deleting a file that still held blocks downloaded ahead of the tip.
+
 To find holes ahead of time rather than discovering them through a failed
 backfill, use the block-file audit:
 
