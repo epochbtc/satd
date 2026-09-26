@@ -358,11 +358,14 @@ them. A block you hold only the header for is not repaired either — it is
 downloaded through the normal path, which applies the checkpoint and signet
 checks and connects it.
 
-A pruned node cannot repair a block above its tip: in prune mode
-`getblockfrompeer` refuses any block the node has not synced past, as Core's
-does. If initial sync stops on such a block with `failed to read stored block`,
-the node has to resync. Before 0.6.0, pruning could cause exactly that by
-deleting a file that still held blocks downloaded ahead of the tip.
+A block the node has stored but not yet connected needs none of this. When
+the connector reaches one whose record is gone, it asks a peer for the block
+itself on the same route, logging
+`Stored block has no readable record; fetching it again from a peer`, and
+connects the copy. That matters on a pruned node, where `getblockfrompeer`
+refuses any block above the tip, as Core's does. Before 0.6.0, pruning could
+delete a file that still held such blocks, and the node stopped for good on
+the first one.
 
 To find holes ahead of time rather than discovering them through a failed
 backfill, use the block-file audit:

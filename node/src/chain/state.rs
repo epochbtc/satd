@@ -105,8 +105,17 @@ pub enum ChainError {
     Connect(#[from] connect::ConnectError),
     #[error("{0}")]
     Storage(#[from] StoreError),
-    #[error("block file write failed: {0}")]
+    /// A block file could not be written, read, or scanned; the message says
+    /// which. (It used to read "block file write failed" whatever the
+    /// operation, so a node that could not *read* a block reported a write.)
+    #[error("block file error: {0}")]
     FlatFile(String),
+    /// A block the index records as stored has no readable record: its file
+    /// is gone, or the bytes at its offset are not that block. Distinct from
+    /// [`Self::FlatFile`] because the remedy is different: the block can be
+    /// fetched again from a peer, and the connector does that (#852).
+    #[error("stored block data unreadable: {0}")]
+    BlockDataUnreadable(String),
     #[error("{0}")]
     Disconnect(#[from] disconnect::DisconnectError),
     #[error("snapshot load failed: {0}")]
@@ -4947,7 +4956,10 @@ impl ChainState {
         };
         let Some(block) = self.read_block_direct(&flat_pos) else {
             phases.enter(ConnectPhase::Idle);
-            return Err(ChainError::FlatFile("failed to read stored block".to_string()));
+            return Err(ChainError::BlockDataUnreadable(format!(
+                "no record for block {hash} at blk{:05}.dat offset {}",
+                flat_pos.file_number, flat_pos.data_pos
+            )));
         };
         // Verify the record is the block the entry claims, exactly as
         // `get_block` and the reindex paths (`require_planned_block`) do. A
@@ -4967,7 +4979,7 @@ impl ChainState {
                 "block index entry points at a different block's record"
             );
             phases.enter(ConnectPhase::Idle);
-            return Err(ChainError::FlatFile(format!(
+            return Err(ChainError::BlockDataUnreadable(format!(
                 "block {hash}: stored record holds {} instead",
                 block.block_hash()
             )));
@@ -17765,6 +17777,55 @@ pub(crate) mod tests {
 
     /// Put a block on disk and in the block index without connecting it — the
     /// state a reindex finds for every block above the chainstate's tip.
+    /// A stored block whose record is gone is its own error, not a block-file
+    /// failure: the connector fetches such a block again, which it cannot do
+    /// for a disk fault. It also said "block file write failed" for a read
+    /// (#852).
+    ///
+    /// Perturbation: return `FlatFile` from `connect_stored_block`'s read
+    /// again and this fails on the variant.
+    #[test]
+    fn a_stored_block_with_no_record_is_unreadable_not_a_write_failure() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let h1 = cs.accept_block(&b1).expect("connect block 1").hash();
+        let b2 = build_test_block(h1, 2, 1_707_000_001);
+        let (accepted, err) = cs.accept_headers(&[b2.header]);
+        assert_eq!(accepted, 1, "fixture: header accepted ({err:?})");
+        store_block_without_connecting(&cs, &b2, 2);
+        roll_append_file(&cs);
+        std::fs::remove_file(cs.blocks_dir().join("blk00000.dat")).unwrap();
+
+        let e = cs
+            .connect_stored_block(&b2.block_hash())
+            .expect_err("block 2 has no record");
+        assert!(
+            matches!(&e, ChainError::BlockDataUnreadable(detail) if detail.contains("blk00000.dat")),
+            "{e:?}"
+        );
+        let text = e.to_string();
+        assert!(text.starts_with("stored block data unreadable"), "{text}");
+        assert!(!text.contains("write"), "a failed read is not a write: {text}");
+        assert_eq!(
+            ChainError::FlatFile("No space left on device".into()).to_string(),
+            "block file error: No space left on device"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Start appending to a fresh block file, as a restart after rotation
+    /// would: `FlatFileManager::new` adopts the highest-numbered file present.
+    /// Leaves every earlier file closed for writing, so a test can lose one.
+    pub(crate) fn roll_append_file(cs: &ChainState) {
+        let next = (1..)
+            .find(|n| !cs.blocks_dir().join(format!("blk{n:05}.dat")).exists())
+            .unwrap();
+        std::fs::write(cs.blocks_dir().join(format!("blk{next:05}.dat")), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+    }
+
     pub(crate) fn store_block_without_connecting(cs: &ChainState, block: &Block, height: u32) {
         use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
         let pos = cs
