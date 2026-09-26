@@ -20,10 +20,11 @@ version: "3.7"
 #
 # Between releases this pins a master commit's `sha-` image, which docker.yml
 # publishes unsigned for exactly this: the status page this package opens
-# onto first ships in 0.6.0. `contrib/packaging/sync-store.sh` refuses a
+# onto, and the `upgradechainstate` switch its satd-init writes, first ship
+# in 0.6.0. `contrib/packaging/sync-store.sh` refuses a
 # `sha-` pin, so it cannot reach the store; when 0.6.0 is released, pin that
 # tag and bump `version` with it (a step in the release checklist).
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-7d15a9c@sha256:ffd413c0ab277f69015de4f119a40343e051fc7d9fe3c75dc3d7b68722018285
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-5e73b1d@sha256:f1d65419241d2ee7efc56b46f6651a27a9657bd35059619c71dcaf809dc64b36
 
 services:
   app_proxy:
