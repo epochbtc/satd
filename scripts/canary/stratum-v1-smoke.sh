@@ -31,7 +31,9 @@ WORK="$(mktemp -d /tmp/satd-canary-stratum-v1.XXXXXX)"
 MINERD_PID=""
 
 cleanup() {
-    if [[ -n "$MINERD_PID" ]]; then kill "$MINERD_PID" 2>/dev/null || true; fi
+    # SIGCONT too: a miner paused for the fill (step 4) holds SIGTERM until
+    # it runs again.
+    if [[ -n "$MINERD_PID" ]]; then kill "$MINERD_PID" 2>/dev/null || true; kill -CONT "$MINERD_PID" 2>/dev/null || true; fi
     stop_core_peer
     stop_satd
 }
@@ -97,6 +99,12 @@ assert_core_accepted_all_found
 # ── 4. A full block ──
 # Core's wallet sends 150 transactions of 250 outputs each (about 34,000 WU
 # apiece, 5 MWU in all), which satd receives over P2P: more than a block.
+# Sending them takes longer than cpuminer takes to find a block, and a block
+# found mid-fill takes the transactions already relayed out of the mempool,
+# so it never holds all 150. The miner is paused until the next job is built
+# from the full mempool. At about a share a minute, satd's idle limit (20 share
+# intervals) is some 20 minutes, far longer than the pause.
+kill -STOP "$MINERD_PID"
 echo "filling the mempool from Core's wallet..."
 docker exec "$CORE_PEER_CONTAINER" sh -c '
     cli() { bitcoin-cli -regtest -rpcport='"$CORE_PEER_RPC_PORT"' -rpcuser='"$CORE_PEER_RPCUSER"' -rpcpassword='"$CORE_PEER_RPCPASSWORD"' -rpcwallet=canary "$@"; }
@@ -115,6 +123,7 @@ echo "ok: satd's mempool holds $(sat_cli getmempoolinfo | jq .size) transactions
 sat_cli generateblock "$STRATUM_PAYOUT_ADDR" '[]' >/dev/null
 FILLED_AT="$(sat_cli getblockcount)"
 found_before="$(stratum_found_hashes | wc -l)"
+kill -CONT "$MINERD_PID"
 deadline=$(($(date +%s) + 600))
 FULL=""
 while [[ $(date +%s) -lt $deadline ]]; do
