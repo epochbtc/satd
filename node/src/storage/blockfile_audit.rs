@@ -376,8 +376,8 @@ mod tests {
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
         let block_a = vec![0xAAu8; 1024];
         let block_b = vec![0xBBu8; 2048];
-        let pos_a = flat.write_block(&block_a, magic).unwrap();
-        let pos_b = flat.write_block(&block_b, magic).unwrap();
+        let pos_a = flat.write_block(&block_a, magic, 0).unwrap();
+        let pos_b = flat.write_block(&block_b, magic, 0).unwrap();
         drop(flat);
 
         let store = open_store(&db_dir);
@@ -417,9 +417,9 @@ mod tests {
         let block_a = vec![0xAAu8; 1024];
         let block_b = vec![0xBBu8; 4096];
         let block_c = vec![0xCCu8; 512];
-        let pos_a = flat.write_block(&block_a, magic).unwrap();
-        let _pos_b = flat.write_block(&block_b, magic).unwrap();
-        let pos_c = flat.write_block(&block_c, magic).unwrap();
+        let pos_a = flat.write_block(&block_a, magic, 0).unwrap();
+        let _pos_b = flat.write_block(&block_b, magic, 0).unwrap();
+        let pos_c = flat.write_block(&block_c, magic, 0).unwrap();
         drop(flat);
 
         let store = open_store(&db_dir);
@@ -456,7 +456,7 @@ mod tests {
 
         let mut flat = FlatFileManager::new(&blocks_dir).unwrap();
         let pos = flat
-            .write_block(&[0u8; 128], [0xfa, 0xbf, 0xb5, 0xda])
+            .write_block(&[0u8; 128], [0xfa, 0xbf, 0xb5, 0xda], 0)
             .unwrap();
         drop(flat);
 
@@ -561,7 +561,7 @@ mod tests {
         let mut flat = FlatFileManager::new(&blocks_dir).unwrap();
         let block_a = vec![0xAAu8; 512];
         let _pos = flat
-            .write_block(&block_a, [0xfa, 0xbf, 0xb5, 0xda])
+            .write_block(&block_a, [0xfa, 0xbf, 0xb5, 0xda], 0)
             .unwrap();
         drop(flat);
 
