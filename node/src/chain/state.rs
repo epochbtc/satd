@@ -8800,24 +8800,22 @@ impl ChainState {
         }
 
         // Per file: the highest height of any block whose record is in it,
-        // and the blocks to stamp `Pruned` if it goes.
+        // and those blocks, whose entries are rewritten if it goes.
         let mut files: std::collections::HashMap<u32, (u32, Vec<BlockHash>)> =
             std::collections::HashMap::new();
         let scan = self.store.for_each_block_index(&mut |hash, entry| {
-            let stamp = match entry.status {
-                BlockStatus::DataStored | BlockStatus::Valid => true,
+            match entry.status {
+                BlockStatus::DataStored | BlockStatus::Valid => {}
                 // An invalidated block that was stored keeps its record for
-                // `reconsiderblock`, so it holds its file but keeps its
-                // status. One that never got past its header has no record:
-                // `num_tx` 0 and the placeholder file 0.
-                BlockStatus::Invalid if entry.num_tx > 0 => false,
+                // `reconsiderblock`, so it holds its file. One that never got
+                // past its header has no record: `num_tx` 0 and the
+                // placeholder file 0.
+                BlockStatus::Invalid if entry.num_tx > 0 => {}
                 _ => return,
-            };
+            }
             let file = files.entry(entry.file_number).or_default();
             file.0 = file.0.max(entry.height);
-            if stamp {
-                file.1.push(hash);
-            }
+            file.1.push(hash);
         });
         match scan {
             Ok(stats) if stats.skipped_bad_key == 0 && stats.skipped_bad_value == 0 => {}
@@ -8893,19 +8891,37 @@ impl ChainState {
                 tracing::warn!(file = file_num, "Failed to delete block file: {}", e);
                 continue;
             }
-            // Stamp the file's blocks `Pruned`, re-reading each under the
-            // lock: one invalidated since the scan keeps `Invalid`, and one
-            // `repair_block_data` rewrote into another file still has its
-            // data.
+            // Rewrite the file's entries, re-reading each under the lock: the
+            // scan's view can be stale. One `repair_block_data` rewrote into
+            // another file still has its data and is left alone, and the
+            // status is the one it has now (an `invalidateblock` or
+            // `reconsiderblock` in between moved it).
             for hash in blocks {
-                if let Some(mut entry) = self.store.get_block_index(hash)
-                    && matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid)
-                    && entry.file_number == *file_num
-                {
-                    tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
-                    entry.status = BlockStatus::Pruned;
-                    batch.block_index_puts.push((*hash, entry));
+                let Some(mut entry) = self.store.get_block_index(hash) else {
+                    continue;
+                };
+                if entry.file_number != *file_num {
+                    continue;
                 }
+                match entry.status {
+                    BlockStatus::DataStored | BlockStatus::Valid => {
+                        entry.status = BlockStatus::Pruned;
+                    }
+                    // `Pruned` would drop the rejection. Keep `Invalid` and
+                    // drop the record instead, in the form a header-only
+                    // invalid entry has: `get_block` then answers "no data"
+                    // rather than reporting the deleted record as corruption,
+                    // and `reconsiderblock` restores it as `HeaderOnly`, a
+                    // block to download, not `DataStored` over nothing.
+                    BlockStatus::Invalid if entry.num_tx > 0 => {
+                        entry.num_tx = 0;
+                        entry.file_number = 0;
+                        entry.data_pos = 0;
+                    }
+                    _ => continue,
+                }
+                tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
+                batch.block_index_puts.push((*hash, entry));
             }
             deleted += 1;
             tracing::info!(file = file_num, "Deleted block file");
@@ -11867,7 +11883,9 @@ pub(crate) mod tests {
     ///
     /// Perturbations: skip `Invalid` entries and file 0 goes at a cut of 3,
     /// under block 4's record; count every `Invalid` entry and file 0 stays
-    /// at a cut of 4, held by the header-only blocks 9 and 10.
+    /// at a cut of 4, held by the header-only blocks 9 and 10; keep the
+    /// invalidated block's record pointer when its file goes and reading it
+    /// reports corruption.
     #[test]
     fn prune_counts_an_invalidated_block_only_if_it_was_stored() {
         let (cs, dir) = make_chain_state();
@@ -11913,17 +11931,36 @@ pub(crate) mod tests {
             "an invalidated block keeps its status when its file goes"
         );
 
+        // Its record went with the file, and it says so: a read is "no data",
+        // not local corruption, and reconsidering it asks for the block
+        // rather than claiming it is stored.
+        assert!(cs.get_block(&fork.block_hash()).is_none());
+        let corrupt = format!("blockdata.corrupt.{}", fork.block_hash());
+        assert!(
+            cs.warnings().list().iter().all(|w| w.id != corrupt),
+            "a pruned record is not corruption"
+        );
+        cs.reconsider_block(fork.block_hash()).expect("reconsider the fork");
+        assert_eq!(
+            cs.get_block_index(&fork.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The plan names each file's blocks as the scan saw them; the stamp is
-    /// written under `accept_lock`, later. An entry invalidated in between
-    /// keeps `Invalid`, and one repointed into another file (what
-    /// `repair_block_data` does) still has its record there, so neither is
-    /// stamped `Pruned`.
+    /// The plan names each file's blocks as the scan saw them; the entries
+    /// are rewritten under `accept_lock`, later, from what they say then. One
+    /// repointed into another file (what `repair_block_data` does) still has
+    /// its record there and is left alone. One invalidated in between keeps
+    /// `Invalid` and loses its record. One that was stored `Invalid` at the
+    /// scan and reconsidered in between claims data again, and must be
+    /// stamped `Pruned` like any other.
     ///
-    /// Perturbation: stamp every planned hash without re-reading it and
-    /// blocks 2 and 3 both come back `Pruned`.
+    /// Perturbations: stamp every planned hash without re-reading it and
+    /// blocks 2 and 3 come back `Pruned`; leave stored `Invalid` entries out
+    /// of the plan's list and block 4 comes back `DataStored` over a deleted
+    /// file.
     #[test]
     fn prune_stamps_only_the_blocks_still_recorded_in_the_deleted_file() {
         let (cs, dir) = make_chain_state();
@@ -11938,6 +11975,14 @@ pub(crate) mod tests {
         }
 
         let (h1, h2, h3) = (blocks[0].block_hash(), blocks[1].block_hash(), blocks[2].block_hash());
+        let h4 = blocks[3].block_hash();
+        // Block 4 as the scan will see it: stored, and marked invalid.
+        let mut stored_invalid = cs.get_block_index(&h4).unwrap();
+        stored_invalid.status = BlockStatus::Invalid;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((h4, stored_invalid));
+        cs.store.write_batch(batch).unwrap();
+
         let deleted = std::thread::scope(|s| {
             // Hold the lock the mutation section needs, so the prune plans
             // (the scan takes no lock) and then waits.
@@ -11952,6 +11997,10 @@ pub(crate) mod tests {
             let mut invalidated = cs.get_block_index(&h3).unwrap();
             invalidated.status = BlockStatus::Invalid;
             batch.block_index_puts.push((h3, invalidated));
+            // What `reconsiderblock` does to a stored invalid block.
+            let mut reconsidered = cs.get_block_index(&h4).unwrap();
+            reconsidered.status = BlockStatus::DataStored;
+            batch.block_index_puts.push((h4, reconsidered));
             cs.store.write_batch(batch).unwrap();
 
             drop(guard);
@@ -11966,7 +12015,14 @@ pub(crate) mod tests {
             BlockStatus::Valid,
             "block 2's record is in file 1 now"
         );
-        assert_eq!(cs.get_block_index(&h3).unwrap().status, BlockStatus::Invalid);
+        let e3 = cs.get_block_index(&h3).unwrap();
+        assert_eq!(e3.status, BlockStatus::Invalid);
+        assert_eq!(e3.num_tx, 0, "block 3's record went with the file");
+        assert!(
+            cs.is_pruned(&h4),
+            "block 4 claimed data in the deleted file again: {:?}",
+            cs.get_block_index(&h4).unwrap().status
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

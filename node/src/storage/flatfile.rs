@@ -572,7 +572,6 @@ impl FlatFileManager {
             ));
         }
         self.read_cache.remove(&file_number);
-        self.highest_height.remove(&file_number);
         let path = self.file_path(file_number);
         if path.exists() {
             // Read the size before the unlink: afterwards there is nothing
@@ -582,6 +581,9 @@ impl FlatFileManager {
             std::fs::remove_file(&path)?;
             self.total_bytes = self.total_bytes.saturating_sub(freed);
         }
+        // Only once the file is gone: a file that failed to unlink still holds
+        // what this process wrote to it, and the next prune round must see it.
+        self.highest_height.remove(&file_number);
         Ok(())
     }
 
@@ -1217,6 +1219,41 @@ mod tests {
         assert_eq!(mgr.read_block(&a).unwrap(), vec![0xAA; 256]);
         assert_eq!(mgr.read_block(&b).unwrap(), vec![0xBB; 128]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that fails to unlink still holds what this process wrote to it,
+    /// so it keeps its recorded height: the next prune round must not see an
+    /// empty record and delete it under an index entry still being committed.
+    ///
+    /// Perturbation: forget the height before the unlink and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_fails_to_unlink_keeps_its_recorded_height() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("failed-unlink");
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        mgr.write_block(b"a block", magic, 9).unwrap();
+        // Move the append file on so file 0 may be deleted at all.
+        mgr.current_file = 1;
+        mgr.current_pos = 0;
+        mgr.write_handle = None;
+
+        // A read-only directory refuses the unlink, except to root, which this
+        // test cannot make fail that way.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let unlink = mgr.delete_file(0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unlink.is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(mgr.file_exists(0));
+        assert_eq!(mgr.highest_height_written(0), Some(9));
+
+        mgr.delete_file(0).unwrap();
+        assert_eq!(mgr.highest_height_written(0), None, "a deleted file is forgotten");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
