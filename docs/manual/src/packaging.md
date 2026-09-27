@@ -195,6 +195,11 @@ container image below carries the first-run tooling all three use
 (`satd-init`, `satd-mkca`), so a package built on that image gets the same
 behaviour without reimplementing it.
 
+For test networks, `contrib/warnet/` builds a variant of the container
+image that [Warnet](https://github.com/bitcoin-dev-project/warnet)'s stock
+Bitcoin Core Helm chart runs unchanged, with example networks and keyless
+scenarios. It is not an operator image; see `contrib/warnet/README.md`.
+
 ## Container
 
 The repository ships a multi-stage `Dockerfile` at the repo root.

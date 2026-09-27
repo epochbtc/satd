@@ -100,6 +100,20 @@ jobs:
           echo "sat-cli:"
           docker run --rm --entrypoint /usr/local/bin/sat-cli satd:ci --version
 
+      # contrib/warnet builds a lab variant of this image for Warnet's stock
+      # Bitcoin Core Helm chart. Build it FROM the image just tested and run
+      # two tanks on the chart's rendered bitcoin.conf, so a change to the
+      # runtime image, the config parser or sat-cli that breaks the chart's
+      # assumptions fails here. amd64 only: the check is layout, not arch.
+      - name: Warnet lab image — contract + two-tank compose test
+        if: matrix.slug == 'amd64'
+        run: |
+          set -euo pipefail
+          contrib/warnet/tests/contract-test.sh
+          contrib/warnet/tests/scenario-lint.sh
+          docker build --build-arg SATD_IMAGE=satd:ci -t satd-warnet:local contrib/warnet
+          SATD_WARNET_IMAGE=satd-warnet:local contrib/warnet/tests/compose-test.sh
+
       # --- publish a per-commit reference ----------------------------------
       #
       # Until now no image existed between releases: this workflow built one
