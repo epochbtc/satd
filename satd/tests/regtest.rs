@@ -15933,6 +15933,38 @@ fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
     );
 }
 
+/// `mocktime=` in `bitcoin.conf` sets the node clock at startup, as the
+/// `-mocktime` flag does and as Bitcoin Core reads it from the file. The
+/// first block's timestamp is the proof: the template takes the mocked time.
+#[test]
+fn mocktime_in_bitcoin_conf_sets_the_clock_at_startup() {
+    // In the past (2017): after the regtest genesis, behind real time.
+    const MOCK: u64 = 1_500_000_000;
+    let datadir = fresh_test_datadir("satd-mocktime-conf");
+    std::fs::write(
+        datadir.join("bitcoin.conf"),
+        format!("regtest=1\nmocktime={MOCK}\n"),
+    )
+    .unwrap();
+    let node = TestNode::start_with_datadir(&datadir, find_available_port(), &[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    let r = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let hash = r["result"][0].as_str().expect("block hash").to_string();
+    let block = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(hash)])
+        .unwrap();
+    assert_eq!(
+        block["result"]["time"].as_u64(),
+        Some(MOCK),
+        "the block template must take the clock set by mocktime= in bitcoin.conf: {block}"
+    );
+}
+
 /// `setmocktime` moves the node clock that block templates, the future-block
 /// check and mempool expiry all read. Core gates it to a mockable chain —
 /// regtest alone — and satd matches that; on top, satd carves it out of
