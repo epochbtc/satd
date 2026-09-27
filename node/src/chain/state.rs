@@ -8798,6 +8798,10 @@ impl ChainState {
         if prune_below >= tip_height {
             return 0;
         }
+        // Every record goes to the file being appended to at the time, so a
+        // record written from here on lands in this file or one the append
+        // moves into later. None of those is deleted this round (see below).
+        let append_file_at_plan = self.flat_files.lock().current_file();
 
         // Per file: the highest height of any block whose record is in it,
         // and those blocks, whose entries are rewritten if it goes.
@@ -8868,9 +8872,17 @@ impl ChainState {
         }
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
+        // The files appended to since the plan began. The scan listed what
+        // they held then, not what went into them since: a
+        // `repair_block_data` in between writes a block below the cut into
+        // one and repoints its entry there, out of the file the plan listed
+        // it under, and the append can then move past it. Everything the
+        // plan knows about such a file can be at or below the cut, and
+        // deleting it would leave the repaired entry over a deleted record.
+        let appended_since_plan = append_file_at_plan..=flat_files.current_file();
 
         for (file_num, (highest, blocks)) in &files {
-            if *highest > prune_below {
+            if *highest > prune_below || appended_since_plan.contains(file_num) {
                 continue;
             }
             // A block this process wrote after the scan read the index, or
@@ -8892,10 +8904,11 @@ impl ChainState {
                 continue;
             }
             // Rewrite the file's entries, re-reading each under the lock: the
-            // scan's view can be stale. One `repair_block_data` rewrote into
-            // another file still has its data and is left alone, and the
-            // status is the one it has now (an `invalidateblock` or
-            // `reconsiderblock` in between moved it).
+            // scan's view can be stale. One that a `repair_block_data`
+            // rewrote into another file after the plan began went to a file
+            // appended to since, which this round keeps: it still has its
+            // data and is left alone. The status is the one it has now (an
+            // `invalidateblock` or `reconsiderblock` in between moved it).
             for hash in blocks {
                 let Some(mut entry) = self.store.get_block_index(hash) else {
                     continue;
@@ -12023,6 +12036,91 @@ pub(crate) mod tests {
             "block 4 claimed data in the deleted file again: {:?}",
             cs.get_block_index(&h4).unwrap().status
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The plan lists each file's blocks as the scan saw them. A
+    /// `repair_block_data` after the scan writes a block below the cut into
+    /// the file being appended to and repoints its entry there, and the
+    /// append can move on before the prune gets the lock. The plan lists
+    /// nothing above the cut in that file, and the repaired block is listed
+    /// under the file it left. Deleting the file would leave the repaired
+    /// entry over a deleted record; the files appended to since the plan
+    /// began are kept.
+    ///
+    /// Perturbation: drop the `appended_since_plan` check and file 2 is
+    /// deleted under block 2's repaired record.
+    #[test]
+    fn prune_keeps_a_file_appended_to_after_the_plan() {
+        let (cs, dir) = make_chain_state();
+        let blocks = unaccepted_chain(8);
+        let magic = network_magic(Network::Regtest);
+
+        // File 0: blocks 1..=4. File 1: blocks 5..=8.
+        for b in &blocks[..4] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for b in &blocks[4..] {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+
+        // File 2, the append file when the prune plans: block 3, repaired
+        // into it earlier, so everything the plan sees in it is below the cut.
+        std::fs::write(cs.blocks_dir().join("blk00002.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        let repoint = |cs: &ChainState, block: &Block, height: u32| {
+            let hash = block.block_hash();
+            let pos = cs
+                .flat_files
+                .lock()
+                .write_block(&serialize(block), magic, height)
+                .expect("write the repaired record");
+            assert_eq!(pos.file_number, 2);
+            let mut entry = cs.get_block_index(&hash).unwrap();
+            entry.file_number = pos.file_number;
+            entry.data_pos = pos.data_pos;
+            let mut batch = crate::storage::StoreBatch::default();
+            batch.block_index_puts.push((hash, entry));
+            cs.store.write_batch(batch).unwrap();
+        };
+        repoint(&cs, &blocks[2], 3);
+
+        let (h1, h2, h3) = (blocks[0].block_hash(), blocks[1].block_hash(), blocks[2].block_hash());
+        let deleted = std::thread::scope(|s| {
+            // Hold the lock the mutation section needs, so the prune plans
+            // (the scan takes no lock) and then waits.
+            let guard = cs.accept_lock.lock();
+            let prune = s.spawn(|| cs.prune_up_to(6));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            // Block 2 repaired into file 2 after the scan listed it in file
+            // 0, then the append moves past file 2: a record that does not
+            // fit a fast-prune file rolls it.
+            repoint(&cs, &blocks[1], 2);
+            {
+                let mut flat = cs.flat_files.lock();
+                flat.set_fast_prune(true);
+                let filler = vec![0u8; crate::storage::flatfile::FAST_PRUNE_FILE_SIZE as usize];
+                let pos = flat.write_block(&filler, magic, 0).expect("filler");
+                assert_eq!(pos.file_number, 3, "the append moved past file 2");
+            }
+
+            drop(guard);
+            prune.join().unwrap()
+        });
+
+        assert_eq!(deleted, 1, "file 0 goes; file 1 holds blocks 7 and 8");
+        assert!(!cs.flat_files.lock().file_exists(0));
+        assert!(cs.is_pruned(&h1));
+        assert!(
+            cs.flat_files.lock().file_exists(2),
+            "file 2 was appended to after the plan"
+        );
+        assert_eq!(cs.get_block(&h2).as_ref(), Some(&blocks[1]), "block 2's repaired record");
+        assert_eq!(cs.get_block(&h3).as_ref(), Some(&blocks[2]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

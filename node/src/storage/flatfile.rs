@@ -541,6 +541,12 @@ impl FlatFileManager {
         self.highest_height.get(&file_number).copied()
     }
 
+    /// The file records are being appended to. It only moves up while this
+    /// manager lives: to the next number when a record does not fit.
+    pub fn current_file(&self) -> u32 {
+        self.current_file
+    }
+
     /// Check whether a given flat file exists on disk.
     pub fn file_exists(&self, file_number: u32) -> bool {
         self.file_path(file_number).exists()
