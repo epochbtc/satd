@@ -73,6 +73,37 @@ data with Bitcoin Core requires a patched fork such as Bitcoin Knots:
 | `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `--limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `--limitdescendantcount=<N>` | `25` | Maximum unconfirmed descendant count. Deprecated alongside `--limitancestorcount`, and likewise no longer gates admission. |
 
+### How `sat-cli` finds the node
+
+`sat-cli` reads the node's `bitcoin.conf` the way `bitcoin-cli` does, so a
+node configured entirely in its config file needs no connection flags:
+
+```sh
+sat-cli -datadir=/path/to/datadir getblockcount
+```
+
+- **Which file.** `-conf=<file>` (relative paths are under the data
+  directory), else `<datadir>/bitcoin.conf`; the data directory is
+  `-datadir` or `~/.bitcoin`. A missing default file is fine; a missing
+  `-conf` file is an error.
+- **Which chain.** `-chain=<name>`, `-regtest`, `-testnet`, `-testnet4` or
+  `-signet` on the command line, else the file's top-level `chain=` or
+  `regtest=1` / `testnet=1` / `testnet4=1` / `signet=1`, else mainnet. More
+  than one selector is an error.
+- **Which settings.** `rpcconnect`, `rpcport`, `rpcuser`, `rpcpassword` and
+  `rpccookiefile` come from the command line first, then the active chain's
+  section (`[main]`, `[test]`, `[testnet4]`, `[signet]`, `[regtest]`), then
+  the top level of the file; the first value in a scope wins. A top-level
+  `rpcport` applies on every chain, as it does for satd itself.
+- **Which credentials.** A non-empty `rpcpassword` from either source means
+  user/password authentication, with `rpcuser` looked up the same way;
+  otherwise the cookie file, whose relative path is under the chain's data
+  directory. satd writes no cookie when `rpcuser` and `rpcpassword` are both
+  set, so this is how `sat-cli` reaches such a node. With `-rpcwait`, a
+  cookie that does not exist yet is read again until the node writes it.
+- **`-generate`** is refused: it mines to a wallet address in `bitcoin-cli`,
+  and satd has no wallet. Use `generatetoaddress` or `generatetodescriptor`.
+
 ## Live Config Reload (`SIGHUP`)
 
 Edit `bitcoin.conf`, then send `SIGHUP` with `kill -HUP <pid>` or `systemctl
