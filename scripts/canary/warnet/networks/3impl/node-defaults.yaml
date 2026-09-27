@@ -1,0 +1,6 @@
+# Rendered by scripts/canary/warnet-3impl.sh from scripts/canary/PINS. Every
+# image is loaded into the cluster before deploy, so nothing is pulled.
+image:
+  repository: "@CORE_REPO@"
+  tag: "@CORE_TAG@"
+  pullPolicy: Never

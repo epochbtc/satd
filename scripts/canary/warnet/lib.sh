@@ -164,6 +164,33 @@ run_scenario() {
     helm uninstall "${pod#pod/}" > /dev/null 2>&1 || true
 }
 
+# deploy_and_wait_peers <network dir>: deploy, then wait until every tank has
+# at least one peer. For networks with a tank whose addnode peers are not
+# reported as `manual`, where Warnet's own "Network connected" never prints.
+deploy_and_wait_peers() {
+    local net="$1" deadline t n ok
+    log "deploying $net"
+    warnet deploy "$net" > "$ARTIFACT_DIR/deploy.log" 2>&1 || { cat "$ARTIFACT_DIR/deploy.log"; die "warnet deploy failed"; }
+    deadline=$((SECONDS + WAIT_DEPLOY))
+    while :; do
+        ok=1
+        for t in $(tanks); do
+            n="$(tank_rpc "$t" getconnectioncount 2>/dev/null || echo 0)"
+            [ "${n:-0}" -ge 1 ] 2>/dev/null || ok=0
+        done
+        if [ "$ok" = 1 ] && [ -n "$(tanks)" ]; then
+            log "every tank has a peer: $(tanks | tr '\n' ' ')"
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            warnet status > "$ARTIFACT_DIR/status-timeout.txt" 2>&1 || true
+            kubectl get pods -A -o wide || true
+            die "some tank has no peer after ${WAIT_DEPLOY}s"
+        fi
+        sleep 5
+    done
+}
+
 # wait_same_height <min> [timeout]: poll until every tank reports the same
 # height, at least <min>. Blocks take a moment to cross the ring, so a single
 # read right after mining would fail on ordinary relay latency; a tank still
@@ -206,6 +233,9 @@ if v1:
     sys.exit(f"{tank}: {len(v1)} peers not on v2 transport")
 ' "$tank" "$n"
 }
+
+# Every peer of <tank> speaks v2 transport, whatever its connection type.
+assert_v2_only() { assert_peers "$1" 0; }
 
 collect_logs() {
     local t

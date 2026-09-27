@@ -56,11 +56,16 @@ SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256",
             # weeks after Core's releases; kubectl follows the kind node's
             # Kubernetes minor. Pinned for reproducibility, bumped by hand.
             "WARNET_COMMIT", "WARNET_CORE_IMAGE", "WARNET_COMMANDER_IMAGE",
+            # rbitcoin's Warnet lab image landed after its latest release (v0.7.0),
+            # so it is pinned by commit and bumped by hand; the two images are the
+            # ones that image's recipe names.
+            "RBITCOIN_COMMIT", "RBITCOIN_RUST_IMAGE", "RBITCOIN_BASE_IMAGE",
             "KIND_SHA256", "KIND_NODE_IMAGE", "KUBECTL_VERSION", "KUBECTL_SHA256", "HELM_SHA256"}
 
-# Images CI builds itself rather than pulls: satd, and the Warnet lab
-# variant contrib/warnet builds FROM it.
-LOCAL_IMAGES = {"satd", "satd-warnet"}
+# Images CI builds itself rather than pulls: satd, the Warnet lab variant
+# contrib/warnet builds FROM it, and rbitcoin's Warnet lab image, built from
+# source at RBITCOIN_COMMIT.
+LOCAL_IMAGES = {"satd", "satd-warnet", "rbitcoin-warnet"}
 
 # A literal image reference: `name:tag`, `org/name:tag` or
 # `registry.host/org/name:tag`, optionally `@sha256:...`. The name must hold a

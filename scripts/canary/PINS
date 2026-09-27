@@ -81,3 +81,11 @@ KUBECTL_VERSION=v1.37.1
 KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
 HELM_VERSION=v4.2.2
 HELM_SHA256=9adafecab4d406853bba163a70e9f104f47dbbf65ce24b7653bae7e36150bcb6
+
+# rbitcoin (github.com/reardencode/rbitcoin), for the nightly three-implementation
+# Warnet rig. rbitcoin publishes no image; scripts/canary/warnet/build-rbitcoin.sh
+# builds the Warnet lab image its repository documents, at this commit, with
+# the Rust image and Debian base its recipe names, pulled by digest.
+RBITCOIN_COMMIT=2c1699cea22230469e3e61f8d6eca9defc03a0a1
+RBITCOIN_RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+RBITCOIN_BASE_IMAGE=debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251

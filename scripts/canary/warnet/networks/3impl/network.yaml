@@ -1,0 +1,25 @@
+# Three implementations in one ring: Bitcoin Core (tank-0000, the miner),
+# satd (tank-0001) and rbitcoin (tank-0002), each peered with both others'
+# implementations. rbitcoin speaks only BIP 324 v2 transport, which Bitcoin
+# Core 27.0+ and satd use by default. head_scale=tiny is rbitcoin's small
+# in-memory header index for short test chains.
+nodes:
+  - name: tank-0000
+    addnode:
+      - tank-0001
+  - name: tank-0001
+    image:
+      repository: "@SATD_REPO@"
+      tag: "@SATD_TAG@"
+      pullPolicy: Never
+    addnode:
+      - tank-0002
+  - name: tank-0002
+    image:
+      repository: "@RBITCOIN_REPO@"
+      tag: "@RBITCOIN_TAG@"
+      pullPolicy: Never
+    addnode:
+      - tank-0000
+    config: |
+      head_scale=tiny
