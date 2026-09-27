@@ -50,8 +50,9 @@ CRATE_SOURCES = {"BDK_WALLET": ("bdk_wallet", BDK_LOCK)}
 # Pinned for reproducibility, not tracked against upstream.
 SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256", "CPUMINER_SHA256", "SRI_COMMIT"}
 
-# Images CI builds itself rather than pulls.
-LOCAL_IMAGES = {"satd"}
+# Images CI builds itself rather than pulls: satd, and the Warnet lab
+# variant contrib/warnet builds FROM it.
+LOCAL_IMAGES = {"satd", "satd-warnet"}
 
 # A literal image reference: `name:tag`, `org/name:tag` or
 # `registry.host/org/name:tag`, optionally `@sha256:...`. The name must hold a
