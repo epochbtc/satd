@@ -164,16 +164,28 @@ run_scenario() {
     helm uninstall "${pod#pod/}" > /dev/null 2>&1 || true
 }
 
-# Every tank reports the same height, at least <min>.
-assert_same_height() {
-    local min="$1" t h first=""
-    for t in $(tanks); do
-        h="$(tank_rpc "$t" getblockcount)"
-        log "  $t height $h"
-        [ "$h" -ge "$min" ] || die "$t is at $h, expected at least $min"
-        [ -z "$first" ] && first="$h"
-        [ "$h" = "$first" ] || die "tanks disagree on height"
+# wait_same_height <min> [timeout]: poll until every tank reports the same
+# height, at least <min>. Blocks take a moment to cross the ring, so a single
+# read right after mining would fail on ordinary relay latency; a tank still
+# apart after the timeout is stuck, not slow.
+wait_same_height() {
+    local min="$1" timeout="${2:-120}" deadline t h first same
+    deadline=$((SECONDS + timeout))
+    while :; do
+        same=1; first=""
+        for t in $(tanks); do
+            h="$(tank_rpc "$t" getblockcount 2>/dev/null || echo -1)"
+            [ -z "$first" ] && first="$h"
+            { [ "$h" = "$first" ] && [ "$h" -ge "$min" ]; } 2>/dev/null || same=0
+        done
+        [ "$same" = 1 ] && [ -n "$first" ] && break
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            for t in $(tanks); do log "  $t height $(tank_rpc "$t" getblockcount 2>/dev/null || echo unreachable)"; done
+            die "tanks did not converge on one height of at least $min within ${timeout}s"
+        fi
+        sleep 2
     done
+    log "every tank at height $first"
 }
 
 # Every peer of <tank> speaks v2 transport, and at least <n> are manual.

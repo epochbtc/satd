@@ -42,8 +42,7 @@ deploy_and_wait "$net"
 
 # Mining through a satd tank: MiniWallet's generatetodescriptor + scantxoutset.
 run_scenario "$scen/keyless_miner.py" --tank tank-0001 --blocks 110
-sleep 5
-assert_same_height 110
+wait_same_height 110
 
 # satd tanks dial their addnode peer by service name, as a manual peer, and
 # every link runs v2 transport (Bitcoin Core 27.0+ defaults to it, as satd does).
@@ -58,8 +57,7 @@ run_scenario "$scen/test_scenarios/p2p_interface.py" --source_dir="$scen"
 # A transaction flood sent through the other satd tank, confirmed everywhere.
 before="$(tank_rpc tank-0000 getblockcount)"
 run_scenario "$scen/keyless_tx_flood.py" --tank tank-0003 --txs 40
-sleep 5
-assert_same_height "$((before + 2))"
+wait_same_height "$((before + 2))"
 
 # Relay, compact blocks and a valid non-standard block, checked on every tank.
 # No reorg rounds: satd can stay a block behind after a reorg whose blocks
