@@ -1,0 +1,25 @@
+# The Warnet canary's network: contrib/warnet/examples/core-satd, with the
+# satd tanks on the image CI just built (@SATD_REPO@:@SATD_TAG@, rendered by
+# run.sh). A ring alternating Bitcoin Core and satd, so every block and
+# transaction crosses between the two.
+nodes:
+  - name: tank-0000
+    addnode:
+      - tank-0001
+  - name: tank-0001
+    image:
+      repository: "@SATD_REPO@"
+      tag: "@SATD_TAG@"
+      pullPolicy: Never
+    addnode:
+      - tank-0002
+  - name: tank-0002
+    addnode:
+      - tank-0003
+  - name: tank-0003
+    image:
+      repository: "@SATD_REPO@"
+      tag: "@SATD_TAG@"
+      pullPolicy: Never
+    addnode:
+      - tank-0000

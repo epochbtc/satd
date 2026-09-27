@@ -43,12 +43,20 @@ GITHUB_SOURCES = {
     "CPUMINER_VERSION": ("stratum-mining/cpuminer", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "SRI_TAG": ("stratum-mining/sv2-apps", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "SRI_JD_CLIENT_IMAGE": ("stratum-mining/sv2-apps", r"^v(\d+)\.(\d+)\.(\d+)$"),
+    "KIND_VERSION": ("kubernetes-sigs/kind", r"^v(\d+)\.(\d+)\.(\d+)$"),
+    "HELM_VERSION": ("helm/helm", r"^v(\d+)\.(\d+)\.(\d+)$"),
 }
 # Crate pins, named the way PINS names its entries so a hold can refer to
 # them: HOLD_BDK_WALLET=<issue>.
 CRATE_SOURCES = {"BDK_WALLET": ("bdk_wallet", BDK_LOCK)}
 # Pinned for reproducibility, not tracked against upstream.
-SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256", "CPUMINER_SHA256", "SRI_COMMIT"}
+SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256", "CPUMINER_SHA256", "SRI_COMMIT",
+            # Warnet has tagged no release since the commit the canary needs, its
+            # commander images carry only `latest`, and its Core images appear
+            # weeks after Core's releases; kubectl follows the kind node's
+            # Kubernetes minor. Pinned for reproducibility, bumped by hand.
+            "WARNET_COMMIT", "WARNET_CORE_IMAGE", "WARNET_COMMANDER_IMAGE",
+            "KIND_SHA256", "KIND_NODE_IMAGE", "KUBECTL_VERSION", "KUBECTL_SHA256", "HELM_SHA256"}
 
 # Images CI builds itself rather than pulls: satd, and the Warnet lab
 # variant contrib/warnet builds FROM it.

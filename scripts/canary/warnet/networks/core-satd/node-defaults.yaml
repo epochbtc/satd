@@ -1,0 +1,7 @@
+# Rendered by scripts/canary/warnet/run.sh: @CORE_REPO@ and @CORE_TAG@ come
+# from WARNET_CORE_IMAGE in scripts/canary/PINS. The image is loaded into the
+# cluster before deploy, so nothing is pulled.
+image:
+  repository: "@CORE_REPO@"
+  tag: "@CORE_TAG@"
+  pullPolicy: Never
