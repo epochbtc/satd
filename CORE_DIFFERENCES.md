@@ -97,6 +97,18 @@ rebuilds its address set from DNS seeds / `-seednode`. Operators
 migrating a datadir should let satd regenerate `peers.dat` rather than
 expect Core's peer set to carry over.
 
+**On `getrawaddrman` slots.** Core's address manager stores each entry in
+a fixed `bucket/position` slot of its new or tried table, and
+`getrawaddrman` reports those slots. satd's address book is a flat map, so
+it *derives* a slot for each entry from Core's own bucket formulas
+(`GetNewBucket`, `GetTriedBucket`, `GetBucketPosition`), keyed by a random
+per-process key instead of `-test=addrman`'s fixed one. The slots are
+stable while the node runs and are spread as Core's are, but they change on
+restart and never match Core's for the same address; a collision moves to
+the next free slot rather than evicting an entry. `getnodeaddresses`,
+`getaddrmaninfo` and `getrawaddrman` report IPv4 and IPv6 only: onion
+candidates learned from `addrv2` gossip are held outside the address book.
+
 **Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families

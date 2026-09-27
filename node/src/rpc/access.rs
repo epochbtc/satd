@@ -92,6 +92,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getchaintxstats"
         | "getconfig"
         | "getconnectioncount"
+        // address-book reads (Core's rpc/net.cpp)
+        | "getnodeaddresses"
+        | "getaddrmaninfo"
+        | "getrawaddrman"
         | "getdifficulty"
         | "getibdprogress"
         | "getindexinfo"
@@ -182,6 +186,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "addconnection"
         // Core's hidden test RPC: pushes an arbitrary message to a peer.
         | "sendmsgtopeer"
+        // Core's hidden test RPC: writes an address into the address book.
+        | "addpeeraddress"
         | "disconnectnode"
         | "setban"
         | "clearbanned"
@@ -279,6 +285,7 @@ mod tests {
             "stop",
             "addnode",
             "addconnection",
+            "addpeeraddress",
             "disconnectnode",
             "setban",
             "clearbanned",
@@ -328,6 +335,9 @@ mod tests {
             "waitfornewblock",
             "subscribemempool",
             "getsilentpaymentblockdata",
+            "getnodeaddresses",
+            "getaddrmaninfo",
+            "getrawaddrman",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::Read), "{m}");
             assert!(readonly_listener_allows(m), "{m} must be allowed");

@@ -21,7 +21,7 @@ note = "measured 2026-09-15: L28 unlinks blocks/rev00000.dat to force a write fa
 file = "feature_addrman.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L65 assert_debug_log 'Loaded 0 addresses from peers.dat'; satd has no addrman and no peers.dat. Follow-up: addrman (not planned for 0.6.0)"
+note = "measured 2026-09-15: L65 assert_debug_log 'Loaded 0 addresses from peers.dat'. satd has an address book persisted to peers.dat, but in a satd-native format with no Core serialization, checksum or bucket table; the test writes Core-format files and checks Core's load messages and corruption errors"
 
 [[test]]
 file = "feature_anchors.py"
@@ -549,8 +549,8 @@ note = "measured 2026-09-15: L149 an addr of 1010 entries is neither logged nor 
 [[test]]
 file = "p2p_addr_selfannouncement.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L74 addpeeraddress is Method not found. Follow-up: addrman and addpeeraddress"
+reason = "feature-missing"
+note = "measured 2026-09-27: addpeeraddress now answers; L76 the node's self-announcement arrives in an addr message carrying 2 addresses, where Core sends it alone before anything else. satd answers getaddr from -externalip and its connected peers in one message. Follow-up: address relay"
 
 [[test]]
 file = "p2p_addrfetch.py"
@@ -631,8 +631,8 @@ note = "measured 2026-09-15: L87 getblockcount 10 != 13: satd serves stale block
 [[test]]
 file = "p2p_getaddr_caching.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L60 addpeeraddress is Method not found. Follow-up: addrman and addpeeraddress"
+reason = "feature-missing"
+note = "measured 2026-09-27: addpeeraddress now answers; L73 a new inbound peer receives no addr reply within the timeout. satd answers getaddr from -externalip and its connected peers, not from the address book, and keeps no per-bind response cache. Follow-up: address relay"
 
 [[test]]
 file = "p2p_getdata.py"
@@ -946,7 +946,7 @@ status = "run"
 file = "rpc_net.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L131 help('getpeerinfo') lacks the network list. Behind it: addpeeraddress, getnodeaddresses and getrawaddrman. Follow-up: per-method help, then addrman"
+note = "measured 2026-09-27: L131 help('getpeerinfo') lacks the network list; past it, L148 getpeerinfo reports relaytxes true for a peer that has sent no version. The address-book RPCs it reaches later now exist, but L315 wants Core's bucket collisions to drop some of 10000 added addresses, L395 a tried-table collision, and L504 Core's exact bucket/position slots, none of which satd's flat, derived-slot book reproduces (CORE_DIFFERENCES.md). Follow-up: per-method help, then getpeerinfo before version"
 
 [[test]]
 file = "rpc_orphans.py"

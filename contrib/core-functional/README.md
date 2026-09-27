@@ -180,6 +180,12 @@ carry the blocker that was actually observed once the RPC existed.
   `fRelay` and gets no address relay, `feeler` is closed on the peer's
   `version`, `addr-fetch` gets a `getaddr` and no `getheaders` and is dropped
   once answered. `getpeerinfo.connection_type` reports the real type.
+- **The address-book RPCs.** `addpeeraddress`, `getnodeaddresses`,
+  `getaddrmaninfo` and `getrawaddrman` exist, in Core's shapes. No row flips
+  yet: `p2p_addr_selfannouncement` and `p2p_getaddr_caching` now get past
+  `addpeeraddress` and stop on how satd answers `getaddr` (from `-externalip`
+  and its connected peers, not the address book), and `rpc_net` still stops
+  first on per-method `help`.
 - `getdeploymentinfo` reported the buried deployments as `dersig`/`cltv`.
   Core's `DeploymentName` spells them `bip66`/`bip65` on the way out, even
   though `-testactivationheight` takes `dersig`/`cltv` on the way in, and the

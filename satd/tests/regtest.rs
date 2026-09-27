@@ -18615,7 +18615,14 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         .iter()
         .filter_map(|row| row.get(0)?.as_str().map(str::to_string))
         .collect();
-    let hidden = ["addconnection", "generate", "sendmsgtopeer", "unsubscribemempool"];
+    let hidden = [
+        "addconnection",
+        "addpeeraddress",
+        "generate",
+        "getrawaddrman",
+        "sendmsgtopeer",
+        "unsubscribemempool",
+    ];
     let mut missing: Vec<&str> = registered
         .iter()
         .map(String::as_str)
@@ -23535,4 +23542,134 @@ fn stratum_v2_jd_push_solution_connects_block() {
     let saved = node.datadir.join("regtest").join("stratum").join("found").join(format!("{height}-{hash}.hex"));
     let raw = node.rpc_ok("getblock", vec![json!(hash), json!(0)]);
     assert_eq!(std::fs::read_to_string(&saved).unwrap(), format!("{}\n", raw.as_str().unwrap()));
+}
+
+// ---------------------------------------------------------------------------
+// Address-manager RPCs: getnodeaddresses, getaddrmaninfo, and Core's hidden
+// addpeeraddress / getrawaddrman (rpc/net.cpp)
+// ---------------------------------------------------------------------------
+
+/// The four address-book RPCs agree with one another and with Core's
+/// shapes: an address added by hand appears in the right table of
+/// `getrawaddrman` under a `bucket/position` key, in `getnodeaddresses`,
+/// and in `getaddrmaninfo`'s counts; a duplicate fails with Core's error;
+/// and the entries keep their service bits and source across a restart
+/// (the `peers.dat` format carries both).
+#[test]
+fn addrman_rpcs_report_a_hand_added_address_everywhere() {
+    use serde_json::json;
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-addrman-rpcs");
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+
+    assert_eq!(
+        node.rpc_ok("addpeeraddress", vec![json!("1.2.3.4"), json!(8333), json!(true)]),
+        json!({"success": true})
+    );
+    // Named form, as Core's test framework sends it.
+    let out = node
+        .rpc_call_with_named_params(
+            "addpeeraddress",
+            json!({"address": "2001:db8::7", "port": 18444}),
+        )
+        .unwrap();
+    assert_eq!(out["result"], json!({"success": true}), "{out}");
+
+    // Already present: Core's `Add` refuses before `Good`, whichever table.
+    for tried in [true, false] {
+        assert_eq!(
+            node.rpc_ok("addpeeraddress", vec![json!("1.2.3.4"), json!(8333), json!(tried)]),
+            json!({"success": false, "error": "failed-adding-to-new"})
+        );
+    }
+
+    let check = |node: &TestNode| {
+        let raw = node.rpc_ok("getrawaddrman", vec![]);
+        let tried = raw["tried"].as_object().unwrap();
+        let new = raw["new"].as_object().unwrap();
+        assert_eq!(tried.len(), 1, "{raw}");
+        assert_eq!(new.len(), 1, "{raw}");
+        let (key, e) = tried.iter().next().unwrap();
+        let (bucket, pos) = key.split_once('/').expect("bucket/position key");
+        assert!(bucket.parse::<u32>().unwrap() < 256, "{key}");
+        assert!(pos.parse::<u32>().unwrap() < 64, "{key}");
+        assert_eq!(
+            e,
+            &json!({
+                "address": "1.2.3.4", "port": 8333, "services": 9,
+                "time": e["time"], "network": "ipv4",
+                "source": "1.2.3.4", "source_network": "ipv4",
+            })
+        );
+        assert!(e["time"].as_u64().unwrap() > 1_527_811_200);
+        let (_, e6) = new.iter().next().unwrap();
+        assert_eq!(e6["address"], json!("2001:db8::7"));
+        assert_eq!(e6["network"], json!("ipv6"));
+        assert_eq!(e6["port"], json!(18444));
+
+        let info = node.rpc_ok("getaddrmaninfo", vec![]);
+        assert_eq!(info["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
+        assert_eq!(info["ipv6"], json!({"new": 1, "tried": 0, "total": 1}));
+        for net in ["onion", "i2p", "cjdns"] {
+            assert_eq!(info[net], json!({"new": 0, "tried": 0, "total": 0}), "{net}");
+        }
+        assert_eq!(info["all_networks"], json!({"new": 1, "tried": 1, "total": 2}));
+
+        let all = node.rpc_ok("getnodeaddresses", vec![json!(0)]);
+        assert_eq!(all.as_array().unwrap().len(), 2, "{all}");
+        // Default count is 1.
+        assert_eq!(node.rpc_ok("getnodeaddresses", vec![]).as_array().unwrap().len(), 1);
+        let v4 = node.rpc_ok("getnodeaddresses", vec![json!(0), json!("IPv4")]);
+        assert_eq!(
+            v4,
+            json!([{"time": v4[0]["time"], "services": 9, "address": "1.2.3.4",
+                    "port": 8333, "network": "ipv4"}])
+        );
+        assert_eq!(node.rpc_ok("getnodeaddresses", vec![json!(0), json!("onion")]), json!([]));
+    };
+    check(&node);
+
+    // Errors, with Core's codes and messages.
+    let err = |method: &str, params: Vec<serde_json::Value>| {
+        let out = node.rpc_call_with_params(method, params).unwrap();
+        (out["error"]["code"].as_i64().unwrap_or(0), out["error"]["message"].as_str().unwrap_or("").to_string())
+    };
+    assert_eq!(err("getnodeaddresses", vec![json!(-1)]), (-8, "Address count out of range".into()));
+    assert_eq!(
+        err("getnodeaddresses", vec![json!(1), json!("Foo")]),
+        (-8, "Network not recognized: Foo".into())
+    );
+    for bad in ["", "not_an_ip"] {
+        assert_eq!(
+            err("addpeeraddress", vec![json!(bad), json!(8333)]),
+            (-30, "Invalid IP address".into()),
+            "{bad:?}"
+        );
+    }
+    for port in [-1, 65536] {
+        assert_eq!(
+            err("addpeeraddress", vec![json!("1.2.3.4"), json!(port)]),
+            (-1, "JSON integer out of range".into())
+        );
+    }
+    let (code, msg) = err("addpeeraddress", vec![json!("1.2.3.4"), json!(1234), json!("True")]);
+    assert_eq!(code, -3);
+    assert!(msg.contains("JSON value of type string is not of expected type bool"), "{msg}");
+
+    // Hidden from the listing, answered by name.
+    let listing = node.rpc_ok("help", vec![]);
+    let listing = listing.as_str().unwrap();
+    for hidden in ["addpeeraddress", "getrawaddrman"] {
+        assert!(!listing.contains(hidden), "{hidden} must be hidden");
+        let one = node.rpc_ok("help", vec![json!(hidden)]);
+        assert!(!one.as_str().unwrap().contains("unknown command"), "{hidden}: {one}");
+    }
+    for listed in ["getnodeaddresses", "getaddrmaninfo"] {
+        assert!(listing.contains(listed), "{listed} must be listed");
+    }
+
+    // Restart: peers.dat keeps both entries with their services and source.
+    node.stop();
+    let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    check(&node);
 }
