@@ -51,6 +51,10 @@ pub(crate) struct StoreControls {
     /// two a caller did, so the count is the only way to pin it.
     get_tx_seq_calls: Arc<AtomicU64>,
     txids_of_seqs_calls: Arc<AtomicU64>,
+    /// How many block-index scans have started. A caller that plans from a
+    /// scan has planned by the time its scan starts, which a test on another
+    /// thread can wait for.
+    block_index_scans: Arc<AtomicU64>,
 }
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
@@ -135,6 +139,12 @@ impl StoreControls {
         self.fail_next_write.store(true, Ordering::SeqCst);
     }
 
+    /// How many block-index scans have started, counting from the store's
+    /// creation.
+    pub(crate) fn block_index_scans(&self) -> u64 {
+        self.block_index_scans.load(Ordering::SeqCst)
+    }
+
     /// How many `get_tx_seq` calls the store has served since the last
     /// reset.
     pub(crate) fn get_tx_seq_calls(&self) -> u64 {
@@ -193,6 +203,7 @@ impl ControllableStore {
                 fail_next_write: Arc::new(AtomicBool::new(false)),
                 get_tx_seq_calls: Arc::new(AtomicU64::new(0)),
                 txids_of_seqs_calls: Arc::new(AtomicU64::new(0)),
+                block_index_scans: Arc::new(AtomicU64::new(0)),
             },
         }
     }
@@ -216,6 +227,7 @@ impl Store for ControllableStore {
         // decide which of the two it trusts. Failing at the end of the visit
         // is that case with a deterministic ordering, which the underlying
         // `HashMap` iteration order would not otherwise give.
+        self.controls.block_index_scans.fetch_add(1, Ordering::SeqCst);
         let stats = self.inner.for_each_block_index(visit)?;
         if self.controls.fail_block_index_scan.load(Ordering::SeqCst) {
             return Err(StoreError::Database("injected block-index scan fault".into()));

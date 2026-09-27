@@ -13,7 +13,7 @@ use crate::chain::{connect, disconnect};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::coinview::Coin;
-use crate::storage::flatfile::{FlatFileManager, FlatFilePos};
+use crate::storage::flatfile::{FlatFileManager, FlatFilePos, PendingRecord};
 use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
@@ -3630,18 +3630,22 @@ impl ChainState {
     /// means deferring `block_index` writes until the record they reference
     /// has been synced — Bitcoin Core's model — which is a larger change than
     /// this fix and is tracked separately.
+    ///
+    /// The caller holds the returned [`PendingRecord`] until the entry
+    /// pointing at the record is committed, which keeps the pruner off the
+    /// record's file until then.
     fn write_block_durable(
         &self,
         block_data: &[u8],
         height: u32,
-    ) -> Result<FlatFilePos, ChainError> {
+    ) -> Result<(FlatFilePos, PendingRecord), ChainError> {
         let mut flat = self.flat_files.lock();
-        let pos = flat
-            .write_block(block_data, network_magic(self.network), height)
+        let (pos, pending) = flat
+            .write_block_pending(block_data, network_magic(self.network), height)
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
         flat.sync_all()
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-        Ok(pos)
+        Ok((pos, pending))
     }
 
     /// Re-derive the flat-file append offset from the file on disk.
@@ -4597,7 +4601,7 @@ impl ChainState {
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data, new_height)?;
+        let (flat_pos, _pending) = self.write_block_durable(&block_data, new_height)?;
 
         // Store block index entry as DataStored
         let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
@@ -4806,7 +4810,7 @@ impl ChainState {
         // while writing its batch *after* releasing that mutex — acquiring
         // them in the other order here would invert the pairing.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data, height)?;
+        let (flat_pos, _pending) = self.write_block_durable(&block_data, height)?;
 
         let _accept_guard = self.accept_lock.lock();
 
@@ -6729,7 +6733,7 @@ impl ChainState {
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self.write_block_durable(&block_data, new_height)?;
+        let (flat_pos, _pending) = self.write_block_durable(&block_data, new_height)?;
 
         // Check if this extends the current tip or is a side chain
         let current_tip = self.tip_hash();
@@ -8798,10 +8802,16 @@ impl ChainState {
         if prune_below >= tip_height {
             return 0;
         }
-        // Every record goes to the file being appended to at the time, so a
-        // record written from here on lands in this file or one the append
-        // moves into later. None of those is deleted this round (see below).
-        let append_file_at_plan = self.flat_files.lock().current_file();
+        // The scan below misses a record whose index entry is committed after
+        // it reads the index. Every writer holds its record pending from the
+        // write until that commit (`PendingRecord`), so such a record was
+        // either pending here or is written from here on, to the file being
+        // appended to now or one the append moves into later. None of those
+        // files is deleted this round (see below).
+        let (append_file_at_plan, pending_at_plan) = {
+            let flat_files = self.flat_files.lock();
+            (flat_files.current_file(), flat_files.files_with_pending_records())
+        };
 
         // Per file: the highest height of any block whose record is in it,
         // and those blocks, whose entries are rewritten if it goes.
@@ -8872,23 +8882,26 @@ impl ChainState {
         }
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
-        // The files appended to since the plan began. The scan listed what
-        // they held then, not what went into them since: a
-        // `repair_block_data` in between writes a block below the cut into
-        // one and repoints its entry there, out of the file the plan listed
-        // it under, and the append can then move past it. Everything the
-        // plan knows about such a file can be at or below the cut, and
-        // deleting it would leave the repaired entry over a deleted record.
+        // The files that can hold a record the scan missed (see the plan
+        // above). A `repair_block_data` writes a block below the cut into the
+        // file being appended to and then repoints its entry there, out of
+        // the file the plan listed it under, and the append can move past
+        // that file before the entry is committed. Everything the plan knows
+        // about the file can be at or below the cut, and deleting it would
+        // leave the repaired entry over a deleted record.
         let appended_since_plan = append_file_at_plan..=flat_files.current_file();
 
         for (file_num, (highest, blocks)) in &files {
-            if *highest > prune_below || appended_since_plan.contains(file_num) {
+            if *highest > prune_below
+                || appended_since_plan.contains(file_num)
+                || pending_at_plan.contains(file_num)
+            {
                 continue;
             }
-            // A block this process wrote after the scan read the index, or
-            // whose entry was still uncommitted when it did, is invisible to
-            // the plan. The flat-file manager recorded its height under the
-            // lock held here.
+            // Core's `nHeightLast`: the highest height this process wrote to
+            // the file, recorded under the lock held here. It needs nothing
+            // from the writer, so it also keeps a block above the cut whose
+            // record was written without being held pending.
             if flat_files
                 .highest_height_written(*file_num)
                 .is_some_and(|h| h > prune_below)
@@ -8905,9 +8918,9 @@ impl ChainState {
             }
             // Rewrite the file's entries, re-reading each under the lock: the
             // scan's view can be stale. One that a `repair_block_data`
-            // rewrote into another file after the plan began went to a file
-            // appended to since, which this round keeps: it still has its
-            // data and is left alone. The status is the one it has now (an
+            // rewrote into another file while the plan ran went to a file
+            // this round keeps (see above): it still has its data and is left
+            // alone. The status is the one it has now (an
             // `invalidateblock` or `reconsiderblock` in between moved it).
             for hash in blocks {
                 let Some(mut entry) = self.store.get_block_index(hash) else {
@@ -12121,6 +12134,156 @@ pub(crate) mod tests {
         );
         assert_eq!(cs.get_block(&h2).as_ref(), Some(&blocks[1]), "block 2's repaired record");
         assert_eq!(cs.get_block(&h3).as_ref(), Some(&blocks[2]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chain of blocks 1..=8 connected into file 0, which the cut at 6
+    /// therefore keeps, and copies of blocks 5 and 6 in file 1, the append
+    /// file, with their entries pointed there.
+    fn chain_with_a_file_below_the_cut() -> (
+        ChainState,
+        std::path::PathBuf,
+        crate::storage::test_store::StoreControls,
+        Vec<Block>,
+    ) {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let blocks = unaccepted_chain(8);
+        for b in &blocks {
+            assert!(cs.accept_block(b).expect("accept").connected());
+        }
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for (b, height) in blocks[4..6].iter().zip(5..) {
+            let pos = cs
+                .flat_files
+                .lock()
+                .write_block(&serialize(b), network_magic(Network::Regtest), height)
+                .expect("write the copy");
+            assert_eq!(pos.file_number, 1);
+            repoint_block_record(&cs, &b.block_hash(), pos);
+        }
+        (cs, dir, controls, blocks)
+    }
+
+    fn repoint_block_record(cs: &ChainState, hash: &BlockHash, pos: FlatFilePos) {
+        let mut entry = cs.get_block_index(hash).unwrap();
+        entry.file_number = pos.file_number;
+        entry.data_pos = pos.data_pos;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((*hash, entry));
+        cs.store.write_batch(batch).unwrap();
+    }
+
+    /// Run `write` on another thread while holding `accept_lock`, so that it
+    /// writes its record into file 1 and then waits to commit the entry
+    /// pointing at it. The append moves past file 1, and `prune_up_to(6)`
+    /// plans, before the lock is released. Returns how many files the prune
+    /// deleted and what `write` returned.
+    fn prune_while_a_write_waits_to_commit<R: Send>(
+        cs: &ChainState,
+        controls: &crate::storage::test_store::StoreControls,
+        write: impl FnOnce() -> R + Send,
+    ) -> (u32, R) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+
+            let bytes = cs.flat_files.lock().size_on_disk();
+            let writer = s.spawn(write);
+            wait("the writer never wrote", &|| {
+                cs.flat_files.lock().size_on_disk() > bytes
+            });
+            // A record that does not fit a fast-prune file rolls it.
+            {
+                let mut flat = cs.flat_files.lock();
+                flat.set_fast_prune(true);
+                let filler = vec![0u8; crate::storage::flatfile::FAST_PRUNE_FILE_SIZE as usize];
+                let pos = flat
+                    .write_block(&filler, network_magic(Network::Regtest), 0)
+                    .expect("filler");
+                assert_eq!(pos.file_number, 2, "the append moved past file 1");
+            }
+
+            // The prune has planned once its scan starts.
+            let scans = controls.block_index_scans();
+            let prune = s.spawn(|| cs.prune_up_to(6));
+            wait("the prune never scanned", &|| controls.block_index_scans() > scans);
+
+            drop(guard);
+            let written = writer.join().unwrap();
+            (prune.join().unwrap(), written)
+        })
+    }
+
+    /// A writer commits the entry pointing at its record only after writing
+    /// the record and releasing the flat-file lock. A `repair_block_data`
+    /// writes block 2 into the append file, the append moves on, and only
+    /// then does the prune plan, while the repair waits to commit: the scan
+    /// lists block 2 under the file it is leaving, and nothing above the cut
+    /// in the file it went to. Whether the commit lands before the prune's
+    /// deletions or after them, deleting that file leaves block 2's entry
+    /// over a deleted record. A file with a record pending when the prune
+    /// plans is kept.
+    ///
+    /// Perturbation: drop the `pending_at_plan` check from `prune_up_to`, or
+    /// let `repair_block_data` drop its `PendingRecord` before the commit,
+    /// and file 1 is deleted under block 2's repaired record.
+    #[test]
+    fn prune_keeps_a_file_with_a_repair_pending_when_it_plans() {
+        let (cs, dir, controls, blocks) = chain_with_a_file_below_the_cut();
+        let h2 = blocks[1].block_hash();
+        // Block 2's record is lost: its entry points past the end of file 0.
+        repoint_block_record(&cs, &h2, FlatFilePos { file_number: 0, data_pos: u32::MAX / 2 });
+        assert!(cs.get_block(&h2).is_none());
+
+        let (deleted, repaired) =
+            prune_while_a_write_waits_to_commit(&cs, &controls, || cs.repair_block_data(&blocks[1]));
+        assert!(matches!(repaired, Ok(BlockDataRepair::Repaired { height: 2 })));
+
+        assert_eq!(deleted, 0, "block 2's record was pending in file 1 when the prune planned");
+        assert!(cs.flat_files.lock().file_exists(1));
+        assert_eq!(cs.get_block(&h2).as_ref(), Some(&blocks[1]), "block 2's repaired record");
+
+        // The entry is committed now, so the next round sees block 2 in file 1.
+        assert_eq!(cs.prune_up_to(6), 1, "file 1 goes");
+        assert!(!cs.flat_files.lock().file_exists(1));
+        for b in [&blocks[1], &blocks[4], &blocks[5]] {
+            assert!(cs.is_pruned(&b.block_hash()));
+        }
+        assert!(cs.flat_files.lock().file_exists(0), "file 0 holds blocks 7 and 8");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same window for `store_block`, the writer IBD runs on: a block of
+    /// a fork below the cut, stored into the append file, which moves on
+    /// before the entry is committed.
+    ///
+    /// Perturbation: let `store_block` drop its `PendingRecord` before the
+    /// commit and file 1 is deleted under the fork block's record.
+    #[test]
+    fn prune_keeps_a_file_with_a_stored_block_pending_when_it_plans() {
+        let (cs, dir, controls, blocks) = chain_with_a_file_below_the_cut();
+        let fork = build_test_block(blocks[0].block_hash(), 2, 1_300_000_100);
+
+        let (deleted, stored) =
+            prune_while_a_write_waits_to_commit(&cs, &controls, || cs.store_block(&fork));
+        assert_eq!(stored.expect("store the fork block"), (fork.block_hash(), 2));
+
+        assert_eq!(deleted, 0, "the fork block's record was pending in file 1 when the prune planned");
+        assert_eq!(cs.get_block(&fork.block_hash()).as_ref(), Some(&fork));
+
+        assert_eq!(cs.prune_up_to(6), 1, "file 1 goes");
+        assert!(cs.is_pruned(&fork.block_hash()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

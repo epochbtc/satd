@@ -316,7 +316,9 @@ impl BackgroundChainState {
         // genesis→snapshot block data (hundreds of GB on mainnet). Only
         // write when the block isn't stored yet (e.g. a test or a caller
         // that connects without pre-storing).
-        let flat_pos = match store_ref.get_block_index(&block_hash) {
+        // The written record stays pending until the batch below commits
+        // the entry pointing at it.
+        let (flat_pos, _pending) = match store_ref.get_block_index(&block_hash) {
             Some(entry)
                 if matches!(
                     entry.status,
@@ -324,16 +326,17 @@ impl BackgroundChainState {
                         | crate::storage::blockindex::BlockStatus::Valid
                 ) =>
             {
-                crate::storage::flatfile::FlatFilePos {
+                let pos = crate::storage::flatfile::FlatFilePos {
                     file_number: entry.file_number,
                     data_pos: entry.data_pos,
-                }
+                };
+                (pos, None)
             }
             _ => {
                 let block_data = serialize(block);
                 let mut flat = self.flat_files.lock();
-                let pos = flat
-                    .write_block(&block_data, network_magic(self.network), new_height)
+                let (pos, pending) = flat
+                    .write_block_pending(&block_data, network_magic(self.network), new_height)
                     .map_err(|e| ChainError::FlatFile(e.to_string()))?;
                 // Same "data before the pointer" ordering
                 // `ChainState::write_block_durable` enforces, and for the same
@@ -346,7 +349,7 @@ impl BackgroundChainState {
                 // block, so one fsync per block is far below the noise floor.
                 flat.sync_all()
                     .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-                pos
+                (pos, Some(pending))
             }
         };
 

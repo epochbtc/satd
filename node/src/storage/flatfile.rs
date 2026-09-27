@@ -136,6 +136,36 @@ pub struct FlatFilePos {
     pub data_pos: u32,
 }
 
+/// Per file, how many records its writers still hold pending.
+type PendingCounts = std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u32, u32>>>;
+
+/// A record in a block file that no committed index entry may point at yet.
+///
+/// A writer commits the entry pointing at a record only after writing the
+/// record and releasing the flat-file lock, so for a while the record is on
+/// disk and the block index does not know it is there. The pruner keeps any
+/// file with a record pending when it plans (see
+/// [`FlatFileManager::files_with_pending_records`]). Hold this until the
+/// entry is committed; dropping it any earlier lets a prune that plans in
+/// between delete the file under the entry.
+#[must_use = "the pruner may delete the record's file once this is dropped"]
+pub struct PendingRecord {
+    file_number: u32,
+    counts: PendingCounts,
+}
+
+impl Drop for PendingRecord {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(n) = counts.get_mut(&self.file_number) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.file_number);
+            }
+        }
+    }
+}
+
 /// Manages sequential block storage in blk*.dat files.
 pub struct FlatFileManager {
     blocks_dir: PathBuf,
@@ -181,6 +211,10 @@ pub struct FlatFileManager {
     /// earlier process are all committed (or orphaned by a crash, and then
     /// unreferenced), so the index covers those.
     highest_height: std::collections::HashMap<u32, u32>,
+    /// The records written through [`Self::write_block_pending`] whose
+    /// [`PendingRecord`] is still alive. Shared with those handles, which
+    /// release their count when they drop, without this manager's lock.
+    pending: PendingCounts,
 }
 
 /// Sum the sizes of every `blk*.dat` in `dir`.
@@ -262,6 +296,7 @@ impl FlatFileManager {
             total_bytes,
             max_file_size: MAX_FILE_SIZE,
             highest_height: std::collections::HashMap::new(),
+            pending: PendingCounts::default(),
         })
     }
 
@@ -286,11 +321,41 @@ impl FlatFileManager {
             .join(format!("blk{:05}.dat", file_number))
     }
 
+    /// [`Self::write_block`] for a writer that commits an index entry
+    /// pointing at the record afterwards: the pruner keeps the record's file
+    /// while the returned [`PendingRecord`] lives. Registered under the same
+    /// lock as the write, so a pruner holding it sees every record written
+    /// so far that is not committed yet.
+    pub fn write_block_pending(
+        &mut self,
+        block_data: &[u8],
+        network_magic: [u8; 4],
+        height: u32,
+    ) -> std::io::Result<(FlatFilePos, PendingRecord)> {
+        let pos = self.write_block(block_data, network_magic, height)?;
+        *self.pending.lock().entry(pos.file_number).or_insert(0) += 1;
+        let pending = PendingRecord {
+            file_number: pos.file_number,
+            counts: self.pending.clone(),
+        };
+        Ok((pos, pending))
+    }
+
+    /// The files holding a record written through
+    /// [`Self::write_block_pending`] whose [`PendingRecord`] is still alive.
+    pub fn files_with_pending_records(&self) -> std::collections::HashSet<u32> {
+        self.pending.lock().keys().copied().collect()
+    }
+
     /// Write a block to the flat files. Returns the position where it was stored.
     ///
     /// `height` is the block's height. The pruner reads the highest height
     /// written to each file ([`Self::highest_height_written`]) so that it
     /// never deletes a file holding a block above its cut.
+    ///
+    /// A writer that will commit an index entry pointing at the record uses
+    /// [`Self::write_block_pending`] instead, unless no prune can run before
+    /// the entry is committed.
     pub fn write_block(
         &mut self,
         block_data: &[u8],
@@ -1260,6 +1325,34 @@ mod tests {
 
         mgr.delete_file(0).unwrap();
         assert_eq!(mgr.highest_height_written(0), None, "a deleted file is forgotten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each pending record holds its file until its handle drops, and a
+    /// file with two holds it until both have.
+    #[test]
+    fn a_pending_record_holds_its_file_until_it_drops() {
+        let dir = temp_dir("pending-records");
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        assert!(mgr.files_with_pending_records().is_empty());
+
+        let (_, first) = mgr.write_block_pending(b"block one", magic, 1).unwrap();
+        let (_, second) = mgr.write_block_pending(b"block two", magic, 2).unwrap();
+        mgr.write_block(b"block three", magic, 3).unwrap();
+        mgr.current_file = 1;
+        mgr.current_pos = 0;
+        mgr.write_handle = None;
+        let (pos, third) = mgr.write_block_pending(b"block four", magic, 4).unwrap();
+        assert_eq!(pos.file_number, 1);
+        assert_eq!(mgr.files_with_pending_records(), [0, 1].into());
+
+        drop(first);
+        assert_eq!(mgr.files_with_pending_records(), [0, 1].into(), "file 0 holds block two");
+        drop(second);
+        assert_eq!(mgr.files_with_pending_records(), [1].into());
+        drop(third);
+        assert!(mgr.files_with_pending_records().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
