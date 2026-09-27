@@ -4005,17 +4005,33 @@ async fn main() {
     // Core resolves both `-connect` and `-addnode` through `Lookup(…,
     // default_port)` with `Params().GetDefaultPort()`, which is what
     // `-seednode` already does here via `resolve_operator_seeds`.
+    //
+    // A host name that does not resolve yet is kept, not dropped: Core
+    // resolves `-connect` and `-addnode` names on every attempt, and a
+    // peer started at the same time as this node (as container
+    // orchestrators do) may have no DNS record for its first seconds.
+    // `refresh_manual_targets` looks such names up again on each reconnect
+    // tick. Only a target that can never resolve here (malformed, `-dns=0`,
+    // `-proxy`) is refused.
+    use node::net::dns::{is_name_target, PeerTargetError};
     let default_peer_port = node::net::peer::default_p2p_port(config.network);
     for addr_str in &config.connect {
-        match peer_manager.resolve_peer_target(addr_str, default_peer_port).await {
+        match peer_manager.resolve_target_classified(addr_str, default_peer_port).await {
             Ok(addr) => {
                 peer_manager.add_peer_addr(addr.clone());
+                if is_name_target(addr_str) {
+                    peer_manager.connect_name_add(addr_str, Some(addr.clone()));
+                }
                 let pm = peer_manager.clone();
                 tokio::spawn(async move {
                     if let Err(e) = pm.connect_peer_addr(&addr).await {
                         tracing::warn!(%addr, "Failed to connect to peer: {}", e);
                     }
                 });
+            }
+            Err(PeerTargetError::Lookup(e)) => {
+                tracing::warn!(addr = addr_str, "connect address does not resolve yet; will keep trying: {}", e);
+                peer_manager.connect_name_add(addr_str, None);
             }
             Err(e) => {
                 tracing::warn!(addr = addr_str, "Invalid connect address: {}", e);
@@ -4030,7 +4046,7 @@ async fn main() {
     // and `getaddednodeinfo` reports that list. Adding the address without
     // recording the entry dials the peer but leaves it invisible to the RPC.
     for addr_str in &config.addnode {
-        match peer_manager.resolve_peer_target(addr_str, default_peer_port).await {
+        match peer_manager.resolve_target_classified(addr_str, default_peer_port).await {
             Ok(addr) => {
                 peer_manager.addnode_add(addr_str, addr.clone());
                 let pm = peer_manager.clone();
@@ -4039,6 +4055,10 @@ async fn main() {
                         tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
                     }
                 });
+            }
+            Err(PeerTargetError::Lookup(e)) => {
+                tracing::warn!(addr = addr_str, "addnode address does not resolve yet; will keep trying: {}", e);
+                peer_manager.addnode_add_unresolved(addr_str);
             }
             Err(e) => {
                 tracing::warn!(addr = addr_str, "Invalid addnode address: {}", e);

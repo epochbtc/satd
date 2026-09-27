@@ -4484,6 +4484,55 @@ fn test_getaddednodeinfo() {
     node.stop();
 }
 
+/// A peer name that does not resolve is kept as an added node, as in Core,
+/// whether it came from `-addnode` or `addnode add`: listed by
+/// `getaddednodeinfo` (not connected, no addresses) and removable by the
+/// same string. satd used to drop the config entry with a warning and fail
+/// the RPC, so a node started before its peers had DNS records never
+/// connected to them. `.invalid` never resolves (RFC 6761).
+#[test]
+fn an_unresolvable_added_node_is_kept_listed_and_removable() {
+    let mut node = TestNode::start(&["-addnode=tank-0000.invalid:18444"]);
+
+    let listed = node.rpc_ok("getaddednodeinfo", vec![]);
+    assert_eq!(
+        listed,
+        serde_json::json!([{"addednode": "tank-0000.invalid:18444", "connected": false, "addresses": []}]),
+        "the config entry must survive a failed lookup"
+    );
+
+    node.rpc_ok("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")]);
+    let dup = node
+        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")])
+        .unwrap();
+    assert_eq!(dup["error"]["code"], -23, "{dup}");
+    assert_eq!(dup["error"]["message"], "Error: Node already added", "{dup}");
+    let one = node.rpc_ok("getaddednodeinfo", vec![serde_json::json!("tank-0001.invalid")]);
+    assert_eq!(one[0]["connected"], false, "{one}");
+
+    node.rpc_ok("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("remove")]);
+    node.rpc_ok("addnode", vec![serde_json::json!("tank-0000.invalid:18444"), serde_json::json!("remove")]);
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    let gone = node
+        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("remove")])
+        .unwrap();
+    assert_eq!(gone["error"]["code"], -24, "{gone}");
+    node.stop();
+}
+
+/// A name refused by configuration is still an error, not a pending entry:
+/// under `-dns=0` it can never resolve, so keeping it would retry forever.
+#[test]
+fn addnode_refuses_a_name_under_dns_off() {
+    let mut node = TestNode::start(&["-dns=0"]);
+    let r = node
+        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -1, "{r}");
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    node.stop();
+}
+
 #[test]
 fn test_getnettotals() {
     let mut node = TestNode::start(&[]);

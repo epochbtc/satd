@@ -2860,24 +2860,45 @@ pub async fn start(
                 // the reconnect loop dials it. Blocking here would stall the RPC
                 // for the whole connect timeout — up to the 20s onion floor — and
                 // wrongly report a transient dial failure as an addnode error.
-                let addr = ctx.peer_manager
-                    .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                //
+                // A name that does not resolve yet is still added, as Core
+                // does (`CConnman::AddNode` never looks a name up): it is
+                // listed at once and dialled when it resolves. Only a target
+                // that can never resolve here (malformed, `-dns=0`,
+                // `-proxy`) is an error.
+                let resolved = match ctx.peer_manager
+                    .resolve_target_classified(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .await
-                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+                {
+                    Ok(addr) => Some(addr),
+                    Err(crate::net::dns::PeerTargetError::Lookup(_)) => None,
+                    Err(e) => return Err(ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)),
+                };
+                let added = match &resolved {
+                    Some(addr) => ctx.peer_manager.addnode_add(&addr_str, addr.clone()),
+                    None => ctx.peer_manager.addnode_add_unresolved(&addr_str),
+                };
                 // -23 = RPC_CLIENT_NODE_ALREADY_ADDED in Core.
-                if !ctx.peer_manager.addnode_add(&addr_str, addr.clone()) {
+                if !added {
                     return Err(ErrorObjectOwned::owned(
                         -23,
-                        "Node already added",
+                        "Error: Node already added",
                         None::<()>,
                     ));
                 }
                 let pm = ctx.peer_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr_with(&addr, v2transport).await {
-                        tracing::debug!(%addr, "addnode add: initial dial failed: {e}");
+                match resolved {
+                    Some(addr) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = pm.connect_peer_addr_with(&addr, v2transport).await {
+                                tracing::debug!(%addr, "addnode add: initial dial failed: {e}");
+                            }
+                        });
                     }
-                });
+                    None => {
+                        tokio::spawn(pm.refresh_manual_targets());
+                    }
+                }
             }
             "onetry" => {
                 // A single, un-remembered attempt — block on it and surface the
@@ -2892,15 +2913,19 @@ pub async fn start(
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
             "remove" => {
+                // By the string the node was added with, as Core's
+                // `RemoveAddedNode` does -- which is the only way to name an
+                // added node that has not resolved -- then by resolved
+                // address, the form satd has always accepted.
                 let addr = ctx.peer_manager
                     .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .await
-                    .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
+                    .ok();
                 // -24 = RPC_CLIENT_NODE_NOT_ADDED in Core.
-                if !ctx.peer_manager.addnode_remove(&addr) {
+                if !ctx.peer_manager.addnode_remove_target(&addr_str, addr.as_ref()) {
                     return Err(ErrorObjectOwned::owned(
                         -24,
-                        "Node could not be removed",
+                        "Error: Node could not be removed. It has not been added previously.",
                         None::<()>,
                     ));
                 }
