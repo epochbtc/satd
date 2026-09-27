@@ -63,5 +63,6 @@ pub mod psbt_v2;
 pub mod rawtx;
 pub mod readonly;
 pub mod warmup;
+pub mod whitelist;
 pub mod server;
 pub mod util;

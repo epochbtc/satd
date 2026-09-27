@@ -631,6 +631,10 @@ fn field_specs() -> Vec<FieldSpec> {
         // decided when the listener is built at startup, so toggling it requires
         // a restart. (Token edits/revocations are live — see authfile.)
         restart!("rpcauthbearer", rpc_auth_bearer),
+        // The allowlists ride on the listeners' shared auth handle, built once
+        // at startup; the credentials on it rotate live, the allowlists do not.
+        restart!("rpcwhitelist", rpc_whitelist),
+        restart!("rpcwhitelistdefault", rpc_whitelist),
         // The API runtime's worker count is fixed when the runtime is built
         // at startup; changing it requires a restart.
         restart!("apithreads", api_threads),

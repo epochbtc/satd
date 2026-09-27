@@ -519,6 +519,10 @@ pub struct Config {
     /// configured. Coexists with `--rpcuser`/`--rpcpassword` and cookie
     /// auth; any valid credential opens the door.
     pub rpcauth: Vec<RpcAuthEntry>,
+    /// Per-user JSON-RPC method allowlists (`-rpcwhitelist`) and the policy
+    /// for users without one (`-rpcwhitelistdefault`), with Bitcoin Core's
+    /// semantics. Inert (restricts nobody) unless one of the two is set.
+    pub rpc_whitelist: node::rpc::whitelist::RpcWhitelist,
     /// Path to the unified-auth bearer-token file (TOML), Core-shaped switch
     /// `authfile=<path>`. `None` (default) keeps today's behavior exactly:
     /// only the Core-compatible cookie/userpass/rpcauth operator path is live.
@@ -1914,6 +1918,11 @@ impl Config {
             }
         }
 
+        // Resolved in a helper, to keep this function's debug-build stack
+        // frame from growing.
+        let rpc_whitelist =
+            resolve_rpc_whitelist(cli.rpc_whitelist_args, &file_get, &file_get_all)?;
+
         let mut rpc_cookie_file = cli
             .rpccookiefile
             .or_else(|| file_get("rpccookiefile").map(PathBuf::from));
@@ -2283,6 +2292,18 @@ impl Config {
         // affect anything," which avoids configuration confusion.
         if rpc_disable_auth && !rpc_mtls {
             return Err("--rpcdisableauth=1 requires --rpcmtls=1".to_string());
+        }
+        // `-rpcwhitelist` restricts RPC users by the name they authenticate
+        // as. The auth-disabled TLS surface authenticates nobody, so it has
+        // no name to restrict: its clients would call every method while the
+        // operator believes the allowlists cover them. Refuse it.
+        if rpc_disable_auth && !rpc_whitelist.is_inert() {
+            return Err(
+                "--rpcdisableauth=1 cannot be combined with --rpcwhitelist or \
+                 --rpcwhitelistdefault=1: allowlists restrict RPC users by name, and the \
+                 auth-disabled TLS surface authenticates no user"
+                    .to_string(),
+            );
         }
 
         // Core's `-listen` is a *soft* default: `InitParameterInteraction`
@@ -3952,6 +3973,7 @@ impl Config {
             rpc_readonly_mtls_client_ca,
             rpc_readonly_mtls_client_allow,
             rpcauth,
+            rpc_whitelist,
             authfile,
             rpc_auth_bearer,
             rpc_cookie_file,
@@ -4619,6 +4641,8 @@ impl Config {
                 "user": self.rpcuser.as_deref().unwrap_or("(cookie)"),
                 "password": if self.rpcpassword.is_some() { "(set)" } else { "(none)" },
                 "rpcauth_users": self.rpcauth.iter().map(|e| e.username.clone()).collect::<Vec<_>>(),
+                "whitelist_users": self.rpc_whitelist.users().map(|(u, _)| u.to_string()).collect::<Vec<_>>(),
+                "whitelist_default": self.rpc_whitelist.default_deny(),
                 "cookie_file": self.rpc_cookie_file.as_ref().map(|p| p.display().to_string()),
                 "cookie_perms": self.rpc_cookie_perms.as_str(),
                 "extended_errors": self.rpc_extended_errors,
@@ -5796,6 +5820,11 @@ pub struct CliArgs {
     /// same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
     pub compact_prefill_args: CompactPrefillArgs,
+
+    /// `-rpcwhitelist` and `-rpcwhitelistdefault`, hand-built for the same
+    /// stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub rpc_whitelist_args: RpcWhitelistArgs,
 
     #[arg(
         long,
@@ -7138,6 +7167,58 @@ impl clap::FromArgMatches for CompactPrefillArgs {
     }
 }
 
+/// Bitcoin Core's `-rpcwhitelist` / `-rpcwhitelistdefault` flags (see
+/// [`CliArgs::rpc_whitelist_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct RpcWhitelistArgs {
+    pub rpcwhitelist: Vec<String>,
+    pub rpcwhitelistdefault: Option<bool>,
+}
+
+/// Help text is Core's own (v31.1 `src/init.cpp:717-718`).
+const RPC_WHITELIST_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    ("rpcwhitelist", "WHITELIST", StratumArgKind::TextList, "Set a whitelist to filter incoming RPC calls for a specific user. The field <whitelist> comes in the format: <USERNAME>:<rpc 1>,<rpc 2>,...,<rpc n>. If multiple whitelists are set for a given user, they are set-intersected. See -rpcwhitelistdefault documentation for information on default whitelist behavior."),
+    ("rpcwhitelistdefault", "BOOL", StratumArgKind::Bool, "Sets default behavior for rpc whitelisting. Unless rpcwhitelistdefault is set to 0, if any -rpcwhitelist is set, the rpc server acts as if all rpc users are subject to empty-unless-otherwise-specified whitelists. If rpcwhitelistdefault is set to 1 and no -rpcwhitelist is set, rpc server acts as if all rpc users are subject to empty whitelists."),
+];
+
+impl clap::Args for RpcWhitelistArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in RPC_WHITELIST_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for RpcWhitelistArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            rpcwhitelist: m
+                .remove_many("rpcwhitelist")
+                .map(|v| v.collect())
+                .unwrap_or_default(),
+            rpcwhitelistdefault: m.remove_one("rpcwhitelistdefault"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// The resolved Stratum [`Config`] fields.
 struct StratumFields {
     stratum: bool,
@@ -7156,6 +7237,43 @@ struct StratumFields {
     stratum_v2_key: Option<std::path::PathBuf>,
     stratum_v2_max_channels: usize,
     stratum_v2_jd: bool,
+}
+
+/// Resolve `-rpcwhitelist` and `-rpcwhitelistdefault` from the command line
+/// and the config file.
+///
+/// Core's `GetArgs` returns the command line's values AND the config file's
+/// (v31.1 `common/settings.cpp` GetSettingsList), so, unlike `-rpcauth`, the
+/// two are not alternatives: every entry counts, and a user listed in both
+/// places keeps the intersection. Taking only one source would leave a user
+/// less restricted than the operator's Core config intends.
+///
+/// An empty `rpcwhitelistdefault=` is true, as Core's `InterpretBool("")`
+/// reads it. An unreadable one is refused rather than falling back to the
+/// default: `rpcwhitelistdefault=on` with no list would otherwise leave every
+/// user unrestricted on a node its operator meant to lock.
+#[inline(never)]
+fn resolve_rpc_whitelist(
+    cli: RpcWhitelistArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+    file_get_all: &dyn Fn(&str) -> Vec<String>,
+) -> Result<node::rpc::whitelist::RpcWhitelist, String> {
+    let mut entries = cli.rpcwhitelist;
+    entries.extend(file_get_all("rpcwhitelist"));
+    let default = match cli.rpcwhitelistdefault {
+        Some(v) => Some(v),
+        None => match file_get("rpcwhitelistdefault") {
+            None => None,
+            Some(v) if v.is_empty() => Some(true),
+            Some(v) => Some(parse_bool(&v).ok_or_else(|| {
+                format!(
+                    "Invalid rpcwhitelistdefault value {v:?}: expected one of \
+                     0/1/true/false/yes/no"
+                )
+            })?),
+        },
+    };
+    Ok(node::rpc::whitelist::RpcWhitelist::new(&entries, default))
 }
 
 /// Resolve `-cmpctblockprefill` and `-cmpctblockprefillbytes` from CLI then
@@ -7430,6 +7548,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "rpcmtls",
     "rpcdisableauth",
     "rpcauthbearer",
+    "rpcwhitelistdefault",
     "rpcextendederrors",
     "logtimestamps",
     "logthreadnames",
@@ -7514,6 +7633,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcreadonlymtlsclientca",
         "rpcreadonlymtlsclientallow",
         "rpcauth",
+        "rpcwhitelist",
+        "rpcwhitelistdefault",
         "authfile",
         "rpcauthbearer",
         "rpccookiefile",
@@ -7744,6 +7865,12 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                 // own words. `-norpcauth` rides as a sentinel entry.
                 if stripped == "rpcauth" {
                     return "--rpcauth=".to_string();
+                }
+                // A bare `-rpcwhitelist` is Core's empty value: the user
+                // named `""` with an empty list, which turns the default to
+                // deny for everyone else.
+                if stripped == "rpcwhitelist" {
+                    return "--rpcwhitelist=".to_string();
                 }
                 if stripped == "norpcauth" || stripped == "norpcauth=1" {
                     return format!("--rpcauth={RPCAUTH_NEGATED}");
@@ -8228,6 +8355,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rpcreadonlymtlsclientca",
     "rpcreadonlymtlsclientallow",
     "rpcauth",
+    "rpcwhitelist",
+    "rpcwhitelistdefault",
     "authfile",
     "rpcauthbearer",
     "rpccookiefile",
@@ -8491,8 +8620,6 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 const FATAL_UNSUPPORTED_KEYS: &[(&str, &str)] = &[
     ("i2psam", "I2P is out of scope; Tor is satd's supported anonymity network (-proxy / -onion / -torcontrol). Leaving this in place would route traffic over clearnet instead of the privacy network you configured."),
     ("i2pacceptincoming", "I2P is out of scope (see i2psam); Tor is satd's supported anonymity network."),
-    ("rpcwhitelist", "satd uses capability-scoped bearer tokens (-authfile) instead of per-user RPC method allowlists; silently skipping this would leave RPC less restricted than your Core config intends. See the Authentication chapter of the manual."),
-    ("rpcwhitelistdefault", "satd uses capability-scoped bearer tokens (-authfile) instead of Core's RPC whitelists; silently skipping this would leave RPC less restricted than your Core config intends. See the Authentication chapter of the manual."),
 ];
 
 /// Optional, richer guidance appended to the warning when a *skipped* Core key
@@ -9828,16 +9955,12 @@ bind=127.0.0.1:9002
 
     /// A Core option that is fatal to skip must be fatal on the command line
     /// too. Core treats the file and the command line as one namespace, so if
-    /// `rpcwhitelist=` in bitcoin.conf refuses to start the node, `-rpcwhitelist=`
+    /// `i2psam=` in bitcoin.conf refuses to start the node, `-i2psam=`
     /// must as well — otherwise moving the key to a flag silently downgrades
     /// RPC restriction to a warning.
     #[test]
     fn fatal_core_cli_options_abort_like_the_config_file() {
-        for flag in [
-            "-rpcwhitelist=monitor:getblockcount",
-            "-rpcwhitelistdefault=0",
-            "-i2psam=127.0.0.1:7656",
-        ] {
+        for flag in ["-i2psam=127.0.0.1:7656", "-i2pacceptincoming=1"] {
             let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
             let err = filter_unsupported_core_cli_args(args)
                 .expect_err("{flag} must be fatal on the command line");
@@ -10802,6 +10925,7 @@ testactivationheight=bip34@2
             rpcreadonlymtlsclientca: None,
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
+            rpc_whitelist_args: RpcWhitelistArgs::default(),
             authfile: None,
             rpcauthbearer: None,
             rpccookiefile: None,
@@ -11117,6 +11241,7 @@ testactivationheight=bip34@2
             rpcreadonlymtlsclientca: None,
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
+            rpc_whitelist_args: RpcWhitelistArgs::default(),
             authfile: None,
             rpcauthbearer: None,
             rpccookiefile: None,
@@ -11828,6 +11953,131 @@ testactivationheight=bip34@2
             err.contains("rpcdisableauth") || err.contains("rpcmtls"),
             "expected disable-auth-without-mtls error, got: {err}"
         );
+    }
+
+    /// `-rpcwhitelist` restricts users by name; the auth-disabled mTLS
+    /// surface names none, so combining them is refused rather than leaving
+    /// that surface's clients outside every list.
+    #[test]
+    fn rpcwhitelist_is_refused_with_rpcdisableauth() {
+        let base = [
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-test",
+            "--rpctlsbind=127.0.0.1:8333",
+            "--rpctlscert=/tmp/cert.pem",
+            "--rpctlskey=/tmp/key.pem",
+            "--rpcmtls=1",
+            "--rpcmtlsclientca=/tmp/ca.pem",
+            "--rpcdisableauth=1",
+        ];
+        let ok = Config::from_cli(CliArgs::try_parse_from(base).unwrap())
+            .expect("auth-disabled mTLS alone loads");
+        assert!(ok.rpc_whitelist.is_inert());
+        for extra in [
+            "--rpcwhitelist=u:getblockcount",
+            "--rpcwhitelistdefault=1",
+        ] {
+            let argv: Vec<&str> = base.iter().copied().chain([extra]).collect();
+            let err = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap_err();
+            assert!(err.contains("rpcwhitelist"), "{extra}: {err}");
+        }
+        // An explicit default of 0 with no list restricts nobody: allowed.
+        let argv: Vec<&str> = base.iter().copied().chain(["--rpcwhitelistdefault=0"]).collect();
+        Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).expect("inert whitelist");
+    }
+
+    /// Both keys load from bitcoin.conf (they used to refuse startup), and a
+    /// user listed on the command line and in the file keeps the intersection:
+    /// Core's `GetArgs` returns both sources' values.
+    #[test]
+    fn rpcwhitelist_reads_the_file_and_the_command_line_together() {
+        use clap::Parser;
+        use node::rpc::whitelist::MethodScope;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(
+            &conf,
+            "regtest=1\nrpcwhitelist=u:getblockcount,getbestblockhash\nrpcwhitelistdefault=0\n",
+        )
+        .unwrap();
+        let dirs = dir.path().to_str().unwrap();
+        let confs = conf.to_str().unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--datadir", dirs, "--conf", confs]).unwrap(),
+        )
+        .unwrap();
+        assert!(!cfg.rpc_whitelist.default_deny(), "the file's default=0 applies");
+        assert!(cfg.rpc_whitelist.scope_for("u").unwrap().allows("getbestblockhash"));
+        assert_eq!(cfg.rpc_whitelist.scope_for("other"), None);
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                dirs,
+                "--conf",
+                confs,
+                "--rpcwhitelist=u:getblockcount",
+                "--rpcwhitelistdefault=1",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let scope = cfg.rpc_whitelist.scope_for("u").unwrap();
+        assert!(scope.allows("getblockcount"));
+        assert!(!scope.allows("getbestblockhash"), "command line ∩ file");
+        assert!(cfg.rpc_whitelist.default_deny(), "the command line's default wins");
+        assert_eq!(cfg.rpc_whitelist.scope_for("other"), Some(MethodScope::DenyAll));
+    }
+
+    /// An empty `rpcwhitelistdefault=` in the file is true, as in Core; a
+    /// value that is not a boolean refuses startup instead of quietly taking
+    /// the default, which with no list would leave everyone unrestricted.
+    #[test]
+    fn rpcwhitelistdefault_file_values_are_read_or_refused() {
+        use clap::Parser;
+        let load = |body: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conf = dir.path().join("bitcoin.conf");
+            std::fs::write(&conf, format!("regtest=1\n{body}")).unwrap();
+            Config::from_cli(
+                CliArgs::try_parse_from([
+                    "satd",
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    "--conf",
+                    conf.to_str().unwrap(),
+                ])
+                .unwrap(),
+            )
+        };
+        assert!(load("rpcwhitelistdefault=\n").unwrap().rpc_whitelist.default_deny());
+        assert!(load("rpcwhitelistdefault=1\n").unwrap().rpc_whitelist.default_deny());
+        assert!(!load("rpcwhitelistdefault=0\n").unwrap().rpc_whitelist.default_deny());
+        let err = load("rpcwhitelistdefault=on\n").unwrap_err();
+        assert!(err.contains("rpcwhitelistdefault"), "{err}");
+    }
+
+    /// Core-style single-dash spellings reach clap: `-rpcwhitelistdefault`
+    /// alone is true, `-norpcwhitelistdefault` false, and a bare
+    /// `-rpcwhitelist` is Core's empty value (user `""`, deny by default).
+    #[test]
+    fn rpcwhitelist_core_spellings_normalize() {
+        let parse = |flags: &[&str]| {
+            let argv: Vec<String> = ["satd", "-regtest", "-datadir=/tmp/satd-test"]
+                .iter()
+                .chain(flags)
+                .map(|s| s.to_string())
+                .collect();
+            let (kept, _) = filter_unsupported_core_cli_args(normalize_args(argv)).unwrap();
+            Config::from_cli(CliArgs::try_parse_from(kept).unwrap()).unwrap()
+        };
+        assert!(parse(&["-rpcwhitelistdefault"]).rpc_whitelist.default_deny());
+        assert!(!parse(&["-norpcwhitelistdefault"]).rpc_whitelist.default_deny());
+        let bare = parse(&["-rpcwhitelist"]).rpc_whitelist;
+        assert!(bare.default_deny());
+        assert_eq!(bare.users().map(|(u, _)| u).collect::<Vec<_>>(), vec![""]);
     }
 
     /// review C3 for the RPC surface: `--rpcmtlsclientallow` without

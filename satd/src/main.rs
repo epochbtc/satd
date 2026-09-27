@@ -694,7 +694,7 @@ async fn main() {
             cookie_path,
             config.rpc_cookie_perms.as_mode(),
         ) {
-            Ok(node::rpc::auth::RpcAuth::Verify(c)) => {
+            Ok(node::rpc::auth::RpcAuth::Verify(c, _)) => {
                 credentials.cookie = c.into_inner().cookie;
             }
             Ok(_) => unreachable!("generate_cookie_with always returns Verify"),
@@ -732,7 +732,10 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    let auth = Arc::new(RpcAuth::Verify(parking_lot::RwLock::new(credentials)));
+    let auth = Arc::new(RpcAuth::Verify(
+        parking_lot::RwLock::new(credentials),
+        config.rpc_whitelist.clone(),
+    ));
 
     // Unified-auth bearer-token store (opt-in via `authfile`). Loaded here so a
     // bad file — missing, group/world-readable, malformed, or carrying an

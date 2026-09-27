@@ -23678,3 +23678,312 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
     let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
     check(&node);
 }
+
+// ---- -rpcwhitelist / -rpcwhitelistdefault (Bitcoin Core `rpc_whitelist.py`) ----
+
+/// Core's `rpc_whitelist.py` users: name, `rpcauth` salt$hash, password. The
+/// salted hashes are public fixtures from that test.
+const WL_USER1: (&str, &str, &str) = (
+    "user1",
+    "50358aa884c841648e0700b073c32b2e$b73e95fff0748cc0b517859d2ca47d9bac1aa78231f3e48fa9222b612bd2083e",
+    "12345",
+);
+const WL_USER2: (&str, &str, &str) = (
+    "user2",
+    "8650ba41296f62092377a38547f361de$4620db7ba063ef4e2f7249853e9f3c5c3592a9619a759e3e6f1c63f2e22f1d21",
+    "54321",
+);
+const WL_STRANGE: (&str, &str, &str) = (
+    "strangedude",
+    "62d67dffec03836edd698314f1b2be62$c2fb4be29bb0e3646298661123cf2d8629640979cabc268ef05ea613ab54068d",
+    "s7R4nG3R7H1nGZ",
+);
+const WL_STRANGE4: (&str, &str, &str) = (
+    "strangedude4",
+    "990c895760a70df83949e8278665e19a$8f0906f20431ff24cb9e7f5b5041e4943bdf2a5c02a19ef4960dcf45e72cde1c",
+    "s7R4nG3R7H1nGZ",
+);
+const WL_STRANGE6: (&str, &str, &str) = (
+    "strangedude6",
+    "67e5583538958883291f6917883eca64$8a866953ef9c5b7d078a62c64754a4eb74f47c2c17821eb4237021d7ef44f991",
+    "N4SziYbHmhC1",
+);
+
+fn wl_rpcauth(u: (&str, &str, &str)) -> String {
+    format!("--rpcauth={}:{}", u.0, u.1)
+}
+
+/// POST `body` exactly as Core's test does (a JSON-RPC 1.0 object, no
+/// `jsonrpc` member) as `user`; the HTTP status and the raw body.
+fn wl_post(node: &TestNode, u: (&str, &str, &str), body: &str) -> (u16, String) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/", node.rpcport))
+        .basic_auth(u.0, Some(u.2))
+        .body(body.to_string())
+        .send()
+        .expect("the server must answer");
+    let status = resp.status().as_u16();
+    (status, resp.text().unwrap_or_default())
+}
+
+fn wl_call(node: &TestNode, u: (&str, &str, &str), method: &str) -> u16 {
+    wl_post(node, u, &format!(r#"{{"method": "{method}"}}"#)).0
+}
+
+/// Core `rpc_whitelist.py`, first phase: `rpcwhitelistdefault=0`, so a user
+/// with no entry is unrestricted while listed users get only their methods.
+/// A refusal is HTTP 403 with an empty body, before the method runs.
+#[test]
+fn rpcwhitelist_restricts_listed_users_to_their_methods() {
+    let node = TestNode::start(&[
+        "--rpcwhitelistdefault=0",
+        &wl_rpcauth(WL_USER1),
+        "--rpcwhitelist=user1:getbestblockhash,getblockcount,",
+        &wl_rpcauth(WL_USER2),
+        "--rpcwhitelist=user2:getblockcount",
+        &wl_rpcauth(WL_STRANGE),
+        "--rpcwhitelist=strangedude:",
+        &wl_rpcauth(WL_STRANGE4),
+        "--rpcwhitelist=strangedude4:getblockcount, getbestblockhash",
+        "--rpcwhitelist=strangedude4:getblockcount",
+        &wl_rpcauth(WL_STRANGE6),
+    ]);
+
+    // Listed users: their methods only.
+    assert_eq!(wl_call(&node, WL_USER1, "getbestblockhash"), 200);
+    assert_eq!(wl_call(&node, WL_USER1, "getblockcount"), 200);
+    assert_eq!(wl_call(&node, WL_USER2, "getblockcount"), 200);
+    for u in [WL_USER1, WL_USER2, WL_STRANGE] {
+        assert_eq!(wl_call(&node, u, "getnetworkinfo"), 403, "{}", u.0);
+        assert_eq!(wl_call(&node, u, "getblockchaininfo"), 403, "{}", u.0);
+    }
+    // A repeated user keeps the intersection.
+    assert_eq!(wl_call(&node, WL_STRANGE4, "getblockcount"), 200);
+    assert_eq!(wl_call(&node, WL_STRANGE4, "getbestblockhash"), 403);
+    // No entry, default off: unrestricted.
+    assert_eq!(wl_call(&node, WL_STRANGE6, "getbestblockhash"), 200);
+    assert_eq!(wl_call(&node, WL_STRANGE6, "getblockchaininfo"), 200);
+    // The cookie user has no entry either.
+    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 200);
+
+    // The refusal is Core's: 403, no body.
+    let (status, body) = wl_post(&node, WL_USER2, r#"{"method": "getnetworkinfo"}"#);
+    assert_eq!((status, body.as_str()), (403, ""));
+
+    // A refused method does not run: `stop` leaves the node answering.
+    assert_eq!(wl_call(&node, WL_USER2, "stop"), 403);
+    assert_eq!(wl_call(&node, WL_USER2, "getblockcount"), 200);
+
+    // A batch runs only if every member is allowed; one outsider refuses it
+    // whole, and a 2.0 notification is checked like any other call.
+    let (status, _) = wl_post(
+        &node,
+        WL_USER1,
+        r#"[{"method":"getblockcount","id":1},{"method":"getbestblockhash","id":2}]"#,
+    );
+    assert_eq!(status, 200);
+    let (status, body) = wl_post(
+        &node,
+        WL_USER1,
+        r#"[{"method":"getblockcount","id":1},{"method":"getnetworkinfo","id":2}]"#,
+    );
+    assert_eq!((status, body.as_str()), (403, ""));
+    let (status, _) = wl_post(&node, WL_USER1, r#"{"jsonrpc":"2.0","method":"stop"}"#);
+    assert_eq!(status, 403);
+    assert_eq!(wl_call(&node, WL_USER1, "getblockcount"), 200, "the node is still up");
+
+    // A body that is not JSON keeps Core's parse error ahead of the 403.
+    let (status, body) = wl_post(&node, WL_USER2, "{not json");
+    assert_ne!(status, 403, "{body}");
+    assert!(body.contains("-32700"), "{body}");
+}
+
+/// Core `rpc_whitelist.py`, later phases: with any `rpcwhitelist` set and
+/// `rpcwhitelistdefault` left unset, the default turns to deny, so a user with
+/// no entry may call nothing; the cookie user is `__cookie__`.
+#[test]
+fn rpcwhitelist_default_denies_unlisted_users_once_any_list_is_set() {
+    let node = TestNode::start(&[
+        &wl_rpcauth(WL_USER2),
+        "--rpcwhitelist=user2:getblockcount",
+        &wl_rpcauth(WL_STRANGE6),
+        // The harness probes readiness with `getblockchaininfo` as the cookie.
+        "--rpcwhitelist=__cookie__:getblockcount,getblockchaininfo,getmempoolinfo,stop",
+    ]);
+
+    assert_eq!(wl_call(&node, WL_STRANGE6, "getbestblockhash"), 403);
+    assert_eq!(wl_call(&node, WL_STRANGE6, "getblockchaininfo"), 403);
+    // Default deny refuses even an empty batch.
+    let (status, body) = wl_post(&node, WL_STRANGE6, "[]");
+    assert_eq!((status, body.as_str()), (403, ""));
+    assert_eq!(wl_call(&node, WL_USER2, "getblockcount"), 200);
+    assert_eq!(wl_call(&node, WL_USER2, "getblockchaininfo"), 403);
+
+    // The cookie user is `__cookie__`, restricted by its own entry.
+    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getmempoolinfo"}"#).0, 200);
+    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 403);
+
+    // `rpcwhitelistdefault=1` with no list at all denies everyone, the cookie
+    // included; covered by the config unit tests, since a node started that
+    // way cannot be probed ready.
+}
+
+/// A restricted user may not open a WebSocket on the JSON-RPC listener: the
+/// frames after an upgrade never pass the layer that reads method names, so
+/// allowing it would let the user call anything. An unrestricted user still
+/// can.
+#[test]
+fn rpcwhitelist_refuses_a_websocket_upgrade_to_a_restricted_user() {
+    use std::io::{Read, Write};
+    let node = TestNode::start(&[
+        "--rpcwhitelistdefault=0",
+        &wl_rpcauth(WL_USER2),
+        "--rpcwhitelist=user2:getblockcount",
+        &wl_rpcauth(WL_STRANGE6),
+    ]);
+    let upgrade_status = |u: (&str, &str, &str)| -> String {
+        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", u.0, u.2));
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", node.rpcport)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        )
+        .unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+    };
+    let restricted = upgrade_status(WL_USER2);
+    assert!(restricted.contains(" 403"), "restricted user: {restricted}");
+    let open = upgrade_status(WL_STRANGE6);
+    assert!(open.contains(" 101"), "unrestricted user: {open}");
+}
+
+/// Opt-in rigor: a node with no whitelist keys leaves every user unrestricted
+/// — an `rpcauth` user reaches methods it would be denied under any list.
+#[test]
+fn rpcwhitelist_absent_restricts_nobody() {
+    let node = TestNode::start(&[&wl_rpcauth(WL_USER2)]);
+    assert_eq!(wl_call(&node, WL_USER2, "getnetworkinfo"), 200);
+    assert_eq!(wl_call(&node, WL_USER2, "getblockchaininfo"), 200);
+    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 200);
+}
+
+/// Bearer tokens are not RPC users: `-rpcwhitelist` names users, and a token
+/// is scoped by the capabilities in the auth file instead. Under a default
+/// that denies every unlisted user, a read token still reaches read methods
+/// and is still refused write methods by its own capability check.
+#[test]
+fn rpcwhitelist_leaves_bearer_tokens_to_their_capabilities() {
+    use std::io::Write;
+    const TOKEN: &str = "satd-test-readonly-token-v1";
+    const TOKEN_SHA256: &str =
+        "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
+    let dir = fresh_test_datadir("satd-whitelist-bearer");
+    let authfile = dir.join("auth.toml");
+    {
+        let mut f = std::fs::File::create(&authfile).unwrap();
+        write!(
+            f,
+            "version = 1\n[[token]]\nid = \"ro\"\nhash = \"sha256:{TOKEN_SHA256}\"\ncapabilities = [\"rpc:read\"]\n"
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&authfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let node = TestNode::start(&[
+        &format!("--authfile={}", authfile.display()),
+        "--rpcauthbearer=1",
+        "--rpcwhitelistdefault=1",
+        "--rpcwhitelist=__cookie__:getblockchaininfo",
+        &wl_rpcauth(WL_STRANGE6),
+    ]);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let bearer = |method: &str| -> (u16, serde_json::Value) {
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", node.rpcport))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":[]}))
+            .send()
+            .unwrap();
+        (resp.status().as_u16(), resp.json().unwrap_or(serde_json::Value::Null))
+    };
+    // The Basic user with no entry is denied everything...
+    assert_eq!(wl_call(&node, WL_STRANGE6, "getblockcount"), 403);
+    // ...while the token answers to its capabilities alone.
+    let (status, json) = bearer("getblockcount");
+    assert_eq!(status, 200, "{json}");
+    assert!(json.get("result").is_some(), "{json}");
+    let (status, json) = bearer("sendrawtransaction");
+    assert_eq!(status, 200);
+    assert_eq!(json["error"]["code"], -32004, "{json}");
+}
+
+/// The allowlists hold on every JSON-RPC listener, not just the plain one:
+/// the TLS listener and the read-only listener refuse a method outside the
+/// user's list with the same 403. On the read-only listener a call must pass
+/// both filters.
+#[test]
+fn rpcwhitelist_applies_on_the_tls_and_read_only_listeners() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let tls_port = find_available_port();
+    let ro_port = find_available_port();
+    let _node = TestNode::start(&[
+        &format!("--rpctlsbind=127.0.0.1:{tls_port}"),
+        &format!("--rpctlscert={}", cert_path.display()),
+        &format!("--rpctlskey={}", key_path.display()),
+        &format!("--rpcreadonlybind=127.0.0.1:{ro_port}"),
+        "--rpcwhitelistdefault=0",
+        &wl_rpcauth(WL_USER2),
+        "--rpcwhitelist=user2:getblockcount,stop",
+    ]);
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&cert_path).unwrap()).unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let post = |url: &str, method: &str| -> (u16, String) {
+        let resp = client
+            .post(url)
+            .basic_auth(WL_USER2.0, Some(WL_USER2.2))
+            .body(format!(r#"{{"method": "{method}"}}"#))
+            .send()
+            .expect("the listener must answer");
+        let status = resp.status().as_u16();
+        (status, resp.text().unwrap_or_default())
+    };
+
+    let tls = format!("https://localhost:{tls_port}/");
+    assert_eq!(post(&tls, "getblockcount").0, 200);
+    assert_eq!(post(&tls, "getblockchaininfo"), (403, String::new()));
+
+    // The read-only listener's accept loop starts on the API runtime.
+    let ro = format!("http://127.0.0.1:{ro_port}/");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.post(&ro).body("").send().is_err() {
+        assert!(Instant::now() < deadline, "read-only listener never accepted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(post(&ro, "getblockcount").0, 200);
+    assert_eq!(post(&ro, "getblockchaininfo"), (403, String::new()));
+    // `stop` is on the user's list but is not a read: the read-only filter
+    // still refuses it, and the node keeps answering.
+    let (_, body) = post(&ro, "stop");
+    assert!(body.contains("error") && !body.contains("stopping"), "{body}");
+    assert_eq!(post(&tls, "getblockcount").0, 200, "the node is still up");
+}

@@ -1355,7 +1355,7 @@ fn required_capability(method: &amp;str) -&gt; Capability {
 }</code></pre></div>
     <p>Small touches with the same posture: the cookie file's permission mode is applied at <code>open(2)</code> time so the secret is never briefly world-readable; token comparison is constant-time; per-principal rate limits shed with 429 inside the same layer.</p>
     <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
-    Core has cookie/userpass/rpcauth and a <code>-rpcwhitelist</code> per-user method list — no scoped tokens, no capability model, no shared auth across surfaces (each side-car brings its own).</div>
+    Core has cookie/userpass/rpcauth and a <code>-rpcwhitelist</code> per-user method list, both of which satd honours — but no scoped tokens, no capability model, no shared auth across surfaces (each side-car brings its own).</div>
   </div>
 </section>
 

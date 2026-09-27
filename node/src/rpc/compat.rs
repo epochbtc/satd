@@ -41,6 +41,9 @@
 use http_body_util::{BodyExt, Limited};
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 
+use crate::rpc::auth::RpcUser;
+use crate::rpc::whitelist::MethodScope;
+
 /// Maximum request body size the compat shim will buffer for JSON-RPC
 /// version normalization: the same
 /// [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the engine is
@@ -725,6 +728,20 @@ where
         let mut inner = self.inner.clone();
         let body_timeout = self.body_timeout;
         Box::pin(async move {
+            // `-rpcwhitelist`: the auth layer attached the user's scope when
+            // the user is restricted. A WebSocket carries its calls as frames
+            // after the upgrade, which never pass through this layer, so a
+            // restricted user may not open one. Core serves no WebSocket.
+            let scope = req.extensions().get::<MethodScope>().cloned();
+            if scope.is_some() && jsonrpsee::server::ws::is_upgrade_request(&req) {
+                tracing::warn!(
+                    target: "rpc::compat",
+                    user = %rpc_user_name(req.extensions()),
+                    "RPC user with an -rpcwhitelist restriction may not open a WebSocket"
+                );
+                return Ok(forbidden());
+            }
+
             let (mut parts, body) = req.into_parts();
 
             // Core does not require a Content-Type header on RPC requests;
@@ -781,6 +798,30 @@ where
                     return Ok(request_timeout());
                 }
             };
+
+            // `-rpcwhitelist`, checked where Core checks it (v31.1
+            // `src/httprpc.cpp:145-190`): after the body parses, before
+            // anything runs. A batch is refused whole if any member names a
+            // method outside the user's list.
+            if let Some(scope) = &scope
+                && let Some(method) = whitelist_refusal(scope, &collected)
+            {
+                let user = rpc_user_name(&parts.extensions);
+                match scope {
+                    MethodScope::DenyAll => tracing::warn!(
+                        target: "rpc::compat",
+                        %user,
+                        "RPC User {user} not allowed to call any methods"
+                    ),
+                    MethodScope::Only(_) => tracing::warn!(
+                        target: "rpc::compat",
+                        %user,
+                        %method,
+                        "RPC User {user} not allowed to call method {method}"
+                    ),
+                }
+                return Ok(forbidden());
+            }
 
             // Decide the response shape from what the client actually spoke,
             // before the request is rewritten to 2.0 for jsonrpsee's benefit.
@@ -970,6 +1011,72 @@ fn request_timeout() -> HttpResponse<HttpBody> {
         .header(hyper::header::CONNECTION, "close")
         .body(HttpBody::from(""))
         .expect("static 408 response is always valid")
+}
+
+/// `403 Forbidden` with an empty body: Core's `WriteReply(HTTP_FORBIDDEN)`
+/// for a call `-rpcwhitelist` does not allow.
+fn forbidden() -> HttpResponse<HttpBody> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .body(HttpBody::from(""))
+        .expect("static 403 response is always valid")
+}
+
+/// The authenticated RPC user, for a log line.
+fn rpc_user_name(ext: &hyper::http::Extensions) -> String {
+    ext.get::<RpcUser>()
+        .map(|u| u.0.to_string())
+        .unwrap_or_default()
+}
+
+/// Whether `scope` refuses the request `body`, and if so the method to name
+/// in the log. `None` lets the request through.
+///
+/// A body that is not JSON is let through: the engine answers it with the
+/// `-32700` parse error Core gives, and runs nothing. A valid body under
+/// `DenyAll` is refused whatever it holds, as Core refuses it before looking
+/// at its shape.
+///
+/// Each request object is read as its raw member list (the same reader the
+/// version rewrite uses), so a `"method"` key spelled with escapes is still
+/// found, and one that appears twice is refused rather than guessed at: the
+/// check must name the method the engine will run. A member with no method,
+/// or a method that is not a string, runs nothing — the engine rejects it —
+/// so it needs no verdict here.
+fn whitelist_refusal(scope: &MethodScope, body: &[u8]) -> Option<String> {
+    fn refused_in(scope: &MethodScope, members: &Members<'_>) -> Option<String> {
+        let mut methods = members.iter().filter(|(k, _)| k == "method");
+        let first = methods.next()?;
+        if methods.next().is_some() {
+            return Some("(duplicate \"method\" member)".to_string());
+        }
+        let name = serde_json::from_str::<String>(first.1.get()).ok()?;
+        (!scope.allows(&name)).then_some(name)
+    }
+    let deny_all = matches!(scope, MethodScope::DenyAll);
+    if let Ok(members) = serde_json::from_slice::<Members>(body) {
+        return if deny_all {
+            Some(String::new())
+        } else {
+            refused_in(scope, &members)
+        };
+    }
+    if let Ok(elements) = serde_json::from_slice::<Vec<&serde_json::value::RawValue>>(body) {
+        if deny_all {
+            return Some(String::new());
+        }
+        return elements.iter().find_map(|raw| {
+            serde_json::from_str::<Members>(raw.get())
+                .ok()
+                .and_then(|m| refused_in(scope, &m))
+        });
+    }
+    // Valid JSON of another shape runs nothing either; only `DenyAll` answers
+    // it before the engine does.
+    if deny_all && serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok() {
+        return Some(String::new());
+    }
+    None
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding
@@ -1437,5 +1544,75 @@ mod tests {
         // node is served by the engine now, and lands in the forward branch
         // rather than being DOM-parsed.
         assert!(too_large_to_normalise(85 * 1024 * 1024));
+    }
+
+    fn only(methods: &[&str]) -> MethodScope {
+        MethodScope::Only(std::sync::Arc::new(
+            methods.iter().map(|m| m.to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn whitelist_refuses_a_method_outside_the_list() {
+        let s = only(&["getblockcount"]);
+        assert_eq!(whitelist_refusal(&s, br#"{"method":"getblockcount"}"#), None);
+        assert_eq!(
+            whitelist_refusal(&s, br#"{"method":"getnetworkinfo"}"#).as_deref(),
+            Some("getnetworkinfo")
+        );
+        // A notification is checked like any other request.
+        assert!(whitelist_refusal(&s, br#"{"jsonrpc":"2.0","method":"stop"}"#).is_some());
+    }
+
+    #[test]
+    fn whitelist_refuses_the_whole_batch_for_one_member() {
+        let s = only(&["getblockcount"]);
+        assert_eq!(
+            whitelist_refusal(&s, br#"[{"method":"getblockcount"},{"method":"getblockcount"}]"#),
+            None
+        );
+        assert!(
+            whitelist_refusal(&s, br#"[{"method":"getblockcount"},{"method":"getnetworkinfo"}]"#)
+                .is_some()
+        );
+        assert_eq!(whitelist_refusal(&s, b"[]"), None, "an empty batch runs nothing");
+    }
+
+    #[test]
+    fn whitelist_reads_the_method_the_engine_will_run() {
+        let s = only(&["getblockcount"]);
+        // An escaped key or value names the same method.
+        assert!(whitelist_refusal(&s, br#"{"m\u0065thod":"stop"}"#).is_some());
+        assert!(whitelist_refusal(&s, br#"{"method":"st\u006fp"}"#).is_some());
+        assert_eq!(whitelist_refusal(&s, br#"{"method":"getblock\u0063ount"}"#), None);
+        // Two `method` members are refused, whichever one is allowed.
+        assert!(
+            whitelist_refusal(&s, br#"{"method":"getblockcount","method":"stop"}"#).is_some()
+        );
+        assert!(
+            whitelist_refusal(&s, br#"{"method":"stop","method":"getblockcount"}"#).is_some()
+        );
+    }
+
+    #[test]
+    fn whitelist_leaves_requests_that_run_nothing_to_the_engine() {
+        let s = only(&["getblockcount"]);
+        // Not JSON: the engine's -32700, as in Core.
+        assert_eq!(whitelist_refusal(&s, b"{not json"), None);
+        assert_eq!(whitelist_refusal(&s, b""), None);
+        // No method, or one that is not a string: rejected by the engine.
+        assert_eq!(whitelist_refusal(&s, br#"{"id":1}"#), None);
+        assert_eq!(whitelist_refusal(&s, br#"{"method":5}"#), None);
+        assert_eq!(whitelist_refusal(&s, br#"[5,{"method":"getblockcount"}]"#), None);
+    }
+
+    #[test]
+    fn whitelist_deny_all_refuses_any_valid_body() {
+        let s = MethodScope::DenyAll;
+        assert!(whitelist_refusal(&s, br#"{"method":"getblockcount"}"#).is_some());
+        assert!(whitelist_refusal(&s, b"[]").is_some());
+        assert!(whitelist_refusal(&s, b"5").is_some());
+        // Parse errors still come first.
+        assert_eq!(whitelist_refusal(&s, b"{not json"), None);
     }
 }
