@@ -136,6 +136,36 @@ pub struct FlatFilePos {
     pub data_pos: u32,
 }
 
+/// Per file, how many records its writers still hold pending.
+type PendingCounts = std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u32, u32>>>;
+
+/// A record in a block file that no committed index entry may point at yet.
+///
+/// A writer commits the entry pointing at a record only after writing the
+/// record and releasing the flat-file lock, so for a while the record is on
+/// disk and the block index does not know it is there. The pruner keeps any
+/// file with a record pending when it plans (see
+/// [`FlatFileManager::files_with_pending_records`]). Hold this until the
+/// entry is committed; dropping it any earlier lets a prune that plans in
+/// between delete the file under the entry.
+#[must_use = "the pruner may delete the record's file once this is dropped"]
+pub struct PendingRecord {
+    file_number: u32,
+    counts: PendingCounts,
+}
+
+impl Drop for PendingRecord {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(n) = counts.get_mut(&self.file_number) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.file_number);
+            }
+        }
+    }
+}
+
 /// Manages sequential block storage in blk*.dat files.
 pub struct FlatFileManager {
     blocks_dir: PathBuf,
@@ -169,6 +199,22 @@ pub struct FlatFileManager {
     /// corruption guard against a datadir written under another setting,
     /// not a policy.
     max_file_size: u64,
+    /// The highest block height each file has been handed by this process,
+    /// recorded when the record's position is allocated.
+    ///
+    /// The pruner plans from `block_index`, but a writer commits its entry
+    /// only after the bytes are in and the flat-file lock is released. A
+    /// block in that window is on disk and invisible to the index, and the
+    /// file it landed in can look deletable. This map is updated under the
+    /// same lock as the write, so a pruner holding the lock sees every block
+    /// this process has written, committed or not. Blocks written by an
+    /// earlier process are all committed (or orphaned by a crash, and then
+    /// unreferenced), so the index covers those.
+    highest_height: std::collections::HashMap<u32, u32>,
+    /// The records written through [`Self::write_block_pending`] whose
+    /// [`PendingRecord`] is still alive. Shared with those handles, which
+    /// release their count when they drop, without this manager's lock.
+    pending: PendingCounts,
 }
 
 /// Sum the sizes of every `blk*.dat` in `dir`.
@@ -249,6 +295,8 @@ impl FlatFileManager {
             xor_key,
             total_bytes,
             max_file_size: MAX_FILE_SIZE,
+            highest_height: std::collections::HashMap::new(),
+            pending: PendingCounts::default(),
         })
     }
 
@@ -273,11 +321,46 @@ impl FlatFileManager {
             .join(format!("blk{:05}.dat", file_number))
     }
 
+    /// [`Self::write_block`] for a writer that commits an index entry
+    /// pointing at the record afterwards: the pruner keeps the record's file
+    /// while the returned [`PendingRecord`] lives. Registered under the same
+    /// lock as the write, so a pruner holding it sees every record written
+    /// so far that is not committed yet.
+    pub fn write_block_pending(
+        &mut self,
+        block_data: &[u8],
+        network_magic: [u8; 4],
+        height: u32,
+    ) -> std::io::Result<(FlatFilePos, PendingRecord)> {
+        let pos = self.write_block(block_data, network_magic, height)?;
+        *self.pending.lock().entry(pos.file_number).or_insert(0) += 1;
+        let pending = PendingRecord {
+            file_number: pos.file_number,
+            counts: self.pending.clone(),
+        };
+        Ok((pos, pending))
+    }
+
+    /// The files holding a record written through
+    /// [`Self::write_block_pending`] whose [`PendingRecord`] is still alive.
+    pub fn files_with_pending_records(&self) -> std::collections::HashSet<u32> {
+        self.pending.lock().keys().copied().collect()
+    }
+
     /// Write a block to the flat files. Returns the position where it was stored.
+    ///
+    /// `height` is the block's height. The pruner reads the highest height
+    /// written to each file ([`Self::highest_height_written`]) so that it
+    /// never deletes a file holding a block above its cut.
+    ///
+    /// A writer that will commit an index entry pointing at the record uses
+    /// [`Self::write_block_pending`] instead, unless no prune can run before
+    /// the entry is committed.
     pub fn write_block(
         &mut self,
         block_data: &[u8],
         network_magic: [u8; 4],
+        height: u32,
     ) -> std::io::Result<FlatFilePos> {
         // Total size: 4 (magic) + 4 (size) + block_data.len()
         let record_size = 8 + block_data.len() as u64;
@@ -309,6 +392,10 @@ impl FlatFileManager {
             file_number: self.current_file,
             data_pos: self.current_pos as u32,
         };
+        // Before the write, as Core's `FindNextBlockPos` updates `nHeightLast`:
+        // a failed write that left bytes behind only keeps the file longer.
+        let highest = self.highest_height.entry(pos.file_number).or_insert(height);
+        *highest = (*highest).max(height);
 
         // Reuse cached write handle or open new one
         let file = match &mut self.write_handle {
@@ -512,6 +599,19 @@ impl FlatFileManager {
         self.dirty
     }
 
+    /// The highest block height this process has written into
+    /// `file_number`, or `None` if it has written nothing there. Blocks from
+    /// an earlier run are not counted; the block index covers them.
+    pub fn highest_height_written(&self, file_number: u32) -> Option<u32> {
+        self.highest_height.get(&file_number).copied()
+    }
+
+    /// The file records are being appended to. It only moves up while this
+    /// manager lives: to the next number when a record does not fit.
+    pub fn current_file(&self) -> u32 {
+        self.current_file
+    }
+
     /// Check whether a given flat file exists on disk.
     pub fn file_exists(&self, file_number: u32) -> bool {
         self.file_path(file_number).exists()
@@ -552,6 +652,9 @@ impl FlatFileManager {
             std::fs::remove_file(&path)?;
             self.total_bytes = self.total_bytes.saturating_sub(freed);
         }
+        // Only once the file is gone: a file that failed to unlink still holds
+        // what this process wrote to it, and the next prune round must see it.
+        self.highest_height.remove(&file_number);
         Ok(())
     }
 
@@ -761,13 +864,13 @@ mod tests {
         assert_eq!(mgr.size_on_disk(), 0, "an empty blocks dir holds nothing");
 
         let block = vec![0xabu8; 1_000];
-        mgr.write_block(&block, magic).unwrap();
+        mgr.write_block(&block, magic, 0).unwrap();
         assert_eq!(
             mgr.size_on_disk(),
             1_008,
             "the record is the block plus its 8-byte header"
         );
-        mgr.write_block(&block, magic).unwrap();
+        mgr.write_block(&block, magic, 0).unwrap();
         assert_eq!(mgr.size_on_disk(), 2_016);
 
         // A reopen must agree with what is on disk, not restart from zero.
@@ -781,7 +884,7 @@ mod tests {
         mgr.current_file = 1;
         mgr.current_pos = 0;
         mgr.write_handle = None;
-        mgr.write_block(&block, magic).unwrap();
+        mgr.write_block(&block, magic, 0).unwrap();
         let with_two = mgr.size_on_disk();
         assert_eq!(with_two, 2_016 + 1_008);
         mgr.delete_file(0).unwrap();
@@ -810,7 +913,7 @@ mod tests {
         let mut mgr = FlatFileManager::new(&dir).unwrap();
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
 
-        let pos = mgr.write_block(b"a block", magic).unwrap();
+        let pos = mgr.write_block(b"a block", magic, 0).unwrap();
         let err = mgr
             .delete_file(pos.file_number)
             .expect_err("the current append file must not be deletable");
@@ -818,7 +921,7 @@ mod tests {
 
         // The file is still there and still writable through the same handle.
         assert!(mgr.file_exists(pos.file_number));
-        let second = mgr.write_block(b"another block", magic).unwrap();
+        let second = mgr.write_block(b"another block", magic, 0).unwrap();
         assert_eq!(second.file_number, pos.file_number);
         assert_eq!(mgr.read_block(&second).unwrap(), b"another block");
 
@@ -834,7 +937,7 @@ mod tests {
         let magic = [0xfa, 0xbf, 0xb5, 0xda]; // regtest
         let block_data = b"fake block data for testing";
 
-        let pos = mgr.write_block(block_data, magic).unwrap();
+        let pos = mgr.write_block(block_data, magic, 0).unwrap();
         assert_eq!(pos.file_number, 0);
         assert_eq!(pos.data_pos, 0);
 
@@ -842,7 +945,7 @@ mod tests {
         assert_eq!(read_back, block_data);
 
         // Write another block
-        let pos2 = mgr.write_block(b"second block", magic).unwrap();
+        let pos2 = mgr.write_block(b"second block", magic, 0).unwrap();
         assert_eq!(pos2.file_number, 0);
         assert!(pos2.data_pos > 0);
 
@@ -860,9 +963,9 @@ mod tests {
         let mut mgr = FlatFileManager::new(&dir).unwrap();
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
 
-        let pos1 = mgr.write_block(b"block one", magic).unwrap();
-        let pos2 = mgr.write_block(b"block two", magic).unwrap();
-        let pos3 = mgr.write_block(b"block three", magic).unwrap();
+        let pos1 = mgr.write_block(b"block one", magic, 0).unwrap();
+        let pos2 = mgr.write_block(b"block two", magic, 0).unwrap();
+        let pos3 = mgr.write_block(b"block three", magic, 0).unwrap();
 
         // All three should be in file 0
         assert_eq!(pos1.file_number, 0);
@@ -891,7 +994,7 @@ mod tests {
         let payloads: Vec<&[u8]> = vec![b"block one", b"second block payload", b"third"];
         let mut written = Vec::new();
         for p in &payloads {
-            written.push(mgr.write_block(p, magic).unwrap());
+            written.push(mgr.write_block(p, magic, 0).unwrap());
         }
 
         let mut visited: Vec<(Vec<u8>, FlatFilePos)> = Vec::new();
@@ -955,7 +1058,7 @@ mod tests {
         // Before writing, file 0 doesn't exist
         assert!(!mgr.file_exists(0));
 
-        mgr.write_block(b"data", magic).unwrap();
+        mgr.write_block(b"data", magic, 0).unwrap();
 
         // After writing, file 0 exists
         assert!(mgr.file_exists(0));
@@ -989,13 +1092,13 @@ mod tests {
         // First manager: write one block
         let pos1 = {
             let mut mgr = FlatFileManager::new(&dir).unwrap();
-            mgr.write_block(b"first block", magic).unwrap()
+            mgr.write_block(b"first block", magic, 0).unwrap()
         };
         // mgr is dropped here
 
         // Second manager: should resume from where the first left off
         let mut mgr2 = FlatFileManager::new(&dir).unwrap();
-        let pos2 = mgr2.write_block(b"second block", magic).unwrap();
+        let pos2 = mgr2.write_block(b"second block", magic, 0).unwrap();
 
         // Both should be in file 0 and the second should not overwrite the first
         assert_eq!(pos1.file_number, 0);
@@ -1020,8 +1123,8 @@ mod tests {
         let data_a = vec![0xAA; 1024]; // 1 KB block
         let data_b = vec![0xBB; 2048]; // 2 KB block
 
-        let pos_a = mgr.write_block(&data_a, magic).unwrap();
-        let pos_b = mgr.write_block(&data_b, magic).unwrap();
+        let pos_a = mgr.write_block(&data_a, magic, 0).unwrap();
+        let pos_b = mgr.write_block(&data_b, magic, 0).unwrap();
 
         // Read both multiple times — should be consistent
         for _ in 0..3 {
@@ -1049,7 +1152,7 @@ mod tests {
         mgr.sync_all().unwrap();
 
         // A write dirties the current file; sync_all clears it.
-        let pos_a = mgr.write_block(&vec![0xAA; 1024], magic).unwrap();
+        let pos_a = mgr.write_block(&vec![0xAA; 1024], magic, 0).unwrap();
         assert!(mgr.has_unsynced_writes());
         mgr.sync_all().unwrap();
         assert!(!mgr.has_unsynced_writes());
@@ -1057,9 +1160,9 @@ mod tests {
         // Force a rotation: a write that would exceed MAX_FILE_SIZE rolls
         // to the next file, fsyncing the outgoing one. Afterward only the
         // new (current) file is dirty, and both blocks read back fine.
-        mgr.write_block(&vec![0xBB; 512], magic).unwrap(); // dirty file 0 again
+        mgr.write_block(&vec![0xBB; 512], magic, 0).unwrap(); // dirty file 0 again
         mgr.current_pos = MAX_FILE_SIZE - 4; // next record won't fit
-        let pos_c = mgr.write_block(&vec![0xCC; 1024], magic).unwrap();
+        let pos_c = mgr.write_block(&vec![0xCC; 1024], magic, 0).unwrap();
         assert_eq!(pos_c.file_number, 1, "write must have rotated to a new file");
         assert!(mgr.has_unsynced_writes(), "new current file is dirty");
         mgr.sync_all().unwrap();
@@ -1081,7 +1184,7 @@ mod tests {
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
         let mut mgr = FlatFileManager::new(&dir).unwrap();
 
-        let first = mgr.write_block(&vec![0xAA; 4096], magic).unwrap();
+        let first = mgr.write_block(&vec![0xAA; 4096], magic, 0).unwrap();
         mgr.sync_all().unwrap();
 
         // Lose the tail of the file, as an unsynced page-cache loss would.
@@ -1096,7 +1199,7 @@ mod tests {
 
         // Without a resync the manager still believes the file is long, so it
         // hands back an offset the record was not written at.
-        let stale = mgr.write_block(&vec![0xBB; 512], magic).unwrap();
+        let stale = mgr.write_block(&vec![0xBB; 512], magic, 0).unwrap();
         assert!(
             !matches!(mgr.read_block(&stale), Ok(ref d) if d.as_slice() == [0xBB; 512]),
             "the stale offset must not resolve to the record just written"
@@ -1113,7 +1216,7 @@ mod tests {
         );
 
         // Records written afterwards read back at the offset reported.
-        let good = mgr.write_block(&vec![0xCC; 777], magic).unwrap();
+        let good = mgr.write_block(&vec![0xCC; 777], magic, 0).unwrap();
         assert_eq!(mgr.read_block(&good).unwrap(), vec![0xCC; 777]);
         assert_eq!(
             good.data_pos as u64, real_len,
@@ -1143,7 +1246,7 @@ mod tests {
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
         let mut mgr = FlatFileManager::new(&dir).unwrap();
 
-        let a = mgr.write_block(&vec![0xAA; 256], magic).unwrap();
+        let a = mgr.write_block(&vec![0xAA; 256], magic, 0).unwrap();
         let clean_len = std::fs::metadata(dir.join("blk00000.dat")).unwrap().len();
 
         // Simulate the aftermath of a torn write: a record header claiming far
@@ -1165,7 +1268,7 @@ mod tests {
         // The recovery the error arm performs.
         mgr.truncate_current_file_to(clean_len).unwrap();
 
-        let b = mgr.write_block(&[0xBB; 128], magic).unwrap();
+        let b = mgr.write_block(&[0xBB; 128], magic, 0).unwrap();
         assert_eq!(
             b.data_pos as u64, clean_len,
             "the next record must start where the torn one was cut off"
@@ -1187,6 +1290,69 @@ mod tests {
         assert_eq!(mgr.read_block(&a).unwrap(), vec![0xAA; 256]);
         assert_eq!(mgr.read_block(&b).unwrap(), vec![0xBB; 128]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that fails to unlink still holds what this process wrote to it,
+    /// so it keeps its recorded height: the next prune round must not see an
+    /// empty record and delete it under an index entry still being committed.
+    ///
+    /// Perturbation: forget the height before the unlink and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_fails_to_unlink_keeps_its_recorded_height() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("failed-unlink");
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        mgr.write_block(b"a block", magic, 9).unwrap();
+        // Move the append file on so file 0 may be deleted at all.
+        mgr.current_file = 1;
+        mgr.current_pos = 0;
+        mgr.write_handle = None;
+
+        // A read-only directory refuses the unlink, except to root, which this
+        // test cannot make fail that way.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let unlink = mgr.delete_file(0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unlink.is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(mgr.file_exists(0));
+        assert_eq!(mgr.highest_height_written(0), Some(9));
+
+        mgr.delete_file(0).unwrap();
+        assert_eq!(mgr.highest_height_written(0), None, "a deleted file is forgotten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each pending record holds its file until its handle drops, and a
+    /// file with two holds it until both have.
+    #[test]
+    fn a_pending_record_holds_its_file_until_it_drops() {
+        let dir = temp_dir("pending-records");
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        assert!(mgr.files_with_pending_records().is_empty());
+
+        let (_, first) = mgr.write_block_pending(b"block one", magic, 1).unwrap();
+        let (_, second) = mgr.write_block_pending(b"block two", magic, 2).unwrap();
+        mgr.write_block(b"block three", magic, 3).unwrap();
+        mgr.current_file = 1;
+        mgr.current_pos = 0;
+        mgr.write_handle = None;
+        let (pos, third) = mgr.write_block_pending(b"block four", magic, 4).unwrap();
+        assert_eq!(pos.file_number, 1);
+        assert_eq!(mgr.files_with_pending_records(), [0, 1].into());
+
+        drop(first);
+        assert_eq!(mgr.files_with_pending_records(), [0, 1].into(), "file 0 holds block two");
+        drop(second);
+        assert_eq!(mgr.files_with_pending_records(), [1].into());
+        drop(third);
+        assert!(mgr.files_with_pending_records().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1240,12 +1406,12 @@ mod tests {
             let mut mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Enabled).unwrap();
             let key = mgr.xor_key();
             let mut positions = Vec::new();
-            positions.push(mgr.write_block(&[0x11; 300], magic).unwrap());
-            positions.push(mgr.write_block(&[0x22; 5000], magic).unwrap());
+            positions.push(mgr.write_block(&[0x11; 300], magic, 0).unwrap());
+            positions.push(mgr.write_block(&[0x22; 5000], magic, 0).unwrap());
             // Force rotation into a second file so the key phase restarts
             // at a fresh absolute offset 0.
             mgr.current_pos = MAX_FILE_SIZE - 4;
-            positions.push(mgr.write_block(&[0x33; 700], magic).unwrap());
+            positions.push(mgr.write_block(&[0x33; 700], magic, 0).unwrap());
             assert_eq!(positions[2].file_number, 1);
             (positions, key)
         };
@@ -1330,7 +1496,7 @@ mod tests {
         std::fs::write(dir.join("xor.dat"), key).unwrap();
 
         let mut mgr = FlatFileManager::new(&dir).unwrap();
-        mgr.write_block(b"real block", magic).unwrap();
+        mgr.write_block(b"real block", magic, 0).unwrap();
         // Simulate Core's preallocation: raw zeros appended after the record.
         {
             use std::io::Write as _;
@@ -1384,7 +1550,7 @@ mod tests {
         let dir = temp_dir("init-populated");
         {
             let mut mgr = FlatFileManager::new(&dir).unwrap();
-            mgr.write_block(b"old plaintext block", [0xfa, 0xbf, 0xb5, 0xda])
+            mgr.write_block(b"old plaintext block", [0xfa, 0xbf, 0xb5, 0xda], 0)
                 .unwrap();
         }
         std::fs::remove_file(dir.join("xor.dat")).unwrap();
@@ -1433,7 +1599,7 @@ mod tests {
         std::fs::write(dir.join("xor.dat"), [0xAA; 8]).unwrap();
         let pos = {
             let mut mgr = FlatFileManager::new(&dir).unwrap();
-            mgr.write_block(&[0x44; 2048], [0xf9, 0xbe, 0xb4, 0xd9]).unwrap()
+            mgr.write_block(&[0x44; 2048], [0xf9, 0xbe, 0xb4, 0xd9], 0).unwrap()
         };
         // Swap the key out from under the files.
         std::fs::write(dir.join("xor.dat"), [0x55; 8]).unwrap();
