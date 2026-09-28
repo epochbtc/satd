@@ -1,0 +1,59 @@
+#!/bin/sh
+# bitcoin-cli -> sat-cli adapter for the Warnet lab image.
+#
+# Warnet's chart writes rpcuser and rpcpassword into bitcoin.conf, and satd
+# writes no cookie when both are set. sat-cli does not read credentials from
+# bitcoin.conf, so this reads rpcuser, rpcpassword, rpcport and regtest from
+# <datadir>/bitcoin.conf the way bitcoin-cli would and passes them on.
+# Command-line values win over the file. Everything else passes through.
+#
+# Limitation: only top-level keys are read, not [section] overrides. The
+# chart writes a flat file for satd's version numbers, so that is enough here.
+set -eu
+DATADIR="${BITCOIN_DATA:-/root/.bitcoin}"
+SAT_CLI="${SAT_CLI:-/usr/local/bin/sat-cli}"
+user=""; pass=""; port=""; chain=""; has_datadir=0
+for a in "$@"; do
+    # Options come before the method, as with bitcoin-cli; stop at the method.
+    case "$a" in -*) ;; *) break ;; esac
+    case "$a" in
+        -datadir=*|--datadir=*) DATADIR="${a#*=}"; has_datadir=1 ;;
+        -rpcuser=*|--rpcuser=*) user="${a#*=}" ;;
+        -rpcpassword=*|--rpcpassword=*) pass="${a#*=}" ;;
+        -rpcport=*|--rpcport=*) port="${a#*=}" ;;
+        -regtest|--regtest|-testnet|--testnet|-testnet4|--testnet4|-signet|--signet|-chain=*|--chain=*) chain="$a" ;;
+        -generate|-generate=*|--generate|--generate=*)
+            echo "bitcoin-cli (satd): -generate needs a wallet and satd is keyless; use generatetoaddress or generatetodescriptor" >&2
+            exit 1 ;;
+        -getinfo|--getinfo|-netinfo|-netinfo=*|--netinfo|--netinfo=*)
+            echo "bitcoin-cli (satd): $a is not supported by sat-cli" >&2
+            exit 1 ;;
+    esac
+done
+conf="$DATADIR/bitcoin.conf"
+# First top-level occurrence of a key; the chart writes each key once.
+val() {
+    [ -r "$conf" ] || return 0
+    sed -n "/^[[:space:]]*\[/q; s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$conf" | head -n1
+}
+# Add only what the caller did not pass: sat-cli refuses a repeated flag.
+extra=""
+add() { extra="$extra
+$1"; }
+[ "$has_datadir" = 1 ] || add "-datadir=$DATADIR"
+if [ -z "$chain" ] && [ "$(val regtest)" = "1" ]; then add -regtest; fi
+[ -n "$port" ] || { port="$(val rpcport)"; [ -z "$port" ] || add "-rpcport=$port"; }
+[ -n "$user" ] || { user="$(val rpcuser)"; [ -z "$user" ] || add "-rpcuser=$user"; }
+[ -n "$pass" ] || { pass="$(val rpcpassword)"; [ -z "$pass" ] || add "-rpcpassword=$pass"; }
+# Prepend the additions; sat-cli takes the first non-flag word as the method.
+# Split $extra on newlines only, with globbing off so a password is never expanded.
+if [ -n "$extra" ]; then
+    set -f
+    old_ifs="$IFS"; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $extra "$@"
+    IFS="$old_ifs"
+    set +f
+fi
+exec "$SAT_CLI" "$@"

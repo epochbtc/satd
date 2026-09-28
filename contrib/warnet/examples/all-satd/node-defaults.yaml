@@ -1,0 +1,7 @@
+# Every tank runs the satd Warnet lab image. Build it and load it into the
+# cluster first (see contrib/warnet/README.md); pullPolicy Never makes a
+# missing image fail loudly instead of pulling something else.
+image:
+  repository: satd-warnet
+  tag: "0.5.2-warnet0"
+  pullPolicy: Never

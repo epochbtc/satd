@@ -1,0 +1,14 @@
+# Two satd tanks wired the way Warnet's bitcoincore chart wires them: the
+# chart-rendered bitcoin.conf mounted at /root/.bitcoin/bitcoin.conf, no
+# command line, and peers addressed by service name. Used by compose-test.sh.
+services:
+  tank0:
+    image: ${SATD_WARNET_IMAGE:-satd-warnet:local}
+    hostname: tank0
+    volumes:
+      - ./tank0.conf:/root/.bitcoin/bitcoin.conf:ro
+  tank1:
+    image: ${SATD_WARNET_IMAGE:-satd-warnet:local}
+    hostname: tank1
+    volumes:
+      - ./tank1.conf:/root/.bitcoin/bitcoin.conf:ro

@@ -1,0 +1,6 @@
+# Tanks default to Bitcoin Core; the satd tanks in network.yaml override the
+# image. Core 27.0 and later speak BIP 324 v2 transport by default, as satd does.
+image:
+  repository: bitcoindevproject/bitcoin
+  tag: "27.0"
+  pullPolicy: IfNotPresent
