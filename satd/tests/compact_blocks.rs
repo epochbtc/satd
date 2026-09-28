@@ -1593,10 +1593,10 @@ fn initial_getheaders(node: &TestNode, peer: &mut RawPeer) -> Vec<NetworkMessage
     seen
 }
 
-/// Core sends `sendheaders` to every peer, inbound included, once the peer
-/// has shown a block past the minimum chain work (`MaybeSendSendHeaders`;
-/// regtest has no minimum), and once only. satd sent it to outbound peers
-/// alone, so an inbound peer announced every block to it by `inv`.
+/// Core sends `sendheaders` to an inbound peer once the peer has shown a
+/// block past the minimum chain work (`MaybeSendSendHeaders`; regtest has no
+/// minimum), and once only. satd sent it to outbound peers alone, so an
+/// inbound peer announced every block to it by `inv`.
 #[test]
 fn an_inbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
     let (node, _) = started_node(5);
@@ -1622,12 +1622,13 @@ fn an_inbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
     assert_eq!(sendheaders_count(&after), 0, "sendheaders goes out once per connection: {after:?}");
 }
 
-/// The outbound side follows the same rule. `sendheaders` used to go out in
-/// the handshake, before the node knew anything of the peer's chain; it now
-/// waits, as Core's does, for the peer to show a block past the minimum
-/// chain work, and still goes out once.
+/// An outbound peer is still sent `sendheaders` as the connection comes up,
+/// before it has shown anything: satd fetches a block announced by `inv`
+/// before it has its header, so a peer mining while the node syncs from it
+/// would otherwise feed it an out-of-order chain. Core's condition must not
+/// send it a second time once the peer does show a block.
 #[test]
-fn an_outbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
+fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
     let (node, _) = started_node(5);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let out = node
@@ -1641,13 +1642,14 @@ fn an_outbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
     let mut before = peer.early.clone();
     before.extend(initial_getheaders(&node, &mut peer));
     before.extend(peer.collect_for(Duration::from_secs(1)));
-    assert_eq!(sendheaders_count(&before), 0, "not in the handshake: {before:?}");
+    assert_eq!(sendheaders_count(&before), 1, "sent once as the connection comes up: {before:?}");
 
     let tip = block_at(&node, &best_hash(&node));
     peer.send(NetworkMessage::Headers(vec![tip.header]));
-    let got = collect_until(&mut peer, |m| matches!(m, NetworkMessage::SendHeaders), test_timeout(20), "sendheaders");
-    assert_eq!(sendheaders_count(&got), 1);
-    peer.send(NetworkMessage::Headers(vec![tip.header]));
+    let b = build_block(&tip, height(&node) + 1, vec![], true, 77);
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    peer.send(NetworkMessage::Block(b.clone()));
+    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the block must connect");
     let after = peer.collect_for(Duration::from_secs(2));
     assert_eq!(sendheaders_count(&after), 0, "once per connection: {after:?}");
 }

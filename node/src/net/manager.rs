@@ -4675,11 +4675,12 @@ impl PeerManager {
     }
 
     /// Bitcoin Core's `MaybeSendSendHeaders` (v31.1 `net_processing.cpp:5607`):
-    /// ask a peer, inbound or outbound, to announce new blocks with `headers`
-    /// (BIP 130) once its best known block has more work than the network's
-    /// minimum chain work, if our common version is at least
-    /// `SENDHEADERS_VERSION`. Core holds it back until then because
-    /// announcements arriving mid headers-sync are no use to it.
+    /// ask a peer to announce new blocks with `headers` (BIP 130) once its
+    /// best known block has more work than the network's minimum chain work,
+    /// if our common version is at least `SENDHEADERS_VERSION`. Core holds it
+    /// back until then because announcements arriving mid headers-sync are no
+    /// use to it. In practice this serves inbound peers: an outbound one was
+    /// sent `sendheaders` in the handshake (`perform_handshake`).
     ///
     /// Core evaluates this on every `SendMessages` pass. The best known block
     /// only moves where availability is recorded, and it never loses work, so
@@ -9810,9 +9811,24 @@ impl PeerManager {
             }
         }
 
-        // No `sendheaders` here, in either direction: it waits until the peer
-        // has shown a block past the minimum chain work
-        // (`maybe_send_sendheaders`), as Core's does.
+        // An outbound peer is asked for header announcements now; an inbound
+        // one once it has shown a block past the minimum chain work
+        // (`maybe_send_sendheaders`, Core's condition). Core waits on the
+        // outbound side too, but satd fetches a block announced by `inv`
+        // before it has the header, so a peer that mines while this node
+        // syncs would hand it an out-of-order chain; header announcements
+        // from the start keep that sync in order. Marked sent, so the
+        // condition never sends a second one.
+        if direction == Direction::Outbound
+            && their_version.version.min(PROTOCOL_VERSION) >= SENDHEADERS_VERSION
+        {
+            conn.send(NetworkMessage::SendHeaders)
+                .await
+                .map_err(|e| format!("send sendheaders: {}", e))?;
+            if let Some(handle) = self.peers.write().get_mut(&id) {
+                handle.info.sent_sendheaders = true;
+            }
+        }
 
         if peer_wants_addrv2
             && let Some(handle) = self.peers.write().get_mut(&id)
