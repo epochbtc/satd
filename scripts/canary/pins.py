@@ -2,7 +2,8 @@
 """The canary pin manifest: consistency, freshness, and the release gate.
 
     pins.py check    Every reference to a pinned image in the canary scripts,
-                     workflows and Rust harnesses matches scripts/canary/PINS.
+                     workflows and Rust harnesses matches scripts/canary/PINS,
+                     and every pin a script reads is one PINS defines.
                      Offline; runs in CI Lint.
     pins.py report   Compare each pin with upstream's newest stable release
                      and print a Markdown table. `--json` for machines.
@@ -56,11 +57,16 @@ SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256",
             # weeks after Core's releases; kubectl follows the kind node's
             # Kubernetes minor. Pinned for reproducibility, bumped by hand.
             "WARNET_COMMIT", "WARNET_CORE_IMAGE", "WARNET_COMMANDER_IMAGE",
+            # rbitcoin's Warnet lab image landed after its latest release (v0.7.0),
+            # so it is pinned by commit and bumped by hand; the two images are the
+            # ones that image's recipe names.
+            "RBITCOIN_COMMIT", "RBITCOIN_RUST_IMAGE", "RBITCOIN_BASE_IMAGE",
             "KIND_SHA256", "KIND_NODE_IMAGE", "KUBECTL_VERSION", "KUBECTL_SHA256", "HELM_SHA256"}
 
-# Images CI builds itself rather than pulls: satd, and the Warnet lab
-# variant contrib/warnet builds FROM it.
-LOCAL_IMAGES = {"satd", "satd-warnet"}
+# Images CI builds itself rather than pulls: satd, the Warnet lab variant
+# contrib/warnet builds FROM it, and rbitcoin's Warnet lab image, built from
+# source at RBITCOIN_COMMIT.
+LOCAL_IMAGES = {"satd", "satd-warnet", "rbitcoin-warnet"}
 
 # A literal image reference: `name:tag`, `org/name:tag` or
 # `registry.host/org/name:tag`, optionally `@sha256:...`. The name must hold a
@@ -78,6 +84,15 @@ CONSUMERS = [
     "satd/tests/common/core_node.rs",
     "fuzz/fuzz_targets/block_differential.rs",
 ]
+
+# Scripts that source PINS. Under `set -u` a pin that PINS does not define
+# fails only when the script runs, and some of them (the nightly rigs) never
+# run on a pull request, so every pin-shaped name they read is checked here.
+PIN_READERS = ["scripts/**/*.sh"]
+# `$NAME` or `${NAME}`, `${NAME%...}` and the like, but not `${NAME:-...}`,
+# `${NAME-...}` or `${NAME:?...}`, which supply a default or their own error.
+PIN_READ = re.compile(r"\$(?:\{)?([A-Z][A-Z0-9_]*_(?:IMAGE|COMMIT|VERSION|SHA256))(?![A-Z0-9_]|:?[-?=+])")
+PIN_ASSIGN = re.compile(r"(?:^|[\s;(])(?:local\s+|export\s+|readonly\s+)?([A-Z][A-Z0-9_]*)=", re.M)
 
 MAX_MAJORS_BEHIND = 1
 MAX_AGE = dt.timedelta(days=183)
@@ -136,6 +151,18 @@ def check() -> int:
                     if m.start() in seen or m.group(0) in pinned_values or m.group(1) in LOCAL_IMAGES:
                         continue
                     errors.append(f"{rel}:{n}: {m.group(0)} is an image reference not taken from PINS")
+    for path in sorted({p for pattern in PIN_READERS for p in ROOT.glob(pattern)}):
+        text = path.read_text()
+        if "canary/PINS" not in text:
+            continue
+        rel = path.relative_to(ROOT)
+        assigned = set(PIN_ASSIGN.findall(text))
+        for n, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for m in PIN_READ.finditer(line):
+                if m.group(1) not in pins and m.group(1) not in assigned:
+                    errors.append(f"{rel}:{n}: ${m.group(1)} is not defined in PINS")
     for e in errors:
         print(e, file=sys.stderr)
     if not errors:

@@ -1,0 +1,171 @@
+# Nightly three-implementation Warnet rig — Bitcoin Core, satd and rbitcoin
+# (github.com/reardencode/rbitcoin) in one Warnet network, checked against
+# each other by contrib/warnet/scenarios/consensus_diff.py: transaction relay,
+# compact blocks, reorgs and a valid non-standard block must leave all three
+# on the same tip.
+#
+# NOT a PR gate. rbitcoin publishes no image; its repository documents a
+# Warnet lab image that this job builds at the commit pinned in
+# scripts/canary/PINS (scripts/canary/warnet/build-rbitcoin.sh). A lab
+# artefact of another project moves on its own schedule, so the rig runs
+# nightly and reports through issues instead of blocking merges.
+#
+# A scheduled failure files or updates one issue per class:
+#   warnet-3impl-divergence  the scenario logged `tip mismatch`: the three
+#                            implementations did not converge. Investigate
+#                            before closing; the per-tank table is in the issue.
+#   warnet-3impl-broken      anything else: the build, the cluster, a scenario
+#                            error. Usually a pin to bump or hold.
+# Dispatched runs never file issues.
+
+name: Warnet three-implementation nightly
+
+on:
+  schedule:
+    # Nightly 05:15 UTC, clear of the block-differential fuzz at 04:00.
+    - cron: '15 5 * * *'
+  workflow_dispatch:
+    inputs:
+      reorgs:
+        description: "Reorg rounds for consensus_diff.py"
+        required: false
+        default: "5"
+
+concurrency:
+  group: warnet-3impl-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  three-impl:
+    name: Warnet (Bitcoin Core + satd + rbitcoin)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the satd image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: satd:ci
+          cache-from: type=gha,scope=docker-ci-amd64
+          provenance: false
+
+      - name: Build the satd Warnet lab image
+        run: docker build --build-arg SATD_IMAGE=satd:ci -t satd-warnet:ci contrib/warnet
+
+      - name: Restore the rbitcoin build
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/rbitcoin-src/target
+          key: ${{ runner.os }}-rbitcoin-${{ hashFiles('scripts/canary/PINS') }}
+          restore-keys: ${{ runner.os }}-rbitcoin-
+
+      - name: Build rbitcoin's Warnet lab image at the pinned commit
+        env:
+          RBITCOIN_SRC: ${{ runner.temp }}/rbitcoin-src
+          RBITCOIN_WARNET_IMAGE: rbitcoin-warnet:ci
+        run: scripts/canary/warnet/build-rbitcoin.sh
+
+      - name: Install kind, kubectl and helm (pinned, checksummed)
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -fsSLo "$bin/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  $bin/kind" | sha256sum -c -
+          curl -fsSLo "$bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $bin/kubectl" | sha256sum -c -
+          curl -fsSLo "$RUNNER_TEMP/helm.tgz" "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  $RUNNER_TEMP/helm.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/helm.tgz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" "$bin/helm"
+          chmod 0755 "$bin/kind" "$bin/kubectl"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Create the kind cluster
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          kind create cluster --name warnet --image "$KIND_NODE_IMAGE" --wait 180s
+
+      - name: Install Warnet at the pinned commit
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          python3 -m venv "$RUNNER_TEMP/warnet"
+          "$RUNNER_TEMP/warnet/bin/pip" install --quiet \
+            "warnet @ git+https://github.com/bitcoin-dev-project/warnet@${WARNET_COMMIT}"
+          echo "$RUNNER_TEMP/warnet/bin" >> "$GITHUB_PATH"
+
+      - name: Run the rig
+        id: rig
+        env:
+          KIND_CLUSTER: warnet
+          ARTIFACT_DIR: ${{ runner.temp }}/warnet-logs
+          REORGS: ${{ inputs.reorgs || '5' }}
+        run: scripts/canary/warnet-3impl.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: warnet-3impl-logs
+          path: ${{ runner.temp }}/warnet-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: File or update the tracking issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LOGS: ${{ runner.temp }}/warnet-logs
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          . scripts/canary/PINS
+          # One open issue per label: comment if one is open, else open one.
+          notify() {
+            label="$1"; color="$2"; desc="$3"; title="$4"; body="$5"
+            gh label create "$label" --color "$color" --description "$desc" 2>/dev/null || true
+            existing=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --label "$label" --title "$title" --body "$body"
+            fi
+          }
+          scen="$LOGS/scenario-consensus_diff.log"
+          if [ -f "$scen" ] && grep -q 'tip mismatch' "$scen"; then
+            table=$(sed -n '/tip mismatch/,/^[^ ]/p' "$scen" | head -n 12)
+            body=$(printf 'The nightly three-implementation Warnet rig found tanks on different tips.\n\n- Run: %s\n- Commit: `%s`\n- rbitcoin: `%s`\n- Bitcoin Core image: `%s`\n\n```\n%s\n```\n\nLogs are in the run'"'"'s `warnet-3impl-logs` artifact.\n' \
+              "$RUN_URL" "$GITHUB_SHA" "$RBITCOIN_COMMIT" "${WARNET_CORE_IMAGE%%@*}" "$table")
+            notify warnet-3impl-divergence B60205 "three-implementation Warnet rig: tanks diverged" \
+              "Warnet three-implementation rig: tanks diverged ($today)" "$body"
+          else
+            body=$(printf 'The nightly three-implementation Warnet rig failed before reaching a verdict.\n\n- Run: %s\n- Commit: `%s`\n- rbitcoin: `%s`\n\nCheck the run log; a moved or broken downstream is bumped or held in `scripts/canary/PINS`.\n' \
+              "$RUN_URL" "$GITHUB_SHA" "$RBITCOIN_COMMIT")
+            notify warnet-3impl-broken FBCA04 "three-implementation Warnet rig is failing" \
+              "Warnet three-implementation rig is failing ($today)" "$body"
+          fi
