@@ -35,7 +35,6 @@ trap collect_logs EXIT
 
 load_pinned_image "$WARNET_CORE_IMAGE"
 load_pinned_image "$WARNET_COMMANDER_IMAGE"
-load_pinned_image "$WARNET_BUSYBOX_IMAGE"
 load_local_image "$SATD_WARNET_IMAGE" "satd-warnet:$SATD_TANK_TAG"
 load_local_image "$RBITCOIN_WARNET_IMAGE" "rbitcoin-warnet:$RBITCOIN_TANK_TAG"
 
