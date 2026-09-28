@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod conf;
 mod policylint;
 mod sign;
 mod sign_v2;
@@ -43,8 +44,23 @@ struct Cli {
     #[arg(long, help = "Use testnet network", global = true)]
     testnet: bool,
 
-    #[arg(long, default_value = "127.0.0.1", help = "RPC host", global = true)]
-    rpcconnect: String,
+    #[arg(long, help = "Use testnet4 network", global = true)]
+    testnet4: bool,
+
+    #[arg(long, help = "Use signet network", global = true)]
+    signet: bool,
+
+    /// Bitcoin Core's `-chain=<name>`: main, test, testnet4, signet, regtest.
+    #[arg(long, value_name = "NAME", help = "Chain to use", global = true)]
+    chain: Option<String>,
+
+    /// Configuration file to read chain, port and credentials from. Relative
+    /// paths are under the data directory. Default `<datadir>/bitcoin.conf`.
+    #[arg(long, value_name = "FILE", help = "Configuration file", global = true)]
+    conf: Option<PathBuf>,
+
+    #[arg(long, help = "RPC host (default: 127.0.0.1)", global = true)]
+    rpcconnect: Option<String>,
 
     #[arg(long, help = "RPC port", global = true)]
     rpcport: Option<u16>,
@@ -102,6 +118,11 @@ struct Cli {
 
     #[arg(long, help = "Wait for server to start", global = true)]
     rpcwait: bool,
+
+    /// Bitcoin Core's `-generate` mines to a wallet address. satd has no
+    /// wallet, so this is refused with a pointer to the keyless RPCs.
+    #[arg(long, global = true, hide = true)]
+    generate: bool,
 
     #[arg(
         long,
@@ -315,6 +336,11 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
         "regtest",
         "testnet",
+        "testnet4",
+        "signet",
+        "chain",
+        "conf",
+        "generate",
         "rpcconnect",
         "rpcport",
         "rpcuser",
@@ -742,6 +768,13 @@ async fn main() {
         }
     };
 
+    if cli.generate {
+        eprintln!(
+            "error: -generate is not supported: satd is keyless; use generatetoaddress/generatetodescriptor"
+        );
+        std::process::exit(1);
+    }
+
     // `policylint` is a pure offline consumer of the policy engine — no RPC, no
     // credentials. Dispatch before any connection setup so it works with no node.
     if let Cmd::Policylint {
@@ -770,6 +803,45 @@ async fn main() {
         std::process::exit(run_sign(psbt.as_deref(), psbt_file.as_deref(), *gap));
     }
 
+    // Chain, host, port and credentials: the command line, then the config
+    // file, then the chain defaults (see `conf.rs` for the rules).
+    let base_datadir = cli.datadir.clone().unwrap_or_else(default_datadir);
+    let conf_path = conf::conf_path(cli.conf.as_deref(), &base_datadir);
+    let conf_file = match conf::ConfFile::read(&conf_path) {
+        Ok(Some(f)) => Some(f),
+        Ok(None) if cli.conf.is_some() => {
+            eprintln!(
+                "error: specified config file \"{}\" could not be opened.",
+                conf_path.display()
+            );
+            std::process::exit(1);
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", conf_path.display());
+            std::process::exit(1);
+        }
+    };
+    let cli_conn = conf::CliConn {
+        chain: cli.chain.clone(),
+        regtest: cli.regtest,
+        testnet: cli.testnet,
+        testnet4: cli.testnet4,
+        signet: cli.signet,
+        rpcconnect: cli.rpcconnect.clone(),
+        rpcport: cli.rpcport,
+        rpcuser: cli.rpcuser.clone(),
+        rpcpassword: cli.rpcpassword.clone(),
+        rpccookiefile: cli.rpccookiefile.clone(),
+    };
+    let conn = match conf::resolve(&cli_conn, conf_file.as_ref(), &base_datadir, conf_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // `signpsbtwithsigner` also signs locally (via an external signer process)
     // and makes no RPC call — dispatch before any RPC credential setup.
     if let Cmd::SignPsbtWithSigner {
@@ -779,117 +851,39 @@ async fn main() {
         fingerprint,
     } = &cli.command
     {
-        let chain = if cli.regtest {
-            "regtest"
-        } else if cli.testnet {
-            "test"
-        } else {
-            "main"
-        };
         std::process::exit(run_sign_with_signer(
             psbt.as_deref(),
             psbt_file.as_deref(),
             signer,
             fingerprint.as_deref(),
-            chain,
+            conn.chain.signer_name(),
         ));
     }
 
-    // Detect chain and rpcport from bitcoin.conf when not explicitly set.
-    let (is_regtest, is_testnet, conf_rpcport) = {
-        let mut r = cli.regtest;
-        let mut t = cli.testnet;
-        let mut port: Option<u16> = None;
-        if let Some(ref datadir) = cli.datadir {
-            let conf = datadir.join("bitcoin.conf");
-            if let Ok(contents) = std::fs::read_to_string(&conf) {
-                if !r && !t {
-                    r = contents.lines().any(|l| {
-                        let l = l.trim();
-                        l == "regtest=1" || l == "regtest = 1"
-                    });
-                    t = contents.lines().any(|l| {
-                        let l = l.trim();
-                        l == "testnet=1" || l == "testnet = 1"
-                    });
-                }
-                if cli.rpcport.is_none() {
-                    let section = if r {
-                        "[regtest]"
-                    } else if t {
-                        "[testnet3]"
-                    } else {
-                        ""
-                    };
-                    let mut in_section = section.is_empty();
-                    for line in contents.lines() {
-                        let l = line.trim();
-                        if l.starts_with('[') {
-                            in_section = l == section;
-                            continue;
-                        }
-                        if !in_section {
-                            continue;
-                        }
-                        if let Some(rest) = l.strip_prefix("rpcport=")
-                            && let Ok(p) = rest.trim().parse::<u16>()
-                        {
-                            port = Some(p);
-                        }
-                    }
-                }
-            }
-        }
-        (r, t, port)
-    };
-
-    let rpcport = cli.rpcport.or(conf_rpcport).unwrap_or({
-        if is_regtest {
-            18443
-        } else if is_testnet {
-            18332
-        } else {
-            8332
-        }
-    });
-
-    let (auth_user, auth_pass) = if let (Some(user), Some(pass)) = (&cli.rpcuser, &cli.rpcpassword)
-    {
-        (user.clone(), pass.clone())
-    } else {
-        let cookie_path = cli.rpccookiefile.clone().unwrap_or_else(|| {
-            let base = cli.datadir.clone().unwrap_or_else(default_datadir);
-            let net_subdir = if is_regtest {
-                "regtest"
-            } else if is_testnet {
-                "testnet3"
-            } else {
-                ""
-            };
-            if net_subdir.is_empty() {
-                base.join(".cookie")
-            } else {
-                base.join(net_subdir).join(".cookie")
-            }
-        });
-
-        match read_cookie_file(&cookie_path) {
-            Ok(creds) => creds,
-            Err(e) => {
-                if !cli.rpcwait {
+    // A missing cookie is fatal now unless `-rpcwait` is set, in which case
+    // it is read again on every attempt: the node writes it as it starts.
+    let credentials = |fatal: bool| -> Option<(String, String)> {
+        match &conn.creds {
+            conf::Creds::UserPass(u, p) => Some((u.clone(), p.clone())),
+            conf::Creds::Cookie(path) => match read_cookie_file(path) {
+                Ok(creds) => Some(creds),
+                Err(e) if fatal => {
                     eprintln!(
                         "error: Could not locate RPC credentials. No authentication cookie could be found, and RPC password is not set.\n\
                              Cookie file: {}\n\
+                             Configuration file: {}\n\
                              {}",
-                        cookie_path.display(),
+                        path.display(),
+                        conn.conf_path.display(),
                         e
                     );
                     std::process::exit(1);
                 }
-                ("".to_string(), "".to_string())
-            }
+                Err(_) => None,
+            },
         }
     };
+    let mut auth = credentials(!cli.rpcwait);
 
     let tls = tls_config::client::ClientTlsOptions {
         enabled: cli.rpctls,
@@ -897,7 +891,7 @@ async fn main() {
         client_cert: cli.rpcclientcert.clone(),
         client_key: cli.rpcclientkey.clone(),
     };
-    let url = tls.endpoint(&cli.rpcconnect, rpcport);
+    let url = tls.endpoint(&conn.host, conn.port);
     let output = OutputFormat::parse(cli.output.as_deref());
 
     let (method, params) = resolve_cmd(&cli.command);
@@ -962,6 +956,14 @@ async fn main() {
     };
 
     loop {
+        if auth.is_none() {
+            auth = credentials(false);
+        }
+        // Only `-rpcwait` gets here without credentials: no cookie yet.
+        let Some((auth_user, auth_pass)) = auth.clone() else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        };
         let auth_header = format!(
             "Basic {}",
             BASE64.encode(format!("{}:{}", auth_user, auth_pass))

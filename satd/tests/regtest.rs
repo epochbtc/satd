@@ -405,6 +405,182 @@ fn test_sat_cli_integration() {
     node.stop();
 }
 
+fn sat_cli_bin() -> PathBuf {
+    std::path::Path::new(env!("CARGO_BIN_EXE_satd"))
+        .parent()
+        .unwrap()
+        .join("sat-cli")
+}
+
+/// A satd started from nothing but a config file (`--datadir`, plus `--conf`
+/// when given), so the node and `sat-cli` read the same file. Killed and
+/// removed on drop, including when an assertion unwinds.
+struct ConfNode {
+    process: Child,
+    datadir: PathBuf,
+}
+
+impl ConfNode {
+    fn start(datadir: PathBuf, conf: Option<&std::path::Path>) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_satd"));
+        cmd.arg(format!("--datadir={}", datadir.display()))
+            .arg("--esplora=0")
+            .arg("--loglevel=error");
+        if let Some(conf) = conf {
+            cmd.arg(format!("--conf={}", conf.display()));
+        }
+        let log = std::fs::File::create(datadir.join("satd.stderr")).unwrap();
+        let process = cmd
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("failed to start satd");
+        ConfNode { process, datadir }
+    }
+
+    /// Run `sat-cli -datadir=<datadir> <args>` until it succeeds or the
+    /// deadline passes; returns the last output either way.
+    fn cli_until_ok(&mut self, args: &[&str]) -> std::process::Output {
+        let deadline = Instant::now() + test_timeout(120);
+        loop {
+            let out = Command::new(sat_cli_bin())
+                .arg(format!("-datadir={}", self.datadir.display()))
+                .args(args)
+                .output()
+                .expect("failed to run sat-cli");
+            if out.status.success() || Instant::now() >= deadline {
+                return out;
+            }
+            if let Ok(Some(status)) = self.process.try_wait() {
+                panic!(
+                    "satd exited with {status}: {}",
+                    std::fs::read_to_string(self.datadir.join("satd.stderr")).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for ConfNode {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        let _ = std::fs::remove_dir_all(&self.datadir);
+    }
+}
+
+fn assert_cli_ok(out: &std::process::Output, want_stdout: &str, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what}: sat-cli failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want_stdout, "{what}");
+}
+
+/// A node whose `bitcoin.conf` carries `rpcuser`/`rpcpassword` writes no
+/// cookie, so `sat-cli` has to take the credentials from the same file, as
+/// `bitcoin-cli` does. The file here is the flat shape Warnet renders:
+/// chain selector, credentials and a top-level `rpcport` with no section —
+/// the port the node binds, and the one `sat-cli` must dial.
+#[test]
+fn test_sat_cli_reads_credentials_and_port_from_a_flat_conf() {
+    let datadir = fresh_test_datadir("satd-satcli-flatconf");
+    let (rpcport, p2p) = (find_available_port(), find_available_port());
+    std::fs::write(
+        datadir.join("bitcoin.conf"),
+        format!(
+            "regtest=1\nrpcuser=user\nrpcpassword=gn0cchi\nrpcport={rpcport}\nport={p2p}\n\
+             listen=1\nrpcallowip=127.0.0.1\n"
+        ),
+    )
+    .unwrap();
+    let mut node = ConfNode::start(datadir.clone(), None);
+
+    let out = node.cli_until_ok(&["getblockcount"]);
+    assert_cli_ok(&out, "0", "no credential, chain or port flags");
+    assert!(
+        !datadir.join("regtest").join(".cookie").exists(),
+        "the node must not have written a cookie; otherwise this proves nothing"
+    );
+
+    // The command line still wins, key by key: a wrong password on the
+    // command line is used over the file's right one.
+    let out = Command::new(sat_cli_bin())
+        .arg(format!("-datadir={}", datadir.display()))
+        .arg("-rpcpassword=wrong")
+        .arg("getblockcount")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a wrong -rpcpassword must not authenticate");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Authorization failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same with the settings under `[regtest]` in a file named by `-conf`
+/// (relative to the data directory for `sat-cli`, as in Bitcoin Core).
+#[test]
+fn test_sat_cli_reads_a_sectioned_conf_named_by_conf() {
+    let datadir = fresh_test_datadir("satd-satcli-sectionconf");
+    let (rpcport, p2p) = (find_available_port(), find_available_port());
+    let conf = datadir.join("alt.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "regtest=1\nrpcport=1\n[main]\nrpcport=2\n[regtest]\nrpcuser=sec\n\
+             rpcpassword=tion\nrpcport={rpcport}\nport={p2p}\n"
+        ),
+    )
+    .unwrap();
+    let mut node = ConfNode::start(datadir.clone(), Some(&conf));
+    let out = node.cli_until_ok(&["-conf=alt.conf", "getblockcount"]);
+    assert_cli_ok(&out, "0", "[regtest] section via -conf");
+
+    // Without -conf the default bitcoin.conf is absent, so sat-cli falls back
+    // to mainnet's port and a cookie that does not exist.
+    let out = Command::new(sat_cli_bin())
+        .arg(format!("-datadir={}", datadir.display()))
+        .arg("getblockcount")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // A -conf that does not exist is an error, not a silent default.
+    let out = Command::new(sat_cli_bin())
+        .arg(format!("-datadir={}", datadir.display()))
+        .arg("-conf=missing.conf")
+        .arg("getblockcount")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not be opened"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `-generate` mines to a wallet address in `bitcoin-cli`; satd has none, so
+/// it is refused by name rather than failing as an unknown flag.
+#[test]
+fn test_sat_cli_refuses_generate() {
+    let out = Command::new(sat_cli_bin())
+        .args(["-regtest", "-generate", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("satd is keyless; use generatetoaddress/generatetodescriptor"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn test_userpass_auth() {
     let mut node = TestNode::start(&["--rpcuser=testuser", "--rpcpassword=testpass"]);
