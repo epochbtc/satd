@@ -139,16 +139,21 @@ class ConsensusDiff(Commander):
         #    relay delivers them, so repeat the step to exercise more orders.
         for i in range(1, self.options.reorgs + 1):
             height = self.miner.getblockcount()
+            old_tip = self.miner.getbestblockhash()
             dropped = self.miner.getblockhash(height - 1)
             self.miner.invalidateblock(dropped)
-            # The first block of the new chain sits where the dropped block
-            # did. A burst of blocks runs block times ahead of the clock, so
-            # its time is the parent's median time past plus one, and mined to
-            # the same output with the same transactions it would be the
-            # dropped block again, which the miner refuses as known invalid.
+            # The miner falls back to the dropped block's parent, or to a
+            # taller branch an earlier round's reconsiderblock made valid
+            # again, and the new chain grows from there. Its first block can
+            # sit where the dropped block did: a burst of blocks runs block
+            # times ahead of the clock, so its time is the parent's median
+            # time past plus one, and mined to the same output with the same
+            # transactions it would be the dropped block again, which the
+            # miner refuses as known invalid.
             self.generatetodescriptor(self.miner, 1, BARE_OP_TRUE, sync_fun=self.no_op)
             self.generate(w, 2, sync_fun=self.no_op)
-            assert self.miner.getblockcount() == height + 1
+            assert self.miner.getblockcount() > height, f"reorg {i}: the new chain is not longer"
+            assert self.miner.getblockhash(height) != old_tip, f"reorg {i}: the old tip is still active"
             self.wait_same_tip(f"reorg {i} onto a longer chain")
             self.miner.reconsiderblock(dropped)
             self.wait_same_tip(f"reconsiderblock {i} leaves the longer chain in place")
