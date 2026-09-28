@@ -109,6 +109,22 @@ the next free slot rather than evicting an entry. `getnodeaddresses`,
 `getaddrmaninfo` and `getrawaddrman` report IPv4 and IPv6 only: onion
 candidates learned from `addrv2` gossip are held outside the address book.
 
+**On private addresses in the address book.** Core's address manager takes
+publicly routable addresses only (`AddrManImpl::AddSingle`), on every chain,
+and satd applies the same rule on mainnet, the test networks and signet. On
+regtest satd also takes valid private, loopback and link-local addresses,
+from gossip, `addpeeraddress` and `peers.dat`, so that lab networks (Warnet,
+docker compose, a test harness on 127.0.0.1) find each other through gossip;
+Core needs a patched build for that, and refuses `addpeeraddress 127.0.0.1`
+with `failed-adding-to-new` where satd on regtest accepts it. An address
+Core's `IsValid` refuses (`0.0.0.0`, `255.255.255.255`, `::`) is refused on
+every chain and never dialled, as in Core.
+
+**On `-seednode`.** Core opens a `-seednode` peer as a short-lived
+`addr-fetch` connection, drops it once it has answered `getaddr`, and uses
+none under `-connect`. satd dials it as a `manual` connection and keeps it,
+under `-connect` too.
+
 **Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
 LevelDB databases. satd uses one RocksDB with multiple column families

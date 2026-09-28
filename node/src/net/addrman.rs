@@ -16,6 +16,14 @@
 //! told us about it; a version 1 file still loads, with Core's defaults for
 //! the two fields.
 //!
+//! The book holds what Core's would: an address that is not valid (Core's
+//! `IsValid`: `0.0.0.0`, `255.255.255.255`, `::` and the like) is refused on
+//! every path in, and so is one that is not publicly routable, which Core's
+//! `AddrManImpl::AddSingle` refuses (v31.1 `src/addrman.cpp:554`). satd
+//! relaxes the second rule on regtest, where lab networks (Warnet, docker
+//! compose, a test harness on loopback) run on exactly the private ranges it
+//! would refuse; see [`AddrMan::set_admit_private`].
+//!
 //! Core's addrman stores every entry at a fixed `bucket/position` slot, and
 //! `getrawaddrman` reports those slots. satd keeps a flat map instead, so
 //! [`AddrMan::positions`] *derives* a slot for each entry with Core's own
@@ -110,6 +118,9 @@ pub struct AddrMan {
     /// SipHash key for the derived `bucket/position` slots (Core's
     /// `nKey`). Random per process, so slots are stable within a run.
     slot_key: (u64, u64),
+    /// Whether the book takes addresses that are valid but not publicly
+    /// routable: private ranges, loopback, link-local. See the module docs.
+    admit_private: bool,
 }
 
 /// Where [`AddrMan::positions`] places an entry: its table and its derived
@@ -180,7 +191,24 @@ impl AddrMan {
             entries: HashMap::new(),
             group_fn: Box::new(default_group),
             slot_key: (rand::random(), rand::random()),
+            admit_private: true,
         }
+    }
+
+    /// Whether the book takes valid addresses that are not publicly
+    /// routable. On by default; the peer manager turns it off everywhere but
+    /// regtest, which leaves Core's rule. An invalid address is refused
+    /// either way. Set before anything is added: entries already held are
+    /// not revisited.
+    pub fn set_admit_private(&mut self, admit: bool) {
+        self.admit_private = admit;
+    }
+
+    /// Whether `addr` may enter the book: it is valid, and it is routable
+    /// unless [`set_admit_private`](Self::set_admit_private) is on.
+    pub fn admits(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        crate::net::is_valid(ip) && (self.admit_private || crate::net::is_routable(ip))
     }
 
     /// Install a custom network-group function (e.g. ASN-based via
@@ -223,6 +251,9 @@ impl AddrMan {
     /// of the peer that announced it. A refresh of a known address updates
     /// its last-seen time only, as before.
     pub fn add_from(&mut self, addr: SocketAddr, now: u64, services: u64, source: IpAddr) -> bool {
+        if !self.admits(&addr) {
+            return false;
+        }
         if let Some(e) = self.entries.get_mut(&addr) {
             e.last_seen = now;
             return false;
@@ -260,6 +291,12 @@ impl AddrMan {
     /// any future caller) cannot grow the table without bound. An address
     /// already present is always refreshed/promoted.
     pub fn mark_good(&mut self, addr: SocketAddr, now: u64) {
+        // A manual peer the operator named can be anything the book would
+        // refuse from gossip; connecting to it does not make it an entry.
+        // Core's `Good` only promotes an entry `Add` already took.
+        if !self.admits(&addr) {
+            return;
+        }
         if !self.entries.contains_key(&addr) && self.entries.len() >= MAX_ENTRIES {
             return;
         }
@@ -327,7 +364,10 @@ impl AddrMan {
     /// Adding an address that is already present fails with
     /// `failed-adding-to-new` whichever table was asked for, because Core's
     /// `Add` refuses a duplicate before `Good` is ever reached. The caps
-    /// that bound gossip bound this path too.
+    /// that bound gossip bound this path too, and so does [`admits`]: Core's
+    /// `AddSingle` refuses an address that is not routable the same way.
+    ///
+    /// [`admits`]: Self::admits
     pub fn add_manual(&mut self, addr: SocketAddr, tried: bool, now: u64) -> Result<(), &'static str> {
         if !self.add_from(addr, now, DEFAULT_SERVICES, addr.ip()) {
             return Err("failed-adding-to-new");
@@ -428,6 +468,11 @@ impl AddrMan {
         let count = read_u32(&mut cur).unwrap_or(0).min(MAX_ENTRIES as u32);
         for _ in 0..count {
             match read_entry(&mut cur, version) {
+                // A file written before the book refused them can hold
+                // addresses it would not take now, `0.0.0.0` learned from a
+                // peer's gossip among them. Drop them here, or they would be
+                // seeded straight back onto the dial list.
+                Some(e) if !self.admits(&e.addr) => continue,
                 Some(mut e) => {
                     // Recompute the cached group under the active group_fn
                     // (the on-disk format does not store it, since `-asmap`
@@ -637,7 +682,7 @@ mod tests {
         let path = dir.path().join("peers.dat");
         let mut a = AddrMan::new();
         a.add(sa("1.2.3.4:8333"), 111);
-        a.add(sa("[2001:db8::1]:8333"), 222);
+        a.add(sa("[2001:470::1]:8333"), 222);
         a.mark_good(sa("1.2.3.4:8333"), 333);
         a.dump(&path).unwrap();
 
@@ -646,7 +691,7 @@ mod tests {
         assert_eq!(b.len(), 2);
         assert!(b.entries[&sa("1.2.3.4:8333")].tried);
         assert_eq!(b.entries[&sa("1.2.3.4:8333")].last_success, 333);
-        assert!(!b.entries[&sa("[2001:db8::1]:8333")].tried);
+        assert!(!b.entries[&sa("[2001:470::1]:8333")].tried);
     }
 
     #[test]
@@ -690,10 +735,10 @@ mod tests {
         let mut a = AddrMan::new();
         a.add(sa("203.0.113.9:8333"), 1);
         assert_eq!(a.entries[&sa("203.0.113.9:8333")].group, vec![203, 0]);
-        a.add(sa("[2001:db8::1]:8333"), 1);
+        a.add(sa("[2001:470::1]:8333"), 1);
         assert_eq!(
-            a.entries[&sa("[2001:db8::1]:8333")].group,
-            vec![0x20, 0x01, 0x0d, 0xb8]
+            a.entries[&sa("[2001:470::1]:8333")].group,
+            vec![0x20, 0x01, 0x04, 0x70]
         );
         // The cached group is what the per-group cap counts against.
         assert_eq!(a.new_count_in_group(&[203, 0]), 1);
@@ -721,7 +766,7 @@ mod tests {
         let mut a = AddrMan::new();
         let source: IpAddr = "198.51.100.7".parse().unwrap();
         assert!(a.add_from(sa("1.2.3.4:8333"), 5, 1 | 8 | 1024, source));
-        a.add_from(sa("[2001:db8::5]:18444"), 6, 1, "2001:db8::9".parse().unwrap());
+        a.add_from(sa("[2001:470::5]:18444"), 6, 1, "2001:470::9".parse().unwrap());
         a.dump(&path).unwrap();
 
         let mut b = AddrMan::new();
@@ -729,9 +774,9 @@ mod tests {
         let e = &b.entries[&sa("1.2.3.4:8333")];
         assert_eq!(e.services, 1 | 8 | 1024);
         assert_eq!(e.source, source);
-        let e6 = &b.entries[&sa("[2001:db8::5]:18444")];
+        let e6 = &b.entries[&sa("[2001:470::5]:18444")];
         assert_eq!(e6.services, 1);
-        assert_eq!(e6.source, "2001:db8::9".parse::<IpAddr>().unwrap());
+        assert_eq!(e6.source, "2001:470::9".parse::<IpAddr>().unwrap());
     }
 
     /// A `peers.dat` written by the version 1 writer (no services, no
@@ -752,9 +797,9 @@ mod tests {
         v1.extend_from_slice(&333u64.to_le_bytes());
         v1.extend_from_slice(&0u32.to_le_bytes());
         v1.extend_from_slice(&333u64.to_le_bytes());
-        // [2001:db8::1]:8333, new, never connected, 2 attempts, last_seen 222
+        // [2001:470::1]:8333, new, never connected, 2 attempts, last_seen 222
         v1.push(1);
-        v1.extend_from_slice(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        v1.extend_from_slice(&"2001:470::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
         v1.extend_from_slice(&8333u16.to_le_bytes());
         v1.push(0);
         v1.extend_from_slice(&0u64.to_le_bytes());
@@ -772,7 +817,7 @@ mod tests {
         assert_eq!((e.last_success, e.last_seen), (333, 333));
         assert_eq!(e.services, DEFAULT_SERVICES);
         assert_eq!(e.source, "1.2.3.4".parse::<IpAddr>().unwrap());
-        let e6 = &a.entries[&sa("[2001:db8::1]:8333")];
+        let e6 = &a.entries[&sa("[2001:470::1]:8333")];
         assert!(!e6.tried);
         assert_eq!((e6.attempts, e6.last_seen), (2, 222));
         assert_eq!(e6.services, DEFAULT_SERVICES);
@@ -958,6 +1003,84 @@ mod tests {
         let counts = a.counts_by_network();
         assert_eq!(counts["ipv4"], TableCounts { new: 1, tried: 1 });
         assert!(!counts.contains_key("ipv6"));
+    }
+
+    /// The book refuses an address that names no host on every path in:
+    /// gossip (`add_from`), `addpeeraddress` (`add_manual`, with Core's
+    /// error), a successful connect (`mark_good`) and `peers.dat` (`load`).
+    /// A satd before this rule could have written `0.0.0.0` to its file;
+    /// loading must drop it rather than seed it back onto the dial list.
+    #[test]
+    fn an_invalid_address_never_enters_the_book() {
+        let invalid = ["0.0.0.0:18444", "255.255.255.255:18444", "[::]:18444", "[2001:db8::1]:8333"];
+        let mut a = AddrMan::new();
+        for bad in invalid {
+            assert!(!a.admits(&sa(bad)), "{bad}");
+            assert!(!a.add_from(sa(bad), 1, DEFAULT_SERVICES, sa("1.2.3.4:8333").ip()), "{bad}");
+            assert_eq!(a.add_manual(sa(bad), true, 1), Err("failed-adding-to-new"), "{bad}");
+            a.mark_good(sa(bad), 1);
+        }
+        assert!(a.is_empty(), "nothing invalid was taken");
+
+        // A file holding them, as a satd before the rule could write it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"SADR");
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let kept = sa("1.2.3.4:8333");
+        let all: Vec<SocketAddr> = invalid.iter().map(|s| sa(s)).chain([kept]).collect();
+        buf.extend_from_slice(&(all.len() as u32).to_le_bytes());
+        for addr in &all {
+            let e = AddrEntry {
+                addr: *addr,
+                tried: true,
+                last_success: 1,
+                attempts: 0,
+                last_seen: 1,
+                services: DEFAULT_SERVICES,
+                source: addr.ip(),
+                group: Vec::new(),
+            };
+            write_entry(&mut buf, &e);
+        }
+        std::fs::write(&path, &buf).unwrap();
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.len(), 1, "only the valid entry loads");
+        assert!(b.entries.contains_key(&kept));
+        assert_eq!(b.select_n(10), vec![kept]);
+    }
+
+    /// Off regtest the book takes Core's rule: routable addresses only, on
+    /// every path in. Private, loopback and link-local addresses are valid
+    /// but refused; with `set_admit_private` (regtest) they are taken.
+    #[test]
+    fn a_private_address_is_refused_unless_admitted() {
+        let private = ["10.0.0.1:8333", "127.0.0.1:18444", "192.168.1.5:8333", "[fe80::1]:8333", "[::1]:8333"];
+        let mut strict = AddrMan::new();
+        strict.set_admit_private(false);
+        for p in private {
+            assert!(!strict.admits(&sa(p)), "{p}");
+            assert!(!strict.add(sa(p), 1), "{p}");
+            assert_eq!(strict.add_manual(sa(p), false, 1), Err("failed-adding-to-new"), "{p}");
+            strict.mark_good(sa(p), 1);
+        }
+        assert!(strict.is_empty());
+        assert!(strict.add(sa("1.2.3.4:8333"), 1), "a routable address is taken");
+
+        // The same file loads differently under the two rules.
+        let mut lax = AddrMan::new();
+        for p in private {
+            assert!(lax.add(sa(p), 1), "{p} is taken when private addresses are admitted");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        lax.dump(&path).unwrap();
+        let mut reloaded = AddrMan::new();
+        reloaded.set_admit_private(false);
+        reloaded.load(&path).unwrap();
+        assert!(reloaded.is_empty(), "a strict book drops private entries on load");
     }
 
     #[test]
