@@ -1107,7 +1107,7 @@ impl PeerManager {
             return true;
         }
         let names: Vec<_> = running.iter().map(|(name, _)| *name).collect();
-        tracing::error!(threads = ?names, "block connector still running at its deadline");
+        tracing::warn!(threads = ?names, "block connector still running at its deadline");
         *threads = running;
         false
     }
