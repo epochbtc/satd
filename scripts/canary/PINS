@@ -58,3 +58,26 @@ ELECTRUM_BASE_IMAGE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701
 # BDK is pinned by scripts/canary/bdk-canary/Cargo.lock, not here; the weekly
 # check reads bdk_wallet's version from that lockfile, and a hold on it is
 # HOLD_BDK_WALLET.
+
+# Warnet (github.com/bitcoin-dev-project/warnet): the CLI and Helm charts the
+# Warnet canary deploys with, pinned by commit because the PyPI release lags
+# the repository by months. The tank and commander images are the ones those
+# charts name; the canary pulls them by digest and loads them into the cluster
+# under the tags the charts use, so the cluster does not pull them. The one
+# exception is the commander chart's busybox init container: the chart names
+# it with no tag, so Kubernetes pulls busybox:latest on every run.
+# WARNET_CORE_IMAGE follows the newest stable Bitcoin Core that Warnet
+# publishes an image for.
+WARNET_COMMIT=c89fa2ecdc9e54aee3929e3f2d977e6a9b917063
+WARNET_CORE_IMAGE=bitcoindevproject/bitcoin:31.0@sha256:d6f7c80579a846949986894f2e80a63178535ab14f9db62e25ad7077de89757e
+WARNET_COMMANDER_IMAGE=bitcoindevproject/commander:latest@sha256:5a3d88c2d50a1a7d48f98cf0a94e17e72497e0cfbe1c8cc2dafc90ac2e1865f4
+#   The cluster: kind, and the kubectl and helm Warnet drives it with (helm is
+#   the version Warnet's own installer names). Each download is checked
+#   against its SHA-256.
+KIND_VERSION=v0.33.0
+KIND_SHA256=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+KIND_NODE_IMAGE=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+KUBECTL_VERSION=v1.37.1
+KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
+HELM_VERSION=v4.2.2
+HELM_SHA256=9adafecab4d406853bba163a70e9f104f47dbbf65ce24b7653bae7e36150bcb6

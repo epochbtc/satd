@@ -1,0 +1,164 @@
+# Warnet canary — satd tanks in a Warnet network beside Bitcoin Core tanks.
+#
+# Warnet (github.com/bitcoin-dev-project/warnet) deploys Bitcoin networks to
+# Kubernetes with a Helm chart written for Bitcoin Core's image.
+# contrib/warnet builds a lab variant of the satd image that the chart runs
+# unchanged; docker.yml already proves that variant against the chart's
+# rendered bitcoin.conf with docker compose. This job goes the rest of the
+# way: a real kind cluster, Warnet's own CLI and charts at a pinned commit,
+# a ring alternating Bitcoin Core and satd, and Warnet's scenario runner
+# driving keyless mining, a transaction flood, Warnet's reconnaissance and
+# P2P-interface scenarios, and a cross-implementation consensus check.
+# scripts/canary/warnet-smoke.sh is the whole test; this file only provides
+# the cluster.
+#
+# Every downstream artefact is pinned in scripts/canary/PINS: Warnet by
+# commit, the Core, commander and kind node images by digest (the script
+# loads them into the cluster so it does not pull them by tag), and kind,
+# kubectl and helm by version and SHA-256. The commander chart's busybox init
+# container is the exception; see PINS.
+#
+# Triggers: pull requests that touch what the canary exercises (a job-level
+# skip otherwise, so the check reports "skipped" rather than going missing),
+# weekly, and on dispatch. Not yet a required check: it becomes one after a
+# clean run of weeks on master, as the other canaries did.
+
+name: Warnet canary
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Mondays 06:30 UTC, beside the weekly canary fleet.
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: warnet-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: detect relevant changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect changes the canary exercises
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "no PR base SHA (schedule/dispatch) — running"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          printf 'Changed files:\n%s\n' "$changed"
+          # The image and its build inputs, the P2P, RPC, config and CLI code a
+          # tank exercises, and the canary itself.
+          if printf '%s\n' "$changed" | grep -qE '^(contrib/warnet/|Dockerfile$|Cargo\.lock$|rust-toolchain\.toml$|node/src/(net|rpc|chain|mempool|validation)/|satd/src/|sat-cli/src/|scripts/canary/(PINS|pins\.py|warnet)|\.github/workflows/warnet-canary\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "nothing the Warnet canary exercises changed -> skip"
+          fi
+
+  warnet-core-satd:
+    name: canary / Warnet (Bitcoin Core + satd)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.run == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        # The satd image build and a kind node with five images loaded need
+        # more than the runner's default free space.
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the satd image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: satd:ci
+          # Read docker.yml's amd64 cache; never write it, so this job cannot
+          # evict what docker.yml relies on.
+          cache-from: type=gha,scope=docker-ci-amd64
+          provenance: false
+
+      - name: Build the Warnet lab image
+        run: docker build --build-arg SATD_IMAGE=satd:ci -t satd-warnet:ci contrib/warnet
+
+      - name: Install kind, kubectl and helm (pinned, checksummed)
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -fsSLo "$bin/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  $bin/kind" | sha256sum -c -
+          curl -fsSLo "$bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $bin/kubectl" | sha256sum -c -
+          curl -fsSLo "$RUNNER_TEMP/helm.tgz" "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  $RUNNER_TEMP/helm.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/helm.tgz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" "$bin/helm"
+          chmod 0755 "$bin/kind" "$bin/kubectl"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Create the kind cluster
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          kind create cluster --name warnet --image "$KIND_NODE_IMAGE" --wait 180s
+          kubectl cluster-info --context kind-warnet
+
+      - name: Install Warnet at the pinned commit
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          python3 -m venv "$RUNNER_TEMP/warnet"
+          "$RUNNER_TEMP/warnet/bin/pip" install --quiet \
+            "warnet @ git+https://github.com/bitcoin-dev-project/warnet@${WARNET_COMMIT}"
+          echo "$RUNNER_TEMP/warnet/bin" >> "$GITHUB_PATH"
+
+      - name: Run the canary
+        env:
+          SATD_WARNET_IMAGE: satd-warnet:ci
+          KIND_CLUSTER: warnet
+          ARTIFACT_DIR: ${{ runner.temp }}/warnet-logs
+        run: scripts/canary/warnet-smoke.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: warnet-canary-logs
+          path: ${{ runner.temp }}/warnet-logs
+          if-no-files-found: ignore
+          retention-days: 7
