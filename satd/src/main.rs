@@ -4495,14 +4495,16 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Wait for the block connector to stop before flushing. Until it does it
     // can still connect blocks, and a block connected after the flush is
-    // past the tip the clean-shutdown marker records; the next start would
-    // trust the marker. It was signalled with the shutdown watch and stops
-    // after the block in hand, so this is usually already done. Bounded by
-    // what is left of the shutdown budget, floored at 1s as the flush's is: a
-    // connector that will not stop is a dirty exit, like a flush that will
-    // not finish.
-    let connector_budget = shutdown_deadline
-        .saturating_sub(shutdown_started.elapsed())
+    // past the tip the clean-shutdown marker records. It was signalled with
+    // the shutdown watch and stops after the block in hand, so this is
+    // usually already done; but one block of large transactions can take
+    // tens of seconds to verify, so the wait gets at most half of what is
+    // left of the budget, keeping the rest for the flush. A connector still
+    // running then does not stop the flush, which is safe alongside it, as
+    // the connector's own periodic flushes are; it costs the marker, since
+    // the tip can still move. `exit_now` at the end makes a connector still
+    // inside RocksDB harmless.
+    let connector_budget = (shutdown_deadline.saturating_sub(shutdown_started.elapsed()) / 2)
         .max(std::time::Duration::from_secs(1));
     let connector_stopped = {
         let pm = peer_manager.clone();
@@ -4510,19 +4512,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             .await
             .unwrap_or(false)
     };
-    if !connector_stopped {
-        tracing::error!(
-            deadline_secs = config.max_shutdown_secs,
-            "Block connector did not stop within --max-shutdown-secs; force-exiting \
-             without the clean-shutdown marker."
+    if connector_stopped {
+        tracing::info!(tip_height = chain_state.tip_height(), "Block connector stopped");
+    } else {
+        tracing::warn!(
+            waited_secs = connector_budget.as_secs(),
+            "Block connector still in a block at its share of --max-shutdown-secs; \
+             flushing without the clean-shutdown marker"
         );
-        auth.cleanup();
-        if let Some(ref pid_path) = config.pid {
-            let _ = std::fs::remove_file(pid_path);
-        }
-        node::shutdown::exit_now(1);
     }
-    tracing::info!(tip_height = chain_state.tip_height(), "Block connector stopped");
 
     // Graceful shutdown — flush UTXO cache before stopping, bounded by
     // --max-shutdown-secs so we actually exit within the deadline no matter
@@ -4603,10 +4601,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
 
-    // Write the clean-shutdown marker only if the flush actually succeeded.
-    // If we timed out or errored, leaving the marker absent is correct — it
-    // tells the next startup (and the operator) that this exit was dirty.
-    if flushed_ok {
+    // Write the clean-shutdown marker only if the flush actually succeeded
+    // and the connector had stopped, so the tip it records is final. If
+    // either did not, leaving the marker absent is correct — it tells the
+    // next startup (and the operator) that this exit was dirty.
+    if flushed_ok && connector_stopped {
         if let Err(e) = node::shutdown::write_marker(&net_datadir, &tip_hash, tip_height) {
             tracing::warn!(error = %e, "Failed to write clean-shutdown marker");
         } else {

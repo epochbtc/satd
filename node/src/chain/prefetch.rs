@@ -68,6 +68,11 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
 /// 4. Computes MTP via read-only store lookups
 /// 5. Computes txids and runs context-free `check_transaction`
 /// 6. Speculatively resolves UTXO inputs (cache warming)
+///
+/// Once `cancel` is set, script pre-verification stops at the next
+/// transaction: the prefetcher is stopping and nothing will take the block.
+/// A block of large transactions can take tens of seconds to verify here,
+/// and stopping the prefetcher waits for every worker (#868).
 #[allow(clippy::too_many_arguments)]
 pub fn prefetch_block(
     store: &dyn Store,
@@ -78,6 +83,7 @@ pub fn prefetch_block(
     _assumevalid: bool,
     primary_engine: PrimaryEngine,
     network: bitcoin::Network,
+    cancel: &AtomicBool,
 ) -> Option<PreprocessedBlock> {
     // 1. Get block hash and entry. During a chainstate reindex the chain to
     //    replay comes from the plan, not the height→hash index (see
@@ -188,43 +194,7 @@ pub fn prefetch_block(
             })
             .collect();
 
-        if verifiable.is_empty() {
-            HashSet::new()
-        } else {
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(4);
-            let chunk_size = verifiable.len().div_ceil(num_threads);
-            let mut verified = HashSet::new();
-            // Use whichever concrete engine the user configured as primary.
-            // Prefetch's "OK" result causes the connect thread to skip its
-            // own primary verify, so this engine must match the user's
-            // authoritative choice — otherwise we'd covertly promote the
-            // other engine to authoritative for pre-verified txs.
-            std::thread::scope(|s| {
-                let handles: Vec<_> = verifiable.chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            chunk.iter()
-                                .filter(|(_, tx, prev_outputs)| match primary_engine {
-                                    PrimaryEngine::Cpp => ConsensusVerifier::new(network)
-                                        .verify_transaction(tx, prev_outputs, height)
-                                        .is_ok(),
-                                    PrimaryEngine::Rust => RustVerifier::new(network)
-                                        .verify_transaction(tx, prev_outputs, height)
-                                        .is_ok(),
-                                })
-                                .map(|(tx_idx, _, _)| *tx_idx)
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    verified.extend(h.join().unwrap());
-                }
-            });
-            verified
-        }
+        verify_speculatively(&verifiable, primary_engine, network, height, cancel)
     };
 
     Some(PreprocessedBlock {
@@ -241,6 +211,58 @@ pub fn prefetch_block(
     })
 }
 
+/// Verify `verifiable`'s scripts in parallel and return the indexes of the
+/// transactions that passed. A transaction not reached before `cancel` is set
+/// is left out, as a failed one is: the connect thread verifies whatever is
+/// missing from the set, so leaving one out costs time, never correctness.
+fn verify_speculatively(
+    verifiable: &[(usize, &Transaction, Vec<TxOut>)],
+    primary_engine: PrimaryEngine,
+    network: bitcoin::Network,
+    height: u32,
+    cancel: &AtomicBool,
+) -> HashSet<usize> {
+    if verifiable.is_empty() {
+        return HashSet::new();
+    }
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    let chunk_size = verifiable.len().div_ceil(num_threads);
+    let mut verified = HashSet::new();
+    // Use whichever concrete engine the user configured as primary.
+    // Prefetch's "OK" result causes the connect thread to skip its
+    // own primary verify, so this engine must match the user's
+    // authoritative choice — otherwise we'd covertly promote the
+    // other engine to authoritative for pre-verified txs.
+    std::thread::scope(|s| {
+        let handles: Vec<_> = verifiable.chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk.iter()
+                        .filter(|(_, tx, prev_outputs)| {
+                            !cancel.load(Ordering::Relaxed)
+                                && match primary_engine {
+                                    PrimaryEngine::Cpp => ConsensusVerifier::new(network)
+                                        .verify_transaction(tx, prev_outputs, height)
+                                        .is_ok(),
+                                    PrimaryEngine::Rust => RustVerifier::new(network)
+                                        .verify_transaction(tx, prev_outputs, height)
+                                        .is_ok(),
+                                }
+                        })
+                        .map(|(tx_idx, _, _)| *tx_idx)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            verified.extend(h.join().unwrap());
+        }
+    });
+    verified
+}
+
 /// Handle returned by `start_prefetcher` to control the background pipeline.
 pub struct PrefetchHandle {
     shutdown: Arc<AtomicBool>,
@@ -252,7 +274,8 @@ pub struct PrefetchHandle {
 }
 
 impl PrefetchHandle {
-    /// Signal all workers to stop and join their threads.
+    /// Signal all workers to stop and join their threads. A worker drops the
+    /// block it is on at its next transaction rather than finishing it.
     pub fn stop(self) {
         self.shutdown.store(true, Ordering::Relaxed);
         for w in self.workers {
@@ -334,6 +357,7 @@ pub fn start_prefetcher(
                                     assumevalid,
                                     primary_engine,
                                     network,
+                                    &w_shutdown,
                                 ) {
                                     w_buffer.lock().insert(height, pre);
                                 }
@@ -408,6 +432,53 @@ pub fn start_prefetcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transaction not reached before the prefetcher is told to stop is
+    /// left out of the verified set, so a worker gives up within one
+    /// transaction instead of finishing a block that can take tens of
+    /// seconds to verify (#868). Leaving one out is safe: the connect
+    /// thread verifies every transaction not in the set.
+    ///
+    /// Perturbation: drop the `cancel` check and the cancelled call verifies
+    /// the transaction.
+    #[test]
+    fn a_cancelled_verification_verifies_nothing() {
+        use bitcoin::hashes::Hash as _;
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: Txid::from_byte_array([7; 32]),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from(vec![0x51]),
+            }],
+        };
+        // Spends an OP_TRUE output with an empty scriptSig.
+        let spent = vec![TxOut {
+            value: bitcoin::Amount::from_sat(2_000),
+            script_pubkey: bitcoin::ScriptBuf::from(vec![0x51]),
+        }];
+        let verifiable = vec![(1usize, &tx, spent)];
+        let network = bitcoin::Network::Regtest;
+
+        let running = AtomicBool::new(false);
+        assert_eq!(
+            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, 1, &running),
+            HashSet::from([1]),
+            "fixture: the transaction must verify when not cancelled"
+        );
+        let stopped = AtomicBool::new(true);
+        assert!(
+            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, 1, &stopped).is_empty(),
+            "a cancelled verification must verify nothing"
+        );
+    }
 
     #[test]
     fn test_read_block_from_nonexistent_file() {

@@ -1089,10 +1089,9 @@ impl PeerManager {
     /// on the watch this manager was built with, each after finishing the
     /// block in hand; the caller signals it first.
     ///
-    /// Shutdown joins them before it flushes, so that no connect lands after
-    /// the flush and the clean-shutdown marker names the tip the node
-    /// stopped at, and so that no connector is inside RocksDB when the
-    /// process exits (#868). Returns `false` if either is still running at
+    /// Shutdown waits for them before it flushes, so that no connect lands
+    /// after the flush and the clean-shutdown marker names the tip the node
+    /// stopped at (#868). Returns `false` if either is still running at
     /// `timeout`; it is kept, and a later call waits for it again.
     pub fn join_connectors(&self, timeout: Duration) -> bool {
         // Wake both loops out of their condvar waits rather than leaving
