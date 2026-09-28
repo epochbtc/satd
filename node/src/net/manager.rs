@@ -774,6 +774,10 @@ pub struct PeerManager {
     bg_downloader: RwLock<BgDownloader>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
+    /// The block processor and background catch-up threads, named. Both
+    /// exit once shutdown is signalled; [`Self::join_connectors`] waits
+    /// for them.
+    connector_threads: parking_lot::Mutex<Vec<(&'static str, std::thread::JoinHandle<()>)>>,
     /// SOCKS5 proxy for all outbound connections (e.g. "127.0.0.1:9050").
     proxy: Option<String>,
     /// Separate SOCKS5 proxy for .onion connections (defaults to proxy).
@@ -898,9 +902,10 @@ impl PeerManager {
         let (block_tx, block_rx) = mpsc::unbounded_channel();
         let connect_signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
         let bg_connect_signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
-        // Cloned for the background catch-up connect loop, which must
-        // observe shutdown (it has no channel to close like block_processor).
+        // Both connect loops stop on shutdown, so that shutdown can join
+        // them before it flushes (see `join_connectors`).
         let bg_shutdown = shutdown.clone();
+        let connect_shutdown = shutdown.clone();
 
         // Check for IBD resume: if headers are ahead of tip, create scheduler
         let tip_height = chain_state.tip_height();
@@ -998,6 +1003,7 @@ impl PeerManager {
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
             )),
             bg_connect_signal: bg_connect_signal.clone(),
+            connector_threads: parking_lot::Mutex::new(Vec::new()),
             proxy,
             onion_proxy,
             proxy_randomize: std::sync::atomic::AtomicBool::new(true),
@@ -1054,19 +1060,57 @@ impl PeerManager {
         let orph = mgr.orphanage.clone();
         let cs_for_block = cs.clone();
         let pm_for_block = Arc::downgrade(&mgr);
-        std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph, pm_for_block);
-        });
+        let block_processor = std::thread::Builder::new()
+            .name("block-processor".into())
+            .spawn(move || {
+                Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph, pm_for_block, connect_shutdown);
+            })
+            .expect("failed to spawn the block processor thread");
 
         // Background AssumeUTXO catch-up connect loop. Long-lived: idles
         // (waiting on `bg_connect_signal`) until a snapshot is loaded and a
         // background chainstate is attached, then connects downloaded
         // historical blocks in order until handoff.
-        std::thread::spawn(move || {
-            Self::bg_catchup_connect_loop(&cs, &bg_connect_signal, &bg_shutdown);
-        });
+        let bg_catchup = std::thread::Builder::new()
+            .name("bg-catchup".into())
+            .spawn(move || {
+                Self::bg_catchup_connect_loop(&cs, &bg_connect_signal, &bg_shutdown);
+            })
+            .expect("failed to spawn the background catch-up thread");
+        *mgr.connector_threads.lock() =
+            vec![("block-processor", block_processor), ("bg-catchup", bg_catchup)];
 
         mgr
+    }
+
+    /// Wait up to `timeout` for the block connector threads to exit: the
+    /// block processor, which also runs the IBD connect loop, and the
+    /// background catch-up loop. They exit once shutdown has been signalled
+    /// on the watch this manager was built with, each after finishing the
+    /// block in hand; the caller signals it first.
+    ///
+    /// Shutdown joins them before it flushes, so that no connect lands after
+    /// the flush and the clean-shutdown marker names the tip the node
+    /// stopped at, and so that no connector is inside RocksDB when the
+    /// process exits (#868). Returns `false` if either is still running at
+    /// `timeout`; it is kept, and a later call waits for it again.
+    pub fn join_connectors(&self, timeout: Duration) -> bool {
+        // Wake both loops out of their condvar waits rather than leaving
+        // them to their timeouts.
+        for signal in [&self.connect_signal, &self.bg_connect_signal] {
+            let (lock, cvar) = &**signal;
+            *lock.lock() = true;
+            cvar.notify_all();
+        }
+        let mut threads = self.connector_threads.lock();
+        let running = crate::shutdown::join_within(std::mem::take(&mut *threads), timeout);
+        if running.is_empty() {
+            return true;
+        }
+        let names: Vec<_> = running.iter().map(|(name, _)| *name).collect();
+        tracing::error!(threads = ?names, "block connector still running at its deadline");
+        *threads = running;
+        false
     }
 
     /// How long a connected peer may go without a useful message before it is
@@ -5594,6 +5638,7 @@ impl PeerManager {
         ibd_eta_secs: Arc<AtomicU64>,
         orphanage: Arc<TxOrphanage>,
         peer_manager: std::sync::Weak<PeerManager>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -5623,6 +5668,7 @@ impl PeerManager {
                 network,
                 &ibd_eta_secs,
                 &peer_manager,
+                &shutdown,
             );
         }
 
@@ -5639,6 +5685,15 @@ impl PeerManager {
             (bitcoin::Block, crate::net::flow::InFlight),
         > = HashMap::new();
         loop {
+            // Shutdown: stop connecting. `join_connectors` is waiting for
+            // this thread to exit before the shutdown flush.
+            if *shutdown.borrow() {
+                tracing::info!(
+                    height = chain_state.tip_height(),
+                    "Block processor stopped for shutdown"
+                );
+                return;
+            }
             // Check if IBD scheduler was activated
             if ibd.read().is_some() {
                 Self::ibd_connect_loop(
@@ -5655,6 +5710,7 @@ impl PeerManager {
                     network,
                     &ibd_eta_secs,
                     &peer_manager,
+                    &shutdown,
                 );
                 continue;
             }
@@ -5676,7 +5732,9 @@ impl PeerManager {
             drop(ready);
 
             // Drain all available blocks from the channel
-            while let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv() {
+            while !*shutdown.borrow()
+                && let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv()
+            {
                 let hash = block.block_hash();
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
@@ -5802,6 +5860,9 @@ impl PeerManager {
                 tracing::warn!(error = %e, "Could not activate the best stored chain");
             }
 
+            if *shutdown.borrow() {
+                continue;
+            }
             // Drain any stored-but-unconnected tail on the best header chain
             // (issue #582). A torn-down IBD connector can leave blocks it
             // downloaded but never connected sitting on disk; nothing else
@@ -5954,6 +6015,7 @@ impl PeerManager {
         network: Network,
         ibd_eta_secs: &Arc<AtomicU64>,
         peer_manager: &std::sync::Weak<PeerManager>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
     ) {
         let mut connected_count = 0u64;
         let mut retry_count = 0u32;
@@ -6034,7 +6096,19 @@ impl PeerManager {
         // plus one refresh every 60s while still stuck.
         let mut last_stuck_log: Option<(u32, Instant)> = None;
 
-        loop {
+        'connect: loop {
+            // Shutdown: stop between blocks. Left running, the loop went on
+            // connecting past the shutdown flush and the clean-shutdown
+            // marker, and was inside RocksDB when the process exited
+            // (#868). The scheduler is left in place; the prefetch pipeline
+            // and the BulkLoad guard wind down below, as on every exit.
+            if *shutdown.borrow() {
+                tracing::info!(
+                    height = chain_state.tip_height(),
+                    "IBD connector stopped for shutdown"
+                );
+                break;
+            }
             // Backpressure: if RocksDB has accumulated too many L0 SST files,
             // the chainstate is on the path that wedged a 78-GB process
             // during a mainnet IBD (10k+ L0 SSTs, 4h cumulative write-stall).
@@ -6048,6 +6122,9 @@ impl PeerManager {
                 let max_wait = Duration::from_secs(60);
                 let poll = Duration::from_millis(500);
                 loop {
+                    if *shutdown.borrow() {
+                        continue 'connect;
+                    }
                     let l0 = chain_state.chainstate_l0_files();
                     if l0 < ibd_l0_pause_at as u64 {
                         if backpressure_paused {
@@ -11170,6 +11247,140 @@ mod tests {
             3,
             "the stored tail must connect without a network event"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accept the headers of `n` test blocks on regtest genesis and, when
+    /// `store` is set, store their data, connecting none of them.
+    fn headers_ahead_of_the_tip(cs: &ChainState, n: u32, store: bool) {
+        use crate::chain::state::tests::{build_test_block, store_block_without_connecting};
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut blocks = Vec::new();
+        for h in 1..=n {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, n, "fixture: headers must be accepted ({err:?})");
+        if store {
+            for (b, h) in blocks.iter().zip(1..) {
+                store_block_without_connecting(cs, b, h);
+            }
+        }
+    }
+
+    /// A real PeerManager over `chain_state`, with the sender of its
+    /// shutdown watch, initially `shutdown`.
+    fn peer_manager_with_shutdown(
+        chain_state: Arc<ChainState>,
+        shutdown: bool,
+    ) -> (Arc<PeerManager>, tokio::sync::watch::Sender<bool>) {
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(shutdown);
+        let pm =
+            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        (pm, shutdown_tx)
+    }
+
+    /// #868: once shutdown is signalled the IBD connect loop connects
+    /// nothing more and its thread exits, so the tip the shutdown flush
+    /// writes, and the clean-shutdown marker records, is the tip the node
+    /// stops at. The loop had no shutdown path: it went on connecting after
+    /// the marker was written, and was inside RocksDB when the process
+    /// exited.
+    ///
+    /// Thirty blocks are stored above the tip and their headers put the node
+    /// more than 24 behind, so the manager starts in IBD, with shutdown
+    /// already signalled.
+    ///
+    /// Perturbations: without the check at the top of the IBD connect loop
+    /// all thirty connect; without the one at the top of the block
+    /// processor's loop it re-enters the IBD loop forever and the join
+    /// times out.
+    #[test]
+    fn the_ibd_connector_connects_nothing_after_shutdown_and_exits() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        headers_ahead_of_the_tip(&cs, 30, true);
+        let chain_state = Arc::new(cs);
+        let (pm, _shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), true);
+        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+
+        assert!(
+            pm.join_connectors(Duration::from_secs(10)),
+            "the connector threads must exit on shutdown"
+        );
+        assert_eq!(
+            chain_state.tip_height(),
+            0,
+            "no block may connect once shutdown is signalled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #868: shutdown ends the IBD connector's wait for block data. The
+    /// reproduction crashed with the connector parked there, waiting on a
+    /// block no peer was sending, minutes after the clean-shutdown marker.
+    ///
+    /// Perturbation: without the check at the top of the IBD connect loop,
+    /// the loop never exits and the join times out.
+    #[test]
+    fn shutdown_ends_the_ibd_connectors_wait_for_block_data() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        headers_ahead_of_the_tip(&cs, 30, false);
+        let chain_state = Arc::new(cs);
+        let (pm, shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), false);
+        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        // Let the connector reach its wait for block 1.
+        std::thread::sleep(Duration::from_millis(200));
+
+        shutdown_tx.send_replace(true);
+        assert!(
+            pm.join_connectors(Duration::from_secs(10)),
+            "the connector threads must exit on shutdown"
+        );
+        assert_eq!(chain_state.tip_height(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Outside IBD the block processor serves the block channel; it stops
+    /// on shutdown too.
+    ///
+    /// Perturbation: without the check at the top of the block processor's
+    /// loop, it never exits and the join times out.
+    #[test]
+    fn the_steady_state_block_processor_exits_on_shutdown() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let (pm, shutdown_tx) = peer_manager_with_shutdown(Arc::new(cs), false);
+        assert!(pm.ibd.read().is_none(), "fixture: the manager must not be in IBD");
+        std::thread::sleep(Duration::from_millis(100));
+
+        shutdown_tx.send_replace(true);
+        assert!(
+            pm.join_connectors(Duration::from_secs(10)),
+            "the connector threads must exit on shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A join that runs out of time keeps the threads it could not join, so
+    /// a later call can still wait for them rather than report them gone.
+    #[test]
+    fn join_connectors_keeps_the_threads_it_could_not_join() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let (pm, shutdown_tx) = peer_manager_with_shutdown(Arc::new(cs), false);
+
+        assert!(
+            !pm.join_connectors(Duration::from_millis(200)),
+            "without a shutdown signal the connectors keep running"
+        );
+        assert_eq!(pm.connector_threads.lock().len(), 2, "both threads must be kept");
+
+        shutdown_tx.send_replace(true);
+        assert!(pm.join_connectors(Duration::from_secs(10)));
+        assert!(pm.connector_threads.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

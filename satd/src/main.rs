@@ -317,8 +317,46 @@ fn report_ancestry_damage(
         }
 }
 
-#[tokio::main]
-async fn main() {
+/// How long the core runtime is given, once `run` has returned, to finish
+/// the tasks still holding the chainstate: dropping it would otherwise wait
+/// without limit for every blocking task.
+const CORE_RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long shutdown waits for the stall watchdog, periodic compactor and
+/// compaction diagnostic to exit. They are woken as shutdown starts, so this
+/// only matters for a forced compaction still running.
+const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The core runtime is built here rather than by `#[tokio::main]` so that the
+/// process ends with a bounded runtime shutdown and `_exit`, not with libc's
+/// `exit()`. `exit()` runs the C++ static destructors, RocksDB's among them,
+/// and any thread still inside RocksDB then fails with SIGSEGV (#868).
+/// `run` stops and joins the node's own threads first; `_exit` covers
+/// whatever outlives them.
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build the core runtime");
+    let chainstate_db = runtime.block_on(run());
+    // Drops every task, and with them their references to the chainstate.
+    runtime.shutdown_timeout(CORE_RUNTIME_SHUTDOWN);
+    if let Some(db) = chainstate_db {
+        match db.strong_count() {
+            0 => tracing::info!("Chainstate database closed"),
+            held => tracing::warn!(
+                held,
+                "Chainstate database still referenced at exit; exiting without closing it"
+            ),
+        }
+    }
+    node::shutdown::exit_now(0);
+}
+
+/// The node, from config load to the end of a graceful shutdown. Returns a
+/// weak reference to the chainstate store, if one was opened, for `main` to
+/// report whether its database closed.
+async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> {
     // Config must be parsed before tracing init so --log-format can select
     // the formatter. Config parse errors go to stderr as plain text. The
     // parsed CLI is retained (`cli_snapshot`) so SIGHUP config reload can
@@ -1117,6 +1155,9 @@ async fn main() {
         tip = %chain_state.tip_hash(),
         "Chain state initialized"
     );
+    // The chainstate database closes when the last reference to its store is
+    // dropped; `main` checks this at exit.
+    let chainstate_db = Arc::downgrade(chain_state.store_ref());
 
     // AssumeUTXO: re-attach a pending background validator left by a prior
     // run, or refuse to start if that snapshot was proven invalid. A
@@ -1458,7 +1499,7 @@ async fn main() {
                 "Exiting after reindex reached -stopatheight"
             );
             auth.cleanup();
-            return;
+            return Some(chainstate_db);
         }
     } else if reindex_chainstate {
         startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
@@ -1493,7 +1534,7 @@ async fn main() {
                 "Exiting after chainstate reindex reached -stopatheight"
             );
             auth.cleanup();
-            return;
+            return Some(chainstate_db);
         }
     }
 
@@ -4228,24 +4269,33 @@ async fn main() {
     // restarts us). Deliberately not a tokio task — the wedge we are
     // protecting against parks every tokio worker, so a tokio-scheduled
     // watchdog would freeze with the rest.
-    node::stall_watchdog::spawn_stall_watchdog(
+    //
+    // It and the two threads below sleep on `maintenance_stop`, which
+    // shutdown sets as it starts, and are joined before the process exits.
+    let maintenance_stop = node::shutdown::ThreadStop::default();
+    let mut maintenance_threads: Vec<node::shutdown::NamedThread> = Vec::new();
+    if let Some(handle) = node::stall_watchdog::spawn_stall_watchdog(
         chain_state.clone(),
         std::time::Duration::from_secs(config.stall_watchdog_secs),
         std::time::Duration::from_secs(config.stall_abort_secs),
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("stall-watchdog", handle));
+    }
 
     // Periodic forced-compaction thread: backstop for RocksDB compaction
     // falling behind. Forces a chainstate compaction when the L0 file count
     // stays above the configured threshold for a full interval. Synchronous
     // and long-running, so it gets its own OS thread rather than a tokio
     // worker.
-    node::stall_watchdog::spawn_periodic_compactor(
+    if let Some(handle) = node::stall_watchdog::spawn_periodic_compactor(
         chain_state.clone(),
         std::time::Duration::from_secs(config.compaction_interval_secs),
         config.compaction_l0_at,
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("rocksdb-compactor", handle));
+    }
 
     // Per-CF pending-compaction diagnostic. Logs one INFO snapshot
     // every `compaction_diag_interval_secs` (default 60) showing the
@@ -4254,11 +4304,13 @@ async fn main() {
     // backlog into a silent disk-fill — the existing compactor reads
     // only the `coins` CF, which stayed healthy throughout while the
     // four secondary-index CFs accumulated ~370 GB of pending work.
-    node::stall_watchdog::spawn_compaction_diagnostic(
+    if let Some(handle) = node::stall_watchdog::spawn_compaction_diagnostic(
         chain_state.clone(),
         std::time::Duration::from_secs(config.compaction_diag_interval_secs),
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("rocksdb-diag", handle));
+    }
 
     // All listeners bound, all background tasks spawned. Tell the
     // service manager we're up. This stops the startup heartbeat and
@@ -4372,6 +4424,12 @@ async fn main() {
         }
     }
 
+    // Wake the stall watchdog, periodic compactor and compaction diagnostic
+    // out of their sleeps; they are joined below, after the flush. The block
+    // connector stops on the shutdown watch, which every exit from the loop
+    // above has set.
+    maintenance_stop.stop();
+
     // Stop the recent-height window build, if it is still scanning or
     // waiting to retry a failed scan. It checks the flag every 64k coins and
     // every 50ms of a retry wait, so this is milliseconds; the wait is
@@ -4435,6 +4493,37 @@ async fn main() {
         }
     }
 
+    // Wait for the block connector to stop before flushing. Until it does it
+    // can still connect blocks, and a block connected after the flush is
+    // past the tip the clean-shutdown marker records; the next start would
+    // trust the marker. It was signalled with the shutdown watch and stops
+    // after the block in hand, so this is usually already done. Bounded by
+    // what is left of the shutdown budget, floored at 1s as the flush's is: a
+    // connector that will not stop is a dirty exit, like a flush that will
+    // not finish.
+    let connector_budget = shutdown_deadline
+        .saturating_sub(shutdown_started.elapsed())
+        .max(std::time::Duration::from_secs(1));
+    let connector_stopped = {
+        let pm = peer_manager.clone();
+        tokio::task::spawn_blocking(move || pm.join_connectors(connector_budget))
+            .await
+            .unwrap_or(false)
+    };
+    if !connector_stopped {
+        tracing::error!(
+            deadline_secs = config.max_shutdown_secs,
+            "Block connector did not stop within --max-shutdown-secs; force-exiting \
+             without the clean-shutdown marker."
+        );
+        auth.cleanup();
+        if let Some(ref pid_path) = config.pid {
+            let _ = std::fs::remove_file(pid_path);
+        }
+        node::shutdown::exit_now(1);
+    }
+    tracing::info!(tip_height = chain_state.tip_height(), "Block connector stopped");
+
     // Graceful shutdown — flush UTXO cache before stopping, bounded by
     // --max-shutdown-secs so we actually exit within the deadline no matter
     // how long the blocking flush takes.
@@ -4445,8 +4534,10 @@ async fn main() {
     // return but the process would still hang until the flush finishes (or
     // forever, on a stuck flush). To genuinely enforce the deadline we run
     // the flush on a dedicated std::thread, signal completion over a oneshot,
-    // and std::process::exit on timeout — that's the only way to end the
-    // process when the flush is stuck inside the rocksdb FFI.
+    // and `exit_now` on timeout — that's the only way to end the process
+    // when the flush is stuck inside the rocksdb FFI, and, unlike
+    // `std::process::exit`, it does not destroy RocksDB's statics under
+    // the flush thread.
     //
     // Safety on timeout-forced exit: no data is lost. The next startup will
     // replay any DataStored-but-not-Valid blocks from flat files. We just
@@ -4508,7 +4599,7 @@ async fn main() {
             if let Some(ref pid_path) = config.pid {
                 let _ = std::fs::remove_file(pid_path);
             }
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -4557,7 +4648,22 @@ async fn main() {
         let _ = std::fs::remove_file(pid_path);
     }
 
-    // Drop local references to help cleanup, but spawned tasks may still hold Arcs
+    // Join the maintenance threads woken when shutdown began. Each holds the
+    // chainstate, so one still running keeps its database open; `main`
+    // reports that at exit rather than waiting on a forced compaction.
+    let still_running = tokio::task::spawn_blocking(move || {
+        node::shutdown::join_within(maintenance_threads, MAINTENANCE_THREADS_SHUTDOWN)
+    })
+    .await
+    .unwrap_or_default();
+    if !still_running.is_empty() {
+        let names: Vec<_> = still_running.iter().map(|(name, _)| *name).collect();
+        tracing::warn!(threads = ?names, "Maintenance threads still running at exit");
+    }
+
+    // Drop local references. Tasks hold more: the API runtime's go when `run`
+    // returns and drops its guard, the core runtime's when `main` shuts it
+    // down, and the chainstate database closes with the last of them.
     drop(peer_manager);
     drop(mempool);
     drop(fee_estimator);
@@ -4565,6 +4671,7 @@ async fn main() {
     tracing::info!("Shutdown complete — local references released");
 
     tracing::info!("satd stopped");
+    Some(chainstate_db)
 }
 
 /// The metrics listener's binds, resolved once at startup, and the startup
