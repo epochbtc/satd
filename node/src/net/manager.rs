@@ -24,7 +24,7 @@ use crate::net::bg_catchup::BgDownloader;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
-use crate::net::peer::{ConnType, Direction, PeerAddr, PeerId, PeerInfo, PeerState};
+use crate::net::peer::{default_p2p_port, ConnType, Direction, PeerAddr, PeerId, PeerInfo, PeerState};
 use crate::net::proxy;
 use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
@@ -77,6 +77,28 @@ const MAX_ONION_CONNECT_ADDRS: usize = 512;
 /// that floods `connect_peer_addrs` via addrv2 gossip could make a single tick
 /// spawn hundreds of concurrent circuits and saturate the proxy.
 const MAX_ONION_DIALS_PER_TICK: usize = 16;
+
+/// How long a resolved peer name that has lost its connection waits before
+/// it is looked up again. Core resolves an added node on each attempt and
+/// attempts once a minute (`ThreadOpenAddedConnections`).
+const MANUAL_TARGET_RELOOKUP: Duration = Duration::from_secs(60);
+
+/// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
+/// host name), with the address it currently resolves to.
+#[derive(Debug, Clone)]
+struct ManualTarget {
+    /// The string as the operator gave it.
+    target: String,
+    /// Registered for dialling; `None` while a name has not resolved.
+    resolved: Option<PeerAddr>,
+    /// An added node, reported by `getaddednodeinfo`; `false` for a
+    /// `-connect` name.
+    listed: bool,
+    /// When a name is next looked up.
+    next_lookup: Instant,
+    /// Consecutive failed lookups, to log the first at `info`.
+    lookups_failed: u32,
+}
 /// Ban score charged for a `headers` message whose parent we don't have. Small
 /// enough that an honest peer announcing a better chain (one such message,
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
@@ -569,10 +591,23 @@ pub struct PeerManager {
     /// transport handshake so the per-type limits are limits rather than
     /// suggestions; see `check_outbound_limit_for`.
     pending_typed_dials: RwLock<Vec<ConnType>>,
-    /// User-provided address strings for addnode RPC, paired with the
-    /// resolved address. Stored so `getaddednodeinfo` can return the
-    /// original string the operator typed, matching Core.
-    addnode_entries: RwLock<Vec<(String, PeerAddr)>>,
+    /// The peers the operator named: every `-addnode` / `addnode add`
+    /// entry, plus each `-connect` entry given as a host name. Keeps the
+    /// string the operator typed (what `getaddednodeinfo` reports, matching
+    /// Core's `m_added_node_params`) next to the address it currently
+    /// resolves to, which is `None` while a name has not resolved yet.
+    /// Names are looked up again by [`Self::refresh_manual_targets`].
+    addnode_entries: RwLock<Vec<ManualTarget>>,
+    /// Set while a [`Self::refresh_manual_targets`] pass is running, so a
+    /// slow resolver cannot stack one pass per reconnect tick.
+    refreshing_manual_targets: std::sync::atomic::AtomicBool,
+    /// Test hook standing in for the system resolver in
+    /// [`Self::resolve_target_classified`].
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    test_resolver: RwLock<
+        Option<Arc<dyn Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError> + Send + Sync>>,
+    >,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`). Advertised in `getaddr` responses and used as the
     /// version message's `addr_from`. Set once at startup.
@@ -903,6 +938,9 @@ impl PeerManager {
             manual_onion_hosts: RwLock::new(HashSet::new()),
             pending_typed_dials: RwLock::new(Vec::new()),
             addnode_entries: RwLock::new(Vec::new()),
+            refreshing_manual_targets: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_resolver: RwLock::new(None),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             whitelist: RwLock::new(Vec::new()),
@@ -1252,6 +1290,29 @@ impl PeerManager {
         .await
     }
 
+    /// [`Self::resolve_peer_target`], keeping a refusal apart from a failed
+    /// lookup. See [`crate::net::dns::PeerTargetError`].
+    pub async fn resolve_target_classified(
+        &self,
+        s: &str,
+        default_port: u16,
+    ) -> Result<PeerAddr, crate::net::dns::PeerTargetError> {
+        #[cfg(test)]
+        {
+            let hook = self.test_resolver.read().clone();
+            if let Some(hook) = hook {
+                return hook(s);
+            }
+        }
+        crate::net::dns::resolve_peer_target_classified(
+            s,
+            default_port,
+            self.proxy.as_deref(),
+            self.dns_enabled(),
+        )
+        .await
+    }
+
     /// The SOCKS proxy used for clearnet (ipv4/ipv6) outbound, if any.
     pub fn proxy_addr(&self) -> Option<String> {
         self.proxy.clone()
@@ -1583,29 +1644,222 @@ impl PeerManager {
         }
     }
 
-    /// Register a peer via the addnode RPC, tracking the user-provided
-    /// string for `getaddednodeinfo`. Returns `true` if newly added.
+    /// Register an added node (`-addnode` or `addnode add`) that resolved to
+    /// `addr`, tracking the operator's string for `getaddednodeinfo`.
+    /// Returns `false`, changing nothing, if it is already an added node.
     pub fn addnode_add(&self, user_str: &str, addr: PeerAddr) -> bool {
-        if !self.add_peer_addr(addr.clone()) {
+        self.add_manual_target(user_str, Some(addr), true)
+    }
+
+    /// Register an added node whose name did not resolve. It is listed by
+    /// `getaddednodeinfo` at once, as in Core, and dialled once
+    /// [`Self::refresh_manual_targets`] resolves it. Returns `false` if it
+    /// is already an added node.
+    pub fn addnode_add_unresolved(&self, user_str: &str) -> bool {
+        self.add_manual_target(user_str, None, true)
+    }
+
+    /// Track a `-connect` host name so that it is looked up again: resolved
+    /// now (`Some`), in case its address changes, or not yet (`None`), so
+    /// it is dialled once it resolves. Never listed by `getaddednodeinfo`.
+    pub fn connect_name_add(&self, name: &str, addr: Option<PeerAddr>) -> bool {
+        self.add_manual_target(name, addr, false)
+    }
+
+    fn add_manual_target(&self, target: &str, addr: Option<PeerAddr>, listed: bool) -> bool {
+        let default_port = default_p2p_port(self.chain_state.network);
+        let mut entries = self.addnode_entries.write();
+        // Core's `CConnman::AddNode`: the same string, or two spellings of
+        // the same numeric address, are one entry. Names are never looked
+        // up to compare. Whether the address is already a dial candidate
+        // (gossip, `peers.dat`) does not matter: that is not an added node.
+        let numeric = |t: &str| {
+            (!crate::net::dns::is_name_target(t))
+                .then(|| PeerAddr::parse_with_default_port(t, default_port).ok())
+                .flatten()
+        };
+        let mine = numeric(target);
+        if entries.iter().any(|e| {
+            e.listed == listed
+                && (e.target == target || (mine.is_some() && numeric(&e.target) == mine))
+        }) {
             return false;
         }
-        self.addnode_entries
-            .write()
-            .push((user_str.to_string(), addr));
+        if let Some(a) = &addr {
+            self.add_peer_addr(a.clone());
+        }
+        entries.push(ManualTarget {
+            target: target.to_string(),
+            resolved: addr,
+            listed,
+            next_lookup: Instant::now(),
+            lookups_failed: 0,
+        });
+        true
+    }
+
+    /// Remove an added node. Matched first by the operator's string, as
+    /// Core's `RemoveAddedNode` does, then by resolved address (the form
+    /// satd has always accepted). Returns `true` if one was removed.
+    pub fn addnode_remove_target(&self, user_str: &str, addr: Option<&PeerAddr>) -> bool {
+        let mut entries = self.addnode_entries.write();
+        let pos = entries
+            .iter()
+            .position(|e| e.listed && e.target == user_str)
+            .or_else(|| {
+                addr.and_then(|a| {
+                    entries
+                        .iter()
+                        .position(|e| e.listed && e.resolved.as_ref() == Some(a))
+                })
+            });
+        let Some(pos) = pos else {
+            return false;
+        };
+        let removed = entries.remove(pos);
+        if let Some(a) = removed.resolved
+            && !entries.iter().any(|e| e.resolved.as_ref() == Some(&a))
+        {
+            self.remove_peer_addr(&a);
+        }
         true
     }
 
     /// Remove a peer registered via addnode, by resolved address. Returns
     /// `true` if found and removed.
     pub fn addnode_remove(&self, addr: &PeerAddr) -> bool {
-        if !self.remove_peer_addr(addr) {
-            return false;
+        self.addnode_remove_target(&addr.to_string(), Some(addr))
+    }
+
+    /// Whether any named target is due a lookup: a name that has not
+    /// resolved yet, or one whose peer is gone and whose address may have
+    /// moved since it was last looked up.
+    fn manual_targets_due(&self, now: Instant) -> bool {
+        self.addnode_entries
+            .read()
+            .iter()
+            .any(|e| crate::net::dns::is_name_target(&e.target) && now >= e.next_lookup)
+    }
+
+    /// Look up again every named target that is due, and dial what changed.
+    ///
+    /// Core resolves an added node's name on every connection attempt
+    /// (`ThreadOpenAddedConnections` passes the string to
+    /// `OpenNetworkConnection`), and does the same for each `-connect`
+    /// entry, so a name that did not resolve at startup is not lost and a
+    /// peer whose address changed is found again. satd resolved each once,
+    /// at startup, and dropped a name that failed: a node started alongside
+    /// its peers never connected to them. This is that retry:
+    ///
+    /// * a name that has not resolved is looked up on every reconnect tick,
+    ///   and dialled as soon as it resolves;
+    /// * a resolved name whose peer is not connected is looked up again at
+    ///   most every [`MANUAL_TARGET_RELOOKUP`], and if the address moved the
+    ///   old one stops being dialled and the new one is.
+    ///
+    /// Run as its own task: lookups can take seconds and must not hold up
+    /// the manager loop. Refusals (`-dns=0`, `-proxy`) never reach this
+    /// list; they are reported where the target is configured.
+    pub async fn refresh_manual_targets(self: Arc<Self>) {
+        if self.refreshing_manual_targets.swap(true, Ordering::AcqRel) {
+            return;
         }
-        let mut entries = self.addnode_entries.write();
-        if let Some(pos) = entries.iter().position(|(_, a)| a == addr) {
-            entries.remove(pos);
+        let now = Instant::now();
+        let default_port = default_p2p_port(self.chain_state.network);
+        let due: Vec<(String, bool, Option<PeerAddr>)> = self
+            .addnode_entries
+            .read()
+            .iter()
+            .filter(|e| crate::net::dns::is_name_target(&e.target) && now >= e.next_lookup)
+            .map(|e| (e.target.clone(), e.listed, e.resolved.clone()))
+            .collect();
+        for (target, listed, old) in due {
+            // A resolved name whose peer is up needs nothing; look again
+            // once it is not.
+            if let Some(a) = &old
+                && self.is_peer_addr_connected(a)
+            {
+                if let Some(e) = self
+                    .addnode_entries
+                    .write()
+                    .iter_mut()
+                    .find(|e| e.target == target && e.listed == listed)
+                {
+                    e.next_lookup = Instant::now() + MANUAL_TARGET_RELOOKUP;
+                }
+                continue;
+            }
+            let result = self.resolve_target_classified(&target, default_port).await;
+            let mut dial = None;
+            {
+                // Re-find the entry: `addnode remove` may have run while the
+                // lookup was in flight, and a removed target must stay gone.
+                let mut entries = self.addnode_entries.write();
+                let Some(idx) = entries
+                    .iter()
+                    .position(|e| e.target == target && e.listed == listed)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(new) => {
+                        let prev = entries[idx].resolved.clone();
+                        entries[idx].lookups_failed = 0;
+                        entries[idx].next_lookup = Instant::now()
+                            + if prev.is_some() { MANUAL_TARGET_RELOOKUP } else { Duration::ZERO };
+                        if prev.as_ref() != Some(&new) {
+                            if let Some(p) = &prev {
+                                let shared = entries
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, e)| i != idx && e.resolved.as_ref() == Some(p));
+                                if !shared {
+                                    self.remove_peer_addr(p);
+                                }
+                                tracing::info!(target = %target, old = %p, new = %new, "Peer name now resolves to a different address");
+                            } else {
+                                tracing::info!(target = %target, addr = %new, "Peer name resolved; connecting");
+                            }
+                            entries[idx].resolved = Some(new.clone());
+                            self.add_peer_addr(new.clone());
+                            dial = Some(new);
+                        }
+                    }
+                    Err(e) => {
+                        let first = entries[idx].lookups_failed == 0;
+                        entries[idx].lookups_failed += 1;
+                        // Unresolved: try again next tick. Resolved: keep
+                        // the address it had; look again later.
+                        entries[idx].next_lookup = Instant::now()
+                            + if entries[idx].resolved.is_some() { MANUAL_TARGET_RELOOKUP } else { Duration::ZERO };
+                        if first && entries[idx].resolved.is_none() {
+                            tracing::info!(target = %target, "Peer name does not resolve yet; will keep trying: {e}");
+                        } else {
+                            tracing::debug!(target = %target, "Peer name lookup failed: {e}");
+                        }
+                    }
+                }
+            }
+            if let Some(addr) = dial
+                && self.is_network_active()
+            {
+                let pm = Arc::clone(&self);
+                tokio::spawn(async move {
+                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                        tracing::debug!(%addr, "Dial after peer name lookup failed: {e}");
+                    }
+                });
+            }
         }
-        true
+        self.refreshing_manual_targets.store(false, Ordering::Release);
+    }
+
+    /// Whether a connection to `addr` is up or being set up.
+    fn is_peer_addr_connected(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Socket(sa) => self.is_addr_connected(sa),
+            PeerAddr::Onion { host, .. } => self.is_onion_connected(host),
+        }
     }
 
     /// Drop a PeerAddr from the auto-reconnect set (the inverse of
@@ -2850,23 +3104,32 @@ impl PeerManager {
 
         let mut out: Vec<serde_json::Value> = Vec::new();
 
-        for (user_str, addr) in entries.iter() {
-            let connected = match addr {
-                PeerAddr::Socket(sa) => peers.values().any(|h| {
+        for entry in entries.iter().filter(|e| e.listed) {
+            let connected = match &entry.resolved {
+                Some(PeerAddr::Socket(sa)) => peers.values().any(|h| {
                     h.info.addr == *sa && h.info.state == PeerState::Connected
                 }),
-                PeerAddr::Onion { host, .. } => peers.values().any(|h| {
+                Some(PeerAddr::Onion { host, .. }) => peers.values().any(|h| {
                     h.info.onion_host.as_deref() == Some(host.as_str())
                         && h.info.state == PeerState::Connected
                 }),
+                None => false,
+            };
+            // Core (`rpc/net.cpp` getaddednodeinfo) lists an address only
+            // for a connected node, and then the address it connected to,
+            // so a name that has not resolved reads as not connected with
+            // no addresses.
+            let addresses = match (&entry.resolved, connected) {
+                (Some(a), true) => serde_json::json!([{
+                    "address": a.to_string(),
+                    "connected": "outbound",
+                }]),
+                _ => serde_json::json!([]),
             };
             out.push(serde_json::json!({
-                "addednode": user_str,
+                "addednode": entry.target,
                 "connected": connected,
-                "addresses": [{
-                    "address": user_str,
-                    "connected": if connected { "outbound" } else { "false" },
-                }],
+                "addresses": addresses,
             }));
         }
 
@@ -3272,6 +3535,15 @@ impl PeerManager {
             // Skipped entirely while networking is paused (`networkactive=0` /
             // `setnetworkactive false`): otherwise each tick would spawn dials
             // that immediately fail the gate, churning backoff state and logs.
+            // Named peers are looked up again on the same tick, whatever the
+            // outbound count: an added node is a manual connection, which
+            // Core dials outside the outbound target.
+            if ticks.is_multiple_of(20)
+                && self.is_network_active()
+                && self.manual_targets_due(Instant::now())
+            {
+                tokio::spawn(Arc::clone(self).refresh_manual_targets());
+            }
             if ticks.is_multiple_of(20) && self.is_network_active() {
                 let outbound = self.outbound_count();
                 let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
@@ -10330,6 +10602,150 @@ mod tests {
         assert_eq!(info.len(), 1);
         assert_eq!(info[0]["addednode"], "localhost:18444");
         assert_eq!(info[0]["connected"], false);
+    }
+
+    /// Point `pm`'s peer-name lookups at `resolve` instead of the system
+    /// resolver.
+    fn set_test_resolver(
+        pm: &PeerManager,
+        resolve: impl Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError> + Send + Sync + 'static,
+    ) {
+        *pm.test_resolver.write() = Some(Arc::new(resolve));
+    }
+
+    /// Wait up to `within` for one TCP connection on `listener`.
+    async fn accepts_within(listener: &TcpListener, within: Duration) -> bool {
+        tokio::time::timeout(within, listener.accept()).await.is_ok()
+    }
+
+    /// Core's `CConnman::AddNode` stores the string without looking it up,
+    /// so a name that does not resolve is still an added node: listed by
+    /// `getaddednodeinfo` (not connected, no addresses), refused as a
+    /// duplicate, and removable by that same string. satd looked the name up
+    /// first and dropped it on failure, so neither the config entry nor the
+    /// RPC could record it.
+    #[test]
+    fn an_added_node_that_does_not_resolve_is_listed_and_removable() {
+        let pm = empty_peer_manager();
+        assert!(pm.addnode_add_unresolved("tank-0001:18444"));
+        assert!(!pm.addnode_add_unresolved("tank-0001:18444"), "the same string is one entry");
+
+        let info = pm.get_added_node_info();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0]["addednode"], "tank-0001:18444");
+        assert_eq!(info[0]["connected"], false);
+        assert_eq!(info[0]["addresses"], serde_json::json!([]), "Core lists addresses only when connected");
+
+        assert!(pm.addnode_remove_target("tank-0001:18444", None));
+        assert!(pm.get_added_node_info().is_empty());
+        assert!(!pm.addnode_remove_target("tank-0001:18444", None));
+    }
+
+    /// Two spellings of one numeric address are one added node (Core's
+    /// `AddNode` compares `LookupNumeric` results), whereas an address that
+    /// is merely a dial candidate -- gossip, `peers.dat` -- is not an added
+    /// node and must not make `addnode add` report a duplicate.
+    #[test]
+    fn added_node_duplicates_are_decided_by_the_added_node_list() {
+        let pm = empty_peer_manager();
+        let sa: SocketAddr = "10.0.0.9:18444".parse().unwrap();
+        pm.add_peer_addr(PeerAddr::Socket(sa));
+        assert!(pm.addnode_add("10.0.0.9:18444", PeerAddr::Socket(sa)), "a dial candidate is not an added node");
+        assert!(!pm.addnode_add("10.0.0.9", PeerAddr::Socket(sa)), "same numeric address, default port");
+        assert_eq!(pm.get_added_node_info().len(), 1);
+    }
+
+    /// The fix proper: a name that does not resolve when it is configured is
+    /// looked up again, and dialled as soon as it resolves. A node started
+    /// alongside its peers otherwise never connects to them.
+    #[tokio::test]
+    async fn an_added_node_that_resolves_later_is_dialled() {
+        let pm = empty_peer_manager();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let resolvable = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&resolvable);
+        set_test_resolver(&pm, move |s| {
+            assert_eq!(s, "tank-0000");
+            if flag.load(Ordering::SeqCst) {
+                Ok(PeerAddr::Socket(target))
+            } else {
+                Err(crate::net::dns::PeerTargetError::Lookup("no such host yet".into()))
+            }
+        });
+        assert!(pm.addnode_add_unresolved("tank-0000"));
+
+        Arc::clone(&pm).refresh_manual_targets().await;
+        assert!(!accepts_within(&listener, Duration::from_millis(300)).await, "nothing to dial yet");
+        assert!(pm.manual_targets_due(Instant::now()), "an unresolved name stays due");
+
+        resolvable.store(true, Ordering::SeqCst);
+        Arc::clone(&pm).refresh_manual_targets().await;
+        assert!(
+            accepts_within(&listener, Duration::from_secs(5)).await,
+            "the name resolved, so the peer must be dialled"
+        );
+        assert!(pm.manual_addrs.read().contains(&target), "and dialled as a manual peer");
+        // Still the operator's entry, not a second one.
+        assert_eq!(pm.get_added_node_info().len(), 1);
+    }
+
+    /// A `-connect` name gets the same treatment, and stays out of
+    /// `getaddednodeinfo`, which lists added nodes only.
+    #[tokio::test]
+    async fn a_connect_name_that_resolves_later_is_dialled() {
+        let pm = empty_peer_manager();
+        pm.set_automatic_outbound(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        set_test_resolver(&pm, move |_| Ok(PeerAddr::Socket(target)));
+        assert!(pm.connect_name_add("tank-0002", None));
+        assert!(pm.get_added_node_info().is_empty());
+
+        Arc::clone(&pm).refresh_manual_targets().await;
+        assert!(accepts_within(&listener, Duration::from_secs(5)).await);
+        assert!(pm.may_dial(&target), "a -connect peer stays dialable under -connect");
+    }
+
+    /// A resolved name whose peer is gone is looked up again, and when the
+    /// name has moved the old address stops being dialled and the new one
+    /// is -- a restarted peer in a container network comes back on a new
+    /// address under the same name.
+    #[tokio::test]
+    async fn a_name_that_moves_is_dialled_at_its_new_address() {
+        let pm = empty_peer_manager();
+        let old: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new = listener.local_addr().unwrap();
+        set_test_resolver(&pm, move |_| Ok(PeerAddr::Socket(new)));
+        assert!(pm.addnode_add("tank-0003", PeerAddr::Socket(old)));
+
+        Arc::clone(&pm).refresh_manual_targets().await;
+        assert!(accepts_within(&listener, Duration::from_secs(5)).await);
+        assert!(!pm.manual_addrs.read().contains(&old), "the old address is no longer a manual peer");
+        assert!(!pm.connect_addrs.read().contains(&old), "nor a dial candidate");
+        assert!(pm.manual_addrs.read().contains(&new));
+    }
+
+    /// `addnode <name> remove` while that name's lookup is in flight must
+    /// win: the lookup finishing afterwards must not register the peer.
+    #[tokio::test]
+    async fn a_removed_name_is_not_registered_by_a_late_lookup() {
+        let pm = empty_peer_manager();
+        let target: SocketAddr = "127.0.0.1:18460".parse().unwrap();
+        let weak = Arc::downgrade(&pm);
+        set_test_resolver(&pm, move |s| {
+            // The lookup is "in flight": the operator removes the node now.
+            if let Some(pm) = weak.upgrade() {
+                assert!(pm.addnode_remove_target(s, None));
+            }
+            Ok(PeerAddr::Socket(target))
+        });
+        assert!(pm.addnode_add_unresolved("tank-0004"));
+        Arc::clone(&pm).refresh_manual_targets().await;
+        assert!(pm.get_added_node_info().is_empty());
+        assert!(!pm.manual_addrs.read().contains(&target));
+        assert!(!pm.connect_addrs.read().contains(&target));
     }
 
     /// An explicitly configured peer must stay dialable under `-connect`

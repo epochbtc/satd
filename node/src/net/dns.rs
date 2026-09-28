@@ -244,29 +244,69 @@ pub async fn resolve_peer_target(
     proxy: Option<&str>,
     dns: bool,
 ) -> Result<PeerAddr, String> {
+    resolve_peer_target_classified(s, default_port, proxy, dns)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Why an operator-supplied peer target did not become an address.
+///
+/// The two cases call for different handling. A target that is refused can
+/// never resolve under this configuration, so keeping it around to retry
+/// would only repeat the same error. A name whose lookup failed may well
+/// resolve later: a peer brought up alongside this node (as container
+/// orchestrators do) often has no DNS record for the first few seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTargetError {
+    /// Malformed, or a name this node is configured never to look up
+    /// (`-dns=0`, or `-proxy`, under which a local lookup would leak).
+    Refused(String),
+    /// A permitted name lookup failed. Retrying may succeed.
+    Lookup(String),
+}
+
+impl std::fmt::Display for PeerTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerTargetError::Refused(m) | PeerTargetError::Lookup(m) => f.write_str(m),
+        }
+    }
+}
+
+/// [`resolve_peer_target`], keeping apart a refusal from a failed lookup.
+pub async fn resolve_peer_target_classified(
+    s: &str,
+    default_port: u16,
+    proxy: Option<&str>,
+    dns: bool,
+) -> Result<PeerAddr, PeerTargetError> {
     // `.onion` and literal-IP forms: no lookup, no leak, always allowed.
     // (`parse_with_default_port` handles these without touching the
-    // resolver; `looks_like_a_name` decides which forms those are.)
-    if !looks_like_a_name(s) {
-        return PeerAddr::parse_with_default_port(s, default_port);
+    // resolver; `is_name_target` decides which forms those are.)
+    if !is_name_target(s) {
+        return PeerAddr::parse_with_default_port(s, default_port).map_err(PeerTargetError::Refused);
     }
     let (host, port) = split_seed_host_port(s, default_port);
     if !dns {
-        return Err(format!(
-            "cannot resolve '{host}': DNS lookups are disabled (-dns=0);              use a literal IP address or a .onion address"
-        ));
+        return Err(PeerTargetError::Refused(format!(
+            "cannot resolve '{host}': DNS lookups are disabled (-dns=0); \
+             use a literal IP address or a .onion address"
+        )));
     }
     if proxy.is_some() {
-        return Err(format!(
-            "refusing to resolve '{host}' locally under -proxy (it would leak              the lookup to your resolver); use a literal IP address or a              .onion address"
-        ));
+        return Err(PeerTargetError::Refused(format!(
+            "refusing to resolve '{host}' locally under -proxy (it would leak \
+             the lookup to your resolver); use a literal IP address or a \
+             .onion address"
+        )));
     }
     match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(mut it) => it
-            .next()
-            .map(PeerAddr::Socket)
-            .ok_or_else(|| format!("invalid address '{s}': could not resolve")),
-        Err(e) => Err(format!("invalid address '{s}': could not resolve: {e}")),
+        Ok(mut it) => it.next().map(PeerAddr::Socket).ok_or_else(|| {
+            PeerTargetError::Lookup(format!("invalid address '{s}': could not resolve"))
+        }),
+        Err(e) => Err(PeerTargetError::Lookup(format!(
+            "invalid address '{s}': could not resolve: {e}"
+        ))),
     }
 }
 
@@ -283,7 +323,7 @@ pub fn is_onion_target(s: &str) -> bool {
 
 /// Whether `s` needs a name lookup to become a socket address — i.e. it is
 /// neither a `.onion` target nor an IP literal (with or without a port).
-fn looks_like_a_name(s: &str) -> bool {
+pub fn is_name_target(s: &str) -> bool {
     if is_onion_target(s) {
         return false;
     }
@@ -417,6 +457,20 @@ pub async fn resolve_dns_seeds(network: Network) -> Vec<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A refusal can never succeed under this configuration and is not
+    /// retried; a failed lookup can, and is. Callers keep the two apart.
+    #[tokio::test]
+    async fn refusals_and_failed_lookups_are_told_apart() {
+        use super::PeerTargetError::{Lookup, Refused};
+        let dns_off = resolve_peer_target_classified("tank-0000:18444", 18444, None, false).await;
+        assert!(matches!(dns_off, Err(Refused(_))), "{dns_off:?}");
+        let proxied = resolve_peer_target_classified("tank-0000", 18444, Some("127.0.0.1:9050"), true).await;
+        assert!(matches!(proxied, Err(Refused(_))), "{proxied:?}");
+        let missing = resolve_peer_target_classified("tank-0000.invalid", 18444, None, true).await;
+        assert!(matches!(missing, Err(Lookup(_))), "{missing:?}");
+    }
+
     use super::*;
 
     #[test]
@@ -789,10 +843,10 @@ mod tests {
             "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion",
             "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion:8333",
         ] {
-            assert!(!looks_like_a_name(literal), "{literal} is a literal");
+            assert!(!is_name_target(literal), "{literal} is a literal");
         }
         for name in ["example.com", "example.com:8333", "localhost", "127.1:8333"] {
-            assert!(looks_like_a_name(name), "{name} needs a lookup");
+            assert!(is_name_target(name), "{name} needs a lookup");
         }
     }
 }
