@@ -6358,6 +6358,48 @@ fn test_clean_shutdown_marker_graceful_stop() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// #868: a SIGTERM stop joins the block connector before the flush, closes
+/// the chainstate database, and exits 0 rather than by a signal. The node
+/// used to return into libc's `exit()` with its threads still running, and
+/// one of them inside RocksDB died of SIGSEGV after `satd stopped`.
+#[test]
+fn test_sigterm_stop_joins_the_connector_and_closes_the_database() {
+    // The harness runs nodes at error level unless the test sets one; the
+    // lines asserted below are info.
+    let mut node = TestNode::start(&["--loglevel=info"]);
+    let pid = node.process.id().to_string();
+    let sent = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -TERM {pid} failed");
+
+    let deadline = Instant::now() + test_timeout(60);
+    let status = loop {
+        if let Some(status) = node.process.try_wait().expect("wait for satd") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "satd did not exit within 60s of SIGTERM");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    assert_eq!(status.code(), Some(0), "satd must exit 0 after SIGTERM ({status}); log:\n{log}");
+
+    let at = |line: &str| {
+        log.find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in the log:\n{log}"))
+    };
+    let connector = at("Block connector stopped");
+    let marker = at("Wrote clean-shutdown marker");
+    let stopped = at("satd stopped");
+    let closed = at("Chainstate database closed");
+    assert!(
+        connector < marker && marker < stopped && stopped < closed,
+        "shutdown must stop the connector, flush and write the marker, then close \
+         the database, in that order; log:\n{log}"
+    );
+}
+
 #[test]
 fn test_clean_shutdown_marker_after_kill() {
     // SIGKILL bypasses the graceful shutdown path — no marker should be written.

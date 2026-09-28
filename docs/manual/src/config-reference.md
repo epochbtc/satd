@@ -122,7 +122,7 @@ startup error.
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
 | `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
-| `maxshutdownsecs` | 30 | hot | satd | Max graceful-shutdown flush duration (seconds) before force exit. |
+| `maxshutdownsecs` | 30 | hot | satd | Graceful-shutdown budget (seconds), shared by the `shutdownnotify` hook (at most half of it), stopping the block connector and the final flush. If the connector or the flush overruns it, satd exits without the clean-shutdown marker. |
 
 ## RPC server
 
