@@ -20,12 +20,16 @@ contain commas.
 import time
 
 from commander import Commander
+from test_framework.descriptors import descsum_create
 from test_framework.script import OP_TRUE, CScript
 from test_framework.wallet import MiniWallet
 
 # Blocks to mine, one at a time, for compact block relay to show up on every
 # tank before step 4 gives up.
 COMPACT_BLOCK_TRIES = 5
+
+# A bare OP_TRUE coinbase output, which no MiniWallet block pays to.
+BARE_OP_TRUE = descsum_create("raw(51)")
 
 
 class ConsensusDiff(Commander):
@@ -137,7 +141,13 @@ class ConsensusDiff(Commander):
             height = self.miner.getblockcount()
             dropped = self.miner.getblockhash(height - 1)
             self.miner.invalidateblock(dropped)
-            self.generate(w, 3, sync_fun=self.no_op)
+            # The first block of the new chain sits where the dropped block
+            # did. A burst of blocks runs block times ahead of the clock, so
+            # its time is the parent's median time past plus one, and mined to
+            # the same output with the same transactions it would be the
+            # dropped block again, which the miner refuses as known invalid.
+            self.generatetodescriptor(self.miner, 1, BARE_OP_TRUE, sync_fun=self.no_op)
+            self.generate(w, 2, sync_fun=self.no_op)
             assert self.miner.getblockcount() == height + 1
             self.wait_same_tip(f"reorg {i} onto a longer chain")
             self.miner.reconsiderblock(dropped)
