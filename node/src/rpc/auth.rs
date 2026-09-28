@@ -20,6 +20,8 @@ pub use satd_auth::{
     CookieCredential, OperatorCreds as Credentials, RpcAuthCredential, UserPassCredential,
 };
 
+use crate::rpc::whitelist::{MethodScope, RpcWhitelist};
+
 /// RPC authentication policy attached to a listener surface.
 ///
 /// `Disabled` is reserved for the mTLS escape hatch on the TLS surface
@@ -35,17 +37,27 @@ pub use satd_auth::{
 /// ([`reload_credentials`](Self::reload_credentials)) without dropping the
 /// shared `Arc<RpcAuth>` the listener surfaces hold. The auto-generated cookie
 /// credential is preserved across reloads.
+///
+/// `Verify` also carries the `-rpcwhitelist` / `-rpcwhitelistdefault`
+/// configuration. It rides here, rather than as a parameter of each listener,
+/// because every JSON-RPC listener — plain, TLS, read-only and the startup
+/// listener — already holds this handle, so no listener can be built without
+/// it. It is fixed for the process: the credentials rotate on SIGHUP, the
+/// allowlists need a restart.
 #[derive(Debug)]
 pub enum RpcAuth {
     Disabled,
-    Verify(RwLock<Credentials>),
+    Verify(RwLock<Credentials>, RpcWhitelist),
 }
 
 impl RpcAuth {
     /// Build the legacy single-userpass form. Retained for call sites (and
     /// tests) that don't yet need multi-credential support.
     pub fn from_user_pass(username: String, password: String) -> Self {
-        RpcAuth::Verify(RwLock::new(Credentials::from_user_pass(username, password)))
+        RpcAuth::Verify(
+            RwLock::new(Credentials::from_user_pass(username, password)),
+            RpcWhitelist::default(),
+        )
     }
 
     /// Generate the cookie file at the given path with `perms` (octal), and
@@ -121,10 +133,13 @@ impl RpcAuth {
             perms = format!("0{:o}", perms),
             "Cookie file written"
         );
-        Ok(RpcAuth::Verify(RwLock::new(Credentials {
-            cookie: Some(CookieCredential { path, token }),
-            ..Default::default()
-        })))
+        Ok(RpcAuth::Verify(
+            RwLock::new(Credentials {
+                cookie: Some(CookieCredential { path, token }),
+                ..Default::default()
+            }),
+            RpcWhitelist::default(),
+        ))
     }
 
     /// Convenience for the legacy default path (`$DATADIR/.cookie`, 0600).
@@ -137,28 +152,33 @@ impl RpcAuth {
     /// matching — including the constant-time secret comparisons — is delegated
     /// to [`satd_auth::OperatorCreds::matches`].
     pub fn validate(&self, auth_header: &str) -> bool {
-        let guard = match self {
-            RpcAuth::Disabled => return true,
-            RpcAuth::Verify(c) => c.read(),
+        match self {
+            RpcAuth::Disabled => true,
+            RpcAuth::Verify(..) => self.validate_user(auth_header).is_some(),
+        }
+    }
+
+    /// [`validate`](Self::validate), returning the user the header
+    /// authenticated as (`__cookie__` for the cookie). `None` when nothing
+    /// matches, and always `None` on `Disabled`, where no user is named.
+    pub fn validate_user(&self, auth_header: &str) -> Option<String> {
+        let RpcAuth::Verify(lock, _) = self else {
+            return None;
         };
-        let creds = &*guard;
-        let encoded = match auth_header.strip_prefix("Basic ") {
-            Some(e) => e,
-            None => return false,
-        };
-        let decoded = match BASE64.decode(encoded) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let decoded_str = match std::str::from_utf8(&decoded) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let (user, pass) = match decoded_str.split_once(':') {
-            Some(parts) => parts,
-            None => return false,
-        };
-        creds.matches(user, pass)
+        let encoded = auth_header.strip_prefix("Basic ")?;
+        let decoded = BASE64.decode(encoded).ok()?;
+        let decoded_str = std::str::from_utf8(&decoded).ok()?;
+        let (user, pass) = decoded_str.split_once(':')?;
+        lock.read().matching_user(user, pass).map(str::to_owned)
+    }
+
+    /// The method scope `-rpcwhitelist` gives `user`, or `None` when the user
+    /// may call anything.
+    pub fn method_scope(&self, user: &str) -> Option<MethodScope> {
+        match self {
+            RpcAuth::Verify(_, whitelist) => whitelist.scope_for(user),
+            RpcAuth::Disabled => None,
+        }
     }
 
     /// Is auth disabled? Used by call sites that want a header-free fast path.
@@ -168,7 +188,7 @@ impl RpcAuth {
 
     /// Delete the cookie file on shutdown.
     pub fn cleanup(&self) {
-        if let RpcAuth::Verify(lock) = self
+        if let RpcAuth::Verify(lock, _) = self
             && let Some(c) = &lock.read().cookie
             && c.path.exists()
         {
@@ -189,7 +209,7 @@ impl RpcAuth {
         userpass: Vec<UserPassCredential>,
         rpcauth: Vec<RpcAuthCredential>,
     ) {
-        if let RpcAuth::Verify(lock) = self {
+        if let RpcAuth::Verify(lock, _) = self {
             let mut creds = lock.write();
             creds.userpass = userpass;
             creds.rpcauth = rpcauth;
@@ -235,6 +255,12 @@ fn now_unix() -> i64 {
 /// under-charges.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpCharged;
+
+/// The RPC user a request authenticated as with a Basic credential:
+/// `__cookie__`, an `-rpcuser`, or an `-rpcauth` name. Absent on the
+/// auth-disabled mTLS surface and for bearer-token principals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcUser(pub Arc<str>);
 
 /// Tower middleware layer for HTTP auth. Authenticates a request and stashes the
 /// resolved [`satd_auth::Principal`] in the request extensions (for the RPC-layer
@@ -325,8 +351,13 @@ where
             // (cookie / userpass / rpcauth, always tried first so legacy clients
             // are unaffected), else — on a bearer-enabled surface — an opaque
             // bearer token resolving to a scoped token principal.
+            //
+            // A Basic credential also names the RPC user, which is what
+            // `-rpcwhitelist` restricts; a bearer token names no such user and
+            // is scoped by its own capabilities instead.
+            let rpc_user: Option<String> = header.as_deref().and_then(|h| auth.validate_user(h));
             let principal: Option<satd_auth::Principal> = match &header {
-                Some(h) if auth.validate(h) => Some(satd_auth::Principal::operator()),
+                Some(_) if rpc_user.is_some() => Some(satd_auth::Principal::operator()),
                 Some(h) => bearer.as_ref().and_then(|store| {
                     let mut scratch = String::new();
                     match satd_auth::Credential::from_authorization(h, &mut scratch) {
@@ -352,6 +383,14 @@ where
                         return Ok(response);
                     }
                     req.extensions_mut().insert(p);
+                    if let Some(user) = rpc_user {
+                        // The body layer enforces the scope: only it reads the
+                        // methods a request names.
+                        if let Some(scope) = auth.method_scope(&user) {
+                            req.extensions_mut().insert(scope);
+                        }
+                        req.extensions_mut().insert(RpcUser(Arc::from(user)));
+                    }
                     if !jsonrpsee::server::ws::is_upgrade_request(&req) {
                         req.extensions_mut().insert(HttpCharged);
                     }
@@ -375,13 +414,16 @@ mod tests {
     use super::*;
 
     fn cookie_auth(token: &str) -> RpcAuth {
-        RpcAuth::Verify(RwLock::new(Credentials {
-            cookie: Some(CookieCredential {
-                path: PathBuf::from("/tmp/test.cookie"),
-                token: token.to_string(),
+        RpcAuth::Verify(
+            RwLock::new(Credentials {
+                cookie: Some(CookieCredential {
+                    path: PathBuf::from("/tmp/test.cookie"),
+                    token: token.to_string(),
+                }),
+                ..Default::default()
             }),
-            ..Default::default()
-        }))
+            RpcWhitelist::default(),
+        )
     }
 
     #[test]
@@ -412,17 +454,20 @@ mod tests {
 
     #[test]
     fn test_reload_credentials_rotates_userpass_keeps_cookie() {
-        let auth = RpcAuth::Verify(RwLock::new(Credentials {
-            cookie: Some(CookieCredential {
-                path: PathBuf::from("/tmp/reload.cookie"),
-                token: "tok".into(),
+        let auth = RpcAuth::Verify(
+            RwLock::new(Credentials {
+                cookie: Some(CookieCredential {
+                    path: PathBuf::from("/tmp/reload.cookie"),
+                    token: "tok".into(),
+                }),
+                userpass: vec![UserPassCredential {
+                    username: "alice".into(),
+                    password: "secret".into(),
+                }],
+                ..Default::default()
             }),
-            userpass: vec![UserPassCredential {
-                username: "alice".into(),
-                password: "secret".into(),
-            }],
-            ..Default::default()
-        }));
+            RpcWhitelist::default(),
+        );
         let alice = BASE64.encode("alice:secret");
         let cookie = BASE64.encode("__cookie__:tok");
         assert!(auth.validate(&format!("Basic {}", alice)));

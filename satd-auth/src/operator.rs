@@ -84,17 +84,26 @@ impl OperatorCreds {
     /// selects which credential to check (it is not the secret). This is the one
     /// operator matcher every surface routes through.
     pub fn matches(&self, user: &str, pass: &str) -> bool {
+        self.matching_user(user, pass).is_some()
+    }
+
+    /// [`matches`](Self::matches), returning the name the caller authenticated
+    /// as: `__cookie__` for the cookie, the configured username for a
+    /// `-rpcuser` pair or an `-rpcauth` entry. That is the name Bitcoin Core
+    /// keys `-rpcwhitelist` on (`RPCAuthorized` hands back the header's user
+    /// part once a credential matches).
+    pub fn matching_user(&self, user: &str, pass: &str) -> Option<&str> {
         // Cookie — only the `__cookie__` username is valid.
         if let Some(c) = &self.cookie
             && user == "__cookie__"
             && ct_eq(pass.as_bytes(), c.token.as_bytes())
         {
-            return true;
+            return Some("__cookie__");
         }
         // Plain user/password.
         for up in &self.userpass {
             if user == up.username && ct_eq(pass.as_bytes(), up.password.as_bytes()) {
-                return true;
+                return Some(&up.username);
             }
         }
         // rpcauth (HMAC-SHA256), constant-time tag compare.
@@ -107,10 +116,10 @@ impl OperatorCreds {
             };
             mac.update(pass.as_bytes());
             if mac.verify_slice(&ra.hash).is_ok() {
-                return true;
+                return Some(&ra.username);
             }
         }
-        false
+        None
     }
 
     /// True if no credential of any kind is configured — the operator surface is
@@ -198,8 +207,22 @@ mod tests {
         assert!(c.matches("__cookie__", "tok"));
         assert!(c.matches("alice", "secret"));
         assert!(c.matches("bob", "p4ss"));
+        assert_eq!(c.matching_user("bob", "p4ss"), Some("bob"));
         assert!(!c.matches("eve", "noway"));
         assert!(!c.is_empty());
         assert!(OperatorCreds::default().is_empty());
+    }
+
+    #[test]
+    fn matching_user_names_the_credential_that_matched() {
+        let mut c = cookie("tok");
+        c.userpass.push(UserPassCredential {
+            username: "alice".into(),
+            password: "secret".into(),
+        });
+        assert_eq!(c.matching_user("__cookie__", "tok"), Some("__cookie__"));
+        assert_eq!(c.matching_user("alice", "secret"), Some("alice"));
+        assert_eq!(c.matching_user("alice", "tok"), None);
+        assert_eq!(c.matching_user("bob", "secret"), None);
     }
 }

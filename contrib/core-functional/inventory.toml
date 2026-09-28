@@ -1026,9 +1026,7 @@ status = "run"
 
 [[test]]
 file = "rpc_whitelist.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L74 satd refuses the rpcwhitelistdefault config key; by design satd uses bearer-token auth instead of Core's RPC whitelists. Follow-up: none planned"
+status = "run"
 
 [[test]]
 file = "tool_bench_sanity_check.py"

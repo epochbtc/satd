@@ -9,8 +9,9 @@ There are two layers:
 
 1. **Core-compatible operator auth**: the cookie file,
    `-rpcuser`/`-rpcpassword`, and `-rpcauth`. This is the default and behaves
-   exactly like Bitcoin Core. It is all-or-nothing: a valid operator
-   credential has full access to everything.
+   exactly like Bitcoin Core. A valid operator credential has full access to
+   everything, unless Core's `-rpcwhitelist` limits that user to a list of
+   JSON-RPC methods (see [Per-user method allowlists](#per-user-method-allowlists-rpcwhitelist)).
 2. **The unified bearer-token layer** (`satd-auth`): opt-in,
    capability-scoped bearer tokens loaded from an `-authfile`, each
    rate-limited and quota-bounded. Scoped tokens let you expose the node to
@@ -28,7 +29,7 @@ There are two layers:
 | | Core-style operator auth | Unified bearer tokens |
 |---|---|---|
 | **Credentials** | `.cookie` file, `-rpcuser`/`-rpcpassword`, `-rpcauth` (HMAC) | Opaque high-entropy tokens, sent as `Authorization: Bearer <token>` |
-| **Granularity** | All-or-nothing: full operator access | Per-token capabilities (for example read-only, Esplora-only, stream-only) |
+| **Granularity** | Full operator access, or a per-user list of JSON-RPC methods with `-rpcwhitelist` | Per-token capabilities (for example read-only, Esplora-only, stream-only) |
 | **Multi-tenant** | No; one shared identity | Yes; each token has its own id, scope, quota, rate limit, and expiry |
 | **Rate / quota limits** | None; the operator is unlimited | Per-token request rate (`429`/`RESOURCE_EXHAUSTED`) and watch-set quota |
 | **Where defined** | Flags, `bitcoin.conf`, or the generated cookie | A TOML `-authfile`, reloadable on `SIGHUP` |
@@ -40,6 +41,59 @@ credential is tried first, so existing Core tooling is not affected. A
 `Bearer` token is consulted only when the request does not carry a valid
 operator Basic credential. A matching cookie, userpass, or `rpcauth`
 credential always resolves to the full-capability operator.
+
+## Per-user method allowlists (`rpcwhitelist`)
+
+satd implements Bitcoin Core's `-rpcwhitelist` and `-rpcwhitelistdefault`
+with Core's semantics, so a `bitcoin.conf` that restricts RPC users works
+unchanged.
+
+```ini
+rpcauth=monitor:<salt>$<hash>
+rpcwhitelist=monitor:getblockcount,getbestblockhash,getblockchaininfo
+```
+
+- `rpcwhitelist=<user>:<method>,<method>,...` limits `<user>` to the listed
+  JSON-RPC methods. Methods are separated by commas or spaces, and names are
+  case-sensitive. The option is repeatable. A user listed more than once
+  keeps only the methods common to every list, and that includes a user
+  listed on both the command line and in `bitcoin.conf`.
+- `rpcwhitelist=<user>` or `rpcwhitelist=<user>:` gives that user an empty
+  list: every call is refused.
+- `rpcwhitelistdefault` decides what users with no list may call. It
+  defaults to **1 as soon as any `rpcwhitelist` is set**, which means an
+  unlisted user may call nothing. Set `rpcwhitelistdefault=0` to leave
+  unlisted users unrestricted. `rpcwhitelistdefault=1` with no list at all
+  refuses every user.
+- The user is the name the request authenticated as. That is `__cookie__`
+  for the cookie file, the `-rpcuser` name, or an `-rpcauth` name. Under a
+  deny default, list `__cookie__` if `sat-cli` or `bitcoin-cli` should keep
+  working with the cookie.
+
+A refused request gets **HTTP 403 with an empty body**, as in Core, and the
+method does not run. A batch is refused whole if any call in it is not
+allowed. A body that is not JSON still gets the `-32700` parse error first.
+The refusal is logged as `RPC User <name> not allowed to call method <m>`.
+
+The allowlists apply to every JSON-RPC listener, including the read-only
+listener, where both filters must allow a call. Four details go beyond
+Core:
+
+- **WebSocket.** satd's JSON-RPC listeners also accept WebSocket upgrades.
+  A user with a list, or any user under a deny default, is refused the
+  upgrade with 403, because calls made over an open WebSocket are not
+  checked against the list.
+- **Bearer tokens** are not RPC users. A token is scoped by the
+  capabilities in its `-authfile` entry, and `-rpcwhitelist` does not apply
+  to it, even under a deny default.
+- **`-rpcdisableauth`** is refused together with any `rpcwhitelist` or
+  with `rpcwhitelistdefault=1`. The auth-disabled mTLS surface authenticates
+  no user, so it has no name to restrict.
+- **Reload.** The lists are fixed at startup. A `SIGHUP` reports a changed
+  `rpcwhitelist` as needing a restart, while credentials still rotate live.
+
+For scoping that covers Esplora, the streaming APIs and MCP, and that
+carries rate limits and expiry, use bearer tokens instead.
 
 ## Capabilities
 
