@@ -164,11 +164,23 @@ run_scenario() {
     helm uninstall "${pod#pod/}" > /dev/null 2>&1 || true
 }
 
-# deploy_and_wait_peers <network dir>: deploy, then wait until every tank has
-# at least one peer. For networks with a tank whose addnode peers are not
-# reported as `manual`, where Warnet's own "Network connected" never prints.
+# manual_peers <tank>: how many of its peers are `manual` (its addnode dials).
+manual_peers() {
+    tank_rpc "$1" getpeerinfo | python3 -c '
+import json, sys
+print(sum(p.get("connection_type") == "manual" for p in json.load(sys.stdin)))'
+}
+
+# deploy_and_wait_peers <network dir> [<tank>=<n>...]: deploy, then wait until
+# every tank has at least one peer and each named tank at least <n> manual
+# peers. For networks with a tank whose addnode peers are not reported as
+# `manual`, where Warnet's own "Network connected" never prints. A peer count
+# alone can end the wait on another tank's inbound dial while this tank's own
+# addnode dial is still in flight, so name the tanks whose dials the caller
+# goes on to assert.
 deploy_and_wait_peers() {
-    local net="$1" deadline t n ok
+    local net="$1"; shift
+    local deadline t n ok want
     log "deploying $net"
     warnet deploy "$net" > "$ARTIFACT_DIR/deploy.log" 2>&1 || { cat "$ARTIFACT_DIR/deploy.log"; die "warnet deploy failed"; }
     deadline=$((SECONDS + WAIT_DEPLOY))
@@ -178,8 +190,12 @@ deploy_and_wait_peers() {
             n="$(tank_rpc "$t" getconnectioncount 2>/dev/null || echo 0)"
             [ "${n:-0}" -ge 1 ] 2>/dev/null || ok=0
         done
+        for want in "$@"; do
+            n="$(manual_peers "${want%%=*}" 2>/dev/null || echo 0)"
+            [ "${n:-0}" -ge "${want#*=}" ] 2>/dev/null || ok=0
+        done
         if [ "$ok" = 1 ] && [ -n "$(tanks)" ]; then
-            log "every tank has a peer: $(tanks | tr '\n' ' ')"
+            log "every tank has a peer${1:+, and $*}: $(tanks | tr '\n' ' ')"
             return 0
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then

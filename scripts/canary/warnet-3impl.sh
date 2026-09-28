@@ -46,9 +46,9 @@ scen="$(scenarios_dir)"
 
 # rbitcoin reports the peer it dials for `addnode` as outbound-full-relay, not
 # manual, so Warnet's "Network connected" (which counts manual peers) never
-# prints for its tank. Wait for every tank to have a peer instead, then check
-# the tanks whose addnode peers are manual.
-deploy_and_wait_peers "$net"
+# prints for its tank. Wait for every tank to have a peer, and for the manual
+# peers of the tanks whose addnode peers are manual, then check them.
+deploy_and_wait_peers "$net" tank-0000=1 tank-0001=1
 assert_peers tank-0000 1
 assert_peers tank-0001 1
 assert_v2_only tank-0002
