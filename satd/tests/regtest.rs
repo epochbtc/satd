@@ -23639,6 +23639,11 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
         err("getnodeaddresses", vec![json!(1), json!("Foo")]),
         (-8, "Network not recognized: Foo".into())
     );
+    // Core 31.0 dropped the deprecated `tor` alias for `onion`.
+    assert_eq!(
+        err("getnodeaddresses", vec![json!(1), json!("tor")]),
+        (-8, "Network not recognized: tor".into())
+    );
     for bad in ["", "not_an_ip"] {
         assert_eq!(
             err("addpeeraddress", vec![json!(bad), json!(8333)]),

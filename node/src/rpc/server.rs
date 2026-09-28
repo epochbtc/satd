@@ -193,6 +193,8 @@ const CORE_NETWORK_NAMES: [&str; 5] = ["ipv4", "ipv6", "onion", "i2p", "cjdns"];
 
 /// Core's `ParseNetwork` (`src/netbase.cpp`), case-insensitive. `None` is
 /// Core's `NET_UNROUTABLE`, which the RPCs report as "not recognized".
+/// Core 31.0 removed the deprecated `tor` alias for `onion`; earlier
+/// releases accept it with a warning.
 fn parse_network_name(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     CORE_NETWORK_NAMES.into_iter().find(|n| *n == lower)

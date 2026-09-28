@@ -51,6 +51,12 @@ const BUCKET_SIZE: u64 = 64;
 const TRIED_BUCKETS_PER_GROUP: u64 = 8;
 const NEW_BUCKETS_PER_SOURCE_GROUP: u64 = 64;
 
+// `positions` places every entry in a table of its own. The tried table
+// holds exactly `MAX_ENTRIES` slots, so every entry can be tried and still
+// find one; a larger cap would leave `FreeSlots::take` nowhere to stop.
+const _: () = assert!(MAX_ENTRIES as u64 <= TRIED_BUCKET_COUNT * BUCKET_SIZE);
+const _: () = assert!(MAX_ENTRIES as u64 <= NEW_BUCKET_COUNT * BUCKET_SIZE);
+
 #[derive(Clone, Debug)]
 pub struct AddrEntry {
     pub addr: SocketAddr,
@@ -385,18 +391,13 @@ impl AddrMan {
     pub fn positions(&self) -> Vec<(AddrSlot, &AddrEntry)> {
         let mut entries: Vec<&AddrEntry> = self.entries.values().collect();
         entries.sort_by_key(|e| e.addr);
-        let mut taken: std::collections::HashSet<(bool, u64)> = Default::default();
+        let mut new = FreeSlots::new(NEW_BUCKET_COUNT * BUCKET_SIZE);
+        let mut tried = FreeSlots::new(TRIED_BUCKET_COUNT * BUCKET_SIZE);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let mut slot = self.derived_slot(e);
-            let buckets = if e.tried { TRIED_BUCKET_COUNT } else { NEW_BUCKET_COUNT };
-            let capacity = buckets * BUCKET_SIZE;
-            let mut index = slot.bucket * BUCKET_SIZE + slot.position;
-            // MAX_ENTRIES is well below either table's capacity, so a free
-            // slot always exists.
-            while !taken.insert((e.tried, index)) {
-                index = (index + 1) % capacity;
-            }
+            let table = if e.tried { &mut tried } else { &mut new };
+            let index = table.take(slot.bucket * BUCKET_SIZE + slot.position);
             slot.bucket = index / BUCKET_SIZE;
             slot.position = index % BUCKET_SIZE;
             out.push((slot, e));
@@ -461,6 +462,39 @@ impl AddrMan {
         std::fs::rename(&tmp, path)
             .map_err(|e| format!("renaming {} -> {}: {e}", tmp.display(), path.display()))?;
         Ok(())
+    }
+}
+
+/// The slots of one table for [`AddrMan::positions`]: `take(i)` claims the
+/// first free slot at or after `i`, wrapping, which is where a linear probe
+/// would land. `next[i] == i` marks a free slot; a taken one points further
+/// on, and every slot in `[i, next[i])` is taken. Each `take` points the
+/// slots it walked at the one it claimed, so later claims skip a run they
+/// have already crossed instead of stepping through it slot by slot, which
+/// goes quadratic once many entries share a group's few buckets.
+struct FreeSlots {
+    next: Vec<u32>,
+}
+
+impl FreeSlots {
+    fn new(capacity: u64) -> Self {
+        FreeSlots { next: (0..capacity as u32).collect() }
+    }
+
+    /// Only called while a slot is free (see the `MAX_ENTRIES` assertions).
+    fn take(&mut self, start: u64) -> u64 {
+        let mut free = start as u32;
+        while self.next[free as usize] != free {
+            free = self.next[free as usize];
+        }
+        let mut i = start as u32;
+        while i != free {
+            let after = self.next[i as usize];
+            self.next[i as usize] = free;
+            i = after;
+        }
+        self.next[free as usize] = (free + 1) % self.next.len() as u32;
+        u64::from(free)
     }
 }
 
@@ -826,6 +860,73 @@ mod tests {
         let unique: std::collections::HashSet<(u64, u64)> =
             slots.iter().map(|(s, _)| (s.bucket, s.position)).collect();
         assert_eq!(unique.len(), 300);
+    }
+
+    /// The placement `positions` replaced: probe one slot at a time from
+    /// the derived slot. It must land every entry where this does.
+    fn probed_positions(a: &AddrMan) -> Vec<(AddrSlot, SocketAddr)> {
+        let mut entries: Vec<&AddrEntry> = a.entries.values().collect();
+        entries.sort_by_key(|e| e.addr);
+        let mut taken = std::collections::HashSet::new();
+        entries
+            .into_iter()
+            .map(|e| {
+                let mut slot = a.derived_slot(e);
+                let buckets = if e.tried { TRIED_BUCKET_COUNT } else { NEW_BUCKET_COUNT };
+                let mut index = slot.bucket * BUCKET_SIZE + slot.position;
+                while !taken.insert((e.tried, index)) {
+                    index = (index + 1) % (buckets * BUCKET_SIZE);
+                }
+                slot.bucket = index / BUCKET_SIZE;
+                slot.position = index % BUCKET_SIZE;
+                (slot, e.addr)
+            })
+            .collect()
+    }
+
+    /// Tried entries in one /16 share its eight buckets (512 slots), so most
+    /// of 3000 overflow into long runs of taken slots; new entries from one
+    /// source group share its 64 buckets. Placement matches a linear probe.
+    #[test]
+    fn positions_match_a_linear_probe_under_heavy_collision() {
+        let mut a = AddrMan::new();
+        for i in 0..3000u32 {
+            a.mark_good(sa(&format!("10.244.{}.{}:18444", i / 256, i % 256)), 1);
+        }
+        let src: IpAddr = "100.1.0.1".parse().unwrap();
+        for i in 0..500u32 {
+            a.add_from(sa(&format!("{}.{}.7.1:8333", 20 + i % 50, i / 50)), 1, DEFAULT_SERVICES, src);
+        }
+        let placed: Vec<(AddrSlot, SocketAddr)> =
+            a.positions().into_iter().map(|(s, e)| (s, e.addr)).collect();
+        assert_eq!(placed.len(), a.len());
+        assert_eq!(placed, probed_positions(&a));
+    }
+
+    /// Claims go to the first free slot at or after the start, wrapping, and
+    /// the table fills completely.
+    #[test]
+    fn free_slots_claim_the_next_free_slot_and_wrap() {
+        let mut f = FreeSlots::new(8);
+        let claims: Vec<u64> = [6, 6, 6, 7, 3, 2, 1, 0].into_iter().map(|s| f.take(s)).collect();
+        assert_eq!(claims, [6, 7, 0, 1, 3, 2, 4, 5]);
+    }
+
+    /// The worst case: every entry tried and in one /16. The tried table has
+    /// exactly `MAX_ENTRIES` slots, so every slot ends up used once. A
+    /// slot-by-slot probe steps over some 50 million taken slots here.
+    #[test]
+    fn positions_fill_a_full_tried_table_from_one_group() {
+        let mut a = AddrMan::new();
+        for i in 0..MAX_ENTRIES {
+            a.mark_good(sa(&format!("10.244.{}.{}:18444", i / 256, i % 256)), 1);
+        }
+        assert_eq!(a.len(), MAX_ENTRIES);
+        let slots = a.positions();
+        assert!(slots.iter().all(|(s, _)| s.tried));
+        let used: std::collections::HashSet<(u64, u64)> =
+            slots.iter().map(|(s, _)| (s.bucket, s.position)).collect();
+        assert_eq!(used.len() as u64, TRIED_BUCKET_COUNT * BUCKET_SIZE);
     }
 
     #[test]
