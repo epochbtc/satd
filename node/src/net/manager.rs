@@ -126,6 +126,12 @@ const MAX_LOCATOR_SZ: usize = 101;
 /// round trip, short enough that the map self-drains.
 const BLOCK_REFETCH_TTL: Duration = Duration::from_secs(600);
 
+/// How long the connector waits on one re-fetch of a stored block whose
+/// record it cannot read before asking another peer. A single-block round
+/// trip is well under this; the IBD connector retries once a second, so
+/// without a floor it would ask a peer on every retry.
+const UNREADABLE_REFETCH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long a tip-following block request counts as in flight. A request is
 /// re-sent every few seconds while the block is still missing, which
 /// refreshes the stamp; an entry this old belongs to a request nobody is
@@ -522,20 +528,28 @@ pub struct PeerManager {
     /// no such guard: its header is accepted before reconstruction starts,
     /// and `handle_inv` only fetches blocks it has no index entry for.)
     compact_in_progress: RwLock<HashMap<bitcoin::BlockHash, Instant>>,
-    /// Blocks explicitly requested by `getblockfrompeer`: hash → (the peer we
-    /// asked, when we asked). A block arriving from *that* peer is routed to
-    /// `ChainState::repair_block_data` instead of the normal accept path —
-    /// the normal path rejects it as a duplicate, which is precisely the case
-    /// a repair needs to handle.
+    /// Blocks explicitly requested for repair (`getblockfrompeer`, and the
+    /// connector's re-fetch of an unreadable stored block): (hash, a peer we
+    /// asked) → when we asked. A block arriving from a peer we asked for it is
+    /// routed to `ChainState::repair_block_data` instead of the normal accept
+    /// path — the normal path rejects it as a duplicate, which is precisely
+    /// the case a repair needs to handle.
     ///
     /// The peer is part of the key on purpose. Matching on hash alone would
     /// let any connected peer consume the operator's registration, so a
     /// hostile peer could both supply the copy and burn the request (the
     /// honest peer's later reply then falls through as an ordinary duplicate
     /// and is dropped) — silently defeating the operator's choice of who to
-    /// trust for these bytes. Entries expire so an unanswered request cannot
-    /// pin memory or divert a much later arrival.
-    block_refetch: RwLock<HashMap<bitcoin::BlockHash, (PeerId, Instant)>>,
+    /// trust for these bytes. Every peer asked is registered, not only the
+    /// latest: the connector asks another peer each interval, and an earlier
+    /// one's reply is as good as the latest's. Entries expire so an
+    /// unanswered request cannot pin memory or divert a much later arrival.
+    block_refetch: RwLock<HashMap<(bitcoin::BlockHash, PeerId), Instant>>,
+    /// When the connector last asked a peer for each unreadable stored block
+    /// ([`Self::refetch_unreadable_block`]). Separate from `block_refetch`,
+    /// which drops a registration whose `getdata` could not be sent: an
+    /// attempt counts toward the interval whether or not it reached a peer.
+    unreadable_refetch_at: parking_lot::Mutex<HashMap<bitcoin::BlockHash, Instant>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
     /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
@@ -881,6 +895,7 @@ impl PeerManager {
             in_flight_blocks: RwLock::new(HashMap::new()),
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
+            unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -4334,17 +4349,62 @@ impl PeerManager {
         // before `send_to_peer` even returns.
         {
             let mut pending = self.block_refetch.write();
-            pending.retain(|_, (_, at)| at.elapsed() < BLOCK_REFETCH_TTL);
-            pending.insert(hash, (peer_id, Instant::now()));
+            pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+            pending.insert((hash, peer_id), Instant::now());
         }
 
         if !self.send_to_peer(peer_id, sync::make_getdata_blocks(&[hash])) {
-            self.block_refetch.write().remove(&hash);
+            self.block_refetch.write().remove(&(hash, peer_id));
             return Err(format!("Failed to send getdata to peer {peer_id}"));
         }
 
         tracing::info!(%hash, peer_id, "Requested single block from peer for data repair");
         Ok(())
+    }
+
+    /// Fetch again a block the connector cannot read: stored per the index,
+    /// but its record is gone (pruning deleted the file under it, #852) or
+    /// is another block's. Nothing else would. The scheduler counts a stored
+    /// block as downloaded, a re-sent copy dies as `Duplicate`, and the
+    /// operator's remedy, `getblockfrompeer`, refuses a block above the tip
+    /// in prune mode. The block goes through the repair route
+    /// (`handle_refetched_block` → `repair_block_data`), which accepts a
+    /// `DataStored` entry, authenticates the copy against the header, and
+    /// repoints the entry, so the connector's next attempt reads it.
+    ///
+    /// At most one request per block per [`UNREADABLE_REFETCH_INTERVAL`],
+    /// each to a peer picked at random, so a peer that never answers does
+    /// not hold the block hostage.
+    pub(crate) fn refetch_unreadable_block(&self, hash: bitcoin::BlockHash, height: u32) {
+        use rand::seq::SliceRandom as _;
+        {
+            let mut last = self.unreadable_refetch_at.lock();
+            last.retain(|_, at| at.elapsed() < UNREADABLE_REFETCH_INTERVAL);
+            if last.contains_key(&hash) {
+                return;
+            }
+            // Before the attempt, so a request that fails to send (a full
+            // queue, a peer going away) still waits out the interval.
+            last.insert(hash, Instant::now());
+        }
+        let peers = self.block_serving_peer_ids();
+        let Some(&peer_id) = peers.choose(&mut rand::thread_rng()) else {
+            tracing::warn!(
+                height, %hash,
+                "Stored block has no readable record and no connected peer can serve it"
+            );
+            return;
+        };
+        match self.request_block_from_peer(hash, peer_id) {
+            Ok(()) => tracing::warn!(
+                height, %hash, peer_id,
+                "Stored block has no readable record; fetching it again from a peer"
+            ),
+            Err(e) => tracing::warn!(
+                height, %hash, peer_id,
+                "Stored block has no readable record; asking a peer for it failed: {e}"
+            ),
+        }
     }
 
     /// Peer ids eligible to serve a block re-fetch: connected, advertising
@@ -4376,16 +4436,12 @@ impl PeerManager {
         let hash = block.block_hash();
         {
             let mut pending = self.block_refetch.write();
-            pending.retain(|_, (_, at)| at.elapsed() < BLOCK_REFETCH_TTL);
-            match pending.get(&hash) {
-                // Registered, but a different peer answered. Leave the
-                // registration armed for the peer we actually asked and let
-                // this copy take the ordinary route.
-                Some((expected, _)) if *expected != id => return false,
-                Some(_) => {
-                    pending.remove(&hash);
-                }
-                None => return false,
+            pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+            // Only a peer we asked for this block. A peer we did not ask takes
+            // the ordinary route, and the registrations of the peers we did
+            // ask stay armed.
+            if pending.remove(&(hash, id)).is_none() {
+                return false;
             }
         }
 
@@ -4414,7 +4470,13 @@ impl PeerManager {
             return false;
         }
 
-        match self.chain_state.repair_block_data(block) {
+        let outcome = self.chain_state.repair_block_data(block);
+        if outcome.is_ok() {
+            // The block is readable now; other asked peers' replies are
+            // ordinary duplicates.
+            self.block_refetch.write().retain(|(h, _), _| *h != hash);
+        }
+        match outcome {
             Ok(crate::chain::state::BlockDataRepair::Repaired { height }) => {
                 tracing::info!(
                     %hash, height, id,
@@ -5132,6 +5194,7 @@ impl PeerManager {
                 ibd_l0_pause_at,
                 network,
                 &ibd_eta_secs,
+                &peer_manager,
             );
         }
 
@@ -5163,6 +5226,7 @@ impl PeerManager {
                     ibd_l0_pause_at,
                     network,
                     &ibd_eta_secs,
+                    &peer_manager,
                 );
                 continue;
             }
@@ -5306,7 +5370,13 @@ impl PeerManager {
             // skips them (data present), and a re-sent copy dies in
             // `accept_block` as `Duplicate` (status is already DataStored),
             // so the channel above cannot carry them either.
-            Self::connect_stored_tail(&chain_state, &fee_estimator, &mempool, &orphanage);
+            Self::connect_stored_tail(
+                &chain_state,
+                &fee_estimator,
+                &mempool,
+                &orphanage,
+                &peer_manager,
+            );
         }
     }
 
@@ -5345,6 +5415,7 @@ impl PeerManager {
         fee_estimator: &FeeEstimator,
         mempool: &Arc<Mempool>,
         orphanage: &Arc<TxOrphanage>,
+        peer_manager: &std::sync::Weak<PeerManager>,
     ) -> u32 {
         const MAX_PER_WAKEUP: u32 = 24;
         let mut connected = 0u32;
@@ -5385,6 +5456,9 @@ impl PeerManager {
             // must be computed against the pre-connect UTXO view, and the
             // mempool/orphanage bookkeeping below needs the transactions.
             let Some(block) = chain_state.get_block(&hash) else {
+                if let Some(pm) = peer_manager.upgrade() {
+                    pm.refetch_unreadable_block(hash, block_height);
+                }
                 break;
             };
             let fees = Self::compute_block_fee_rates(&block, chain_state);
@@ -5441,6 +5515,7 @@ impl PeerManager {
         ibd_l0_pause_at: u32,
         network: Network,
         ibd_eta_secs: &Arc<AtomicU64>,
+        peer_manager: &std::sync::Weak<PeerManager>,
     ) {
         let mut connected_count = 0u64;
         let mut retry_count = 0u32;
@@ -5844,6 +5919,11 @@ impl PeerManager {
                     // lets the existing recovery run instead of spinning.
                     Err(e) => {
                         retry_count += 1;
+                        if matches!(e, crate::chain::state::ChainError::BlockDataUnreadable(_))
+                            && let Some(pm) = peer_manager.upgrade()
+                        {
+                            pm.refetch_unreadable_block(hash, next_height);
+                        }
                         if retry_count >= 30 {
                             // The block at tip+1 can't connect because its
                             // parent isn't the active tip. If a competing
@@ -10456,6 +10536,233 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Block 1 connected; block 2 stored above the tip with its record gone,
+    /// as #852's prune left it; headers known through `headers_tip`.
+    fn a_chain_whose_next_block_has_no_record(
+        headers_tip: u32,
+    ) -> (Arc<ChainState>, bitcoin::Block, std::path::PathBuf) {
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, roll_append_file, store_block_without_connecting,
+        };
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let mut parent = cs.accept_block(&b1).expect("connect block 1").hash();
+        let mut blocks = Vec::new();
+        for h in 2..=headers_tip {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted as usize, headers.len(), "fixture: headers accepted ({err:?})");
+        let b2 = blocks.swap_remove(0);
+        store_block_without_connecting(&cs, &b2, 2);
+        roll_append_file(&cs);
+        std::fs::remove_file(cs.blocks_dir().join("blk00000.dat")).unwrap();
+        assert!(cs.has_block_data(&b2.block_hash()), "fixture: the index says stored");
+        assert!(!cs.block_data_readable(&b2.block_hash()), "fixture: the record is gone");
+        (Arc::new(cs), b2, dir)
+    }
+
+    /// A connected peer advertising NODE_NETWORK and NODE_WITNESS; what the
+    /// node sends it comes back on the receiver.
+    fn attach_block_serving_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
+        let addr: SocketAddr = "10.0.0.7:8333".parse().unwrap();
+        let (mut handle, rx) = mk_handle_rx(id, addr, PeerState::Connected, 0);
+        handle.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        pm.peers.write().insert(id, handle);
+        rx
+    }
+
+    /// How many `getdata` requests for `hash` arrive within `within`.
+    fn count_getdata(
+        rx: &mut mpsc::Receiver<NetworkMessage>,
+        hash: bitcoin::BlockHash,
+        within: Duration,
+        stop_at_first: bool,
+    ) -> usize {
+        let deadline = Instant::now() + within;
+        let mut seen = 0;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(NetworkMessage::GetData(inv))
+                    if inv.iter().any(|i| {
+                        matches!(i, Inventory::WitnessBlock(h) | Inventory::Block(h) if *h == hash)
+                    }) =>
+                {
+                    seen += 1;
+                    if stop_at_first {
+                        return seen;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        seen
+    }
+
+    fn tip_reaches(cs: &ChainState, height: u32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while cs.tip_height() < height && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cs.tip_height() >= height
+    }
+
+    /// #852: the IBD connector's next block was stored, but pruning had
+    /// deleted its file. The index says the data is here, so the scheduler
+    /// never asks for it again and a re-sent copy dies as `Duplicate`; the
+    /// connector retried the read for 30 hours. It now asks a peer for the
+    /// block on the repair route and connects the copy.
+    ///
+    /// Headers run 29 past the tip, so the node starts in the IBD connector
+    /// and the steady-state drain (which has its own re-fetch) never runs.
+    ///
+    /// Perturbation: drop the re-fetch from `ibd_connect_loop`'s error arm and
+    /// no `getdata` for block 2 is sent.
+    #[test]
+    fn the_ibd_connector_fetches_again_a_stored_block_it_cannot_read() {
+        let (cs, b2, dir) = a_chain_whose_next_block_has_no_record(30);
+        let pm = peer_manager_over(cs.clone());
+        assert!(pm.ibd.read().is_some(), "fixture: the node starts in IBD");
+        let mut rx = attach_block_serving_peer(&pm, 7);
+
+        assert_eq!(
+            count_getdata(&mut rx, b2.block_hash(), Duration::from_secs(15), true),
+            1,
+            "the connector must ask a peer for block 2"
+        );
+        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        assert!(
+            tip_reaches(&cs, 2, Duration::from_secs(10)),
+            "block 2 must connect from the repaired record"
+        );
+
+        *pm.ibd.write() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same hole one block above the tip of a synced node: the
+    /// steady-state drain reads the block before connecting it, and on a
+    /// missing record it stopped for that wakeup, every wakeup.
+    ///
+    /// Perturbation: drop the re-fetch from `connect_stored_tail` and no
+    /// `getdata` for block 2 is sent.
+    #[test]
+    fn the_stored_tail_drain_fetches_again_a_stored_block_it_cannot_read() {
+        let (cs, b2, dir) = a_chain_whose_next_block_has_no_record(2);
+        let pm = peer_manager_over(cs.clone());
+        assert!(pm.ibd.read().is_none(), "fixture: a one-block gap is the drain's");
+        let mut rx = attach_block_serving_peer(&pm, 7);
+
+        assert_eq!(
+            count_getdata(&mut rx, b2.block_hash(), Duration::from_secs(15), true),
+            1,
+            "the drain must ask a peer for block 2"
+        );
+        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        assert!(
+            tip_reaches(&cs, 2, Duration::from_secs(10)),
+            "block 2 must connect from the repaired record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The IBD connector retries once a second and the drain wakes every
+    /// 500 ms; without a floor each attempt would be another request.
+    ///
+    /// Perturbation: drop the `UNREADABLE_REFETCH_INTERVAL` check and the
+    /// second call sends a second `getdata`.
+    #[test]
+    fn a_stored_block_is_fetched_again_at_most_once_per_interval() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let pm = peer_manager_over(Arc::new(cs));
+        let mut rx = attach_block_serving_peer(&pm, 7);
+        use bitcoin::hashes::Hash as _;
+        let hash = bitcoin::BlockHash::from_byte_array([7u8; 32]);
+
+        pm.refetch_unreadable_block(hash, 5);
+        pm.refetch_unreadable_block(hash, 5);
+        assert_eq!(count_getdata(&mut rx, hash, Duration::from_millis(500), false), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-fetch whose `getdata` could not be sent still counts toward the
+    /// interval. The repair registration is dropped on a failed send, so a
+    /// floor read from it let the IBD connector's once-a-second retries each
+    /// make a fresh attempt, and log it, against a saturated or failing peer.
+    ///
+    /// Perturbation: record the attempt only once the request is sent and the
+    /// second call asks the working peer at once.
+    #[test]
+    fn a_refetch_that_fails_to_send_still_waits_out_the_interval() {
+        use bitcoin::hashes::Hash as _;
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let pm = peer_manager_over(Arc::new(cs));
+        let hash = bitcoin::BlockHash::from_byte_array([7u8; 32]);
+
+        // A peer whose receiver is gone: the send fails.
+        drop(attach_block_serving_peer(&pm, 7));
+        pm.refetch_unreadable_block(hash, 5);
+
+        // A peer that would answer, well inside the interval.
+        let mut rx = attach_block_serving_peer(&pm, 7);
+        pm.refetch_unreadable_block(hash, 5);
+        assert_eq!(count_getdata(&mut rx, hash, Duration::from_millis(500), false), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The connector asks a different peer each interval, so several can be
+    /// asked for one block. Any of them may answer first, and each reply is as
+    /// good as the others: the copy is authenticated against the header either
+    /// way. A registration held only by the latest peer dropped an earlier
+    /// one's reply to the ordinary route, where it died as `Duplicate`. A peer
+    /// nobody asked still gets the ordinary route, so it cannot consume a
+    /// request an operator made of a peer they chose.
+    ///
+    /// Perturbations: keep only the latest peer's registration and peer 7's
+    /// reply repairs nothing; match the registration on the hash alone and
+    /// peer 9's unsolicited copy repairs it.
+    #[test]
+    fn a_reply_from_any_peer_asked_repairs_a_block_and_no_other_does() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state, roll_append_file};
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let h1 = cs.accept_block(&b1).expect("connect block 1").hash();
+        let b2 = build_test_block(h1, 2, 1_707_000_001);
+        let h2 = cs.accept_block(&b2).expect("connect block 2").hash();
+        roll_append_file(&cs);
+        let b3 = build_test_block(h2, 3, 1_707_000_002);
+        cs.accept_block(&b3).expect("connect block 3");
+        // Block 2 is connected and its record is gone: a hole below the tip,
+        // which no connector will touch.
+        std::fs::remove_file(cs.blocks_dir().join("blk00000.dat")).unwrap();
+        assert!(!cs.block_data_readable(&h2), "fixture: block 2 has no record");
+
+        let cs = Arc::new(cs);
+        let pm = peer_manager_over(cs.clone());
+        let _rx7 = attach_block_serving_peer(&pm, 7);
+        let _rx8 = attach_block_serving_peer(&pm, 8);
+        let _rx9 = attach_block_serving_peer(&pm, 9);
+        pm.request_block_from_peer(h2, 7).expect("ask peer 7");
+        pm.request_block_from_peer(h2, 8).expect("then peer 8");
+
+        pm.handle_message(9, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        assert!(!cs.block_data_readable(&h2), "peer 9 was not asked");
+
+        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        assert!(cs.block_data_readable(&h2), "peer 7 was asked, before peer 8");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The drain must return to its caller after a bounded batch. The
     /// block processor is single-threaded: while the drain walks, it
     /// cannot notice a newly-armed scheduler, service the block channel,
@@ -10499,6 +10806,7 @@ mod tests {
             &fee_estimator,
             &mempool,
             &orphanage,
+            &std::sync::Weak::new(),
         );
         assert_eq!(first, 24, "one wakeup must connect exactly the cap");
         assert_eq!(chain_state.tip_height(), 25, "tip must stop at the cap boundary");
@@ -10508,6 +10816,7 @@ mod tests {
             &fee_estimator,
             &mempool,
             &orphanage,
+            &std::sync::Weak::new(),
         );
         assert_eq!(second, 6, "the next wakeup must finish the remainder");
         assert_eq!(chain_state.tip_height(), 31, "the whole tail must connect across wakeups");
