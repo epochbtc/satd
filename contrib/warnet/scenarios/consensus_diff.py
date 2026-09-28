@@ -23,6 +23,10 @@ from commander import Commander
 from test_framework.script import OP_TRUE, CScript
 from test_framework.wallet import MiniWallet
 
+# Blocks to mine, one at a time, for compact block relay to show up on every
+# tank before step 4 gives up.
+COMPACT_BLOCK_TRIES = 5
+
 
 class ConsensusDiff(Commander):
     def set_test_params(self):
@@ -63,6 +67,17 @@ class ConsensusDiff(Commander):
             time.sleep(1)
         raise AssertionError(f"tip mismatch after '{step}':\n{self.table()}")
 
+    def used_cmpctblock(self, n):
+        """Whether a cmpctblock crossed any of the tank's connections, either
+        way. None when the tank does not report per-message byte counts."""
+        peers = n.getpeerinfo()
+        if not all("bytesrecv_per_msg" in p for p in peers):
+            return None
+        return any(
+            p["bytesrecv_per_msg"].get("cmpctblock", 0) > 0 or p["bytessent_per_msg"].get("cmpctblock", 0) > 0
+            for p in peers
+        )
+
     def wait_in_mempool(self, txid, step, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -95,17 +110,24 @@ class ConsensusDiff(Commander):
             assert txid in n.getblock(tip)["tx"], f"{n.tank}: {txid} not in block {tip}"
         self.log.info("ok - every tank has the transaction in the tip block")
 
-        # 4. Blocks travelled as compact blocks somewhere on every tank.
-        for n in self.nodes:
-            peers = n.getpeerinfo()
-            if not all("bytesrecv_per_msg" in p for p in peers):
-                self.log.info(f"skip - {n.tank} does not report per-message byte counts")
-                continue
-            used = any(
-                p["bytesrecv_per_msg"].get("cmpctblock", 0) > 0 or p["bytessent_per_msg"].get("cmpctblock", 0) > 0
-                for p in peers
+        # 4. Blocks travel as compact blocks somewhere on every tank. A node
+        #    asks a peer to push new blocks as cmpctblock (BIP 152 high
+        #    bandwidth) only once that peer has delivered it a new tip, so on
+        #    a network this scenario has just brought up the first blocks can
+        #    all arrive whole. Mine one more block at a time until every tank
+        #    has used compact blocks.
+        for extra in range(COMPACT_BLOCK_TRIES + 1):
+            used = {n.tank: self.used_cmpctblock(n) for n in self.nodes}
+            unused = [tank for tank, u in used.items() if u is False]
+            if not unused:
+                break
+            assert extra < COMPACT_BLOCK_TRIES, (
+                f"no cmpctblock sent or received on any peer of {', '.join(unused)} after {extra} more blocks"
             )
-            assert used, f"{n.tank}: no cmpctblock sent or received on any peer"
+            self.generate(w, 1, sync_fun=self.no_op)
+            self.wait_same_tip(f"block {extra + 1} more for compact block relay")
+        for tank in [tank for tank, u in used.items() if u is None]:
+            self.log.info(f"skip - {tank} does not report per-message byte counts")
         self.log.info("ok - compact blocks carried blocks on every tank")
 
         # 5. Reorgs: drop the top two blocks on the miner and mine a longer
