@@ -313,6 +313,20 @@ struct SequenceIds {
     unlinked: std::collections::HashMap<BlockHash, Vec<BlockHash>>,
 }
 
+/// How far above the active tip a stored chain may reach for the steady-state
+/// paths to activate it. Past this, blocks are still arriving out of order
+/// from many peers and the IBD connector walks them in.
+const MAX_ACTIVATION_AHEAD: u32 = 128;
+
+/// A block `store_block` has validated and written to a block file but not
+/// yet indexed. Holding the pending record keeps a prune from deleting the
+/// bytes before the index entry that names them is committed.
+struct StagedBlockStore {
+    hash: BlockHash,
+    entry: BlockIndexEntry,
+    _pending: PendingRecord,
+}
+
 /// Core's `SEQ_ID_BEST_CHAIN_FROM_DISK` (`chain.h`): what the blocks of the
 /// chain loaded at startup score, so that tip beats an equal-work competitor.
 const SEQ_ID_BEST_CHAIN_FROM_DISK: i32 = 0;
@@ -385,6 +399,16 @@ pub struct ChainState {
     /// `nLastPreciousChainwork` — the equal-work tie-break. See
     /// [`SequenceIds`].
     sequence_ids: Mutex<SequenceIds>,
+    /// Bumped each time a block's data is indexed, after the entry commits
+    /// (`note_block_data_arrived`). Part of the key that keeps
+    /// [`Self::activate_best_stored_chain`] from repeating an attempt nothing
+    /// has changed since.
+    blocks_indexed: AtomicU64,
+    /// `(tip, best header, blocks_indexed)` as the last
+    /// [`Self::activate_best_stored_chain`] attempt found them.
+    last_activation_attempt: Mutex<Option<(BlockHash, BlockHash, u64)>>,
+    /// Reorgs rolled back by [`Self::abort_reorg`] since startup.
+    reorg_aborts: AtomicU64,
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
@@ -872,6 +896,9 @@ impl ChainState {
                     header_row_changes: Mutex::new(Vec::new()),
                     tips: RwLock::new(tips),
                     sequence_ids: Mutex::new(SequenceIds::default()),
+                    blocks_indexed: AtomicU64::new(0),
+                    last_activation_attempt: Mutex::new(None),
+                    reorg_aborts: AtomicU64::new(0),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     connector_scan_last: Mutex::new(None),
                     num_threads,
@@ -988,6 +1015,9 @@ impl ChainState {
             header_row_changes: Mutex::new(Vec::new()),
             tips: RwLock::new(std::collections::HashSet::from([genesis_hash])),
             sequence_ids: Mutex::new(SequenceIds::default()),
+            blocks_indexed: AtomicU64::new(0),
+            last_activation_attempt: Mutex::new(None),
+            reorg_aborts: AtomicU64::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             connector_scan_last: Mutex::new(None),
             num_threads,
@@ -4553,6 +4583,13 @@ impl ChainState {
     ///
     /// Returns `(block_hash, height)` on success.
     pub fn store_block(&self, block: &Block) -> Result<(BlockHash, u32), ChainError> {
+        let staged = self.stage_block_store(block)?;
+        self.commit_block_store(staged)
+    }
+
+    /// `store_block`'s first half: validate the block and write its bytes,
+    /// without the accept lock. Nothing is indexed yet.
+    fn stage_block_store(&self, block: &Block) -> Result<StagedBlockStore, ChainError> {
         let block_hash = block.block_hash();
 
         // Check for duplicate — skip if already DataStored or Valid
@@ -4610,7 +4647,7 @@ impl ChainState {
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let (flat_pos, _pending) = self.write_block_durable(&block_data, new_height)?;
+        let (flat_pos, pending) = self.write_block_durable(&block_data, new_height)?;
 
         // Store block index entry as DataStored
         let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
@@ -4623,7 +4660,18 @@ impl ChainState {
             data_pos: flat_pos.data_pos,
             chainwork,
         };
+        Ok(StagedBlockStore {
+            hash: block_hash,
+            entry,
+            _pending: pending,
+        })
+    }
 
+    /// `store_block`'s second half: index a staged block under the accept
+    /// lock.
+    fn commit_block_store(&self, staged: StagedBlockStore) -> Result<(BlockHash, u32), ChainError> {
+        let StagedBlockStore { hash: block_hash, entry, _pending } = staged;
+        let new_height = entry.height;
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((block_hash, entry.clone()));
         // Write height_hash so the forward connect loop can find this block even
@@ -4660,6 +4708,23 @@ impl ChainState {
         // the normal IBD path and contends only with a racing RPC submit.)
         {
             let _accept_guard = self.accept_lock.lock();
+            // The duplicate check in `stage_block_store` ran without the lock,
+            // and validation and the data write have happened since. The block
+            // can have been connected meanwhile: the connect thread accepts
+            // blocks from its channel while peer tasks store the copies the
+            // IBD scheduler asked for, so one block can arrive by both paths.
+            // Writing this entry then would replace the `Valid` entry the
+            // connect just committed with `DataStored`, and the tip would read
+            // as a block this chainstate never connected. Every connect onto
+            // it is refused from then on, and sync stops for good (#861).
+            // Check again under the lock that orders this write against every
+            // connect. The bytes already written stay in the block file,
+            // unreferenced.
+            if let Some(existing) = self.store.get_block_index(&block_hash)
+                && existing.status != BlockStatus::HeaderOnly
+            {
+                return Err(ChainError::Duplicate);
+            }
             if new_height > self.tip_height()
                 && self.store.get_block_hash_by_height(new_height).is_none()
             {
@@ -4868,6 +4933,9 @@ impl ChainState {
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, repaired));
         self.write_chain_batch(batch)?;
+        // Readable data where there was none can unblock a reorg that failed
+        // on it, so `activate_best_stored_chain` should look again.
+        self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
 
         tracing::info!(
             %hash,
@@ -6767,106 +6835,89 @@ impl ChainState {
             self.write_chain_batch(batch)?;
             // Core's `ReceivedBlockTransactions`: fix this block's place in
             // the arrival order before anything can consult the tie-break.
-            self.note_block_data_arrived(block_hash, &entry);
+            let newly_connectable = self.note_block_data_arrived(block_hash, &entry);
 
-            // Check if this side chain now has more work than the current tip
             let tip_entry = self.store.get_block_index(&current_tip)
                 .ok_or(ChainError::BadPrevBlock)?;
-            if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
-                // Side chain has less or equal work — don't reorg
-                return Ok(BlockAcceptance::Stored(block_hash));
-            }
 
-            // During IBD, if the side chain is far ahead of our tip, don't attempt
-            // reorg — the intermediate blocks will arrive and connect in order.
-            // This avoids expensive failed reorg attempts when blocks arrive
-            // out of order from multiple peers.
-            if new_height > tip_entry.height + 128 {
-                return Ok(BlockAcceptance::Stored(block_hash));
-            }
-
-            // Side chain has more work — find fork point and reorg
-            tracing::info!(
-                new_height,
-                old_tip_height = tip_entry.height,
-                "Reorg: side chain has more work, activating"
-            );
-
-            // Walk back from both the active tip and the side-chain
-            // tip in parallel until they meet at a common ancestor
-            // — that is the fork point.
+            // Core's `FindMostWorkChain`: of the chains whose every block has
+            // data, activate the one with the most work. This block need not
+            // be its tip, and need not be on it at all.
             //
-            // We deliberately do NOT use `BlockStatus::Valid` (stale
-            // disconnected blocks keep that marker) nor
-            // `get_block_hash_by_height` (the height index is a
-            // "best-known-at-height" lookup populated by
-            // accept_header / accept_headers / store_block too, not
-            // an active-chain-only oracle). Walking ancestor pointers
-            // is bounded by reorg depth (<= 128 by the IBD guard at
-            // line ~1265) and only consults `prev_blockhash` /
-            // `height`, both of which are immutable per block.
-            let fork_entry = {
-                let mut active_hash = current_tip;
-                let mut active_height = tip_entry.height;
-                let mut side_hash = prev_hash;
-                let mut side_height = new_height.saturating_sub(1);
-
-                // Equalize heights: walk the deeper walker back.
-                while active_height > side_height {
-                    let entry = self
-                        .store
-                        .get_block_index(&active_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    active_hash = entry.header.prev_blockhash;
-                    active_height -= 1;
+            // - A block with more work than the tip, over a gap, is stored and
+            //   waits. Reorging towards it would disconnect the active chain
+            //   only to meet the hole in the reconnect loop and roll back
+            //   (#739). A gap directly above the tip used to be tried the same
+            //   way, as a "reorg" with nothing to disconnect (#861).
+            // - A block with no more work than the tip can complete the path
+            //   to one with more: a descendant that arrived first and was
+            //   parked, or the tip of the best-header chain. Nothing activated
+            //   that chain until yet another block arrived (#856).
+            // The block is stored whatever this finds. An index walk that
+            // fails here is damage the startup audits report, and is no
+            // reason to reject a block that passed every check.
+            let target = self
+                .activation_target(&tip_entry, &newly_connectable)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Could not choose a chain to activate; staying on the current tip");
+                    None
+                });
+            let Some((target, fork_entry)) = target else {
+                if compare_u256(&new_chainwork, &tip_entry.chainwork) > 0 {
+                    tracing::debug!(
+                        new_height,
+                        tip_height = tip_entry.height,
+                        "Side chain has more work, but a block below it has not arrived; waiting for it"
+                    );
                 }
-                while side_height > active_height {
-                    let entry = self
-                        .store
-                        .get_block_index(&side_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    side_hash = entry.header.prev_blockhash;
-                    side_height -= 1;
-                }
-
-                // Walk both back together until they meet.
-                while active_hash != side_hash {
-                    let a_entry = self
-                        .store
-                        .get_block_index(&active_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    let s_entry = self
-                        .store
-                        .get_block_index(&side_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
-                    active_hash = a_entry.header.prev_blockhash;
-                    side_hash = s_entry.header.prev_blockhash;
-                }
-
-                self.store
-                    .get_block_index(&active_hash)
-                    .ok_or(ChainError::BadPrevBlock)?
+                return Ok(BlockAcceptance::Stored(block_hash));
             };
 
-            // AssumeUTXO reorg-depth guard: while a snapshot is loaded,
-            // this (snapshot) chainstate's UTXO base IS the snapshot
-            // block — it has connected no blocks below `snapshot_height`.
-            // A reorg whose fork point is below the snapshot height would
-            // try to disconnect blocks the snapshot assumes as final and
-            // that this chainstate never connected. Decline the reorg
-            // (keep the side-chain block stored) rather than corrupt the
-            // snapshot base. The background chainstate is what validates
-            // that buried history.
-            if let Some(bg) = self.background()
-                && fork_entry.height < bg.snapshot_height()
-            {
-                tracing::warn!(
-                    fork_height = fork_entry.height,
-                    snapshot_height = bg.snapshot_height(),
-                    new_height,
-                    "AssumeUTXO: refusing reorg below the snapshot height"
+            if target.header.block_hash() != block_hash {
+                // The chain to activate runs past this block, or does not
+                // include it. Its blocks are all stored, so this is the reorg
+                // `invalidateblock` and `reconsiderblock` run. A failure there
+                // is about some other block, which `reorg_to` has already
+                // rolled back and marked if it was invalid. This one is
+                // stored, and valid as far as anything has checked.
+                if let Err(e) = self.reorg_to(&target) {
+                    tracing::warn!(
+                        error = %e,
+                        target = %target.header.block_hash(),
+                        target_height = target.height,
+                        "Could not activate the chain this block completed; staying on the current tip"
+                    );
+                    return Ok(BlockAcceptance::Stored(block_hash));
+                }
+                // As at the end of the connect below: a block that arrived
+                // without its header announced first (`submitblock`) must not
+                // leave the tip out-working the best header.
+                self.update_best_header(target.header.block_hash(), target.chainwork);
+                return Ok(
+                    if self.active_chain_hash_at_height(new_height) == Some(block_hash) {
+                        BlockAcceptance::Connected(block_hash)
+                    } else {
+                        BlockAcceptance::Stored(block_hash)
+                    },
                 );
-                return Ok(BlockAcceptance::Stored(block_hash));
+            }
+
+            if fork_entry.header.block_hash() == current_tip {
+                // Every block between the tip and this one is stored but not
+                // connected. Connecting them disconnects nothing, so it is
+                // not a reorg and is not reported as one.
+                tracing::info!(
+                    new_height,
+                    tip_height = tip_entry.height,
+                    "Connecting stored blocks below a block that extends the tip"
+                );
+            } else {
+                tracing::info!(
+                    new_height,
+                    old_tip_height = tip_entry.height,
+                    fork_height = fork_entry.height,
+                    "Reorg: side chain has more work, activating"
+                );
             }
 
             // Atomic-reorg durable checkpoint (issue #262). Flush the
@@ -6928,6 +6979,9 @@ impl ChainState {
             // failure before the block is identified reports "unknown"
             // rather than the previous block's identity.
             let mut side_failed_at: Option<(BlockHash, u32)> = None;
+            // A side block that failed validation, to mark once the reorg has
+            // rolled back. See `ConnectError::is_verdict_on_block`.
+            let mut side_invalid: Option<BlockHash> = None;
             let side_result: Result<(), ChainError> = (|| {
                 // Collect side-chain blocks fork+1..=prev, forward order.
                 let mut to_connect = Vec::new();
@@ -7009,6 +7063,11 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
                         phase_tracker: None,
+                    })
+                    .inspect_err(|e| {
+                        if e.is_verdict_on_block() {
+                            side_invalid = Some(*side_hash);
+                        }
                     })?;
                     let _chain_mutation = self.begin_chain_mutation();
                     self.write_chain_batch(batch)?;
@@ -7068,6 +7127,14 @@ impl ChainState {
                     &e,
                     side_failed_at,
                 );
+                // Core's `InvalidBlockFound`. Unmarked, the branch stays the
+                // best candidate and every block that arrives on it tries,
+                // and fails, the same reorg again. Buffered like the
+                // triggering block's mark below: no flush while the reorg's
+                // exclusion is held.
+                if let Some(bad) = side_invalid {
+                    let _ = self.mark_subtree_invalid(bad);
+                }
                 return Err(e);
             }
 
@@ -7181,8 +7248,9 @@ impl ChainState {
                 //
                 // Core's `InvalidBlockFound` skips the marking entirely for a
                 // mutation-class verdict, and so do we — see the equivalent
-                // guard on `check_block` above.
-                if !e.is_mutation_class() {
+                // guard on `check_block` above. Nor is a failure that reports
+                // damage to this node's own storage a verdict on the block.
+                if e.is_verdict_on_block() {
                     let _ = self.mark_subtree_invalid(block_hash);
                 }
                 return Err(e.into());
@@ -7320,16 +7388,22 @@ impl ChainState {
         // walk the diff top-down and see a fully-consistent chainstate
         // + mempool by the time each event lands.
         if let Some(pending) = pending_reorg.take() {
+            // With nothing disconnected, the fork point was the tip and this
+            // only connected stored blocks up to the triggering one: an
+            // extension, reported as the connects it is and not as a reorg.
+            let reorged = !pending.disconnected.is_empty();
             // First-class reorg marker, emitted once before the per-block
             // disconnect/connect sequence so subscribers have an explicit
             // fork-point signal (rather than inferring one). The new tip is
             // the triggering block.
-            self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
-                from_height: pending.old_height,
-                old_tip: pending.old_tip,
-                to_height: new_height,
-                new_tip: block_hash,
-            });
+            if reorged {
+                self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
+                    from_height: pending.old_height,
+                    old_tip: pending.old_tip,
+                    to_height: new_height,
+                    new_tip: block_hash,
+                });
+            }
             for (hash, height) in &pending.original_disconnected {
                 self.emit_chain_event(
                     crate::chain::events::ChainEvent::BlockDisconnected {
@@ -7345,7 +7419,7 @@ impl ChainState {
                 });
             }
 
-            if let Some(log) = self.reorg_log.get() {
+            if reorged && let Some(log) = self.reorg_log.get() {
                 let mut reconnected = pending.reconnected_so_far;
                 reconnected.push(block_hash);
                 let record = crate::chain::reorg_log::ReorgRecord::new(
@@ -7452,6 +7526,7 @@ impl ChainState {
         cause: &dyn std::fmt::Display,
         failed_at: Option<(BlockHash, u32)>,
     ) {
+        self.reorg_aborts.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             error = %cause,
             failed_block = failed_at.map(|(h, _)| h.to_string()),
@@ -7496,6 +7571,12 @@ impl ChainState {
         // when a reorg has already failed.
         self.repopulate_mtp_cache_from(old_tip, old_height);
         self.set_tip(old_tip, old_height);
+    }
+
+    /// How many reorgs [`Self::abort_reorg`] has rolled back since startup.
+    /// Each one disconnected the active chain for nothing.
+    pub fn reorg_abort_count(&self) -> u64 {
+        self.reorg_aborts.load(Ordering::Relaxed)
     }
 
     /// A reorg needs to roll back and the coin cache cannot be attributed to
@@ -8319,9 +8400,13 @@ impl ChainState {
     /// A no-op for a block that already has an id: a re-store of the same
     /// block must not renumber it, or a competing tip could jump the queue by
     /// being sent twice.
-    fn assign_sequence_ids(&self, hash: BlockHash) {
+    ///
+    /// Returns the blocks it numbered: every block that became connectable
+    /// just now, which are the ones Core adds to `setBlockIndexCandidates`.
+    fn assign_sequence_ids(&self, hash: BlockHash) -> Vec<BlockHash> {
         let mut seq = self.sequence_ids.lock();
         let mut queue = std::collections::VecDeque::from([hash]);
+        let mut numbered = Vec::new();
         while let Some(h) = queue.pop_front() {
             if seq.ids.contains_key(&h) {
                 continue;
@@ -8331,10 +8416,12 @@ impl ChainState {
             // outrank every natural id and silently act as a `preciousblock`.
             seq.next = seq.next.saturating_add(1);
             seq.ids.insert(h, id);
+            numbered.push(h);
             if let Some(children) = seq.unlinked.remove(&h) {
                 queue.extend(children);
             }
         }
+        numbered
     }
 
     /// Park `child` until `parent` becomes connectable — Core's
@@ -8352,16 +8439,23 @@ impl ChainState {
     }
 
     /// Record that `hash`'s data is now stored: assign its sequence id if it
-    /// is connectable, otherwise park it behind its parent.
-    fn note_block_data_arrived(&self, hash: BlockHash, entry: &BlockIndexEntry) {
+    /// is connectable, otherwise park it behind its parent. Returns the blocks
+    /// that became connectable: `hash` itself and any parked descendant it
+    /// completed the path for. Called after the block's index entry commits.
+    fn note_block_data_arrived(&self, hash: BlockHash, entry: &BlockIndexEntry) -> Vec<BlockHash> {
+        self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
         match self.is_connectable(entry) {
             Ok(true) => self.assign_sequence_ids(hash),
-            Ok(false) => self.park_unlinked(entry.header.prev_blockhash, hash),
+            Ok(false) => {
+                self.park_unlinked(entry.header.prev_blockhash, hash);
+                Vec::new()
+            }
             Err(e) => {
                 // The tie-break is an ordering preference, not a safety
                 // property: a block left without an id scores as if loaded
                 // from disk, which is the conservative end.
                 tracing::debug!(%hash, error = %e, "sequence id: connectability check failed");
+                Vec::new()
             }
         }
     }
@@ -8482,6 +8576,169 @@ impl ChainState {
         self.reorg_to(&best)
     }
 
+    /// The highest block on the best-header chain whose whole path down to the
+    /// active chain has data.
+    ///
+    /// The parked-descendant walk in [`Self::note_block_data_arrived`] finds a
+    /// completed path only from the block that completed it, and only among
+    /// blocks stored this run. This finds one however the blocks arrived and
+    /// across a restart.
+    ///
+    /// `None` when the best header does not out-work the tip, or is far enough
+    /// ahead that the IBD connector owns the catch-up.
+    fn best_header_stored_prefix(
+        &self,
+        tip_entry: &BlockIndexEntry,
+    ) -> Result<Option<BlockIndexEntry>, ChainError> {
+        let Some(best) = self.store.get_block_index(&self.best_header_hash()) else {
+            return Ok(None);
+        };
+        if compare_u256(&best.chainwork, &tip_entry.chainwork) <= 0
+            || best.height > tip_entry.height.saturating_add(MAX_ACTIVATION_AHEAD)
+        {
+            return Ok(None);
+        }
+        let fork_hash = self.find_fork(tip_entry, &best)?.header.block_hash();
+        // Newest first, from the best header down to just above the fork.
+        let mut path = Vec::new();
+        let mut entry = best;
+        while entry.header.block_hash() != fork_hash {
+            let parent = entry.header.prev_blockhash;
+            path.push(entry);
+            entry = self
+                .store
+                .get_block_index(&parent)
+                .ok_or(ChainError::BadPrevBlock)?;
+        }
+        // Oldest first: the prefix ends below the first block without data.
+        let mut top = None;
+        for e in path.into_iter().rev() {
+            if !matches!(e.status, BlockStatus::DataStored | BlockStatus::Valid) {
+                break;
+            }
+            top = Some(e);
+        }
+        Ok(top)
+    }
+
+    /// Core's `FindMostWorkChain`, asked only where the answer can have
+    /// changed: the blocks that just became connectable, and the stored
+    /// prefix of the best-header chain. Every block either offers has data
+    /// all the way down to the active chain, so a reorg towards it cannot
+    /// discover a missing block halfway through.
+    ///
+    /// Returns the block to activate and the fork point under it, or `None`
+    /// when nothing outranks the tip under Core's candidate order.
+    fn activation_target(
+        &self,
+        tip_entry: &BlockIndexEntry,
+        newly_connectable: &[BlockHash],
+    ) -> Result<Option<(BlockIndexEntry, BlockIndexEntry)>, ChainError> {
+        let mut best = self.best_header_stored_prefix(tip_entry)?;
+        for hash in newly_connectable {
+            // A parked block can have been marked invalid while it waited.
+            let Some(e) = self
+                .store
+                .get_block_index(hash)
+                .filter(|e| matches!(e.status, BlockStatus::DataStored | BlockStatus::Valid))
+            else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|b| self.compare_candidates(&e, b).is_lt())
+            {
+                best = Some(e);
+            }
+        }
+        let Some(best) = best else {
+            return Ok(None);
+        };
+        // During IBD, a side chain far ahead of the tip is the connector's to
+        // walk: its blocks arrive out of order from many peers, and taking it
+        // here would hold the accept lock across a long connect run.
+        if !self.compare_candidates(&best, tip_entry).is_lt()
+            || best.height > tip_entry.height.saturating_add(MAX_ACTIVATION_AHEAD)
+        {
+            return Ok(None);
+        }
+        let fork = self.find_fork(tip_entry, &best)?;
+        // AssumeUTXO reorg-depth guard: while a snapshot is loaded, this
+        // (snapshot) chainstate's UTXO base IS the snapshot block, and it has
+        // connected no blocks below `snapshot_height`. A reorg whose fork
+        // point is below the snapshot height would try to disconnect blocks
+        // the snapshot assumes as final and that this chainstate never
+        // connected. Decline it (the blocks stay stored) rather than corrupt
+        // the snapshot base. The background chainstate is what validates that
+        // buried history.
+        if let Some(bg) = self.background()
+            && fork.height < bg.snapshot_height()
+        {
+            tracing::warn!(
+                fork_height = fork.height,
+                snapshot_height = bg.snapshot_height(),
+                new_height = best.height,
+                "AssumeUTXO: refusing reorg below the snapshot height"
+            );
+            return Ok(None);
+        }
+        Ok(Some((best, fork)))
+    }
+
+    /// Switch to a competing branch whose blocks have all arrived, when
+    /// nothing is left to arrive that would do it. Core's `ActivateBestChain`
+    /// runs after every stored block, so a chain is activated the moment its
+    /// last missing block lands. satd activates from `accept_block`, and
+    /// only the blocks that pass through there trigger it. This covers the
+    /// rest:
+    /// - blocks the IBD scheduler stored before handing the frontier to the
+    ///   steady-state path;
+    /// - a data repair;
+    /// - a restart between the last block arriving and the switch (#856).
+    ///
+    /// Returns the new tip when the chain switched. A stored run that extends
+    /// the tip is left to the connector's stored-tail drain, which connects
+    /// it block by block with the bookkeeping a reorg does not do.
+    ///
+    /// Keyed on the tip, the best header and a count of indexed blocks, so an
+    /// attempt that failed is not repeated until one of them changes. The
+    /// caller polls this on every connector wakeup, and while nothing has
+    /// changed it reads two index entries and returns.
+    pub fn activate_best_stored_chain(&self) -> Result<Option<BlockHash>, ChainError> {
+        if !self.best_header_beats_active_tip() {
+            return Ok(None);
+        }
+        let key = || {
+            (
+                self.tip_hash(),
+                self.best_header_hash(),
+                self.blocks_indexed.load(Ordering::Acquire),
+            )
+        };
+        if *self.last_activation_attempt.lock() == Some(key()) {
+            return Ok(None);
+        }
+        let _accept_guard = self.accept_lock.lock();
+        // Transient, and says so elsewhere; retried once the load finishes.
+        if self.check_no_snapshot_load().is_err() {
+            return Ok(None);
+        }
+        let key = key();
+        *self.last_activation_attempt.lock() = Some(key);
+        let tip_entry = self
+            .store
+            .get_block_index(&key.0)
+            .ok_or(ChainError::BadPrevBlock)?;
+        let Some((target, fork)) = self.activation_target(&tip_entry, &[])? else {
+            return Ok(None);
+        };
+        if fork.header.block_hash() == key.0 {
+            return Ok(None);
+        }
+        self.reorg_to(&target)?;
+        Ok(Some(target.header.block_hash()))
+    }
+
     /// Find the common ancestor (fork point) of the active tip and `target`
     /// by walking both back via `prev_blockhash`. Immune to height-index
     /// pollution (consults only immutable `prev_blockhash`/`height`).
@@ -8599,6 +8856,8 @@ impl ChainState {
         // died on in the abort log, and is `None` when the loop failed before
         // identifying one.
         let mut reconnect_failed_at: Option<(BlockHash, u32)> = None;
+        // See `side_invalid` in `accept_block`.
+        let mut reconnect_invalid: Option<BlockHash> = None;
         let reconnect: Result<(), ChainError> = (|| {
             let mut to_connect = Vec::new();
             let mut hash = target_hash;
@@ -8627,6 +8886,11 @@ impl ChainState {
                     .store
                     .get_block_index(&e.header.prev_blockhash)
                     .ok_or(ChainError::BadPrevBlock)?;
+                // The same parent check as `accept_block`'s reconnect loop,
+                // for the same reason: the fork point must be a block this
+                // chainstate connected, and a status that says otherwise is
+                // damage to refuse, not build on.
+                self.require_connected_parent(&e.header.prev_blockhash, h, e.height)?;
                 let use_noop = self.should_skip_scripts(e.height);
                 let noop = NoopVerifier;
                 let verifier: &dyn ScriptVerifier =
@@ -8654,6 +8918,11 @@ impl ChainState {
                     #[cfg(feature = "block-filter-index")]
                     filter_index: &self.filter_index,
                     phase_tracker: None,
+                })
+                .inspect_err(|err| {
+                    if err.is_verdict_on_block() {
+                        reconnect_invalid = Some(*h);
+                    }
                 })?;
                 let _chain_mutation = self.begin_chain_mutation();
                 self.write_chain_batch(batch)?;
@@ -8684,6 +8953,12 @@ impl ChainState {
                 &e,
                 reconnect_failed_at,
             );
+            // See the twin mark in `accept_block`: an unmarked invalid block
+            // leaves its branch the best candidate, to be retried and failed
+            // again.
+            if let Some(bad) = reconnect_invalid {
+                let _ = self.mark_subtree_invalid(bad);
+            }
             return Err(e);
         }
 
@@ -8711,7 +8986,7 @@ impl ChainState {
                 ) {
                     tracing::debug!(
                         err = ?e,
-                        "invalidate/reconsider reorg: mempool re-add failed (likely conflict)"
+                        "Reorg: mempool re-add failed (likely conflict)"
                     );
                 }
             }
@@ -8722,13 +8997,17 @@ impl ChainState {
         }
 
         // Chain events, in the canonical order (Reorg marker → disconnect
-        // newest-first → reconnect oldest-first).
-        self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
-            from_height: disconnect_info.old_height,
-            old_tip: disconnect_info.old_tip,
-            to_height: new_height,
-            new_tip,
-        });
+        // newest-first → reconnect oldest-first). A run that disconnected
+        // nothing extended the tip, and is not reported as a reorg.
+        let reorged = !disconnect_info.disconnected.is_empty();
+        if reorged {
+            self.emit_chain_event(crate::chain::events::ChainEvent::Reorg {
+                from_height: disconnect_info.old_height,
+                old_tip: disconnect_info.old_tip,
+                to_height: new_height,
+                new_tip,
+            });
+        }
         for (hash, height) in &disconnect_info.disconnected_with_height {
             self.emit_chain_event(crate::chain::events::ChainEvent::BlockDisconnected {
                 hash: *hash,
@@ -8742,7 +9021,7 @@ impl ChainState {
             });
         }
 
-        if let Some(log) = self.reorg_log.get() {
+        if reorged && let Some(log) = self.reorg_log.get() {
             let record = crate::chain::reorg_log::ReorgRecord::new(
                 fork_entry.height,
                 disconnect_info.old_tip,
@@ -8758,15 +9037,16 @@ impl ChainState {
         // it has to, so each block validates against the branch being
         // reconnected. Re-pushing them here would be a no-op.)
 
-        // Durably commit the new chainstate (the operator-driven reorg is rare
-        // and deliberate; flushing keeps the on-disk tip consistent and closes
-        // the multi-block FRESH-elision window of #262). A flush failure does
+        // Durably commit the new chainstate (a reorg is rare, whether an
+        // operator or a completed branch asked for it; flushing keeps the
+        // on-disk tip consistent and closes the multi-block FRESH-elision
+        // window of #262). A flush failure does
         // not un-commit the in-memory reorg, so log loudly and continue.
         if let Err(e) = self.store.flush() {
             tracing::error!(
                 error = %e,
                 new_tip = %new_tip,
-                "Coin-cache flush failed after invalidate/reconsider reorg; coins remain dirty in cache"
+                "Coin-cache flush failed after activating the best chain; coins remain dirty in cache"
             );
         }
 
@@ -8775,7 +9055,7 @@ impl ChainState {
             old_height = disconnect_info.old_height,
             %new_tip,
             new_height,
-            "invalidate/reconsider: activated best valid chain"
+            "Activated the best valid chain"
         );
         Ok(())
     }
@@ -15699,6 +15979,457 @@ pub(crate) mod tests {
             "the refused reorg must restore the pre-reorg tip, not strand the chain"
         );
         assert_eq!(cs.tip_height(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Active chain genesis -> A1 -> A2 -> A3, and a heavier branch B2 -> B3
+    /// -> B4 forking at A1 whose headers are known but whose blocks have not
+    /// been delivered. Returns the A3 hash and the three B blocks.
+    fn chain_with_a_heavier_branch_announced(cs: &ChainState) -> (BlockHash, [Block; 3]) {
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).expect("accept A3").hash();
+        let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
+        let b3 = build_test_block(b2.block_hash(), 3, 1_300_000_013);
+        let b4 = build_test_block(b3.block_hash(), 4, 1_300_000_014);
+        for b in [&b2, &b3, &b4] {
+            cs.accept_header(&b.header).expect("accept B header");
+        }
+        assert_eq!(cs.best_header_hash(), b4.block_hash());
+        (a3_hash, [b2, b3, b4])
+    }
+
+    /// #861. The connect thread accepts a block from its channel while a peer
+    /// task stores another copy of it for the IBD scheduler. The copy passed
+    /// `store_block`'s duplicate check before the connect, and its index write
+    /// landed after it: the tip went from `Valid` to `DataStored`, and every
+    /// connect onto it was refused from then on.
+    ///
+    /// Perturbation: drop the re-check in `commit_block_store` and the commit
+    /// succeeds, the tip reads `DataStored`, and block 6 is refused with
+    /// `ParentNeverConnected`.
+    #[test]
+    fn a_racing_store_does_not_demote_a_block_the_connect_thread_connected() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 4);
+        let b5 = build_test_block(cs.tip_hash(), 5, 1_300_000_005);
+        let b5_hash = b5.block_hash();
+        cs.accept_header(&b5.header).unwrap();
+
+        // The peer task gets as far as the data write...
+        let staged = cs.stage_block_store(&b5).expect("stage the IBD copy");
+        // ...the connect thread connects the channel copy...
+        assert!(cs.accept_block(&b5).expect("connect block 5").connected());
+        // ...and the peer task commits.
+        let late = cs.commit_block_store(staged);
+        assert!(
+            matches!(late, Err(ChainError::Duplicate)),
+            "the late copy must be a duplicate, got {late:?}"
+        );
+        assert_eq!(
+            cs.get_block_index(&b5_hash).unwrap().status,
+            BlockStatus::Valid,
+            "the connected tip must not be demoted"
+        );
+
+        let b6 = build_test_block(b5_hash, 6, 1_300_000_006);
+        cs.accept_header(&b6.header).unwrap();
+        cs.store_block(&b6).unwrap();
+        cs.connect_stored_block(&b6.block_hash())
+            .expect("the next block connects onto the tip");
+        assert_eq!(cs.tip_height(), 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #861 and #739. A block two above the tip, whose parent has not arrived,
+    /// is stored and waits. It used to start a "reorg" forking at the tip,
+    /// which disconnected nothing, met the missing parent in the reconnect
+    /// loop, and rolled back with an `ERROR`.
+    #[test]
+    fn a_block_above_a_gap_at_the_tip_waits_without_a_reorg() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        let tip5 = cs.tip_hash();
+        let b6 = build_test_block(tip5, 6, 1_300_000_006);
+        let b7 = build_test_block(b6.block_hash(), 7, 1_300_000_007);
+        cs.accept_header(&b6.header).unwrap();
+        cs.accept_header(&b7.header).unwrap();
+
+        let early = cs.accept_block(&b7);
+        assert!(
+            matches!(early, Ok(BlockAcceptance::Stored(h)) if h == b7.block_hash()),
+            "block 7 must be stored and wait for block 6, got {early:?}"
+        );
+        assert_eq!(cs.reorg_abort_count(), 0, "no reorg may be attempted");
+        assert_eq!(cs.tip_hash(), tip5);
+
+        // Block 6 connects onto the untouched tip, and the connector's
+        // stored-tail drain takes block 7 from there.
+        assert!(cs.accept_block(&b6).unwrap().connected());
+        cs.connect_stored_block(&b7.block_hash()).expect("block 7 connects");
+        assert_eq!(cs.tip_hash(), b7.block_hash());
+        assert_eq!(cs.reorg_abort_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #739 and #856, in the order a compact block produces: the heavier
+    /// branch's tip arrives first, then its parents from the top down.
+    ///
+    /// - B4 is stored and waits, without disconnecting anything to discover
+    ///   that B2 and B3 are missing (#739).
+    /// - B2, the last to arrive, completes the branch, and the node moves to
+    ///   B4 there and then (#856). It used to stay on A3 until yet another
+    ///   block arrived.
+    ///
+    /// Perturbation: report a parked block as connectable from
+    /// `note_block_data_arrived` and B4's arrival starts the reorg again, which
+    /// aborts. Return `Stored` instead of calling `reorg_to` when the target is
+    /// not the arriving block, and the tip stays on A3.
+    #[test]
+    fn a_heavier_branch_is_activated_when_its_last_block_arrives() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_announced(&cs);
+
+        let r4 = cs.accept_block(&b4);
+        assert!(matches!(r4, Ok(BlockAcceptance::Stored(_))), "B4: {r4:?}");
+        let r3 = cs.accept_block(&b3);
+        assert!(matches!(r3, Ok(BlockAcceptance::Stored(_))), "B3: {r3:?}");
+        assert_eq!(cs.tip_hash(), a3_hash);
+        assert_eq!(cs.reorg_abort_count(), 0, "no reorg before the branch is complete");
+
+        let r2 = cs.accept_block(&b2);
+        assert!(
+            matches!(r2, Ok(BlockAcceptance::Connected(h)) if h == b2.block_hash()),
+            "B2 joins the active chain as part of the switch, got {r2:?}"
+        );
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+        assert_eq!(cs.tip_height(), 4);
+        assert_eq!(cs.get_block_hash_by_height(2), Some(b2.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(3), Some(b3.block_hash()));
+        assert_eq!(cs.reorg_abort_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #856 for a branch the best header does not describe: B4 reached the
+    /// node as a block and never as a header, so only the blocks parked behind
+    /// B2 know the branch is complete when B2 arrives.
+    ///
+    /// Perturbation: drop the `newly_connectable` candidates from
+    /// `activation_target` and the tip stays on A3.
+    #[test]
+    fn a_heavier_branch_never_announced_by_header_is_activated_from_its_parked_blocks() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).unwrap().hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).unwrap().hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).unwrap().hash();
+        let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
+        let b3 = build_test_block(b2.block_hash(), 3, 1_300_000_013);
+        let b4 = build_test_block(b3.block_hash(), 4, 1_300_000_014);
+        // B3 has no more work than A3, so the best header stays A3.
+        cs.accept_header(&b2.header).unwrap();
+        cs.accept_header(&b3.header).unwrap();
+        assert_eq!(cs.best_header_hash(), a3_hash);
+
+        for b in [&b4, &b3] {
+            assert!(matches!(cs.accept_block(b), Ok(BlockAcceptance::Stored(_))));
+        }
+        assert_eq!(cs.tip_hash(), a3_hash);
+        cs.accept_block(&b2).unwrap();
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+        assert_eq!(cs.reorg_abort_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #856 across a restart. The descendants that arrived first were parked
+    /// in memory, and a restart forgets that. When the last block arrives
+    /// afterwards, only the best-header chain still says the branch is
+    /// complete.
+    ///
+    /// Perturbation: drop `best_header_stored_prefix` from
+    /// `activation_target` and the tip stays on A3.
+    #[test]
+    fn a_heavier_branch_completed_after_a_restart_is_activated() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_announced(&cs);
+        cs.accept_block(&b4).unwrap();
+        cs.accept_block(&b3).unwrap();
+        assert_eq!(cs.tip_hash(), a3_hash);
+
+        // What a restart loses: the parked-descendant map.
+        *cs.sequence_ids.lock() = SequenceIds::default();
+
+        cs.accept_block(&b2).unwrap();
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #856 with nothing left to arrive: the whole branch was stored by the
+    /// IBD scheduler's path, which never activates anything. The connector's
+    /// periodic `activate_best_stored_chain` makes the switch, and does not
+    /// repeat itself afterwards.
+    #[test]
+    fn a_stored_heavier_branch_is_activated_by_the_connector_hook() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_announced(&cs);
+        for b in [&b4, &b3, &b2] {
+            cs.store_block(b).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), a3_hash, "store_block never activates");
+
+        let switched = cs.activate_best_stored_chain().expect("activate");
+        assert_eq!(switched, Some(b4.block_hash()));
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+        assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
+        assert_eq!(cs.reorg_abort_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch that fails validation partway up is marked invalid, so the
+    /// hook, which runs on every connector wakeup, does not keep
+    /// disconnecting the active chain to fail at the same block.
+    ///
+    /// Perturbation: drop the `mark_subtree_invalid` after `reorg_to`'s abort
+    /// and the second attempt runs the reorg again (two aborts).
+    #[test]
+    fn an_invalid_branch_is_marked_and_not_retried() {
+        use bitcoin::hashes::Hash;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).unwrap().hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).unwrap().hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).unwrap().hash();
+
+        let bogus = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5b; 32]),
+            ),
+            vout: 0,
+        };
+        let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
+        let b3 = build_test_block_spending(b2.block_hash(), 3, 1_300_000_013, bogus);
+        let b4 = build_test_block(b3.block_hash(), 4, 1_300_000_014);
+        for b in [&b2, &b3, &b4] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+
+        let first = cs.activate_best_stored_chain();
+        assert!(first.is_err(), "B3 cannot connect: {first:?}");
+        assert_eq!(cs.tip_hash(), a3_hash, "the failed reorg rolled back");
+        assert_eq!(cs.reorg_abort_count(), 1);
+        for (b, what) in [(&b3, "B3"), (&b4, "B4")] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{what} must be marked invalid"
+            );
+        }
+        assert_ne!(cs.get_block_index(&b2.block_hash()).unwrap().status, BlockStatus::Invalid);
+
+        // Clear the attempt key, so only the mark can stop a second try.
+        *cs.last_activation_attempt.lock() = None;
+        assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
+        assert_eq!(cs.reorg_abort_count(), 1, "the branch must not be tried again");
+        assert_eq!(cs.tip_hash(), a3_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `reorg_to` checks each reconnected block's parent the way
+    /// `accept_block`'s reconnect loop does, now that the connector hook
+    /// reaches it from the P2P path as well as from `invalidateblock`.
+    ///
+    /// Perturbation: drop the `require_connected_parent` call from
+    /// `reorg_to`'s loop and the branch is built onto A1 and committed.
+    #[test]
+    fn a_stored_branch_is_not_built_onto_an_unconnected_fork_point() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_announced(&cs);
+        for b in [&b2, &b3, &b4] {
+            cs.store_block(b).unwrap();
+        }
+        let a1_hash = b2.header.prev_blockhash;
+        force_status(&cs, &a1_hash, BlockStatus::DataStored);
+
+        let result = cs.activate_best_stored_chain();
+        assert!(
+            matches!(result, Err(ChainError::ParentNeverConnected)),
+            "got {result:?}"
+        );
+        assert_eq!(cs.tip_hash(), a3_hash, "the refused reorg rolled back");
+        assert_ne!(
+            cs.get_block_index(&b2.block_hash()).unwrap().status,
+            BlockStatus::Invalid,
+            "local damage is no verdict on the branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same mark on `accept_block`'s own reorg, for a block below the one
+    /// that triggered it. Only the triggering block used to be marked, so a
+    /// bad block in the middle of a branch left the branch standing, and each
+    /// new block on it ran the reorg again.
+    ///
+    /// Perturbation: drop the `mark_subtree_invalid` after the side loop's
+    /// abort and B3 stays `DataStored`.
+    #[test]
+    fn a_block_that_fails_inside_a_reorg_is_marked_invalid() {
+        use bitcoin::hashes::Hash;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).unwrap().hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).unwrap().hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).unwrap().hash();
+
+        let bogus = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5c; 32]),
+            ),
+            vout: 0,
+        };
+        let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
+        let b3 = build_test_block_spending(b2.block_hash(), 3, 1_300_000_013, bogus);
+        let b4 = build_test_block(b3.block_hash(), 4, 1_300_000_014);
+        cs.accept_block(&b2).unwrap();
+        cs.accept_block(&b3).unwrap();
+        assert!(cs.accept_block(&b4).is_err(), "B3 cannot connect");
+        assert_eq!(cs.tip_hash(), a3_hash);
+        for (b, what) in [(&b3, "B3"), (&b4, "B4")] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{what} must be marked invalid"
+            );
+        }
+        assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
+        assert_eq!(cs.reorg_abort_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reorg that fails for a reason that is not the block's fault (here,
+    /// B3's bytes are unreadable) is not marked invalid. The hook does not
+    /// repeat it while nothing changes, and tries again once the data is
+    /// repaired.
+    ///
+    /// Perturbation: drop the `blocks_indexed` bump from `repair_block_data`
+    /// and the attempt after the repair is skipped. Drop the attempt-key check
+    /// from `activate_best_stored_chain` and the second call runs the failing
+    /// reorg again.
+    #[test]
+    fn a_reorg_that_failed_on_missing_data_is_retried_after_a_repair() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_announced(&cs);
+        // B3 last, so cutting the file at its record leaves every other block.
+        for b in [&b2, &b4, &b3] {
+            cs.store_block(b).unwrap();
+        }
+        punch_block_data_hole(&cs, &dir, &b3.block_hash());
+
+        assert!(cs.activate_best_stored_chain().is_err());
+        assert_eq!(cs.tip_hash(), a3_hash);
+        assert_eq!(cs.reorg_abort_count(), 1);
+        assert_eq!(
+            cs.get_block_index(&b3.block_hash()).unwrap().status,
+            BlockStatus::DataStored,
+            "unreadable data is no verdict on the block"
+        );
+
+        assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
+        assert_eq!(cs.reorg_abort_count(), 1, "nothing changed, so no second attempt");
+
+        cs.repair_block_data(&b3).expect("repair B3");
+        assert_eq!(cs.activate_best_stored_chain().unwrap(), Some(b4.block_hash()));
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Connecting stored blocks between the tip and a new block disconnects
+    /// nothing, so it is not a reorg. It used to be reported as one: a
+    /// `Reorg` event from the tip to the new block, and a record in
+    /// `getreorghistory`.
+    #[test]
+    fn connecting_stored_blocks_above_the_tip_is_not_reported_as_a_reorg() {
+        use crate::chain::events::ChainEvent;
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        let b6 = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        let b7 = build_test_block(b6.block_hash(), 7, 1_300_000_007);
+        cs.accept_header(&b6.header).unwrap();
+        cs.accept_header(&b7.header).unwrap();
+        cs.store_block(&b6).unwrap();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<ChainEvent>(16);
+        cs.set_chain_event_sender(tx);
+        assert!(cs.accept_block(&b7).unwrap().connected());
+        assert_eq!(cs.tip_hash(), b7.block_hash());
+
+        let events: Vec<ChainEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ChainEvent::BlockConnected { hash: h6, height: 6 },
+                    ChainEvent::BlockConnected { hash: h7, height: 7 },
+                ] if *h6 == b6.block_hash() && *h7 == b7.block_hash()
+            ),
+            "two connects and no reorg marker: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same through `reorg_to`: a block that completes a stored run above
+    /// the tip, where the run's top is a block that arrived earlier.
+    #[test]
+    fn completing_a_stored_run_above_the_tip_connects_it_without_a_reorg() {
+        use crate::chain::events::ChainEvent;
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        let b6 = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        let b7 = build_test_block(b6.block_hash(), 7, 1_300_000_007);
+        let b8 = build_test_block(b7.block_hash(), 8, 1_300_000_008);
+        for b in [&b6, &b7, &b8] {
+            cs.accept_header(&b.header).unwrap();
+        }
+        cs.store_block(&b6).unwrap();
+        cs.store_block(&b8).unwrap();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<ChainEvent>(16);
+        cs.set_chain_event_sender(tx);
+        let r7 = cs.accept_block(&b7);
+        assert!(matches!(r7, Ok(BlockAcceptance::Connected(_))), "B7: {r7:?}");
+        assert_eq!(cs.tip_hash(), b8.block_hash());
+
+        let events: Vec<ChainEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().all(|e| matches!(e, ChainEvent::BlockConnected { .. })),
+            "connects only: {events:?}"
+        );
+        assert_eq!(events.len(), 3, "{events:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -7062,6 +7062,77 @@ fn test_reorg_record_reflects_completed_state() {
     node_a.stop();
 }
 
+/// #856 through the RPC path. A heavier branch whose tip arrives before the
+/// blocks under it is stored and waits, and the node moves onto it when the
+/// last missing block arrives, the way Core's `ActivateBestChain` does after
+/// every stored block. satd used to try the reorg on the tip's arrival,
+/// disconnect its own chain, find the rest missing and roll back, and then
+/// stay on the shorter chain even after the rest arrived.
+#[test]
+fn a_heavier_branch_submitted_tip_first_is_activated_when_complete() {
+    use bitcoin::WitnessProgram;
+    use bitcoin::WitnessVersion;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{Address, Network, PublicKey};
+    // Distinct coinbase addresses, so the two chains differ from height 1
+    // (see `test_reorg_record_reflects_completed_state`).
+    let addr_a = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let secp = Secp256k1::new();
+    let sk_b = SecretKey::from_slice(&[0x35u8; 32]).unwrap();
+    let pk_b = PublicKey::new(sk_b.public_key(&secp));
+    let pkh_b = bitcoin::hashes::hash160::Hash::hash(&pk_b.to_bytes());
+    let prog_b = WitnessProgram::new(WitnessVersion::V0, pkh_b.as_byte_array()).unwrap();
+    let addr_b = Address::from_witness_program(prog_b, Network::Regtest).to_string();
+
+    let mut node_a = TestNode::start(&[]);
+    let a_hashes: Vec<String> = serde_json::from_value(
+        node_a.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr_a)]),
+    )
+    .unwrap();
+
+    let mut node_b = TestNode::start(&[]);
+    let b_hashes: Vec<String> = serde_json::from_value(
+        node_b.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr_b)]),
+    )
+    .unwrap();
+    let mut b_headers = Vec::new();
+    let mut b_blocks = Vec::new();
+    for h in &b_hashes {
+        b_headers.push(node_b.rpc_ok("getblockheader", vec![serde_json::json!(h), serde_json::json!(false)]));
+        b_blocks.push(node_b.rpc_ok("getblock", vec![serde_json::json!(h), serde_json::json!(0)]));
+    }
+    node_b.stop();
+
+    // The headers first, as a peer announces them, then the blocks from the
+    // top down.
+    for header in &b_headers {
+        node_a.rpc_ok("submitheader", vec![header.clone()]);
+    }
+    for (i, block) in b_blocks.iter().enumerate().rev() {
+        node_a.rpc_ok("submitblock", vec![block.clone()]);
+        let tip = node_a.rpc_ok("getbestblockhash", vec![]);
+        if i > 0 {
+            assert_eq!(tip, a_hashes[1], "the branch is incomplete until B1 arrives");
+        }
+    }
+    assert_eq!(
+        node_a.rpc_ok("getbestblockhash", vec![]),
+        b_hashes[2],
+        "B1 completed the heavier branch, so the node must be on it"
+    );
+
+    // One reorg, done once and all the way.
+    let hist = node_a.rpc_ok("getreorghistory", vec![]);
+    let records = hist["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{hist}");
+    assert_eq!(records[0]["old_tip"], a_hashes[1]);
+    assert_eq!(records[0]["new_tip"], b_hashes[2]);
+    assert_eq!(records[0]["reconnected"], serde_json::json!(b_hashes));
+
+    node_a.stop();
+}
+
 #[test]
 fn test_reorg_record_not_written_when_final_block_fails() {
     // Residual edge case: disconnect + intermediate side-chain reconnect

@@ -5705,6 +5705,17 @@ impl PeerManager {
                 }
             }
 
+            // A competing branch whose blocks are all stored, with none left
+            // to arrive and trigger the switch from `accept_block` (#856):
+            // blocks the IBD scheduler fetched before handing off, a data
+            // repair, a restart. The same situation as the tail below, for
+            // a branch that forks below the tip. Keyed inside on what has
+            // changed since the last attempt, so an idle wakeup is cheap and
+            // a failing reorg is not retried every 500ms.
+            if let Err(e) = chain_state.activate_best_stored_chain() {
+                tracing::warn!(error = %e, "Could not activate the best stored chain");
+            }
+
             // Drain any stored-but-unconnected tail on the best header chain
             // (issue #582). A torn-down IBD connector can leave blocks it
             // downloaded but never connected sitting on disk; nothing else
@@ -5730,11 +5741,10 @@ impl PeerManager {
     /// This is the steady-state counterpart of the IBD connect loop's
     /// stored-block walk: it exists so a tail downloaded by a scheduler
     /// that tore down before connecting it (issue #582) drains without a
-    /// network event. A failed branch activation is the other producer of
-    /// this state: `accept_block` stores the triggering block before the
-    /// reorg attempt, so when the activation aborts (an intermediate
-    /// block's data not yet stored — ordinary out-of-order delivery at
-    /// the tip), the block stays `DataStored` above the tip with nothing
+    /// network event. Out-of-order delivery at the tip is the other
+    /// producer of this state: a block whose parent has not arrived is
+    /// stored and waits (`accept_block` activates only a chain whose every
+    /// block has data), so it sits `DataStored` above the tip with nothing
     /// on the network path able to reach it — `request_missing_blocks`
     /// skips it (data present) and a re-sent copy dies as `Duplicate`.
     /// Once the late parent connects, this drain is what picks it up.
@@ -10960,12 +10970,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The mainnet stall reached through the reorg door rather than a
-    /// torn-down scheduler: block N+2 arrives before N+1 — ordinary
-    /// out-of-order delivery at the tip. `accept_block` stores N+2,
-    /// attempts to activate its branch, finds N+1's data missing, and
-    /// aborts the reorg cleanly. Correct — but the caller sees an error,
-    /// and nothing queues N+2 for another attempt:
+    /// The mainnet stall reached through out-of-order delivery rather than a
+    /// torn-down scheduler: block N+2 arrives before N+1 — ordinary at the
+    /// tip. `accept_block` stores N+2 and waits, since its parent has no
+    /// data. (It used to try to activate the branch, find N+1 missing and
+    /// abort the reorg, #739.) Nothing queues N+2 for another attempt:
     /// `request_missing_blocks` skips it forever after (data present)
     /// and a re-sent copy dies in `accept_block` as `Duplicate`. When
     /// N+1 then arrives and connects, only the steady-state drain can
@@ -10973,7 +10982,7 @@ mod tests {
     /// node was observed parked two blocks behind its headers tip for 21
     /// minutes, in total silence, with 40+ peers connected.
     #[test]
-    fn a_block_rejected_by_a_failed_reorg_connects_once_its_parent_arrives() {
+    fn a_block_stored_ahead_of_its_parent_connects_once_the_parent_arrives() {
         use crate::chain::state::tests::{build_test_block, make_chain_state};
 
         let (cs, dir) = make_chain_state();
@@ -10987,19 +10996,18 @@ mod tests {
         let (accepted, err) = cs.accept_headers(&[b2.header, b3.header]);
         assert_eq!(accepted, 2, "fixture: headers must be accepted ({err:?})");
 
-        // N+2 first. The side-chain branch stores it, the activation
-        // needs N+1's data, and the abort rails restore the old tip.
-        let e = cs
-            .accept_block(&b3)
-            .expect_err("activation must fail: N+1's data is missing");
+        // N+2 first. The side-chain branch stores it, and with N+1's data
+        // missing there is no chain to activate yet.
+        let r = cs.accept_block(&b3);
         assert!(
-            matches!(e, crate::chain::state::ChainError::FlatFile(_)),
-            "must fail the way the incident did (missing data, not bad-prevblk): {e:?}"
+            matches!(r, Ok(crate::chain::state::BlockAcceptance::Stored(_))),
+            "N+2 must be stored and wait for N+1: {r:?}"
         );
-        assert_eq!(cs.tip_height(), 1, "the abort must restore the pre-reorg tip");
+        assert_eq!(cs.tip_height(), 1, "the tip must not move");
+        assert_eq!(cs.reorg_abort_count(), 0, "no reorg may be attempted");
         assert!(
             cs.has_block_data(&b3.block_hash()),
-            "the rejected block's stored data must survive the abort"
+            "the waiting block's data must be stored"
         );
 
         // N+1 arrives moments later and extends the tip normally.
@@ -11017,7 +11025,7 @@ mod tests {
         assert_eq!(
             chain_state.tip_height(),
             3,
-            "the drain must connect the once-rejected block without a network event"
+            "the drain must connect the waiting block without a network event"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

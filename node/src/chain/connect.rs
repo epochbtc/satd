@@ -119,6 +119,20 @@ impl ConnectError {
     pub fn is_mutation_class(&self) -> bool {
         matches!(self, Self::TxValidation(e) if e.is_mutation_class())
     }
+
+    /// Whether this rejection may be recorded against the block as `Invalid`
+    /// (Core's `InvalidBlockFound`). Not a mutation-class rejection, and not
+    /// one of the failures that report this node's own index state instead of
+    /// anything about the block: marking a valid block invalid for those
+    /// strands its branch until an operator runs `reconsiderblock`.
+    pub fn is_verdict_on_block(&self) -> bool {
+        match self {
+            #[cfg(feature = "block-filter-index")]
+            Self::FilterIndexEmit(_) => false,
+            Self::SpIndexEmit(_) | Self::ChainTxGap { .. } | Self::TxSeqOverflow => false,
+            e => !e.is_mutation_class(),
+        }
+    }
 }
 
 /// Compute median time past (MTP) for a given height using the store directly.
@@ -1116,6 +1130,25 @@ mod tests {
     use bitcoin::{
         Amount, Block, BlockHash, Network, Sequence, Transaction, TxIn, TxOut, Witness,
     };
+
+    /// A reorg marks a block invalid on these. A contents verdict counts; a
+    /// mutation-class rejection does not (the hash does not commit to what was
+    /// rejected), and neither does a failure of this node's own index state.
+    #[test]
+    fn only_a_verdict_on_the_contents_marks_a_block_invalid() {
+        assert!(ConnectError::MissingOrSpentInput { outpoint: OutPoint::null() }.is_verdict_on_block());
+        assert!(ConnectError::BadCoinbaseValue.is_verdict_on_block());
+        assert!(ConnectError::ScriptFailed("x".into()).is_verdict_on_block());
+        assert!(
+            !ConnectError::TxValidation(crate::validation::ValidationError::BadMerkleRoot)
+                .is_verdict_on_block()
+        );
+        assert!(!ConnectError::ChainTxGap { parent: BlockHash::all_zeros() }.is_verdict_on_block());
+        assert!(!ConnectError::SpIndexEmit("x".into()).is_verdict_on_block());
+        assert!(!ConnectError::TxSeqOverflow.is_verdict_on_block());
+        #[cfg(feature = "block-filter-index")]
+        assert!(!ConnectError::FilterIndexEmit("x".into()).is_verdict_on_block());
+    }
 
     #[test]
     fn test_connect_genesis_block() {
