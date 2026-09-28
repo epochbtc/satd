@@ -5732,9 +5732,7 @@ impl PeerManager {
             drop(ready);
 
             // Drain all available blocks from the channel
-            while !*shutdown.borrow()
-                && let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv()
-            {
+            while let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv() {
                 let hash = block.block_hash();
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
@@ -5860,9 +5858,6 @@ impl PeerManager {
                 tracing::warn!(error = %e, "Could not activate the best stored chain");
             }
 
-            if *shutdown.borrow() {
-                continue;
-            }
             // Drain any stored-but-unconnected tail on the best header chain
             // (issue #582). A torn-down IBD connector can leave blocks it
             // downloaded but never connected sitting on disk; nothing else
@@ -11342,6 +11337,52 @@ mod tests {
             "the connector threads must exit on shutdown"
         );
         assert_eq!(chain_state.tip_height(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #868: shutdown also ends the IBD connector's compaction backpressure
+    /// pause, which otherwise waits up to 60 s and then connects a block
+    /// anyway.
+    ///
+    /// The store reports an L0 file count at the pause threshold, so the
+    /// connector pauses before its first block, with thirty stored and ready.
+    ///
+    /// Perturbation: drop the check in the backpressure wait and the join
+    /// times out while the wait runs its 60 s.
+    #[test]
+    fn shutdown_ends_the_ibd_connectors_backpressure_pause() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        store.controls().set_chainstate_l0_files(8);
+        let (cs, dir) = crate::chain::state::tests::make_chain_state_with_store(Box::new(store));
+        headers_ahead_of_the_tip(&cs, 30, true);
+        let chain_state = Arc::new(cs);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::with_config(
+            chain_state.clone(),
+            Arc::new(Mempool::new(1_000_000, 0)),
+            Arc::new(FeeEstimator::new()),
+            Network::Regtest,
+            shutdown_rx,
+            0,
+            125,
+            DEFAULT_MAX_INBOUND_PER_IP,
+            86400,
+            None,
+            None,
+            1,
+            50_000,
+            8,
+        );
+        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(chain_state.tip_height(), 0, "fixture: the connector must be paused");
+
+        shutdown_tx.send_replace(true);
+        assert!(
+            pm.join_connectors(Duration::from_secs(10)),
+            "the connector threads must exit on shutdown"
+        );
+        assert_eq!(chain_state.tip_height(), 0, "no block may connect once shutdown is signalled");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
