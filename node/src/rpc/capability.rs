@@ -70,6 +70,10 @@ fn required_capability(method: &str) -> Capability {
         // Writes arbitrary bytes onto a peer connection: the same class of
         // test-only peer control as `addconnection`.
         "sendmsgtopeer" => Capability::TestNet,
+        // Writes an address of the caller's choosing into the address book,
+        // which seeds the dial list on the next start: test-only peer
+        // control, like the two above.
+        "addpeeraddress" => Capability::TestNet,
         _ => match classify(method) {
             Some(RpcAccess::Read) => Capability::RpcRead,
             // Handing a transaction to the mempool is its own capability so a
@@ -592,6 +596,7 @@ mod tests {
         for (method, cap) in [
             ("setmocktime", Capability::TestClock),
             ("addconnection", Capability::TestNet),
+            ("addpeeraddress", Capability::TestNet),
         ] {
             assert_eq!(required_capability(method), cap, "{method}");
             assert_ne!(
@@ -604,6 +609,38 @@ mod tests {
         assert_ne!(Capability::TestClock, Capability::TestNet);
         assert_eq!(Capability::TestNet.as_str(), "test:net");
         assert_eq!(Capability::parse("test:net"), Some(Capability::TestNet));
+    }
+
+    /// `addpeeraddress` writes an address of the caller's choosing into
+    /// the book the node dials from, so it takes `test:net` too.
+    #[tokio::test]
+    async fn a_write_token_is_forbidden_on_addpeeraddress() {
+        let write_token = Principal::token(
+            Arc::from("rw"),
+            CapabilitySet::EMPTY
+                .with(Capability::RpcRead)
+                .with(Capability::RpcWrite),
+            None,
+            None,
+            Principal::operator().accounting().clone(),
+        );
+        let (svc, dispatched) = filter();
+        let rp = svc.call(req_with("addpeeraddress", Some(write_token))).await;
+        assert!(rp.is_error());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(rp.as_json().get().contains("test:net"), "{}", rp.as_json().get());
+
+        let net_token = Principal::token(
+            Arc::from("net"),
+            CapabilitySet::EMPTY.with(Capability::TestNet),
+            None,
+            None,
+            Principal::operator().accounting().clone(),
+        );
+        let (svc, dispatched) = filter();
+        let rp = svc.call(req_with("addpeeraddress", Some(net_token))).await;
+        assert!(rp.is_success(), "{}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

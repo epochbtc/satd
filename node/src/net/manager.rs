@@ -1498,9 +1498,23 @@ impl PeerManager {
     /// peer's per-IP rate limit will FIN all but the first within a few
     /// hundred ms — surfacing as severe peer churn.
     pub fn add_connect_addr(&self, addr: SocketAddr) {
+        self.add_connect_addr_from(
+            addr,
+            crate::net::addrman::DEFAULT_SERVICES,
+            addr.ip(),
+        );
+    }
+
+    /// [`add_connect_addr`](Self::add_connect_addr) for a gossiped address,
+    /// recording the service bits it was announced with and the peer that
+    /// announced it (Core's `nServices` and `source`, which `getnodeaddresses`
+    /// and `getrawaddrman` report).
+    pub fn add_connect_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
         // Record in the persistent address book (peers.dat) as a *new*
         // address. This is the chokepoint for gossiped addresses.
-        self.addrman.write().add(addr, now_unix_secs());
+        self.addrman
+            .write()
+            .add_from(addr, now_unix_secs(), services, source);
         // Under `-connect` the node dials only the peers it was told to.
         // Core keeps learning addresses in that mode (they go to the addrman
         // above) but sets `m_use_addrman_outgoing = false`, so it never opens
@@ -1599,6 +1613,52 @@ impl PeerManager {
     /// fixed-seed fallback).
     pub fn addrman_is_empty(&self) -> bool {
         self.addrman.read().is_empty()
+    }
+
+    /// A copy of every address-book entry, for `getnodeaddresses`.
+    pub fn addrman_snapshot(&self) -> Vec<crate::net::addrman::AddrEntry> {
+        self.addrman.read().iter().cloned().collect()
+    }
+
+    /// Every address-book entry with its derived `bucket/position` slot, for
+    /// `getrawaddrman`.
+    pub fn addrman_positions(
+        &self,
+    ) -> Vec<(crate::net::addrman::AddrSlot, crate::net::addrman::AddrEntry)> {
+        self.addrman
+            .read()
+            .positions()
+            .into_iter()
+            .map(|(slot, e)| (slot, e.clone()))
+            .collect()
+    }
+
+    /// New/tried counts per network, for `getaddrmaninfo`.
+    pub fn addrman_counts(
+        &self,
+    ) -> std::collections::BTreeMap<&'static str, crate::net::addrman::TableCounts> {
+        self.addrman.read().counts_by_network()
+    }
+
+    /// Core's `addpeeraddress`: add an address to the book by hand. Errors
+    /// are Core's strings (`failed-adding-to-new` / `failed-adding-to-tried`).
+    ///
+    /// The address only enters the book. It does not join the dial list, as
+    /// in Core, where the RPC touches addrman and nothing else.
+    pub fn addrman_add_manual(&self, addr: SocketAddr, tried: bool) -> Result<(), &'static str> {
+        self.addrman
+            .write()
+            .add_manual(addr, tried, crate::time::now_secs())
+    }
+
+    /// The IP of peer `id`, as the `source` of the addresses it announces.
+    /// `None` for an unknown peer and for an onion peer, whose socket is the
+    /// unspecified placeholder: the address is then its own source, as for
+    /// any address whose announcer the book cannot represent.
+    fn peer_ip(&self, id: PeerId) -> Option<IpAddr> {
+        let peers = self.peers.read();
+        let ip = peers.get(&id)?.info.addr.ip();
+        (!ip.is_unspecified()).then_some(ip)
     }
 
     /// Install a custom addrman network-group function (e.g. `-asmap`).
@@ -3861,13 +3921,18 @@ impl PeerManager {
                 // Otherwise this is the message that latches the link's
                 // addr relay on, inbound included.
                 let relay_addrs = self.setup_address_relay(id);
+                let source = self.peer_ip(id);
                 for (_, addr) in &addrs {
                     if relay_addrs
                         && let Ok(sock_addr) = addr.socket_addr()
                         && !self.is_addr_connected(&sock_addr)
                         && !self.is_addr_banned(&sock_addr)
                     {
-                        self.add_connect_addr(sock_addr);
+                        self.add_connect_addr_from(
+                            sock_addr,
+                            addr.services.to_u64(),
+                            source.unwrap_or(sock_addr.ip()),
+                        );
                     }
                 }
                 self.note_addr_fetch_answered(id, addrs.len());
@@ -4005,6 +4070,7 @@ impl PeerManager {
                 // As above: a block-relay-only link relays no addresses in
                 // either direction, and anything else latches on.
                 let relay_addrs = self.setup_address_relay(id);
+                let source = self.peer_ip(id);
                 for addr_msg in addrs.iter().filter(|_| relay_addrs) {
                     match &addr_msg.addr {
                         // BIP 155 TorV3: `socket_addr()` can't represent these,
@@ -4022,7 +4088,11 @@ impl PeerManager {
                                 && !self.is_addr_connected(&sock_addr)
                                 && !self.is_addr_banned(&sock_addr)
                             {
-                                self.add_connect_addr(sock_addr);
+                                self.add_connect_addr_from(
+                                    sock_addr,
+                                    addr_msg.services.to_u64(),
+                                    source.unwrap_or(sock_addr.ip()),
+                                );
                             }
                         }
                     }
@@ -12204,6 +12274,49 @@ mod tests {
 
         pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
         assert_eq!(info(&pm), (true, true), "high-bandwidth v2");
+    }
+
+    /// `addr` and `addrv2` record what `getnodeaddresses` and
+    /// `getrawaddrman` report: the announced service bits, and the peer that
+    /// announced the address as its source.
+    #[test]
+    fn gossiped_addresses_keep_their_services_and_source() {
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+        let pm = empty_peer_manager();
+        let announcer: SocketAddr = "203.0.113.9:8333".parse().unwrap();
+        pm.peers
+            .write()
+            .insert(1, mk_handle(1, announcer, Direction::Inbound, PeerState::Connected));
+
+        let v1: SocketAddr = "198.51.100.1:8333".parse().unwrap();
+        let v1_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
+        pm.handle_message(
+            1,
+            NetworkMessage::Addr(vec![(1, Address::new(&v1, v1_services))]),
+            crate::net::flow::InFlight::new(pm.peer_flow(1)),
+        );
+        pm.handle_message(
+            1,
+            NetworkMessage::AddrV2(vec![AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NETWORK_LIMITED,
+                addr: AddrV2::Ipv4("198.51.100.2".parse().unwrap()),
+                port: 8333,
+            }]),
+            crate::net::flow::InFlight::new(pm.peer_flow(1)),
+        );
+
+        let book = pm.addrman_snapshot();
+        let entry = |ip: &str| {
+            book.iter()
+                .find(|e| e.addr.ip().to_string() == ip)
+                .unwrap_or_else(|| panic!("{ip} not in the address book: {book:?}"))
+        };
+        assert_eq!(entry("198.51.100.1").services, v1_services.to_u64());
+        assert_eq!(entry("198.51.100.1").source, announcer.ip());
+        assert_eq!(entry("198.51.100.2").services, ServiceFlags::NETWORK_LIMITED.to_u64());
+        assert_eq!(entry("198.51.100.2").source, announcer.ip());
     }
 
     // ---- BIP 152 high-bandwidth peer selection ----

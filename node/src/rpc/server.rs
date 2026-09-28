@@ -132,9 +132,11 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("clearbanned", "Network"),
     ("disconnectnode", "Network"),
     ("getaddednodeinfo", "Network"),
+    ("getaddrmaninfo", "Network"),
     ("getconnectioncount", "Network"),
     ("getnettotals", "Network"),
     ("getnetworkinfo", "Network"),
+    ("getnodeaddresses", "Network"),
     ("getorphaninfo", "Network"),
     ("getpeerinfo", "Network"),
     ("listbanned", "Network"),
@@ -181,7 +183,22 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("sendmsgtopeer", "hidden"),
     ("generate", "hidden"),
     ("unsubscribemempool", "hidden"),
+    ("addpeeraddress", "hidden"),
+    ("getrawaddrman", "hidden"),
 ];
+
+/// Core's `GetNetworkNames()`: every network `getaddrmaninfo` reports and
+/// `getnodeaddresses` accepts, in Core's order.
+const CORE_NETWORK_NAMES: [&str; 5] = ["ipv4", "ipv6", "onion", "i2p", "cjdns"];
+
+/// Core's `ParseNetwork` (`src/netbase.cpp`), case-insensitive. `None` is
+/// Core's `NET_UNROUTABLE`, which the RPCs report as "not recognized".
+/// Core 31.0 removed the deprecated `tor` alias for `onion`; earlier
+/// releases accept it with a warning.
+fn parse_network_name(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    CORE_NETWORK_NAMES.into_iter().find(|n| *n == lower)
+}
 
 /// Max concurrent RPC connections per listener. Mirrors jsonrpsee's own
 /// `ServerConfig` default (100). Used both as the inner `ConnectionGuard`
@@ -3197,6 +3214,140 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!({}))
     })?;
 
+    // --- Address manager (Core's rpc/net.cpp) ---
+
+    // `getnodeaddresses [count=1] [network]`: a shuffled sample of the
+    // address book. satd's book holds socket addresses only, so `onion`,
+    // `i2p` and `cjdns` are valid networks that are always empty.
+    module.register_method("getnodeaddresses", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let count: Option<i64> = args.optional("count")?;
+        let network: Option<String> = args.optional("network")?;
+        args.check()?;
+        let count = count.unwrap_or(1);
+        if count < 0 {
+            return Err(ErrorObjectOwned::owned(-8, "Address count out of range", None::<()>));
+        }
+        let network = match network {
+            None => None,
+            Some(n) => match parse_network_name(&n) {
+                Some(net) => Some(net),
+                None => {
+                    return Err(ErrorObjectOwned::owned(
+                        -8,
+                        format!("Network not recognized: {n}"),
+                        None::<()>,
+                    ));
+                }
+            },
+        };
+        let mut entries: Vec<_> = ctx
+            .peer_manager
+            .addrman_snapshot()
+            .into_iter()
+            .filter(|e| {
+                network.is_none_or(|n| crate::net::addrman::network_name(e.addr.ip()) == n)
+            })
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            entries.shuffle(&mut rand::thread_rng());
+        }
+        if count > 0 {
+            entries.truncate(count as usize);
+        }
+        let out: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "time": e.last_seen,
+                    "services": e.services,
+                    "address": crate::net::addrman::addr_string(e.addr.ip()),
+                    "port": e.addr.port(),
+                    "network": crate::net::addrman::network_name(e.addr.ip()),
+                })
+            })
+            .collect();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Array(out))
+    })?;
+
+    // `getaddrmaninfo`: new/tried/total per network plus `all_networks`.
+    module.register_method("getaddrmaninfo", |_params, ctx, _extensions| {
+        let counts = ctx.peer_manager.addrman_counts();
+        let mut out = serde_json::Map::new();
+        let mut all = crate::net::addrman::TableCounts::default();
+        for net in CORE_NETWORK_NAMES {
+            let c = counts.get(net).copied().unwrap_or_default();
+            all.new += c.new;
+            all.tried += c.tried;
+            out.insert(
+                net.to_string(),
+                serde_json::json!({"new": c.new, "tried": c.tried, "total": c.total()}),
+            );
+        }
+        out.insert(
+            "all_networks".to_string(),
+            serde_json::json!({"new": all.new, "tried": all.tried, "total": all.total()}),
+        );
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(out))
+    })?;
+
+    // Core's hidden `addpeeraddress`: put an address in the book by hand,
+    // for tests. Touches the book only; nothing is dialled.
+    module.register_method("addpeeraddress", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let address: String = args.required("address")?;
+        let port: i64 = args.required("port")?;
+        let tried: bool = args.optional_or("tried", false)?;
+        args.check()?;
+        // Core reads the port with `getInt<uint16_t>`, whose range failure
+        // is a bare `std::runtime_error` (-1).
+        let port = u16::try_from(port)
+            .map_err(|_| ErrorObjectOwned::owned(-1, "JSON integer out of range", None::<()>))?;
+        // `LookupHost(addr, /*fAllowLookup=*/false)`: a literal IP only.
+        let ip: std::net::IpAddr = address.parse().map_err(|_| {
+            ErrorObjectOwned::owned(-30, "Invalid IP address", None::<()>)
+        })?;
+        let mut out = serde_json::Map::new();
+        let success = match ctx
+            .peer_manager
+            .addrman_add_manual(std::net::SocketAddr::new(ip, port), tried)
+        {
+            Ok(()) => true,
+            Err(e) => {
+                out.insert("error".to_string(), serde_json::json!(e));
+                false
+            }
+        };
+        out.insert("success".to_string(), serde_json::json!(success));
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(out))
+    })?;
+
+    // Core's hidden `getrawaddrman`: every entry keyed by `bucket/position`.
+    // satd's slots are derived, not stored (see `net::addrman`).
+    module.register_method("getrawaddrman", |_params, ctx, _extensions| {
+        let mut new = serde_json::Map::new();
+        let mut tried = serde_json::Map::new();
+        for (slot, e) in ctx.peer_manager.addrman_positions() {
+            let entry = serde_json::json!({
+                "address": crate::net::addrman::addr_string(e.addr.ip()),
+                "port": e.addr.port(),
+                "services": e.services,
+                "time": e.last_seen,
+                "network": crate::net::addrman::network_name(e.addr.ip()),
+                "source": crate::net::addrman::addr_string(e.source),
+                "source_network": crate::net::addrman::network_name(e.source),
+            });
+            let key = format!("{}/{}", slot.bucket, slot.position);
+            if slot.tried {
+                tried.insert(key, entry);
+            } else {
+                new.insert(key, entry);
+            }
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({"new": new, "tried": tried}))
+    })?;
+
     module.register_method("disconnectnode", |params, ctx, _extensions| {
         // Core takes the peer either by address or by id, and requires
         // exactly one of the two -- `disconnectnode "" 3` is how its own test
@@ -5070,13 +5221,23 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_four() {
+    fn the_hidden_commands_are_the_expected_six() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(hidden, ["addconnection", "sendmsgtopeer", "generate", "unsubscribemempool"]);
+        assert_eq!(
+            hidden,
+            [
+                "addconnection",
+                "sendmsgtopeer",
+                "generate",
+                "unsubscribemempool",
+                "addpeeraddress",
+                "getrawaddrman",
+            ]
+        );
     }
 }
 
