@@ -8288,6 +8288,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stopatheight",
     "testactivationheight",
     "vbparams",
+    "mocktime",
     "consensus",
     // Indexing
     "txindex",
@@ -10293,6 +10294,31 @@ testactivationheight=segwit@900
             "{}",
             file_only.user_agent
         );
+    }
+
+    /// `mocktime=` in `bitcoin.conf` reaches `Config::mocktime`, as it does in
+    /// Bitcoin Core. It used to be a warn-and-skip key, so the file spelling
+    /// was dropped before the resolver could read it.
+    #[test]
+    fn mocktime_from_config_file() {
+        use clap::Parser;
+        for body in [
+            "regtest=1\n[regtest]\nmocktime=1700000000\n",
+            "regtest=1\nmocktime=1700000000\n",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conf = dir.path().join("bitcoin.conf");
+            std::fs::write(&conf, body).unwrap();
+            let argv = [
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
+            let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+            assert_eq!(cfg.mocktime, Some(1_700_000_000), "conf body {body:?}");
+        }
     }
 
     /// The config-file spelling resolves through the same path.
