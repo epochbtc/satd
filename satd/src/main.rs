@@ -61,7 +61,7 @@ impl notify::WatchdogProbe for ChainStateProbe {
 /// reindex `-stopatheight`), each of which would unwind and drop the
 /// runtime. This guard funnels every such drop onto a plain OS thread —
 /// where dropping a runtime is allowed — and bounds the wait so a wedged
-/// streaming client can't hold shutdown open. (`std::process::exit` paths
+/// streaming client can't hold shutdown open. (`exit_now` paths
 /// skip the destructor entirely, which is fine: no drop, no panic.)
 struct ApiRuntimeGuard(Option<tokio::runtime::Runtime>);
 
@@ -213,7 +213,7 @@ fn write_rebuild_marker(
             node::rebuild_marker::path(net_datadir).display()
         );
         auth.cleanup();
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 }
 
@@ -228,7 +228,7 @@ fn remove_rebuild_marker(net_datadir: &std::path::Path, auth: &node::rpc::auth::
             node::rebuild_marker::path(net_datadir).display()
         );
         auth.cleanup();
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 }
 
@@ -317,8 +317,47 @@ fn report_ancestry_damage(
         }
 }
 
-#[tokio::main]
-async fn main() {
+/// How long the core runtime is given, once `run` has returned, to finish
+/// the tasks still holding the chainstate: dropping it would otherwise wait
+/// without limit for every blocking task.
+const CORE_RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long shutdown waits for the stall watchdog, periodic compactor and
+/// compaction diagnostic to exit. They are woken as shutdown starts, so this
+/// only matters for a forced compaction still running.
+const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The core runtime is built here rather than by `#[tokio::main]` so that the
+/// process ends with a bounded runtime shutdown and `_exit`, not with libc's
+/// `exit()`. `exit()` runs the C++ static destructors, RocksDB's among them,
+/// and any thread still inside RocksDB then fails with SIGSEGV (#868).
+/// `run` stops and joins the node's own threads first; `_exit` covers
+/// whatever outlives them. A panic in `run` and every fatal error exit take
+/// `_exit` too.
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build the core runtime");
+    let chainstate_db = node::shutdown::exit_now_on_panic(|| runtime.block_on(run()));
+    // Drops every task, and with them their references to the chainstate.
+    runtime.shutdown_timeout(CORE_RUNTIME_SHUTDOWN);
+    if let Some(db) = chainstate_db {
+        match db.strong_count() {
+            0 => tracing::info!("Chainstate database closed"),
+            held => tracing::warn!(
+                held,
+                "Chainstate database still referenced at exit; exiting without closing it"
+            ),
+        }
+    }
+    node::shutdown::exit_now(0);
+}
+
+/// The node, from config load to the end of a graceful shutdown. Returns a
+/// weak reference to the chainstate store, if one was opened, for `main` to
+/// report whether its database closed.
+async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> {
     // Config must be parsed before tracing init so --log-format can select
     // the formatter. Config parse errors go to stderr as plain text. The
     // parsed CLI is retained (`cli_snapshot`) so SIGHUP config reload can
@@ -327,7 +366,7 @@ async fn main() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Error: {}", e);
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -339,7 +378,7 @@ async fn main() {
     // so that stops being an assumption if either changes.
     if !node::set_user_agent(config.user_agent.clone()) {
         eprintln!("Error: could not install user agent {}", config.user_agent);
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Install `-testactivationheight` overrides (regtest only, enforced by
@@ -506,7 +545,7 @@ async fn main() {
             net_datadir.display(),
             e
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Consume the clean-shutdown marker from the previous run (if any), BEFORE
@@ -551,7 +590,7 @@ async fn main() {
             legacy_redb.display(),
             legacy_redb.display(),
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Partition dbcache budget: 1/3 to RocksDB block cache, 2/3 to CoinCache overlays
@@ -575,7 +614,7 @@ async fn main() {
             // there is nothing partial left to protect.
             if let Err(e) = node::rebuild_marker::remove(&net_datadir) {
                 eprintln!("Error removing a stale rebuild marker: {e}");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             tracing::info!(
                 "Removed a rebuild marker left by a chainstate that no longer exists"
@@ -598,7 +637,7 @@ async fn main() {
             }
             InterruptedRebuild::Refuse(msg) => {
                 eprintln!("{msg}");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     }
@@ -641,7 +680,7 @@ async fn main() {
                     net_datadir.join("chainstate").display(),
                     config.blocks_dir().display(),
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             tracing::warn!(
                 "Chainstate is {stored_desc} schema, older than this satd's v{expected}; \
@@ -653,7 +692,7 @@ async fn main() {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error opening chain database: {}", e);
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         }
@@ -665,11 +704,11 @@ async fn main() {
                  -upgradechainstate never downgrades a chainstate; run with \
                  --reindex-chainstate to rebuild it at this version."
             );
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -703,7 +742,7 @@ async fn main() {
                 // reason in the log.
                 println!("Unable to open cookie authentication file for writing: {e}");
                 eprintln!("Error: Unable to start HTTP server. See debug log for details.");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -730,7 +769,7 @@ async fn main() {
             "Error: authfile is set but no operator credential (cookie / rpcuser+rpcpassword / \
              rpcauth) is configured — refusing to start to avoid locking out bitcoin-cli/sat-cli"
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
     let auth = Arc::new(RpcAuth::Verify(
         parking_lot::RwLock::new(credentials),
@@ -759,7 +798,7 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Error loading authfile {}: {}", path.display(), e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         None => None,
@@ -863,7 +902,7 @@ async fn main() {
         if let Err(e) = store.clear_all() {
             eprintln!("Error clearing database for reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     } else if reindex_chainstate {
         // Handle -reindex-chainstate: clear UTXO/undo, keep block index.
@@ -912,13 +951,13 @@ async fn main() {
                         plan.tip_height()
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("Error planning chainstate reindex: {}", e);
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         }
@@ -937,7 +976,7 @@ async fn main() {
         if let Err(e) = store.clear_chainstate() {
             eprintln!("Error clearing chainstate for reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     }
 
@@ -954,7 +993,7 @@ async fn main() {
         Err(e) => {
             eprintln!("Error initializing block storage: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
     flat_files.set_fast_prune(config.fastprune);
@@ -1005,7 +1044,7 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Error: invalid assumevalid hash '{}': {}", hash_str, e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     };
@@ -1108,7 +1147,7 @@ async fn main() {
         Err(e) => {
             eprintln!("Error initializing chain state: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -1117,6 +1156,9 @@ async fn main() {
         tip = %chain_state.tip_hash(),
         "Chain state initialized"
     );
+    // The chainstate database closes when the last reference to its store is
+    // dropped; `main` checks this at exit.
+    let chainstate_db = Arc::downgrade(chain_state.store_ref());
 
     // AssumeUTXO: re-attach a pending background validator left by a prior
     // run, or refuse to start if that snapshot was proven invalid. A
@@ -1138,12 +1180,12 @@ async fn main() {
                  (--reindex) or removing the datadir's chainstate and reloading a valid snapshot."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         Err(e) => {
             eprintln!("FATAL: cannot resume pending AssumeUTXO snapshot: {e}");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     }
 
@@ -1300,7 +1342,7 @@ async fn main() {
             // Distinct from the generic exit(1) used throughout startup, so an
             // operator's alerting can tell "chainstate is damaged" apart from
             // "the config file has a typo" without scraping stderr.
-            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+            node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
         }
         if !audit.unvalidated_floor.is_empty() {
             // Normal on an AssumeUTXO node: history below the snapshot base
@@ -1372,7 +1414,7 @@ async fn main() {
              validating-only node."
         );
         auth.cleanup();
-        std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+        node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
     }
 
     // Reloadable reorg-webhook target, shared with the dispatcher. Stays `None`
@@ -1439,7 +1481,7 @@ async fn main() {
         ) {
             eprintln!("Error during reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Finished, even when `-stopatheight` cut the connect short: the
         // block index then ends where the chainstate does, which is an
@@ -1458,7 +1500,7 @@ async fn main() {
                 "Exiting after reindex reached -stopatheight"
             );
             auth.cleanup();
-            return;
+            return Some(chainstate_db);
         }
     } else if reindex_chainstate {
         startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
@@ -1471,7 +1513,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error during chainstate reindex: {}", e);
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         // Only a replay that reached the chain's tip is finished. One that
@@ -1493,7 +1535,7 @@ async fn main() {
                 "Exiting after chainstate reindex reached -stopatheight"
             );
             auth.cleanup();
-            return;
+            return Some(chainstate_db);
         }
     }
 
@@ -1525,7 +1567,7 @@ async fn main() {
             );
             report_ancestry_damage(&audit, config.prune, &net_datadir);
             auth.cleanup();
-            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+            node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
         }
     }
 
@@ -1547,7 +1589,7 @@ async fn main() {
                      please report it with the message above."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -1575,7 +1617,7 @@ async fn main() {
                 Err(e) => {
                     eprintln!("FATAL: --fast-start: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         } else {
@@ -1641,7 +1683,7 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("Error loading policyfile {}:\n{}", path.display(), e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -1815,7 +1857,7 @@ async fn main() {
         Err(e) => {
             tracing::error!("events bus: failed to resolve edge identity: {e}");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
     tracing::info!(
@@ -1975,7 +2017,7 @@ async fn main() {
             Err(e) => {
                 tracing::error!("events gRPC sink: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -1996,7 +2038,7 @@ async fn main() {
             Err(e) => {
                 tracing::error!("events ZMQ sink: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2090,7 +2132,7 @@ async fn main() {
             Err(e) => {
                 tracing::error!("streamws transport: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2267,7 +2309,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error loading asmap: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2840,7 +2882,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         (None, None, None) => None,
@@ -2850,7 +2892,7 @@ async fn main() {
             // partial-config gate.
             eprintln!("Error: --rpctlsbind requires --rpctlscert AND --rpctlskey");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -2879,7 +2921,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error: invalid --rpcreadonlytlsbind {addr_str:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         (None, None, None) => None,
@@ -2888,7 +2930,7 @@ async fn main() {
                 "Error: --rpcreadonlytlsbind requires --rpcreadonlytlscert AND --rpcreadonlytlskey"
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -2988,7 +3030,7 @@ async fn main() {
         Err(e) => {
             eprintln!("Error starting RPC server: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -3109,7 +3151,7 @@ async fn main() {
             Err(e) => {
                 tracing::error!(target: "alert", error = %e, "alertfile is unusable");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -3153,7 +3195,7 @@ async fn main() {
                 Err(e) => {
                     eprintln!("Error: -mcpbind/-mcpport: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let tls_configured = config.mcp_tls_cert.is_some() && config.mcp_tls_key.is_some();
@@ -3168,7 +3210,7 @@ async fn main() {
                      set. A remote MCP listener must be authenticated; set --mcpallowremote \
                      (which requires --mcpauth and --authfile), or bind to loopback."
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // A remote MCP listener must use TLS so the bearer token is never
             // sent in cleartext. Config-load validation already enforces this
@@ -3181,7 +3223,7 @@ async fn main() {
                      A remote MCP listener must use TLS so the bearer token is not sent in \
                      cleartext; set --mcpcert and --mcpkey, or bind to loopback."
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // Build the rustls acceptor when cert+key are present. mTLS adds
             // client-cert verification + the subject allowlist on top.
@@ -3194,7 +3236,7 @@ async fn main() {
                     },
                     (true, None) => {
                         eprintln!("Error: --mcpmtls=1 requires --mcpmtlsclientca");
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                     (false, _) => tls_config::ClientAuthPolicy::Disabled,
                 };
@@ -3202,7 +3244,7 @@ async fn main() {
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("Error: failed to build MCP TLS acceptor: {e}");
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                 };
                 let allow =
@@ -3303,7 +3345,7 @@ async fn main() {
                             tls.bind
                         );
                         auth.cleanup();
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                 },
             };
@@ -3378,7 +3420,7 @@ async fn main() {
                      or set --esplora=0 to skip the tx-endpoint surface."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // Round-2 review H1: same address-index completeness gate
             // as the Electrum startup path. Esplora's `/address/*`
@@ -3396,7 +3438,7 @@ async fn main() {
                      to skip the Esplora listener."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             let bind: SocketAddr = match config.esplora_bind.parse() {
                 Ok(a) => a,
@@ -3407,7 +3449,7 @@ async fn main() {
                         config.esplora_bind
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let auth_cfg = match &config.esplora_auth {
@@ -3493,7 +3535,7 @@ async fn main() {
                 Err(e) => {
                     eprintln!("Error: esplora startup failed: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             // Bind synchronously so a port conflict / permissions error
@@ -3504,7 +3546,7 @@ async fn main() {
                 Err(e) => {
                     eprintln!("Error: esplora listener could not bind to {bind}: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             // TLS listener (optional). Same pattern as Electrum:
@@ -3524,7 +3566,7 @@ async fn main() {
                         "Error: --esploratlsbind requires --esploratlscert AND --esploratlskey"
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
                 (Some(addr_str), Some(cert), Some(key)) => {
                     let tls_bind: SocketAddr = match addr_str.parse() {
@@ -3534,7 +3576,7 @@ async fn main() {
                                 "Error: invalid --esploratlsbind {addr_str:?}: {e}"
                             );
                             auth.cleanup();
-                            std::process::exit(1);
+                            node::shutdown::exit_now(1);
                         }
                     };
                     // mTLS policy: when --esploramtls=1, build the
@@ -3557,7 +3599,7 @@ async fn main() {
                         Err(e) => {
                             eprintln!("Error: esplora TLS config: {e}");
                             auth.cleanup();
-                            std::process::exit(1);
+                            node::shutdown::exit_now(1);
                         }
                     };
                     let tls_listener =
@@ -3568,7 +3610,7 @@ async fn main() {
                                     "Error: esplora TLS listener could not bind to {tls_bind}: {e}"
                                 );
                                 auth.cleanup();
-                                std::process::exit(1);
+                                node::shutdown::exit_now(1);
                             }
                         };
                     Some((tls_bind, tls_listener, acceptor))
@@ -3642,7 +3684,7 @@ async fn main() {
                  or set --electrum=0 to skip the Electrum server."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Round-1 review H2: refuse to bind Electrum when the
         // address-history CFs are known to be partial. Without this
@@ -3663,7 +3705,7 @@ async fn main() {
                  to skip the Electrum server."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Bind-address parsing exits cleanly on invalid input rather
         // than panicking (review H3). The plain-bind value comes from
@@ -3677,7 +3719,7 @@ async fn main() {
                     config.electrum_bind
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let electrum_tls_bind = match config
@@ -3690,7 +3732,7 @@ async fn main() {
             Some((raw, Err(e))) => {
                 eprintln!("Error: invalid --electrumtlsbind {raw:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let electrum_cfg = electrum_proto::ElectrumConfig {
@@ -3753,7 +3795,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error: electrum server bind failed: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         // Mirror the Esplora fix: read back actual bound addresses
@@ -3794,7 +3836,7 @@ async fn main() {
             raw.parse().unwrap_or_else(|e| {
                 eprintln!("Error: invalid --{flag} {raw:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             })
         };
         let stratum_bind = parse_bind("stratumbind", &config.stratum_bind);
@@ -3862,7 +3904,7 @@ async fn main() {
             Err(e) => {
                 eprintln!("Error: stratum server bind failed: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let reported_bind = server
@@ -3955,7 +3997,7 @@ async fn main() {
                          Set -port=<n>/-bind=<addr> to change it, or -listen=0 to disable inbound P2P."
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let pm = peer_manager.clone();
@@ -3984,7 +4026,7 @@ async fn main() {
                      Another instance of satd may already be running, or the port is in use."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let pm = peer_manager.clone();
@@ -4204,7 +4246,7 @@ async fn main() {
         tokio::spawn(async move {
             if let Err(e) = fast_start::load_when_ready(cs, dd, path, prune, dbcache, sd).await {
                 tracing::error!(error = %e, "FATAL: --fast-start snapshot load failed");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         });
     }
@@ -4228,24 +4270,33 @@ async fn main() {
     // restarts us). Deliberately not a tokio task — the wedge we are
     // protecting against parks every tokio worker, so a tokio-scheduled
     // watchdog would freeze with the rest.
-    node::stall_watchdog::spawn_stall_watchdog(
+    //
+    // It and the two threads below sleep on `maintenance_stop`, which
+    // shutdown sets as it starts, and are joined before the process exits.
+    let maintenance_stop = node::shutdown::ThreadStop::default();
+    let mut maintenance_threads: Vec<node::shutdown::NamedThread> = Vec::new();
+    if let Some(handle) = node::stall_watchdog::spawn_stall_watchdog(
         chain_state.clone(),
         std::time::Duration::from_secs(config.stall_watchdog_secs),
         std::time::Duration::from_secs(config.stall_abort_secs),
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("stall-watchdog", handle));
+    }
 
     // Periodic forced-compaction thread: backstop for RocksDB compaction
     // falling behind. Forces a chainstate compaction when the L0 file count
     // stays above the configured threshold for a full interval. Synchronous
     // and long-running, so it gets its own OS thread rather than a tokio
     // worker.
-    node::stall_watchdog::spawn_periodic_compactor(
+    if let Some(handle) = node::stall_watchdog::spawn_periodic_compactor(
         chain_state.clone(),
         std::time::Duration::from_secs(config.compaction_interval_secs),
         config.compaction_l0_at,
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("rocksdb-compactor", handle));
+    }
 
     // Per-CF pending-compaction diagnostic. Logs one INFO snapshot
     // every `compaction_diag_interval_secs` (default 60) showing the
@@ -4254,11 +4305,13 @@ async fn main() {
     // backlog into a silent disk-fill — the existing compactor reads
     // only the `coins` CF, which stayed healthy throughout while the
     // four secondary-index CFs accumulated ~370 GB of pending work.
-    node::stall_watchdog::spawn_compaction_diagnostic(
+    if let Some(handle) = node::stall_watchdog::spawn_compaction_diagnostic(
         chain_state.clone(),
         std::time::Duration::from_secs(config.compaction_diag_interval_secs),
-        shutdown_rx.clone(),
-    );
+        maintenance_stop.clone(),
+    ) {
+        maintenance_threads.push(("rocksdb-diag", handle));
+    }
 
     // All listeners bound, all background tasks spawned. Tell the
     // service manager we're up. This stops the startup heartbeat and
@@ -4372,6 +4425,12 @@ async fn main() {
         }
     }
 
+    // Wake the stall watchdog, periodic compactor and compaction diagnostic
+    // out of their sleeps; they are joined below, after the flush. The block
+    // connector stops on the shutdown watch, which every exit from the loop
+    // above has set.
+    maintenance_stop.stop();
+
     // Stop the recent-height window build, if it is still scanning or
     // waiting to retry a failed scan. It checks the flag every 64k coins and
     // every 50ms of a retry wait, so this is milliseconds; the wait is
@@ -4435,6 +4494,35 @@ async fn main() {
         }
     }
 
+    // Wait for the block connector to stop before flushing. Until it does it
+    // can still connect blocks, and a block connected after the flush is
+    // past the tip the clean-shutdown marker records. It was signalled with
+    // the shutdown watch and stops after the block in hand, so this is
+    // usually already done; but one block of large transactions can take
+    // tens of seconds to verify, so the wait gets at most half of what is
+    // left of the budget, keeping the rest for the flush. A connector still
+    // running then does not stop the flush, which is safe alongside it, as
+    // the connector's own periodic flushes are; it costs the marker, since
+    // the tip can still move. `exit_now` at the end makes a connector still
+    // inside RocksDB harmless.
+    let connector_budget = (shutdown_deadline.saturating_sub(shutdown_started.elapsed()) / 2)
+        .max(std::time::Duration::from_secs(1));
+    let connector_stopped = {
+        let pm = peer_manager.clone();
+        tokio::task::spawn_blocking(move || pm.join_connectors(connector_budget))
+            .await
+            .unwrap_or(false)
+    };
+    if connector_stopped {
+        tracing::info!(tip_height = chain_state.tip_height(), "Block connector stopped");
+    } else {
+        tracing::warn!(
+            waited_secs = connector_budget.as_secs(),
+            "Block connector still in a block at its share of --max-shutdown-secs; \
+             flushing without the clean-shutdown marker"
+        );
+    }
+
     // Graceful shutdown — flush UTXO cache before stopping, bounded by
     // --max-shutdown-secs so we actually exit within the deadline no matter
     // how long the blocking flush takes.
@@ -4445,8 +4533,10 @@ async fn main() {
     // return but the process would still hang until the flush finishes (or
     // forever, on a stuck flush). To genuinely enforce the deadline we run
     // the flush on a dedicated std::thread, signal completion over a oneshot,
-    // and std::process::exit on timeout — that's the only way to end the
-    // process when the flush is stuck inside the rocksdb FFI.
+    // and `exit_now` on timeout — that's the only way to end the process
+    // when the flush is stuck inside the rocksdb FFI, and, unlike
+    // `std::process::exit`, it does not destroy RocksDB's statics under
+    // the flush thread.
     //
     // Safety on timeout-forced exit: no data is lost. The next startup will
     // replay any DataStored-but-not-Valid blocks from flat files. We just
@@ -4508,14 +4598,15 @@ async fn main() {
             if let Some(ref pid_path) = config.pid {
                 let _ = std::fs::remove_file(pid_path);
             }
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
-    // Write the clean-shutdown marker only if the flush actually succeeded.
-    // If we timed out or errored, leaving the marker absent is correct — it
-    // tells the next startup (and the operator) that this exit was dirty.
-    if flushed_ok {
+    // Write the clean-shutdown marker only if the flush actually succeeded
+    // and the connector had stopped, so the tip it records is final. If
+    // either did not, leaving the marker absent is correct — it tells the
+    // next startup (and the operator) that this exit was dirty.
+    if flushed_ok && connector_stopped {
         if let Err(e) = node::shutdown::write_marker(&net_datadir, &tip_hash, tip_height) {
             tracing::warn!(error = %e, "Failed to write clean-shutdown marker");
         } else {
@@ -4557,7 +4648,22 @@ async fn main() {
         let _ = std::fs::remove_file(pid_path);
     }
 
-    // Drop local references to help cleanup, but spawned tasks may still hold Arcs
+    // Join the maintenance threads woken when shutdown began. Each holds the
+    // chainstate, so one still running keeps its database open; `main`
+    // reports that at exit rather than waiting on a forced compaction.
+    let still_running = tokio::task::spawn_blocking(move || {
+        node::shutdown::join_within(maintenance_threads, MAINTENANCE_THREADS_SHUTDOWN)
+    })
+    .await
+    .unwrap_or_default();
+    if !still_running.is_empty() {
+        let names: Vec<_> = still_running.iter().map(|(name, _)| *name).collect();
+        tracing::warn!(threads = ?names, "Maintenance threads still running at exit");
+    }
+
+    // Drop local references. Tasks hold more: the API runtime's go when `run`
+    // returns and drops its guard, the core runtime's when `main` shuts it
+    // down, and the chainstate database closes with the last of them.
     drop(peer_manager);
     drop(mempool);
     drop(fee_estimator);
@@ -4565,6 +4671,7 @@ async fn main() {
     tracing::info!("Shutdown complete — local references released");
 
     tracing::info!("satd stopped");
+    Some(chainstate_db)
 }
 
 /// The metrics listener's binds, resolved once at startup, and the startup
@@ -4642,7 +4749,7 @@ async fn start_metrics_startup(
             Err(e) => {
                 eprintln!("Error: -metricsbind/-metricsport: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
     // Config::load already refused partial TLS settings; these checks are
@@ -4655,14 +4762,14 @@ async fn start_metrics_startup(
             else {
                 eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             };
             let tls_bind: SocketAddr = match addr_str.parse() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Error: invalid --metricstlsbind {addr_str:?}: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let client_ca = if config.metrics_mtls {
@@ -4680,7 +4787,7 @@ async fn start_metrics_startup(
                 Err(e) => {
                     eprintln!("Error: metrics TLS config: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             Some((tls_bind, Arc::new(acceptor)))
@@ -4724,7 +4831,7 @@ async fn start_metrics_startup(
             Err(e) => {
                 eprintln!("Error: metrics TLS listener could not bind to {tls_bind}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     };
@@ -4839,7 +4946,7 @@ async fn start_startup_rpc(
         .await
         .unwrap_or_else(|e| {
             eprintln!("Failed to start startup RPC server on {bind_addr}: {e}");
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         });
         handles.push(handle);
     }
@@ -5384,5 +5491,255 @@ mod interrupted_rebuild_tests {
         assert_eq!(describe_ago(600), "10 minutes ago");
         assert_eq!(describe_ago(3 * 3_600 + 59), "3 hours ago");
         assert_eq!(describe_ago(5 * 86_400), "5 days ago");
+    }
+}
+
+#[cfg(test)]
+mod exit_path_tests {
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `src` with its comments removed and its string and character
+    /// literals emptied, keeping every newline, so that what is left is code
+    /// and still falls on its own lines.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let at = |i: usize| chars.get(i).copied().unwrap_or('\0');
+        let ident = |c: char| c == '_' || c.is_alphanumeric();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '/' && at(i + 1) == '/' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && at(i + 1) == '*' {
+                // Block comments nest.
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && at(i + 1) == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && at(i + 1) == '/' {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if chars[i] == '\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if c == 'r'
+                && (i == 0
+                    || !ident(chars[i - 1])
+                    || (matches!(chars[i - 1], 'b' | 'c') && (i < 2 || !ident(chars[i - 2]))))
+                && {
+                    let mut j = i + 1;
+                    while at(j) == '#' {
+                        j += 1;
+                    }
+                    at(j) == '"'
+                }
+            {
+                // A raw string: r"…", r#"…"#, br"…", cr"…".
+                let mut j = i + 1;
+                while at(j) == '#' {
+                    j += 1;
+                }
+                let hashes = j - i - 1;
+                i = j + 1;
+                while i < chars.len()
+                    && !(chars[i] == '"' && (1..=hashes).all(|k| at(i + k) == '#'))
+                {
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i += 1 + hashes;
+                out.push_str("\"\"");
+            } else if c == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    if at(i) == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i += 1;
+                out.push_str("\"\"");
+            } else if c == '\'' && (at(i + 1) == '\\' || at(i + 2) == '\'') {
+                // A character literal; a lifetime or label has no closing
+                // quote after one character.
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                out.push_str("' '");
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The lines of `src` that end the process through libc's `exit()`: that
+    /// name `std::process::exit` or `libc::exit` as a call, a function value
+    /// or an import, or import everything from either module. Comments and
+    /// literals do not count, and whitespace is ignored, so a path or a `use`
+    /// list may be split across lines; a hit is reported on the line where
+    /// it starts. Importing `exit` is enough, which covers a bare `exit(`
+    /// after the import.
+    fn libc_exit_lines(src: &str) -> Vec<usize> {
+        let (mut code, mut line_of, mut line) = (String::new(), Vec::new(), 1);
+        for c in code_only(src).chars() {
+            if c == '\n' {
+                line += 1;
+            }
+            if !c.is_whitespace() {
+                code.push(c);
+                line_of.resize(code.len(), line);
+            }
+        }
+        let mut lines = Vec::new();
+        for module in ["process::", "libc::"] {
+            for path in [format!("{module}exit"), format!("{module}*")] {
+                lines.extend(code.match_indices(&path).map(|(at, _)| line_of[at]));
+            }
+            for (at, open) in code.match_indices(&format!("{module}{{")) {
+                let list = &code[at + open.len()..];
+                let list = &list[..list.find('}').unwrap_or(list.len())];
+                if list.split(',').any(|item| item == "exit" || item.starts_with("exitas")) {
+                    lines.push(line_of[at]);
+                }
+            }
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// The scan, on the spellings that evaded its earlier versions and on
+    /// the source it must let through.
+    #[test]
+    fn the_exit_scan_sees_every_spelling() {
+        let exits = [
+            "std::process::exit(1);",
+            "    process::exit (1);",
+            "std::process::\n    exit(1);",
+            "use std::process::exit;",
+            "use std::process::{self, exit};",
+            "use std::process::{\n    self,\n    exit,\n};\nfn f() { exit(1) }",
+            "use std::process::{exit as quit};",
+            "use std::{io, process::{self, exit}};",
+            "use std::process::*;\nfn f() { exit(1) }",
+            "unsafe { libc::exit(1) }",
+            "unsafe { libc :: exit(1) }",
+            "use libc::{c_int, exit};",
+            "use libc::*;",
+            "let end: fn(i32) -> ! = std::process::exit;",
+            "tokio::select! { _ = x => std::process::exit(1) }",
+            "let url = \"http://x\"; std::process::exit(1);",
+            "let q = '\"'; std::process::exit(1);",
+            "fn f<'a>(x: &'a str) -> &'a str { std::process::exit(1) }",
+            "let dir = r\"C:\\\"; std::process::exit(1);",
+        ];
+        for src in exits {
+            assert!(!libc_exit_lines(src).is_empty(), "missed {src:?}");
+        }
+        let allowed = [
+            "node::shutdown::exit_now(1);",
+            "unsafe { libc::_exit(code) }",
+            "std::process::abort();",
+            "return std::process::ExitCode::from(1);",
+            "// std::process::exit(1)",
+            "/// ends in `std::process::exit`",
+            "/* std::process::exit(1) */",
+            "/* outer /* inner */ std::process::exit(1) */",
+            "let code = 1; // not std::process::exit(1)",
+            "tracing::error!(\"would have called std::process::exit(1)\");",
+            "let s = r#\"std::process::exit(1) \"quoted\"\"#;",
+            "let s = \"escaped \\\" std::process::exit(1)\";",
+        ];
+        for src in allowed {
+            assert!(libc_exit_lines(src).is_empty(), "flagged {src:?}");
+        }
+        assert_eq!(
+            libc_exit_lines("/* one\ntwo */\nlet s = \"a\nb\";\nuse std::process::{\n    exit,\n};"),
+            vec![5],
+            "a hit is reported on its first line"
+        );
+    }
+
+    /// `std::process::exit` ends in libc's `exit()`, which destroys RocksDB's
+    /// C++ statics under any thread still inside RocksDB: a fatal error in a
+    /// running node would crash it on the way out (#868). Every exit in satd
+    /// and the node library goes through `node::shutdown::exit_now`. The
+    /// crash depends on timing, so this is pinned on the source. The one
+    /// exception is the control in the node's `exit_now` tests, which must
+    /// call `exit()` to show what `exit_now` skips; its line carries the
+    /// marker.
+    #[test]
+    fn the_node_never_exits_through_libc_exit() {
+        let marker = "exit-guard: allowed";
+        // CARGO_MANIFEST_DIR is <repo>/satd for this crate.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in [root.join("src"), root.join("../node/src")] {
+            rust_sources(&dir, &mut files);
+        }
+        assert!(files.len() > 100, "found only {} source files", files.len());
+        let (mut calls, mut marked) = (Vec::new(), Vec::new());
+        for file in &files {
+            let src = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            for n in libc_exit_lines(&src) {
+                let at = format!("{}:{n}", file.display());
+                if lines[n - 1].contains(marker) {
+                    marked.push(at);
+                } else {
+                    calls.push(at);
+                }
+            }
+        }
+        assert!(calls.is_empty(), "exit through node::shutdown::exit_now instead: {calls:?}");
+        assert_eq!(marked.len(), 1, "only the exit_now tests' control may exit(): {marked:?}");
+    }
+
+    /// A panic that unwound out of `main` would end the process through
+    /// libc's `exit()` as well. `main` cannot run under a test, so this is
+    /// pinned on its source.
+    #[test]
+    fn main_exits_now_on_a_panic_in_the_node() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("\nfn main() {").expect("fn main")..];
+        let body = &body[..body.find("\n}\n").expect("end of fn main")];
+        assert!(
+            body.contains("node::shutdown::exit_now_on_panic(|| runtime.block_on(run()))"),
+            "main must run the node under exit_now_on_panic"
+        );
     }
 }

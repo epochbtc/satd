@@ -1493,7 +1493,7 @@ impl Config {
                 eprintln!(
                     "Error: Error parsing command line arguments: Invalid parameter {arg}"
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
         let cli = match CliArgs::try_parse_from(normalized) {
@@ -1511,11 +1511,11 @@ impl Config {
                     // "version". clap's default is `satd <v>`, which does not
                     // contain it.
                     println!("satd version {}", env!("CARGO_PKG_VERSION"));
-                    std::process::exit(0);
+                    node::shutdown::exit_now(0);
                 }
                 if e.kind() == ErrorKind::DisplayHelp {
                     e.print().ok();
-                    std::process::exit(0);
+                    node::shutdown::exit_now(0);
                 }
                 // Bitcoin Core reports a bad command line as
                 // "Error: Error parsing command line arguments: <detail>".
@@ -1523,7 +1523,7 @@ impl Config {
                 // verbatim into the FailedToStartError message, and Core's tests
                 // match on the "Error: Error parsing" shape.
                 eprintln!("Error: Error parsing command line arguments: {e}");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let mut config = Self::from_cli(cli.clone())?;

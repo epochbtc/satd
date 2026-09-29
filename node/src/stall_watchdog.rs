@@ -28,11 +28,15 @@
 //!   catch up — typically because the operator chose `--maxahead=all` and
 //!   sustained write pressure for the duration of the IBD.
 //!
-//! Both threads honor `shutdown_rx` by polling its `borrow()` synchronously
-//! at each tick. They never `.await` it — that would re-introduce the
-//! tokio-runtime dependency we set out to avoid.
+//! Every thread here sleeps on a [`ThreadStop`] rather than
+//! `thread::sleep`, so a stop wakes it at once, and returns its
+//! `JoinHandle`: shutdown stops and joins them before the process exits,
+//! instead of leaving them holding the chainstate while `exit()` destroys
+//! RocksDB's statics underneath them (#868). A tokio shutdown watch would
+//! re-introduce the runtime dependency these threads exist to avoid.
 
 use crate::chain::state::ChainState;
+use crate::shutdown::ThreadStop;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,7 +55,7 @@ use std::time::{Duration, Instant};
 /// existing `--max-shutdown-secs`-bounded flush path stamp a clean-shutdown
 /// marker and persist the post-last-checkpoint memtable. If the same lock
 /// the wedge is holding also blocks graceful shutdown, that path runs into
-/// its own bounded timeout and force-exits via `process::exit`, and the
+/// its own bounded timeout and force-exits via `exit_now`, and the
 /// watchdog's outer fence still fires if for some reason neither path
 /// completes.
 ///
@@ -87,13 +91,13 @@ pub fn spawn_stall_watchdog(
     chain_state: Arc<ChainState>,
     stall_threshold: Duration,
     abort_after: Duration,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+    stop: ThreadStop,
+) -> Option<std::thread::JoinHandle<()>> {
     if stall_threshold.is_zero() {
         tracing::info!("Stall watchdog disabled (stall_threshold=0)");
-        return;
+        return None;
     }
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("stall-watchdog".into())
         .spawn(move || {
             tracing::info!(
@@ -108,8 +112,7 @@ pub fn spawn_stall_watchdog(
             let mut dumped_for_this_stall = false;
             let mut sigterm_sent = false;
             loop {
-                std::thread::sleep(poll);
-                if *shutdown_rx.borrow() {
+                if stop.sleep(poll) {
                     tracing::info!("Stall watchdog shutting down");
                     return;
                 }
@@ -181,6 +184,7 @@ pub fn spawn_stall_watchdog(
             }
         })
         .expect("failed to spawn stall-watchdog thread");
+    Some(handle)
 }
 
 /// Raise `SIGTERM` to our own process so the main shutdown path (which
@@ -219,13 +223,13 @@ pub fn spawn_periodic_compactor(
     chain_state: Arc<ChainState>,
     interval: Duration,
     l0_compact_at: u64,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+    stop: ThreadStop,
+) -> Option<std::thread::JoinHandle<()>> {
     if interval.is_zero() || l0_compact_at == 0 {
         tracing::info!("Periodic compactor disabled");
-        return;
+        return None;
     }
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("rocksdb-compactor".into())
         .spawn(move || {
             tracing::info!(
@@ -233,18 +237,10 @@ pub fn spawn_periodic_compactor(
                 l0_compact_at,
                 "Periodic forced-compaction thread started"
             );
-            // Sleep in small slices so shutdown is responsive even when the
-            // configured interval is long (e.g. 30 minutes).
-            let slice = Duration::from_secs(5);
             loop {
-                let mut waited = Duration::ZERO;
-                while waited < interval {
-                    std::thread::sleep(slice);
-                    if *shutdown_rx.borrow() {
-                        tracing::info!("Periodic compactor shutting down");
-                        return;
-                    }
-                    waited += slice;
+                if stop.sleep(interval) {
+                    tracing::info!("Periodic compactor shutting down");
+                    return;
                 }
                 let l0 = chain_state.chainstate_l0_files();
                 let pending = chain_state.chainstate_pending_compaction_bytes();
@@ -289,6 +285,7 @@ pub fn spawn_periodic_compactor(
             }
         })
         .expect("failed to spawn rocksdb-compactor thread");
+    Some(handle)
 }
 
 /// Per-column-family pending-compaction diagnostic. Wakes every
@@ -308,11 +305,11 @@ pub fn spawn_periodic_compactor(
 pub fn spawn_compaction_diagnostic(
     chain_state: Arc<ChainState>,
     interval: Duration,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+    stop: ThreadStop,
+) -> Option<std::thread::JoinHandle<()>> {
     if interval.is_zero() {
         tracing::info!("Compaction diagnostic disabled");
-        return;
+        return None;
     }
     // One-shot SST size dump at startup so an operator can answer
     // "where do my chainstate GBs live?" without waiting a full tick.
@@ -320,23 +317,17 @@ pub fn spawn_compaction_diagnostic(
     // snapshot for the live view.
     log_sst_size_breakdown(&chain_state);
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("rocksdb-diag".into())
         .spawn(move || {
             tracing::info!(
                 interval_secs = interval.as_secs(),
                 "Compaction diagnostic thread started"
             );
-            let slice = Duration::from_secs(5);
             loop {
-                let mut waited = Duration::ZERO;
-                while waited < interval {
-                    std::thread::sleep(slice);
-                    if *shutdown_rx.borrow() {
-                        tracing::info!("Compaction diagnostic shutting down");
-                        return;
-                    }
-                    waited += slice;
+                if stop.sleep(interval) {
+                    tracing::info!("Compaction diagnostic shutting down");
+                    return;
                 }
                 let mut breakdown = chain_state.pending_compaction_bytes_by_cf();
                 // Sort by pending bytes desc so the most-loaded CFs
@@ -368,6 +359,7 @@ pub fn spawn_compaction_diagnostic(
             }
         })
         .expect("failed to spawn rocksdb-diag thread");
+    Some(handle)
 }
 
 /// Emit one INFO line listing on-disk SST size per CF, sorted desc.
@@ -502,7 +494,65 @@ fn read_state(status_path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::path::Path;
+
+    /// Every thread here wakes on its stop and can be joined straight away,
+    /// whatever its interval. Shutdown joins them before the process exits
+    /// (#868); a join that had to wait out the watchdog's 15 s poll would
+    /// run into the exit it has to precede.
+    ///
+    /// Perturbation: go back to `thread::sleep` followed by a flag check,
+    /// and the join times out.
+    #[test]
+    fn every_thread_stops_and_joins_promptly_on_a_stop() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let cs = Arc::new(cs);
+        let hour = Duration::from_secs(3600);
+        let stop = ThreadStop::default();
+        let threads = vec![
+            (
+                "stall-watchdog",
+                spawn_stall_watchdog(cs.clone(), hour, hour, stop.clone()).expect("enabled"),
+            ),
+            (
+                "rocksdb-compactor",
+                spawn_periodic_compactor(cs.clone(), hour, 1, stop.clone()).expect("enabled"),
+            ),
+            (
+                "rocksdb-diag",
+                spawn_compaction_diagnostic(cs.clone(), hour, stop.clone()).expect("enabled"),
+            ),
+        ];
+        // Let each thread reach its sleep before the stop.
+        std::thread::sleep(Duration::from_millis(100));
+        stop.stop();
+        let left = crate::shutdown::join_within(threads, Duration::from_secs(5));
+        let names: Vec<_> = left.iter().map(|(name, _)| *name).collect();
+        assert!(names.is_empty(), "still running after the stop: {names:?}");
+        assert_eq!(
+            Arc::strong_count(&cs),
+            1,
+            "the joined threads must have released the chainstate"
+        );
+        drop(cs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disabled thread is not spawned, so there is nothing to join.
+    #[test]
+    fn a_disabled_thread_has_no_handle() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let cs = Arc::new(cs);
+        let stop = ThreadStop::default();
+        let hour = Duration::from_secs(3600);
+        assert!(spawn_stall_watchdog(cs.clone(), Duration::ZERO, hour, stop.clone()).is_none());
+        assert!(spawn_periodic_compactor(cs.clone(), Duration::ZERO, 1, stop.clone()).is_none());
+        assert!(spawn_periodic_compactor(cs.clone(), hour, 0, stop.clone()).is_none());
+        assert!(spawn_compaction_diagnostic(cs.clone(), Duration::ZERO, stop).is_none());
+        drop(cs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Sanity-check the `/proc/self/task/*` reader: on any Linux test host
     /// at least one task entry must produce a readable `comm` and a

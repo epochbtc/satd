@@ -55,6 +55,10 @@ pub(crate) struct StoreControls {
     /// scan has planned by the time its scan starts, which a test on another
     /// thread can wait for.
     block_index_scans: Arc<AtomicU64>,
+    /// What the store reports as the chainstate's L0 file count, which the
+    /// IBD connector's compaction backpressure reads. `InMemoryStore` has no
+    /// levels and reports 0, so the pause is otherwise unreachable.
+    chainstate_l0_files: Arc<AtomicU64>,
 }
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
@@ -139,6 +143,11 @@ impl StoreControls {
         self.fail_next_write.store(true, Ordering::SeqCst);
     }
 
+    /// Set the chainstate L0 file count the store reports.
+    pub(crate) fn set_chainstate_l0_files(&self, files: u64) {
+        self.chainstate_l0_files.store(files, Ordering::SeqCst);
+    }
+
     /// How many block-index scans have started, counting from the store's
     /// creation.
     pub(crate) fn block_index_scans(&self) -> u64 {
@@ -204,6 +213,7 @@ impl ControllableStore {
                 get_tx_seq_calls: Arc::new(AtomicU64::new(0)),
                 txids_of_seqs_calls: Arc::new(AtomicU64::new(0)),
                 block_index_scans: Arc::new(AtomicU64::new(0)),
+                chainstate_l0_files: Arc::new(AtomicU64::new(0)),
             },
         }
     }
@@ -237,6 +247,10 @@ impl Store for ControllableStore {
 
     fn has_txindex(&self) -> bool {
         self.controls.txindex.load(Ordering::SeqCst)
+    }
+
+    fn chainstate_l0_files(&self) -> u64 {
+        self.controls.chainstate_l0_files.load(Ordering::SeqCst)
     }
 
     fn tx_index_complete(&self) -> bool {

@@ -440,9 +440,12 @@ impl ScriptVerifier for RustVerifier {
 /// wall-clock terms — shadow uses spare CPU but doesn't slow block connection.
 pub struct ShadowVerifier {
     primary: Box<dyn ScriptVerifier>,
-    shadow_tx: crossbeam_channel::Sender<ShadowWork>,
+    /// `None` once `drop` has closed the queue.
+    shadow_tx: Option<crossbeam_channel::Sender<ShadowWork>>,
     queue_size: usize,
-    _workers: Vec<std::thread::JoinHandle<()>>,
+    /// Set by `drop`: a worker discards what is still queued and exits.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     /// Counts shadow txs dropped because the queue was full. Rate-limited
     /// reporter (see `report_drop`) consumes this and logs an aggregated
     /// WARN at most once per 5s — a per-drop WARN at IBD verify rates can
@@ -477,6 +480,7 @@ impl ShadowVerifier {
     ) -> Self {
         let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(queue_size);
         let shadow = std::sync::Arc::new(shadow);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let primary_label = primary_name.to_string();
         let shadow_label = shadow_name.to_string();
 
@@ -488,6 +492,7 @@ impl ShadowVerifier {
         let mut workers = Vec::with_capacity(num_workers);
         for n in 0..num_workers {
             let w_rx = rx.clone();
+            let w_stop = stop.clone();
             let w_shadow = shadow.clone();
             let w_primary_label = primary_label.clone();
             let w_shadow_label = shadow_label.clone();
@@ -499,6 +504,9 @@ impl ShadowVerifier {
                     .name(format!("shadow-{}", n))
                     .spawn(move || {
                 while let Ok(work) = w_rx.recv() {
+                    if w_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     let tx: Transaction = match bitcoin::consensus::deserialize(&work.tx_bytes) {
                         Ok(t) => t,
                         Err(_) => continue,
@@ -552,11 +560,23 @@ impl ShadowVerifier {
 
         Self {
             primary,
-            shadow_tx: tx,
+            shadow_tx: Some(tx),
             queue_size,
-            _workers: workers,
+            stop,
+            workers,
             dropped: std::sync::atomic::AtomicU64::new(0),
             last_drop_log_epoch: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Queue `work` for the shadow pool, counting it as dropped when the queue
+    /// is full.
+    fn enqueue(&self, work: ShadowWork) {
+        let height = work.height;
+        if let Some(shadow_tx) = &self.shadow_tx
+            && let Err(crossbeam_channel::TrySendError::Full(_)) = shadow_tx.try_send(work)
+        {
+            self.report_drop(height);
         }
     }
 
@@ -616,30 +636,24 @@ impl ScriptVerifier for ShadowVerifier {
 
         // On primary success, dispatch shadow verification asynchronously.
         if result.is_ok() {
-            let work = ShadowWork {
+            self.enqueue(ShadowWork {
                 tx_bytes: bitcoin::consensus::serialize(tx),
                 prev_outputs: prev_outputs.to_vec(),
                 height,
                 txid: tx.compute_txid(),
-            };
-            if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
-                self.report_drop(height);
-            }
+            });
         }
 
         result
     }
 
     fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
-        let work = ShadowWork {
+        self.enqueue(ShadowWork {
             tx_bytes: bitcoin::consensus::serialize(tx),
             prev_outputs: prev_outputs.to_vec(),
             height,
             txid: tx.compute_txid(),
-        };
-        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.shadow_tx.try_send(work) {
-            self.report_drop(height);
-        }
+        });
     }
 
     fn primary_engine(&self) -> PrimaryEngine {
@@ -650,9 +664,18 @@ impl ScriptVerifier for ShadowVerifier {
 }
 
 impl Drop for ShadowVerifier {
+    /// Stop the workers and wait for them. Left running, a worker can still
+    /// be inside the shadow engine, the C++ one included, when the process
+    /// exits and destroys that engine's statics (#868). What is still queued
+    /// is discarded rather than verified first: shadow checks are
+    /// best-effort, and a full queue drops work already.
     fn drop(&mut self) {
-        // Drop the sender to signal workers to exit
-        // Workers will drain remaining items and stop on recv error
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Closing the queue wakes the workers parked in `recv`.
+        drop(self.shadow_tx.take());
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -877,5 +900,76 @@ mod tests {
                 .is_err()
         );
     }
-}
 
+    /// A shadow engine that takes 200 ms a transaction, counts the
+    /// verifications it starts, and records when it is dropped.
+    struct SlowShadow {
+        started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ScriptVerifier for SlowShadow {
+        fn verify_transaction(
+            &self,
+            _tx: &Transaction,
+            _prev_outputs: &[TxOut],
+            _height: u32,
+        ) -> Result<(), ScriptError> {
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(())
+        }
+    }
+
+    impl Drop for SlowShadow {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Dropping a `ShadowVerifier` stops its workers and waits for them, so
+    /// none is left inside the shadow engine when the process exits (#868),
+    /// and it discards the queue rather than verifying it first.
+    ///
+    /// The workers hold the only references to the shadow engine, so the
+    /// engine is dropped exactly when the last worker has exited.
+    ///
+    /// Perturbations: without the join, `drop` returns while the worker is
+    /// still in its first verification and the engine is not yet dropped;
+    /// without the stop flag, the join waits for all five and `started` is 5.
+    #[test]
+    fn dropping_the_shadow_verifier_stops_and_joins_its_workers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let verifier = ShadowVerifier::new(
+            Box::new(NoopVerifier),
+            Box::new(SlowShadow { started: started.clone(), dropped: dropped.clone() }),
+            "noop",
+            "slow",
+            16,
+            1,
+        );
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![TxOut::NULL],
+        };
+        for _ in 0..5 {
+            verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while started.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(started.load(SeqCst), 1, "fixture: the worker must be busy with the first");
+
+        drop(verifier);
+        assert!(
+            dropped.load(SeqCst),
+            "drop must return only after every worker has exited"
+        );
+        assert_eq!(started.load(SeqCst), 1, "the four still queued must be discarded");
+    }
+}

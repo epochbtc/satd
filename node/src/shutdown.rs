@@ -15,6 +15,11 @@
 //! The marker contains a small JSON payload with the observed tip hash,
 //! tip height, and shutdown timestamp. The contents are advisory — if the
 //! file is malformed we treat it as "not present" and log a warning.
+//!
+//! The module also holds what the end of a shutdown needs to stop the
+//! node's own threads before the process exits ([`ThreadStop`],
+//! [`join_within`]) and to exit without running C++ static destructors
+//! underneath any thread that is still running ([`exit_now`]).
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -25,9 +30,9 @@ use crate::storage::StoreError;
 
 /// Outcome of awaiting a bounded shutdown flush. The main binary uses this
 /// to decide whether to write the clean-shutdown marker, log an error, or
-/// force-exit with `std::process::exit(1)` — the only way to actually
-/// honor `--max-shutdown-secs` when the flush is stuck inside a blocking
-/// FFI call that tokio cannot abort.
+/// force-exit with [`exit_now`] — the only way to actually honor
+/// `--max-shutdown-secs` when the flush is stuck inside a blocking FFI call
+/// that tokio cannot abort.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BoundedFlushOutcome {
     /// Flush completed successfully within the deadline; marker may be written.
@@ -56,6 +61,98 @@ pub async fn await_bounded_flush(
         Ok(Ok(Err(e))) => BoundedFlushOutcome::FlushError(e.to_string()),
         Ok(Err(_)) => BoundedFlushOutcome::ChannelDropped,
         Err(_) => BoundedFlushOutcome::TimedOut,
+    }
+}
+
+/// A stop request that an OS thread sleeps on.
+///
+/// A thread that polls a flag between `thread::sleep` calls notices a stop
+/// only when its sleep ends, 15 s later for the stall watchdog, which can be
+/// after the process has begun to exit. [`ThreadStop::sleep`] returns as soon
+/// as [`ThreadStop::stop`] is called, so the thread can be joined straight
+/// away.
+#[derive(Clone, Default)]
+pub struct ThreadStop(std::sync::Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
+
+impl ThreadStop {
+    /// Ask every thread sleeping on this, or on a clone of it, to stop.
+    pub fn stop(&self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock() = true;
+        cvar.notify_all();
+    }
+
+    /// Whether [`stop`](Self::stop) has been called.
+    pub fn is_stopped(&self) -> bool {
+        *self.0.0.lock()
+    }
+
+    /// Sleep for `duration`, or until a stop is requested. Returns `true` if
+    /// a stop was requested, before or during the sleep.
+    pub fn sleep(&self, duration: Duration) -> bool {
+        let (lock, cvar) = &*self.0;
+        let mut stopped = lock.lock();
+        if !*stopped {
+            let _ = cvar.wait_while_for(&mut stopped, |stopped| !*stopped, duration);
+        }
+        *stopped
+    }
+}
+
+/// A named thread, as [`join_within`] takes and returns them.
+pub type NamedThread = (&'static str, std::thread::JoinHandle<()>);
+
+/// Join `threads`, waiting at most `timeout` for them to finish. Returns the
+/// threads still running at the deadline, unjoined. A thread that panicked
+/// counts as finished, and its name is logged.
+pub fn join_within(threads: Vec<NamedThread>, timeout: Duration) -> Vec<NamedThread> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut running = threads;
+    loop {
+        let (finished, still): (Vec<_>, Vec<_>) =
+            running.into_iter().partition(|(_, handle)| handle.is_finished());
+        for (name, handle) in finished {
+            if handle.join().is_err() {
+                tracing::error!(thread = name, "thread panicked before shutdown joined it");
+            }
+        }
+        running = still;
+        if running.is_empty() || std::time::Instant::now() >= deadline {
+            return running;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// End the process now with `code`, without running `atexit` handlers or C++
+/// static destructors.
+///
+/// Returning from `main` and `std::process::exit` both end in libc's
+/// `exit()`, which destroys every C++ static, RocksDB's among them: its
+/// option-type maps and the ZSTD decompression-context cache. A thread still
+/// inside RocksDB at that moment uses freed memory, and a node that had shut
+/// down cleanly died of SIGSEGV after logging `satd stopped` (#868, #37).
+/// `_exit` skips the destructors. Nothing satd relies on at exit lives in
+/// them: logs go to stdout and stderr, both flushed here, and a clean
+/// shutdown flushes the chainstate before calling this.
+pub fn exit_now(code: i32) -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    // SAFETY: `_exit` takes no pointers, cannot fail and does not return.
+    unsafe { libc::_exit(code) }
+}
+
+/// Run `f`; if it panics, end the process with [`exit_now`] and the exit
+/// code of an unhandled panic (101).
+///
+/// A panic that unwound out of `main` would drop the runtime, which waits
+/// without limit for blocking tasks, and then end the process through
+/// libc's `exit()`, under the node's threads (#868). The panic hook has
+/// already reported the panic by the time this exits.
+pub fn exit_now_on_panic<T>(f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => exit_now(101),
     }
 }
 
@@ -277,7 +374,7 @@ mod tests {
     async fn bounded_flush_times_out_when_sender_is_slow() {
         // Keep the sender alive but never signal. The deadline should fire
         // and the outcome must be TimedOut — which the main binary reacts
-        // to by calling std::process::exit(1), the actual enforcement of
+        // to by calling `exit_now(1)`, the actual enforcement of
         // --max-shutdown-secs.
         let (_tx_kept_alive, rx) = tokio::sync::oneshot::channel::<Result<(), StoreError>>();
         let t0 = std::time::Instant::now();
@@ -291,5 +388,136 @@ mod tests {
             "timeout should fire quickly; elapsed={:?}",
             elapsed
         );
+    }
+
+    /// A stop ends a sleep that has already started, which is what lets
+    /// shutdown join a thread straight away instead of after its interval.
+    ///
+    /// Perturbation: sleep with `std::thread::sleep` and only then check the
+    /// flag, and the sleeper takes the full hour.
+    #[test]
+    fn a_stop_ends_a_sleep_in_progress() {
+        let stop = ThreadStop::default();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let sleeper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let _ = woke_tx.send(stop.sleep(Duration::from_secs(3600)));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        stop.stop();
+        assert_eq!(
+            woke_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the sleeper must wake on the stop and report it"
+        );
+        sleeper.join().unwrap();
+        assert!(stop.is_stopped());
+        assert!(
+            stop.sleep(Duration::from_secs(3600)),
+            "a sleep after the stop returns at once"
+        );
+    }
+
+    #[test]
+    fn a_sleep_without_a_stop_runs_its_length() {
+        let stop = ThreadStop::default();
+        let t0 = std::time::Instant::now();
+        assert!(!stop.sleep(Duration::from_millis(50)));
+        assert!(t0.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// `join_within` names what is still running at the deadline, and does
+    /// not wait for it past the deadline.
+    #[test]
+    fn join_within_names_the_threads_still_running() {
+        let stop = ThreadStop::default();
+        let quick = std::thread::spawn(|| {});
+        let slow = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                stop.sleep(Duration::from_secs(3600));
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let left = join_within(
+            vec![("quick", quick), ("slow", slow)],
+            Duration::from_millis(200),
+        );
+        let names: Vec<_> = left.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["slow"]);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        stop.stop();
+        assert!(join_within(left, Duration::from_secs(5)).is_empty());
+    }
+
+    /// A thread that panicked has finished: it is joined, not reported as
+    /// still running.
+    #[test]
+    fn join_within_counts_a_panicked_thread_as_finished() {
+        let panicked = std::thread::spawn(|| panic!("expected by the test"));
+        let left = join_within(vec![("panicked", panicked)], Duration::from_secs(5));
+        assert!(left.is_empty());
+    }
+
+    /// Set by the exit tests below when they re-run this test binary as a
+    /// child process; names the way the child ends.
+    const EXIT_PROBE: &str = "SATD_EXIT_PROBE";
+    const EXIT_HANDLERS_RAN: &str = "exit handlers ran";
+
+    /// The child half of the exit tests, and a no-op in an ordinary run. It
+    /// registers an `atexit` handler, which libc's `exit()` runs from the
+    /// same list as the C++ static destructors, then ends the process the
+    /// way `EXIT_PROBE` names.
+    #[test]
+    fn exit_probe_child() {
+        let Ok(how) = std::env::var(EXIT_PROBE) else {
+            return;
+        };
+        extern "C" fn announce() {
+            let line = format!("{EXIT_HANDLERS_RAN}\n");
+            // SAFETY: writes a live buffer of the given length to stdout.
+            unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+        }
+        // SAFETY: registers a plain `extern "C"` function.
+        assert_eq!(unsafe { libc::atexit(announce) }, 0);
+        match how.as_str() {
+            // SAFETY: ends the process; nothing here outlives it. The one
+            // `exit()` satd's `the_node_never_exits_through_libc_exit` allows.
+            "exit" => unsafe { libc::exit(3) }, // exit-guard: allowed
+            "exit_now" => exit_now(3),
+            "panic" => exit_now_on_panic(|| panic!("expected by the test")),
+            other => panic!("unknown exit probe {other}"),
+        }
+    }
+
+    /// Run [`exit_probe_child`] in a child process; its exit code, and
+    /// whether its exit handlers ran.
+    fn run_exit_probe(how: &str) -> (Option<i32>, bool) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["shutdown::tests::exit_probe_child", "--exact", "--nocapture"])
+            .env(EXIT_PROBE, how)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        (out.status.code(), stdout.contains(EXIT_HANDLERS_RAN))
+    }
+
+    /// The control for the two tests below: libc's `exit()` runs the
+    /// handlers, so their absence there means something.
+    #[test]
+    fn exit_runs_the_exit_handlers() {
+        assert_eq!(run_exit_probe("exit"), (Some(3), true));
+    }
+
+    #[test]
+    fn exit_now_skips_the_exit_handlers() {
+        assert_eq!(run_exit_probe("exit_now"), (Some(3), false));
+    }
+
+    #[test]
+    fn a_panic_exits_now_with_the_panic_exit_code() {
+        assert_eq!(run_exit_probe("panic"), (Some(101), false));
     }
 }
