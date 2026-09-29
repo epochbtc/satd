@@ -8202,9 +8202,9 @@ impl PeerManager {
                     return;
                 }
                 self.log_reconstructed(id, &block_hash, entry.height, &stats, false, started);
-                // The block is in hand: nothing is in flight for it any more,
-                // just as when a `block` message brings it.
-                self.note_block_arrived(&block_hash);
+                // The block is in hand, so no peer is asked for it any more.
+                // It is not stored yet: see `forget_block_requests`.
+                self.forget_block_requests(&block_hash);
                 let _ = self.block_tx.send((
                     id,
                     self.peer_stats(id),
@@ -8342,7 +8342,7 @@ impl PeerManager {
         match compact::complete_pending(pending, &txns, segwit_active) {
             Ok((block, stats)) => {
                 self.log_reconstructed(id, &block_hash, height, &stats, true, since);
-                self.note_block_arrived(&block_hash);
+                self.forget_block_requests(&block_hash);
                 let _ = self.block_tx.send((
                     id,
                     self.peer_stats(id),
@@ -8524,12 +8524,18 @@ impl PeerManager {
                 .iter()
                 .any(|(h, r)| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL && !(*peer == id && h == hash))
         });
+        let marked: Vec<bitcoin::BlockHash> = self
+            .compact_in_progress
+            .read()
+            .iter()
+            .filter(|(_, at)| at.elapsed() < COMPACT_RECONSTRUCT_SUPPRESSION)
+            .map(|(h, _)| *h)
+            .collect();
+        // A rebuilt block keeps its mark until it lapses (see
+        // `forget_block_requests`); once the block is stored it is no longer
+        // in flight.
         let reconstructing = !self.pending_compact.read().is_empty()
-            || self
-                .compact_in_progress
-                .read()
-                .values()
-                .any(|at| at.elapsed() < COMPACT_RECONSTRUCT_SUPPRESSION);
+            || marked.iter().any(|h| !self.chain_state.has_block_data(h));
         !other_request && !reconstructing
     }
 
@@ -8596,6 +8602,20 @@ impl PeerManager {
     /// A block arrived, by whatever route: nothing is in flight for it any
     /// more, and no partial compact reconstruction of it needs finishing.
     fn note_block_arrived(&self, hash: &bitcoin::BlockHash) {
+        self.forget_block_requests(hash);
+        if self.compact_in_progress.read().contains_key(hash) {
+            self.compact_in_progress.write().remove(hash);
+        }
+    }
+
+    /// No peer is asked for `hash` any more, and no partial reconstruction of
+    /// it needs finishing. A rebuilt `cmpctblock` clears only this much: the
+    /// block is on its way to the connect thread and not stored yet, so it
+    /// keeps its `compact_in_progress` mark. Without the mark, a
+    /// tip-following sweep in that window reads the block as missing and
+    /// downloads it again in full. The mark lapses after
+    /// [`COMPACT_RECONSTRUCT_SUPPRESSION`].
+    fn forget_block_requests(&self, hash: &bitcoin::BlockHash) {
         // Read-only fast path: this runs for every block, IBD included, and
         // both tables are empty for all but the blocks at the tip.
         if self.in_flight_blocks.read().values().any(|asked| asked.contains_key(hash)) {
@@ -8606,9 +8626,6 @@ impl PeerManager {
         }
         if self.pending_compact.read().values().any(|p| p.hash == *hash) {
             self.pending_compact.write().retain(|_, p| p.hash != *hash);
-        }
-        if self.compact_in_progress.read().contains_key(hash) {
-            self.compact_in_progress.write().remove(hash);
         }
     }
 
@@ -13062,7 +13079,10 @@ mod tests {
             }),
         );
         assert!(!f.pm.block_requested_from(1, &h2), "a rebuilt block is no longer in flight");
-        assert!(!f.pm.compact_reconstruction_in_flight(&h2));
+        assert!(
+            f.pm.compact_reconstruction_in_flight(&h2),
+            "the sweep leaves it alone until the connector has it"
+        );
         assert!(f.pm.pending_compact.read().is_empty());
     }
 
@@ -13070,7 +13090,12 @@ mod tests {
     /// request that asked for it, so the next block announced alone is
     /// fetched compactly too. Left behind, the finished request reads as
     /// another block in flight for as long as it lives, and every block
-    /// after the first goes back to being fetched whole.
+    /// after the first goes back to being fetched whole. The rebuilt block's
+    /// reconstruction mark outlives it on purpose, and counts as nothing in
+    /// flight once the block is stored.
+    ///
+    /// Perturbation: count every recent mark in `nothing_else_in_flight`, as
+    /// before, and B3 is fetched whole.
     #[test]
     fn a_cmpctblock_rebuilt_from_the_mempool_ends_its_request() {
         let mut f = compact_fetch_fixture();
@@ -13086,6 +13111,32 @@ mod tests {
         let b3 = coinbase_only_child(&b2, 3);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b3.header]));
         assert_eq!(block_requests(&drain(&mut f.rx), b3.block_hash()), vec![true]);
+    }
+
+    /// A rebuilt block is on its way to the connect thread, not stored, and
+    /// the tip-following sweep leaves it alone until it is. The sweep runs in
+    /// the manager loop pass that handled the `cmpctblock`, so clearing the
+    /// block's reconstruction mark as it was rebuilt made that pass download
+    /// it again in full. The accept lock holds the connector off, so the
+    /// block is still unstored when the sweep runs.
+    ///
+    /// Perturbation: clear the mark in `forget_block_requests` and the sweep
+    /// asks for the block.
+    #[test]
+    fn the_sweep_does_not_fetch_a_rebuilt_block_before_it_is_stored() {
+        let mut f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
+        assert_eq!(block_requests(&drain(&mut f.rx), h2), vec![true]);
+
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(!f.pm.chain_state.has_block_data(&h2), "precondition: not stored yet");
+        f.pm.request_missing_blocks(1);
+        assert!(block_requests(&drain(&mut f.rx), h2).is_empty(), "the sweep must not fetch it again");
+        drop(held);
+        wait_for_tip(&f.pm, h2);
     }
 
     /// A `cmpctblock` we asked a peer for, turned away because three other
