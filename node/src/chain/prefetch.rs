@@ -283,6 +283,15 @@ impl PrefetchHandle {
         }
     }
 
+    /// Signal every worker to stop and return without waiting for them.
+    /// For shutdown: one transaction's scripts can take a worker tens of
+    /// seconds, and a worker holds nothing shutdown needs. It only reads the
+    /// store and fills a buffer no one will take, and it exits at its next
+    /// transaction (#868).
+    pub fn abandon(self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
     /// Notify the prefetcher that the connect thread has advanced to `height`.
     pub fn advance_cursor(&self, height: u32) {
         self.cursor.store(height, Ordering::Relaxed);
@@ -441,6 +450,34 @@ mod tests {
     ///
     /// Perturbation: drop the `cancel` check and the cancelled call verifies
     /// the transaction.
+    /// `abandon` signals the workers and returns without waiting for them.
+    ///
+    /// Perturbation: make it join the workers, as `stop` does, and it waits
+    /// for the busy one.
+    #[test]
+    fn abandon_returns_without_waiting_for_a_busy_worker() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let busy = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let handle = PrefetchHandle {
+            shutdown: shutdown.clone(),
+            workers: vec![busy],
+            cursor: Arc::new(AtomicU32::new(0)),
+            buffer: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            handle.abandon();
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let _ = release_tx.send(());
+        assert!(returned, "abandon must not wait for a busy worker");
+        assert!(shutdown.load(Ordering::Relaxed), "abandon must signal the workers");
+    }
+
     #[test]
     fn a_cancelled_verification_verifies_nothing() {
         use bitcoin::hashes::Hash as _;

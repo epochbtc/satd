@@ -6633,8 +6633,14 @@ impl PeerManager {
             }
         }
 
-        // Stop the prefetch pipeline
-        prefetch_handle.stop();
+        // Stop the prefetch pipeline. For shutdown, without waiting for it:
+        // a worker can be tens of seconds into one transaction's scripts,
+        // and it holds nothing shutdown needs (#868).
+        if *shutdown.borrow() {
+            prefetch_handle.abandon();
+        } else {
+            prefetch_handle.stop();
+        }
     }
 
     /// Extract fee rates from a connected block and feed them to the fee estimator.
@@ -11382,6 +11388,61 @@ mod tests {
             "the connector threads must exit on shutdown"
         );
         assert_eq!(chain_state.tip_height(), 0, "no block may connect once shutdown is signalled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #868: the IBD connector stops for shutdown without waiting for a
+    /// prefetch worker that is still busy. One transaction's scripts can
+    /// take a worker tens of seconds, and waiting for it held the connector,
+    /// and with it the shutdown flush, past its deadline.
+    ///
+    /// Block 1's data is never stored, so the connector waits for it and
+    /// never reads a coin; block 2 is stored and spends a coin whose read
+    /// parks, so the prefetch worker that takes it is held inside the read.
+    ///
+    /// Perturbation: stop the pipeline with `stop` on shutdown too, and the
+    /// join times out waiting for the parked worker.
+    #[test]
+    fn the_ibd_connector_does_not_wait_for_a_busy_prefetch_worker() {
+        use crate::chain::state::tests::{
+            build_test_block, build_test_block_spending, make_chain_state_with_store,
+            store_block_without_connecting,
+        };
+        use bitcoin::hashes::Hash as _;
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+
+        let gated = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x68; 32]),
+            vout: 0,
+        };
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_001);
+        let b2 = build_test_block_spending(b1.block_hash(), 2, 1_707_000_002, gated);
+        let mut blocks = vec![b1, b2];
+        for h in 3..=30u32 {
+            let parent = blocks.last().unwrap().block_hash();
+            blocks.push(build_test_block(parent, h, 1_707_000_000 + h));
+        }
+        let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 30, "fixture: headers must be accepted ({err:?})");
+        for (b, h) in blocks.iter().zip(1..).skip(1) {
+            store_block_without_connecting(&cs, b, h);
+        }
+        let gate = controls.arm_coin_gate(gated);
+
+        let chain_state = Arc::new(cs);
+        let (pm, shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), false);
+        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        gate.wait_entered();
+
+        shutdown_tx.send_replace(true);
+        let stopped = pm.join_connectors(Duration::from_secs(10));
+        gate.release();
+        assert!(stopped, "the connector must not wait for the parked prefetch worker");
+        assert_eq!(chain_state.tip_height(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
