@@ -244,6 +244,9 @@ pub struct PeerInfo {
     /// When true, new-tip blocks are announced to this peer with a
     /// `headers` message rather than a legacy `inv`.
     pub prefers_headers: bool,
+    /// We sent this peer `sendheaders`. Core's `Peer::m_sent_sendheaders`:
+    /// it goes out once per connection, in either direction.
+    pub sent_sendheaders: bool,
     /// Peer signaled BIP 155 addrv2 support via SendAddrV2.
     pub wants_addrv2: bool,
     /// Whether address relay is set up on this link — Core's
@@ -313,6 +316,7 @@ impl PeerInfo {
             hb_from: false,
             known_block: None,
             prefers_headers: false,
+            sent_sendheaders: false,
             wants_addrv2: false,
             addr_relay_enabled: false,
             fee_filter: 0,

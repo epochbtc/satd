@@ -1084,6 +1084,28 @@ impl ChainState {
         )
     }
 
+    /// Bitcoin Core's `nMinimumChainWork` for this network, big-endian like
+    /// every chainwork in the block index (`kernel/chainparams.cpp`, v31.1).
+    /// A custom signet has none, as in Core: its chain starts wherever its
+    /// operator started it. satd does not gate header acceptance or block
+    /// download on it; the peer manager reads it to decide when a peer has
+    /// shown a chain worth asking for header announcements (Core's
+    /// `MaybeSendSendHeaders`).
+    pub fn minimum_chain_work(&self) -> [u8; 32] {
+        let hex = match self.network {
+            Network::Bitcoin => "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
+            Network::Testnet => "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
+            Network::Testnet4 => "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
+            Network::Signet if self.signet_challenge.is_none() => {
+                "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+            }
+            _ => return [0u8; 32],
+        };
+        let mut work = [0u8; 32];
+        hex::decode_to_slice(hex, &mut work).expect("a 64-digit hex constant");
+        work
+    }
+
     /// Effective P2P network magic. Custom-signet challenges derive their
     /// own magic (BIP 325); everything else uses the `bitcoin` crate's
     /// per-network value.
@@ -9648,6 +9670,49 @@ pub(crate) mod tests {
 
     pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
         make_chain_state_with_store(Box::new(InMemoryStore::new()))
+    }
+
+    /// `nMinimumChainWork` per network, as Bitcoin Core v31.1's
+    /// `kernel/chainparams.cpp` sets it. A custom signet has none; regtest
+    /// has none.
+    #[test]
+    fn minimum_chain_work_follows_cores_chainparams() {
+        let hex_of = |network: Network, challenge: Option<Vec<u8>>| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut cs = ChainState::new(
+                Box::new(InMemoryStore::new()),
+                FlatFileManager::new(&dir.path().join("blocks")).unwrap(),
+                network,
+                Box::new(crate::validation::script::NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            cs.set_signet_challenge(challenge);
+            hex::encode(cs.minimum_chain_work())
+        };
+        assert_eq!(
+            hex_of(Network::Bitcoin, None),
+            "0000000000000000000000000000000000000001128750f82f4c366153a3a030"
+        );
+        assert_eq!(
+            hex_of(Network::Testnet, None),
+            "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"
+        );
+        assert_eq!(
+            hex_of(Network::Testnet4, None),
+            "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+        );
+        assert_eq!(
+            hex_of(Network::Signet, None),
+            "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+        );
+        assert_eq!(hex_of(Network::Signet, Some(vec![0x51])), "0".repeat(64));
+        assert_eq!(hex_of(Network::Regtest, None), "0".repeat(64));
     }
 
     /// The commit-to-tip-write window is exactly the one a paired

@@ -360,6 +360,28 @@ fn is_getdata_for(hash: BlockHash) -> impl Fn(&NetworkMessage) -> bool {
     }
 }
 
+/// Each request for `hash` in `msgs`, in order: `true` for
+/// `MSG_CMPCT_BLOCK`, `false` for the full block.
+fn block_requests(msgs: &[NetworkMessage], hash: BlockHash) -> Vec<bool> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            NetworkMessage::GetData(inv) => Some(inv),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|i| match i {
+            Inventory::CompactBlock(h) if *h == hash => Some(true),
+            Inventory::Block(h) | Inventory::WitnessBlock(h) if *h == hash => Some(false),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `getdata` for `hash` in either form.
+fn is_block_request_for(hash: BlockHash) -> impl Fn(&NetworkMessage) -> bool {
+    move |m| !block_requests(std::slice::from_ref(m), hash).is_empty()
+}
+
 /// A node with `blocks` blocks mined, so it is past IBD.
 fn started_node(blocks: u64) -> (TestNode, DeterministicWallet) {
     let node = TestNode::start(&[]);
@@ -657,11 +679,13 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     let hash = b.block_hash();
     // Only three peers can be high-bandwidth, so the four take the other road
     // past the unsolicited-push gate: the node asks each of them for the
-    // block after the header is announced.
+    // block after the header is announced -- the announcer for a
+    // `cmpctblock`, the others in full once the tip-following sweep reaches
+    // them.
     peers[0].send(NetworkMessage::Headers(vec![b.header]));
     for (i, p) in peers.iter_mut().enumerate() {
         assert!(
-            p.recv_until(is_getdata_for(hash), test_timeout(20)).is_some(),
+            p.recv_until(is_block_request_for(hash), test_timeout(20)).is_some(),
             "the node must request the block from peer {i}"
         );
     }
@@ -1386,4 +1410,246 @@ fn a_cmpctblock_announcement_makes_the_peer_a_download_source() {
         "the node knows {ANNOUNCED} headers past its tip, has no data for them, and the \
          peer that announced them is its only source; asking nobody is a wedge, not a delay"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Low-bandwidth compact fetch: blocks announced by `headers`
+// ---------------------------------------------------------------------------
+
+/// Everything `peer` receives until a message matching `pred` arrives, that
+/// message included. Panics if none does within `timeout`.
+fn collect_until(peer: &mut RawPeer, pred: impl Fn(&NetworkMessage) -> bool, timeout: Duration, what: &str) -> Vec<NetworkMessage> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "{what}: not seen, got {seen:?}");
+        for m in peer.collect_for(Duration::from_millis(100).min(left)) {
+            let done = pred(&m);
+            seen.push(m);
+            if done {
+                return seen;
+            }
+        }
+    }
+}
+
+/// Core's headers direct fetch (`HeadersDirectFetchBlocks`): a peer that
+/// speaks BIP 152 version 2 but was never selected for high-bandwidth relay
+/// announces one new block by `headers`, and the node asks for it as
+/// `MSG_CMPCT_BLOCK` instead of the full block. The `cmpctblock` is rebuilt
+/// the way a pushed one is, with a `getblocktxn` for the transaction the node
+/// has never seen, and the block connects without ever being fetched whole.
+#[test]
+fn a_block_announced_by_headers_is_fetched_as_a_cmpctblock() {
+    let (node, wallet) = started_node(101);
+    let dest = DeterministicWallet::from_secret([0x69; 32]);
+    let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node, &wallet, dest.address.script_pubkey(), 1_000,
+    );
+    let tx: Transaction = deserialize(&hex::decode(&tx_hex).unwrap()).unwrap();
+
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    assert_eq!(node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"], json!(false), "a low-bandwidth peer");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, height(&node) + 1, vec![tx.clone()], true, 71);
+    let hash = b.block_hash();
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    let mut seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
+    assert_eq!(block_requests(&seen, hash), vec![true], "the block must be asked for as a cmpctblock");
+
+    peer.send(cmpct(HeaderAndShortIds::from_block(&b, 71, 2, &[]).unwrap()));
+    let asked = collect_until(&mut peer, is_getblocktxn_for(hash), test_timeout(20), "a getblocktxn");
+    let Some(NetworkMessage::GetBlockTxn(g)) = asked.last() else { unreachable!() };
+    assert_eq!(g.txs_request.indexes, vec![1], "only the transaction the node lacks");
+    seen.extend(asked.iter().cloned());
+
+    peer.send(NetworkMessage::BlockTxn(BlockTxn {
+        transactions: BlockTransactions { block_hash: hash, transactions: vec![tx] },
+    }));
+    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the rebuilt block must connect");
+    seen.extend(peer.collect_for(Duration::from_secs(1)));
+    assert_eq!(block_requests(&seen, hash), vec![true], "never fetched in full");
+    assert_eq!(banned_count(&node), 0);
+}
+
+/// A fetched `cmpctblock` whose reconstruction fails -- it fills a slot with
+/// the wrong transaction after a short-ID collision, and the merkle root no
+/// longer matches -- is fetched again, whole, from the same peer, and the
+/// block connects. Nothing is left waiting on a compact block that will not
+/// come.
+#[test]
+fn a_fetched_cmpctblock_that_fails_reconstruction_falls_back_to_the_full_block() {
+    let (node, wallet) = started_node(101);
+    let dest = DeterministicWallet::from_secret([0x6a; 32]);
+    let (t_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node, &wallet, dest.address.script_pubkey(), 1_000,
+    );
+    let (t2_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node, &wallet, dest.address.script_pubkey(), 2_000,
+    );
+    let t: Transaction = deserialize(&hex::decode(&t_hex).unwrap()).unwrap();
+    let t2: Transaction = deserialize(&hex::decode(&t2_hex).unwrap()).unwrap();
+    node.rpc_ok("sendrawtransaction", vec![json!(t_hex)]);
+
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, height(&node) + 1, vec![t2], true, 72);
+    let hash = b.block_hash();
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    let seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
+    assert_eq!(block_requests(&seen, hash), vec![true], "the block must be asked for as a cmpctblock");
+
+    let mut compact = HeaderAndShortIds::from_block(&b, 0x4321, 2, &[]).unwrap();
+    let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
+    compact.short_ids[0] = ShortId::with_siphash_keys(&t.compute_wtxid().to_raw_hash(), keys);
+    peer.send(cmpct(compact));
+
+    let fallback = collect_until(&mut peer, is_getdata_for(hash), test_timeout(20), "a full getdata");
+    assert!(!fallback.iter().any(is_getblocktxn_for(hash)), "a complete but wrong block needs no getblocktxn");
+    peer.send(NetworkMessage::Block(b));
+    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the full block must connect");
+    assert!(!peer.is_closed(), "a collision is not misbehaviour");
+    assert_eq!(banned_count(&node), 0);
+}
+
+/// A compact request the peer never answers does not strand the block: the
+/// tip-following sweep holds off only for a short window, then fetches the
+/// block in full.
+#[test]
+fn an_unanswered_compact_request_is_followed_by_a_full_fetch() {
+    let (node, _) = started_node(1);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, height(&node) + 1, vec![], true, 73);
+    let hash = b.block_hash();
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    let seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
+    assert_eq!(block_requests(&seen, hash), vec![true]);
+
+    // Say nothing. The full request must follow.
+    collect_until(&mut peer, is_getdata_for(hash), test_timeout(30), "a full getdata after the compact one");
+    peer.send(NetworkMessage::Block(b));
+    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the block must connect");
+}
+
+/// Core asks for a `cmpctblock` only when the announcement leaves exactly one
+/// block to fetch. Two new blocks in one `headers` message are fetched in
+/// full.
+#[test]
+fn an_announcement_leaving_two_blocks_to_fetch_is_fetched_in_full() {
+    let (node, _) = started_node(1);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b2 = build_block(&tip, height(&node) + 1, vec![], true, 74);
+    let b3 = build_block(&b2, height(&node) + 2, vec![], true, 75);
+    peer.send(NetworkMessage::Headers(vec![b2.header, b3.header]));
+    let mut seen = collect_until(&mut peer, is_getdata_for(b3.block_hash()), test_timeout(20), "a request for both");
+    seen.extend(peer.collect_for(Duration::from_secs(1)));
+    assert_eq!(block_requests(&seen, b2.block_hash()), vec![false]);
+    assert_eq!(block_requests(&seen, b3.block_hash()), vec![false]);
+
+    peer.send(NetworkMessage::Block(b2));
+    peer.send(NetworkMessage::Block(b3.clone()));
+    poll_until(|| best_hash(&node) == b3.block_hash(), test_timeout(20), "both must connect");
+}
+
+// ---------------------------------------------------------------------------
+// BIP 130 `sendheaders`
+// ---------------------------------------------------------------------------
+
+fn sendheaders_count(msgs: &[NetworkMessage]) -> usize {
+    msgs.iter().filter(|m| matches!(m, NetworkMessage::SendHeaders)).count()
+}
+
+fn hash_at(node: &TestNode, h: u32) -> BlockHash {
+    node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap()
+}
+
+/// The connection opens with a `getheaders` whose locator starts one below
+/// the tip, as Core's initial `getheaders` does; checks it and returns
+/// everything received up to it.
+fn initial_getheaders(node: &TestNode, peer: &mut RawPeer) -> Vec<NetworkMessage> {
+    let seen = collect_until(
+        peer,
+        |m| matches!(m, NetworkMessage::GetHeaders(_)),
+        test_timeout(20),
+        "the connection's getheaders",
+    );
+    let Some(NetworkMessage::GetHeaders(g)) = seen.last() else { unreachable!() };
+    assert_eq!(
+        g.locator_hashes.first(),
+        Some(&hash_at(node, height(node) - 1)),
+        "the locator starts below the tip, so a peer on the tip answers with a header"
+    );
+    seen
+}
+
+/// Core sends `sendheaders` to an inbound peer once the peer has shown a
+/// block past the minimum chain work (`MaybeSendSendHeaders`; regtest has no
+/// minimum), and once only. satd sent it to outbound peers alone, so an
+/// inbound peer announced every block to it by `inv`.
+#[test]
+fn an_inbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
+    let (node, _) = started_node(5);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    let mut before = peer.early.clone();
+    before.extend(initial_getheaders(&node, &mut peer));
+    before.extend(peer.collect_for(Duration::from_secs(1)));
+    assert_eq!(sendheaders_count(&before), 0, "not before the peer has shown a block: {before:?}");
+
+    // The answer to that getheaders: the tip's header.
+    let tip = block_at(&node, &best_hash(&node));
+    peer.send(NetworkMessage::Headers(vec![tip.header]));
+    let got = collect_until(&mut peer, |m| matches!(m, NetworkMessage::SendHeaders), test_timeout(20), "sendheaders");
+    assert_eq!(sendheaders_count(&got), 1);
+
+    // More blocks shown, by header and by a new block: no second one.
+    peer.send(NetworkMessage::Headers(vec![tip.header]));
+    let b = build_block(&tip, height(&node) + 1, vec![], true, 76);
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    peer.send(NetworkMessage::Block(b.clone()));
+    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the block must connect");
+    let after = peer.collect_for(Duration::from_secs(2));
+    assert_eq!(sendheaders_count(&after), 0, "sendheaders goes out once per connection: {after:?}");
+}
+
+/// An outbound peer is still sent `sendheaders` as the connection comes up,
+/// before it has shown anything: satd fetches a block announced by `inv`
+/// before it has its header, so a peer mining while the node syncs from it
+/// would otherwise feed it an out-of-order chain. Core's condition must not
+/// send it a second time once the peer does show a block.
+#[test]
+fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
+    let (node, _) = started_node(5);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![json!(listener.local_addr().unwrap().to_string()), json!("outbound-full-relay"), json!(false)],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "addconnection: {out}");
+    let mut peer = RawPeer::accept(&listener);
+    let mut before = peer.early.clone();
+    before.extend(initial_getheaders(&node, &mut peer));
+    before.extend(peer.collect_for(Duration::from_secs(1)));
+    assert_eq!(sendheaders_count(&before), 1, "sent once as the connection comes up: {before:?}");
+
+    let tip = block_at(&node, &best_hash(&node));
+    peer.send(NetworkMessage::Headers(vec![tip.header]));
+    let b = build_block(&tip, height(&node) + 1, vec![], true, 77);
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    peer.send(NetworkMessage::Block(b.clone()));
+    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the block must connect");
+    let after = peer.collect_for(Duration::from_secs(2));
+    assert_eq!(sendheaders_count(&after), 0, "once per connection: {after:?}");
 }

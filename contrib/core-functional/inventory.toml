@@ -582,13 +582,11 @@ note = "measured 2026-09-15: the -blocksonly violation disconnects landed; L46 t
 file = "p2p_compactblocks.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured with high-bandwidth compact relay in place: still stops in make_utxos, before any compact-block subtest -- a block pushed with send_and_ping is not connected (getbestblockhash stays at genesis). The residual is only the unrequested-block rule, same root as p2p_unrequested_blocks"
+note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utxos, the sendcmpct and construction subtests pass; L388 fails on the inv half of test_compactblock_requests -- satd answers a block inv with a full getdata where Core sends only getheaders, so the first getdata the test sees is MSG_WITNESS_BLOCK, not MSG_CMPCT_BLOCK. Measured with that half skipped, the headers half passes, as do the getblocktxn, handler and not-at-tip subtests; the test then stops at L657, which wants 'Ignoring low-work compact block' (Core's anti-DoS work threshold for cmpctblock headers). Follow-up: inv -> getheaders (see p2p_sendheaders) and the low-work threshold"
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
-status = "skip"
-reason = "feature-missing"
-note = "re-measured with high-bandwidth compact relay in place: fails at its first assertion, before any compact-block behaviour is checked -- a block pushed with send_and_ping to the -blocksonly node does not become the tip"
+status = "run"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
@@ -793,7 +791,7 @@ note = "measured 2026-09-16 with message ordering behind ping in place: past L32
 file = "p2p_sendheaders.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L334 an unexpected getheaders after a block inv. Behind it: inv->getheaders-not-getdata, per-peer announcement state and direct fetch. Follow-up: Core's header announcement state machine"
+note = "re-measured 2026-09-28: L252, a getheaders with a null locator whose hashStop satd holds only as a header is answered with headers 1..tip; Core answers nothing for a block it may not serve (BlockRequestAllowed). Measured 2026-09-15 at L334, an unexpected getheaders after a block inv; behind both: inv->getheaders-not-getdata and per-peer announcement state. Follow-up: Core's header announcement state machine"
 
 [[test]]
 file = "p2p_sendtxrcncl.py"

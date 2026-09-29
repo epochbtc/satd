@@ -102,8 +102,9 @@ labels) and does not consume an RPC worker on every scrape.
 
 ### Compact block relay
 
-Each block that arrives as a BIP 152 compact block logs one line at `info`
-when it is reconstructed:
+Each block that arrives as a BIP 152 compact block, whether a high-bandwidth
+peer pushed it or the node asked for it after a `headers` announcement, logs
+one line at `info` when it is reconstructed:
 
 ```
 compact block reconstructed hash=… height=… peer=… prefilled=1 prefilled_bytes=… mempool=2841 mempool_bytes=… extra=0 extra_bytes=0 requested=3 fetched_bytes=… redundant_prefilled=0 round_trip=true elapsed_ms=…

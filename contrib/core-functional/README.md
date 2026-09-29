@@ -166,6 +166,12 @@ carry the blocker that was actually observed once the RPC existed.
   (`MaybeSetPeerAsAnnouncingHeaderAndIDs`) promotes the peer that delivered
   the tip. Selection, `cmpctblock` announcements and `MSG_CMPCT_BLOCK`
   serving now follow Core. This put `p2p_compactblocks_hb.py` in the run-set.
+- **Blocks announced by `headers` were always fetched whole.** satd never sent
+  `getdata(MSG_CMPCT_BLOCK)`, where Core's headers direct fetch asks a peer
+  that speaks BIP 152 version 2 for a compact block when the announcement
+  leaves one block to fetch and nothing else is in flight -- and asks for the
+  full block under `-blocksonly`. This put `p2p_compactblocks_blocksonly.py`
+  in the run-set (#867).
 - **`-connect=0` was dialled as an address.** Core spells "open no outbound
   connections" that way and every functional-test node is started with it, so
   satd dialled `0.0.0.0:8333` at startup and kept re-dialling it from the
