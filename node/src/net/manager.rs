@@ -572,13 +572,23 @@ pub struct PeerManager {
     /// which drops a registration whose `getdata` could not be sent: an
     /// attempt counts toward the interval whether or not it reached a peer.
     unreadable_refetch_at: parking_lot::Mutex<HashMap<bitcoin::BlockHash, Instant>>,
-    /// Configured outbound peer addresses for auto-reconnect.
-    connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Addresses the node learned for itself: `addr`/`addrv2` gossip, the
+    /// address book at startup, DNS seeds. The reconnect loop dials them only
+    /// while `automatic_outbound` is on, as `outbound-full-relay`
+    /// connections. Only addresses the address book would take get here
+    /// (`AddrMan::admits`).
+    ///
+    /// Kept apart from `manual_addrs`. This list used to hold both, and
+    /// `spawn_peer` called any peer on it `manual`, so every peer reached
+    /// through gossip was reported, whitelisted and counted as one (#866).
+    learned_addrs: RwLock<Vec<SocketAddr>>,
     /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
     automatic_outbound: std::sync::atomic::AtomicBool,
-    /// Addresses that should be tagged as manual (addnode-initiated) when
-    /// they connect. Includes both persistent addnode entries and onetry
-    /// connections. Onetry entries are removed after the connect completes.
+    /// The clearnet peers the operator named: `-connect`, `-addnode` /
+    /// `addnode add` (the address a name resolved to), and `-seednode`. The
+    /// reconnect loop dials them whatever `automatic_outbound` says, and a
+    /// connection to one is `manual`. An `addnode onetry` is a manual
+    /// connection too, but it is typed at its dial and never recorded here.
     manual_addrs: RwLock<HashSet<SocketAddr>>,
     /// The `.onion` hosts an operator named (`-connect` / `-addnode` /
     /// `-seednode`), as opposed to those learned from `addrv2` gossip. The
@@ -931,7 +941,7 @@ impl PeerManager {
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
-            connect_addrs: RwLock::new(Vec::new()),
+            learned_addrs: RwLock::new(Vec::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
@@ -944,7 +954,13 @@ impl PeerManager {
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             whitelist: RwLock::new(Vec::new()),
-            addrman: RwLock::new(crate::net::addrman::AddrMan::new()),
+            // Core's rule off regtest: routable addresses only. Regtest keeps
+            // private ones, which lab networks run on.
+            addrman: RwLock::new({
+                let mut book = crate::net::addrman::AddrMan::new();
+                book.set_admit_private(network == Network::Regtest);
+                book
+            }),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
@@ -1490,31 +1506,66 @@ impl PeerManager {
         }
     }
 
-    /// Register addresses for auto-reconnect.
+    /// Record a gossiped address as a dial candidate, with the default
+    /// service bits and as its own source.
     ///
     /// Deduped: addr/addrv2 gossip from multiple peers frequently announces
     /// the same socket address many times. Without dedup, the reconnect
     /// loop spawns one `connect_outbound` task per duplicate, and a remote
     /// peer's per-IP rate limit will FIN all but the first within a few
     /// hundred ms — surfacing as severe peer churn.
-    pub fn add_connect_addr(&self, addr: SocketAddr) {
-        self.add_connect_addr_from(
+    pub fn add_learned_addr(&self, addr: SocketAddr) {
+        self.add_learned_addr_from(
             addr,
             crate::net::addrman::DEFAULT_SERVICES,
             addr.ip(),
         );
     }
 
-    /// [`add_connect_addr`](Self::add_connect_addr) for a gossiped address,
+    /// [`add_learned_addr`](Self::add_learned_addr) for a gossiped address,
     /// recording the service bits it was announced with and the peer that
     /// announced it (Core's `nServices` and `source`, which `getnodeaddresses`
     /// and `getrawaddrman` report).
-    pub fn add_connect_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
+    pub fn add_learned_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
         // Record in the persistent address book (peers.dat) as a *new*
-        // address. This is the chokepoint for gossiped addresses.
-        self.addrman
-            .write()
-            .add_from(addr, now_unix_secs(), services, source);
+        // address. This is the chokepoint for gossiped addresses, and the
+        // book's rule decides what the node learns at all. An address it
+        // refuses goes on the dial list no more than in the book: one that
+        // names no host, like the `0.0.0.0` a peer relayed in #866, which on
+        // Linux dials the local host, or, off regtest, one that is not
+        // publicly routable. Core refuses both in `AddrManImpl::AddSingle`
+        // (v31.1 `src/addrman.cpp:554`) and dials only from its book.
+        {
+            let mut book = self.addrman.write();
+            if !book.admits(&addr) {
+                tracing::debug!(%addr, "Ignoring a gossiped address the address book does not take");
+                return;
+            }
+            book.add_from(addr, now_unix_secs(), services, source);
+        }
+        self.push_learned(addr);
+    }
+
+    /// Record a peer from a DNS seed or the compiled-in fixed seeds as a
+    /// dial candidate. These are the node's own bootstrap sources, not peers
+    /// the operator named: Core adds them to its address book and dials them
+    /// as automatic connections, so they join the learned candidates rather
+    /// than `manual_addrs`, under the same rule as gossip. An onion seed
+    /// joins the onion candidates.
+    pub fn add_learned_peer_addr(&self, addr: &PeerAddr) {
+        match addr {
+            PeerAddr::Socket(sa) => {
+                if self.addrman.read().admits(sa) {
+                    self.push_learned(*sa);
+                }
+            }
+            PeerAddr::Onion { host, port } => self.add_onion_connect_addr(host.clone(), *port),
+        }
+    }
+
+    /// Put an address the node learned on the reconnect loop's automatic
+    /// dial list.
+    fn push_learned(&self, addr: SocketAddr) {
         // Under `-connect` the node dials only the peers it was told to.
         // Core keeps learning addresses in that mode (they go to the addrman
         // above) but sets `m_use_addrman_outgoing = false`, so it never opens
@@ -1524,7 +1575,7 @@ impl PeerManager {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return;
         }
-        let mut addrs = self.connect_addrs.write();
+        let mut addrs = self.learned_addrs.write();
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
@@ -1539,8 +1590,8 @@ impl PeerManager {
 
     /// Whether the reconnect loop may dial `addr`.
     ///
-    /// The `add_connect_addr` gate alone is not enough. `peers.dat` is loaded
-    /// straight into `connect_addrs` at startup, long before `-connect` has
+    /// The `push_learned` gate alone is not enough. `peers.dat` is loaded
+    /// straight into `learned_addrs` at startup, long before `-connect` has
     /// been applied to the manager, so a node restarted with `-connect=0` and
     /// an existing address book still dialled everything it had learned --
     /// exactly the reconnect-to-the-network-you-disconnected-from this mode
@@ -1593,7 +1644,9 @@ impl PeerManager {
         }
         let picks = am.select_n(seed);
         drop(am);
-        let mut addrs = self.connect_addrs.write();
+        // Straight onto the list, not through `push_learned`: `-connect` has
+        // not been applied yet, and `may_dial` holds these back under it.
+        let mut addrs = self.learned_addrs.write();
         for a in picks {
             if !addrs.contains(&a) {
                 addrs.push(a);
@@ -1669,29 +1722,21 @@ impl PeerManager {
         self.addrman.write().set_group_fn(f);
     }
 
-    /// Register a peer for auto-reconnect. Returns `true` if the address
-    /// was newly added, `false` if it was already in the set (duplicate).
+    /// Register a peer the operator named (`-connect`, `-addnode`,
+    /// `-seednode`) for auto-reconnect: the reconnect loop dials it even
+    /// under `-connect`, and a connection to it is `manual`. Returns `true`
+    /// if the address was newly registered, `false` if it already was.
+    ///
+    /// The address may also be one the node learned (`peers.dat` seeds
+    /// `learned_addrs` at startup, long before `-connect` reaches the
+    /// manager, and gossip adds to it continuously). That does not matter:
+    /// the two lists are separate, and registering here is what makes it
+    /// manual. When the two were one list, an already-present address was
+    /// once left unmarked, so under `-connect` one failed dial stranded the
+    /// node with no peers at all.
     pub fn add_peer_addr(&self, addr: PeerAddr) -> bool {
         match &addr {
-            PeerAddr::Socket(sa) => {
-                // Mark as manual *before* the duplicate check -- so spawn_peer
-                // tags the peer correctly, and so `may_dial` keeps letting it
-                // through. An address can already be a dial candidate by the
-                // time it is configured: `peers.dat` seeds `connect_addrs` at
-                // startup, long before `-connect` reaches the manager, and
-                // gossip adds to it continuously. Marking it only on the
-                // newly-added path left an explicitly configured peer failing
-                // `may_dial`, so under `-connect` one failed dial or
-                // disconnect stranded the node with no peers at all. The onion
-                // arm below already registers before its duplicate check.
-                self.manual_addrs.write().insert(*sa);
-                let mut addrs = self.connect_addrs.write();
-                if addrs.contains(sa) {
-                    return false;
-                }
-                addrs.push(*sa);
-                true
-            }
+            PeerAddr::Socket(sa) => self.manual_addrs.write().insert(*sa),
             PeerAddr::Onion { host, .. } => {
                 self.manual_onion_hosts.write().insert(host.clone());
                 let mut addrs = self.connect_peer_addrs.write();
@@ -1927,23 +1972,19 @@ impl PeerManager {
     /// this only stops future reconnect attempts; it does not force-disconnect
     /// an already-established peer. Returns `true` if the address was found
     /// and removed, `false` if it was not in the set.
+    ///
+    /// An address the node also learned for itself stays a learned
+    /// candidate, as in Core, where removing an added node leaves its
+    /// address book alone.
     pub fn remove_peer_addr(&self, addr: &PeerAddr) -> bool {
-        // `add_peer_addr` registers the address in `manual_addrs` /
-        // `manual_onion_hosts` as well as the reconnect list, and this only
-        // ever cleared the reconnect list. A removed `addnode` peer therefore
-        // stayed "manual" for the life of the process: it kept being dialled
-        // as a manual connection, and `is_manual_target` kept exempting it
-        // from `-connect` gating — so `addnode <peer> remove` on a
+        // The manual registration has to go, not only the dial. A removed
+        // `addnode` peer once stayed "manual" for the life of the process:
+        // it kept being dialled as a manual connection and exempt from
+        // `-connect` gating, so `addnode <peer> remove` on a
         // `-connect`-pinned node left the peer connectable when the whole
         // point of that flag is that it is not.
         match addr {
-            PeerAddr::Socket(sa) => {
-                self.manual_addrs.write().remove(sa);
-                let mut addrs = self.connect_addrs.write();
-                let before = addrs.len();
-                addrs.retain(|a| a != sa);
-                addrs.len() < before
-            }
+            PeerAddr::Socket(sa) => self.manual_addrs.write().remove(sa),
             PeerAddr::Onion { host, .. } => {
                 self.manual_onion_hosts.write().remove(host);
                 let mut addrs = self.connect_peer_addrs.write();
@@ -2132,17 +2173,20 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to an outbound peer, letting `spawn_peer` classify it.
+    /// Connect to an outbound peer with no caller-chosen type, as the
+    /// reconnect loop does. `spawn_peer` classifies it: `manual` if the
+    /// operator named the address, `outbound-full-relay` otherwise.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
         self.connect_outbound_as(addr, None, None).await
     }
 
     /// Connect to an outbound peer of a caller-chosen type.
     ///
-    /// `conn_type` is `Some` only for `addconnection`; every other dial passes
-    /// `None` and keeps the historical classification (manual if the address
-    /// is an addnode/-connect target, full-relay otherwise) along with the
-    /// historical single outbound cap.
+    /// `conn_type` is `Some(Manual)` for a dial the operator asked for
+    /// ([`Self::connect_peer_addr_with`]), and one of `addconnection`'s four
+    /// types for that RPC. `None` is an automatic dial, classified by
+    /// `spawn_peer`. A manual or automatic dial takes the historical single
+    /// outbound cap; `addconnection`'s types take Core's per-type ones.
     pub async fn connect_outbound_as(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -2244,9 +2288,27 @@ impl PeerManager {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
+        // Core's `ConnectNode` opens a socket only to an address that
+        // `IsValid()` (v31.1 `src/net.cpp:443`), for a manual target as much
+        // as a learned one. `0.0.0.0`, `255.255.255.255` and `::` name no
+        // host, and on Linux a connect to `0.0.0.0` reaches the local host:
+        // a gossiped `0.0.0.0:<our port>` had the node dial itself on every
+        // reconnect tick (#866). The address book refuses such an address
+        // on the way in, but this is the one place every socket dial passes
+        // (the reconnect loop, `addnode`, `-connect`, `addconnection`), so it
+        // holds however the address arrived.
+        if !crate::net::is_valid(addr.ip()) {
+            return Err(format!("{addr} is not a valid address to connect to"));
+        }
         // Take the capacity check and the per-type reservation together, so
         // two callers cannot both pass the same free slot.
         let _typed_slot = match conn_type {
+            // A manual dial is capped as an automatic one is, as it always
+            // was; it has no per-type reservation to take.
+            None | Some(ConnType::Manual) => {
+                self.check_outbound_limit()?;
+                None
+            }
             Some(t) if reserve => {
                 let mut pending = self.pending_typed_dials.write();
                 self.check_outbound_limit_for(t, &pending)?;
@@ -2255,17 +2317,13 @@ impl PeerManager {
                 Some(TypedDialGuard { set: &self.pending_typed_dials, conn_type: t })
             }
             Some(_) => None,
-            None => {
-                self.check_outbound_limit()?;
-                None
-            }
         };
 
         // Claim the dial slot before doing any network I/O. Without this,
         // the reconnect loop can spawn multiple concurrent `connect_outbound`
-        // tasks for the same addr (the addr is removed from `connect_addrs`
-        // after the dial returns, not before it starts), and a remote
-        // peer's per-IP rate limit will FIN all but the first.
+        // tasks for the same addr (nothing takes an address off the dial
+        // lists while a dial to it is in flight), and a remote peer's per-IP
+        // rate limit will FIN all but the first.
         {
             let mut pending = self.pending_connections.write();
             if pending.contains(&addr) {
@@ -2330,11 +2388,14 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to a .onion peer address via SOCKS5 proxy.
+    /// Connect to a .onion peer address via SOCKS5 proxy. `conn_type` is
+    /// `Some(Manual)` for a dial the operator asked for and `None` for an
+    /// automatic one, which `spawn_peer` classifies.
     pub async fn connect_outbound_onion(
         self: &Arc<Self>,
         host: &str,
         port: u16,
+        conn_type: Option<ConnType>,
     ) -> Result<(), String> {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
@@ -2400,12 +2461,15 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             Some(host),
-            None,
+            conn_type,
         );
         Ok(())
     }
 
-    /// Connect to a PeerAddr (either socket or .onion).
+    /// Dial a peer the operator asked for (either socket or .onion), there
+    /// and then: `-connect`, `-addnode` and `-seednode` at startup and on
+    /// reload, `addnode add`, `addnode onetry`, and a named peer whose
+    /// name resolved. The connection is `manual`.
     pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
         self.connect_peer_addr_with(addr, None).await
     }
@@ -2417,20 +2481,29 @@ impl PeerManager {
         addr: &PeerAddr,
         use_v2: Option<bool>,
     ) -> Result<(), String> {
-        // Connections from addnode RPC (including onetry) are manual.
-        // Mark the address so spawn_peer tags the peer correctly.
+        // Typed at the dial rather than by registering the address. This
+        // used to add it to `manual_addrs` for the dial and take it out
+        // again afterwards unless it was a dial candidate, which every
+        // gossip-learned address was: an `addnode <learned> onetry` left it
+        // manual for good, dialled as one even under `-connect`.
         match addr {
             PeerAddr::Socket(sa) => {
-                self.manual_addrs.write().insert(*sa);
-                let result = self.connect_outbound_as(*sa, None, use_v2).await;
-                // onetry: remove the manual marker after connect.
-                // Persistent addnode entries remain in connect_addrs.
-                if !self.connect_addrs.read().contains(sa) {
-                    self.manual_addrs.write().remove(sa);
-                }
-                result
+                self.connect_outbound_as(*sa, Some(ConnType::Manual), use_v2).await
             }
-            PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port).await,
+            PeerAddr::Onion { host, port } => {
+                self.connect_outbound_onion(host, *port, Some(ConnType::Manual)).await
+            }
+        }
+    }
+
+    /// Dial `addr` as one of the node's own automatic dials: the reconnect
+    /// loop's, and a seed's. No type is chosen here; `spawn_peer` reports
+    /// the connection `manual` if the operator named the peer and
+    /// `outbound-full-relay` otherwise.
+    pub async fn connect_peer_addr_automatic(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        match addr {
+            PeerAddr::Socket(sa) => self.connect_outbound(*sa).await,
+            PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port, None).await,
         }
     }
 
@@ -3609,7 +3682,20 @@ impl PeerManager {
                 let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
                 let need_peers = outbound < target;
                 if need_peers {
-                    let addrs = self.connect_addrs.read().clone();
+                    // The peers the operator named first, then those the node
+                    // learned. An address on both lists is offered once, and
+                    // `spawn_peer` makes it the manual connection it is: Core
+                    // makes no automatic connection to an added node
+                    // (`AddedNodesContain`, v31.1 `src/net.cpp:2883`).
+                    let manual: HashSet<SocketAddr> = self.manual_addrs.read().clone();
+                    let learned: Vec<SocketAddr> = self
+                        .learned_addrs
+                        .read()
+                        .iter()
+                        .filter(|a| !manual.contains(a))
+                        .copied()
+                        .collect();
+                    let addrs: Vec<SocketAddr> = manual.into_iter().chain(learned).collect();
 
                     let now = Instant::now();
 
@@ -3723,7 +3809,7 @@ impl PeerManager {
                         let pm = Arc::clone(self);
                         tokio::spawn(async move {
                             let key = peer_addr.to_string();
-                            match pm.connect_peer_addr(&peer_addr).await {
+                            match pm.connect_peer_addr_automatic(&peer_addr).await {
                                 Ok(_) => {
                                     pm.onion_reconnect_backoff
                                         .write()
@@ -3928,7 +4014,7 @@ impl PeerManager {
                         && !self.is_addr_connected(&sock_addr)
                         && !self.is_addr_banned(&sock_addr)
                     {
-                        self.add_connect_addr_from(
+                        self.add_learned_addr_from(
                             sock_addr,
                             addr.services.to_u64(),
                             source.unwrap_or(sock_addr.ip()),
@@ -4088,7 +4174,7 @@ impl PeerManager {
                                 && !self.is_addr_connected(&sock_addr)
                                 && !self.is_addr_banned(&sock_addr)
                             {
-                                self.add_connect_addr_from(
+                                self.add_learned_addr_from(
                                     sock_addr,
                                     addr_msg.services.to_u64(),
                                     source.unwrap_or(sock_addr.ip()),
@@ -8376,12 +8462,51 @@ impl PeerManager {
         }
     }
 
+    /// How an outbound connection that no caller typed is reported: `manual`
+    /// when it reaches a peer the operator named, `outbound-full-relay`
+    /// otherwise. An onion peer is judged by its host: its socket is the
+    /// `0.0.0.0` placeholder every onion peer shares.
+    ///
+    /// Only the operator's own lists decide. The automatic dial list once
+    /// counted too, and it holds every gossiped address, so every peer the
+    /// node reached through gossip was reported `manual` (#866).
+    fn untyped_outbound_conn_type(&self, addr: &SocketAddr, onion_host: Option<&str>) -> ConnType {
+        let named = match onion_host {
+            Some(host) => self.manual_onion_hosts.read().contains(host),
+            None => self.manual_addrs.read().contains(addr),
+        };
+        if named { ConnType::Manual } else { ConnType::OutboundFullRelay }
+    }
+
+    /// The `-whitelist` permissions an outbound connection takes. Core
+    /// consults its outgoing whitelist only for a manual connection
+    /// (`ConnectNode`, v31.1 `src/net.cpp:514`) and hands an automatic one
+    /// nothing.
+    ///
+    /// Nor does a manual onion peer take any. Its socket is the `0.0.0.0`
+    /// placeholder every onion peer shares, and matching that would hand it
+    /// whatever an `out` entry covering `0.0.0.0` grants; Core matches the
+    /// onion address itself, which no IP subnet contains.
+    fn outbound_whitelist_permissions(
+        &self,
+        conn_type: ConnType,
+        addr: &SocketAddr,
+        onion_host: Option<&str>,
+    ) -> crate::net::permissions::NetPermissions {
+        if conn_type == ConnType::Manual && onion_host.is_none() {
+            self.whitelist_permissions_for(addr.ip(), crate::net::permissions::Direction::OUT)
+        } else {
+            crate::net::permissions::NetPermissions::NONE
+        }
+    }
+
     /// Spawn read/write tasks for a new peer connection.
     ///
-    /// `conn_type` is `Some` only when the caller has already decided what
-    /// kind of connection this is -- today that is the `addconnection` RPC.
-    /// `None` means "work it out from the address", which is how every
-    /// ordinary dial reaches here.
+    /// `conn_type` is `Some` when the caller has already decided what kind of
+    /// connection this is: `Manual` for a dial the operator asked for, or
+    /// the type `addconnection` was given. `None` means "work it out from
+    /// the address" ([`Self::untyped_outbound_conn_type`]), which is how the
+    /// reconnect loop's dials, and a seed's, reach here.
     fn spawn_peer(
         self: &Arc<Self>,
         id: PeerId,
@@ -8394,18 +8519,14 @@ impl PeerManager {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
         info.onion_host = onion_host.map(str::to_string);
-        // Mark peers from `addnode` / `-connect` so getpeerinfo reports
-        // connection_type = "manual" instead of "outbound-full-relay".
+        // Peers from `addnode` / `-connect` are `manual`; everything the
+        // node dials by itself is `outbound-full-relay`. The type is not a
+        // label only: it decides the outgoing `-whitelist` below, whether a
+        // peer lacking the desired services is dropped at the handshake, and
+        // which outbound slots the peer counts against.
         if direction == Direction::Outbound {
-            info.conn_type = conn_type.unwrap_or_else(|| {
-                if self.connect_addrs.read().contains(&addr)
-                    || self.manual_addrs.read().contains(&addr)
-                {
-                    ConnType::Manual
-                } else {
-                    ConnType::OutboundFullRelay
-                }
-            });
+            info.conn_type = conn_type
+                .unwrap_or_else(|| self.untyped_outbound_conn_type(&addr, onion_host));
         }
         // `-whitelist` permissions, scoped to the direction this peer was
         // reached in. Core consults its *outgoing* whitelist only for a
@@ -8419,14 +8540,7 @@ impl PeerManager {
             Direction::Inbound => self
                 .whitelist_permissions_for(addr.ip(), crate::net::permissions::Direction::IN),
             Direction::Outbound => {
-                if info.conn_type == ConnType::Manual {
-                    self.whitelist_permissions_for(
-                        addr.ip(),
-                        crate::net::permissions::Direction::OUT,
-                    )
-                } else {
-                    crate::net::permissions::NetPermissions::NONE
-                }
+                self.outbound_whitelist_permissions(info.conn_type, &addr, onion_host)
             }
         };
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
@@ -10082,8 +10196,8 @@ mod tests {
     }
 
     #[test]
-    fn add_connect_addr_dedups() {
-        // Pure-Vec test of the dedup idiom used inside add_connect_addr.
+    fn add_learned_addr_dedups() {
+        // Pure-Vec test of the dedup idiom used inside add_learned_addr.
         let mut addrs: Vec<SocketAddr> = Vec::new();
         let a: SocketAddr = "1.2.3.4:8333".parse().unwrap();
         let b: SocketAddr = "1.2.3.5:8333".parse().unwrap();
@@ -10666,10 +10780,11 @@ mod tests {
         let pm = empty_peer_manager();
         assert!(pm.get_added_node_info().is_empty());
 
-        // A dial candidate is not an added node — this is the path gossiped
-        // and seeded addresses take, and they must not show up here.
-        let gossiped: SocketAddr = "127.0.0.1:18445".parse().unwrap();
-        pm.add_peer_addr(PeerAddr::Socket(gossiped));
+        // A dial candidate is not an added node — this is the path
+        // `-connect` and `-seednode` addresses take, and they must not show
+        // up here.
+        let candidate: SocketAddr = "127.0.0.1:18445".parse().unwrap();
+        pm.add_peer_addr(PeerAddr::Socket(candidate));
         assert!(
             pm.get_added_node_info().is_empty(),
             "a plain dial candidate must not appear in getaddednodeinfo"
@@ -10802,8 +10917,10 @@ mod tests {
 
         Arc::clone(&pm).refresh_manual_targets().await;
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
-        assert!(!pm.manual_addrs.read().contains(&old), "the old address is no longer a manual peer");
-        assert!(!pm.connect_addrs.read().contains(&old), "nor a dial candidate");
+        assert!(
+            !pm.manual_addrs.read().contains(&old),
+            "the old address is no longer a manual peer, nor dialled as one"
+        );
         assert!(pm.manual_addrs.read().contains(&new));
     }
 
@@ -10825,35 +10942,173 @@ mod tests {
         Arc::clone(&pm).refresh_manual_targets().await;
         assert!(pm.get_added_node_info().is_empty());
         assert!(!pm.manual_addrs.read().contains(&target));
-        assert!(!pm.connect_addrs.read().contains(&target));
+        assert!(!pm.learned_addrs.read().contains(&target));
     }
 
     /// An explicitly configured peer must stay dialable under `-connect`
-    /// even when its address was already a dial candidate. `peers.dat` is
-    /// loaded into `connect_addrs` at startup, ~1400 lines before `-connect`
+    /// even when its address was already a learned candidate. `peers.dat` is
+    /// loaded into `learned_addrs` at startup, ~1400 lines before `-connect`
     /// is applied and the configured peers are registered, so for a node
     /// with an address book this is the *common* case, not the odd one.
-    /// Registering the manual marker only on the newly-added path left
-    /// `may_dial` refusing the one peer the operator named: the startup dial
-    /// still happened, but nothing could retry it.
+    /// When the two were one list, registering the manual marker only on the
+    /// newly-added path left `may_dial` refusing the one peer the operator
+    /// named: the startup dial still happened, but nothing could retry it.
     #[test]
     fn a_configured_peer_already_in_the_dial_pool_stays_dialable() {
         let pm = empty_peer_manager();
         let addr: SocketAddr = "127.0.0.1:18455".parse().unwrap();
 
         // As the address book does at startup, before `-connect` is applied.
-        pm.add_connect_addr(addr);
+        pm.add_learned_addr(addr);
+        assert!(pm.learned_addrs.read().contains(&addr));
         pm.set_automatic_outbound(false);
 
-        // Then the configured `-connect=<addr>`, finding it already present.
+        // Then the configured `-connect=<addr>`, finding it already learned:
+        // it is still newly a peer the operator named.
         assert!(
-            !pm.add_peer_addr(PeerAddr::Socket(addr)),
-            "the address was already a dial candidate"
+            pm.add_peer_addr(PeerAddr::Socket(addr)),
+            "being learned does not make an address the operator's"
         );
+        assert!(!pm.add_peer_addr(PeerAddr::Socket(addr)), "registering twice is one entry");
         assert!(
             pm.may_dial(&addr),
             "an explicitly configured peer must stay dialable under -connect"
         );
+    }
+
+    /// The type of a peer found by the peer's `conn_type` on the handle.
+    fn conn_type_at(pm: &PeerManager, addr: SocketAddr) -> Option<ConnType> {
+        pm.peers
+            .read()
+            .values()
+            .find(|h| h.info.addr == addr)
+            .map(|h| h.info.conn_type)
+    }
+
+    /// Only the operator's own lists make a dial `manual` (#866). The
+    /// automatic dial list used to count too, and it holds every gossiped
+    /// address, so every peer reached through gossip was reported, granted
+    /// the outgoing whitelist and slotted as a manual one. An onion peer is
+    /// judged by its host: its socket is the placeholder all onion peers
+    /// share, which a `-connect=0.0.0.0:<port>` entry would otherwise match.
+    #[test]
+    fn untyped_dials_are_manual_only_for_the_operators_peers() {
+        let pm = empty_peer_manager();
+        let learned: SocketAddr = "127.0.0.1:18461".parse().unwrap();
+        let named: SocketAddr = "127.0.0.1:18462".parse().unwrap();
+        pm.add_learned_addr(learned);
+        assert!(pm.learned_addrs.read().contains(&learned));
+        pm.add_peer_addr(PeerAddr::Socket(named));
+        assert_eq!(pm.untyped_outbound_conn_type(&learned, None), ConnType::OutboundFullRelay);
+        assert_eq!(pm.untyped_outbound_conn_type(&named, None), ConnType::Manual);
+
+        let named_host = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let learned_host = "2bqghnldu6mcug4pikzprwhtjjnsyederctvci6klcwzepnjd46ikjyd.onion";
+        pm.add_peer_addr(PeerAddr::Onion { host: named_host.to_string(), port: 8333 });
+        pm.add_learned_peer_addr(&PeerAddr::Onion { host: learned_host.to_string(), port: 8333 });
+        let placeholder: SocketAddr = ([0, 0, 0, 0], 8333).into();
+        // An operator entry for the placeholder itself must not reach an
+        // onion peer that shares it.
+        pm.add_peer_addr(PeerAddr::Socket(placeholder));
+        assert_eq!(pm.untyped_outbound_conn_type(&placeholder, Some(named_host)), ConnType::Manual);
+        assert_eq!(
+            pm.untyped_outbound_conn_type(&placeholder, Some(learned_host)),
+            ConnType::OutboundFullRelay
+        );
+    }
+
+    /// Core consults its outgoing whitelist for manual connections only, so
+    /// a learned peer takes none of an `out` entry. A manual onion peer
+    /// takes none either: matching its `0.0.0.0` placeholder against an
+    /// entry that covers it would grant it the entry.
+    #[test]
+    fn the_outgoing_whitelist_reaches_manual_clearnet_peers_only() {
+        let pm = empty_peer_manager();
+        pm.set_whitelist(vec![
+            crate::net::permissions::WhitelistEntry::parse("noban,out@0.0.0.0/0").unwrap(),
+        ]);
+        let peer: SocketAddr = "127.0.0.1:18463".parse().unwrap();
+        assert!(pm.outbound_whitelist_permissions(ConnType::Manual, &peer, None).noban);
+        assert_eq!(
+            pm.outbound_whitelist_permissions(ConnType::OutboundFullRelay, &peer, None),
+            crate::net::permissions::NetPermissions::NONE
+        );
+        let placeholder: SocketAddr = ([0, 0, 0, 0], 8333).into();
+        assert_eq!(
+            pm.outbound_whitelist_permissions(ConnType::Manual, &placeholder, Some("x.onion")),
+            crate::net::permissions::NetPermissions::NONE
+        );
+    }
+
+    /// `addnode onetry` is a manual connection, typed at its dial. It used
+    /// to register the address as manual for the dial and remove it after
+    /// only if it was not a dial candidate -- which every gossiped address
+    /// was -- so a onetry to a learned address made it manual for good:
+    /// reported and whitelisted as one on every later automatic dial, and
+    /// dialled even under `-connect`.
+    #[tokio::test]
+    async fn an_onetry_dial_is_manual_and_registers_nothing() {
+        let pm = empty_peer_manager();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        pm.add_learned_addr(target);
+
+        pm.connect_peer_addr(&PeerAddr::Socket(target)).await.expect("the onetry dial connects");
+        assert!(accepts_within(&listener, Duration::from_secs(5)).await);
+        assert_eq!(conn_type_at(&pm, target), Some(ConnType::Manual), "an onetry dial is manual");
+        assert!(!pm.manual_addrs.read().contains(&target), "and leaves no registration behind");
+        assert_eq!(pm.untyped_outbound_conn_type(&target, None), ConnType::OutboundFullRelay);
+        pm.set_automatic_outbound(false);
+        assert!(!pm.may_dial(&target), "a learned address stays undialable under -connect");
+    }
+
+    /// A DNS or fixed seed is the node's own bootstrap source, not a peer
+    /// the operator named: Core dials it as an automatic connection. It
+    /// joins the learned candidates, under the book's rule, and is dialled
+    /// as `outbound-full-relay`.
+    #[tokio::test]
+    async fn a_seed_is_learned_and_dialled_as_outbound_full_relay() {
+        let pm = empty_peer_manager();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let seed = listener.local_addr().unwrap();
+        pm.add_learned_peer_addr(&PeerAddr::Socket(seed));
+        assert!(pm.learned_addrs.read().contains(&seed));
+        assert!(!pm.manual_addrs.read().contains(&seed));
+
+        pm.connect_peer_addr_automatic(&PeerAddr::Socket(seed)).await.expect("the seed dial connects");
+        assert!(accepts_within(&listener, Duration::from_secs(5)).await);
+        assert_eq!(conn_type_at(&pm, seed), Some(ConnType::OutboundFullRelay));
+
+        // Nothing the book refuses, and nothing at all under `-connect`.
+        let zero: SocketAddr = ([0, 0, 0, 0], seed.port()).into();
+        pm.add_learned_peer_addr(&PeerAddr::Socket(zero));
+        assert!(!pm.learned_addrs.read().contains(&zero));
+        pm.set_automatic_outbound(false);
+        let other: SocketAddr = "127.0.0.1:18464".parse().unwrap();
+        pm.add_learned_peer_addr(&PeerAddr::Socket(other));
+        assert!(!pm.learned_addrs.read().contains(&other));
+    }
+
+    /// Every socket dial refuses an address that names no host, manual or
+    /// automatic, as Core's `ConnectNode` does (`src/net.cpp:443`). On Linux
+    /// a connect to `0.0.0.0` reaches the local host, so without the check
+    /// the listener below takes the dial.
+    #[tokio::test]
+    async fn an_invalid_address_is_never_dialled() {
+        let pm = empty_peer_manager();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let zero: SocketAddr = ([0, 0, 0, 0], port).into();
+
+        assert!(pm.connect_peer_addr(&PeerAddr::Socket(zero)).await.is_err(), "manual");
+        assert!(pm.connect_outbound(zero).await.is_err(), "automatic");
+        assert!(
+            !accepts_within(&listener, Duration::from_millis(500)).await,
+            "0.0.0.0 must not be dialled"
+        );
+        // The same listener does take a dial to an address that names it.
+        pm.connect_outbound(listener.local_addr().unwrap()).await.expect("a valid address is dialled");
+        assert!(accepts_within(&listener, Duration::from_secs(5)).await);
     }
 
     /// A real PeerManager over a caller-supplied chain state — spawns the

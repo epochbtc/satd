@@ -7911,10 +7911,16 @@ mod raw_p2p {
     /// client above cannot do: watch for a specific `pong`.
     pub struct OrderedP2pClient {
         stream: TcpStream,
+        magic: Magic,
     }
 
     impl OrderedP2pClient {
         pub fn connect(p2p_port: u16) -> Self {
+            Self::connect_on(p2p_port, Magic::REGTEST)
+        }
+
+        /// [`Self::connect`] to a node on another chain, speaking its magic.
+        pub fn connect_on(p2p_port: u16, magic: Magic) -> Self {
             let addr: std::net::SocketAddr = format!("127.0.0.1:{p2p_port}").parse().unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             let stream = loop {
@@ -7929,7 +7935,7 @@ mod raw_p2p {
             stream.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
             stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
             stream.set_nodelay(true).unwrap();
-            let mut client = OrderedP2pClient { stream };
+            let mut client = OrderedP2pClient { stream, magic };
             client.handshake();
             client
         }
@@ -7951,7 +7957,7 @@ mod raw_p2p {
         }
 
         pub fn send(&mut self, msg: NetworkMessage) {
-            let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+            let raw = RawNetworkMessage::new(self.magic, msg);
             self.stream.write_all(&serialize(&raw)).expect("p2p write");
             self.stream.flush().ok();
         }
@@ -17529,8 +17535,22 @@ mod addconn_listener {
 
         /// Finish the handshake the way a well-behaved peer would.
         pub fn complete_handshake(&self, stream: &mut TcpStream) {
-            send(stream, NetworkMessage::Version(our_version(self.addr)));
-            send(stream, NetworkMessage::Verack);
+            self.complete_handshake_on(stream, Magic::REGTEST);
+        }
+
+        /// [`Self::complete_handshake`] for a node on another chain.
+        pub fn complete_handshake_on(&self, stream: &mut TcpStream, magic: Magic) {
+            send_on(stream, magic, NetworkMessage::Version(our_version(self.addr)));
+            send_on(stream, magic, NetworkMessage::Verack);
+        }
+
+        /// Whether the node has dialled this listener: a connection waiting
+        /// to be accepted, taken without blocking.
+        pub fn was_dialled(&self) -> bool {
+            self.listener.set_nonblocking(true).expect("non-blocking listener");
+            let dialled = self.listener.accept().is_ok();
+            self.listener.set_nonblocking(false).expect("blocking listener");
+            dialled
         }
     }
 
@@ -17553,7 +17573,11 @@ mod addconn_listener {
     }
 
     pub fn send(stream: &mut TcpStream, msg: NetworkMessage) {
-        let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+        send_on(stream, Magic::REGTEST, msg);
+    }
+
+    pub fn send_on(stream: &mut TcpStream, magic: Magic, msg: NetworkMessage) {
+        let raw = RawNetworkMessage::new(magic, msg);
         stream.write_all(&serialize(&raw)).expect("send");
     }
 
@@ -23641,7 +23665,7 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
     let out = node
         .rpc_call_with_named_params(
             "addpeeraddress",
-            json!({"address": "2001:db8::7", "port": 18444}),
+            json!({"address": "2803:0:1234:abcd::7", "port": 18444}),
         )
         .unwrap();
     assert_eq!(out["result"], json!({"success": true}), "{out}");
@@ -23674,7 +23698,7 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
         );
         assert!(e["time"].as_u64().unwrap() > 1_527_811_200);
         let (_, e6) = new.iter().next().unwrap();
-        assert_eq!(e6["address"], json!("2001:db8::7"));
+        assert_eq!(e6["address"], json!("2803:0:1234:abcd::7"));
         assert_eq!(e6["network"], json!("ipv6"));
         assert_eq!(e6["port"], json!(18444));
 
@@ -24057,4 +24081,355 @@ fn rpcwhitelist_applies_on_the_tls_and_read_only_listeners() {
     let (_, body) = post(&ro, "stop");
     assert!(body.contains("error") && !body.contains("stopping"), "{body}");
     assert_eq!(post(&tls, "getblockcount").0, 200, "the node is still up");
+}
+
+// ---- Address gossip: what is learned, what is dialled, and as what (#866) ----
+
+mod gossip {
+    use super::addconn_listener::Inbound;
+    use super::raw_p2p::OrderedP2pClient;
+    use super::*;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::SocketAddr;
+
+    fn now() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32
+    }
+
+    /// A legacy `addr` announcing `addrs` as full nodes.
+    pub fn addr(addrs: &[SocketAddr]) -> NetworkMessage {
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        NetworkMessage::Addr(addrs.iter().map(|a| (now(), Address::new(a, services))).collect())
+    }
+
+    /// An `addrv2` announcing `entries` as full nodes.
+    pub fn addrv2(entries: Vec<(AddrV2, u16)>) -> NetworkMessage {
+        NetworkMessage::AddrV2(
+            entries
+                .into_iter()
+                .map(|(addr, port)| AddrV2Message {
+                    time: now(),
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr,
+                    port,
+                })
+                .collect(),
+        )
+    }
+
+    /// Send `msg` and wait until the node has processed it: a `pong`
+    /// answers for everything the peer sent ahead of its `ping`.
+    pub fn announce(peer: &mut OrderedP2pClient, msg: NetworkMessage) {
+        let nonce = rand::random::<u64>();
+        peer.send(msg);
+        peer.send(NetworkMessage::Ping(nonce));
+        peer.await_pong(nonce, test_timeout(30));
+    }
+
+    /// The address book, as `getnodeaddresses 0` lists it: `ip:port`.
+    pub fn book(node: &TestNode) -> Vec<String> {
+        let all = node.rpc_ok("getnodeaddresses", vec![serde_json::json!(0)]);
+        all.as_array()
+            .expect("getnodeaddresses array")
+            .iter()
+            .map(|e| match e["address"].as_str().unwrap() {
+                v6 if v6.contains(':') => format!("[{v6}]:{}", e["port"]),
+                v4 => format!("{v4}:{}", e["port"]),
+            })
+            .collect()
+    }
+
+    /// The `getpeerinfo` entry for the peer at `addr`, once it has one.
+    pub fn peer_at(node: &TestNode, addr: SocketAddr) -> serde_json::Value {
+        let find = || -> Option<serde_json::Value> {
+            let info = node.rpc_call("getpeerinfo").ok()?;
+            info["result"]
+                .as_array()?
+                .iter()
+                .find(|p| p["addr"] == serde_json::json!(addr.to_string()))
+                .cloned()
+        };
+        poll_until(|| find().is_some(), test_timeout(20), &format!("{addr} never showed up in getpeerinfo"));
+        find().unwrap()
+    }
+
+    /// Accept the node's dial on `listener` and finish the handshake.
+    pub fn take_dial(listener: &Inbound, magic: bitcoin::p2p::Magic) -> std::net::TcpStream {
+        let (mut stream, _) = listener.accept_version(test_timeout(40));
+        listener.complete_handshake_on(&mut stream, magic);
+        stream
+    }
+
+    /// Prove a reconnect tick has run since now: drop the node's connection
+    /// to `named`, an operator's peer, and wait for the reconnect loop to
+    /// dial it again. Every candidate on the dial lists at that moment was
+    /// offered in the same tick, so a short grace after it covers their
+    /// dials too.
+    pub fn await_reconnect_tick(named: &Inbound, stream: std::net::TcpStream, magic: bitcoin::p2p::Magic) -> std::net::TcpStream {
+        drop(stream);
+        let again = take_dial(named, magic);
+        std::thread::sleep(Duration::from_secs(2));
+        again
+    }
+}
+
+/// A peer the node reached through gossip is an automatic connection:
+/// `outbound-full-relay`, with none of an `out` whitelist entry. satd
+/// reported it as `manual` (#866), because the reconnect loop's single dial
+/// list held both the operator's peers and every gossiped address, and any
+/// address on it counted as the operator's. The type is behaviour, not a
+/// label: Core consults its outgoing whitelist for manual connections only,
+/// so the gossiped peer was being granted `noban` here. The operator's own
+/// peer, alongside, keeps both.
+#[test]
+fn a_peer_reached_through_gossip_is_outbound_full_relay_not_manual() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::Magic;
+    use raw_p2p::OrderedP2pClient;
+    use serde_json::json;
+
+    let node = TestNode::start(&["--v2transport=0", "--whitelist=noban,out@127.0.0.1"]);
+    let named = Inbound::bind();
+    let learned = Inbound::bind();
+
+    node.rpc_ok("addnode", vec![json!(named.addr.to_string()), json!("add")]);
+    let _named_stream = gossip::take_dial(&named, Magic::REGTEST);
+
+    let mut gossiper = OrderedP2pClient::connect(node.p2p_port.expect("p2p port"));
+    gossip::announce(&mut gossiper, gossip::addr(&[learned.addr]));
+    let _learned_stream = gossip::take_dial(&learned, Magic::REGTEST);
+
+    let peer = gossip::peer_at(&node, learned.addr);
+    assert_eq!(peer["connection_type"], json!("outbound-full-relay"), "{peer}");
+    assert_eq!(peer["permissions"], json!([]), "an automatic connection takes no outgoing whitelist: {peer}");
+
+    let peer = gossip::peer_at(&node, named.addr);
+    assert_eq!(peer["connection_type"], json!("manual"), "{peer}");
+    assert_eq!(peer["permissions"], json!(["noban", "download"]), "{peer}");
+}
+
+/// An address that names no host -- `0.0.0.0`, `255.255.255.255`, `::` --
+/// is neither learned from gossip nor dialled, whether it arrives in `addr`
+/// or `addrv2` (#866). Core's `IsValid` is false for all three, and its
+/// address book refuses them. On Linux a connect to `0.0.0.0` reaches the
+/// local host, so satd, handed a peer's `0.0.0.0:<port>`, connected to
+/// whatever listened on that port here, on every reconnect tick; given its
+/// own port, it connected to itself.
+///
+/// The control is a valid address announced last: once it is dialled, a
+/// reconnect tick has offered everything announced before it.
+#[test]
+fn an_address_that_names_no_host_is_neither_learned_nor_dialled() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::Magic;
+    use raw_p2p::OrderedP2pClient;
+    use serde_json::json;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let node = TestNode::start(&["--v2transport=0"]);
+    // Where a dial to `0.0.0.0:<port>` lands.
+    let local = Inbound::bind();
+    let port = local.addr.port();
+    let control = Inbound::bind();
+
+    let mut gossiper = OrderedP2pClient::connect(node.p2p_port.expect("p2p port"));
+    gossip::announce(
+        &mut gossiper,
+        gossip::addr(&[
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv4Addr::BROADCAST, port)),
+        ]),
+    );
+    gossip::announce(
+        &mut gossiper,
+        gossip::addrv2(vec![
+            (AddrV2::Ipv4(Ipv4Addr::UNSPECIFIED), port),
+            (AddrV2::Ipv6(Ipv6Addr::UNSPECIFIED), port),
+            (AddrV2::Ipv4(Ipv4Addr::BROADCAST), port),
+            (AddrV2::Ipv4(Ipv4Addr::LOCALHOST), control.addr.port()),
+        ]),
+    );
+
+    let book = gossip::book(&node);
+    assert!(book.contains(&control.addr.to_string()), "the control is learned: {book:?}");
+    for bad in [format!("0.0.0.0:{port}"), format!("255.255.255.255:{port}"), format!("[::]:{port}")] {
+        assert!(!book.contains(&bad), "{bad} must not be learned: {book:?}");
+    }
+
+    let _control_stream = gossip::take_dial(&control, Magic::REGTEST);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!local.was_dialled(), "0.0.0.0:{port} was dialled, reaching the local host");
+
+    // Core's `addpeeraddress` answer for such an address: the book refuses it.
+    assert_eq!(
+        node.rpc_ok("addpeeraddress", vec![json!("0.0.0.0"), json!(port)]),
+        json!({"success": false, "error": "failed-adding-to-new"})
+    );
+}
+
+/// The dial itself refuses an address that names no host, however it got
+/// there: Core's `ConnectNode` opens a socket only to an address that
+/// `IsValid()`, for a manual target as much as a learned one. `addnode
+/// onetry` reports the failure, as satd's `onetry` does for any dial, and
+/// `addnode add` lists the entry, as Core's does, without ever dialling it
+/// -- across a reconnect tick, proven by the loop redialling a second
+/// added node.
+#[test]
+fn an_address_that_names_no_host_is_not_dialled_even_when_named() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::Magic;
+    use serde_json::json;
+
+    let node = TestNode::start(&["--v2transport=0"]);
+    let local = Inbound::bind();
+    let zero = format!("0.0.0.0:{}", local.addr.port());
+
+    let out = node
+        .rpc_call_with_params("addnode", vec![json!(zero), json!("onetry")])
+        .unwrap();
+    assert!(!out["error"].is_null(), "an onetry to {zero} must fail: {out}");
+
+    node.rpc_ok("addnode", vec![json!(zero), json!("add")]);
+    let added = node.rpc_ok("getaddednodeinfo", vec![]);
+    assert!(
+        added.as_array().unwrap().iter().any(|e| e["addednode"] == json!(zero)),
+        "the entry is listed: {added}"
+    );
+
+    let named = Inbound::bind();
+    node.rpc_ok("addnode", vec![json!(named.addr.to_string()), json!("add")]);
+    let stream = gossip::take_dial(&named, Magic::REGTEST);
+    let _stream = gossip::await_reconnect_tick(&named, stream, Magic::REGTEST);
+    assert!(!local.was_dialled(), "{zero} was dialled, reaching the local host");
+
+    // The listener is reachable at an address that names it.
+    node.rpc_ok("addnode", vec![json!(local.addr.to_string()), json!("onetry")]);
+    assert!(local.was_dialled(), "a valid onetry must dial");
+}
+
+/// `peers.dat` is the other way onto the dial list: at startup the address
+/// book seeds it. A book a satd before this fix wrote can hold `0.0.0.0`
+/// learned from a peer's gossip, so loading must drop it rather than seed
+/// it straight back. The control, a valid entry of the same file, is dialled
+/// in the same reconnect tick.
+#[test]
+fn an_address_that_names_no_host_in_peers_dat_is_dropped_on_load() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::Magic;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let local = Inbound::bind();
+    let control = Inbound::bind();
+
+    // `peers.dat`, format version 2: magic, version, count, then per entry
+    // the IP (tag 0 + 4 bytes), port, tried, last success, attempts, last
+    // seen, services, and the source IP.
+    let entry = |buf: &mut Vec<u8>, ip: Ipv4Addr, port: u16| {
+        buf.push(0);
+        buf.extend_from_slice(&ip.octets());
+        buf.extend_from_slice(&port.to_le_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&9u64.to_le_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&ip.octets());
+    };
+    let mut dat: Vec<u8> = Vec::new();
+    dat.extend_from_slice(b"SADR");
+    dat.extend_from_slice(&2u32.to_le_bytes());
+    dat.extend_from_slice(&2u32.to_le_bytes());
+    entry(&mut dat, Ipv4Addr::UNSPECIFIED, local.addr.port());
+    let IpAddr::V4(loopback) = control.addr.ip() else { unreachable!() };
+    entry(&mut dat, loopback, control.addr.port());
+
+    let datadir = fresh_test_datadir("satd-peersdat-invalid");
+    std::fs::create_dir_all(datadir.join("regtest")).unwrap();
+    std::fs::write(datadir.join("regtest").join("peers.dat"), &dat).unwrap();
+    let node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--v2transport=0"]);
+
+    let _control_stream = gossip::take_dial(&control, Magic::REGTEST);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!local.was_dialled(), "0.0.0.0 from peers.dat was dialled, reaching the local host");
+    let book = gossip::book(&node);
+    assert!(book.contains(&control.addr.to_string()), "{book:?}");
+    assert!(!book.iter().any(|a| a.starts_with("0.0.0.0:")), "{book:?}");
+}
+
+/// Off regtest the address book takes Core's rule: an address that is not
+/// publicly routable is refused, so a peer cannot point the node at
+/// loopback or its LAN (Core's `AddrManImpl::AddSingle`). A private peer the
+/// operator names is still dialled, as Core dials it -- the rule is about
+/// what the node learns, not what it is told. Regtest keeps private
+/// addresses, which lab networks run on (see the test above).
+#[test]
+fn off_regtest_a_gossiped_private_address_is_neither_learned_nor_dialled() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::Magic;
+    use raw_p2p::OrderedP2pClient;
+    use std::net::SocketAddr;
+
+    let named = Inbound::bind();
+    let private = Inbound::bind();
+    let node = TestNode::start_on_chain(
+        "--signet",
+        &[
+            "--v2transport=0",
+            "--dnsseed=0",
+            "--fixedseeds=0",
+            &format!("--addnode={}", named.addr),
+        ],
+    );
+    let stream = gossip::take_dial(&named, Magic::SIGNET);
+
+    // RFC 7600's dummy address: routable by Core's rules, going nowhere.
+    // Core's functional tests announce it for the same reason.
+    let routable: SocketAddr = "192.0.0.8:38333".parse().unwrap();
+    let mut gossiper = OrderedP2pClient::connect_on(node.p2p_port.expect("p2p port"), Magic::SIGNET);
+    gossip::announce(&mut gossiper, gossip::addr(&[private.addr, routable]));
+
+    let _stream = gossip::await_reconnect_tick(&named, stream, Magic::SIGNET);
+    assert!(!private.was_dialled(), "a gossiped loopback address was dialled on signet");
+
+    let book = gossip::book(&node);
+    assert!(book.contains(&routable.to_string()), "a routable address is learned: {book:?}");
+    assert!(!book.contains(&private.addr.to_string()), "a loopback address is not: {book:?}");
+    // Nor does connecting to the operator's private peer, twice now, put it
+    // in the book: Core's `Good` promotes only an entry `Add` took.
+    assert!(!book.contains(&named.addr.to_string()), "{book:?}");
+}
+
+/// Under `-connect` the node dials the peers it was given and nothing else.
+/// Core keeps learning addresses in that mode but never opens a connection
+/// from them (`m_use_addrman_outgoing = false`), and the reconnect loop must
+/// not either: the gossiped address is in the book, and through a reconnect
+/// tick it is not dialled while the pinned peer, a manual connection, is.
+#[test]
+fn under_connect_a_gossiped_address_is_learned_but_never_dialled() {
+    use addconn_listener::Inbound;
+    use bitcoin::p2p::Magic;
+    use raw_p2p::OrderedP2pClient;
+    use serde_json::json;
+
+    let pinned = Inbound::bind();
+    let learned = Inbound::bind();
+    let node = TestNode::start(&["--v2transport=0", "--listen=1", &format!("--connect={}", pinned.addr)]);
+    let stream = gossip::take_dial(&pinned, Magic::REGTEST);
+
+    let mut gossiper = OrderedP2pClient::connect(node.p2p_port.expect("p2p port"));
+    gossip::announce(&mut gossiper, gossip::addr(&[learned.addr]));
+    let book = gossip::book(&node);
+    assert!(book.contains(&learned.addr.to_string()), "still learned under -connect: {book:?}");
+
+    let _stream = gossip::await_reconnect_tick(&pinned, stream, Magic::REGTEST);
+    assert!(!learned.was_dialled(), "a gossiped address was dialled under -connect");
+    let peer = gossip::peer_at(&node, pinned.addr);
+    assert_eq!(peer["connection_type"], json!("manual"), "{peer}");
 }
