@@ -483,8 +483,9 @@ mod tests {
         // SAFETY: registers a plain `extern "C"` function.
         assert_eq!(unsafe { libc::atexit(announce) }, 0);
         match how.as_str() {
-            // SAFETY: ends the process; nothing here outlives it.
-            "exit" => unsafe { libc::exit(3) },
+            // SAFETY: ends the process; nothing here outlives it. The one
+            // `exit()` satd's `the_node_never_exits_through_libc_exit` allows.
+            "exit" => unsafe { libc::exit(3) }, // exit-guard: allowed
             "exit_now" => exit_now(3),
             "panic" => exit_now_on_panic(|| panic!("expected by the test")),
             other => panic!("unknown exit probe {other}"),

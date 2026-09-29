@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 /// existing `--max-shutdown-secs`-bounded flush path stamp a clean-shutdown
 /// marker and persist the post-last-checkpoint memtable. If the same lock
 /// the wedge is holding also blocks graceful shutdown, that path runs into
-/// its own bounded timeout and force-exits via `process::exit`, and the
+/// its own bounded timeout and force-exits via `exit_now`, and the
 /// watchdog's outer fence still fires if for some reason neither path
 /// completes.
 ///

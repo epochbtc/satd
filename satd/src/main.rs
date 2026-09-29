@@ -5509,14 +5509,68 @@ mod exit_path_tests {
         }
     }
 
+    /// Whether a line of Rust ends the process through libc's `exit()`:
+    /// names `std::process::exit` or `libc::exit`, as a call, a function
+    /// value or an import, with any spacing. Importing it is enough, which
+    /// covers a bare `exit(` after the import. Comments are skipped.
+    fn exits_through_libc_exit(line: &str) -> bool {
+        let code = line.split("//").next().unwrap_or_default();
+        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        [concat!("process", "::"), concat!("libc", "::")].iter().any(|module| {
+            let named = code.contains(&format!("{module}exit"));
+            let imported = code.split(&format!("{module}{{")).skip(1).any(|list| {
+                let list = list.split('}').next().unwrap_or_default();
+                list.split(',').any(|item| item == "exit" || item.starts_with("exitas"))
+            });
+            named || imported
+        })
+    }
+
+    /// The matcher, on the spellings that evaded its first version and on
+    /// the lines it must let through. `EXIT` stands for `exit`, so that this
+    /// test's own source does not trip the guard.
+    #[test]
+    fn the_exit_matcher_sees_every_spelling() {
+        let exits = [
+            "std::process::EXIT(1);",
+            "    process::EXIT (1);",
+            "use std::process::EXIT;",
+            "use std::process::{self, EXIT};",
+            "use std::process::{EXIT as quit};",
+            "unsafe { libc::EXIT(1) }",
+            "unsafe { libc :: EXIT(1) }",
+            "use libc::{c_int, EXIT};",
+            "let end: fn(i32) -> ! = std::process::EXIT;",
+        ];
+        for line in exits {
+            let line = line.replace("EXIT", "exit");
+            assert!(exits_through_libc_exit(&line), "missed {line:?}");
+        }
+        let allowed = [
+            "node::shutdown::EXIT_now(1);",
+            "unsafe { libc::_EXIT(code) }",
+            "std::process::abort();",
+            "return std::process::ExitCode::from(1);",
+            "// std::process::EXIT(1)",
+            "/// ends in `std::process::EXIT`",
+            "let code = 1; // not std::process::EXIT(1)",
+        ];
+        for line in allowed {
+            let line = line.replace("EXIT", "exit");
+            assert!(!exits_through_libc_exit(&line), "flagged {line:?}");
+        }
+    }
+
     /// `std::process::exit` ends in libc's `exit()`, which destroys RocksDB's
     /// C++ statics under any thread still inside RocksDB: a fatal error in a
     /// running node would crash it on the way out (#868). Every exit in satd
     /// and the node library goes through `node::shutdown::exit_now`. The
-    /// crash depends on timing, so this is pinned on the source.
+    /// crash depends on timing, so this is pinned on the source. The one
+    /// exception is the control in the node's `exit_now` tests, which must
+    /// call `exit()` to show what `exit_now` skips; it carries the marker.
     #[test]
     fn the_node_never_exits_through_libc_exit() {
-        let needle = concat!("process", "::exit(");
+        let marker = concat!("exit-guard", ": allowed");
         // CARGO_MANIFEST_DIR is <repo>/satd for this crate.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
@@ -5524,16 +5578,20 @@ mod exit_path_tests {
             rust_sources(&dir, &mut files);
         }
         assert!(files.len() > 100, "found only {} source files", files.len());
-        let mut calls = Vec::new();
+        let (mut calls, mut marked) = (Vec::new(), Vec::new());
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
             for (n, line) in text.lines().enumerate() {
-                if !line.trim_start().starts_with("//") && line.contains(needle) {
-                    calls.push(format!("{}:{}", file.display(), n + 1));
+                let at = format!("{}:{}", file.display(), n + 1);
+                if line.contains(marker) {
+                    marked.push(at);
+                } else if exits_through_libc_exit(line) {
+                    calls.push(at);
                 }
             }
         }
         assert!(calls.is_empty(), "exit through node::shutdown::exit_now instead: {calls:?}");
+        assert_eq!(marked.len(), 1, "only the exit_now tests' control may exit(): {marked:?}");
     }
 
     /// A panic that unwound out of `main` would end the process through
