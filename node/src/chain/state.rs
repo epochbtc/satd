@@ -6876,11 +6876,20 @@ impl ChainState {
             if target.header.block_hash() != block_hash {
                 // The chain to activate runs past this block, or does not
                 // include it. Its blocks are all stored, so this is the reorg
-                // `invalidateblock` and `reconsiderblock` run. A failure there
-                // is about some other block, which `reorg_to` has already
-                // rolled back and marked if it was invalid. This one is
-                // stored, and valid as far as anything has checked.
-                if let Err(e) = self.reorg_to(&target) {
+                // `invalidateblock` and `reconsiderblock` run. `reorg_to` has
+                // rolled back any failure, and marked the block if it failed
+                // validation. If that block is this one, it is rejected, as
+                // the connect below would reject it. Otherwise the verdict is
+                // on some other block, and this one passed its own checks:
+                // it is reported `Stored`, even when it sits above the failed
+                // block and was marked with it. Core's `submitblock` says
+                // "inconclusive" there, since it only reports a verdict
+                // `ConnectTip` reached on the submitted block itself.
+                let mut invalid = None;
+                if let Err(e) = self.reorg_to_naming_invalid(&target, &mut invalid) {
+                    if invalid == Some(block_hash) {
+                        return Err(e);
+                    }
                     tracing::warn!(
                         error = %e,
                         target = %target.header.block_hash(),
@@ -8792,6 +8801,17 @@ impl ChainState {
     /// `abort_reorg` as the infallible in-cache rollback). Caller must hold
     /// `accept_lock`. `target == fork` is a pure truncation (empty reconnect).
     fn reorg_to(&self, target: &BlockIndexEntry) -> Result<(), ChainError> {
+        self.reorg_to_naming_invalid(target, &mut None)
+    }
+
+    /// [`Self::reorg_to`], also setting `invalid` to the block that failed
+    /// validation, when that is why it failed. That block and its descendants
+    /// are marked `Invalid` by then.
+    fn reorg_to_naming_invalid(
+        &self,
+        target: &BlockIndexEntry,
+        invalid: &mut Option<BlockHash>,
+    ) -> Result<(), ChainError> {
         let current_tip = self.tip_hash();
         let tip_entry = self
             .store
@@ -8958,6 +8978,7 @@ impl ChainState {
             // again.
             if let Some(bad) = reconnect_invalid {
                 let _ = self.mark_subtree_invalid(bad);
+                *invalid = Some(bad);
             }
             return Err(e);
         }
@@ -16325,6 +16346,114 @@ pub(crate) mod tests {
         }
         assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
         assert_eq!(cs.reorg_abort_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Active chain genesis -> A1 -> A2 -> A3, and a branch B2 -> B3 -> B4
+    /// forking at A1 whose headers are known. `bad` is the height of the B
+    /// block that spends a coin that does not exist, which passes every check
+    /// before the connect. Returns the A3 hash and the three B blocks.
+    fn chain_with_a_heavier_branch_failing_at(cs: &ChainState, bad: u32) -> (BlockHash, [Block; 3]) {
+        use bitcoin::hashes::Hash;
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).unwrap().hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).unwrap().hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        let a3_hash = cs.accept_block(&a3).unwrap().hash();
+
+        let bogus = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5d; 32]),
+            ),
+            vout: 0,
+        };
+        let mut prev = a1_hash;
+        let mut branch = Vec::new();
+        for (height, time) in [(2, 1_300_000_012), (3, 1_300_000_013), (4, 1_300_000_014)] {
+            let b = if height == bad {
+                build_test_block_spending(prev, height, time, bogus)
+            } else {
+                build_test_block(prev, height, time)
+            };
+            cs.accept_header(&b.header).unwrap();
+            prev = b.block_hash();
+            branch.push(b);
+        }
+        (a3_hash, branch.try_into().unwrap())
+    }
+
+    /// The block that completes a heavier branch can be the one that fails.
+    /// The branch's tip arrived before it, so `accept_block` switches with
+    /// `reorg_to`, and the rejection must still reach the caller:
+    /// `submitblock` reports the reason, and the peer that sent the block
+    /// gets the answer an invalid block gets.
+    ///
+    /// Perturbation: return `Stored` whenever the switch fails and B3 is
+    /// reported stored.
+    #[test]
+    fn a_block_that_fails_while_completing_a_heavier_branch_is_rejected() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_failing_at(&cs, 3);
+        // B2 has less work than A3, and B4 waits for B3.
+        for b in [&b2, &b4] {
+            let r = cs.accept_block(b);
+            assert!(matches!(r, Ok(BlockAcceptance::Stored(_))), "{r:?}");
+        }
+
+        let r3 = cs.accept_block(&b3);
+        assert!(
+            matches!(
+                r3,
+                Err(ChainError::Connect(connect::ConnectError::MissingOrSpentInput { .. }))
+            ),
+            "B3 failed its own connect and must be rejected, got {r3:?}"
+        );
+        assert_eq!(cs.reorg_abort_count(), 1, "the switch to B4 was tried");
+        assert_eq!(cs.tip_hash(), a3_hash);
+        for (b, what) in [(&b3, "B3"), (&b4, "B4")] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{what} must be marked invalid"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the same rule. When the block that fails is below
+    /// the one that arrived, the arriving block passed its own checks and is
+    /// reported `Stored`, though it is marked invalid with the rest of the
+    /// branch. Core's `submitblock` answers "inconclusive" for it.
+    ///
+    /// Perturbation: reject the arriving block whenever it reads `Invalid`
+    /// after a failed switch, and B3 is rejected with B2's error.
+    #[test]
+    fn a_block_above_the_one_that_failed_is_not_rejected_for_it() {
+        let (cs, dir) = make_chain_state();
+        let (a3_hash, [b2, b3, b4]) = chain_with_a_heavier_branch_failing_at(&cs, 2);
+        for b in [&b2, &b4] {
+            let r = cs.accept_block(b);
+            assert!(matches!(r, Ok(BlockAcceptance::Stored(_))), "{r:?}");
+        }
+
+        let r3 = cs.accept_block(&b3);
+        assert!(
+            matches!(r3, Ok(BlockAcceptance::Stored(h)) if h == b3.block_hash()),
+            "B3 is not the block that failed, got {r3:?}"
+        );
+        assert_eq!(cs.reorg_abort_count(), 1, "the switch to B4 was tried");
+        assert_eq!(cs.tip_hash(), a3_hash);
+        for (b, what) in [(&b2, "B2"), (&b3, "B3"), (&b4, "B4")] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{what} must be marked invalid"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
