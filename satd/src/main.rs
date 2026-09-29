@@ -5509,56 +5509,189 @@ mod exit_path_tests {
         }
     }
 
-    /// Whether a line of Rust ends the process through libc's `exit()`:
-    /// names `std::process::exit` or `libc::exit`, as a call, a function
-    /// value or an import, with any spacing. Importing it is enough, which
-    /// covers a bare `exit(` after the import. Comments are skipped.
-    fn exits_through_libc_exit(line: &str) -> bool {
-        let code = line.split("//").next().unwrap_or_default();
-        let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-        [concat!("process", "::"), concat!("libc", "::")].iter().any(|module| {
-            let named = code.contains(&format!("{module}exit"));
-            let imported = code.split(&format!("{module}{{")).skip(1).any(|list| {
-                let list = list.split('}').next().unwrap_or_default();
-                list.split(',').any(|item| item == "exit" || item.starts_with("exitas"))
-            });
-            named || imported
-        })
+    /// `src` with its comments removed and its string and character
+    /// literals emptied, keeping every newline, so that what is left is code
+    /// and still falls on its own lines.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let at = |i: usize| chars.get(i).copied().unwrap_or('\0');
+        let ident = |c: char| c == '_' || c.is_alphanumeric();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '/' && at(i + 1) == '/' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && at(i + 1) == '*' {
+                // Block comments nest.
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && at(i + 1) == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && at(i + 1) == '/' {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if chars[i] == '\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if c == 'r'
+                && (i == 0
+                    || !ident(chars[i - 1])
+                    || (matches!(chars[i - 1], 'b' | 'c') && (i < 2 || !ident(chars[i - 2]))))
+                && {
+                    let mut j = i + 1;
+                    while at(j) == '#' {
+                        j += 1;
+                    }
+                    at(j) == '"'
+                }
+            {
+                // A raw string: r"…", r#"…"#, br"…", cr"…".
+                let mut j = i + 1;
+                while at(j) == '#' {
+                    j += 1;
+                }
+                let hashes = j - i - 1;
+                i = j + 1;
+                while i < chars.len()
+                    && !(chars[i] == '"' && (1..=hashes).all(|k| at(i + k) == '#'))
+                {
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i += 1 + hashes;
+                out.push_str("\"\"");
+            } else if c == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    if at(i) == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i += 1;
+                out.push_str("\"\"");
+            } else if c == '\'' && (at(i + 1) == '\\' || at(i + 2) == '\'') {
+                // A character literal; a lifetime or label has no closing
+                // quote after one character.
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                out.push_str("' '");
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
     }
 
-    /// The matcher, on the spellings that evaded its first version and on
-    /// the lines it must let through. `EXIT` stands for `exit`, so that this
-    /// test's own source does not trip the guard.
+    /// The lines of `src` that end the process through libc's `exit()`: that
+    /// name `std::process::exit` or `libc::exit` as a call, a function value
+    /// or an import, or import everything from either module. Comments and
+    /// literals do not count, and whitespace is ignored, so a path or a `use`
+    /// list may be split across lines; a hit is reported on the line where
+    /// it starts. Importing `exit` is enough, which covers a bare `exit(`
+    /// after the import.
+    fn libc_exit_lines(src: &str) -> Vec<usize> {
+        let (mut code, mut line_of, mut line) = (String::new(), Vec::new(), 1);
+        for c in code_only(src).chars() {
+            if c == '\n' {
+                line += 1;
+            }
+            if !c.is_whitespace() {
+                code.push(c);
+                line_of.resize(code.len(), line);
+            }
+        }
+        let mut lines = Vec::new();
+        for module in ["process::", "libc::"] {
+            for path in [format!("{module}exit"), format!("{module}*")] {
+                lines.extend(code.match_indices(&path).map(|(at, _)| line_of[at]));
+            }
+            for (at, open) in code.match_indices(&format!("{module}{{")) {
+                let list = &code[at + open.len()..];
+                let list = &list[..list.find('}').unwrap_or(list.len())];
+                if list.split(',').any(|item| item == "exit" || item.starts_with("exitas")) {
+                    lines.push(line_of[at]);
+                }
+            }
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// The scan, on the spellings that evaded its earlier versions and on
+    /// the source it must let through.
     #[test]
-    fn the_exit_matcher_sees_every_spelling() {
+    fn the_exit_scan_sees_every_spelling() {
         let exits = [
-            "std::process::EXIT(1);",
-            "    process::EXIT (1);",
-            "use std::process::EXIT;",
-            "use std::process::{self, EXIT};",
-            "use std::process::{EXIT as quit};",
-            "unsafe { libc::EXIT(1) }",
-            "unsafe { libc :: EXIT(1) }",
-            "use libc::{c_int, EXIT};",
-            "let end: fn(i32) -> ! = std::process::EXIT;",
+            "std::process::exit(1);",
+            "    process::exit (1);",
+            "std::process::\n    exit(1);",
+            "use std::process::exit;",
+            "use std::process::{self, exit};",
+            "use std::process::{\n    self,\n    exit,\n};\nfn f() { exit(1) }",
+            "use std::process::{exit as quit};",
+            "use std::{io, process::{self, exit}};",
+            "use std::process::*;\nfn f() { exit(1) }",
+            "unsafe { libc::exit(1) }",
+            "unsafe { libc :: exit(1) }",
+            "use libc::{c_int, exit};",
+            "use libc::*;",
+            "let end: fn(i32) -> ! = std::process::exit;",
+            "tokio::select! { _ = x => std::process::exit(1) }",
+            "let url = \"http://x\"; std::process::exit(1);",
+            "let q = '\"'; std::process::exit(1);",
+            "fn f<'a>(x: &'a str) -> &'a str { std::process::exit(1) }",
+            "let dir = r\"C:\\\"; std::process::exit(1);",
         ];
-        for line in exits {
-            let line = line.replace("EXIT", "exit");
-            assert!(exits_through_libc_exit(&line), "missed {line:?}");
+        for src in exits {
+            assert!(!libc_exit_lines(src).is_empty(), "missed {src:?}");
         }
         let allowed = [
-            "node::shutdown::EXIT_now(1);",
-            "unsafe { libc::_EXIT(code) }",
+            "node::shutdown::exit_now(1);",
+            "unsafe { libc::_exit(code) }",
             "std::process::abort();",
             "return std::process::ExitCode::from(1);",
-            "// std::process::EXIT(1)",
-            "/// ends in `std::process::EXIT`",
-            "let code = 1; // not std::process::EXIT(1)",
+            "// std::process::exit(1)",
+            "/// ends in `std::process::exit`",
+            "/* std::process::exit(1) */",
+            "/* outer /* inner */ std::process::exit(1) */",
+            "let code = 1; // not std::process::exit(1)",
+            "tracing::error!(\"would have called std::process::exit(1)\");",
+            "let s = r#\"std::process::exit(1) \"quoted\"\"#;",
+            "let s = \"escaped \\\" std::process::exit(1)\";",
         ];
-        for line in allowed {
-            let line = line.replace("EXIT", "exit");
-            assert!(!exits_through_libc_exit(&line), "flagged {line:?}");
+        for src in allowed {
+            assert!(libc_exit_lines(src).is_empty(), "flagged {src:?}");
         }
+        assert_eq!(
+            libc_exit_lines("/* one\ntwo */\nlet s = \"a\nb\";\nuse std::process::{\n    exit,\n};"),
+            vec![5],
+            "a hit is reported on its first line"
+        );
     }
 
     /// `std::process::exit` ends in libc's `exit()`, which destroys RocksDB's
@@ -5567,10 +5700,11 @@ mod exit_path_tests {
     /// and the node library goes through `node::shutdown::exit_now`. The
     /// crash depends on timing, so this is pinned on the source. The one
     /// exception is the control in the node's `exit_now` tests, which must
-    /// call `exit()` to show what `exit_now` skips; it carries the marker.
+    /// call `exit()` to show what `exit_now` skips; its line carries the
+    /// marker.
     #[test]
     fn the_node_never_exits_through_libc_exit() {
-        let marker = concat!("exit-guard", ": allowed");
+        let marker = "exit-guard: allowed";
         // CARGO_MANIFEST_DIR is <repo>/satd for this crate.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
@@ -5580,12 +5714,13 @@ mod exit_path_tests {
         assert!(files.len() > 100, "found only {} source files", files.len());
         let (mut calls, mut marked) = (Vec::new(), Vec::new());
         for file in &files {
-            let text = std::fs::read_to_string(file).unwrap();
-            for (n, line) in text.lines().enumerate() {
-                let at = format!("{}:{}", file.display(), n + 1);
-                if line.contains(marker) {
+            let src = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            for n in libc_exit_lines(&src) {
+                let at = format!("{}:{n}", file.display());
+                if lines[n - 1].contains(marker) {
                     marked.push(at);
-                } else if exits_through_libc_exit(line) {
+                } else {
                     calls.push(at);
                 }
             }
