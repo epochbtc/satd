@@ -61,7 +61,7 @@ impl notify::WatchdogProbe for ChainStateProbe {
 /// reindex `-stopatheight`), each of which would unwind and drop the
 /// runtime. This guard funnels every such drop onto a plain OS thread —
 /// where dropping a runtime is allowed — and bounds the wait so a wedged
-/// streaming client can't hold shutdown open. (`std::process::exit` paths
+/// streaming client can't hold shutdown open. (`exit_now` paths
 /// skip the destructor entirely, which is fine: no drop, no panic.)
 struct ApiRuntimeGuard(Option<tokio::runtime::Runtime>);
 
@@ -213,7 +213,7 @@ fn write_rebuild_marker(
             node::rebuild_marker::path(net_datadir).display()
         );
         auth.cleanup();
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 }
 
@@ -228,7 +228,7 @@ fn remove_rebuild_marker(net_datadir: &std::path::Path, auth: &node::rpc::auth::
             node::rebuild_marker::path(net_datadir).display()
         );
         auth.cleanup();
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 }
 
@@ -332,13 +332,14 @@ const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::f
 /// `exit()`. `exit()` runs the C++ static destructors, RocksDB's among them,
 /// and any thread still inside RocksDB then fails with SIGSEGV (#868).
 /// `run` stops and joins the node's own threads first; `_exit` covers
-/// whatever outlives them.
+/// whatever outlives them. A panic in `run` and every fatal error exit take
+/// `_exit` too.
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to build the core runtime");
-    let chainstate_db = runtime.block_on(run());
+    let chainstate_db = node::shutdown::exit_now_on_panic(|| runtime.block_on(run()));
     // Drops every task, and with them their references to the chainstate.
     runtime.shutdown_timeout(CORE_RUNTIME_SHUTDOWN);
     if let Some(db) = chainstate_db {
@@ -365,7 +366,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Error: {}", e);
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -377,7 +378,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // so that stops being an assumption if either changes.
     if !node::set_user_agent(config.user_agent.clone()) {
         eprintln!("Error: could not install user agent {}", config.user_agent);
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Install `-testactivationheight` overrides (regtest only, enforced by
@@ -544,7 +545,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             net_datadir.display(),
             e
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Consume the clean-shutdown marker from the previous run (if any), BEFORE
@@ -589,7 +590,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             legacy_redb.display(),
             legacy_redb.display(),
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
 
     // Partition dbcache budget: 1/3 to RocksDB block cache, 2/3 to CoinCache overlays
@@ -613,7 +614,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // there is nothing partial left to protect.
             if let Err(e) = node::rebuild_marker::remove(&net_datadir) {
                 eprintln!("Error removing a stale rebuild marker: {e}");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             tracing::info!(
                 "Removed a rebuild marker left by a chainstate that no longer exists"
@@ -636,7 +637,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             }
             InterruptedRebuild::Refuse(msg) => {
                 eprintln!("{msg}");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     }
@@ -679,7 +680,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     net_datadir.join("chainstate").display(),
                     config.blocks_dir().display(),
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             tracing::warn!(
                 "Chainstate is {stored_desc} schema, older than this satd's v{expected}; \
@@ -691,7 +692,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error opening chain database: {}", e);
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         }
@@ -703,11 +704,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                  -upgradechainstate never downgrades a chainstate; run with \
                  --reindex-chainstate to rebuild it at this version."
             );
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         Err(e) => {
             eprintln!("Error opening chain database: {}", e);
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -741,7 +742,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 // reason in the log.
                 println!("Unable to open cookie authentication file for writing: {e}");
                 eprintln!("Error: Unable to start HTTP server. See debug log for details.");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -768,7 +769,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             "Error: authfile is set but no operator credential (cookie / rpcuser+rpcpassword / \
              rpcauth) is configured — refusing to start to avoid locking out bitcoin-cli/sat-cli"
         );
-        std::process::exit(1);
+        node::shutdown::exit_now(1);
     }
     let auth = Arc::new(RpcAuth::Verify(
         parking_lot::RwLock::new(credentials),
@@ -797,7 +798,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             }
             Err(e) => {
                 eprintln!("Error loading authfile {}: {}", path.display(), e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         None => None,
@@ -901,7 +902,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         if let Err(e) = store.clear_all() {
             eprintln!("Error clearing database for reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     } else if reindex_chainstate {
         // Handle -reindex-chainstate: clear UTXO/undo, keep block index.
@@ -950,13 +951,13 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         plan.tip_height()
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("Error planning chainstate reindex: {}", e);
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         }
@@ -975,7 +976,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         if let Err(e) = store.clear_chainstate() {
             eprintln!("Error clearing chainstate for reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     }
 
@@ -992,7 +993,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         Err(e) => {
             eprintln!("Error initializing block storage: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
     flat_files.set_fast_prune(config.fastprune);
@@ -1043,7 +1044,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             }
             Err(e) => {
                 eprintln!("Error: invalid assumevalid hash '{}': {}", hash_str, e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     };
@@ -1146,7 +1147,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         Err(e) => {
             eprintln!("Error initializing chain state: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -1179,12 +1180,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                  (--reindex) or removing the datadir's chainstate and reloading a valid snapshot."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         Err(e) => {
             eprintln!("FATAL: cannot resume pending AssumeUTXO snapshot: {e}");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     }
 
@@ -1341,7 +1342,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // Distinct from the generic exit(1) used throughout startup, so an
             // operator's alerting can tell "chainstate is damaged" apart from
             // "the config file has a typo" without scraping stderr.
-            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+            node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
         }
         if !audit.unvalidated_floor.is_empty() {
             // Normal on an AssumeUTXO node: history below the snapshot base
@@ -1413,7 +1414,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
              validating-only node."
         );
         auth.cleanup();
-        std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+        node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
     }
 
     // Reloadable reorg-webhook target, shared with the dispatcher. Stays `None`
@@ -1480,7 +1481,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         ) {
             eprintln!("Error during reindex: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Finished, even when `-stopatheight` cut the connect short: the
         // block index then ends where the chainstate does, which is an
@@ -1512,7 +1513,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error during chainstate reindex: {}", e);
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         // Only a replay that reached the chain's tip is finished. One that
@@ -1566,7 +1567,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             );
             report_ancestry_damage(&audit, config.prune, &net_datadir);
             auth.cleanup();
-            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+            node::shutdown::exit_now(EXIT_CHAINSTATE_DAMAGED);
         }
     }
 
@@ -1588,7 +1589,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      please report it with the message above."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -1616,7 +1617,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Err(e) => {
                     eprintln!("FATAL: --fast-start: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             }
         } else {
@@ -1682,7 +1683,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             }
             Err(e) => {
                 eprintln!("Error loading policyfile {}:\n{}", path.display(), e);
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -1856,7 +1857,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         Err(e) => {
             tracing::error!("events bus: failed to resolve edge identity: {e}");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
     tracing::info!(
@@ -2016,7 +2017,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 tracing::error!("events gRPC sink: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2037,7 +2038,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 tracing::error!("events ZMQ sink: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2131,7 +2132,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 tracing::error!("streamws transport: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2308,7 +2309,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error loading asmap: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -2881,7 +2882,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error: invalid --rpctlsbind {addr_str:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         (None, None, None) => None,
@@ -2891,7 +2892,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // partial-config gate.
             eprintln!("Error: --rpctlsbind requires --rpctlscert AND --rpctlskey");
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -2920,7 +2921,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error: invalid --rpcreadonlytlsbind {addr_str:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
         (None, None, None) => None,
@@ -2929,7 +2930,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "Error: --rpcreadonlytlsbind requires --rpcreadonlytlscert AND --rpcreadonlytlskey"
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -3029,7 +3030,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         Err(e) => {
             eprintln!("Error starting RPC server: {}", e);
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
     };
 
@@ -3150,7 +3151,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 tracing::error!(target: "alert", error = %e, "alertfile is unusable");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         }
     }
@@ -3194,7 +3195,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Err(e) => {
                     eprintln!("Error: -mcpbind/-mcpport: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let tls_configured = config.mcp_tls_cert.is_some() && config.mcp_tls_key.is_some();
@@ -3209,7 +3210,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      set. A remote MCP listener must be authenticated; set --mcpallowremote \
                      (which requires --mcpauth and --authfile), or bind to loopback."
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // A remote MCP listener must use TLS so the bearer token is never
             // sent in cleartext. Config-load validation already enforces this
@@ -3222,7 +3223,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      A remote MCP listener must use TLS so the bearer token is not sent in \
                      cleartext; set --mcpcert and --mcpkey, or bind to loopback."
                 );
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // Build the rustls acceptor when cert+key are present. mTLS adds
             // client-cert verification + the subject allowlist on top.
@@ -3235,7 +3236,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     },
                     (true, None) => {
                         eprintln!("Error: --mcpmtls=1 requires --mcpmtlsclientca");
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                     (false, _) => tls_config::ClientAuthPolicy::Disabled,
                 };
@@ -3243,7 +3244,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("Error: failed to build MCP TLS acceptor: {e}");
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                 };
                 let allow =
@@ -3344,7 +3345,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                             tls.bind
                         );
                         auth.cleanup();
-                        std::process::exit(1);
+                        node::shutdown::exit_now(1);
                     }
                 },
             };
@@ -3419,7 +3420,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      or set --esplora=0 to skip the tx-endpoint surface."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             // Round-2 review H1: same address-index completeness gate
             // as the Electrum startup path. Esplora's `/address/*`
@@ -3437,7 +3438,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      to skip the Esplora listener."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
             let bind: SocketAddr = match config.esplora_bind.parse() {
                 Ok(a) => a,
@@ -3448,7 +3449,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         config.esplora_bind
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let auth_cfg = match &config.esplora_auth {
@@ -3534,7 +3535,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Err(e) => {
                     eprintln!("Error: esplora startup failed: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             // Bind synchronously so a port conflict / permissions error
@@ -3545,7 +3546,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Err(e) => {
                     eprintln!("Error: esplora listener could not bind to {bind}: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             // TLS listener (optional). Same pattern as Electrum:
@@ -3565,7 +3566,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         "Error: --esploratlsbind requires --esploratlscert AND --esploratlskey"
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
                 (Some(addr_str), Some(cert), Some(key)) => {
                     let tls_bind: SocketAddr = match addr_str.parse() {
@@ -3575,7 +3576,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                                 "Error: invalid --esploratlsbind {addr_str:?}: {e}"
                             );
                             auth.cleanup();
-                            std::process::exit(1);
+                            node::shutdown::exit_now(1);
                         }
                     };
                     // mTLS policy: when --esploramtls=1, build the
@@ -3598,7 +3599,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         Err(e) => {
                             eprintln!("Error: esplora TLS config: {e}");
                             auth.cleanup();
-                            std::process::exit(1);
+                            node::shutdown::exit_now(1);
                         }
                     };
                     let tls_listener =
@@ -3609,7 +3610,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                                     "Error: esplora TLS listener could not bind to {tls_bind}: {e}"
                                 );
                                 auth.cleanup();
-                                std::process::exit(1);
+                                node::shutdown::exit_now(1);
                             }
                         };
                     Some((tls_bind, tls_listener, acceptor))
@@ -3683,7 +3684,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                  or set --electrum=0 to skip the Electrum server."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Round-1 review H2: refuse to bind Electrum when the
         // address-history CFs are known to be partial. Without this
@@ -3704,7 +3705,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                  to skip the Electrum server."
             );
             auth.cleanup();
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         }
         // Bind-address parsing exits cleanly on invalid input rather
         // than panicking (review H3). The plain-bind value comes from
@@ -3718,7 +3719,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     config.electrum_bind
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let electrum_tls_bind = match config
@@ -3731,7 +3732,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Some((raw, Err(e))) => {
                 eprintln!("Error: invalid --electrumtlsbind {raw:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let electrum_cfg = electrum_proto::ElectrumConfig {
@@ -3794,7 +3795,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error: electrum server bind failed: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         // Mirror the Esplora fix: read back actual bound addresses
@@ -3835,7 +3836,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             raw.parse().unwrap_or_else(|e| {
                 eprintln!("Error: invalid --{flag} {raw:?}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             })
         };
         let stratum_bind = parse_bind("stratumbind", &config.stratum_bind);
@@ -3903,7 +3904,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => {
                 eprintln!("Error: stratum server bind failed: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let reported_bind = server
@@ -3996,7 +3997,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                          Set -port=<n>/-bind=<addr> to change it, or -listen=0 to disable inbound P2P."
                     );
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let pm = peer_manager.clone();
@@ -4025,7 +4026,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      Another instance of satd may already be running, or the port is in use."
                 );
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
         let pm = peer_manager.clone();
@@ -4245,7 +4246,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         tokio::spawn(async move {
             if let Err(e) = fast_start::load_when_ready(cs, dd, path, prune, dbcache, sd).await {
                 tracing::error!(error = %e, "FATAL: --fast-start snapshot load failed");
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         });
     }
@@ -4748,7 +4749,7 @@ async fn start_metrics_startup(
             Err(e) => {
                 eprintln!("Error: -metricsbind/-metricsport: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         };
     // Config::load already refused partial TLS settings; these checks are
@@ -4761,14 +4762,14 @@ async fn start_metrics_startup(
             else {
                 eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             };
             let tls_bind: SocketAddr = match addr_str.parse() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Error: invalid --metricstlsbind {addr_str:?}: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             let client_ca = if config.metrics_mtls {
@@ -4786,7 +4787,7 @@ async fn start_metrics_startup(
                 Err(e) => {
                     eprintln!("Error: metrics TLS config: {e}");
                     auth.cleanup();
-                    std::process::exit(1);
+                    node::shutdown::exit_now(1);
                 }
             };
             Some((tls_bind, Arc::new(acceptor)))
@@ -4830,7 +4831,7 @@ async fn start_metrics_startup(
             Err(e) => {
                 eprintln!("Error: metrics TLS listener could not bind to {tls_bind}: {e}");
                 auth.cleanup();
-                std::process::exit(1);
+                node::shutdown::exit_now(1);
             }
         },
     };
@@ -4945,7 +4946,7 @@ async fn start_startup_rpc(
         .await
         .unwrap_or_else(|e| {
             eprintln!("Failed to start startup RPC server on {bind_addr}: {e}");
-            std::process::exit(1);
+            node::shutdown::exit_now(1);
         });
         handles.push(handle);
     }
@@ -5490,5 +5491,62 @@ mod interrupted_rebuild_tests {
         assert_eq!(describe_ago(600), "10 minutes ago");
         assert_eq!(describe_ago(3 * 3_600 + 59), "3 hours ago");
         assert_eq!(describe_ago(5 * 86_400), "5 days ago");
+    }
+}
+
+#[cfg(test)]
+mod exit_path_tests {
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `std::process::exit` ends in libc's `exit()`, which destroys RocksDB's
+    /// C++ statics under any thread still inside RocksDB: a fatal error in a
+    /// running node would crash it on the way out (#868). Every exit in satd
+    /// and the node library goes through `node::shutdown::exit_now`. The
+    /// crash depends on timing, so this is pinned on the source.
+    #[test]
+    fn the_node_never_exits_through_libc_exit() {
+        let needle = concat!("process", "::exit(");
+        // CARGO_MANIFEST_DIR is <repo>/satd for this crate.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in [root.join("src"), root.join("../node/src")] {
+            rust_sources(&dir, &mut files);
+        }
+        assert!(files.len() > 100, "found only {} source files", files.len());
+        let mut calls = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains(needle) {
+                    calls.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(calls.is_empty(), "exit through node::shutdown::exit_now instead: {calls:?}");
+    }
+
+    /// A panic that unwound out of `main` would end the process through
+    /// libc's `exit()` as well. `main` cannot run under a test, so this is
+    /// pinned on its source.
+    #[test]
+    fn main_exits_now_on_a_panic_in_the_node() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("\nfn main() {").expect("fn main")..];
+        let body = &body[..body.find("\n}\n").expect("end of fn main")];
+        assert!(
+            body.contains("node::shutdown::exit_now_on_panic(|| runtime.block_on(run()))"),
+            "main must run the node under exit_now_on_panic"
+        );
     }
 }

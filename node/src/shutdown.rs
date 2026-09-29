@@ -142,6 +142,20 @@ pub fn exit_now(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// Run `f`; if it panics, end the process with [`exit_now`] and the exit
+/// code of an unhandled panic (101).
+///
+/// A panic that unwound out of `main` would drop the runtime, which waits
+/// without limit for blocking tasks, and then end the process through
+/// libc's `exit()`, under the node's threads (#868). The panic hook has
+/// already reported the panic by the time this exits.
+pub fn exit_now_on_panic<T>(f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => exit_now(101),
+    }
+}
+
 /// Filename of the marker inside the network datadir.
 pub const MARKER_FILENAME: &str = ".clean_shutdown";
 
@@ -445,5 +459,64 @@ mod tests {
         let panicked = std::thread::spawn(|| panic!("expected by the test"));
         let left = join_within(vec![("panicked", panicked)], Duration::from_secs(5));
         assert!(left.is_empty());
+    }
+
+    /// Set by the exit tests below when they re-run this test binary as a
+    /// child process; names the way the child ends.
+    const EXIT_PROBE: &str = "SATD_EXIT_PROBE";
+    const EXIT_HANDLERS_RAN: &str = "exit handlers ran";
+
+    /// The child half of the exit tests, and a no-op in an ordinary run. It
+    /// registers an `atexit` handler, which libc's `exit()` runs from the
+    /// same list as the C++ static destructors, then ends the process the
+    /// way `EXIT_PROBE` names.
+    #[test]
+    fn exit_probe_child() {
+        let Ok(how) = std::env::var(EXIT_PROBE) else {
+            return;
+        };
+        extern "C" fn announce() {
+            let line = format!("{EXIT_HANDLERS_RAN}\n");
+            // SAFETY: writes a live buffer of the given length to stdout.
+            unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+        }
+        // SAFETY: registers a plain `extern "C"` function.
+        assert_eq!(unsafe { libc::atexit(announce) }, 0);
+        match how.as_str() {
+            // SAFETY: ends the process; nothing here outlives it.
+            "exit" => unsafe { libc::exit(3) },
+            "exit_now" => exit_now(3),
+            "panic" => exit_now_on_panic(|| panic!("expected by the test")),
+            other => panic!("unknown exit probe {other}"),
+        }
+    }
+
+    /// Run [`exit_probe_child`] in a child process; its exit code, and
+    /// whether its exit handlers ran.
+    fn run_exit_probe(how: &str) -> (Option<i32>, bool) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["shutdown::tests::exit_probe_child", "--exact", "--nocapture"])
+            .env(EXIT_PROBE, how)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        (out.status.code(), stdout.contains(EXIT_HANDLERS_RAN))
+    }
+
+    /// The control for the two tests below: libc's `exit()` runs the
+    /// handlers, so their absence there means something.
+    #[test]
+    fn exit_runs_the_exit_handlers() {
+        assert_eq!(run_exit_probe("exit"), (Some(3), true));
+    }
+
+    #[test]
+    fn exit_now_skips_the_exit_handlers() {
+        assert_eq!(run_exit_probe("exit_now"), (Some(3), false));
+    }
+
+    #[test]
+    fn a_panic_exits_now_with_the_panic_exit_code() {
+        assert_eq!(run_exit_probe("panic"), (Some(101), false));
     }
 }
