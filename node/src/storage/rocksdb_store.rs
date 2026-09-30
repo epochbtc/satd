@@ -1970,6 +1970,17 @@ impl RocksDbStore {
             wb.delete_cf(&cf_coins, key);
         }
 
+        // A put that replaces a stored row leaves one coin where there was
+        // one, but the loop above counted it in as a new coin. Count the row
+        // it replaces out, under the amount and height it was counted with.
+        for (_, stored_amount, stored_height) in &batch.coin_overwrites {
+            count_delta -= 1;
+            amount_delta -= *stored_amount as i64;
+            let bucket = (*stored_height / HEIGHT_HIST_BUCKET) as usize;
+            *hist_deltas.entry(bucket).or_default() -= 1;
+            *recent_deltas.entry(*stored_height).or_default() -= 1;
+        }
+
         // Height index
         for (height, hash) in &batch.height_hash_puts {
             wb.put_cf(&cf_hi, height.to_le_bytes(), hash_bytes(hash));
@@ -4484,6 +4495,123 @@ mod tests {
         assert_eq!(store.get_tip().unwrap(), tip_hash);
         assert_eq!(store.get_block_hash_by_height(0).unwrap(), genesis_hash);
         assert_eq!(store.get_tx_location(&txid).unwrap(), genesis_hash);
+    }
+
+    /// A `CoinCache` over a store whose recent-height window is live, the
+    /// shape `ChainState` runs on.
+    fn counted_cache() -> (crate::storage::coin_cache::CoinCache, tempfile::TempDir) {
+        let (store, dir) = temp_store(false);
+        recent_build(&store);
+        let cache = crate::storage::coin_cache::CoinCache::new(Box::new(store), 16);
+        let tip = StoreBatch { tip: Some(make_block_hash(0x01)), ..Default::default() };
+        cache.write_batch(tip).unwrap();
+        (cache, dir)
+    }
+
+    /// Flush, then hold every running counter the store keeps — count,
+    /// amount, height histogram, recent-height window — against a walk of
+    /// the coins actually on disk.
+    fn assert_counters_match_coins(cache: &crate::storage::coin_cache::CoinCache) {
+        cache.flush().unwrap();
+        let (mut count, mut amount) = (0u64, 0u64);
+        let mut by_height = std::collections::HashMap::<u32, u64>::new();
+        cache
+            .for_each_coin_snapshot(&mut |_, coin| {
+                count += 1;
+                amount += coin.amount;
+                *by_height.entry(coin.height).or_default() += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(cache.coin_count(), count, "utxo_count vs coins on disk");
+        assert_eq!(cache.coin_total_amount(), amount, "total_amount vs coins on disk");
+        let hist = cache.utxo_height_hist();
+        let buckets = hist.len().max(by_height.keys().map(|h| (h / HEIGHT_HIST_BUCKET) as usize + 1).max().unwrap_or(0));
+        for bucket in 0..buckets {
+            let walked: u64 = by_height
+                .iter()
+                .filter(|(h, _)| (**h / HEIGHT_HIST_BUCKET) as usize == bucket)
+                .map(|(_, n)| n)
+                .sum();
+            assert_eq!(hist.get(bucket).copied().unwrap_or(0), walked, "height histogram bucket {bucket}");
+        }
+        let window = cache.utxo_recent_heights().expect("window is live");
+        for height in window.base..=window.top() {
+            assert_eq!(
+                window.count_at(height),
+                Some(by_height.get(&height).copied().unwrap_or(0)),
+                "recent window at height {height}"
+            );
+        }
+    }
+
+    fn put(op: OutPoint, coin: Coin) -> StoreBatch {
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, coin));
+        batch
+    }
+
+    fn remove(op: OutPoint, amount: u64, height: u32) -> StoreBatch {
+        let mut batch = StoreBatch::default();
+        batch.coin_removes.push((op, amount, height));
+        batch
+    }
+
+    /// A reorg spends a stored coin (the disconnect) and creates it again
+    /// (the replacement branch re-mines its transaction), one block higher,
+    /// inside one flush window. The flush writes the coin over its old row:
+    /// one coin before, one coin after, now counted at the new height.
+    #[test]
+    fn a_coin_put_back_over_its_stored_row_is_counted_once() {
+        let (cache, _dir) = counted_cache();
+        let x = make_outpoint(0x31, 0);
+        let other = make_outpoint(0x32, 0);
+        cache.write_batch(put(x, make_coin(7_000, 999))).unwrap();
+        cache.write_batch(put(other, make_coin(1_000, 5))).unwrap();
+        assert_counters_match_coins(&cache);
+
+        cache.write_batch(remove(x, 7_000, 999)).unwrap();
+        cache.write_batch(put(x, make_coin(7_000, 1_000))).unwrap();
+        assert_counters_match_coins(&cache);
+        assert_eq!(cache.coin_count(), 2);
+        assert_eq!(cache.get_coin(&x).unwrap().height, 1_000);
+    }
+
+    /// The same coin put back over its stored row, then spent again before
+    /// the flush: the flush deletes the stored row, which was counted at the
+    /// height it was stored with, not the height of the coin that replaced it.
+    #[test]
+    fn a_put_back_coin_spent_again_deletes_the_row_it_was_counted_as() {
+        let (cache, _dir) = counted_cache();
+        let x = make_outpoint(0x33, 0);
+        cache.write_batch(put(x, make_coin(7_000, 999))).unwrap();
+        cache.write_batch(put(make_outpoint(0x34, 0), make_coin(1_000, 5))).unwrap();
+        assert_counters_match_coins(&cache);
+
+        cache.write_batch(remove(x, 7_000, 999)).unwrap();
+        cache.write_batch(put(x, make_coin(7_000, 1_000))).unwrap();
+        cache.write_batch(remove(x, 7_000, 1_000)).unwrap();
+        assert_counters_match_coins(&cache);
+        assert_eq!(cache.coin_count(), 1);
+    }
+
+    /// A coin created and spent inside one window, then created and spent
+    /// again inside the same window: what a reorg does to an output that both
+    /// branches create and spend in one block. It never reaches the store,
+    /// so the flush must not emit a remove for it.
+    #[test]
+    fn a_coin_created_and_spent_twice_in_one_window_is_never_counted() {
+        let (cache, _dir) = counted_cache();
+        cache.write_batch(put(make_outpoint(0x35, 0), make_coin(1_000, 5))).unwrap();
+        assert_counters_match_coins(&cache);
+
+        let o = make_outpoint(0x36, 0);
+        for _ in 0..2 {
+            cache.write_batch(put(o, make_coin(90_000, 1_000))).unwrap();
+            cache.write_batch(remove(o, 90_000, 1_000)).unwrap();
+        }
+        assert_counters_match_coins(&cache);
+        assert_eq!(cache.coin_count(), 1);
     }
 
     /// Regression: `ChainState` holds a `Box<dyn Store>` that is in

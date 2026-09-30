@@ -14216,6 +14216,103 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Re-mine `block` after its transactions changed.
+    fn remine(block: &mut Block) {
+        use bitcoin::pow::CompactTarget;
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target =
+            crate::storage::blockindex::target_from_compact(CompactTarget::from_consensus(0x207fffff));
+        for nonce in 0u32..2_000_000 {
+            block.header.nonce = nonce;
+            let mut hash_be = *block.block_hash().as_raw_hash().as_byte_array();
+            hash_be.reverse();
+            if hash_be <= target {
+                return;
+            }
+        }
+        panic!("failed to mine test block");
+    }
+
+    /// A reorg whose replacement block re-mines the displaced block's
+    /// transactions must leave `gettxoutsetinfo`'s running counters equal to
+    /// the coins actually on disk.
+    #[test]
+    fn reorg_remining_the_same_transactions_keeps_the_utxo_counters_exact() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
+
+        let db = tempfile::TempDir::new().unwrap();
+        let inner = crate::storage::rocksdb_store::RocksDbStore::open(db.path(), false, 16, false, -1)
+            .unwrap();
+        let (cs, dir) = make_chain_state_with_store(Box::new(inner));
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut first_coinbase = None;
+        for h in 1..=101u32 {
+            let b = build_test_block(parent, h, 1_700_000_000 + h);
+            if h == 1 {
+                first_coinbase = Some(b.txdata[0].compute_txid());
+            }
+            parent = cs.accept_block(&b).expect("accept chain A").hash();
+        }
+        let a101 = parent;
+
+        let spend = |prev: OutPoint, values: &[u64]| Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: values
+                .iter()
+                .map(|v| TxOut { value: Amount::from_sat(*v), script_pubkey: ScriptBuf::new() })
+                .collect(),
+        };
+        // T spends the height-1 coinbase into t0 and t1; U spends t0 inside
+        // the same block. Both blocks at height 102 carry T and U.
+        let t = spend(OutPoint { txid: first_coinbase.unwrap(), vout: 0 }, &[1_000_000_000, 3_900_000_000]);
+        let u = spend(OutPoint { txid: t.compute_txid(), vout: 0 }, &[900_000_000]);
+
+        let mut a102 = build_test_block(a101, 102, 1_700_000_102);
+        a102.txdata.extend([t.clone(), u.clone()]);
+        remine(&mut a102);
+        cs.accept_block(&a102).expect("accept A102");
+        cs.flush_coin_cache().unwrap();
+
+        let mut b102 = build_test_block(a101, 102, 1_700_001_102);
+        b102.txdata.extend([t, u]);
+        remine(&mut b102);
+        let b102_hash = cs.accept_block(&b102).expect("store B102").hash();
+        let b103 = build_test_block(b102_hash, 103, 1_700_001_103);
+        cs.accept_block(&b103).expect("reorg onto B");
+        assert_eq!(cs.tip_height(), 103);
+        cs.flush_coin_cache().unwrap();
+
+        // Coinbases 2..=101, B102's, B103's, t1 and u0.
+        let mut walked = 0u64;
+        let mut walked_amount = 0u64;
+        let base = cs
+            .store_ref()
+            .for_each_coin_snapshot(&mut |_, coin| {
+                walked += 1;
+                walked_amount += coin.amount;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(walked, 104, "coins on disk");
+        assert_eq!(walked_amount, 102 * 5_000_000_000 + 3_900_000_000 + 900_000_000);
+        assert_eq!(base.coin_count, walked, "meta utxo_count vs coins on disk");
+        assert_eq!(cs.coin_count(), walked, "utxo_count vs coins on disk");
+        assert_eq!(cs.coin_total_amount(), walked_amount, "total_amount vs coins on disk");
+
+        drop(cs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Two threads call `accept_block` at once — modeling a `submitblock`
     /// RPC (or internal mine) racing the connect thread. `accept_lock`
     /// must serialize them so the shared coin cache and `tip` are never
