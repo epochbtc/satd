@@ -280,13 +280,42 @@ pub async fn resolve_peer_target_classified(
     proxy: Option<&str>,
     dns: bool,
 ) -> Result<PeerAddr, PeerTargetError> {
+    if let Some(addr) = classify_peer_target(s, default_port, proxy, dns)? {
+        return Ok(addr);
+    }
+    let (host, port) = split_seed_host_port(s, default_port);
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(mut it) => it.next().map(PeerAddr::Socket).ok_or_else(|| {
+            PeerTargetError::Lookup(format!("invalid address '{s}': could not resolve"))
+        }),
+        Err(e) => Err(PeerTargetError::Lookup(format!(
+            "invalid address '{s}': could not resolve: {e}"
+        ))),
+    }
+}
+
+/// The part of [`resolve_peer_target_classified`] that needs no lookup:
+/// the address of a `.onion` or IP-literal target, `None` for a host name
+/// that has to be looked up, or the refusal of a target that can never
+/// resolve here (malformed, `-dns=0`, `-proxy`).
+///
+/// Never waits on a resolver, so startup can register the operator's
+/// targets before it serves RPC and look the names up afterwards.
+pub fn classify_peer_target(
+    s: &str,
+    default_port: u16,
+    proxy: Option<&str>,
+    dns: bool,
+) -> Result<Option<PeerAddr>, PeerTargetError> {
     // `.onion` and literal-IP forms: no lookup, no leak, always allowed.
     // (`parse_with_default_port` handles these without touching the
     // resolver; `is_name_target` decides which forms those are.)
     if !is_name_target(s) {
-        return PeerAddr::parse_with_default_port(s, default_port).map_err(PeerTargetError::Refused);
+        return PeerAddr::parse_with_default_port(s, default_port)
+            .map(Some)
+            .map_err(PeerTargetError::Refused);
     }
-    let (host, port) = split_seed_host_port(s, default_port);
+    let (host, _) = split_seed_host_port(s, default_port);
     if !dns {
         return Err(PeerTargetError::Refused(format!(
             "cannot resolve '{host}': DNS lookups are disabled (-dns=0); \
@@ -300,14 +329,7 @@ pub async fn resolve_peer_target_classified(
              .onion address"
         )));
     }
-    match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(mut it) => it.next().map(PeerAddr::Socket).ok_or_else(|| {
-            PeerTargetError::Lookup(format!("invalid address '{s}': could not resolve"))
-        }),
-        Err(e) => Err(PeerTargetError::Lookup(format!(
-            "invalid address '{s}': could not resolve: {e}"
-        ))),
-    }
+    Ok(None)
 }
 
 /// Whether `s` names a `.onion` service, with or without a port.
@@ -847,6 +869,36 @@ mod tests {
         }
         for name in ["example.com", "example.com:8333", "localhost", "127.1:8333"] {
             assert!(is_name_target(name), "{name} needs a lookup");
+        }
+    }
+
+    /// Startup registers each `-addnode` entry with `classify_peer_target`
+    /// before it serves RPC (#876), so the classifier has to reach the
+    /// resolver's verdict on everything the resolver decides without a
+    /// lookup, and leave only a permitted name for the lookup. (That it
+    /// never looks anything up is the compiler's to check: it is not async.)
+    #[tokio::test]
+    async fn classifying_a_target_agrees_with_resolving_it_short_of_the_lookup() {
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let proxy = Some("127.0.0.1:9050");
+        for (target, proxy, dns) in [
+            ("1.2.3.4".to_string(), None, true),
+            ("1.2.3.4:1234".to_string(), proxy, false),
+            ("[2001:db8::1]:1234".to_string(), None, false),
+            (format!("{onion}:8333"), proxy, true),
+            (format!("{onion}:notaport"), None, true),
+            ("example.invalid:8333".to_string(), None, false),
+            ("example.invalid:8333".to_string(), proxy, true),
+        ] {
+            let resolved = resolve_peer_target_classified(&target, 8333, proxy, dns).await;
+            assert_eq!(
+                classify_peer_target(&target, 8333, proxy, dns),
+                resolved.map(Some),
+                "{target} (proxy {proxy:?}, dns {dns})"
+            );
+        }
+        for name in ["example.invalid:8333", "localhost"] {
+            assert_eq!(classify_peer_target(name, 8333, None, true), Ok(None), "{name}");
         }
     }
 }

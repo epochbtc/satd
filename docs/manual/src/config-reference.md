@@ -241,7 +241,7 @@ startup error.
 | `assumevalid` | per-network hash | restart | core | Skip script verification up to HASH (`0`=verify all, `all`=skip old blocks). |
 | `assumevalidage` | 86400 | restart | satd | With `assumevalid=all`, still verify scripts for blocks newer than SECS. |
 | `checkpoints` | on | restart | core | Enforce the built-in block checkpoints. `-checkpoints=0` disables checkpoint validation. |
-| `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT. |
+| `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT, during initial block download too, where the node stops at HEIGHT itself. `0` is off, as in Core. |
 | `testactivationheight` | none | restart | core | Regtest only (warned and ignored elsewhere): `name@height` buried-deployment override (`bip34`\|`dersig`\|`cltv`\|`csv`\|`segwit`), repeatable. Note Core's own asymmetry, which satd matches: this option takes `dersig`/`cltv`, while `getdeploymentinfo` *reports* the same deployments as `bip66`/`bip65`; command-line and config-file occurrences merge, last wins per name. |
 | `vbparams` | none | restart | core | Regtest only (warned and ignored elsewhere): `deployment:start:end[:min_activation_height]` BIP 9 window override. Only `testdummy` is accepted — satd activates taproot at a fixed height and counts no signalling, so an override for it would be reported and not honoured, and is refused by name. |
 | `consensus` | rust-shadow | restart | satd | Consensus engine: `cpp`\|`rust`\|`rust-shadow`\|`cpp-shadow`. |

@@ -342,12 +342,71 @@ fn test_stopatheight_exits_after_target_block() {
     );
 }
 
+/// `-stopatheight` during initial block download (#873). The IBD connector
+/// emits no chain event, and the watcher listened for nothing else, so it
+/// never heard of those blocks: a node syncing from a peer went straight past
+/// the target and kept running. It has to stop, and at the target itself,
+/// which is what a snapshot taken at a given height needs.
+///
+/// Spawned directly rather than through `TestNode`, whose start waits for
+/// RPC to answer: the node may be gone before a readiness poll lands.
+#[test]
+fn stopatheight_stops_initial_block_download_at_the_target() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={p2p_port_a}")]);
+    node_a.mine_blocks(150, "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202");
+
+    let datadir = fresh_test_datadir("satd-stopatheight-ibd");
+    let log_path = datadir.join("satd-ibd.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg(format!("--connect=127.0.0.1:{p2p_port_a}"))
+        .arg("--stopatheight=100")
+        .stdout(log.try_clone().expect("clone log"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn satd");
+    let deadline = Instant::now() + test_timeout(120);
+    let status = loop {
+        match child.try_wait().expect("wait for satd") {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "satd did not stop at -stopatheight=100 during IBD:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
+        }
+    };
+    let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(status.success(), "{status:?}\n{text}");
+    assert!(text.contains("IBD write mode"), "the blocks must come through the IBD connector:\n{text}");
+
+    // It stopped at the target, not past it. Asked through the marker, the
+    // record of the tip the node flushed and shut down at: a restart would
+    // go on to connect the blocks above the target that IBD had already
+    // downloaded, as Core's does.
+    let marker = node::shutdown::consume_marker(&datadir.join("regtest"))
+        .unwrap_or_else(|| panic!("no clean-shutdown marker:\n{text}"));
+    assert_eq!(marker.tip_height, 100, "{text}");
+    node_a.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn test_stopatheight_zero_disabled() {
-    // No --stopatheight flag → daemon does not self-shutdown after
-    // mining blocks. Sanity check that the watcher only spawns when
-    // configured.
-    let mut node = TestNode::start(&[]);
+    // `--stopatheight=0` is Core's default and means off: the daemon
+    // does not shut itself down after mining blocks. Taken as a target,
+    // it stopped the node at its first block.
+    let mut node = TestNode::start(&["--stopatheight=0"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     node.rpc_call_with_params(
         "generatetoaddress",
@@ -4490,6 +4549,11 @@ fn test_getaddednodeinfo() {
 /// same string. satd used to drop the config entry with a warning and fail
 /// the RPC, so a node started before its peers had DNS records never
 /// connected to them. `.invalid` never resolves (RFC 6761).
+///
+/// The first `getaddednodeinfo` goes out as soon as RPC answers, which is
+/// why startup registers the `-addnode` entries before RPC serves (#876).
+/// Registered after their lookup, they raced it, and this failed whenever
+/// the resolver was slow to give up on `tank-0000.invalid`.
 #[test]
 fn an_unresolvable_added_node_is_kept_listed_and_removable() {
     let mut node = TestNode::start(&["-addnode=tank-0000.invalid:18444"]);

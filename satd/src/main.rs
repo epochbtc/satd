@@ -1724,9 +1724,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // configured height. Matches Bitcoin Core's `-stopatheight`. Uses
     // the chain-event channel rather than polling so the latency
     // between block-connected and shutdown is bounded by the broadcast
-    // delivery (microseconds) rather than a polling interval — without
-    // this guarantee, fast IBD could advance the tip several blocks
-    // past the target before we noticed.
+    // delivery (microseconds) rather than a polling interval.
+    //
+    // The IBD connector and the stored-tail drain emit no chain event.
+    // They check the target themselves (the peer manager is built with
+    // it, below), between one block and the next, so that IBD stops at the
+    // target rather than past it (#873).
     if let Some(target_height) = config.stopatheight {
         let mut rx = chain_event_tx.subscribe();
         let stop_tx = shutdown_tx.clone();
@@ -2259,6 +2262,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         config.prefetch_workers,
         config.max_ahead,
         config.ibd_l0_pause_at,
+        // -stopatheight on the connects the watcher above never hears of.
+        // Given here, not set afterwards: the constructor starts the IBD
+        // connector, which on a restart with blocks already stored ahead of
+        // the tip is connecting before this call returns.
+        config.stopatheight.map(|height| (height, shutdown_tx.clone())),
     );
 
     // Bitcoin Core's `-timeout` bounds the version/verack handshake.
@@ -2946,6 +2954,13 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         None
     };
     let allowip = config.rpcallowip.clone();
+
+    // Register the `-addnode` entries before RPC serves, so the first
+    // `getaddednodeinfo` lists them all (#876). Nothing is looked up yet:
+    // the entries are dialled, and the names looked up, once the node is up
+    // (below).
+    let addnode_dials = peer_manager.register_config_addnodes(&config.addnode);
+
     // JSON-RPC stays on the consensus (core) runtime — it is the control
     // plane and carries the chain-mutating methods (generate*/submitblock/
     // invalidateblock/reconsiderblock). Keeping it here both avoids
@@ -4084,31 +4099,21 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
-    // Connect to -addnode peers (does NOT disable DNS seeding).
-    //
-    // Register via `addnode_add`, not `add_peer_addr`: Core keeps config
-    // `-addnode` entries and RPC-added ones in the same `m_added_nodes` list,
-    // and `getaddednodeinfo` reports that list. Adding the address without
-    // recording the entry dials the peer but leaves it invisible to the RPC.
-    for addr_str in &config.addnode {
-        match peer_manager.resolve_target_classified(addr_str, default_peer_port).await {
-            Ok(addr) => {
-                peer_manager.addnode_add(addr_str, addr.clone());
-                let pm = peer_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr(&addr).await {
-                        tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
-                    }
-                });
+    // Connect to -addnode peers (does NOT disable DNS seeding). They were
+    // registered before RPC started (`register_config_addnodes`, above), in
+    // Core's `m_added_nodes` list, which `getaddednodeinfo` reports. A name
+    // is looked up by `refresh_manual_targets`, now and on every reconnect
+    // tick until it resolves, and dialled when it does.
+    for addr in addnode_dials {
+        let pm = peer_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pm.connect_peer_addr(&addr).await {
+                tracing::warn!(%addr, "Failed to connect to addnode peer: {}", e);
             }
-            Err(PeerTargetError::Lookup(e)) => {
-                tracing::warn!(addr = addr_str, "addnode address does not resolve yet; will keep trying: {}", e);
-                peer_manager.addnode_add_unresolved(addr_str);
-            }
-            Err(e) => {
-                tracing::warn!(addr = addr_str, "Invalid addnode address: {}", e);
-            }
-        }
+        });
+    }
+    if config.addnode.iter().any(|a| is_name_target(a)) {
+        tokio::spawn(peer_manager.clone().refresh_manual_targets());
     }
 
     // -seednode: operator-supplied bootstrap peers (Bitcoin Core's
