@@ -634,7 +634,8 @@ pub struct Config {
     /// so RocksDB flushes cleanly. Primary use case is deterministic
     /// testing — e.g. dumping a UTXO snapshot at exactly an AssumeUTXO
     /// anchor height for cross-validation against Core's published
-    /// `hash_serialized_3` values. `None` (default) = run indefinitely.
+    /// `hash_serialized_3` values. `None` (default, or `0` as in Core) =
+    /// run indefinitely.
     pub stopatheight: Option<u32>,
     /// Regtest-only buried-deployment overrides from Core's
     /// `-testactivationheight=name@height` (#548). Parsed and validated
@@ -2696,9 +2697,12 @@ impl Config {
             .or_else(|| file_get("assumevalidage").and_then(|v| v.parse().ok()))
             .unwrap_or(86400); // default: 24 hours
 
+        // `0`, Core's default, is off (`m_stop_at_height && ...`). Taken as
+        // a target, it stopped the node at the first block it connected.
         let stopatheight = cli
             .stopatheight
-            .or_else(|| file_get("stopatheight").and_then(|v| v.parse().ok()));
+            .or_else(|| file_get("stopatheight").and_then(|v| v.parse().ok()))
+            .filter(|&height| height != 0);
 
         // `-testactivationheight=name@height` (Core-compatible, regtest
         // only). Core reads command-line occurrences first and config-file
@@ -5318,7 +5322,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "HEIGHT",
-        help = "Stop running after the active-chain tip reaches HEIGHT (matches Core's -stopatheight)"
+        help = "Stop running after the active-chain tip reaches HEIGHT (matches Core's -stopatheight; 0 = off)"
     )]
     pub stopatheight: Option<u32>,
 
@@ -13184,6 +13188,28 @@ rpcport=39999
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Regtest);
+    }
+
+    /// `-stopatheight=0` is Core's default, and off, whether it comes from
+    /// the config file or the command line. Taken as a target, it stopped
+    /// the node at the first block it connected.
+    #[test]
+    fn stopatheight_zero_is_off() {
+        let (_d, cfg) = load_with_files("stopatheight=0\n", &[]);
+        assert_eq!(cfg.unwrap().stopatheight, None);
+        let (_d, cfg) = load_with_files("stopatheight=7\n", &[]);
+        assert_eq!(cfg.unwrap().stopatheight, Some(7));
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--stopatheight=0",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_cli(cli).unwrap().stopatheight, None);
     }
 
     // ---- includeconf: chained config files ----

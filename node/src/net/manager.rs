@@ -734,6 +734,9 @@ pub struct PeerManager {
     fee_estimator: Arc<FeeEstimator>,
     /// Shutdown signal.
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// `-stopatheight`, and the sender on which reaching it asks for
+    /// shutdown. See [`Self::set_stop_at_height`].
+    stop_at_height: std::sync::OnceLock<(u32, tokio::sync::watch::Sender<bool>)>,
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
@@ -1010,6 +1013,7 @@ impl PeerManager {
             ban_list: RwLock::new(crate::net::ban::BanList::default()),
             banlist_dump: parking_lot::Mutex::new(()),
             shutdown,
+            stop_at_height: std::sync::OnceLock::new(),
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
@@ -1107,6 +1111,41 @@ impl PeerManager {
             vec![("block-processor", block_processor), ("bg-catchup", bg_catchup)];
 
         mgr
+    }
+
+    /// `-stopatheight`: shut down once the active tip reaches `height`.
+    ///
+    /// Core checks the target on every tip it connects
+    /// (`KernelNotifications::blockTip`). Here a connect that emits
+    /// `ChainEvent::BlockConnected` reaches the watcher in `main`; the IBD
+    /// connector and the stored-tail drain emit no event, so they check it
+    /// themselves, through [`Self::stop_if_at_height`] (#873). Set once, at
+    /// startup; a second call changes nothing.
+    pub fn set_stop_at_height(&self, height: u32, shutdown: tokio::sync::watch::Sender<bool>) {
+        let _ = self.stop_at_height.set((height, shutdown));
+    }
+
+    /// Ask for shutdown if `height`, the height a connect has just taken the
+    /// tip to, reaches `-stopatheight`. Returns whether it does.
+    ///
+    /// Asked for between one connect and the next, shutdown also stops a
+    /// connector at the target rather than past it, because the connector
+    /// checks for shutdown before it connects another block.
+    fn stop_if_at_height(&self, height: u32) -> bool {
+        let Some((target, shutdown)) = self.stop_at_height.get() else {
+            return false;
+        };
+        if height < *target {
+            return false;
+        }
+        if shutdown.send_if_modified(|stop| !std::mem::replace(stop, true)) {
+            tracing::info!(
+                target = *target,
+                tip = height,
+                "-stopatheight reached; broadcasting shutdown"
+            );
+        }
+        true
     }
 
     /// Wait up to `timeout` for the block connector threads to exit: the
@@ -1396,6 +1435,16 @@ impl PeerManager {
             self.dns_enabled(),
         )
         .await
+    }
+
+    /// [`Self::resolve_target_classified`] short of the lookup: see
+    /// [`crate::net::dns::classify_peer_target`].
+    pub fn classify_target(
+        &self,
+        s: &str,
+        default_port: u16,
+    ) -> Result<Option<PeerAddr>, crate::net::dns::PeerTargetError> {
+        crate::net::dns::classify_peer_target(s, default_port, self.proxy.as_deref(), self.dns_enabled())
     }
 
     /// The SOCKS proxy used for clearnet (ipv4/ipv6) outbound, if any.
@@ -1831,6 +1880,39 @@ impl PeerManager {
     /// is already an added node.
     pub fn addnode_add_unresolved(&self, user_str: &str) -> bool {
         self.add_manual_target(user_str, None, true)
+    }
+
+    /// Register the `-addnode` entries at startup. Called before RPC
+    /// serves, so `getaddednodeinfo` lists every entry from its first
+    /// answer: registered only once its name had been looked up, an entry
+    /// was missing from any answer given in the meantime (#876). Core sets
+    /// its added-node list from `-addnode` during init, and RPC answers
+    /// nothing but "warming up" until init is done.
+    ///
+    /// Nothing is looked up here. A literal or `.onion` target is added
+    /// with its address, and a name unresolved, for
+    /// [`Self::refresh_manual_targets`] to look up once the node is up. A
+    /// target that can never resolve here (malformed, `-dns=0`, `-proxy`)
+    /// is refused. Returns the addresses to dial.
+    pub fn register_config_addnodes(&self, targets: &[String]) -> Vec<PeerAddr> {
+        let default_port = default_p2p_port(self.chain_state.network);
+        let mut dial = Vec::new();
+        for target in targets {
+            match self.classify_target(target, default_port) {
+                Ok(Some(addr)) => {
+                    if self.addnode_add(target, addr.clone()) {
+                        dial.push(addr);
+                    }
+                }
+                Ok(None) => {
+                    self.addnode_add_unresolved(target);
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %target, "Invalid addnode address: {}", e);
+                }
+            }
+        }
+        dial
     }
 
     /// Track a `-connect` host name so that it is looked up again: resolved
@@ -6034,6 +6116,11 @@ impl PeerManager {
                     mempool.remove_for_block(&block, block_height);
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
                     connected += 1;
+                    // `-stopatheight`, which this connect, like the IBD
+                    // connector's, reports to no chain-event subscriber.
+                    if peer_manager.upgrade().is_some_and(|pm| pm.stop_if_at_height(block_height)) {
+                        break;
+                    }
                 }
                 // Any failure parks the walk for this wakeup: `Duplicate`
                 // means the tip moved under us, `BadPrevBlock` means the
@@ -6353,6 +6440,15 @@ impl PeerManager {
                         }
                         // Tell the prefetcher we've advanced
                         prefetch_handle.advance_cursor(next_height + 1);
+
+                        // `-stopatheight`. This connect emits no chain
+                        // event, so the watcher in `main` never heard of
+                        // it, and IBD ran straight past the target (#873).
+                        // The shutdown asked for here also stops the loop
+                        // at the target: its first check is for shutdown.
+                        if let Some(pm) = peer_manager.upgrade() {
+                            pm.stop_if_at_height(next_height);
+                        }
 
                         // Skip fee recording during IBD — the coins are already
                         // spent so get_coin returns None for every input, and fee
@@ -11176,6 +11272,58 @@ mod tests {
         assert!(pm.addnode_add("10.0.0.9:18444", PeerAddr::Socket(sa)), "a dial candidate is not an added node");
         assert!(!pm.addnode_add("10.0.0.9", PeerAddr::Socket(sa)), "same numeric address, default port");
         assert_eq!(pm.get_added_node_info().len(), 1);
+    }
+
+    /// Startup registers the `-addnode` entries before RPC serves (#876),
+    /// with `register_config_addnodes`, which is not async and so cannot
+    /// wait on a lookup. Every entry is listed at once: a literal or
+    /// `.onion` target with its address to dial, a name unresolved, left
+    /// for `refresh_manual_targets`. Only a target that can never resolve is
+    /// left out, and a duplicate is neither listed nor dialled twice.
+    #[test]
+    fn config_addnodes_are_all_listed_before_any_lookup() {
+        let pm = empty_peer_manager();
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let dial = pm.register_config_addnodes(&[
+            "10.0.0.7".to_string(),
+            format!("{onion}:18444"),
+            "tank-0000:18444".to_string(),
+            format!("{onion}:notaport"),
+            "10.0.0.7:18444".to_string(),
+        ]);
+        assert_eq!(
+            dial,
+            vec![
+                PeerAddr::Socket("10.0.0.7:18444".parse().unwrap()),
+                PeerAddr::Onion { host: onion.to_string(), port: 18444 },
+            ]
+        );
+        let listed: Vec<String> = pm
+            .get_added_node_info()
+            .iter()
+            .map(|e| e["addednode"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, ["10.0.0.7".to_string(), format!("{onion}:18444"), "tank-0000:18444".to_string()]);
+        assert!(pm.manual_targets_due(Instant::now()), "the name is due its lookup");
+    }
+
+    /// `-stopatheight` on the connects that emit no chain event (#873):
+    /// nothing below the target, shutdown at it and past it, and nothing at
+    /// all when no target is set.
+    #[test]
+    fn reaching_stop_at_height_asks_for_shutdown() {
+        let pm = empty_peer_manager();
+        assert!(!pm.stop_if_at_height(u32::MAX), "no target set");
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        pm.set_stop_at_height(100, tx);
+        assert!(!pm.stop_if_at_height(99));
+        assert!(!*rx.borrow(), "below the target");
+        assert!(pm.stop_if_at_height(100));
+        assert!(*rx.borrow(), "at the target");
+        // A node restarted above its target stops after its next block, as
+        // Core's does.
+        assert!(pm.stop_if_at_height(101));
     }
 
     /// The fix proper: a name that does not resolve when it is configured is
