@@ -11790,6 +11790,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #873: `-stopatheight` stops the IBD connector at the target. Its
+    /// connects emit no chain event, so the watcher in `main`, which heard
+    /// of nothing else, never saw them, and IBD ran straight past it.
+    ///
+    /// Thirty blocks are stored and ready. The connector is held in its
+    /// compaction pause (L0 at the threshold) until the target is set, then
+    /// let go.
+    ///
+    /// Perturbations: without the check after each connect, all thirty
+    /// connect and nothing asks for shutdown; stopping only past the target
+    /// leaves the tip at 11.
+    #[test]
+    fn the_ibd_connector_stops_at_stop_at_height() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls().clone();
+        controls.set_chainstate_l0_files(8);
+        let (cs, dir) = crate::chain::state::tests::make_chain_state_with_store(Box::new(store));
+        headers_ahead_of_the_tip(&cs, 30, true);
+        let chain_state = Arc::new(cs);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::with_config(
+            chain_state.clone(),
+            Arc::new(Mempool::new(1_000_000, 0)),
+            Arc::new(FeeEstimator::new()),
+            Network::Regtest,
+            shutdown_rx,
+            0,
+            125,
+            DEFAULT_MAX_INBOUND_PER_IP,
+            86400,
+            None,
+            None,
+            1,
+            50_000,
+            8,
+        );
+        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        pm.set_stop_at_height(10, shutdown_tx.clone());
+        controls.set_chainstate_l0_files(0);
+
+        assert!(
+            pm.join_connectors(Duration::from_secs(20)),
+            "the connector must stop once it reaches the target"
+        );
+        assert!(*shutdown_tx.borrow(), "reaching the target asks for shutdown");
+        assert_eq!(chain_state.tip_height(), 10, "the connector stops at the target, not past it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #868: the IBD connector stops for shutdown without waiting for a
     /// prefetch worker that is still busy. One transaction's scripts can
     /// take a worker tens of seconds, and waiting for it held the connector,
@@ -12280,6 +12329,52 @@ mod tests {
         );
         assert_eq!(second, 6, "the next wakeup must finish the remainder");
         assert_eq!(chain_state.tip_height(), 31, "the whole tail must connect across wakeups");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #873: the stored-tail drain, which emits no chain event either,
+    /// stops at `-stopatheight` and asks for shutdown. The manager only
+    /// holds the target; the drain walks its own chain state.
+    ///
+    /// Perturbation: without the check, the walk connects all nine.
+    #[test]
+    fn the_stored_tail_drain_stops_at_stop_at_height() {
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, store_block_without_connecting,
+        };
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let mut parent = cs.accept_block(&b1).expect("connect block 1").hash();
+        let mut headers = Vec::new();
+        let mut tail = Vec::new();
+        for h in 2..=10u32 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+            tail.push((b, h));
+        }
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 9, "fixture: headers must be accepted ({err:?})");
+        for (b, h) in &tail {
+            store_block_without_connecting(&cs, b, *h);
+        }
+        let chain_state = Arc::new(cs);
+
+        let pm = empty_peer_manager();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        pm.set_stop_at_height(5, shutdown_tx);
+        let connected = PeerManager::connect_stored_tail(
+            &chain_state,
+            &FeeEstimator::new(),
+            &Arc::new(Mempool::new(1_000_000, 0)),
+            &Arc::new(TxOrphanage::with_defaults()),
+            &Arc::downgrade(&pm),
+        );
+        assert_eq!(connected, 4);
+        assert_eq!(chain_state.tip_height(), 5, "the drain stops at the target");
+        assert!(*shutdown_rx.borrow(), "and asks for shutdown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
