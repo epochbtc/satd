@@ -1727,8 +1727,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // delivery (microseconds) rather than a polling interval.
     //
     // The IBD connector and the stored-tail drain emit no chain event.
-    // They check the target themselves (`PeerManager::set_stop_at_height`,
-    // below), between one block and the next, so that IBD stops at the
+    // They check the target themselves (the peer manager is built with
+    // it, below), between one block and the next, so that IBD stops at the
     // target rather than past it (#873).
     if let Some(target_height) = config.stopatheight {
         let mut rx = chain_event_tx.subscribe();
@@ -2262,6 +2262,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         config.prefetch_workers,
         config.max_ahead,
         config.ibd_l0_pause_at,
+        // -stopatheight on the connects the watcher above never hears of.
+        // Given here, not set afterwards: the constructor starts the IBD
+        // connector, which on a restart with blocks already stored ahead of
+        // the tip is connecting before this call returns.
+        config.stopatheight.map(|height| (height, shutdown_tx.clone())),
     );
 
     // Bitcoin Core's `-timeout` bounds the version/verack handshake.
@@ -2272,10 +2277,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // Per-connection SOCKS credential randomization (Tor stream isolation).
     peer_manager.set_proxy_randomize(config.proxyrandomize);
     peer_manager.set_dns_enabled(config.dns);
-    // -stopatheight on the connects the watcher above never hears of.
-    if let Some(height) = config.stopatheight {
-        peer_manager.set_stop_at_height(height, shutdown_tx.clone());
-    }
 
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);

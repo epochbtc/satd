@@ -735,8 +735,8 @@ pub struct PeerManager {
     /// Shutdown signal.
     shutdown: tokio::sync::watch::Receiver<bool>,
     /// `-stopatheight`, and the sender on which reaching it asks for
-    /// shutdown. See [`Self::set_stop_at_height`].
-    stop_at_height: std::sync::OnceLock<(u32, tokio::sync::watch::Sender<bool>)>,
+    /// shutdown. See [`Self::stop_if_at_height`].
+    stop_at_height: Option<(u32, tokio::sync::watch::Sender<bool>)>,
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
@@ -895,7 +895,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
     }
 
     pub fn with_prune(
@@ -907,9 +907,14 @@ impl PeerManager {
         prune_target_mb: u64,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
     }
 
+    /// `stop_at_height` is `-stopatheight` and the sender on which reaching
+    /// it asks for shutdown (see [`Self::stop_if_at_height`]). It is fixed
+    /// here, before the connector threads start: on a restart with blocks
+    /// already stored ahead of the tip, the IBD connector connects from the
+    /// moment its thread does.
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         chain_state: Arc<ChainState>,
@@ -926,6 +931,7 @@ impl PeerManager {
         prefetch_workers: usize,
         max_ahead: u32,
         ibd_l0_pause_at: u32,
+        stop_at_height: Option<(u32, tokio::sync::watch::Sender<bool>)>,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::channel(4096);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
@@ -1013,7 +1019,7 @@ impl PeerManager {
             ban_list: RwLock::new(crate::net::ban::BanList::default()),
             banlist_dump: parking_lot::Mutex::new(()),
             shutdown,
-            stop_at_height: std::sync::OnceLock::new(),
+            stop_at_height,
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
@@ -1113,26 +1119,19 @@ impl PeerManager {
         mgr
     }
 
-    /// `-stopatheight`: shut down once the active tip reaches `height`.
+    /// `-stopatheight`: ask for shutdown if `height`, the height a connect
+    /// has just taken the tip to, reaches the target. Returns whether it does.
     ///
     /// Core checks the target on every tip it connects
     /// (`KernelNotifications::blockTip`). Here a connect that emits
     /// `ChainEvent::BlockConnected` reaches the watcher in `main`; the IBD
-    /// connector and the stored-tail drain emit no event, so they check it
-    /// themselves, through [`Self::stop_if_at_height`] (#873). Set once, at
-    /// startup; a second call changes nothing.
-    pub fn set_stop_at_height(&self, height: u32, shutdown: tokio::sync::watch::Sender<bool>) {
-        let _ = self.stop_at_height.set((height, shutdown));
-    }
-
-    /// Ask for shutdown if `height`, the height a connect has just taken the
-    /// tip to, reaches `-stopatheight`. Returns whether it does.
-    ///
-    /// Asked for between one connect and the next, shutdown also stops a
-    /// connector at the target rather than past it, because the connector
-    /// checks for shutdown before it connects another block.
+    /// connector and the stored-tail drain emit no event, so they call this
+    /// after each connect (#873). Asked for between one connect and the
+    /// next, shutdown also stops a connector at the target rather than past
+    /// it, because the connector checks for shutdown before it connects
+    /// another block.
     fn stop_if_at_height(&self, height: u32) -> bool {
-        let Some((target, shutdown)) = self.stop_at_height.get() else {
+        let Some((target, shutdown)) = self.stop_at_height.as_ref() else {
             return false;
         };
         if height < *target {
@@ -11164,6 +11163,13 @@ mod tests {
     }
 
     fn empty_peer_manager() -> Arc<PeerManager> {
+        empty_peer_manager_stopping_at(None)
+    }
+
+    /// [`empty_peer_manager`], with a `-stopatheight` target.
+    fn empty_peer_manager_stopping_at(
+        stop_at_height: Option<(u32, tokio::sync::watch::Sender<bool>)>,
+    ) -> Arc<PeerManager> {
         use crate::chain::state::AssumeValid;
         use crate::storage::db::InMemoryStore;
         use crate::storage::flatfile::FlatFileManager;
@@ -11191,7 +11197,24 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // Leak the TempDir so the blocks dir outlives the manager for the test.
         std::mem::forget(dir);
-        PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        PeerManager::with_config(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+            0,
+            125,
+            DEFAULT_MAX_INBOUND_PER_IP,
+            86400,
+            None,
+            None,
+            workers,
+            50_000,
+            0,
+            stop_at_height,
+        )
     }
 
     /// `getaddednodeinfo` reports the added-node list, and Core keeps config
@@ -11312,11 +11335,10 @@ mod tests {
     /// all when no target is set.
     #[test]
     fn reaching_stop_at_height_asks_for_shutdown() {
-        let pm = empty_peer_manager();
-        assert!(!pm.stop_if_at_height(u32::MAX), "no target set");
+        assert!(!empty_peer_manager().stop_if_at_height(u32::MAX), "no target set");
 
         let (tx, rx) = tokio::sync::watch::channel(false);
-        pm.set_stop_at_height(100, tx);
+        let pm = empty_peer_manager_stopping_at(Some((100, tx)));
         assert!(!pm.stop_if_at_height(99));
         assert!(!*rx.borrow(), "below the target");
         assert!(pm.stop_if_at_height(100));
@@ -11776,6 +11798,7 @@ mod tests {
             1,
             50_000,
             8,
+            None,
         );
         assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
         std::thread::sleep(Duration::from_millis(300));
@@ -11794,19 +11817,18 @@ mod tests {
     /// connects emit no chain event, so the watcher in `main`, which heard
     /// of nothing else, never saw them, and IBD ran straight past it.
     ///
-    /// Thirty blocks are stored and ready. The connector is held in its
-    /// compaction pause (L0 at the threshold) until the target is set, then
-    /// let go.
+    /// Thirty blocks are stored and ready, as on a restart that finds a
+    /// downloaded tail: the manager arms IBD as it is built, and the
+    /// connector connects from the moment its thread starts. The target is
+    /// therefore fixed by the constructor, before that thread exists.
     ///
     /// Perturbations: without the check after each connect, all thirty
     /// connect and nothing asks for shutdown; stopping only past the target
-    /// leaves the tip at 11.
+    /// leaves the tip at 11; a target set only after the threads start is
+    /// missed while the connector runs ahead of it.
     #[test]
     fn the_ibd_connector_stops_at_stop_at_height() {
-        let store = crate::storage::test_store::ControllableStore::new();
-        let controls = store.controls().clone();
-        controls.set_chainstate_l0_files(8);
-        let (cs, dir) = crate::chain::state::tests::make_chain_state_with_store(Box::new(store));
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
         headers_ahead_of_the_tip(&cs, 30, true);
         let chain_state = Arc::new(cs);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -11824,11 +11846,10 @@ mod tests {
             None,
             1,
             50_000,
-            8,
+            0,
+            Some((10, shutdown_tx.clone())),
         );
         assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
-        pm.set_stop_at_height(10, shutdown_tx.clone());
-        controls.set_chainstate_l0_files(0);
 
         assert!(
             pm.join_connectors(Duration::from_secs(20)),
@@ -12362,9 +12383,8 @@ mod tests {
         }
         let chain_state = Arc::new(cs);
 
-        let pm = empty_peer_manager();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        pm.set_stop_at_height(5, shutdown_tx);
+        let pm = empty_peer_manager_stopping_at(Some((5, shutdown_tx)));
         let connected = PeerManager::connect_stored_tail(
             &chain_state,
             &FeeEstimator::new(),
