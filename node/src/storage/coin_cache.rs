@@ -33,10 +33,16 @@ enum DirtyEntry {
     /// Coin was spent. Carries (amount, height) for counter/histogram updates.
     /// If `fresh` = true, the coin was created and spent in the same flush window
     /// and can be discarded without touching the backing store.
+    ///
+    /// `row_unknown` = true means the spent coin was one restored after a
+    /// failed flush, so whether the store holds its row is not known. The
+    /// flush still writes the remove, but a coin put back over this entry is
+    /// counted as a new row, not as a replacement of one.
     Spent {
         amount: u64,
         height: u32,
         fresh: bool,
+        row_unknown: bool,
     },
 }
 
@@ -610,7 +616,10 @@ impl CoinCache {
     ///   coin emits a real remove for a key the store may not hold — a RocksDB
     ///   delete of a missing key, which is a no-op for the rows (the running
     ///   counters still count it out). A coin that replaced a stored row
-    ///   keeps its `replaces`, since the batch carries it.
+    ///   keeps its `replaces`, since the batch carries it. Any other restored
+    ///   coin has no known row, and keeps that through a later spend
+    ///   (`row_unknown`), so putting it back is counted as a new row rather
+    ///   than as a replacement of one that may never have been written.
     /// - Coins created *and* spent inside the failed window were elided from
     ///   the batch entirely, so they are not restored, and that is correct:
     ///   they have no row in the backing store (the write failed, and it would
@@ -672,6 +681,7 @@ impl CoinCache {
                         amount,
                         height,
                         fresh: false,
+                        row_unknown: false,
                     });
                     restored += 1;
                 }
@@ -923,10 +933,15 @@ impl CoinCache {
                 let (fresh, replaces) = match dirty.get(&outpoint) {
                     None => (true, None),
                     Some(DirtyEntry::Spent { fresh: true, .. }) => (true, None),
+                    // A restored coin's row is not known; neither is this one's.
+                    Some(DirtyEntry::Spent {
+                        row_unknown: true, ..
+                    }) => (false, None),
                     Some(DirtyEntry::Spent {
                         amount,
                         height,
                         fresh: false,
+                        row_unknown: false,
                     }) => (false, Some((*amount, *height))),
                     // Re-putting an unspent coin: no caller does this. Keep
                     // what is known about the stored row.
@@ -952,16 +967,21 @@ impl CoinCache {
                 // If the coin was fresh (created in this flush window), mark the
                 // spend as fresh too — it can be elided entirely during flush.
                 // If it was put back over a stored row, the flush deletes that
-                // row, which is the one the store counted.
-                let (amount, height, fresh) = match dirty.get(&outpoint) {
+                // row, which is the one the store counted. If it was restored
+                // after a failed flush, whether it has a row stays unknown.
+                let (amount, height, fresh, row_unknown) = match dirty.get(&outpoint) {
                     Some(DirtyEntry::Present { fresh: true, .. }) => {
-                        (spent_amount, spent_height, true)
+                        (spent_amount, spent_height, true, false)
                     }
                     Some(DirtyEntry::Present {
                         replaces: Some((amount, height)),
                         ..
-                    }) => (*amount, *height, false),
-                    _ => (spent_amount, spent_height, false),
+                    }) => (*amount, *height, false, false),
+                    Some(DirtyEntry::Present { .. }) => (spent_amount, spent_height, false, true),
+                    Some(DirtyEntry::Spent { row_unknown, .. }) => {
+                        (spent_amount, spent_height, false, *row_unknown)
+                    }
+                    None => (spent_amount, spent_height, false, false),
                 };
                 dirty.insert(
                     outpoint,
@@ -969,6 +989,7 @@ impl CoinCache {
                         amount,
                         height,
                         fresh,
+                        row_unknown,
                     },
                 );
             }
@@ -4458,6 +4479,49 @@ mod tests {
         cache.flush().expect("retry succeeds");
         assert_eq!(cache.coin_count(), 1);
         assert_eq!(cache.get_coin(&x).unwrap().height, 2);
+    }
+
+    /// A coin restored after a failed flush has no known row in the store.
+    /// Spending it and putting it back in one window, as a reorg re-mining
+    /// it does, must not make it a replacement: the store would count a row
+    /// out that may never have been written.
+    #[test]
+    fn a_restored_coin_put_back_after_a_spend_is_not_a_replacement() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let y = make_outpoint(0xF5, 0);
+        let mut create = StoreBatch::default();
+        create.coin_puts.push((y, make_coin(6_000, 3)));
+        cache.write_batch(create).unwrap();
+        controls.fail_next_write();
+        cache.flush().expect_err("the injected fault must surface");
+        assert!(matches!(
+            cache.dirty.read().get(&y),
+            Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+        ));
+
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((y, 6_000, 3));
+        cache.write_batch(spend).unwrap();
+        let mut again = StoreBatch::default();
+        again.coin_puts.push((y, make_coin(6_000, 4)));
+        cache.write_batch(again).unwrap();
+        assert!(
+            matches!(
+                cache.dirty.read().get(&y),
+                Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+            ),
+            "no stored row is known, so the put-back must not name one"
+        );
+
+        cache.flush().expect("retry succeeds");
+        assert_eq!(cache.coin_count(), 1);
+        assert_eq!(cache.coin_total_amount(), 6_000);
+        assert_eq!(cache.get_coin(&y).unwrap().height, 4);
     }
 
     /// The restore must not overwrite a write that arrived while the failed
