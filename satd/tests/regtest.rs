@@ -4584,6 +4584,79 @@ fn an_unresolvable_added_node_is_kept_listed_and_removable() {
     node.stop();
 }
 
+/// A config reload that adds `-addnode` entries registers them as startup
+/// does (#879): each is listed by `getaddednodeinfo`, a name that does not
+/// resolve is kept rather than dropped, and each is removable with
+/// `addnode remove`. The reload used to dial a new entry without adding it,
+/// so none was listed, `addnode remove` failed with -24 while the peer went
+/// on being dialled, and a name that did not resolve was lost.
+#[test]
+fn a_reload_registers_new_addnode_entries_as_added_nodes() {
+    let mut node = TestNode::start(&[]);
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+
+    // Nothing listens on `closed`: an added node all the same.
+    let closed = format!("127.0.0.1:{}", find_available_port());
+    let conf = node.datadir.join("bitcoin.conf");
+    std::fs::write(&conf, format!("[regtest]\naddnode=tank-0000.invalid:18444\naddnode={closed}\n")).unwrap();
+    send_sighup(&node);
+
+    let added = |node: &TestNode| -> Vec<String> {
+        node.rpc_ok("getaddednodeinfo", vec![])
+            .as_array()
+            .expect("getaddednodeinfo returns an array")
+            .iter()
+            .map(|e| e["addednode"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let deadline = Instant::now() + test_timeout(10);
+    while added(&node).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        added(&node),
+        ["tank-0000.invalid:18444".to_string(), closed.clone()],
+        "every entry the reload added must be an added node"
+    );
+
+    for entry in ["tank-0000.invalid:18444", closed.as_str()] {
+        node.rpc_ok("addnode", vec![serde_json::json!(entry), serde_json::json!("remove")]);
+    }
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    node.stop();
+}
+
+/// The same for `-connect` (#879): a name that does not resolve when a
+/// reload adds it is kept and looked up again, as at startup, rather than
+/// dropped as an "invalid connect address". A `-connect` entry is not an
+/// added node, so nothing lists it; the evidence is the lookup that the
+/// reconnect tick (every 10 s) makes again for a name it is still tracking.
+#[test]
+fn a_reload_keeps_a_new_connect_name_that_does_not_resolve_yet() {
+    let mut node = TestNode::start(&["--loglevel=info"]);
+    let conf = node.datadir.join("bitcoin.conf");
+    std::fs::write(&conf, "[regtest]\nconnect=tank-0001.invalid:18444\n").unwrap();
+    send_sighup(&node);
+
+    let retried = |node: &TestNode| {
+        std::fs::read_to_string(&node.stderr_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.contains("Peer name does not resolve yet") && l.contains("tank-0001.invalid"))
+    };
+    let deadline = Instant::now() + test_timeout(30);
+    while !retried(&node) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        retried(&node),
+        "the reloaded -connect name must be looked up again\n{}",
+        std::fs::read_to_string(&node.stderr_log).unwrap_or_default()
+    );
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    node.stop();
+}
+
 /// A name refused by configuration is still an error, not a pending entry:
 /// under `-dns=0` it can never resolve, so keeping it would retry forever.
 #[test]

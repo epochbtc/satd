@@ -1881,12 +1881,13 @@ impl PeerManager {
         self.add_manual_target(user_str, None, true)
     }
 
-    /// Register the `-addnode` entries at startup. Called before RPC
-    /// serves, so `getaddednodeinfo` lists every entry from its first
-    /// answer: registered only once its name had been looked up, an entry
-    /// was missing from any answer given in the meantime (#876). Core sets
-    /// its added-node list from `-addnode` during init, and RPC answers
-    /// nothing but "warming up" until init is done.
+    /// Register `-addnode` entries: all of them at startup, and those a
+    /// config reload adds (#879). Called at startup before RPC serves, so
+    /// `getaddednodeinfo` lists every entry from its first answer:
+    /// registered only once its name had been looked up, an entry was
+    /// missing from any answer given in the meantime (#876). Core sets its
+    /// added-node list from `-addnode` during init, and RPC answers nothing
+    /// but "warming up" until init is done.
     ///
     /// Nothing is looked up here. A literal or `.onion` target is added
     /// with its address, and a name unresolved, for
@@ -1912,6 +1913,36 @@ impl PeerManager {
             }
         }
         dial
+    }
+
+    /// Register a `-connect` target, at startup or when a config reload adds
+    /// it (#879), and return the address to dial if it has one yet. A name
+    /// is looked up now and tracked, so that it is looked up again
+    /// ([`Self::connect_name_add`]); one that does not resolve yet is kept,
+    /// and dialled once [`Self::refresh_manual_targets`] resolves it. Only
+    /// a target that can never resolve here (malformed, `-dns=0`, `-proxy`)
+    /// is refused. Never listed by `getaddednodeinfo`.
+    pub async fn register_connect_target(&self, target: &str) -> Option<PeerAddr> {
+        use crate::net::dns::PeerTargetError;
+        let default_port = default_p2p_port(self.chain_state.network);
+        match self.resolve_target_classified(target, default_port).await {
+            Ok(addr) => {
+                self.add_peer_addr(addr.clone());
+                if crate::net::dns::is_name_target(target) {
+                    self.connect_name_add(target, Some(addr.clone()));
+                }
+                Some(addr)
+            }
+            Err(PeerTargetError::Lookup(e)) => {
+                tracing::warn!(addr = target, "connect address does not resolve yet; will keep trying: {}", e);
+                self.connect_name_add(target, None);
+                None
+            }
+            Err(e) => {
+                tracing::warn!(addr = target, "Invalid connect address: {}", e);
+                None
+            }
+        }
     }
 
     /// Track a `-connect` host name so that it is looked up again: resolved
@@ -11398,6 +11429,42 @@ mod tests {
         Arc::clone(&pm).refresh_manual_targets().await;
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
         assert!(pm.may_dial(&target), "a -connect peer stays dialable under -connect");
+    }
+
+    /// Startup and a config reload register `-connect` entries through
+    /// `register_connect_target` (#879). A name that resolves is dialled
+    /// and tracked for a later lookup, one that does not resolve yet is
+    /// kept for `refresh_manual_targets` rather than dropped, and one that
+    /// can never resolve is refused. None of them is an added node.
+    #[tokio::test]
+    async fn connect_targets_are_kept_whether_or_not_they_resolve_yet() {
+        use crate::net::dns::PeerTargetError;
+        let pm = empty_peer_manager();
+        let up: SocketAddr = "10.0.0.8:18444".parse().unwrap();
+        set_test_resolver(&pm, move |s| match s {
+            "tank-0005" => Ok(PeerAddr::Socket(up)),
+            "tank-0006" => Err(PeerTargetError::Lookup("no such host yet".into())),
+            _ => Err(PeerTargetError::Refused("name lookups are disabled (-dns=0)".into())),
+        });
+
+        assert_eq!(pm.register_connect_target("tank-0005").await, Some(PeerAddr::Socket(up)));
+        assert!(pm.manual_addrs.read().contains(&up), "dialled as a manual peer");
+        assert_eq!(pm.register_connect_target("tank-0006").await, None, "nothing to dial yet");
+        assert_eq!(pm.register_connect_target("tank-0007").await, None, "refused");
+
+        let tracked: Vec<(String, bool)> = pm
+            .addnode_entries
+            .read()
+            .iter()
+            .map(|e| (e.target.clone(), e.resolved.is_some()))
+            .collect();
+        assert_eq!(
+            tracked,
+            [("tank-0005".to_string(), true), ("tank-0006".to_string(), false)],
+            "both names are tracked; the refused one is not"
+        );
+        assert!(pm.manual_targets_due(Instant::now()), "the unresolved name is due its lookup");
+        assert!(pm.get_added_node_info().is_empty(), "a -connect entry is not an added node");
     }
 
     /// A resolved name whose peer is gone is looked up again, and when the
