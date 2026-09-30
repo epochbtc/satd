@@ -11849,7 +11849,6 @@ mod tests {
             0,
             Some((10, shutdown_tx.clone())),
         );
-        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
 
         assert!(
             pm.join_connectors(Duration::from_secs(20)),
@@ -11857,6 +11856,12 @@ mod tests {
         );
         assert!(*shutdown_tx.borrow(), "reaching the target asks for shutdown");
         assert_eq!(chain_state.tip_height(), 10, "the connector stops at the target, not past it");
+        // Checked last: an IBD that stops for shutdown keeps its scheduler,
+        // one that runs to the end clears it.
+        assert!(
+            pm.ibd.read().is_some(),
+            "fixture: the blocks must come through the IBD connector, stopped short of its end"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
