@@ -4072,30 +4072,17 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // orchestrators do) may have no DNS record for its first seconds.
     // `refresh_manual_targets` looks such names up again on each reconnect
     // tick. Only a target that can never resolve here (malformed, `-dns=0`,
-    // `-proxy`) is refused.
-    use node::net::dns::{is_name_target, PeerTargetError};
-    let default_peer_port = node::net::peer::default_p2p_port(config.network);
+    // `-proxy`) is refused. A config reload that adds an entry registers it
+    // the same way (`register_connect_target`).
+    use node::net::dns::is_name_target;
     for addr_str in &config.connect {
-        match peer_manager.resolve_target_classified(addr_str, default_peer_port).await {
-            Ok(addr) => {
-                peer_manager.add_peer_addr(addr.clone());
-                if is_name_target(addr_str) {
-                    peer_manager.connect_name_add(addr_str, Some(addr.clone()));
+        if let Some(addr) = peer_manager.register_connect_target(addr_str).await {
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    tracing::warn!(%addr, "Failed to connect to peer: {}", e);
                 }
-                let pm = peer_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr(&addr).await {
-                        tracing::warn!(%addr, "Failed to connect to peer: {}", e);
-                    }
-                });
-            }
-            Err(PeerTargetError::Lookup(e)) => {
-                tracing::warn!(addr = addr_str, "connect address does not resolve yet; will keep trying: {}", e);
-                peer_manager.connect_name_add(addr_str, None);
-            }
-            Err(e) => {
-                tracing::warn!(addr = addr_str, "Invalid connect address: {}", e);
-            }
+            });
         }
     }
 

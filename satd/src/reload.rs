@@ -96,50 +96,56 @@ pub fn webhook_target_from(c: &Config) -> Option<WebhookTarget> {
 /// reflects that they take effect without a restart.
 fn consumed_from_reloaded_config(_c: &Config, _h: &ReloadHandles) {}
 
-/// Register + dial the socket-style peer addresses present in `new` but not in
-/// `old` (`-addnode`/`-connect` reload). Mirrors the startup path: `add_peer_addr`
-/// registers for auto-reconnect (idempotent/deduped), then a spawned task dials.
-///
-/// Only the *added* entries are dialed — existing peers are left alone, so a
-/// reload that merely appends a peer doesn't churn live connections. Removing an
-/// entry from the file does NOT disconnect that peer (matches Core's `-addnode`:
-/// use `disconnectnode` for that). Runs inside the tokio runtime (the reload is
-/// driven from the main select loop), so `tokio::spawn` is valid here.
-fn dial_added_peers(
-    old: &[String],
-    new: &[String],
-    pm: &Arc<PeerManager>,
-    network: bitcoin::Network,
-    label: &'static str,
-) {
-    let default_port = node::net::peer::default_p2p_port(network);
-    let added: Vec<String> = new
-        .iter()
-        .filter(|a| !old.iter().any(|o| o == *a))
-        .cloned()
-        .collect();
+/// The entries of a peer list present in `new` but not in `old`. Only these
+/// act on a reload: existing peers are left alone, so a reload that merely
+/// appends a peer doesn't churn live connections. Removing an entry from the
+/// file does NOT disconnect that peer, nor remove an added node (use
+/// `disconnectnode` and `addnode remove` for those).
+fn added_entries(old: &[String], new: &[String]) -> Vec<String> {
+    new.iter().filter(|a| !old.contains(a)).cloned().collect()
+}
+
+/// `-addnode` reload: register the added entries exactly as startup does
+/// (`register_config_addnodes`), then dial them (#879). Each is an added node,
+/// listed by `getaddednodeinfo` and removable with `addnode remove`, and a
+/// name that does not resolve yet is kept and looked up again rather than
+/// dropped. Runs inside the tokio runtime (the reload is driven from the main
+/// select loop), so `tokio::spawn` is valid here.
+fn register_added_addnodes(old: &[String], new: &[String], pm: &Arc<PeerManager>) {
+    let added = added_entries(old, new);
     if added.is_empty() {
         return;
     }
-    // Resolution is async now (it must not block a runtime worker on a
-    // resolver, and it consults `-proxy`/`-dns`), so it moves into a spawned
-    // task alongside the dial. One task per address: a single loop would
-    // serialise the dials, and N unreachable entries would hold the N-th
-    // behind (N-1) connect timeouts — the startup path dials them
-    // concurrently, and a reload should not be slower than a restart.
-    for addr_str in added {
+    // One task per address: a single loop would serialise the dials, and N
+    // unreachable entries would hold the N-th behind (N-1) connect timeouts
+    // — the startup path dials them concurrently, and a reload should not be
+    // slower than a restart.
+    for addr in pm.register_config_addnodes(&added) {
         let pm = pm.clone();
         tokio::spawn(async move {
-            match pm.resolve_peer_target(&addr_str, default_port).await {
-                Ok(addr) => {
-                    pm.add_peer_addr(addr.clone());
-                    if let Err(e) = pm.connect_peer_addr(&addr).await {
-                        tracing::warn!(addr = %addr, "{label} reload connect failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(addr = %addr_str, "invalid {label} address on reload: {e}");
-                }
+            if let Err(e) = pm.connect_peer_addr(&addr).await {
+                tracing::warn!(addr = %addr, "addnode reload connect failed: {e}");
+            }
+        });
+    }
+    if added.iter().any(|a| node::net::dns::is_name_target(a)) {
+        tokio::spawn(pm.clone().refresh_manual_targets());
+    }
+}
+
+/// `-connect` reload: register the added entries exactly as startup does
+/// (`register_connect_target`), then dial them (#879). A name is tracked so
+/// that it is looked up again, and one that does not resolve yet is kept
+/// rather than dropped. Registration looks the name up, so each entry gets
+/// its own task, for the reason given at [`register_added_addnodes`].
+fn register_added_connects(old: &[String], new: &[String], pm: &Arc<PeerManager>) {
+    for target in added_entries(old, new) {
+        let pm = pm.clone();
+        tokio::spawn(async move {
+            if let Some(addr) = pm.register_connect_target(&target).await
+                && let Err(e) = pm.connect_peer_addr(&addr).await
+            {
+                tracing::warn!(addr = %addr, "connect reload connect failed: {e}");
             }
         });
     }
@@ -733,16 +739,14 @@ fn field_specs() -> Vec<FieldSpec> {
                 // specific peers -- and still refusing to after they removed
                 // the pin.
                 h.peer_manager.set_automatic_outbound(new.automatic_outbound);
-                dial_added_peers(&old.connect, &new.connect, &h.peer_manager, new.network, "connect");
+                register_added_connects(&old.connect, &new.connect, &h.peer_manager);
             })),
             sensitive: false,
         },
-        live_delta!("addnode", addnode, |old, new, h| dial_added_peers(
+        live_delta!("addnode", addnode, |old, new, h| register_added_addnodes(
             &old.addnode,
             &new.addnode,
-            &h.peer_manager,
-            new.network,
-            "addnode"
+            &h.peer_manager
         )),
         live_delta!("seednode", seednode, dial_added_seednodes),
         live!("maxconnections", maxconnections, |c, h| {
