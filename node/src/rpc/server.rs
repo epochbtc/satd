@@ -1849,8 +1849,12 @@ pub async fn start(
                     ));
                 }
             }
-            Err(crate::mempool::pool::MempoolError::AlreadyExists) => {
-                // Already in mempool — we'll re-announce below.
+            Err(
+                crate::mempool::pool::MempoolError::AlreadyExists
+                | crate::mempool::pool::MempoolError::SameNonWitnessData,
+            ) => {
+                // Already in mempool, or the same txid with another witness
+                // is — we'll re-announce the resident one below.
             }
             Err(_) => {
                 // The pre-flight exists only to price the transaction for

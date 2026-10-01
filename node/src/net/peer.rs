@@ -249,6 +249,11 @@ pub struct PeerInfo {
     pub sent_sendheaders: bool,
     /// Peer signaled BIP 155 addrv2 support via SendAddrV2.
     pub wants_addrv2: bool,
+    /// BIP 339 wtxid relay was negotiated: the peer sent `wtxidrelay` between
+    /// `version` and `verack` at a common protocol version of at least 70016.
+    /// Transactions are announced to it as `MSG_WTX` carrying the wtxid, and
+    /// its `MSG_TX` announcements are ignored. Core's `Peer::m_wtxid_relay`.
+    pub wtxid_relay: bool,
     /// Whether address relay is set up on this link — Core's
     /// `Peer::m_addr_relay_enabled`, latched by `SetupAddressRelay`.
     ///
@@ -318,6 +323,7 @@ impl PeerInfo {
             prefers_headers: false,
             sent_sendheaders: false,
             wants_addrv2: false,
+            wtxid_relay: false,
             addr_relay_enabled: false,
             fee_filter: 0,
             conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),

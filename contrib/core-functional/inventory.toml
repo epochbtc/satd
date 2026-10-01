@@ -406,9 +406,7 @@ note = "measured 2026-09-15: L287 getrawtransaction of a confirmed coinbase with
 
 [[test]]
 file = "mempool_accept_wtxid.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: getmempoolentry.wtxid landed; the test then waits at L55 for a MSG_WTX announcement of the submitted transaction, and satd announces by txid. Follow-up: BIP 339 wtxid relay (#714)"
+status = "run"
 
 [[test]]
 file = "mempool_cluster.py"
@@ -576,7 +574,7 @@ note = "measured 2026-09-16: the L60 999-block sync now completes; the test runs
 file = "p2p_blocksonly.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: the -blocksonly violation disconnects landed; L46 then waits for a getdata by wtxid, and satd announces the RPC transaction by txid. Follow-up: BIP 339 wtxid relay (#714)"
+note = "measured 2026-10-01: wtxid relay landed (#714) and the getdata by wtxid at L46 arrives; L58 then wants relay=1 in the version sent to a peer with the relay permission under -blocksonly, where satd sends 0. Core's PushNodeVersion sets fRelay for any peer it takes transactions from. Follow-up: fRelay honours the relay permission"
 
 [[test]]
 file = "p2p_compactblocks.py"
@@ -610,9 +608,7 @@ note = "measured 2026-09-15: L119 no inbound peer is evicted (0 != 1); satd has 
 
 [[test]]
 file = "p2p_feefilter.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: the feefilter send rules landed; L87 then waits for inventory announced by wtxid, and satd announces by txid. Follow-up: BIP 339 wtxid relay (#714)"
+status = "run"
 
 [[test]]
 file = "p2p_filter.py"
@@ -667,7 +663,7 @@ note = "measured 2026-09-15: L86 sum(inflight) never equals the stalled block co
 file = "p2p_ibd_txrelay.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: the IBD feefilter and the received-message log line landed; L96 then waits for a getdata answering a MSG_WTX inv, which satd ignores. Follow-up: BIP 339 wtxid relay (#714)"
+note = "measured 2026-10-01: wtxid relay landed (#714), so a MSG_WTX inv is now fetched -- and L67 it is fetched while the only block is two days old. Core's IsInitialBlockDownload goes by tip age; satd's transaction relay leaves IBD once its tip is within 24 blocks of the best header. Follow-up: transaction relay gated on the chainstate's IBD state"
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
@@ -701,13 +697,13 @@ note = "measured 2026-09-15: the reject line is Core's (<txid> (wtxid=...) from 
 file = "p2p_leak.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L150 no wtxidrelay during the handshake; satd has no BIP 339 wtxid relay. Follow-up: #714"
+note = "measured 2026-10-01: wtxidrelay and sendaddrv2 now go only to a peer at 70016 or above (#714); L177 a peer at version 31799 is not disconnected, as satd has no minimum peer version. Follow-up: Core's MIN_PEER_PROTO_VERSION and its 'using obsolete version' line"
 
 [[test]]
 file = "p2p_leak_tx.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: getrawmempool mempool_sequence landed; L47 then reads getpeerinfo.last_inv_sequence, Core's announce-gated relay bookkeeping. Follow-up: announce-gated getdata (#714 / W19)"
+note = "measured 2026-10-01, unchanged by wtxid relay (#714): L47 reads getpeerinfo.last_inv_sequence, Core's announce-gated relay bookkeeping. Follow-up: announce-gated getdata (W19)"
 
 [[test]]
 file = "p2p_message_capture.py"
@@ -785,7 +781,7 @@ note = "measured 2026-09-15: L33 assert_debug_log 'Empty addrman, adding seednod
 file = "p2p_segwit.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-16 with message ordering behind ping in place: past L321 and now failing at L508 test_v0_outputs_arent_spendable, where a block spending a v0 witness output without its witness must be rejected. Follow-up: witness-aware getdata and stripped blocks, then #714"
+note = "measured 2026-09-16 with message ordering behind ping in place: past L321 and now failing at L508 test_v0_outputs_arent_spendable, where a block spending a v0 witness output without its witness must be rejected. Follow-up: witness-aware getdata and stripped blocks"
 
 [[test]]
 file = "p2p_sendheaders.py"
@@ -807,13 +803,11 @@ status = "run"
 file = "p2p_tx_download.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L171 no getdata after a MSG_WTX inv; satd has no wtxid relay or Core's tx download scheduling. Follow-up: #714"
+note = "measured 2026-10-01: a MSG_WTX inv is fetched by wtxid (#714); L171 two peers announcing the same wtxid are both sent a getdata, where Core's TxRequestTracker asks one and falls back to the other on expiry. Follow-up: Core's tx download scheduling"
 
 [[test]]
 file = "p2p_tx_privacy.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L48 the spy peer never sees a MSG_WTX inv; satd announces by txid. Follow-up: #714"
+status = "run"
 
 [[test]]
 file = "p2p_unrequested_blocks.py"
@@ -956,7 +950,7 @@ note = "measured 2026-09-15: L52 getorphantxs is Method not found. Follow-up: ge
 file = "rpc_packages.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L546 waits for four wtxid announcements; satd announces by txid. Follow-up: #714"
+note = "measured 2026-10-01: the four wtxid announcements at L546 arrive (#714); L111 testmempoolaccept of independent transactions plus one with missing inputs validates the others in full, where Core stops at the missing input and returns only their txid and wtxid. Follow-up: package validation stops at the first missing input"
 
 [[test]]
 file = "rpc_preciousblock.py"

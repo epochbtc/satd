@@ -177,6 +177,9 @@ const PROTOCOL_VERSION: u32 = 70016;
 /// BIP 130's `sendheaders` is only sent to a peer whose common version with
 /// us reaches this (Core's `SENDHEADERS_VERSION`).
 const SENDHEADERS_VERSION: u32 = 70012;
+/// BIP 339's `wtxidrelay` is sent to, and honoured from, a peer whose common
+/// version with us reaches this (Core's `WTXID_RELAY_VERSION`).
+const WTXID_RELAY_VERSION: u32 = 70016;
 /// Most tip-following block requests recorded per peer. The records exist to
 /// answer "did we ask this peer for this block?", and a peer can make us
 /// record one per hash it announces: an `inv` may carry
@@ -373,6 +376,16 @@ fn log_received(id: PeerId, msg: &NetworkMessage) {
     let raw = bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone());
     let payload = bitcoin::consensus::serialize(&raw).len().saturating_sub(24);
     tracing::debug!("received: {cmd} ({payload} bytes) peer={id}");
+}
+
+/// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
+/// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
+fn tx_announcement(wtxid_relay: bool, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid) -> Inventory {
+    if wtxid_relay {
+        Inventory::WTx(wtxid)
+    } else {
+        Inventory::WitnessTransaction(txid)
+    }
 }
 
 /// Core's `CInv::ToString`: the inventory type's name and the hash.
@@ -4373,6 +4386,14 @@ impl PeerManager {
                     tracing::debug!(id, "Peer supports addrv2");
                 }
             }
+            // BIP 339 negotiates wtxid relay between version and verack
+            // (`perform_handshake`), so the two ends never disagree on how a
+            // transaction is announced. Core disconnects a peer that sends
+            // `wtxidrelay` after its verack.
+            NetworkMessage::WtxidRelay => {
+                tracing::debug!("wtxidrelay received after verack, disconnecting peer={id}");
+                self.disconnect_by_id(id);
+            }
             NetworkMessage::NotFound(inventory) => {
                 // Authoritative "I don't have this" from the peer. Until
                 // this commit we logged at debug and did nothing, so the
@@ -4469,7 +4490,8 @@ impl PeerManager {
     /// *disconnects* such peers unless they have `noban` — satd is
     /// deliberately softer to stay friendly to clients that probe. We
     /// respond, honoring the peer's fee filter, with `inv` message(s) of
-    /// witness-tx inventory, batched to [`MAX_INV_PER_MSG`]; the peer then
+    /// transaction inventory (by wtxid to a BIP 339 peer, by txid to the
+    /// rest), batched to [`MAX_INV_PER_MSG`]; the peer then
     /// `getdata`s the ones it wants. Dumps to one peer are spaced at least
     /// [`MEMPOOL_REQUEST_COOLDOWN_SECS`] apart — each costs a full mempool
     /// scan and up to multi-MB of queued invs, and the permission grant is
@@ -4494,7 +4516,7 @@ impl PeerManager {
         // and is past the per-peer cooldown. The cooldown stamp is taken
         // under the same write lock that reads it, so concurrent requests
         // can't double-serve.
-        let fee_filter = {
+        let (fee_filter, wtxid_relay) = {
             let mut peers = self.peers.write();
             match peers.get_mut(&id) {
                 Some(h) if h.info.state == PeerState::Connected && h.info.relays_txs() => {
@@ -4506,20 +4528,20 @@ impl PeerManager {
                         return;
                     }
                     h.last_mempool_served = Some(now);
-                    h.info.fee_filter
+                    (h.info.fee_filter, h.info.wtxid_relay)
                 }
                 _ => return,
             }
         };
-        let txids = self.mempool.txids_above_feerate(fee_filter);
-        if txids.is_empty() {
+        let ids = self.mempool.relay_ids_above_feerate(fee_filter);
+        if ids.is_empty() {
             return;
         }
-        tracing::debug!(id, count = txids.len(), "serving BIP35 mempool request");
-        for chunk in txids.chunks(MAX_INV_PER_MSG) {
+        tracing::debug!(id, count = ids.len(), "serving BIP35 mempool request");
+        for chunk in ids.chunks(MAX_INV_PER_MSG) {
             let inv = chunk
                 .iter()
-                .map(|txid| Inventory::WitnessTransaction(*txid))
+                .map(|(txid, wtxid)| tx_announcement(wtxid_relay, *txid, *wtxid))
                 .collect::<Vec<_>>();
             if !self.send_to_peer(id, NetworkMessage::Inv(inv)) {
                 // Channel full — the peer isn't draining its queue; the rest
@@ -4535,8 +4557,22 @@ impl PeerManager {
         let mut blocks_to_get = Vec::new();
         let mut txs_to_get = Vec::new();
         let reject_tx_invs = self.rejects_incoming_txs(id);
+        let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
 
         for inv in inventory {
+            // BIP 339: a peer that negotiated wtxid relay announces by wtxid,
+            // and one that did not announces by txid. Core skips an `inv` of
+            // the other kind before looking at it any further, so it is not
+            // a protocol violation either. Only `MSG_TX` is skipped on a
+            // wtxid link, as in Core: `MSG_WITNESS_TX` is a getdata type.
+            let mismatched = if wtxid_relay {
+                matches!(inv, Inventory::Transaction(_))
+            } else {
+                matches!(inv, Inventory::WTx(_))
+            };
+            if mismatched {
+                continue;
+            }
             if reject_tx_invs {
                 let tx_hash = match &inv {
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
@@ -4576,7 +4612,16 @@ impl PeerManager {
                     } else if !self.is_ibd() && !self.blocksonly() {
                         // Don't request transactions during IBD — we can't
                         // validate them — nor under -blocksonly (no tx relay).
-                        txs_to_get.push(txid);
+                        txs_to_get.push(Inventory::WitnessTransaction(txid));
+                    }
+                }
+                // Fetched as announced, by wtxid: a resident transaction with
+                // the same txid and another witness is not the one offered.
+                Inventory::WTx(wtxid) => {
+                    if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
+                        self.note_broadcast_witness(id, txid);
+                    } else if !self.is_ibd() && !self.blocksonly() {
+                        txs_to_get.push(Inventory::WTx(wtxid));
                     }
                 }
                 _ => {}
@@ -4598,7 +4643,7 @@ impl PeerManager {
             self.maybe_send_getheaders(id);
         }
         if !txs_to_get.is_empty() {
-            self.send_to_peer(id, sync::make_getdata_txs(&txs_to_get));
+            self.send_to_peer(id, NetworkMessage::GetData(txs_to_get));
         }
     }
 
@@ -6892,6 +6937,7 @@ impl PeerManager {
             // Everything else is local policy / standardness / resource limits /
             // RBF / duplicates — not misbehavior.
             MempoolError::AlreadyExists
+            | MempoolError::SameNonWitnessData
             | MempoolError::ConflictingSpend
             | MempoolError::MissingInputs
             | MempoolError::InsufficientFee(..)
@@ -7137,22 +7183,37 @@ impl PeerManager {
     }
 
     /// Relay a newly-admitted tx to other peers whose fee filter allows it.
+    /// Relay-quarantined txs are never INV'd: the node declines to gossip
+    /// them (design §2.4/§6.1).
     fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
+        self.announce_to_peers(txid, Some(from));
+    }
+
+    /// `inv` `txid` to every connected, tx-relaying peer whose fee filter it
+    /// clears, other than `skip`: by wtxid to a peer that negotiated BIP 339
+    /// wtxid relay, by txid to the rest. Nothing goes out while the tx is
+    /// relay-quarantined.
+    fn announce_to_peers(&self, txid: bitcoin::Txid, skip: Option<PeerId>) {
         let entry = self.mempool.get(&txid);
-        // Relay-quarantined: the node declines to gossip this tx (design
-        // §2.4/§6.1), so it is never INV'd to peers.
         if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
             return;
         }
-        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
-        let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+        let entry_fee_rate = entry.as_ref().map_or(0, |e| e.fee_rate);
+        let by_txid = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
+        // A tx that has already left the mempool has no wtxid to give, and
+        // a `getdata` for it would only be answered `notfound`.
+        let by_wtxid = entry.map(|e| NetworkMessage::Inv(vec![Inventory::WTx(e.tx.compute_wtxid())]));
         let peers = self.peers.read();
         for (peer_id, handle) in peers.iter() {
-            if *peer_id != from
-                && handle.info.state == PeerState::Connected
-                && handle.info.relays_txs()
-                && entry_fee_rate >= handle.info.fee_filter
+            if Some(*peer_id) == skip
+                || handle.info.state != PeerState::Connected
+                || !handle.info.relays_txs()
+                || entry_fee_rate < handle.info.fee_filter
             {
+                continue;
+            }
+            let inv = if handle.info.wtxid_relay { by_wtxid.as_ref() } else { Some(&by_txid) };
+            if let Some(inv) = inv {
                 let _ = handle.msg_tx.try_send(inv.clone());
             }
         }
@@ -7169,26 +7230,13 @@ impl PeerManager {
     /// fee filter the tx clears. It is called synchronously from the RPC
     /// handler (not via the lossy mempool event broadcast) so a
     /// successful `sendrawtransaction` reliably reaches the wire.
+    ///
+    /// Relay-quarantined txs are withheld from the wire even on the
+    /// local-origin path. A relay-scoped local submission is normally refused
+    /// outright (design §6.1), but with an `allowquarantined` override the tx
+    /// is admitted to the quarantine class and must still not be announced.
     pub fn announce_tx(&self, txid: bitcoin::Txid) {
-        let entry = self.mempool.get(&txid);
-        // Relay-quarantined: withheld from the wire even on the local-origin
-        // path. A relay-scoped local submission is normally refused outright
-        // (design §6.1), but with an `allowquarantined` override the tx is
-        // admitted to the quarantine class and must still not be announced.
-        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
-            return;
-        }
-        let entry_fee_rate = entry.map(|e| e.fee_rate).unwrap_or(0);
-        let inv = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
-        let peers = self.peers.read();
-        for handle in peers.values() {
-            if handle.info.state == PeerState::Connected
-                && handle.info.relays_txs()
-                && entry_fee_rate >= handle.info.fee_filter
-            {
-                let _ = handle.msg_tx.try_send(inv.clone());
-            }
-        }
+        self.announce_to_peers(txid, None);
     }
 
     /// Broadcast a locally-originated transaction: decode it, accept it
@@ -7259,7 +7307,10 @@ impl PeerManager {
             allow_quarantined,
         ) {
             Ok(txid) => txid,
-            Err(MempoolError::AlreadyExists) => resubmit_txid,
+            // The same txid with another witness counts too: Core's
+            // `BroadcastTransaction` re-announces whichever witness the pool
+            // holds, and `announce_tx` reads the wtxid from the pool.
+            Err(MempoolError::AlreadyExists | MempoolError::SameNonWitnessData) => resubmit_txid,
             Err(e) => return Err(e),
         };
         // Mark on the resubmit path too — Core's BroadcastTransaction
@@ -7319,7 +7370,7 @@ impl PeerManager {
         if self.is_actively_syncing() {
             return;
         }
-        // (txid, fee_rate) pairs are snapshotted BEFORE taking the peers
+        // (txid, wtxid, fee_rate) triples are snapshotted BEFORE taking the peers
         // lock: `mempool.get` can block behind a long `accept_transaction`
         // write hold (script verification), and stalling every P2P router
         // behind that while holding `peers.read()` would be self-inflicted.
@@ -7335,8 +7386,8 @@ impl PeerManager {
             }
             let invs: Vec<Inventory> = pairs
                 .iter()
-                .filter(|(_, fee_rate)| *fee_rate >= handle.info.fee_filter)
-                .map(|(txid, _)| Inventory::WitnessTransaction(*txid))
+                .filter(|(_, _, fee_rate)| *fee_rate >= handle.info.fee_filter)
+                .map(|(txid, wtxid, _)| tx_announcement(handle.info.wtxid_relay, *txid, *wtxid))
                 .collect();
             for chunk in invs.chunks(MAX_INV_PER_MSG) {
                 let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
@@ -7413,8 +7464,8 @@ impl PeerManager {
         }
         let invs: Vec<Inventory> = pairs
             .iter()
-            .filter(|(_, fee_rate)| *fee_rate >= handle.info.fee_filter)
-            .map(|(txid, _)| Inventory::WitnessTransaction(*txid))
+            .filter(|(_, _, fee_rate)| *fee_rate >= handle.info.fee_filter)
+            .map(|(txid, wtxid, _)| tx_announcement(handle.info.wtxid_relay, *txid, *wtxid))
             .collect();
         for chunk in invs.chunks(MAX_INV_PER_MSG) {
             let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
@@ -7895,6 +7946,22 @@ impl PeerManager {
                         // peer never received it, and retiring the tx on a
                         // dropped send would defeat the exact failure mode
                         // rebroadcast exists to cover.
+                        if self.send_to_peer(id, NetworkMessage::Tx(entry.tx)) {
+                            self.note_broadcast_witness(id, txid);
+                        }
+                    } else {
+                        not_found.push(inv);
+                    }
+                }
+                // BIP 339: the same, looked up by wtxid. A resident
+                // transaction with the same txid and another witness is not
+                // the one asked for, so the answer is `notfound`.
+                Inventory::WTx(wtxid) => {
+                    if let Some((txid, entry)) = self
+                        .mempool
+                        .get_by_wtxid(&wtxid)
+                        .filter(|(_, e)| e.scope.assists_relay())
+                    {
                         if self.send_to_peer(id, NetworkMessage::Tx(entry.tx)) {
                             self.note_broadcast_witness(id, txid);
                         }
@@ -9930,15 +9997,14 @@ impl PeerManager {
         // flag here, or we'd silently drop it and never send addrv2 (incl. our
         // onion) to a peer that supports it.
         let mut peer_wants_addrv2 = false;
+        // BIP 339: likewise `wtxidrelay`, which asks for transactions to be
+        // announced by wtxid. It counts only between version and verack.
+        let mut peer_wtxid_relay = false;
 
         if direction == Direction::Outbound {
             conn.send(NetworkMessage::Version(our_version.clone()))
                 .await
                 .map_err(|e| format!("send version: {}", e))?;
-            // BIP 155: signal addrv2 support after Version, before Verack
-            conn.send(NetworkMessage::SendAddrV2)
-                .await
-                .map_err(|e| format!("send sendaddrv2: {}", e))?;
         }
 
         // Core's `ProcessMessage` before `version`: anything else is ignored
@@ -9979,6 +10045,15 @@ impl PeerManager {
             return Err("peer lacks the expected services".to_string());
         }
 
+        // The feature negotiation messages go out between the peer's version
+        // and our verack, and only at a common version of at least 70016, as
+        // Core sends them. BIP 339 negotiates on that version, so the peer's
+        // `wtxidrelay` counts only there too. BIP 155 is defined for every
+        // version, but Core withholds `sendaddrv2` below it as a courtesy to
+        // software that rejects messages it does not know.
+        let common_version = their_version.version.min(PROTOCOL_VERSION);
+        let wtxid_relay_version = common_version >= WTXID_RELAY_VERSION;
+
         match direction {
             Direction::Outbound => {
                 // A feeler exists to answer one question -- is anything still
@@ -9998,6 +10073,7 @@ impl PeerManager {
                     self.peers.write().remove(&id);
                     return Err("feeler connection: closing after version".to_string());
                 }
+                self.send_feature_negotiation(conn, wtxid_relay_version).await?;
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
@@ -10006,10 +10082,7 @@ impl PeerManager {
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
-                // BIP 155: signal addrv2 support after Version, before Verack
-                conn.send(NetworkMessage::SendAddrV2)
-                    .await
-                    .map_err(|e| format!("send sendaddrv2: {}", e))?;
+                self.send_feature_negotiation(conn, wtxid_relay_version).await?;
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
@@ -10022,7 +10095,14 @@ impl PeerManager {
             match self.recv_handshake(id, conn, connected_at).await? {
                 NetworkMessage::Verack => break,
                 NetworkMessage::SendAddrV2 => peer_wants_addrv2 = true,
-                NetworkMessage::WtxidRelay => {}
+                // Core's `WTXIDRELAY` handler, with its log lines.
+                NetworkMessage::WtxidRelay if !wtxid_relay_version => tracing::debug!(
+                    "ignoring wtxidrelay due to old common version={common_version} from peer={id}"
+                ),
+                NetworkMessage::WtxidRelay if peer_wtxid_relay => {
+                    tracing::debug!("ignoring duplicate wtxidrelay from peer={id}")
+                }
+                NetworkMessage::WtxidRelay => peer_wtxid_relay = true,
                 NetworkMessage::Unknown { command, .. } if command.as_ref() == "sendtxrcncl" => {}
                 other => tracing::debug!(
                     "Unsupported message \"{}\" prior to verack from peer={id}",
@@ -10055,8 +10135,29 @@ impl PeerManager {
         {
             handle.info.wants_addrv2 = true;
         }
+        // Set before the peer is marked connected, so it is never announced a
+        // transaction by txid once it has asked for wtxids.
+        if peer_wtxid_relay
+            && let Some(handle) = self.peers.write().get_mut(&id)
+        {
+            handle.info.wtxid_relay = true;
+        }
 
         Ok(their_version)
+    }
+
+    /// `wtxidrelay` (BIP 339) then `sendaddrv2` (BIP 155), Core's order, when
+    /// the common version reaches 70016; nothing below it.
+    async fn send_feature_negotiation(&self, conn: &mut Connection, at_70016: bool) -> Result<(), String> {
+        if !at_70016 {
+            return Ok(());
+        }
+        conn.send(NetworkMessage::WtxidRelay)
+            .await
+            .map_err(|e| format!("send wtxidrelay: {}", e))?;
+        conn.send(NetworkMessage::SendAddrV2)
+            .await
+            .map_err(|e| format!("send sendaddrv2: {}", e))
     }
 
     /// Disconnect any `addr-fetch` peer that has been connected longer than
@@ -12765,6 +12866,33 @@ mod tests {
         }
     }
 
+    /// Resubmitting the same txid with another witness succeeds too, and
+    /// re-announces the witness the pool holds, as Core's
+    /// `BroadcastTransaction` does: a wtxid relay peer is offered the
+    /// resident wtxid, never the submitted one, which the node cannot serve.
+    #[test]
+    fn a_resubmit_with_another_witness_reannounces_the_resident_one() {
+        use bitcoin::hashes::Hash;
+        let (pm, _dir) = mk_test_pm();
+        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.wtxid_relay = true;
+        pm.peers.write().insert(1, h1);
+
+        let mut resident = witness_tx(4, 0xaa);
+        resident.output[0].script_pubkey =
+            bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x42u8; 20]));
+        let mut other = resident.clone();
+        other.input[0].witness = bitcoin::Witness::from_slice(&[vec![0xbbu8]]);
+        let txid = resident.compute_txid();
+        assert_eq!(other.compute_txid(), txid, "fixture: same txid");
+        pm.mempool.insert_entry_for_test(txid, resident.clone(), 0);
+
+        let result = pm.submit_and_announce(other, crate::mempool::pool::TxSource::Rpc, false);
+        assert_eq!(result.ok(), Some(txid), "a resubmit with another witness must succeed");
+        expect_inv(&mut rx1, &[Inventory::WTx(resident.compute_wtxid())], "the resident witness");
+        assert!(pm.mempool.is_unbroadcast(&txid), "and it is rebroadcast like any resubmit");
+    }
+
     /// Minimal regtest `PeerManager` for the rebroadcast / echo tests.
     fn mk_test_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
         use crate::chain::state::AssumeValid;
@@ -13080,6 +13208,304 @@ mod tests {
             rx.try_recv().is_err(),
             "an immediate second request falls inside the cooldown and is ignored"
         );
+    }
+
+    /// A transaction with a witness, so its wtxid is not its txid. Two calls
+    /// that differ only in `witness_byte` give the same txid.
+    fn witness_tx(seed: u8, witness_byte: u8) -> bitcoin::Transaction {
+        use bitcoin::hashes::Hash;
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([seed; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::from_slice(&[vec![witness_byte]]),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new_op_return([seed]),
+            }],
+        }
+    }
+
+    fn expect_inv(rx: &mut mpsc::Receiver<NetworkMessage>, want: &[Inventory], path: &str) {
+        match rx.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => assert_eq!(inv, want, "{path}"),
+            other => panic!("{path}: expected an inv, got {other:?}"),
+        }
+    }
+
+    fn expect_getdata(rx: &mut mpsc::Receiver<NetworkMessage>, want: &[Inventory], what: &str) {
+        match rx.try_recv() {
+            Ok(NetworkMessage::GetData(inv)) => assert_eq!(inv, want, "{what}"),
+            other => panic!("{what}: expected a getdata, got {other:?}"),
+        }
+    }
+
+    /// BIP 339: every path that announces a transaction gives a peer that
+    /// negotiated wtxid relay `MSG_WTX` with the wtxid, and every other peer
+    /// the txid -- peer relay, a local broadcast, the rebroadcast pass, the
+    /// on-connect announcement and a BIP 35 `mempool` reply.
+    #[test]
+    fn every_announcement_is_by_wtxid_to_a_wtxid_relay_peer_and_by_txid_to_the_rest() {
+        let (pm, _dir) = mk_test_pm();
+        pm.set_rebroadcast_config(0, 99);
+        let tx = witness_tx(1, 0xaa);
+        let txid = pm
+            .mempool
+            .insert_tx_scoped_for_test(tx.clone(), crate::mempool::pool::QuarantineScope::acting());
+        let by_wtxid = [Inventory::WTx(tx.compute_wtxid())];
+        let by_txid = [Inventory::WitnessTransaction(txid)];
+
+        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.wtxid_relay = true;
+        h1.info.permissions.mempool = true;
+        let (mut h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        h2.info.permissions.mempool = true;
+        {
+            let mut peers = pm.peers.write();
+            peers.insert(1, h1);
+            peers.insert(2, h2);
+        }
+
+        pm.announce_tx(txid);
+        expect_inv(&mut rx1, &by_wtxid, "local broadcast to the wtxid relay peer");
+        expect_inv(&mut rx2, &by_txid, "local broadcast to the other peer");
+
+        pm.broadcast_inv(99, txid);
+        expect_inv(&mut rx1, &by_wtxid, "peer relay to the wtxid relay peer");
+        expect_inv(&mut rx2, &by_txid, "peer relay to the other peer");
+
+        pm.mempool.mark_unbroadcast(txid);
+        pm.rebroadcast_unbroadcast_txs();
+        expect_inv(&mut rx1, &by_wtxid, "rebroadcast to the wtxid relay peer");
+        expect_inv(&mut rx2, &by_txid, "rebroadcast to the other peer");
+
+        pm.announce_unbroadcast_to_peer(1);
+        expect_inv(&mut rx1, &by_wtxid, "on-connect announcement to the wtxid relay peer");
+        pm.announce_unbroadcast_to_peer(2);
+        expect_inv(&mut rx2, &by_txid, "on-connect announcement to the other peer");
+
+        pm.handle_mempool_request(1);
+        expect_inv(&mut rx1, &by_wtxid, "mempool reply to the wtxid relay peer");
+        pm.handle_mempool_request(2);
+        expect_inv(&mut rx2, &by_txid, "mempool reply to the other peer");
+
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err(), "one announcement per path");
+    }
+
+    /// BIP 339: a `getdata` for `MSG_WTX` is served by wtxid. The same txid
+    /// with another witness is not what was asked for, nor is a txid read as
+    /// a wtxid, and a relay-quarantined tx is not served at all. Serving a
+    /// pending local tx counts as propagation, as a fetch by txid does.
+    #[test]
+    fn a_getdata_by_wtxid_serves_exactly_that_transaction() {
+        use crate::mempool::pool::QuarantineScope;
+        let (pm, _dir) = mk_test_pm();
+        pm.set_rebroadcast_config(0, 1);
+        let tx = witness_tx(1, 0xaa);
+        let txid = pm.mempool.insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
+        pm.mempool.mark_unbroadcast(txid);
+        let quarantined = witness_tx(2, 0xaa);
+        pm.mempool
+            .insert_tx_scoped_for_test(quarantined.clone(), QuarantineScope { relay: true, template: false });
+
+        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.wtxid_relay = true;
+        pm.peers.write().insert(1, h1);
+
+        pm.handle_getdata(1, vec![Inventory::WTx(tx.compute_wtxid())]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::Tx(served)) => assert_eq!(served.compute_wtxid(), tx.compute_wtxid()),
+            other => panic!("a getdata by wtxid must be served the tx, got {other:?}"),
+        }
+        assert!(
+            !pm.mempool.is_unbroadcast(&txid),
+            "a peer fetching the local tx by wtxid is a propagation witness"
+        );
+
+        let other_witness = Inventory::WTx(witness_tx(1, 0xbb).compute_wtxid());
+        let txid_as_wtxid = Inventory::WTx(bitcoin::Wtxid::from_raw_hash(txid.to_raw_hash()));
+        let withheld = Inventory::WTx(quarantined.compute_wtxid());
+        pm.handle_getdata(1, vec![other_witness, txid_as_wtxid, withheld]);
+        match rx1.try_recv() {
+            Ok(NetworkMessage::NotFound(inv)) => {
+                assert_eq!(inv, vec![other_witness, txid_as_wtxid, withheld]);
+            }
+            other => panic!("none of these is servable, got {other:?}"),
+        }
+        assert!(rx1.try_recv().is_err());
+    }
+
+    /// BIP 339 on the receive side, as Core's `INV` handler takes it. On a
+    /// wtxid relay link `MSG_WTX` is fetched by wtxid and `MSG_TX` ignored;
+    /// on any other link `MSG_WTX` is ignored. The ignored kind is dropped
+    /// before the blocks-only check, so it costs a block-relay-only peer
+    /// nothing, and a `MSG_WTX` for a resident tx is a propagation witness
+    /// rather than a fetch.
+    #[test]
+    fn an_inv_is_taken_only_in_the_form_the_link_negotiated() {
+        use crate::mempool::pool::QuarantineScope;
+        let (pm, _dir) = mk_test_pm();
+        let tip = pm.chain_state.tip_hash();
+        let block =
+            crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+        pm.chain_state.accept_block(&block).expect("block connects");
+        assert!(!pm.is_ibd(), "no transaction is fetched in IBD, and this would prove nothing");
+        pm.set_rebroadcast_config(0, 1);
+
+        let resident = witness_tx(1, 0xaa);
+        let resident_txid = pm.mempool.insert_tx_scoped_for_test(resident.clone(), QuarantineScope::acting());
+        pm.mempool.mark_unbroadcast(resident_txid);
+        let new = witness_tx(2, 0xaa);
+        let (new_txid, new_wtxid) = (new.compute_txid(), new.compute_wtxid());
+
+        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.wtxid_relay = true;
+        let (h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h3, mut rx3) = mk_handle_rx(3, "10.0.0.3:8333".parse().unwrap(), PeerState::Connected, 0);
+        h3.info.conn_type = ConnType::BlockRelay;
+        let (mut h4, _rx4) = mk_handle_rx(4, "10.0.0.4:8333".parse().unwrap(), PeerState::Connected, 0);
+        h4.info.conn_type = ConnType::BlockRelay;
+        h4.info.wtxid_relay = true;
+        {
+            let mut peers = pm.peers.write();
+            peers.insert(1, h1);
+            peers.insert(2, h2);
+            peers.insert(3, h3);
+            peers.insert(4, h4);
+        }
+
+        pm.handle_inv(1, vec![Inventory::Transaction(new_txid), Inventory::WTx(new_wtxid)]);
+        expect_getdata(&mut rx1, &[Inventory::WTx(new_wtxid)], "a wtxid relay peer's MSG_WTX, not its MSG_TX");
+        // Core skips only `MSG_TX` on a wtxid link; `MSG_WITNESS_TX` is a
+        // getdata type that nothing announces, and passes.
+        pm.handle_inv(1, vec![Inventory::WitnessTransaction(new_txid)]);
+        expect_getdata(&mut rx1, &[Inventory::WitnessTransaction(new_txid)], "MSG_WITNESS_TX");
+
+        pm.handle_inv(2, vec![Inventory::WTx(new_wtxid), Inventory::Transaction(new_txid)]);
+        expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(new_txid)], "the other peer's MSG_TX only");
+
+        pm.handle_inv(3, vec![Inventory::WTx(new_wtxid)]);
+        assert!(rx3.try_recv().is_err());
+        assert!(
+            pm.peers.read().contains_key(&3),
+            "a MSG_WTX the link did not negotiate is ignored, not a protocol violation"
+        );
+        pm.handle_inv(4, vec![Inventory::WTx(new_wtxid)]);
+        assert!(
+            !pm.peers.read().contains_key(&4),
+            "a negotiated tx inv on a block-relay-only link is a protocol violation"
+        );
+
+        pm.handle_inv(1, vec![Inventory::WTx(resident.compute_wtxid())]);
+        assert!(rx1.try_recv().is_err(), "a resident tx is not fetched again");
+        assert!(
+            !pm.mempool.is_unbroadcast(&resident_txid),
+            "a wtxid relay peer announcing the local tx back is a propagation witness"
+        );
+    }
+
+    /// Core disconnects a peer that sends `wtxidrelay` after its verack: the
+    /// two ends would otherwise disagree on how transactions are announced.
+    #[test]
+    fn a_wtxidrelay_after_verack_disconnects() {
+        let (pm, _dir) = mk_test_pm();
+        let (h1, _rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        pm.handle_message(1, NetworkMessage::WtxidRelay, crate::net::flow::InFlight::new(None));
+        assert!(!pm.peers.read().contains_key(&1));
+    }
+
+    /// BIP 339's negotiation over a real socket, with satd on either end.
+    /// `wtxidrelay` and `sendaddrv2` go out after the peer's version and
+    /// before satd's verack when the common version reaches 70016, and not
+    /// below, as Core sends them; the peer's `wtxidrelay` is honoured on the
+    /// same condition, and only before its verack.
+    #[tokio::test]
+    async fn wtxid_relay_is_negotiated_between_version_and_verack() {
+        use crate::net::connection::Connection;
+        use bitcoin::p2p::{Address, Magic};
+
+        async fn remote_side(
+            conn: &mut Connection,
+            version: u32,
+            send_wtxidrelay: bool,
+        ) -> Vec<&'static str> {
+            let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+            let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            conn.send(NetworkMessage::Version(VersionMessage {
+                version,
+                services,
+                timestamp: crate::time::now_secs() as i64,
+                receiver: Address::new(&zero, ServiceFlags::NONE),
+                sender: Address::new(&zero, services),
+                nonce: 0x5eed,
+                user_agent: "/wtxid-test/".into(),
+                start_height: 0,
+                relay: true,
+            }))
+            .await
+            .unwrap();
+            let mut seen = Vec::new();
+            loop {
+                let msg = conn.recv().await.unwrap();
+                seen.push(msg.cmd());
+                if matches!(msg, NetworkMessage::Verack) {
+                    break;
+                }
+            }
+            if send_wtxidrelay {
+                conn.send(NetworkMessage::WtxidRelay).await.unwrap();
+            }
+            conn.send(NetworkMessage::Verack).await.unwrap();
+            seen
+        }
+
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            for (version, send_wtxidrelay, negotiated) in
+                [(70016, true, true), (70016, false, false), (70015, true, false)]
+            {
+                let case = format!("{direction:?}, peer at {version}, peer sends wtxidrelay: {send_wtxidrelay}");
+                let (pm, _dir) = mk_test_pm();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dialer = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+                let (dialed, accepted) = tokio::join!(dialer, listener.accept());
+                let (dialed, (accepted, peer_addr)) = (dialed.unwrap(), accepted.unwrap());
+                let (ours, theirs) = match direction {
+                    Direction::Inbound => (accepted, dialed),
+                    Direction::Outbound => (dialed, accepted),
+                };
+                pm.peers.write().insert(1, mk_handle(1, peer_addr, direction, PeerState::Connecting));
+                let mut ours = Connection::with_magic(ours, Magic::REGTEST);
+                let mut theirs = Connection::with_magic(theirs, Magic::REGTEST);
+
+                let (handshake, seen) = tokio::join!(
+                    pm.perform_handshake(1, &mut ours, direction, crate::time::now_secs()),
+                    remote_side(&mut theirs, version, send_wtxidrelay),
+                );
+                handshake.unwrap_or_else(|e| panic!("{case}: handshake failed: {e}"));
+
+                let version_at = seen.iter().position(|c| *c == "version").expect("satd sent version");
+                for negotiation in ["wtxidrelay", "sendaddrv2"] {
+                    let at = seen.iter().position(|c| *c == negotiation);
+                    if version >= WTXID_RELAY_VERSION {
+                        assert!(
+                            at.is_some_and(|at| at > version_at),
+                            "{case}: satd must send {negotiation} between its version and verack, sent {seen:?}"
+                        );
+                    } else {
+                        assert_eq!(at, None, "{case}: no {negotiation} below 70016, sent {seen:?}");
+                    }
+                }
+                assert_eq!(pm.peers.read()[&1].info.wtxid_relay, negotiated, "{case}");
+            }
+        }
     }
 
     /// `bind_listener` must surface a bind failure as `Err` *before* any accept
