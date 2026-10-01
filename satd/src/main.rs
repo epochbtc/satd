@@ -385,12 +385,14 @@ fn main() {
 /// report whether its database closed.
 async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> {
     // SIGHUP (config reload) and SIGUSR1 (TLS certificate reload) terminate
-    // the process by default, so both are registered before anything else.
-    // One sent while the node is still starting is then held and handled when
-    // the wait loop at the end of startup first polls it, instead of killing
-    // the node. That window is wide: the RPC server answers long before
-    // startup finishes, so anything that waits for RPC and then reloads
-    // (a test, `systemctl reload`) can land in it.
+    // the process by default, so both are registered first thing in `run`;
+    // only building the runtime comes before. One sent while the node is
+    // still starting is then held and handled when the wait loop at the end
+    // of startup first polls it, instead of killing the node. That window is
+    // wide: the RPC server answers long before startup finishes, so anything
+    // that waits for RPC and then reloads (a test, `systemctl reload`) can
+    // land in it. A reload sent to a startup that never finishes is held
+    // forever rather than killing it; SIGTERM and SIGINT still stop it.
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("Failed to register SIGHUP handler");
     // SIGUSR1 reloads TLS certificates from their configured paths (the leaf

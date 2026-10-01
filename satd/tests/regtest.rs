@@ -6542,6 +6542,7 @@ fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
         .arg(format!("--datadir={}", datadir.display()))
         .arg(format!("--rpcport={rpcport}"))
         .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
         .arg("--loglevel=info")
         .stdout(out.try_clone().unwrap())
         .stderr(out)
