@@ -119,6 +119,9 @@ so a flag passed on the command line always wins over the same key in the file.
 > repurposed for config reload. See
 > [`CORE_DIFFERENCES.md`](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md).
 
+A reload sent while satd is still starting is held and applied as soon as
+startup finishes.
+
 A reload that fails to parse, such as a typo or an invalid value, is logged and
 the running config is kept; satd never exits on a bad reload. A
 recognized-but-unsupported Core option is skipped with a warning, not an error.

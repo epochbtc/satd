@@ -384,6 +384,25 @@ fn main() {
 /// weak reference to the chainstate store, if one was opened, for `main` to
 /// report whether its database closed.
 async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> {
+    // SIGHUP (config reload) and SIGUSR1 (TLS certificate reload) terminate
+    // the process by default, so both are registered first thing in `run`;
+    // only building the runtime comes before. One sent while the node is
+    // still starting is then held and handled when the wait loop at the end
+    // of startup first polls it, instead of killing the node. That window is
+    // wide: the RPC server answers long before startup finishes, so anything
+    // that waits for RPC and then reloads (a test, `systemctl reload`) can
+    // land in it. A reload sent to a startup that never finishes is held
+    // forever rather than killing it; SIGTERM and SIGINT still stop it.
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("Failed to register SIGHUP handler");
+    // SIGUSR1 reloads TLS certificates from their configured paths (the leaf
+    // cert/key only — same paths, no rebind). Dedicated signal, separate from
+    // SIGHUP config reload, so automated short-TTL cert rotation (cert-manager
+    // hooks, systemd path units) can refresh certs cheaply and without running
+    // the full config diff/apply machinery.
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .expect("Failed to register SIGUSR1 handler");
+
     // Config must be parsed before tracing init so --log-format can select
     // the formatter. Config parse errors go to stderr as plain text. The
     // parsed CLI is retained (`cli_snapshot`) so SIGHUP config reload can
@@ -4392,10 +4411,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // daemon keeps running; a bad reload is logged and the running config is
     // kept. Shutdown signals break out of the loop into the graceful-flush path
     // below.
+    // SIGHUP and SIGUSR1 were registered at the top of `run`.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to register SIGTERM handler");
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .expect("Failed to register SIGHUP handler");
     // SIGINT (Ctrl+C) registered as a persistent `Signal` rather than a fresh
     // `tokio::signal::ctrl_c()` future per loop iteration. A recreated-each-
     // iteration future can miss a SIGINT delivered while the loop is busy in a
@@ -4404,13 +4422,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // coalesces and yields it on the next poll.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("Failed to register SIGINT handler");
-    // SIGUSR1 reloads TLS certificates from their configured paths (the leaf
-    // cert/key only — same paths, no rebind). Dedicated signal, separate from
-    // SIGHUP config reload, so automated short-TTL cert rotation (cert-manager
-    // hooks, systemd path units) can refresh certs cheaply and without running
-    // the full config diff/apply machinery.
-    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-        .expect("Failed to register SIGUSR1 handler");
     let reload_handles = reload::ReloadHandles {
         cli: cli_snapshot,
         mempool: mempool.clone(),

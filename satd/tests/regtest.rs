@@ -6510,6 +6510,115 @@ fn test_sighup_config_reload_applies_and_survives_bad_config() {
     node.stop();
 }
 
+/// A reload sent while the node is still starting is held until startup
+/// finishes and then applied; it does not kill the node. SIGHUP and SIGUSR1
+/// terminate a process by default, and satd used to register its handlers
+/// only at the end of startup, well after the RPC server was answering, so a
+/// reload in that window killed the node. A test that reloaded as soon as
+/// RPC answered hit this on a loaded CI runner.
+///
+/// The cookie is written early in startup, before the chain is loaded, so
+/// signalling as soon as it appears lands in that window every time.
+#[test]
+fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
+    struct Spawned {
+        child: Child,
+        datadir: PathBuf,
+    }
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.datadir);
+        }
+    }
+
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir(&format!("satd-test-{rpcport}"));
+    let log = datadir.join("satd.stderr");
+    let out = std::fs::File::create(&log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={rpcport}"))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg("--loglevel=info")
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .expect("spawn satd");
+    let mut node = Spawned { child, datadir: datadir.clone() };
+    let log_text = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    let cookie_path = datadir.join("regtest").join(".cookie");
+    let deadline = Instant::now() + test_timeout(60);
+    while !cookie_path.exists() {
+        assert!(node.child.try_wait().unwrap().is_none(), "satd exited during startup\n{}", log_text());
+        assert!(Instant::now() < deadline, "satd never wrote its cookie\n{}", log_text());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Startup has read the config file by now, so only the reload can turn
+    // this on.
+    std::fs::write(datadir.join("bitcoin.conf"), "[regtest]\nrpcextendederrors=1\n").unwrap();
+    for signal in ["-USR1", "-HUP"] {
+        let status = Command::new("kill")
+            .arg(signal)
+            .arg(node.child.id().to_string())
+            .status()
+            .expect("spawn kill");
+        assert!(status.success(), "kill {signal} returned {status:?}");
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let rpc = |method: &str, params: serde_json::Value| -> Option<serde_json::Value> {
+        let cookie = std::fs::read_to_string(&cookie_path).ok()?;
+        let auth = base64::engine::general_purpose::STANDARD.encode(cookie.trim());
+        client
+            .post(format!("http://127.0.0.1:{rpcport}/"))
+            .header("Authorization", format!("Basic {auth}"))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string())
+            .send()
+            .ok()?
+            .json::<serde_json::Value>()
+            .ok()
+    };
+    // Once the node is up, the reload has turned on extended errors: an
+    // out-of-range height carries the error category.
+    let deadline = Instant::now() + test_timeout(120);
+    loop {
+        assert!(
+            node.child.try_wait().unwrap().is_none(),
+            "a reload sent during startup killed the node\n{}",
+            log_text()
+        );
+        let resp = rpc("getblockhash", serde_json::json!([9999]));
+        if resp.as_ref().is_some_and(|r| r["error"]["data"]["category"] == "rpc.input.range") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reload was never applied; last response {resp:?}\n{}",
+            log_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let text = log_text();
+    assert!(text.contains("SIGHUP received"), "{text}");
+    assert!(text.contains("SIGUSR1 received"), "{text}");
+
+    rpc("stop", serde_json::json!([]));
+    let deadline = Instant::now() + test_timeout(60);
+    while node.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "satd did not stop\n{}", log_text());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn test_sighup_reload_applies_mempool_policy_live() {
     // Mempool/relay policy is hot-reloadable: SIGHUP swaps the live policy and
