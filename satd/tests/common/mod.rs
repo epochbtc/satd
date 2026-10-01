@@ -165,7 +165,33 @@ pub fn requested_esplora_port(extra_args: &[&str]) -> Option<u16> {
             a.strip_prefix("--esplorabind=")
                 .or_else(|| a.strip_prefix("--esploratlsbind="))
         })
-        .and_then(|hostport| hostport.rsplit_once(':'))
+        .and_then(probeable_port)
+}
+
+/// The port from an `--electrumbind=host:port` argument, when that port is one
+/// this harness can usefully wait on. Electrum is off by default, so a bind
+/// argument alone is not a request: without `--electrum=1` satd never binds it
+/// and a wait would run to the startup deadline. Port `0` and a host that
+/// loopback cannot reach are left alone for the reasons given at
+/// [`requested_esplora_port`].
+pub fn requested_electrum_port(extra_args: &[&str]) -> Option<u16> {
+    let enabled = extra_args
+        .iter()
+        .any(|a| *a == "--electrum=1" || *a == "--electrum=true");
+    if !enabled {
+        return None;
+    }
+    extra_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--electrumbind="))
+        .and_then(probeable_port)
+}
+
+/// The port of a `host:port` bind that a loopback connect can probe: the host
+/// must be loopback or the wildcard, and the port must not be `0`.
+fn probeable_port(hostport: &str) -> Option<u16> {
+    hostport
+        .rsplit_once(':')
         .filter(|(host, _)| matches!(*host, "127.0.0.1" | "localhost" | "0.0.0.0"))
         .and_then(|(_, port)| port.parse().ok())
         .filter(|port| *port != 0)
@@ -200,6 +226,24 @@ fn wait_for_requested_esplora(
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     wait_for_listener(process, "esplora", addr, deadline)
+}
+
+/// Same contract as [`wait_for_requested_esplora`], for the Electrum
+/// listener, which satd binds after Esplora and so later still after the
+/// JSON-RPC listener the readiness probe waits on. Electrum tests dial the
+/// port as soon as `start` returns and do not retry, so on a loaded runner the
+/// first request could land before the bind and fail with a bare
+/// `Connection refused`.
+fn wait_for_requested_electrum(
+    process: &mut Child,
+    extra_args: &[&str],
+    deadline: Instant,
+) -> Result<(), String> {
+    let Some(port) = requested_electrum_port(extra_args) else {
+        return Ok(());
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    wait_for_listener(process, "electrum", addr, deadline)
 }
 
 /// The TLS surfaces a test asked for, as `(flag, bind address)`. Only
@@ -557,6 +601,7 @@ impl TestNode {
         let cookie = captured_cookie;
 
         if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline)
+            .and_then(|()| wait_for_requested_electrum(&mut process, extra_args, deadline))
             .and_then(|()| wait_for_requested_tls(&mut process, extra_args, deadline))
         {
             // Same contract as the two failure paths above: kill and reap the
@@ -670,13 +715,14 @@ impl TestNode {
 
         let cookie = std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file");
 
-        // Same Esplora-bind race as the cold-start path; this one panics rather
+        // Same listener-bind races as the cold-start path; this one panics rather
         // than returning Err because it has no retry above it. Kill and reap
         // first: `Child::drop` does not kill, so unwinding past a live handle
         // orphans a satd that goes on holding the RPC port, the P2P port and
         // the datadir lock for the rest of the test binary's run — which then
         // fails whichever later tests draw those ports.
         if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline)
+            .and_then(|()| wait_for_requested_electrum(&mut process, extra_args, deadline))
             .and_then(|()| wait_for_requested_tls(&mut process, extra_args, deadline))
         {
             let _ = process.kill();

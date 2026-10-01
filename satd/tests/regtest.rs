@@ -115,6 +115,40 @@ fn test_requested_esplora_port_only_waits_on_a_port_that_can_accept() {
     );
 }
 
+/// The same wait for the Electrum listener, which satd binds after Esplora.
+/// Electrum is off by default, so a bind argument without `--electrum=1` names
+/// a port nothing will ever listen on.
+#[test]
+fn test_requested_electrum_port_only_waits_on_a_port_that_can_accept() {
+    use common::requested_electrum_port;
+
+    assert_eq!(
+        requested_electrum_port(&["--electrum=1", "--electrumbind=127.0.0.1:50011"]),
+        Some(50011)
+    );
+    assert_eq!(
+        requested_electrum_port(&["--electrum=true", "--electrumbind=0.0.0.0:50012"]),
+        Some(50012)
+    );
+    // Not enabled, or enabled with no bind of its own (the default port is
+    // one this harness did not pick and may belong to something else).
+    assert_eq!(requested_electrum_port(&["--electrumbind=127.0.0.1:50011"]), None);
+    assert_eq!(
+        requested_electrum_port(&["--electrum=0", "--electrumbind=127.0.0.1:50011"]),
+        None
+    );
+    assert_eq!(requested_electrum_port(&["--electrum=1"]), None);
+    // Ephemeral, and a host loopback cannot probe.
+    assert_eq!(
+        requested_electrum_port(&["--electrum=1", "--electrumbind=127.0.0.1:0"]),
+        None
+    );
+    assert_eq!(
+        requested_electrum_port(&["--electrum=1", "--electrumbind=[::1]:50013"]),
+        None
+    );
+}
+
 #[test]
 fn test_regtest_getblockchaininfo() {
     let mut node = TestNode::start(&[]);
