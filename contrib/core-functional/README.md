@@ -160,6 +160,17 @@ carry the blocker that was actually observed once the RPC existed.
 
 ## Fixed
 
+- **BIP 339 wtxid relay** (#714). satd sent no `wtxidrelay`, announced every
+  transaction by txid as `MSG_WITNESS_TX`, and ignored `MSG_WTX`. The
+  framework's `P2PTxInvStore` records only `MSG_TX` and `MSG_WTX`
+  announcements, so it never saw one of satd's. Wtxid relay is now negotiated
+  between `version` and `verack`, and a peer that negotiates it is announced,
+  and served, transactions by wtxid. `wtxidrelay` and `sendaddrv2` go only to
+  a peer at version 70016 or above, as Core sends them. The same txid with
+  another witness is refused as `txn-same-nonwitness-data-in-mempool`. This
+  put `mempool_accept_wtxid.py`, `p2p_feefilter.py` and `p2p_tx_privacy.py`
+  in the run-set. The six other rows that named #714 now stop on the blocker
+  in their notes.
 - **BIP 152 high-bandwidth compact block relay.** satd asked every peer for
   high-bandwidth announcements and never selected any itself, so
   `getpeerinfo.bip152_hb_to` stayed false where Core's selection rule

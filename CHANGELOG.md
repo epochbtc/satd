@@ -70,6 +70,7 @@ item below is (or will be) written up in full in the in-development
 - `getstratuminfo` lists each connected miner (device, difficulty, share counts, best share, last share, estimated hashrate) and a node-wide hashrate; the metrics endpoint exports `satd_stratum_*` connections, miners, shares by result, blocks found and hashrate.
 - `-debug=stratum`: the Stratum server's per-miner debug lines (device, version-rolling mask, every share with the difficulty it achieved, a five-minute status line with estimated hashrate). Always logged: a disconnect summary per miner, and every refused share with its reason.
 - A block found through the Stratum server is saved to `<datadir>/stratum/found/<height>-<hash>.hex` before it is submitted, so a block the node refuses, or a submission that panics, can still be sent to another node with `submitblock`.
+- BIP 339 wtxid relay. `wtxidrelay` is negotiated between `version` and `verack`; a peer that negotiates it (every Bitcoin Core since 0.21) is announced transactions by wtxid and can fetch them by wtxid, and its own `MSG_WTX` announcements are fetched. Other peers are unchanged. `wtxidrelay` and `sendaddrv2` go only to peers at protocol version 70016 or above, a `wtxidrelay` after `verack` disconnects, and the same txid with another witness is refused as `txn-same-nonwitness-data-in-mempool`, all as in Core (#714).
 
 ### Fixed
 

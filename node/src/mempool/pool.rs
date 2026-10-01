@@ -1,4 +1,4 @@
-use bitcoin::{Block, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Block, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -98,6 +98,11 @@ fn format_btc(sats: u64) -> String {
 pub enum MempoolError {
     #[error("txn-already-in-mempool")]
     AlreadyExists,
+    /// A transaction with this txid and another witness is already in the
+    /// pool: the same transaction as far as a txid can tell, a different one
+    /// by wtxid (BIP 339). Core's `PreChecks` tells the two apart.
+    #[error("txn-same-nonwitness-data-in-mempool")]
+    SameNonWitnessData,
     #[error("txn-mempool-conflict")]
     ConflictingSpend,
     #[error("bad-txns-inputs-missingorspent")]
@@ -223,6 +228,7 @@ impl MempoolError {
             | Self::PrematureCoinbaseSpend
             | Self::Validation(_)
             | Self::AlreadyExists
+            | Self::SameNonWitnessData
             | Self::ConflictingSpend
             | Self::InsufficientFee(..)
             | Self::MempoolFull
@@ -247,6 +253,7 @@ impl MempoolError {
     pub fn reject_reason(&self) -> String {
         match self {
             MempoolError::AlreadyExists => "txn-already-in-mempool".to_string(),
+            MempoolError::SameNonWitnessData => "txn-same-nonwitness-data-in-mempool".to_string(),
             MempoolError::ConflictingSpend => "txn-mempool-conflict".to_string(),
             MempoolError::MissingInputs => "bad-txns-inputs-missingorspent".to_string(),
             MempoolError::InsufficientFee(..) => "min relay fee not met".to_string(),
@@ -738,7 +745,7 @@ struct MempoolInner {
     // use a fast hasher (`FxHashMap`) rather than the default SipHash: hashing a
     // hash again for DoS resistance buys nothing here and showed up as a real
     // cost in mempool graph traversals. See `get_descendants` / `collect_children`.
-    entries: FxHashMap<Txid, MempoolEntry>,
+    entries: EntryMap,
     spends: FxHashMap<OutPoint, Txid>,
     /// Fee deltas from `prioritisetransaction` for txs not yet in the mempool.
     /// Core stores priority deltas regardless of whether the tx is resident;
@@ -835,6 +842,102 @@ impl RollingMinFee {
             self.rate = rate as f64;
             self.block_since_bump = false;
         }
+    }
+}
+
+/// The pool's entries, keyed by txid, with a wtxid index beside them.
+///
+/// A BIP 339 peer announces and requests transactions by wtxid, so a
+/// `getdata` for `MSG_WTX` needs a lookup the txid key cannot give. The index
+/// lives in this type, not as a second map on [`MempoolInner`], so that no
+/// write path can move an entry without moving its wtxid: [`Self::insert`] and
+/// [`Self::remove`] are the only ways in and out, and every read goes through
+/// `Deref` to the txid map.
+///
+/// Each entry is keyed by its own transaction's txid, so no two entries share
+/// a wtxid and the two maps are always the same size.
+#[derive(Default)]
+struct EntryMap {
+    by_txid: FxHashMap<Txid, MempoolEntry>,
+    by_wtxid: FxHashMap<Wtxid, Txid>,
+}
+
+impl EntryMap {
+    /// Insert or replace the entry for `txid`. A replaced entry with another
+    /// witness gives up its wtxid.
+    fn insert(&mut self, txid: Txid, entry: MempoolEntry) -> Option<MempoolEntry> {
+        let wtxid = entry.tx.compute_wtxid();
+        let old = self.by_txid.insert(txid, entry);
+        if let Some(old) = &old {
+            self.unindex(txid, old);
+        }
+        self.by_wtxid.insert(wtxid, txid);
+        debug_assert_eq!(self.by_wtxid.len(), self.by_txid.len(), "two entries share a wtxid");
+        old
+    }
+
+    fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
+        let entry = self.by_txid.remove(txid)?;
+        self.unindex(*txid, &entry);
+        debug_assert_eq!(self.by_wtxid.len(), self.by_txid.len(), "an entry left its wtxid behind");
+        Some(entry)
+    }
+
+    fn unindex(&mut self, txid: Txid, entry: &MempoolEntry) {
+        let wtxid = entry.tx.compute_wtxid();
+        if self.by_wtxid.get(&wtxid) == Some(&txid) {
+            self.by_wtxid.remove(&wtxid);
+        }
+    }
+
+    /// The entry's bookkeeping fields, for update in place. Its `tx` must not
+    /// change: the wtxid index is keyed on it.
+    fn get_mut(&mut self, txid: &Txid) -> Option<&mut MempoolEntry> {
+        self.by_txid.get_mut(txid)
+    }
+
+    /// The txid of the resident transaction whose wtxid is `wtxid`.
+    fn txid_of(&self, wtxid: &Wtxid) -> Option<Txid> {
+        self.by_wtxid.get(wtxid).copied()
+    }
+
+    /// Core's duplicate check in `PreChecks`, in its order: `tx` itself is
+    /// already here, or another transaction with its txid and another
+    /// witness is.
+    fn check_not_resident(&self, txid: &Txid, tx: &Transaction) -> Result<(), MempoolError> {
+        if !self.by_txid.contains_key(txid) {
+            return Ok(());
+        }
+        if self.by_wtxid.contains_key(&tx.compute_wtxid()) {
+            Err(MempoolError::AlreadyExists)
+        } else {
+            Err(MempoolError::SameNonWitnessData)
+        }
+    }
+
+    /// Every resident `(txid, wtxid, entry)`, read off the index so that no
+    /// transaction is hashed.
+    fn iter_with_wtxid(&self) -> impl Iterator<Item = (Txid, Wtxid, &MempoolEntry)> {
+        self.by_wtxid
+            .iter()
+            .filter_map(|(wtxid, txid)| self.by_txid.get(txid).map(|e| (*txid, *wtxid, e)))
+    }
+}
+
+impl std::ops::Deref for EntryMap {
+    type Target = FxHashMap<Txid, MempoolEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_txid
+    }
+}
+
+impl<'a> IntoIterator for &'a EntryMap {
+    type Item = (&'a Txid, &'a MempoolEntry);
+    type IntoIter = std::collections::hash_map::Iter<'a, Txid, MempoolEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_txid.iter()
     }
 }
 
@@ -1236,7 +1339,7 @@ impl Mempool {
     pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             inner: RwLock::new(MempoolInner {
-                entries: FxHashMap::default(),
+                entries: EntryMap::default(),
                 spends: FxHashMap::default(),
                 total_bytes: 0,
                 quarantine_bytes: 0,
@@ -2438,9 +2541,7 @@ impl Mempool {
         let mut inner = self.inner.write();
 
         // Check not already in mempool
-        if inner.entries.contains_key(&txid) {
-            return Err(MempoolError::AlreadyExists);
-        }
+        inner.entries.check_not_resident(&txid, &tx)?;
 
         // Detect conflicting spends (RBF candidates)
         let mut conflicts: HashSet<Txid> = HashSet::new();
@@ -3280,6 +3381,21 @@ impl Mempool {
         self.inner.read().entries.get(txid).cloned()
     }
 
+    /// Get a transaction, and its txid, by wtxid: the id a BIP 339 peer
+    /// announces and requests by. A resident transaction with the same txid
+    /// and another witness is not a match.
+    pub fn get_by_wtxid(&self, wtxid: &Wtxid) -> Option<(Txid, MempoolEntry)> {
+        let inner = self.inner.read();
+        let txid = inner.entries.txid_of(wtxid)?;
+        inner.entries.get(&txid).map(|e| (txid, e.clone()))
+    }
+
+    /// The txid of the resident transaction whose wtxid is `wtxid`, without
+    /// cloning it.
+    pub fn txid_of_wtxid(&self, wtxid: &Wtxid) -> Option<Txid> {
+        self.inner.read().entries.txid_of(wtxid)
+    }
+
     /// Adjust the fee delta for a transaction (for mining priority).
     ///
     /// Matches Bitcoin Core's `PrioritiseTransaction`: the delta is stored
@@ -3459,20 +3575,21 @@ impl Mempool {
             .collect()
     }
 
-    /// Txids of mempool entries whose fee rate is at least `min_fee_rate`
-    /// (sat/kvB). Used to answer a BIP35 `mempool` request without cloning
-    /// every entry's transaction.
+    /// `(txid, wtxid)` of every mempool entry whose fee rate is at least
+    /// `min_fee_rate` (sat/kvB). Used to answer a BIP35 `mempool` request
+    /// without cloning every entry's transaction; the caller announces by
+    /// whichever id the peer relays by (BIP 339).
     ///
     /// BIP35 is a **relay** assist path (we are announcing our mempool to a
     /// peer), so quarantine-relay entries are excluded — the node never
     /// advertises a transaction it has declined to gossip (design §2.4/§6.1).
-    pub fn txids_above_feerate(&self, min_fee_rate: u64) -> Vec<Txid> {
+    pub fn relay_ids_above_feerate(&self, min_fee_rate: u64) -> Vec<(Txid, Wtxid)> {
         self.inner
             .read()
             .entries
-            .iter()
-            .filter(|(_, e)| e.scope.assists_relay() && e.fee_rate >= min_fee_rate)
-            .map(|(txid, _)| *txid)
+            .iter_with_wtxid()
+            .filter(|(_, _, e)| e.scope.assists_relay() && e.fee_rate >= min_fee_rate)
+            .map(|(txid, wtxid, _)| (txid, wtxid))
             .collect()
     }
 
@@ -4617,9 +4734,7 @@ impl Mempool {
         let tip_mtp = chain_state.get_median_time_past(next_height);
 
         let inner = self.inner.read();
-        if inner.entries.contains_key(&txid) {
-            return Err(MempoolError::AlreadyExists);
-        }
+        inner.entries.check_not_resident(&txid, tx)?;
 
         // Detect conflicting spends (RBF candidates).
         let mut conflicts: HashSet<Txid> = HashSet::new();
@@ -5834,9 +5949,7 @@ impl Mempool {
         // Take write lock
         let mut inner = self.inner.write();
 
-        if inner.entries.contains_key(&txid) {
-            return Err(MempoolError::AlreadyExists);
-        }
+        inner.entries.check_not_resident(&txid, &tx)?;
 
         // No two mempool entries may spend the same outpoint.
         //
@@ -6146,9 +6259,10 @@ impl Mempool {
         txids
     }
 
-    /// Live unbroadcast `(txid, fee_rate)` pairs, for the announce paths —
-    /// the fee rate is captured here so callers never have to re-enter the
-    /// mempool lock (or clone whole entries) while holding the peers lock.
+    /// Live unbroadcast `(txid, wtxid, fee_rate)` triples, for the announce
+    /// paths — the wtxid (for BIP 339 peers) and fee rate are captured here so
+    /// callers never have to re-enter the mempool lock (or clone whole
+    /// entries) while holding the peers lock.
     ///
     /// Rebroadcast and announce-to-new-peer are **relay** assist paths, so
     /// quarantine-relay entries are excluded: a local tx that became
@@ -6156,7 +6270,7 @@ impl Mempool {
     /// demotion — design §6.1/§8) stays in the unbroadcast set for promotion
     /// on reload but is never put on the wire while withheld. The `retain`
     /// still prunes departed txids regardless of scope.
-    pub fn unbroadcast_entries(&self) -> Vec<(Txid, u64)> {
+    pub fn unbroadcast_entries(&self) -> Vec<(Txid, Wtxid, u64)> {
         let mut inner = self.inner.write();
         let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
@@ -6164,7 +6278,9 @@ impl Mempool {
             .keys()
             .filter_map(|txid| {
                 let e = entries.get(txid)?;
-                e.scope.assists_relay().then_some((*txid, e.fee_rate))
+                e.scope
+                    .assists_relay()
+                    .then(|| (*txid, e.tx.compute_wtxid(), e.fee_rate))
             })
             .collect();
         self.sync_unbroadcast_len(&inner);
@@ -6297,11 +6413,17 @@ impl Mempool {
     /// it unbroadcast. Lets cross-module tests (the peer manager) exercise the
     /// rebroadcast path without standing up a funded UTXO set.
     pub(crate) fn insert_unbroadcast_for_test(&self, txid: Txid, fee_rate: u64) {
+        use bitcoin::hashes::Hash as _;
+        // The key is not this tx's txid, but the tx still has to be unique
+        // to it: the pool's wtxid index holds one entry per transaction.
         let tx = Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: Vec::new(),
-            output: Vec::new(),
+            output: vec![TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return(txid.to_byte_array()),
+            }],
         };
         let mut inner = self.inner.write();
         inner.entries.insert(
@@ -9482,7 +9604,7 @@ mod tests {
         let full = mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
 
         let ids: std::collections::HashSet<Txid> =
-            mp.txids_above_feerate(0).into_iter().collect();
+            mp.relay_ids_above_feerate(0).into_iter().map(|(t, _)| t).collect();
         // BIP35 is a relay path: announce only what we gossip.
         assert!(ids.contains(&acting));
         assert!(ids.contains(&template_only), "on-template txs are still relayed");
@@ -9500,7 +9622,7 @@ mod tests {
         mp.mark_unbroadcast(relay_only);
 
         let ids: std::collections::HashSet<Txid> =
-            mp.unbroadcast_entries().into_iter().map(|(t, _)| t).collect();
+            mp.unbroadcast_entries().into_iter().map(|(t, _, _)| t).collect();
         assert!(ids.contains(&acting));
         assert!(
             !ids.contains(&relay_only),
@@ -9508,6 +9630,139 @@ mod tests {
         );
         // It is still tracked for promotion-on-reload, just not rebroadcast.
         assert!(mp.is_unbroadcast(&relay_only));
+    }
+
+    /// A transaction with a witness, so its wtxid is not its txid. Two calls
+    /// that differ only in `witness_byte` give the same txid.
+    fn witness_tx(seed: u8, witness_byte: u8) -> Transaction {
+        use bitcoin::hashes::Hash as _;
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint { txid: Txid::from_byte_array([seed; 32]), vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::from_slice(&[vec![witness_byte]]),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new_op_return([seed]),
+            }],
+        }
+    }
+
+    fn entry_of(tx: Transaction) -> MempoolEntry {
+        MempoolEntry {
+            tx,
+            fee: 0,
+            weight: 4,
+            fee_rate: 0,
+            time: 0,
+            fee_delta: 0,
+            sigop_cost: 0,
+            prev_scripthashes: Vec::new(),
+            prev_amounts: Vec::new(),
+            prev_scripts: Vec::new(),
+            sp_tweak: None,
+            source: TxSource::Rpc,
+            scope: QuarantineScope::acting(),
+            quarantine_rule: None,
+        }
+    }
+
+    /// BIP 339: a `getdata` for `MSG_WTX` is answered from this index, so it
+    /// has to follow the txid map through every way in and out -- including
+    /// a same-txid entry with another witness taking the slot, which must
+    /// not leave the old wtxid resolving to the new transaction.
+    #[test]
+    fn the_wtxid_index_follows_every_insert_replace_and_remove() {
+        let a = witness_tx(1, 0xaa);
+        let a_other = witness_tx(1, 0xbb);
+        let b = witness_tx(2, 0xaa);
+        let txid = a.compute_txid();
+        assert_eq!(a_other.compute_txid(), txid, "fixture: same txid");
+        assert_ne!(a.compute_wtxid(), a_other.compute_wtxid(), "fixture: other witness");
+        assert_ne!(a.compute_wtxid().to_raw_hash(), txid.to_raw_hash(), "fixture: wtxid is not the txid");
+
+        let mut map = EntryMap::default();
+        assert!(map.insert(txid, entry_of(a.clone())).is_none());
+        map.insert(b.compute_txid(), entry_of(b.clone()));
+        assert_eq!(map.txid_of(&a.compute_wtxid()), Some(txid));
+        assert_eq!(map.txid_of(&b.compute_wtxid()), Some(b.compute_txid()));
+        assert_eq!(map.txid_of(&a_other.compute_wtxid()), None, "another witness is another transaction");
+
+        let replaced = map.insert(txid, entry_of(a_other.clone())).expect("same txid replaces");
+        assert_eq!(replaced.tx.compute_wtxid(), a.compute_wtxid());
+        assert_eq!(map.txid_of(&a_other.compute_wtxid()), Some(txid));
+        assert_eq!(map.txid_of(&a.compute_wtxid()), None, "the replaced witness no longer resolves");
+
+        map.remove(&txid).expect("resident");
+        assert_eq!(map.txid_of(&a_other.compute_wtxid()), None, "a removed entry takes its wtxid with it");
+        assert_eq!(map.txid_of(&b.compute_wtxid()), Some(b.compute_txid()), "the other entry is untouched");
+        assert_eq!(map.by_wtxid.len(), map.len());
+
+        let ids: Vec<(Txid, Wtxid)> = map.iter_with_wtxid().map(|(t, w, _)| (t, w)).collect();
+        assert_eq!(ids, vec![(b.compute_txid(), b.compute_wtxid())]);
+    }
+
+    /// The pool's own lookups and the announce paths read the index, so a
+    /// BIP 339 peer is offered and served the wtxid, never the txid.
+    #[test]
+    fn the_pool_answers_by_wtxid_and_hands_the_announce_paths_the_wtxid() {
+        let mp = Mempool::new(1_000_000, 0);
+        let tx = witness_tx(3, 0xaa);
+        let txid = mp.insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
+        let wtxid = tx.compute_wtxid();
+
+        let (found_txid, entry) = mp.get_by_wtxid(&wtxid).expect("found by wtxid");
+        assert_eq!(found_txid, txid);
+        assert_eq!(entry.tx, tx);
+        assert_eq!(mp.txid_of_wtxid(&wtxid), Some(txid));
+        assert!(
+            mp.get_by_wtxid(&Wtxid::from_raw_hash(txid.to_raw_hash())).is_none(),
+            "a txid is not a wtxid for a witness transaction"
+        );
+        assert!(mp.get_by_wtxid(&witness_tx(3, 0xbb).compute_wtxid()).is_none());
+
+        assert_eq!(mp.relay_ids_above_feerate(0), vec![(txid, wtxid)]);
+        mp.mark_unbroadcast(txid);
+        assert_eq!(mp.unbroadcast_entries(), vec![(txid, wtxid, 0)]);
+
+        mp.remove_for_test(&txid);
+        assert!(mp.get_by_wtxid(&wtxid).is_none());
+        assert!(mp.relay_ids_above_feerate(0).is_empty());
+    }
+
+    /// Core's duplicate check in `PreChecks`, on both admission paths:
+    /// resubmitting the resident transaction is `txn-already-in-mempool`,
+    /// the same txid with another witness is
+    /// `txn-same-nonwitness-data-in-mempool`, and the resident one stays.
+    #[test]
+    fn the_same_txid_with_another_witness_is_its_own_rejection() {
+        let op = outpoint(0xE7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let mut one = spend(op, 90_000, 0x31);
+        one.input[0].witness = bitcoin::Witness::from_slice(&[vec![0x01; 71], vec![0x02; 33]]);
+        let mut two = one.clone();
+        two.input[0].witness = bitcoin::Witness::from_slice(&[vec![0x03; 71], vec![0x02; 33]]);
+        assert_eq!(one.compute_txid(), two.compute_txid(), "fixture: same txid");
+        let txid = mp
+            .accept_transaction(one.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("admitted");
+
+        for (tx, want) in [(&one, "txn-already-in-mempool"), (&two, "txn-same-nonwitness-data-in-mempool")] {
+            let accepted = mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false);
+            assert_eq!(accepted.unwrap_err().reject_reason(), want, "accept_transaction");
+            let tested = mp.test_accept(tx, &cs, &NoopVerifier);
+            assert_eq!(tested.unwrap_err().reject_reason(), want, "test_accept");
+        }
+        assert_eq!(
+            mp.get_by_wtxid(&one.compute_wtxid()).map(|(t, _)| t),
+            Some(txid),
+            "the resident witness stays"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // --- PR 6a: ruleset reload re-placement (§8, I9) ---

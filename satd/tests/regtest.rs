@@ -3559,6 +3559,78 @@ fn test_node_that_mined_its_own_chain_accepts_relayed_tx() {
     node_a.stop();
 }
 
+/// BIP 339 end to end, on real sockets. The node sends `wtxidrelay` (and
+/// `sendaddrv2`) between its `version` and `verack` to a peer at protocol
+/// version 70016, and neither to one at 70015, as Core does. A peer that
+/// sends `wtxidrelay` back is announced a local broadcast by
+/// wtxid and can fetch it by wtxid. A peer that does not, or that sends it at
+/// 70015, is announced the txid. A `wtxidrelay` after `verack` drops the
+/// connection, as Core does.
+#[test]
+fn wtxid_relay_is_negotiated_and_announces_by_wtxid() {
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_blockdata::Inventory;
+
+    let p2p_port = find_available_port();
+    let mut node = TestNode::start(&[&format!("--port={p2p_port}")]);
+    let wallet = DeterministicWallet::from_secret([0x76u8; 32]);
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(wallet.address.to_string())],
+    )
+    .unwrap();
+
+    let mut by_wtxid = raw_p2p::ScriptedPeer::connect(p2p_port, 70016, true);
+    let mut by_txid = raw_p2p::ScriptedPeer::connect(p2p_port, 70016, false);
+    let mut too_old = raw_p2p::ScriptedPeer::connect(p2p_port, 70015, true);
+    for (peer, sent) in [(&by_wtxid, true), (&by_txid, true), (&too_old, false)] {
+        let at = |cmd: &str| peer.handshake.iter().position(|c| c == cmd);
+        for negotiation in ["wtxidrelay", "sendaddrv2"] {
+            match (sent, at("version"), at(negotiation)) {
+                (true, Some(v), Some(n)) => assert!(v < n, "{negotiation} before version: {:?}", peer.handshake),
+                (false, Some(_), None) => {}
+                _ => panic!("expected {negotiation}: {sent}, the node sent {:?}", peer.handshake),
+            }
+        }
+    }
+
+    let dest = wallet.address.script_pubkey();
+    let (raw_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
+    let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+    assert_ne!(txid.to_raw_hash(), wtxid.to_raw_hash(), "fixture: a segwit spend");
+    node.rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap();
+
+    let announced = |peer: &mut raw_p2p::ScriptedPeer| {
+        peer.recv_until(Duration::from_secs(30), |m| match m {
+            NetworkMessage::Inv(inv) => inv.iter().find(|i| {
+                matches!(i, Inventory::WTx(_) | Inventory::WitnessTransaction(_) | Inventory::Transaction(_))
+            }).cloned(),
+            _ => None,
+        })
+    };
+    assert_eq!(announced(&mut by_wtxid), Inventory::WTx(wtxid));
+    assert_eq!(announced(&mut by_txid), Inventory::WitnessTransaction(txid));
+    assert_eq!(announced(&mut too_old), Inventory::WitnessTransaction(txid));
+
+    by_wtxid.send(NetworkMessage::GetData(vec![Inventory::WTx(wtxid)]));
+    let served = by_wtxid.recv_until(Duration::from_secs(30), |m| match m {
+        NetworkMessage::Tx(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert_eq!(served.compute_wtxid(), wtxid);
+
+    by_txid.send(NetworkMessage::WtxidRelay);
+    assert!(
+        by_txid.closed_within(Duration::from_secs(30)),
+        "a wtxidrelay after verack must drop the connection"
+    );
+
+    node.stop();
+}
+
 #[test]
 fn test_parallel_ibd() {
     let p2p_port_a = find_available_port();
@@ -8251,6 +8323,103 @@ mod raw_p2p {
                     Err(e) => panic!("recv while waiting for pong: {e}"),
                 }
             }
+        }
+    }
+
+    /// A peer that runs the handshake to order -- its protocol version, and
+    /// whether it sends BIP 339's `wtxidrelay` before its `verack` -- and
+    /// keeps the commands the node sent up to the node's own `verack`. It
+    /// then reads its own replies, answering the node's pings.
+    pub struct ScriptedPeer {
+        stream: TcpStream,
+        /// The node's handshake, by command, ending with its `verack`.
+        pub handshake: Vec<String>,
+    }
+
+    impl ScriptedPeer {
+        pub fn connect(p2p_port: u16, version: u32, send_wtxidrelay: bool) -> Self {
+            let addr: SocketAddr = format!("127.0.0.1:{p2p_port}").parse().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("p2p connect to {addr} failed: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut peer = ScriptedPeer { stream, handshake: Vec::new() };
+
+            let mut ours = build_version();
+            ours.version = version;
+            peer.send(NetworkMessage::Version(ours));
+            loop {
+                let msg = recv_msg(&mut peer.stream).expect("handshake recv");
+                peer.handshake.push(msg.cmd().to_string());
+                if matches!(msg, NetworkMessage::Verack) {
+                    break;
+                }
+            }
+            if send_wtxidrelay {
+                peer.send(NetworkMessage::WtxidRelay);
+            }
+            peer.send(NetworkMessage::Verack);
+            // The node answers a ping only once the peer's tasks are running,
+            // which is after it has marked the peer connected: past this, an
+            // announcement cannot miss it.
+            let nonce = 0x3339_u64 + u64::from(version);
+            peer.send(NetworkMessage::Ping(nonce));
+            peer.recv_until(Duration::from_secs(30), |m| {
+                matches!(m, NetworkMessage::Pong(n) if *n == nonce).then_some(())
+            });
+            peer
+        }
+
+        pub fn send(&mut self, msg: NetworkMessage) {
+            let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+            self.stream.write_all(&serialize(&raw)).expect("p2p write");
+            self.stream.flush().ok();
+        }
+
+        /// Read until `pick` accepts a message, answering pings meanwhile.
+        pub fn recv_until<T>(
+            &mut self,
+            timeout: Duration,
+            mut pick: impl FnMut(&NetworkMessage) -> Option<T>,
+        ) -> T {
+            let deadline = Instant::now() + timeout;
+            loop {
+                assert!(Instant::now() < deadline, "timed out waiting for a message");
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
+                    Ok(msg) => {
+                        if let Some(found) = pick(&msg) {
+                            return found;
+                        }
+                    }
+                    Err(e) => panic!("recv: {e}"),
+                }
+            }
+        }
+
+        /// Whether the node closes the connection within `timeout`.
+        pub fn closed_within(&mut self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                        return false;
+                    }
+                    Err(_) => return true,
+                }
+            }
+            false
         }
     }
 }
