@@ -6895,6 +6895,69 @@ fn test_reindex() {
         response["result"], 10,
         "Block count should be preserved after reindex"
     );
+    // Block files that reach the previous tip are a complete reindex (#504).
+    let warnings = node.rpc_ok("getwarnings", vec![]);
+    assert!(!warnings.to_string().contains("reindex.short"), "{warnings}");
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Issue #504. A block file missing from the middle of `blocks/` ends a
+/// `-reindex` at the hole. The node keeps the chain below it and syncs the
+/// rest from peers, but must not pass the run off as a completed reindex:
+/// the floor is the tip the node had before the wipe, which `satd` reads
+/// before clearing the database. `-fastprune` (without `-prune`) shrinks the
+/// block files so a short chain spans several.
+#[test]
+fn a_reindex_over_a_missing_block_file_raises_reindex_short() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-reindex-short");
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--fastprune=1"]);
+    // In batches: one call for all of them outruns the client's timeout.
+    for _ in 0..6 {
+        node.rpc_ok(
+            "generatetoaddress",
+            vec![serde_json::json!(100), serde_json::json!(addr)],
+        );
+    }
+    assert_eq!(node.rpc_ok("getblockcount", vec![]), 600);
+    node.stop();
+
+    let blocks = datadir.join("regtest").join("blocks");
+    assert!(
+        blocks.join("blk00002.dat").exists(),
+        "premise: 600 blocks span at least three 64 KiB files"
+    );
+    std::fs::remove_file(blocks.join("blk00001.dat")).unwrap();
+
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--fastprune=1", "--reindex"]);
+    let height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap();
+    assert!(
+        height > 0 && height < 600,
+        "the replay ends at the hole, got height {height}"
+    );
+    let warnings = node.rpc_ok("getwarnings", vec![]);
+    let short = warnings["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == "reindex.short")
+        .unwrap_or_else(|| panic!("the short reindex must raise reindex.short: {warnings}"))
+        .clone();
+    assert_eq!(short["severity"], "error", "{short}");
+    assert_eq!(short["context"]["previous_height"], 600, "{short}");
+    assert_eq!(short["context"]["planned_height"], height, "{short}");
+    // The reindex appends genesis to the block files before it scans them,
+    // and whether that record fits below the hole or rolls into the missing
+    // file's number decides which of these names the hole. Either locates it.
+    assert!(
+        short["context"]["missing_file"] == "blk00001.dat"
+            || short["context"]["first_orphan_file"] == "blk00002.dat",
+        "the warning must locate the hole: {short}"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
