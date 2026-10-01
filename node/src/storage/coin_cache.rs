@@ -17,14 +17,32 @@ const DEFAULT_DBCACHE_MB: u64 = 450;
 enum DirtyEntry {
     /// Coin exists in backing store and was modified/added. `fresh` = true means
     /// the coin was created in this flush window (never written to backing store).
-    Present { coin: Coin, fresh: bool },
+    ///
+    /// `replaces` is the (amount, height) of the row the backing store holds
+    /// for this outpoint, when the coin was put back over a stored coin that
+    /// this window spent: a reorg disconnecting a block and reconnecting a
+    /// branch that re-mines its transactions. The flush writes the coin over
+    /// that row, and the store must count it as a replacement, not an
+    /// addition. `None` with `fresh == false` is a coin restored after a
+    /// failed flush, whose stored row is not known.
+    Present {
+        coin: Coin,
+        fresh: bool,
+        replaces: Option<(u64, u32)>,
+    },
     /// Coin was spent. Carries (amount, height) for counter/histogram updates.
     /// If `fresh` = true, the coin was created and spent in the same flush window
     /// and can be discarded without touching the backing store.
+    ///
+    /// `row_unknown` = true means the spent coin was one restored after a
+    /// failed flush, so whether the store holds its row is not known. The
+    /// flush still writes the remove, but a coin put back over this entry is
+    /// counted as a new row, not as a replacement of one.
     Spent {
         amount: u64,
         height: u32,
         fresh: bool,
+        row_unknown: bool,
     },
 }
 
@@ -446,10 +464,17 @@ impl CoinCache {
         let mut fresh_elided = 0u64;
         // Drain dirty map: build batch and collect surviving coins for LRU promotion
         let mut promote: Vec<(OutPoint, Coin)> = Vec::with_capacity(dirty.len());
+        // The removes of coins with no known stored row (`Spent::row_unknown`).
+        // `coin_removes` has no room for that, and a failed write hands the
+        // batch back to `restore_after_failed_flush`, which needs it.
+        let mut rowless_removes: std::collections::HashSet<OutPoint> = std::collections::HashSet::new();
 
         for (outpoint, entry) in dirty.drain() {
             match entry {
-                DirtyEntry::Present { coin, .. } => {
+                DirtyEntry::Present { coin, replaces, .. } => {
+                    if let Some((amount, height)) = replaces {
+                        batch.coin_overwrites.push((outpoint, amount, height));
+                    }
                     // Serialize for RocksDB batch (needs owned Coin)
                     batch.coin_puts.push((outpoint, coin.clone()));
                     // Move (not clone) into promote list for LRU insertion
@@ -458,7 +483,10 @@ impl CoinCache {
                 DirtyEntry::Spent { fresh: true, .. } => {
                     fresh_elided += 1;
                 }
-                DirtyEntry::Spent { amount, height, .. } => {
+                DirtyEntry::Spent { amount, height, row_unknown, .. } => {
+                    if row_unknown {
+                        rowless_removes.insert(outpoint);
+                    }
                     batch.coin_removes.push((outpoint, amount, height));
                 }
             }
@@ -468,6 +496,7 @@ impl CoinCache {
 
         let puts = batch.coin_puts.len();
         let removes = batch.coin_removes.len();
+        let overwrites = batch.coin_overwrites.len();
         let index_puts = batch.block_index_puts.len();
         let undo_puts = batch.undo_puts.len();
 
@@ -526,6 +555,7 @@ impl CoinCache {
             tracing::info!(
                 coin_puts = puts,
                 coin_removes = removes,
+                coin_overwrites = overwrites,
                 fresh_elided = fresh_elided,
                 block_index = index_puts,
                 undo = undo_puts,
@@ -534,7 +564,7 @@ impl CoinCache {
             );
             if let Err((returned, e)) = self.inner.write_batch_recoverable(batch, mode) {
                 match returned {
-                    Some(batch) => self.restore_after_failed_flush(*batch),
+                    Some(batch) => self.restore_after_failed_flush(*batch, &rowless_removes),
                     // The inner store cannot say what it applied, so replaying
                     // could double-apply. Nothing to do but say so: the delta
                     // is gone and the caller's error is the only signal.
@@ -591,7 +621,15 @@ impl CoinCache {
     ///   can no longer be sure of for anything in the batch, and `false` is
     ///   the conservative direction. The cost is that a later spend of such a
     ///   coin emits a real remove for a key the store may not hold — a RocksDB
-    ///   delete of a missing key, which is a no-op.
+    ///   delete of a missing key, which is a no-op for the rows (the running
+    ///   counters still count it out). A coin that replaced a stored row
+    ///   keeps its `replaces`, since the batch carries it. Any other restored
+    ///   coin has no known row, and keeps that through a later spend
+    ///   (`row_unknown`), so putting it back is counted as a new row rather
+    ///   than as a replacement of one that may never have been written. A
+    ///   restored remove keeps it too: `rowless_removes` names the removes
+    ///   whose coin had no known row, which the batch has no field for, so
+    ///   that a second failed flush does not turn one into a known row.
     /// - Coins created *and* spent inside the failed window were elided from
     ///   the batch entirely, so they are not restored, and that is correct:
     ///   they have no row in the backing store (the write failed, and it would
@@ -603,9 +641,18 @@ impl CoinCache {
     /// Entries written by another thread between the drain and here win:
     /// their value is newer. The counters are additive rather than restored
     /// wholesale for the same reason.
-    fn restore_after_failed_flush(&self, mut batch: StoreBatch) {
+    fn restore_after_failed_flush(
+        &self,
+        mut batch: StoreBatch,
+        rowless_removes: &std::collections::HashSet<OutPoint>,
+    ) {
         let coin_puts = std::mem::take(&mut batch.coin_puts);
         let coin_removes = std::mem::take(&mut batch.coin_removes);
+        let coin_overwrites: HashMap<OutPoint, (u64, u32)> =
+            std::mem::take(&mut batch.coin_overwrites)
+                .into_iter()
+                .map(|(outpoint, amount, height)| (outpoint, (amount, height)))
+                .collect();
         let tip = batch.tip.take();
 
         // `dirty_count` mirrors the map's population, so only ops actually
@@ -622,10 +669,21 @@ impl CoinCache {
             use std::collections::hash_map::Entry;
             let mut dirty = self.dirty.write();
             for (outpoint, coin) in coin_puts {
-                count_delta += 1;
+                let replaces = coin_overwrites.get(&outpoint).copied();
+                // A replacement is one coin in place of one: the delta the
+                // failed write would have applied is the amount difference.
+                if let Some((stored_amount, _)) = replaces {
+                    amount_delta -= stored_amount as i64;
+                } else {
+                    count_delta += 1;
+                }
                 amount_delta += coin.amount as i64;
                 if let Entry::Vacant(slot) = dirty.entry(outpoint) {
-                    slot.insert(DirtyEntry::Present { coin, fresh: false });
+                    slot.insert(DirtyEntry::Present {
+                        coin,
+                        fresh: false,
+                        replaces,
+                    });
                     restored += 1;
                 }
             }
@@ -637,6 +695,7 @@ impl CoinCache {
                         amount,
                         height,
                         fresh: false,
+                        row_unknown: rowless_removes.contains(&outpoint),
                     });
                     restored += 1;
                 }
@@ -863,23 +922,55 @@ impl CoinCache {
                 // licenses eliding a later spend: if the store never had it,
                 // create-then-spend inside one window needs no write at all.
                 //
-                // The test below is not that, though — it is "no dirty entry
-                // for this outpoint". The two agree only because of an
-                // invariant on the callers, which is worth stating since
-                // nothing enforces it: a `coin_put` is only ever issued for an
-                // outpoint the store does not hold. Connection creates outputs
-                // under txids that have never existed, and disconnection
-                // re-adds only coins it is simultaneously removing from the
-                // store's view. So "not in dirty" implies "not in the store":
-                // an outpoint the store holds and that was spent in this
-                // window is in `dirty` as `Spent`, giving `fresh = false` and
-                // a real remove at flush.
+                // With no dirty entry, "absent" rests on an invariant on the
+                // callers, which is worth stating since nothing enforces it: a
+                // `coin_put` for an outpoint with no dirty entry is only ever
+                // issued for an outpoint the store does not hold. Connection
+                // creates outputs under txids that are not in the UTXO set,
+                // and disconnection re-adds only coins whose spend has already
+                // reached the store. Break that invariant and the failure is a
+                // phantom UTXO — an elided remove leaving a spent coin in the
+                // store — not a lost one.
                 //
-                // Break that invariant and the failure is a phantom UTXO — an
-                // elided remove leaving a spent coin in the store — not a lost
-                // one. Worth knowing which direction it fails in.
-                let fresh = !dirty.contains_key(&outpoint);
-                dirty.insert(outpoint, DirtyEntry::Present { coin, fresh });
+                // With a `Spent` entry, the outpoint was spent in this window
+                // and is being put back: a reorg that disconnects a block and
+                // connects a branch re-mining its transactions does this to
+                // every output they create. Whether the store holds a row is
+                // then exactly what the `Spent` entry records. A fresh spend
+                // never reached the store, so the coin is fresh again (Core
+                // erases a FRESH coin on spend, and re-adds it FRESH). A
+                // non-fresh spend is still stored: the flush will write this
+                // coin over that row, and must count it as a replacement.
+                // Treating either case as "not fresh, new row" miscounted the
+                // UTXO set by one coin per re-mined output, in both
+                // directions.
+                let (fresh, replaces) = match dirty.get(&outpoint) {
+                    None => (true, None),
+                    Some(DirtyEntry::Spent { fresh: true, .. }) => (true, None),
+                    // A restored coin's row is not known; neither is this one's.
+                    Some(DirtyEntry::Spent {
+                        row_unknown: true, ..
+                    }) => (false, None),
+                    Some(DirtyEntry::Spent {
+                        amount,
+                        height,
+                        fresh: false,
+                        row_unknown: false,
+                    }) => (false, Some((*amount, *height))),
+                    // Re-putting an unspent coin: no caller does this. Keep
+                    // what is known about the stored row.
+                    Some(DirtyEntry::Present {
+                        fresh, replaces, ..
+                    }) => (*fresh, *replaces),
+                };
+                dirty.insert(
+                    outpoint,
+                    DirtyEntry::Present {
+                        coin,
+                        fresh,
+                        replaces,
+                    },
+                );
             }
 
             for (outpoint, spent_amount, spent_height) in batch.coin_removes {
@@ -889,15 +980,30 @@ impl CoinCache {
                 clean.pop(&outpoint);
                 // If the coin was fresh (created in this flush window), mark the
                 // spend as fresh too — it can be elided entirely during flush.
-                let was_fresh = dirty
-                    .get(&outpoint)
-                    .is_some_and(|e| matches!(e, DirtyEntry::Present { fresh: true, .. }));
+                // If it was put back over a stored row, the flush deletes that
+                // row, which is the one the store counted. If it was restored
+                // after a failed flush, whether it has a row stays unknown.
+                let (amount, height, fresh, row_unknown) = match dirty.get(&outpoint) {
+                    Some(DirtyEntry::Present { fresh: true, .. }) => {
+                        (spent_amount, spent_height, true, false)
+                    }
+                    Some(DirtyEntry::Present {
+                        replaces: Some((amount, height)),
+                        ..
+                    }) => (*amount, *height, false, false),
+                    Some(DirtyEntry::Present { .. }) => (spent_amount, spent_height, false, true),
+                    Some(DirtyEntry::Spent { row_unknown, .. }) => {
+                        (spent_amount, spent_height, false, *row_unknown)
+                    }
+                    None => (spent_amount, spent_height, false, false),
+                };
                 dirty.insert(
                     outpoint,
                     DirtyEntry::Spent {
-                        amount: spent_amount,
-                        height: spent_height,
-                        fresh: was_fresh,
+                        amount,
+                        height,
+                        fresh,
+                        row_unknown,
                     },
                 );
             }
@@ -1082,6 +1188,7 @@ impl CoinCache {
                     block_index_puts: batch.block_index_puts,
                     coin_puts: Vec::new(),
                     coin_removes: Vec::new(),
+                    coin_overwrites: Vec::new(),
                     tip: None,
                     height_hash_puts: batch.height_hash_puts,
                     height_hash_removes: batch.height_hash_removes,
@@ -4344,6 +4451,148 @@ mod tests {
         assert_eq!(cache.get_cumulative_tx_count(&block), Some(42));
     }
 
+    /// A failed flush that carried a coin put back over its stored row must
+    /// restore it as a replacement: the count must not grow by the coin the
+    /// store already holds, and the retry must still tell the store which row
+    /// it replaces.
+    #[test]
+    fn a_failed_flush_restores_a_replacement_as_a_replacement() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let x = make_outpoint(0xF4, 0);
+        let mut base = StoreBatch::default();
+        base.coin_puts.push((x, make_coin(5_000, 1)));
+        cache.write_batch(base).unwrap();
+        cache.flush().unwrap();
+
+        // The reorg: spend X, then put it back one block higher.
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((x, 5_000, 1));
+        cache.write_batch(spend).unwrap();
+        let mut again = StoreBatch::default();
+        again.coin_puts.push((x, make_coin(5_000, 2)));
+        cache.write_batch(again).unwrap();
+        assert_eq!(cache.coin_count(), 1);
+
+        controls.fail_next_write();
+        cache.flush().expect_err("the injected fault must surface");
+        assert_eq!(cache.coin_count(), 1, "coin_count after the failed flush");
+        assert_eq!(cache.coin_total_amount(), 5_000, "total amount after the failed flush");
+        assert!(
+            matches!(
+                cache.dirty.read().get(&x),
+                Some(DirtyEntry::Present { replaces: Some((5_000, 1)), .. })
+            ),
+            "the restored entry must still name the row it replaces"
+        );
+
+        cache.flush().expect("retry succeeds");
+        assert_eq!(cache.coin_count(), 1);
+        assert_eq!(cache.get_coin(&x).unwrap().height, 2);
+    }
+
+    /// A coin restored after a failed flush has no known row in the store.
+    /// Spending it and putting it back in one window, as a reorg re-mining
+    /// it does, must not make it a replacement: the store would count a row
+    /// out that may never have been written.
+    #[test]
+    fn a_restored_coin_put_back_after_a_spend_is_not_a_replacement() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let y = make_outpoint(0xF5, 0);
+        let mut create = StoreBatch::default();
+        create.coin_puts.push((y, make_coin(6_000, 3)));
+        cache.write_batch(create).unwrap();
+        controls.fail_next_write();
+        cache.flush().expect_err("the injected fault must surface");
+        assert!(matches!(
+            cache.dirty.read().get(&y),
+            Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+        ));
+
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((y, 6_000, 3));
+        cache.write_batch(spend).unwrap();
+        let mut again = StoreBatch::default();
+        again.coin_puts.push((y, make_coin(6_000, 4)));
+        cache.write_batch(again).unwrap();
+        assert!(
+            matches!(
+                cache.dirty.read().get(&y),
+                Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+            ),
+            "no stored row is known, so the put-back must not name one"
+        );
+
+        cache.flush().expect("retry succeeds");
+        assert_eq!(cache.coin_count(), 1);
+        assert_eq!(cache.coin_total_amount(), 6_000);
+        assert_eq!(cache.get_coin(&y).unwrap().height, 4);
+    }
+
+    /// The same coin through a second failed flush. Spending the restored
+    /// coin stages a remove of a row nobody knows exists; when that flush
+    /// fails too, the restored remove must still say so, or putting the coin
+    /// back names a stored row to replace and the store counts out a row
+    /// that may never have been written.
+    ///
+    /// The assertions are on the entries, because the test store counts the
+    /// rows it holds rather than keeping running totals, so a wrongly named
+    /// replacement does not move its count. RocksDB counts the replaced row
+    /// out (`a_coin_put_back_over_its_stored_row_is_counted_once`).
+    #[test]
+    fn a_restored_spend_still_has_no_known_row_after_a_second_failed_flush() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let z = make_outpoint(0xF6, 0);
+        let mut create = StoreBatch::default();
+        create.coin_puts.push((z, make_coin(8_000, 3)));
+        cache.write_batch(create).unwrap();
+        controls.fail_next_write();
+        cache.flush().expect_err("the first injected fault must surface");
+
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((z, 8_000, 3));
+        cache.write_batch(spend).unwrap();
+        controls.fail_next_write();
+        cache.flush().expect_err("the second injected fault must surface");
+        assert!(
+            matches!(
+                cache.dirty.read().get(&z),
+                Some(DirtyEntry::Spent { row_unknown: true, .. })
+            ),
+            "the restored remove must still have no known row"
+        );
+
+        let mut again = StoreBatch::default();
+        again.coin_puts.push((z, make_coin(8_000, 4)));
+        cache.write_batch(again).unwrap();
+        assert!(
+            matches!(
+                cache.dirty.read().get(&z),
+                Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+            ),
+            "no stored row is known, so the put-back must not name one"
+        );
+
+        cache.flush().expect("retry succeeds");
+        assert_eq!(cache.coin_count(), 1);
+        assert_eq!(cache.coin_total_amount(), 8_000);
+        assert_eq!(cache.get_coin(&z).unwrap().height, 4);
+    }
+
     /// The restore must not overwrite a write that arrived while the failed
     /// flush was in flight — that write is newer, and the whole reason the
     /// dirty lock is dropped before the inner call is to let it happen.
@@ -4368,7 +4617,7 @@ mod tests {
         spend.coin_removes.push((y, 7_000, 2));
         cache.write_batch(spend).unwrap();
         let gauge_before = cache.dirty_count();
-        cache.restore_after_failed_flush(drained);
+        cache.restore_after_failed_flush(drained, &std::collections::HashSet::new());
 
         assert!(
             cache.get_coin(&y).is_none(),
@@ -4422,7 +4671,7 @@ mod tests {
         older.height_hash_puts.push((2, hash_a));
         older.height_hash_removes.push(3);
         older.tip = Some(tip_old);
-        cache.restore_after_failed_flush(older);
+        cache.restore_after_failed_flush(older, &std::collections::HashSet::new());
 
         // Newer values win immediately...
         assert_eq!(cache.get_block_hash_by_height(2), Some(hash_b));

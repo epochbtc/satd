@@ -106,6 +106,16 @@ pub struct StoreBatch {
     pub coin_puts: Vec<(OutPoint, Coin)>,
     /// (outpoint, spent_amount, spent_height) — carried for O(1) counter/histogram updates.
     pub coin_removes: Vec<(OutPoint, u64, u32)>,
+    /// (outpoint, stored_amount, stored_height) for each `coin_puts` entry
+    /// that replaces a row the store already holds instead of adding one.
+    /// The put is written as usual; this only tells a store that keeps
+    /// running counters to count the replaced row out, so the put nets to
+    /// zero coins rather than one.
+    ///
+    /// `CoinCache` emits these when a reorg removes a stored coin and puts
+    /// it back inside one flush window, which is what happens to the outputs
+    /// of every transaction the replacement branch re-mines.
+    pub coin_overwrites: Vec<(OutPoint, u64, u32)>,
     pub tip: Option<BlockHash>,
     pub height_hash_puts: Vec<(u32, BlockHash)>,
     pub height_hash_removes: Vec<u32>,
@@ -299,6 +309,7 @@ impl StoreBatch {
         self.block_index_puts.extend(other.block_index_puts);
         self.coin_puts.extend(other.coin_puts);
         self.coin_removes.extend(other.coin_removes);
+        self.coin_overwrites.extend(other.coin_overwrites);
         if other.tip.is_some() {
             self.tip = other.tip;
         }
