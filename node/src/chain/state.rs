@@ -5984,10 +5984,18 @@ impl ChainState {
     /// durable. Headers past the target are still scanned in phase 1
     /// (planning needs the full parent→children map to pick the branch
     /// correctly), but no further blocks are connected.
+    ///
+    /// `prev_tip_height` is the highest tip the node is known to have reached
+    /// before the wipe. It is a coverage floor (issue #504): block files that
+    /// hold a shorter chain are missing something, and the replay says so
+    /// instead of reporting a completed reindex. It does not fail: the caller
+    /// has already cleared the database, and the node syncs the rest from
+    /// peers.
     pub fn reindex_from_flat_files(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+        prev_tip_height: Option<u32>,
     ) -> Result<(), ChainError> {
         use std::collections::HashMap;
 
@@ -6005,6 +6013,7 @@ impl ChainState {
         let mut header_by_hash: HashMap<BlockHash, HeaderRef> = HashMap::new();
         let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
         let mut scanned: u64 = 0;
+        let gap;
         {
             let flat_files = self.flat_files.lock();
             flat_files
@@ -6064,6 +6073,7 @@ impl ChainState {
                     std::ops::ControlFlow::Continue(())
                 })
                 .map_err(|e| ChainError::FlatFile(format!("scan flat files: {}", e)))?;
+            gap = flat_files.first_gap();
         }
         let total = scanned;
         if let Some(p) = &progress {
@@ -6071,6 +6081,18 @@ impl ChainState {
             p.set_current(total);
         }
         tracing::info!(scanned, "Phase 1: indexed block headers from flat files");
+        // The scan stops at the first missing file number, so every file
+        // above a hole goes unread. Name the hole: it is the likeliest reason
+        // the replay ends short, and the file is what the operator can
+        // restore.
+        if let Some((missing, unread)) = gap {
+            tracing::warn!(
+                missing = %format!("blk{missing:05}.dat"),
+                unread,
+                "reindex: the block file scan stopped at a missing file; the block files \
+                 above it were not read"
+            );
+        }
 
         // Phase 2: pick the branch to replay, then fetch each block from disk
         // and connect it in chain order.
@@ -6117,6 +6139,77 @@ impl ChainState {
                  network and that blk00000.dat is present and intact."
             );
             return Err(ChainError::BadPrevBlock);
+        }
+
+        // The coverage floor (issue #504). A missing block file or a truncated
+        // record ends the plan at the hole, and a plan that ends at a hole
+        // looks like a whole chain. Replaying it is still right: every block
+        // below the hole is good, and the node syncs the rest from peers.
+        // Reporting the result as a completed reindex is not, so the shortfall
+        // is logged at error and recorded as a standing warning before the
+        // connect starts, which a `-stopatheight` run reports too.
+        let short_of = prev_tip_height.filter(|&required| plan.tip_height < required);
+        if let Some(required) = short_of {
+            // Where the stored chain picks up again past the hole, if it does:
+            // blocks whose parent is nowhere in the files. The gap alone is
+            // not enough, because it can be gone by now. `ChainState::new`
+            // appended genesis to the empty database's block files before
+            // this scan, and when genesis does not fit in the file below a
+            // gap it rolls over into the missing file's number, so the scan
+            // reads past the hole.
+            let mut orphaned = 0usize;
+            let mut first_orphan_file: Option<u32> = None;
+            for (hash, record) in &header_by_hash {
+                let parent = record.header.prev_blockhash;
+                if *hash != genesis_hash
+                    && parent != genesis_hash
+                    && !header_by_hash.contains_key(&parent)
+                {
+                    orphaned += 1;
+                    let file = record.pos.file_number;
+                    first_orphan_file = Some(first_orphan_file.map_or(file, |f| f.min(file)));
+                }
+            }
+            let cause = match (gap, first_orphan_file) {
+                (Some((missing, unread)), _) => format!(
+                    "blk{missing:05}.dat is missing, and the {unread} block file(s) above it \
+                     were not read"
+                ),
+                (None, Some(file)) => format!(
+                    "{orphaned} stored block(s) have no parent in the block files, the first \
+                     in blk{file:05}.dat, so the blocks before them are missing or cut short"
+                ),
+                (None, None) => "no stored block extends that height, so the newest block \
+                                 files are missing or the last one is cut short"
+                    .to_string(),
+            };
+            tracing::error!(
+                planned = plan.tip_height,
+                required,
+                scanned = total,
+                cause = %cause,
+                "Reindex: the block files hold the chain only to a height below the tip this \
+                 node had already reached. The heights they hold replay as normal; the node \
+                 will sync the rest from peers."
+            );
+            self.warnings.record(
+                "reindex.short",
+                crate::warnings::Severity::Error,
+                format!(
+                    "The block files hold the chain only to height {}, below height \
+                     {required} that this node had reached before the reindex ({cause}); \
+                     the chain above it will be re-fetched from peers",
+                    plan.tip_height
+                ),
+                serde_json::json!({
+                    "planned_height": plan.tip_height,
+                    "previous_height": required,
+                    "missing_file": gap.map(|(missing, _)| format!("blk{missing:05}.dat")),
+                    "unread_files": gap.map(|(_, unread)| unread),
+                    "orphaned_blocks": orphaned,
+                    "first_orphan_file": first_orphan_file.map(|f| format!("blk{f:05}.dat")),
+                }),
+            );
         }
 
         // `children` is dead once the plan exists; without this it stays
@@ -6354,7 +6447,16 @@ impl ChainState {
         if let Some(p) = &progress {
             p.set_current(connected as u64);
         }
-        tracing::info!(connected, "Reindex from flat files complete");
+        match short_of {
+            Some(required) => tracing::warn!(
+                connected,
+                height = self.tip_height(),
+                required,
+                "Reindex from flat files replayed every block the files hold, and ended below \
+                 the previous tip"
+            ),
+            None => tracing::info!(connected, "Reindex from flat files complete"),
+        }
         Ok(())
     }
 
@@ -18383,7 +18485,7 @@ pub(crate) mod tests {
         cs.store.flush().unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("a bad side-chain block must not abort the reindex");
 
         assert_eq!(re.tip_hash(), main_tip, "the main chain must still replay");
@@ -18438,7 +18540,7 @@ pub(crate) mod tests {
         cs.store.flush().unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("an unreplayable block must stop the reindex, not fail it");
 
         assert_eq!(
@@ -18469,6 +18571,178 @@ pub(crate) mod tests {
         assert_eq!(halted.severity, crate::warnings::Severity::Error);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One framed `blk*.dat` record: magic, payload length, payload.
+    fn blk_record(block: &Block) -> Vec<u8> {
+        let payload = serialize(block);
+        let mut record = network_magic(Network::Regtest).to_vec();
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(&payload);
+        record
+    }
+
+    /// Six regtest blocks on genesis, two to a file in `blk00000.dat`,
+    /// `blk00001.dat` and `blk00002.dat` under `dir/blocks`: the layout a
+    /// synced node leaves, at a size a test can cut holes in.
+    fn six_blocks_in_three_files(dir: &std::path::Path) -> Vec<Block> {
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut blocks = Vec::new();
+        let mut parent = genesis_hash;
+        for h in 1..=6u32 {
+            let b = build_test_block(parent, h, 1_709_300_000 + h);
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        let blocks_dir = dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        for (n, pair) in blocks.chunks(2).enumerate() {
+            let bytes: Vec<u8> = pair.iter().flat_map(blk_record).collect();
+            std::fs::write(blocks_dir.join(format!("blk{n:05}.dat")), bytes).unwrap();
+        }
+        blocks
+    }
+
+    fn reindex_warning(cs: &ChainState, id: &str) -> Option<crate::warnings::Warning> {
+        cs.warnings().list().into_iter().find(|w| w.id == id)
+    }
+
+    /// Issue #504. A block file missing from the middle of `blocks/` ends the
+    /// scan at the hole, so the replay connects only what lies below it. That
+    /// part is right, and the node syncs the rest from peers, but the run
+    /// must not pass for a completed reindex: the files held less chain than
+    /// the node had already reached.
+    ///
+    /// Perturbation: drop the `reindex.short` record and the `find` fails;
+    /// drop `first_gap` from the scan and the message no longer names the
+    /// file.
+    #[test]
+    fn a_reindex_over_a_missing_block_file_says_it_ended_short() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocks = six_blocks_in_three_files(tmp.path());
+        std::fs::remove_file(tmp.path().join("blocks").join("blk00001.dat")).unwrap();
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6))
+            .expect("the node can sync the rest from peers, so a short replay must not fail");
+        assert_eq!(re.tip_height(), 2, "everything below the hole replays");
+        assert_eq!(re.tip_hash(), blocks[1].block_hash());
+
+        let short = reindex_warning(&re, "reindex.short")
+            .expect("a replay that ends below the previous tip must say so");
+        assert_eq!(short.severity, crate::warnings::Severity::Error);
+        assert!(
+            short.message.contains("height 2, below height 6"),
+            "{}",
+            short.message
+        );
+        assert!(
+            short.message.contains("blk00001.dat is missing"),
+            "the warning must name the file to restore: {}",
+            short.message
+        );
+        assert_eq!(short.context["missing_file"], "blk00001.dat");
+        assert_eq!(short.context["unread_files"], 1);
+        assert_eq!(
+            short.context["orphaned_blocks"], 0,
+            "the scan stopped at the gap, so it never saw the blocks above it"
+        );
+
+        // A `-stopatheight` run reports it too: the files are short whatever
+        // the target.
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(Some(1), None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 1);
+        assert!(reindex_warning(&re, "reindex.short").is_some());
+    }
+
+    /// Issue #504, the truncated-file shape: an interrupted copy leaves a
+    /// file cut off partway through a record, with every file number present.
+    #[test]
+    fn a_reindex_over_a_truncated_block_file_says_it_ended_short() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocks = six_blocks_in_three_files(tmp.path());
+        // Keep block 1's record and 40 bytes of block 2's.
+        let keep = blk_record(&blocks[0]).len() + 40;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("blocks").join("blk00000.dat"))
+            .unwrap()
+            .set_len(keep as u64)
+            .unwrap();
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 1);
+
+        let short = reindex_warning(&re, "reindex.short")
+            .expect("a replay that ends below the previous tip must say so");
+        assert!(
+            short.message.contains("height 1, below height 6"),
+            "{}",
+            short.message
+        );
+        // No file is missing, so none may be named; block 3 is where the
+        // stored chain picks up again without its parent.
+        assert!(short.context["missing_file"].is_null());
+        assert!(
+            short.message.contains("the first in blk00001.dat"),
+            "the warning must say where the files resume: {}",
+            short.message
+        );
+        assert_eq!(short.context["orphaned_blocks"], 1);
+        assert_eq!(short.context["first_orphan_file"], "blk00001.dat");
+    }
+
+    /// Issue #504, the shape with nothing past the hole: the newest block
+    /// file is gone, so no stored block is orphaned and no file number is
+    /// skipped. The floor is the only thing that can tell.
+    #[test]
+    fn a_reindex_over_block_files_missing_the_newest_says_it_ended_short() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        six_blocks_in_three_files(tmp.path());
+        std::fs::remove_file(tmp.path().join("blocks").join("blk00002.dat")).unwrap();
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 4);
+
+        let short = reindex_warning(&re, "reindex.short")
+            .expect("a replay that ends below the previous tip must say so");
+        assert!(
+            short.message.contains("height 4, below height 6"),
+            "{}",
+            short.message
+        );
+        assert!(
+            short.message.contains("the newest block files are missing"),
+            "{}",
+            short.message
+        );
+        assert_eq!(short.context["orphaned_blocks"], 0);
+    }
+
+    /// Issue #504, the other direction: block files that reach the previous
+    /// tip raise nothing, and neither does a `-stopatheight` below it, which
+    /// is the operator's choice rather than a short set of files.
+    ///
+    /// Perturbation: compare with `<=` instead of `<` and the first
+    /// assertion on the warnings fails.
+    #[test]
+    fn a_reindex_that_reaches_the_previous_tip_raises_no_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocks = six_blocks_in_three_files(tmp.path());
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 6);
+        assert_eq!(re.tip_hash(), blocks[5].block_hash());
+        assert!(reindex_warning(&re, "reindex.short").is_none());
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(Some(3), None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 3);
+        assert!(reindex_warning(&re, "reindex.short").is_none());
     }
 
     /// Issue #533. A live `block_index` entry whose data is unreadable is local
@@ -18549,7 +18823,7 @@ pub(crate) mod tests {
 
         // Reindex from the flat files with an empty database.
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("reindex must not abort on a fork point");
 
         assert_eq!(re.tip_hash(), main_tip, "replayed the wrong branch");
@@ -18627,7 +18901,7 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), main_hash, "equal work must not reorg the tip");
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("reindex must not abort on a double-spending stale sibling");
 
         assert_eq!(re.tip_hash(), main_hash);
@@ -18680,7 +18954,7 @@ pub(crate) mod tests {
         let expected_coins = cs.store.coin_count();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
 
         assert_eq!(re.tip_hash(), b_tip, "replay must follow the most work");
         assert_eq!(re.tip_height(), 8);
@@ -19516,7 +19790,7 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), b_tip);
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
         assert_eq!(re.tip_height(), 8);
 
         // Every indexed side block must sit at a height the active chain also
@@ -19569,7 +19843,7 @@ pub(crate) mod tests {
         }
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("reindex over duplicated records");
 
         assert_eq!(re.tip_hash(), main_tip);
@@ -19603,7 +19877,7 @@ pub(crate) mod tests {
         let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(4), None)
+        re.reindex_from_flat_files(Some(4), None, None)
             .expect("reindex to -stopatheight");
 
         assert_eq!(re.tip_height(), 4);
@@ -20243,7 +20517,7 @@ pub(crate) mod tests {
         let (_cs, dir) = signet_chain_stored_unchecked(&[default_signet_block(1), bad2.clone()]);
 
         let re = signet_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None)
+        re.reindex_from_flat_files(None, None, None)
             .expect("an unreplayable block stops the reindex, it does not fail it");
         assert_eq!(re.tip_height(), 1);
         assert_eq!(re.tip_hash(), default_signet_block(1).block_hash());
@@ -20276,7 +20550,7 @@ pub(crate) mod tests {
         assert!(cs.store.get_block_index(&bad2.block_hash()).is_some(), "premise: stored");
 
         let re = signet_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
         assert_eq!(re.tip_hash(), default_signet_block(3).block_hash());
         assert!(
             re.store.get_block_index(&bad2.block_hash()).is_none(),

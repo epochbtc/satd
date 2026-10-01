@@ -239,6 +239,15 @@ fn read_dir_blk_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+/// The file number in a `blk%05u.dat` name, or `None` for any other name.
+fn blk_file_number(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("blk")?.strip_suffix(".dat")?;
+    if digits.len() < 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 impl FlatFileManager {
     /// Open `blocks_dir` with [`XorMode::Auto`]: honor an existing
     /// `xor.dat` (so Core v28+ obfuscated dirs read transparently),
@@ -744,6 +753,29 @@ impl FlatFileManager {
         Ok(count)
     }
 
+    /// Where [`Self::for_each_block`] stops short of the files on disk: the
+    /// first missing `blk*.dat` number, and how many `blk*.dat` files above
+    /// it the scan never reads. `None` when no file sits above the first
+    /// missing number, so the scan reaches every file there is.
+    ///
+    /// A pruned blocks dir has this shape by design, since pruning deletes
+    /// the lowest-numbered files. Anywhere else it means a file went missing
+    /// (a partial restore, an interrupted copy) and every block stored above
+    /// it is out of the scan's reach.
+    pub fn first_gap(&self) -> Option<(u32, usize)> {
+        let mut first_missing = 0u32;
+        while self.file_path(first_missing).exists() {
+            first_missing += 1;
+        }
+        let above = std::fs::read_dir(&self.blocks_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|e| blk_file_number(&e.file_name().to_string_lossy()))
+            .filter(|n| *n > first_missing)
+            .count();
+        (above > 0).then_some((first_missing, above))
+    }
+
     /// Scan every block in the given file-number range. Stops on the
     /// first `ControlFlow::Break` returned by the visitor (use this to
     /// early-exit when you've found everything you're looking for).
@@ -1029,6 +1061,45 @@ mod tests {
         .unwrap();
         assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `first_gap` names the file `for_each_block` stops at and counts the
+    /// files above it that the scan never reads (issue #504).
+    #[test]
+    fn first_gap_reports_the_files_a_scan_cannot_reach() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mgr = FlatFileManager::new(dir).unwrap();
+        assert_eq!(mgr.first_gap(), None, "an empty dir has nothing out of reach");
+
+        let touch = |n: u32| std::fs::write(dir.join(format!("blk{n:05}.dat")), b"").unwrap();
+        touch(0);
+        touch(1);
+        assert_eq!(mgr.first_gap(), None, "contiguous files are all scanned");
+
+        touch(3);
+        touch(4);
+        // Names that are not block files, including a rev file and a number
+        // too short to be one, do not count.
+        std::fs::write(dir.join("rev00009.dat"), b"").unwrap();
+        std::fs::write(dir.join("blk9.dat"), b"").unwrap();
+        std::fs::write(dir.join("xor.dat"), b"").unwrap();
+        assert_eq!(mgr.first_gap(), Some((2, 2)));
+
+        // A pruned dir: the lowest files are gone.
+        std::fs::remove_file(dir.join("blk00000.dat")).unwrap();
+        assert_eq!(mgr.first_gap(), Some((0, 3)));
+    }
+
+    #[test]
+    fn blk_file_number_parses_only_block_file_names() {
+        assert_eq!(blk_file_number("blk00000.dat"), Some(0));
+        assert_eq!(blk_file_number("blk01234.dat"), Some(1234));
+        assert_eq!(blk_file_number("blk123456.dat"), Some(123_456));
+        assert_eq!(blk_file_number("blk0001.dat"), None);
+        assert_eq!(blk_file_number("rev00000.dat"), None);
+        assert_eq!(blk_file_number("blk00000.dat.tmp"), None);
+        assert_eq!(blk_file_number("blk+0001.dat"), None);
     }
 
     #[test]

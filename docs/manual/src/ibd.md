@@ -245,6 +245,28 @@ nothing and is removed at the next start.
 `-reindex-chainstate -stopatheight=H` stops short on purpose and is refused
 all the same on the next plain start: the node could never advance past H.
 
+### Block files that end early
+
+A full `-reindex` can only rebuild what the block files hold. It reads
+`blk00000.dat`, `blk00001.dat` and on in order, stops at the first missing
+number, and stops reading a file at a record that is cut off. A file lost in a
+partial restore or an interrupted copy therefore ends the rebuilt chain at the
+hole.
+
+satd holds the replay to the highest tip the node is known to have reached
+before the wipe: the chain database's tip, an unfinished rebuild's marker, or
+the clean-shutdown marker, whichever is highest. When the block files end
+below it, satd replays what they hold, then syncs the rest from peers as Core
+would. It also logs an error, does not log the reindex as complete, and raises
+the `reindex.short` warning (`getwarnings`, `getblockchaininfo`). The warning gives both heights and locates the hole: it names
+the missing file, or the first file where stored blocks pick up again without
+their parents. Restoring that file and running `-reindex` again saves the
+download.
+
+A pruned node is exempt: pruning deletes the oldest block files on purpose, so
+its reindex always downloads the chain again. A block on the chain whose stored
+bytes fail validation stops the replay too, with the `reindex.halted` warning.
+
 ### Upgrading the chainstate unprompted
 
 `-upgradechainstate=1` runs `-reindex-chainstate` by itself when it is

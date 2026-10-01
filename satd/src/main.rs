@@ -217,6 +217,32 @@ fn write_rebuild_marker(
     }
 }
 
+/// The coverage floor a full `-reindex` replay is held to (issue #504): the
+/// highest tip the node is known to have reached before the wipe. Three
+/// places can know it, and any of them can be absent: the chain database's
+/// own tip; an unfinished rebuild's marker, when the database holds only the
+/// partial tip that run left; and the clean-shutdown marker, which survives
+/// the chain database being deleted by hand.
+///
+/// A pruned node gets none. Pruning deletes the oldest block files on
+/// purpose, so its reindex always ends low and downloads the chain again, as
+/// Core's does.
+fn reindex_coverage_floor(
+    store_tip_height: Option<u32>,
+    unfinished: Option<&node::rebuild_marker::Found>,
+    prior_shutdown_height: Option<u32>,
+    pruning: bool,
+) -> Option<u32> {
+    if pruning {
+        return None;
+    }
+    let earlier = match unfinished {
+        Some(node::rebuild_marker::Found::Marker(m)) => m.prev_tip_height,
+        _ => None,
+    };
+    store_tip_height.max(earlier).max(prior_shutdown_height)
+}
+
 /// The rebuild finished: remove its marker. Fails closed, like the write:
 /// a marker left behind would make the next start refuse a good datadir, so
 /// say so now rather than then.
@@ -884,6 +910,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // which is the derived state this whole replay path exists to distrust.
     // `None` when not doing a chainstate reindex, or when there was no tip.
     let mut prev_chainstate_tip: Option<(bitcoin::BlockHash, u32)> = None;
+    // The height a full `-reindex` replay must reach before it calls itself
+    // complete; see `reindex_coverage_floor`.
+    let mut reindex_floor: Option<u32> = None;
 
     // Handle -reindex: clear everything, will rebuild from flat files
     if config.reindex {
@@ -892,6 +921,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let prev_height = store
             .get_tip()
             .and_then(|h| store.get_block_index(&h).map(|e| e.height));
+        reindex_floor = reindex_coverage_floor(
+            prev_height,
+            unfinished_rebuild.as_ref(),
+            prior_shutdown.as_ref().map(|r| r.tip_height),
+            config.prune > 0 || config.prune_manual,
+        );
         write_rebuild_marker(
             &net_datadir,
             node::rebuild_marker::RebuildKind::Full,
@@ -1478,14 +1513,16 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         if let Err(e) = chain_state.reindex_from_flat_files(
             config.stopatheight,
             Some(startup_progress.clone()),
+            reindex_floor,
         ) {
             eprintln!("Error during reindex: {}", e);
             auth.cleanup();
             node::shutdown::exit_now(1);
         }
-        // Finished, even when `-stopatheight` cut the connect short: the
-        // block index then ends where the chainstate does, which is an
-        // ordinary node P2P can extend.
+        // Finished, even when `-stopatheight` cut the connect short or the
+        // block files ended below the previous tip: the block index then
+        // ends where the chainstate does, which is an ordinary node P2P can
+        // extend.
         remove_rebuild_marker(&net_datadir, &auth);
         // Mirror PR #185's IBD behavior: when `-stopatheight` is set
         // and reindex halts at the target, exit cleanly. The operator's
@@ -5475,6 +5512,54 @@ mod interrupted_rebuild_tests {
         assert!(matches!(act(&m, false, false, true), InterruptedRebuild::Refuse(_)));
         assert_eq!(act(&m, false, true, false), InterruptedRebuild::Proceed);
         assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
+    }
+
+    /// Issue #504. The floor is the highest height any source knows the node
+    /// reached, so a retry after an interrupted `-reindex` (whose database
+    /// holds only the partial tip) and a start whose chain database was
+    /// deleted by hand are both held to the real one.
+    ///
+    /// Perturbation: drop any one source from `reindex_coverage_floor` and
+    /// the matching assertion fails.
+    #[test]
+    fn the_reindex_floor_is_the_highest_known_tip() {
+        let unfinished = marker(RebuildKind::Full);
+        let floor = |tip, unfinished, shutdown| {
+            super::reindex_coverage_floor(tip, unfinished, shutdown, false)
+        };
+        assert_eq!(floor(None, None, None), None, "a new datadir has no floor");
+        assert_eq!(floor(Some(800_000), None, None), Some(800_000));
+        assert_eq!(
+            floor(Some(12), Some(&unfinished), None),
+            Some(967_870),
+            "an interrupted run's partial tip must not lower the floor"
+        );
+        assert_eq!(
+            floor(None, None, Some(900_000)),
+            Some(900_000),
+            "the shutdown marker outlives a deleted chain database"
+        );
+        assert_eq!(floor(Some(970_000), Some(&unfinished), Some(969_000)), Some(970_000));
+        let unreadable = Found::Unreadable("expected value".into());
+        assert_eq!(floor(Some(5), Some(&unreadable), None), Some(5));
+    }
+
+    /// A pruned node's reindex ends low on purpose: pruning deleted the
+    /// oldest block files, and the node downloads the chain again.
+    ///
+    /// Perturbation: drop the `pruning` early return and this fails.
+    #[test]
+    fn a_pruned_node_has_no_reindex_floor() {
+        let unfinished = marker(RebuildKind::Full);
+        assert_eq!(
+            super::reindex_coverage_floor(
+                Some(970_000),
+                Some(&unfinished),
+                Some(970_000),
+                true
+            ),
+            None
+        );
     }
 
     #[test]
