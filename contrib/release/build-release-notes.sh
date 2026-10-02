@@ -17,12 +17,15 @@
 #   - Prepends a banner linking to the canonical rendered file at the tag, then
 #     emits the notes with their repo-relative links rewritten to absolute
 #     blob URLs at the tag, so every link resolves from the release page.
+#   - Refuses a body over 100,000 bytes, which GitHub would truncate once the
+#     workflow appends its generated PR list.
 #
 # Exit codes:
 #   0   body written
 #   3   no release-notes file for this version (caller may fall back to
 #       auto-generated notes — e.g. an -rcN pre-release tag)
-#   1   found but malformed (empty), or other hard error
+#   1   found but malformed (empty), too long for a GitHub release body, or
+#       other hard error
 #   64  usage error
 #
 # Usage:
@@ -98,9 +101,23 @@ emit() {
         "$notes"
 }
 
+# GitHub truncates a release body at 125,000 characters, silently and
+# mid-sentence, and the release workflow appends GitHub's generated PR list
+# after this body (about 14,000 characters for 0.6.0's 108 PRs). v0.5.0 lost
+# its upgrade notes that way. The curated notes get 100,000 and the list the
+# rest. Counted in bytes, which are never fewer than characters.
+MAX_BODY_BYTES=100000
+
+body="$(emit)"
+size=$(printf '%s\n' "$body" | wc -c)
+if (( size > MAX_BODY_BYTES )); then
+    echo "::error::release body from ${notes} is ${size} bytes; the limit is ${MAX_BODY_BYTES}, so GitHub would cut it short once the generated PR list is appended. Condense the notes." >&2
+    exit 1
+fi
+
 if [[ -n "$OUTPUT" ]]; then
-    emit > "$OUTPUT"
-    echo "wrote release body to ${OUTPUT} (from ${notes})" >&2
+    printf '%s\n' "$body" > "$OUTPUT"
+    echo "wrote release body to ${OUTPUT} (from ${notes}, ${size} bytes)" >&2
 else
-    emit
+    printf '%s\n' "$body"
 fi
