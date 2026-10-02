@@ -1,0 +1,51 @@
+name: Release notes
+
+# Every docs/release-notes file has to render to a GitHub Release body that
+# fits once the release workflow appends GitHub's generated PR list;
+# contrib/release/build-release-notes.sh refuses one that would not. Checked
+# on the pull request that grows a file, because at the tag it is too late:
+# the notes at a tagged commit can only be fixed with a new tag.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'docs/release-notes/**'
+      - 'contrib/release/build-release-notes.sh'
+      - '.github/workflows/release-notes.yml'
+
+concurrency:
+  group: release-notes-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fit:
+    name: Release notes fit a GitHub release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Render every release-notes file
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in docs/release-notes/[0-9]*.md; do
+            v="$(basename "$f" .md)"
+            v="${v%-pre}"
+            # A -pre file warns that it is not renamed yet; show the script's
+            # output only when it refuses.
+            if out="$(contrib/release/build-release-notes.sh \
+                        --repo "$GITHUB_REPOSITORY" --tag "v$v" \
+                        --output /dev/null 2>&1)"; then
+              echo "ok    ${out##*$'\n'}"
+            else
+              echo "$out"
+              fail=1
+            fi
+          done
+          exit "$fail"
