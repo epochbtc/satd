@@ -112,7 +112,6 @@ run_compose() {
 # into /etc/default/satd, which is the only place satd will actually read it
 # from: a `signet=1` line in a config file is accepted and then ignored.
 render_config() {
-    SATD_STACK_SUBNET="$(stack_subnet)" \
     SATD_TLS_HOSTNAME="$(hostname)" \
         "$LIB/configure-network" "$1"
 }

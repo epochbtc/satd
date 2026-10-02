@@ -32,6 +32,8 @@ services:
     environment:
       NETWORK: ${NETWORK:-signet}
       SATD_MCP: ${SATD_MCP:-0}
+      # Read by the satd-init in images up to 0.6.0-rc1, which put the
+      # subnet in rpcallowip; later images ignore it.
       SATD_STACK_SUBNET: ${SATD_STACK_SUBNET:-10.77.0.0/24}
       SATD_TLS_HOSTNAME: ${SATD_TLS_HOSTNAME:-satd}
       SATD_P2P_PORT: ${SATD_P2P_PORT:-38333}
@@ -104,8 +106,8 @@ volumes:
 
 networks:
   satd:
-    # A fixed subnet so bitcoin.conf's rpcallowip can name it exactly rather
-    # than opening RPC to every RFC1918 address.
+    # A fixed subnet: satd images up to 0.6.0-rc1 name it in rpcallowip
+    # (see satd-init above).
     ipam:
       config:
         - subnet: ${SATD_STACK_SUBNET:-10.77.0.0/24}

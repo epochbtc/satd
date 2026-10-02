@@ -17,6 +17,7 @@ item below is (or will be) written up in full in the in-development
 
 ### Changed
 
+- `satd-init` (the reference stack, the appliance, Umbrel and StartOS) writes `rpcallowip=0.0.0.0/0`. The allowlist now gates the published TLS JSON-RPC listener too, and the stack-subnet list it wrote refused every client on the LAN before the handshake. The plain listener is kept off the LAN by the network, as the other plain listeners already were.
 - `satd-init` (the reference stack, Umbrel and StartOS) writes `upgradechainstate=1` for a satd that has the flag, so an app-store node rebuilds its chainstate from the block files by itself on the first start after a release that changes the format, and restarts a rebuild a power cut interrupted.
 - sat-tui draws the mempool size and UTXO age histograms as log-scaled bar charts, four rows tall with each bucket's count on its bar, instead of one-row linear sparklines that showed the largest bucket and flattened the rest. Both tails of each distribution are now visible. The age chart marks its young buckets as estimates while the node is still building its exact counts.
 - **Storage: every index is keyed on a dense transaction ordinal instead of a 32-byte txid.** Four schema steps, 3 → 7, and **one** `-reindex-chainstate` for all of them; the block files are untouched and nothing is re-downloaded. A fully indexed mainnet chainstate is projected to drop from ~826 GB to ~449 GB. Pruned datadirs must resync. The four bullets below are the individual steps.

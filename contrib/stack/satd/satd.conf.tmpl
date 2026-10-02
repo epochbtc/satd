@@ -13,8 +13,8 @@
 # Plain listeners bind the compose network only and are NOT published to
 # the host: RPC, Electrum, Esplora and the metrics endpoint are how the
 # overlay containers (LND, NBXplorer, RTL, the mint) talk to satd, and
-# those clients have no way to trust a private CA. `rpcallowip` narrows
-# the RPC surface to this stack's own subnet.
+# those clients have no way to trust a private CA. What keeps them inside
+# is where they are reachable from, not `rpcallowip` (see JSON-RPC below).
 #
 # TLS listeners bind 0.0.0.0 and ARE published. Everything that leaves the
 # host is TLS, presenting the per-install certificate from tls/mkca.sh.
@@ -55,9 +55,14 @@ peerblockfilters=1
 server=1
 rpcbind=0.0.0.0
 rpcport=@RPC_PORT@
-# The stack's own subnet, plus loopback for `docker exec satd sat-cli`.
-rpcallowip=127.0.0.1
-rpcallowip=@SUBNET@
+# `rpcallowip` gates the TLS listener too, and that one is published: its
+# clients are wherever the operator's wallets are, so the list admits every
+# address. A narrower list refuses them before the TLS handshake. The plain
+# listener is kept off the LAN by the network instead, as the other plain
+# listeners already are: it is never published directly (StartOS fronts it
+# with its own TLS proxy), and the appliance, which runs satd on the host,
+# opens 8332 at nftables to the stack subnet only.
+rpcallowip=0.0.0.0/0
 rpctlsbind=0.0.0.0:@RPC_TLS_PORT@
 rpctlscert=@TLS_DIR@/fullchain.crt
 rpctlskey=@TLS_DIR@/leaf.key

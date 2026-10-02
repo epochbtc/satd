@@ -21,9 +21,8 @@
 #   SATD_HOST=10.77.0.1 docker compose \
 #       -f compose.appliance.yml -f compose.lightning.yml up -d
 #
-# satd itself binds 0.0.0.0 so the gateway reaches it. bitcoin.conf's
-# rpcallowip limits that to this subnet, and nftables keeps every plain
-# listener off the LAN entirely.
+# satd itself binds 0.0.0.0 so the gateway reaches it, and nftables keeps
+# every plain listener off the LAN: only this subnet reaches them.
 
 name: satd-appliance
 
