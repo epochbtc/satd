@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # satd-init's guarded keys (status page, metrics over TLS, chainstate
-# upgrades), against stub binaries.
+# upgrades) and the JSON-RPC allowlist, against stub binaries.
 #
 # Each must be written for a satd that has the key and not for one that does
 # not: satd refuses an unknown config key, so the second case is the
@@ -77,6 +77,18 @@ if grep -q '^upgradechainstate' "$WORK/b/bitcoin.conf"; then
     bad "wrote upgradechainstate for a satd without it"
 else
     ok "writes nothing for a satd without it"
+fi
+
+echo "== satd-init: JSON-RPC over TLS from the LAN =="
+# rpcallowip gates the published TLS listener as well as the plain one, so a
+# list naming only the stack subnet refuses every wallet on the LAN before the
+# handshake. The appliance boot test sees that as an `unexpected eof`.
+render "$WORK/new/satd" "$WORK/d" SATD_STACK_SUBNET=10.99.0.0/24
+if grep -q '^rpctlsbind=0\.0\.0\.0:' "$WORK/d/bitcoin.conf" \
+    && grep -qx 'rpcallowip=0.0.0.0/0' "$WORK/d/bitcoin.conf"; then
+    ok "the TLS listener admits a client outside the stack subnet"
+else
+    bad "TLS RPC refuses the LAN: $(grep -E '^rpc(allowip|tlsbind)' "$WORK/d/bitcoin.conf" | tr '\n' ' ')"
 fi
 
 echo
