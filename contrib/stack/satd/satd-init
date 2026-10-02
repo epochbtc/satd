@@ -26,7 +26,6 @@ TEMPLATE="${SATD_CONF_TEMPLATE:-/etc/satd/satd.conf.tmpl}"
 MKCA="${SATD_MKCA:-/usr/local/bin/satd-mkca}"
 
 NETWORK="${NETWORK:-signet}"
-SUBNET="${SATD_STACK_SUBNET:-10.77.0.0/24}"
 TLS_HOSTNAME="${SATD_TLS_HOSTNAME:-$(hostname)}"
 MCP_ENABLED="${SATD_MCP:-0}"
 # Further names to put in MCP's Host allowlist, comma-separated. The names
@@ -107,7 +106,6 @@ render() {
         -e "s|@ESPLORA_TLS_PORT@|$ESPLORA_TLS_PORT|g" \
         -e "s|@METRICS_PORT@|$METRICS_PORT|g" \
         -e "s|@ZMQ_PORT@|$ZMQ_PORT|g" \
-        -e "s|@SUBNET@|$SUBNET|g" \
         -e "s|@TLS_DIR@|$TLS_DIR|g" \
         "$TEMPLATE"
 }
