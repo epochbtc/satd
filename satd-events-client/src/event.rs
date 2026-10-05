@@ -842,9 +842,164 @@ pub enum Event {
         /// via `SetWatchOptions.include_raw_tx`; `None` otherwise.
         raw_tx: Option<Vec<u8>>,
     },
+    /// An incremental watch add (`add_scripts`, `add_outpoints`, …) that the
+    /// server did **not** register: over the quota, over the per-add rate
+    /// limit, over a per-connection cap, without `stream:watch`, or malformed.
+    /// None of the items it names is watched. Items the add re-asserted
+    /// (already watched) are not named and stay watched. The server sends
+    /// nothing for an add that registered.
+    ///
+    /// [`ResilientWatch`](crate::ResilientWatch) drops the named items from its
+    /// mirror before handing this on, so a reconnect does not re-register
+    /// them; re-add them yourself if you want another try (for example after
+    /// [`retry_after_secs`](WatchAddRejected::retry_after_secs) on a rate limit).
+    WatchAddRejected(WatchAddRejected),
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,
+}
+
+/// The payload of [`Event::WatchAddRejected`]: which add was refused, why, and
+/// the items it named. Only the item field for [`kind`](Self::kind) is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WatchAddRejected {
+    /// Which kind of add was refused.
+    pub kind: WatchAddKind,
+    /// Why it was refused.
+    pub reason: WatchAddRejectReason,
+    /// [`QuotaExceeded`](WatchAddRejectReason::QuotaExceeded): the units the
+    /// refused items cost. [`CapExceeded`](WatchAddRejectReason::CapExceeded):
+    /// the count the add would have reached. 0 otherwise.
+    pub required: u64,
+    /// `QuotaExceeded`: the units the token already holds. 0 otherwise.
+    pub held: u64,
+    /// `QuotaExceeded`: the token's unit quota. `CapExceeded`: the cap. 0
+    /// otherwise.
+    pub quota: u64,
+    /// [`RateLimited`](WatchAddRejectReason::RateLimited): seconds until the
+    /// rate limit admits another add. 0 otherwise.
+    pub retry_after_secs: u32,
+    /// Refused scripthashes (32 bytes each).
+    pub scripthashes: Vec<Vec<u8>>,
+    /// Refused outpoints, as `(txid, vout)` (txid in internal byte order).
+    pub outpoints: Vec<(Vec<u8>, u32)>,
+    /// Refused lifecycle watches, by txid.
+    pub txids: Vec<Vec<u8>>,
+    /// Refused depth alarms, as `(txid, depth)`.
+    pub depth_alarms: Vec<(Vec<u8>, u32)>,
+    /// The refused descriptor and the window it asked for.
+    pub descriptor: Option<RejectedDescriptor>,
+    /// Refused script prefixes, as `(prefix, bits)` with the prefix masked to
+    /// `bits`.
+    pub prefixes: Vec<(Vec<u8>, u32)>,
+    /// Refused silent-payment targets, by scan pubkey `b_scan·G` (33 bytes).
+    pub scan_pubkeys: Vec<Vec<u8>>,
+}
+
+/// A descriptor named by a [`WatchAddRejected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RejectedDescriptor {
+    /// The descriptor string the add carried.
+    pub descriptor: String,
+    /// The window size the add asked for.
+    pub gap_limit: u32,
+    /// The window start the add asked for.
+    pub start: u32,
+    /// `true` when an earlier window of this descriptor stays watched (a refused
+    /// slide); `false` when the descriptor is not watched at all.
+    pub kept: bool,
+}
+
+/// Which kind of add a [`WatchAddRejected`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchAddKind {
+    /// `add_scripts`.
+    Scripts,
+    /// `add_outpoints`.
+    Outpoints,
+    /// `add_tx_lifecycle`.
+    Transactions,
+    /// `add_depth_alarms`.
+    DepthAlarms,
+    /// `add_descriptor`.
+    Descriptor,
+    /// `add_script_prefixes`.
+    ScriptPrefixes,
+    /// `add_silent_payments`.
+    SilentPayments,
+    /// A kind code this client build does not recognize (a newer server).
+    Unknown,
+}
+
+/// Why the server refused an incremental add (see [`Event::WatchAddRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchAddRejectReason {
+    /// The refused items' unit cost does not fit the token's watch quota. Remove
+    /// watches, or ask the operator for a larger quota.
+    QuotaExceeded,
+    /// The token's per-add rate limit is spent. The same add can succeed after
+    /// `retry_after_secs`.
+    RateLimited,
+    /// A per-connection cap: 16 silent-payment targets, 256 descriptors, or the
+    /// WebSocket entry cap. Remove watches on this connection first.
+    CapExceeded,
+    /// The token lacks the `stream:watch` capability.
+    PermissionDenied,
+    /// The add could not be applied as a whole (a `min_values` list not parallel
+    /// to its scripthashes, an invalid descriptor, too many txid × depth
+    /// pairs). A client bug: the same add will fail again.
+    Malformed,
+    /// A reason code this client build does not recognize (a newer server).
+    Unknown,
+}
+
+impl WatchAddRejected {
+    pub(crate) fn from_proto(r: pb::WatchAddRejected) -> Self {
+        use pb::watch_add_rejected::{Kind, Reason};
+        let kind = match Kind::try_from(r.kind) {
+            Ok(Kind::Scripts) => WatchAddKind::Scripts,
+            Ok(Kind::Outpoints) => WatchAddKind::Outpoints,
+            Ok(Kind::Transactions) => WatchAddKind::Transactions,
+            Ok(Kind::DepthAlarms) => WatchAddKind::DepthAlarms,
+            Ok(Kind::Descriptor) => WatchAddKind::Descriptor,
+            Ok(Kind::ScriptPrefixes) => WatchAddKind::ScriptPrefixes,
+            Ok(Kind::SilentPayments) => WatchAddKind::SilentPayments,
+            Ok(Kind::Unspecified) | Err(_) => WatchAddKind::Unknown,
+        };
+        let reason = match Reason::try_from(r.reason) {
+            Ok(Reason::QuotaExceeded) => WatchAddRejectReason::QuotaExceeded,
+            Ok(Reason::RateLimited) => WatchAddRejectReason::RateLimited,
+            Ok(Reason::CapExceeded) => WatchAddRejectReason::CapExceeded,
+            Ok(Reason::PermissionDenied) => WatchAddRejectReason::PermissionDenied,
+            Ok(Reason::Malformed) => WatchAddRejectReason::Malformed,
+            Ok(Reason::Unspecified) | Err(_) => WatchAddRejectReason::Unknown,
+        };
+        let descriptor = (kind == WatchAddKind::Descriptor).then(|| RejectedDescriptor {
+            descriptor: r.descriptor,
+            gap_limit: r.gap_limit,
+            start: r.start,
+            kept: r.descriptor_kept,
+        });
+        WatchAddRejected {
+            kind,
+            reason,
+            required: r.required,
+            held: r.held,
+            quota: r.quota,
+            retry_after_secs: r.retry_after_secs,
+            scripthashes: r.scripthashes,
+            outpoints: r.outpoints.into_iter().map(|o| (o.txid, o.vout)).collect(),
+            txids: r.txids,
+            depth_alarms: r.depth_alarms.into_iter().map(|d| (d.txid, d.depth)).collect(),
+            descriptor,
+            prefixes: r.prefixes.into_iter().map(|p| (p.prefix, p.bits)).collect(),
+            scan_pubkeys: r.scan_pubkeys,
+        }
+    }
 }
 
 /// Why a mid-stream re-anchor was declined by the server (see
@@ -1044,6 +1199,7 @@ impl From<pb::NodeEvent> for Event {
                 },
                 None => Event::Unknown,
             },
+            Body::WatchAddRejected(r) => Event::WatchAddRejected(WatchAddRejected::from_proto(r)),
             Body::RescanResult(r) => match r.outcome {
                 Some(pb::rescan_result::Outcome::Accepted(a)) => Event::RescanAccepted {
                     from_height: a.from_height,

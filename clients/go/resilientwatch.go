@@ -750,6 +750,10 @@ func (w *ResilientWatch) handleEvent(ctx context.Context, ev Event, cur *Cursor,
 	// completed txid. The node reports the REQUESTED threshold as depth (the
 	// alarm's identity), so that is the exact key to drop.
 	switch e := ev.(type) {
+	case *WatchAddRejected:
+		// The node refused an add: it does not hold these items, so a reconnect
+		// must not re-register them.
+		w.mirror.forgetRejected(e)
 	case *TxidDepthReached:
 		if t, ok := txid32(e.Txid); ok {
 			w.mirror.removeDepthAlarms([][32]byte{t}, []uint32{e.Depth})

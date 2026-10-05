@@ -44,6 +44,57 @@ func (w *WatchSet) removeDepthAlarms(txids [][32]byte, depths []uint32) {
 
 func (w *WatchSet) removeDescriptor(descriptor string) {
 	delete(w.descriptors, descriptor)
+	delete(w.descriptorPrev, descriptor)
+}
+
+// forgetRejected drops what the node refused to register, so the mirror holds
+// only what the node holds. Items are named exactly as the node echoes them; a
+// prefix comes back masked, which removeScriptPrefixes matches.
+func (w *WatchSet) forgetRejected(r *WatchAddRejected) {
+	for _, h := range r.Scripthashes {
+		if t, ok := txid32(h); ok {
+			w.removeScripts(t)
+		}
+	}
+	for _, o := range r.Outpoints {
+		if t, ok := txid32(o.Txid); ok {
+			w.removeOutpoints(OutpointRef{Txid: t, Vout: o.Vout})
+		}
+	}
+	for _, t := range r.Txids {
+		if id, ok := txid32(t); ok {
+			w.removeTxLifecycle(id)
+		}
+	}
+	for _, a := range r.DepthAlarms {
+		if t, ok := txid32(a.Txid); ok {
+			w.removeDepthAlarms([][32]byte{t}, []uint32{a.Depth})
+		}
+	}
+	w.removeScriptPrefixes(r.Prefixes...)
+	for _, k := range r.ScanPubkeys {
+		var id [33]byte
+		if len(k) == len(id) {
+			copy(id[:], k)
+			w.removeSilentPayments(id)
+		}
+	}
+	if d := r.Descriptor; d != nil {
+		// Only the window the refusal names; a later slide already replaced it.
+		if cur, ok := w.descriptors[d.Descriptor]; ok && cur == (descriptorWindow{gapLimit: d.GapLimit, start: d.Start}) {
+			prev, hadPrev := w.descriptorPrev[d.Descriptor]
+			delete(w.descriptorPrev, d.Descriptor)
+			switch {
+			case d.Kept && hadPrev:
+				w.descriptors[d.Descriptor] = prev
+			case d.Kept:
+				// Kept, but the mirror never saw the earlier window (a
+				// loader-built set): leave the requested one to replay.
+			default:
+				delete(w.descriptors, d.Descriptor)
+			}
+		}
+	}
 }
 
 func (w *WatchSet) removeScriptPrefixes(prefixes ...ScriptPrefix) {
@@ -95,6 +146,12 @@ func (w *WatchSet) clone() *WatchSet {
 		out.descriptors = make(map[string]descriptorWindow, len(w.descriptors))
 		for k, v := range w.descriptors {
 			out.descriptors[k] = v
+		}
+	}
+	if len(w.descriptorPrev) > 0 {
+		out.descriptorPrev = make(map[string]descriptorWindow, len(w.descriptorPrev))
+		for k, v := range w.descriptorPrev {
+			out.descriptorPrev[k] = v
 		}
 	}
 	if len(w.prefixes) > 0 {
@@ -196,9 +253,8 @@ func (w *WatchSet) controlMessages() ([]*eventspb.SubscribeControl, error) {
 	// AddTransactions is a txids x min_depths CROSS PRODUCT, so every txid
 	// sharing the same depth set travels in one message. Emitting one message
 	// per txid instead spent one server rate-limit token per alarmed txid on
-	// every reconnect, and the node sheds an over-budget add SILENTLY, with no
-	// ack - so on a rate-limited node most alarms were simply never
-	// re-registered. Wallets tend to use the same few depth sets throughout,
+	// every reconnect, and the node refuses an over-budget add - so on a
+	// rate-limited node most alarms were never re-registered. Wallets tend to use the same few depth sets throughout,
 	// which collapses hundreds of messages into a handful.
 	{
 		bySet := map[string][][]byte{}

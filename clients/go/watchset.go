@@ -39,6 +39,9 @@ type WatchSet struct {
 	depthAlarms map[depthAlarm]struct{}
 	// descriptors maps a descriptor string to its latest window.
 	descriptors map[string]descriptorWindow
+	// descriptorPrev maps a descriptor to the window its latest add replaced,
+	// so a slide the node refuses can fall back to the window the node holds.
+	descriptorPrev map[string]descriptorWindow
 	// prefixes is the set of registered buckets, keyed by (bits, prefix hex) so
 	// the byte slice does not have to be a map key.
 	prefixes map[prefixKey]ScriptPrefix
@@ -131,7 +134,18 @@ func (w *WatchSet) AddDescriptor(descriptor string, gapLimit, start uint32) *Wat
 	if w.descriptors == nil {
 		w.descriptors = map[string]descriptorWindow{}
 	}
-	w.descriptors[descriptor] = descriptorWindow{gapLimit: gapLimit, start: start}
+	win := descriptorWindow{gapLimit: gapLimit, start: start}
+	prev, had := w.descriptors[descriptor]
+	w.descriptors[descriptor] = win
+	switch {
+	case had && prev != win:
+		if w.descriptorPrev == nil {
+			w.descriptorPrev = map[string]descriptorWindow{}
+		}
+		w.descriptorPrev[descriptor] = prev
+	case !had:
+		delete(w.descriptorPrev, descriptor)
+	}
 	return w
 }
 

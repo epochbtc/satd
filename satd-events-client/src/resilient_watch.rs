@@ -34,6 +34,11 @@
 //!   caller can escalate to a full resnapshot — the exception, not the rule.
 //! - **Cursor persistence** — confirmed cursors are committed-on-poll to a
 //!   shared [`CursorStore`], so a resume survives reconnects and restarts.
+//! - **Refused adds leave the mirror** — when the server answers an add with
+//!   [`Event::WatchAddRejected`], the items it names are dropped from the mirror
+//!   (a refused descriptor slide falls back to the window it replaced), so a
+//!   reconnect re-registers only what the server actually holds. The event is
+//!   still handed to the caller.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -47,7 +52,7 @@ use crate::client::{
     validate_prefix, AutoClose, EventStream, SilentPaymentTarget, StreamClient, WatchHandle,
 };
 use crate::error::StreamError;
-use crate::event::{Cursor, CursorRejectReason, Event};
+use crate::event::{Cursor, CursorRejectReason, Event, WatchAddRejected};
 use crate::resilience::{Backoff, CursorStore, NoopCursorStore};
 
 /// A boxed integrator error returned by a watch-set loader.
@@ -87,6 +92,9 @@ pub(crate) struct WatchSetMirror {
     depth_alarms: BTreeSet<(Txid, u32)>,
     /// Descriptor → its latest `(gap_limit, start)` window.
     descriptors: BTreeMap<String, (u32, u32)>,
+    /// Descriptor → the window its latest add replaced, so a slide the server
+    /// refuses can fall back to the window the server still holds.
+    descriptor_prev: BTreeMap<String, (u32, u32)>,
     /// Script-prefix buckets, as `(bits, prefix)` (validated on insert).
     prefixes: BTreeSet<(u32, Vec<u8>)>,
     /// BIP 352 scan-key targets, keyed by identity `b_scan·G` (33 bytes) — the
@@ -148,11 +156,61 @@ impl WatchSetMirror {
     }
 
     fn add_descriptor(&mut self, descriptor: String, gap_limit: u32, start: u32) {
-        self.descriptors.insert(descriptor, (gap_limit, start));
+        let window = (gap_limit, start);
+        match self.descriptors.insert(descriptor.clone(), window) {
+            Some(prev) if prev != window => {
+                self.descriptor_prev.insert(descriptor, prev);
+            }
+            Some(_) => {}
+            None => {
+                self.descriptor_prev.remove(&descriptor);
+            }
+        }
     }
 
     fn remove_descriptor(&mut self, descriptor: &str) {
         self.descriptors.remove(descriptor);
+        self.descriptor_prev.remove(descriptor);
+    }
+
+    /// Drop what the server refused to register, so the mirror holds only what
+    /// the server holds. Items are named exactly as the server echoes them.
+    fn forget_rejected(&mut self, r: &WatchAddRejected) {
+        let fixed = |b: &Vec<u8>| <[u8; 32]>::try_from(b.as_slice()).ok();
+        let scripts: Vec<Scripthash> = r.scripthashes.iter().filter_map(fixed).collect();
+        self.remove_scripts(&scripts);
+        let outpoints: Vec<(Txid, u32)> =
+            r.outpoints.iter().filter_map(|(t, v)| Some((fixed(t)?, *v))).collect();
+        self.remove_outpoints(&outpoints);
+        let txids: Vec<Txid> = r.txids.iter().filter_map(fixed).collect();
+        self.remove_tx_lifecycle(&txids);
+        let alarms: Vec<(Txid, u32)> =
+            r.depth_alarms.iter().filter_map(|(t, d)| Some((fixed(t)?, *d))).collect();
+        self.remove_depth_alarms(&alarms);
+        // The server echoes a prefix masked to its bits; the mirror holds it as
+        // the caller wrote it.
+        for (prefix, bits) in &r.prefixes {
+            self.prefixes.retain(|(b, p)| !(b == bits && mask_prefix(p, *b) == *prefix));
+        }
+        let ids: Vec<[u8; 33]> =
+            r.scan_pubkeys.iter().filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok()).collect();
+        self.remove_silent_payments(&ids);
+        if let Some(d) = &r.descriptor {
+            // Only the window the refusal names; a later slide already replaced it.
+            if self.descriptors.get(&d.descriptor) == Some(&(d.gap_limit, d.start)) {
+                match self.descriptor_prev.remove(&d.descriptor) {
+                    Some(prev) if d.kept => {
+                        self.descriptors.insert(d.descriptor.clone(), prev);
+                    }
+                    // Kept, but the mirror never saw the earlier window (a
+                    // loader-built set): leave the requested one to replay.
+                    None if d.kept => {}
+                    _ => {
+                        self.descriptors.remove(&d.descriptor);
+                    }
+                }
+            }
+        }
     }
 
     fn add_prefixes(&mut self, items: &[pb::ScriptPrefix]) {
@@ -1584,6 +1642,9 @@ impl ResilientWatch {
         // is the exact `(txid, depth)` key to drop; a finalize evicts the whole
         // lifecycle watch for the txid.
         match &ev {
+            // The server refused an add: it does not hold these items, so a
+            // reconnect must not re-register them.
+            Event::WatchAddRejected(r) => self.mirror.forget_rejected(r),
             Event::TxidDepthReached { txid, depth, .. } => {
                 if let Ok(t) = <[u8; 32]>::try_from(txid.as_slice()) {
                     self.mirror.remove_depth_alarms(&[(t, *depth)]);
@@ -1786,6 +1847,18 @@ impl ResilientWatch {
         self.committed = Some(c);
         Ok(())
     }
+}
+
+/// `prefix` with the bits past `bits` cleared, as the server echoes it.
+fn mask_prefix(prefix: &[u8], bits: u32) -> Vec<u8> {
+    let mut out = prefix.to_vec();
+    let rem = bits % 8;
+    if rem != 0
+        && let Some(last) = out.get_mut((bits / 8) as usize)
+    {
+        *last &= 0xffu8 << (8 - rem);
+    }
+    out
 }
 
 /// `txids × depths` as flattened pairs.
@@ -2393,6 +2466,129 @@ mod tests {
             !w.mirror.tx_lifecycles.contains_key(&[8u8; 32]),
             "auto-close finalize prunes the lifecycle watch the server evicted"
         );
+    }
+
+    // --- refused adds leave the mirror ----------------------------------------
+
+    fn refused(r: pb::WatchAddRejected) -> Event {
+        Event::WatchAddRejected(WatchAddRejected::from_proto(r))
+    }
+
+    #[tokio::test]
+    async fn refused_adds_are_pruned_from_the_mirror() {
+        use pb::watch_add_rejected::{Kind, Reason};
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+        w.add_outpoints([([3u8; 32], 0), ([3u8; 32], 1)]).await.unwrap();
+        // 12 bits: the caller's low nibble survives in the mirror, the server
+        // echoes it masked.
+        w.add_script_prefixes([(vec![0xab, 0xcd], 12)]).await.unwrap();
+
+        let out = w
+            .handle_event(
+                refused(pb::WatchAddRejected {
+                    kind: Kind::Scripts as i32,
+                    reason: Reason::QuotaExceeded as i32,
+                    scripthashes: vec![vec![2u8; 32]],
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(Event::WatchAddRejected(_))), "still surfaced to the caller");
+        assert!(w.mirror.scripts.contains_key(&[1u8; 32]), "an item the server holds stays");
+        assert!(!w.mirror.scripts.contains_key(&[2u8; 32]), "a refused script is dropped");
+
+        w.handle_event(
+            refused(pb::WatchAddRejected {
+                kind: Kind::Outpoints as i32,
+                reason: Reason::RateLimited as i32,
+                outpoints: vec![pb::Outpoint { txid: vec![3u8; 32], vout: 1 }],
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(w.mirror.outpoints.contains(&([3u8; 32], 0)));
+        assert!(!w.mirror.outpoints.contains(&([3u8; 32], 1)));
+
+        w.handle_event(
+            refused(pb::WatchAddRejected {
+                kind: Kind::ScriptPrefixes as i32,
+                reason: Reason::CapExceeded as i32,
+                prefixes: vec![pb::ScriptPrefix { prefix: vec![0xab, 0xc0], bits: 12 }],
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(w.mirror.prefixes.is_empty(), "the masked echo matches the caller's prefix");
+    }
+
+    #[tokio::test]
+    async fn refused_descriptor_slide_falls_back_to_the_window_the_server_holds() {
+        use pb::watch_add_rejected::{Kind, Reason};
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        w.add_descriptor("wpkh(a)", 20, 0).await.unwrap();
+        w.add_descriptor("wpkh(a)", 20, 20).await.unwrap();
+        w.add_descriptor("wpkh(b)", 20, 0).await.unwrap();
+
+        // The slide of `a` to start 20 is refused; the server keeps start 0.
+        w.handle_event(
+            refused(pb::WatchAddRejected {
+                kind: Kind::Descriptor as i32,
+                reason: Reason::QuotaExceeded as i32,
+                descriptor: "wpkh(a)".into(),
+                gap_limit: 20,
+                start: 20,
+                descriptor_kept: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.mirror.descriptors.get("wpkh(a)"), Some(&(20, 0)), "replays the held window");
+
+        // A brand-new descriptor that is refused is not watched at all.
+        w.handle_event(
+            refused(pb::WatchAddRejected {
+                kind: Kind::Descriptor as i32,
+                reason: Reason::CapExceeded as i32,
+                descriptor: "wpkh(b)".into(),
+                gap_limit: 20,
+                start: 0,
+                descriptor_kept: false,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!w.mirror.descriptors.contains_key("wpkh(b)"));
+
+        // A refusal for a window the caller already slid past changes nothing.
+        w.add_descriptor("wpkh(a)", 20, 40).await.unwrap();
+        w.handle_event(
+            refused(pb::WatchAddRejected {
+                kind: Kind::Descriptor as i32,
+                reason: Reason::RateLimited as i32,
+                descriptor: "wpkh(a)".into(),
+                gap_limit: 20,
+                start: 20,
+                descriptor_kept: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.mirror.descriptors.get("wpkh(a)"), Some(&(20, 40)));
     }
 
     // --- cursor persistence (commit-on-poll) ----------------------------------

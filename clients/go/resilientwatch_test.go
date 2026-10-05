@@ -1107,3 +1107,90 @@ func waitForAddScripts(t *testing.T, s *scriptedWatch) *eventspb.SubscribeContro
 	t.Fatalf("no AddScripts control on any of %d leg(s)", s.legCount())
 	return nil
 }
+
+// TestRefusedAddsArePrunedFromTheMirror: a WatchAddRejected names items the
+// node does not hold. Re-registering them on every reconnect would repeat the
+// refusal forever, so the mirror drops them; a refused descriptor slide falls
+// back to the window the node still holds. The event still reaches the caller.
+func TestRefusedAddsArePrunedFromTheMirror(t *testing.T) {
+	kept := [32]byte{0x01}
+	refused := [32]byte{0x02}
+	client, _ := startScriptedWatch(t,
+		func(l *watchLeg, s eventspb.NodeEventStream_WatchServer) error {
+			deadline := time.Now().Add(5 * time.Second)
+			// The adds land before the stream connects, so the mirror replays
+			// its net set: AddScripts, AddDescriptor (latest window) and
+			// AddScriptPrefixes.
+			for time.Now().Before(deadline) && len(l.controls()) < 3 {
+				time.Sleep(time.Millisecond)
+			}
+			for _, r := range []*eventspb.WatchAddRejected{
+				{
+					Kind:         eventspb.WatchAddRejected_SCRIPTS,
+					Reason:       eventspb.WatchAddRejected_QUOTA_EXCEEDED,
+					Scripthashes: [][]byte{append([]byte(nil), refused[:]...)},
+				},
+				{
+					// 12 bits: the node echoes the prefix masked.
+					Kind:     eventspb.WatchAddRejected_SCRIPT_PREFIXES,
+					Reason:   eventspb.WatchAddRejected_CAP_EXCEEDED,
+					Prefixes: []*eventspb.ScriptPrefix{{Prefix: []byte{0xab, 0xc0}, Bits: 12}},
+				},
+				{
+					Kind:        eventspb.WatchAddRejected_DESCRIPTOR,
+					Reason:      eventspb.WatchAddRejected_RATE_LIMITED,
+					Descriptor_: "wpkh(a)", GapLimit: 20, Start: 20, DescriptorKept: true,
+				},
+			} {
+				if err := s.Send(&eventspb.NodeEvent{Body: &eventspb.NodeEvent_WatchAddRejected{WatchAddRejected: r}}); err != nil {
+					return err
+				}
+			}
+			time.Sleep(150 * time.Millisecond)
+			return nil
+		},
+		parkLeg,
+	)
+	w := client.ResilientWatch(context.Background(), ResilientWatchConfig{
+		Backoff: Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Multiplier: 2},
+	})
+	defer func() { _ = w.Close() }()
+
+	ctx := context.Background()
+	if err := w.AddScripts(ctx, ScriptWatch{Scripthash: kept}, ScriptWatch{Scripthash: refused}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddScriptPrefixes(ctx, ScriptPrefix{Prefix: []byte{0xab, 0xcd}, Bits: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddDescriptor(ctx, "wpkh(a)", 20, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddDescriptor(ctx, "wpkh(a)", 20, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	for seen := 0; seen < 3; {
+		ev, err := w.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ev.(*WatchAddRejected); ok {
+			seen++
+		}
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.mirror.scripts[kept]; !ok {
+		t.Error("a script the node holds left the mirror")
+	}
+	if _, ok := w.mirror.scripts[refused]; ok {
+		t.Error("a refused script is still mirrored and would be replayed on reconnect")
+	}
+	if len(w.mirror.prefixes) != 0 {
+		t.Errorf("the masked echo did not match the caller's prefix: %v", w.mirror.prefixes)
+	}
+	if got := w.mirror.descriptors["wpkh(a)"]; got != (descriptorWindow{gapLimit: 20, start: 0}) {
+		t.Errorf("descriptor window = %+v, want the window the node kept (start 0)", got)
+	}
+}
