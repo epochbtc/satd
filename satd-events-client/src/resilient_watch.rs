@@ -95,9 +95,10 @@ pub(crate) struct WatchSetMirror {
     depth_alarms: BTreeSet<(Txid, u32)>,
     /// Descriptor → its latest `(gap_limit, start)` window.
     descriptors: BTreeMap<String, (u32, u32)>,
-    /// Descriptor → the window its latest add replaced, so a slide the server
-    /// refuses can fall back to the window the server still holds.
-    descriptor_prev: BTreeMap<String, (u32, u32)>,
+    /// Descriptor → the windows its earlier adds asked for, oldest first, so a
+    /// slide the server refuses can fall back to the window it still holds.
+    /// Bounded by [`DESCRIPTOR_HISTORY`].
+    descriptor_history: BTreeMap<String, Vec<(u32, u32)>>,
     /// Script-prefix buckets, as `(bits, prefix)` (validated on insert).
     prefixes: BTreeSet<(u32, Vec<u8>)>,
     /// BIP 352 scan-key targets, keyed by identity `b_scan·G` (33 bytes) — the
@@ -162,18 +163,23 @@ impl WatchSetMirror {
         let window = (gap_limit, start);
         match self.descriptors.insert(descriptor.clone(), window) {
             Some(prev) if prev != window => {
-                self.descriptor_prev.insert(descriptor, prev);
+                let history = self.descriptor_history.entry(descriptor).or_default();
+                history.retain(|w| *w != window);
+                history.push(prev);
+                if history.len() > DESCRIPTOR_HISTORY {
+                    history.remove(0);
+                }
             }
             Some(_) => {}
             None => {
-                self.descriptor_prev.remove(&descriptor);
+                self.descriptor_history.remove(&descriptor);
             }
         }
     }
 
     fn remove_descriptor(&mut self, descriptor: &str) {
         self.descriptors.remove(descriptor);
-        self.descriptor_prev.remove(descriptor);
+        self.descriptor_history.remove(descriptor);
     }
 
     /// The part of the mirror a refusal names, for re-sending it: only items the
@@ -246,9 +252,13 @@ impl WatchSetMirror {
             r.scan_pubkeys.iter().filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok()).collect();
         self.remove_silent_payments(&ids);
         if let Some(d) = &r.descriptor {
-            // Only the window the refusal names; a later slide already replaced it.
-            if self.descriptors.get(&d.descriptor) == Some(&(d.gap_limit, d.start)) {
-                match self.descriptor_prev.remove(&d.descriptor) {
+            let refused = (d.gap_limit, d.start);
+            if self.descriptors.get(&d.descriptor) == Some(&refused) {
+                // The node refused the latest window. It handles slides in
+                // order, so what it keeps is the latest earlier window that was
+                // not itself refused.
+                let prev = self.descriptor_history.get_mut(&d.descriptor).and_then(Vec::pop);
+                match prev {
                     Some(prev) if d.kept => {
                         self.descriptors.insert(d.descriptor.clone(), prev);
                     }
@@ -257,8 +267,16 @@ impl WatchSetMirror {
                     None if d.kept => {}
                     _ => {
                         self.descriptors.remove(&d.descriptor);
+                        self.descriptor_history.remove(&d.descriptor);
                     }
                 }
+            } else if let Some(history) = self.descriptor_history.get_mut(&d.descriptor) {
+                // An earlier slide was refused while a later one is pending: that
+                // window cannot be the one the node keeps.
+                history.retain(|w| *w != refused);
+            }
+            if self.descriptor_history.get(&d.descriptor).is_some_and(Vec::is_empty) {
+                self.descriptor_history.remove(&d.descriptor);
             }
         }
     }
@@ -2011,6 +2029,11 @@ impl ResilientWatch {
     }
 }
 
+/// Earlier windows kept per descriptor for a refused slide to fall back to. A
+/// caller slides one step at a time and the server answers in order, so a few
+/// are plenty; the oldest is dropped past this.
+const DESCRIPTOR_HISTORY: usize = 8;
+
 /// `prefix` with the bits past `bits` cleared, as the server echoes it.
 fn mask_prefix(prefix: &[u8], bits: u32) -> Vec<u8> {
     let mut out = prefix.to_vec();
@@ -2733,6 +2756,29 @@ mod tests {
         .await
         .unwrap();
         assert!(!w.mirror.descriptors.contains_key("wpkh(b)"));
+
+        // Two slides in flight, both refused: the fallback is the window held
+        // before either, not the first refused one.
+        w.add_descriptor("wpkh(c)", 20, 0).await.unwrap();
+        w.add_descriptor("wpkh(c)", 20, 20).await.unwrap();
+        w.add_descriptor("wpkh(c)", 20, 40).await.unwrap();
+        for start in [20, 40] {
+            w.handle_event(
+                refused(pb::WatchAddRejected {
+                    kind: Kind::Descriptor as i32,
+                    reason: Reason::QuotaExceeded as i32,
+                    descriptor: "wpkh(c)".into(),
+                    gap_limit: 20,
+                    start,
+                    descriptor_kept: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(w.mirror.descriptors.get("wpkh(c)"), Some(&(20, 0)), "falls back past both refusals");
 
         // A refusal for a window the caller already slid past changes nothing.
         w.add_descriptor("wpkh(a)", 20, 40).await.unwrap();

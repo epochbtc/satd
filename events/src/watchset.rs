@@ -1078,7 +1078,9 @@ impl WatchSet {
     /// push the retained count over the cap, the whole add is shed (like a
     /// descriptor over its cap). All-or-nothing on quota. `register` receives the
     /// net-new targets AND the re-asserted ones so the caller applies label
-    /// updates in the matcher. A rejection names the net-new targets by identity.
+    /// updates in the matcher. A re-assert is free (no rate token) and its label
+    /// update applies even when the add's net-new targets are refused; a
+    /// rejection names only the net-new targets, by identity.
     pub(crate) fn add_silent_payments(
         &mut self,
         principal: Option<&satd_auth::Principal>,
@@ -1104,6 +1106,14 @@ impl WatchSet {
         if net_new.is_empty() && reassert.is_empty() {
             return Ok(());
         }
+        // A re-asserted target is already inside every limit, so its label update
+        // is free and always applies, like a re-asserted script's floor in
+        // `add_items_priced`. Only net-new targets are charged, and only they can
+        // be refused.
+        if net_new.is_empty() {
+            register(&reassert);
+            return Ok(());
+        }
         let rejected = |reason, net_new: &[node::events::SpWatchTarget]| AddRejected {
             reason,
             items: RejectedItems::SilentPayments(net_new.iter().map(|t| t.scan_pubkey()).collect()),
@@ -1121,6 +1131,9 @@ impl WatchSet {
                 requested: (self.silent_payments.len() + net_new.len()) as u64,
                 limit: MAX_SP_TARGETS_PER_CONNECTION as u64,
             };
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
             return Err(rejected(reason, &net_new));
         }
         if let Err(reason) = self.room().check(net_new.len()) {
@@ -1129,11 +1142,14 @@ impl WatchSet {
                 kind = "silent_payments",
                 "watch-set at per-connection entry cap; skipping add",
             );
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
             return Err(rejected(reason, &net_new));
         }
-        // Per-add rate limit (mirrors `add_items_priced`): one token per
-        // effective add/update, after the empty short-circuit so a fully-empty
-        // message cannot burn the bucket.
+        // Per-add rate limit (mirrors `add_items_priced`): one token per add
+        // with net-new targets, after the short-circuits above so a re-assert
+        // or an empty message cannot burn the bucket.
         if let Some(p) = principal
             && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
         {
@@ -1143,6 +1159,9 @@ impl WatchSet {
                 retry_after_secs,
                 "watch add rate-limited; skipping",
             );
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
             return Err(rejected(AddRejectReason::RateLimited { retry_after_secs }, &net_new));
         }
         let new_ids: Vec<[u8; 33]> = net_new.iter().map(|t| t.scan_pubkey()).collect();
@@ -2574,6 +2593,42 @@ mod tests {
         ws.remove_silent_payments([sp_target(1).scan_pubkey()], |ids| unregistered = ids.len());
         assert_eq!(unregistered, 1);
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn sp_reassert_is_free_and_applies_when_new_targets_are_refused() {
+        use satd_auth::RatePolicy;
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(100),
+            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            acct,
+        );
+        let mut ws = WatchSet::default();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap(); // the only token
+
+        // A label-only re-assert needs no token: it applies and nothing is refused.
+        let mut applied = Vec::new();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |ts| {
+            applied = ts.iter().map(|t| t.scan_pubkey()).collect();
+        })
+        .unwrap();
+        assert_eq!(applied, vec![sp_target(1).scan_pubkey()]);
+
+        // A new target with the bucket empty is refused; the re-assert in the
+        // same message still applies, and only the new target is named.
+        let mut applied = Vec::new();
+        let rejected = ws
+            .add_silent_payments(Some(&p), vec![sp_target(1), sp_target(2)], |ts| {
+                applied = ts.iter().map(|t| t.scan_pubkey()).collect();
+            })
+            .unwrap_err();
+        assert!(matches!(rejected.reason, AddRejectReason::RateLimited { .. }), "{rejected:?}");
+        assert_eq!(rejected.items, RejectedItems::SilentPayments(vec![sp_target(2).scan_pubkey()]));
+        assert_eq!(applied, vec![sp_target(1).scan_pubkey()], "the re-assert's labels still apply");
         assert_eq!(ws.len(), 1);
     }
 

@@ -44,7 +44,7 @@ func (w *WatchSet) removeDepthAlarms(txids [][32]byte, depths []uint32) {
 
 func (w *WatchSet) removeDescriptor(descriptor string) {
 	delete(w.descriptors, descriptor)
-	delete(w.descriptorPrev, descriptor)
+	delete(w.descriptorHistory, descriptor)
 }
 
 // subsetFor is the part of the mirror a refusal names, for re-sending it: only
@@ -195,19 +195,38 @@ func (w *WatchSet) forgetRejected(r *WatchAddRejected) {
 		}
 	}
 	if d := r.Descriptor; d != nil {
-		// Only the window the refusal names; a later slide already replaced it.
-		if cur, ok := w.descriptors[d.Descriptor]; ok && cur == (descriptorWindow{gapLimit: d.GapLimit, start: d.Start}) {
-			prev, hadPrev := w.descriptorPrev[d.Descriptor]
-			delete(w.descriptorPrev, d.Descriptor)
+		refused := descriptorWindow{gapLimit: d.GapLimit, start: d.Start}
+		history := w.descriptorHistory[d.Descriptor]
+		if cur, ok := w.descriptors[d.Descriptor]; ok && cur == refused {
+			// The node refused the latest window. It handles slides in order,
+			// so what it keeps is the latest earlier window that was not itself
+			// refused.
 			switch {
-			case d.Kept && hadPrev:
-				w.descriptors[d.Descriptor] = prev
+			case d.Kept && len(history) > 0:
+				w.descriptors[d.Descriptor] = history[len(history)-1]
+				history = history[:len(history)-1]
 			case d.Kept:
 				// Kept, but the mirror never saw the earlier window (a
 				// loader-built set): leave the requested one to replay.
 			default:
 				delete(w.descriptors, d.Descriptor)
+				history = nil
 			}
+		} else {
+			// An earlier slide was refused while a later one is pending: that
+			// window cannot be the one the node keeps.
+			kept := history[:0:0]
+			for _, h := range history {
+				if h != refused {
+					kept = append(kept, h)
+				}
+			}
+			history = kept
+		}
+		if len(history) == 0 {
+			delete(w.descriptorHistory, d.Descriptor)
+		} else {
+			w.descriptorHistory[d.Descriptor] = history
 		}
 	}
 }
@@ -263,10 +282,10 @@ func (w *WatchSet) clone() *WatchSet {
 			out.descriptors[k] = v
 		}
 	}
-	if len(w.descriptorPrev) > 0 {
-		out.descriptorPrev = make(map[string]descriptorWindow, len(w.descriptorPrev))
-		for k, v := range w.descriptorPrev {
-			out.descriptorPrev[k] = v
+	if len(w.descriptorHistory) > 0 {
+		out.descriptorHistory = make(map[string][]descriptorWindow, len(w.descriptorHistory))
+		for k, v := range w.descriptorHistory {
+			out.descriptorHistory[k] = append([]descriptorWindow(nil), v...)
 		}
 	}
 	if len(w.prefixes) > 0 {

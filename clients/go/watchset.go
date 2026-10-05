@@ -39,9 +39,10 @@ type WatchSet struct {
 	depthAlarms map[depthAlarm]struct{}
 	// descriptors maps a descriptor string to its latest window.
 	descriptors map[string]descriptorWindow
-	// descriptorPrev maps a descriptor to the window its latest add replaced,
-	// so a slide the node refuses can fall back to the window the node holds.
-	descriptorPrev map[string]descriptorWindow
+	// descriptorHistory maps a descriptor to the windows its earlier adds asked
+	// for, oldest first, so a slide the node refuses can fall back to the
+	// window the node still holds. Bounded by descriptorHistoryLen.
+	descriptorHistory map[string][]descriptorWindow
 	// prefixes is the set of registered buckets, keyed by (bits, prefix hex) so
 	// the byte slice does not have to be a map key.
 	prefixes map[prefixKey]ScriptPrefix
@@ -52,6 +53,11 @@ type WatchSet struct {
 	// includeRawTx is the raw-tx opt-in, when the caller set one.
 	includeRawTx *bool
 }
+
+// descriptorHistoryLen bounds the earlier windows kept per descriptor for a
+// refused slide to fall back to. A caller slides one step at a time and the
+// node answers in order, so a few are plenty; the oldest is dropped past this.
+const descriptorHistoryLen = 8
 
 type depthAlarm struct {
 	txid  [32]byte
@@ -139,12 +145,22 @@ func (w *WatchSet) AddDescriptor(descriptor string, gapLimit, start uint32) *Wat
 	w.descriptors[descriptor] = win
 	switch {
 	case had && prev != win:
-		if w.descriptorPrev == nil {
-			w.descriptorPrev = map[string]descriptorWindow{}
+		if w.descriptorHistory == nil {
+			w.descriptorHistory = map[string][]descriptorWindow{}
 		}
-		w.descriptorPrev[descriptor] = prev
+		history := w.descriptorHistory[descriptor][:0:0]
+		for _, h := range w.descriptorHistory[descriptor] {
+			if h != win {
+				history = append(history, h)
+			}
+		}
+		history = append(history, prev)
+		if len(history) > descriptorHistoryLen {
+			history = history[1:]
+		}
+		w.descriptorHistory[descriptor] = history
 	case !had:
-		delete(w.descriptorPrev, descriptor)
+		delete(w.descriptorHistory, descriptor)
 	}
 	return w
 }

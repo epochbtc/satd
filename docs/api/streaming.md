@@ -517,8 +517,7 @@ no event, so a client that sees none can rely on its adds having landed. The add
 is all-or-nothing over its **net-new** items: none of the items the event names is
 watched. Items the message re-asserted (already watched) are not named and stay
 watched; their metadata (a script's `min_value` floor, a silent-payment target's
-labels) still updates, except when a silent-payment add is refused for its cap or
-the rate limit.
+labels) still updates, and a message that only re-asserts is never refused.
 
 ```proto
 message WatchAddRejected {
