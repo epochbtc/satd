@@ -601,10 +601,12 @@ type WatchSetRejected struct {
 // are not named and stay watched. The node sends nothing for an add that
 // registered.
 //
-// [ResilientWatch] drops the named items from its mirror before handing this
-// on, so a reconnect does not re-register them; re-add them yourself if you
-// want another try (for example after RetryAfterSecs on a rate limit). Only the
-// item field for Kind is set.
+// [ResilientWatch] re-sends a [WatchAddRejectRateLimited] add itself after the
+// node's retry hint, within its backoff budget, and hands the event on only once
+// that budget runs out. For any other reason, or then, it drops the named items
+// from its mirror before handing this on, so a reconnect does not re-register
+// them; re-add them yourself if you want another try. Only the item field for
+// Kind is set.
 type WatchAddRejected struct {
 	// Kind is which kind of add was refused.
 	Kind WatchAddKind

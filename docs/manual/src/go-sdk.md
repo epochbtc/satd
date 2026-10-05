@@ -232,8 +232,10 @@ The incremental `Add*` calls work the same way. One the node does not register
 `stream:watch`, or malformed) is answered with one `*WatchAddRejected` event
 naming the kind, the reason, the numbers behind it and the refused items; none of
 those items is watched. An add that registers produces no event.
-`ResilientWatch` drops the refused items from its mirror before handing the event
-on, so a reconnect does not re-register them.
+`ResilientWatch` re-sends a rate-limited add itself after the node's retry hint,
+within its backoff budget, and absorbs the event until that budget runs out.
+Then, and for every other reason, it drops the refused items from its mirror
+before handing the event on, so a reconnect does not re-register them.
 
 ## Durable watch: `ResilientWatch`
 

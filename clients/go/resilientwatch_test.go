@@ -1,6 +1,7 @@
 package satdevents
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -1138,7 +1139,7 @@ func TestRefusedAddsArePrunedFromTheMirror(t *testing.T) {
 				},
 				{
 					Kind:        eventspb.WatchAddRejected_DESCRIPTOR,
-					Reason:      eventspb.WatchAddRejected_RATE_LIMITED,
+					Reason:      eventspb.WatchAddRejected_QUOTA_EXCEEDED,
 					Descriptor_: "wpkh(a)", GapLimit: 20, Start: 20, DescriptorKept: true,
 				},
 			} {
@@ -1192,5 +1193,74 @@ func TestRefusedAddsArePrunedFromTheMirror(t *testing.T) {
 	}
 	if got := w.mirror.descriptors["wpkh(a)"]; got != (descriptorWindow{gapLimit: 20, start: 0}) {
 		t.Errorf("descriptor window = %+v, want the window the node kept (start 0)", got)
+	}
+}
+
+// TestRateLimitedAddIsReSent: a rate limit is transient, so the refused items
+// stay in the mirror and the SDK re-sends them once the node's hint allows. The
+// refusal is absorbed: Next never sees it, only the next real event.
+func TestRateLimitedAddIsReSent(t *testing.T) {
+	kept := [32]byte{0x01}
+	throttled := [32]byte{0x02}
+	resent := make(chan *eventspb.AddScripts, 1)
+	client, _ := startScriptedWatch(t,
+		func(l *watchLeg, s eventspb.NodeEventStream_WatchServer) error {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) && len(l.controls()) < 1 {
+				time.Sleep(time.Millisecond)
+			}
+			if err := s.Send(&eventspb.NodeEvent{Body: &eventspb.NodeEvent_WatchAddRejected{
+				WatchAddRejected: &eventspb.WatchAddRejected{
+					Kind:         eventspb.WatchAddRejected_SCRIPTS,
+					Reason:       eventspb.WatchAddRejected_RATE_LIMITED,
+					Scripthashes: [][]byte{append([]byte(nil), throttled[:]...)},
+				},
+			}}); err != nil {
+				return err
+			}
+			// Wait for the re-send, then release the caller with a real event.
+			for time.Now().Before(deadline) && len(l.controls()) < 2 {
+				time.Sleep(time.Millisecond)
+			}
+			if c := l.controls(); len(c) >= 2 {
+				resent <- c[1].GetAddScripts()
+			}
+			if err := s.Send(&eventspb.NodeEvent{Body: &eventspb.NodeEvent_Heartbeat{Heartbeat: &eventspb.Heartbeat{}}}); err != nil {
+				return err
+			}
+			<-s.Context().Done()
+			return nil
+		},
+		parkLeg,
+	)
+	w := client.ResilientWatch(context.Background(), ResilientWatchConfig{
+		Backoff: Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Multiplier: 2, MaxRetries: 3},
+	})
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.AddScripts(ctx, ScriptWatch{Scripthash: kept}, ScriptWatch{Scripthash: throttled}); err != nil {
+		t.Fatal(err)
+	}
+	ev, err := w.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ev.(*Heartbeat); !ok {
+		t.Fatalf("first event = %T, want the heartbeat: a rate-limited refusal is absorbed while it retries", ev)
+	}
+	select {
+	case a := <-resent:
+		if len(a.GetScripthashes()) != 1 || !bytes.Equal(a.GetScripthashes()[0], throttled[:]) {
+			t.Errorf("re-sent %x, want only the throttled script", a.GetScripthashes())
+		}
+	default:
+		t.Fatal("the throttled script was never re-sent")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.mirror.scripts[throttled]; !ok {
+		t.Error("a rate-limited script left the mirror")
 	}
 }

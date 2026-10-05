@@ -47,6 +47,121 @@ func (w *WatchSet) removeDescriptor(descriptor string) {
 	delete(w.descriptorPrev, descriptor)
 }
 
+// subsetFor is the part of the mirror a refusal names, for re-sending it: only
+// items the caller still holds (a removal since the refusal wins), with their
+// current metadata. A descriptor is included only at the window the refusal
+// named; a later slide already replaced it.
+func (w *WatchSet) subsetFor(r *WatchAddRejected) *WatchSet {
+	out := NewWatchSet()
+	for _, b := range r.Scripthashes {
+		if h, ok := txid32(b); ok {
+			if floor, held := w.scripts[h]; held {
+				if out.scripts == nil {
+					out.scripts = map[[32]byte]*uint64{}
+				}
+				out.scripts[h] = floor
+			}
+		}
+	}
+	for _, o := range r.Outpoints {
+		if t, ok := txid32(o.Txid); ok {
+			op := OutpointRef{Txid: t, Vout: o.Vout}
+			if _, held := w.outpoints[op]; held {
+				if out.outpoints == nil {
+					out.outpoints = map[OutpointRef]struct{}{}
+				}
+				out.outpoints[op] = struct{}{}
+			}
+		}
+	}
+	for _, b := range r.Txids {
+		if t, ok := txid32(b); ok {
+			if close, held := w.lifecycles[t]; held {
+				if out.lifecycles == nil {
+					out.lifecycles = map[[32]byte]AutoClose{}
+				}
+				out.lifecycles[t] = close
+			}
+		}
+	}
+	for _, a := range r.DepthAlarms {
+		if t, ok := txid32(a.Txid); ok {
+			key := depthAlarm{txid: t, depth: a.Depth}
+			if _, held := w.depthAlarms[key]; held {
+				if out.depthAlarms == nil {
+					out.depthAlarms = map[depthAlarm]struct{}{}
+				}
+				out.depthAlarms[key] = struct{}{}
+			}
+		}
+	}
+	for _, p := range r.Prefixes {
+		key := prefixKey{bits: p.Bits, prefix: string(maskPrefixSafe(p.Prefix, p.Bits))}
+		if held, ok := w.prefixes[key]; ok {
+			if out.prefixes == nil {
+				out.prefixes = map[prefixKey]ScriptPrefix{}
+			}
+			out.prefixes[key] = held
+		}
+	}
+	for _, b := range r.ScanPubkeys {
+		var id [33]byte
+		if len(b) != len(id) {
+			continue
+		}
+		copy(id[:], b)
+		if t, held := w.silentPayments[id]; held {
+			if out.silentPayments == nil {
+				out.silentPayments = map[[33]byte]SilentPaymentTarget{}
+			}
+			out.silentPayments[id] = t
+		}
+	}
+	if d := r.Descriptor; d != nil {
+		win := descriptorWindow{gapLimit: d.GapLimit, start: d.Start}
+		if cur, held := w.descriptors[d.Descriptor]; held && cur == win {
+			out.descriptors = map[string]descriptorWindow{d.Descriptor: win}
+		}
+	}
+	return out
+}
+
+// retryKeys is one identity per item a refusal names, for the per-item retry
+// budget. The first byte is the kind, so items of different kinds never collide.
+func retryKeys(r *WatchAddRejected) []string {
+	var keys []string
+	tagged := func(tag byte, parts ...[]byte) string {
+		b := []byte{tag}
+		for _, p := range parts {
+			b = append(b, p...)
+		}
+		return string(b)
+	}
+	be32 := func(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
+	for _, b := range r.Scripthashes {
+		keys = append(keys, tagged(1, b))
+	}
+	for _, o := range r.Outpoints {
+		keys = append(keys, tagged(2, o.Txid, be32(o.Vout)))
+	}
+	for _, b := range r.Txids {
+		keys = append(keys, tagged(3, b))
+	}
+	for _, a := range r.DepthAlarms {
+		keys = append(keys, tagged(4, a.Txid, be32(a.Depth)))
+	}
+	if r.Descriptor != nil {
+		keys = append(keys, tagged(5, []byte(r.Descriptor.Descriptor)))
+	}
+	for _, p := range r.Prefixes {
+		keys = append(keys, tagged(6, p.Prefix, be32(p.Bits)))
+	}
+	for _, b := range r.ScanPubkeys {
+		keys = append(keys, tagged(7, b))
+	}
+	return keys
+}
+
 // forgetRejected drops what the node refused to register, so the mirror holds
 // only what the node holds. Items are named exactly as the node echoes them; a
 // prefix comes back masked, which removeScriptPrefixes matches.

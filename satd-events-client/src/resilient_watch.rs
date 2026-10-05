@@ -34,13 +34,16 @@
 //!   caller can escalate to a full resnapshot — the exception, not the rule.
 //! - **Cursor persistence** — confirmed cursors are committed-on-poll to a
 //!   shared [`CursorStore`], so a resume survives reconnects and restarts.
-//! - **Refused adds leave the mirror** — when the server answers an add with
-//!   [`Event::WatchAddRejected`], the items it names are dropped from the mirror
-//!   (a refused descriptor slide falls back to the window it replaced), so a
-//!   reconnect re-registers only what the server actually holds. The event is
-//!   still handed to the caller.
+//! - **Refused adds** — when the server answers an add with
+//!   [`Event::WatchAddRejected`] for its rate limit, the items stay in the mirror
+//!   and are re-sent after the server's retry hint, within the backoff budget;
+//!   the event is absorbed until the budget runs out. Any other refusal (quota,
+//!   cap, permission, malformed), or a rate limit past the budget, drops the
+//!   items from the mirror (a refused descriptor slide falls back to the window
+//!   it replaced) and hands the event to the caller, so a reconnect re-registers
+//!   only what the server holds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -52,7 +55,7 @@ use crate::client::{
     validate_prefix, AutoClose, EventStream, SilentPaymentTarget, StreamClient, WatchHandle,
 };
 use crate::error::StreamError;
-use crate::event::{Cursor, CursorRejectReason, Event, WatchAddRejected};
+use crate::event::{Cursor, CursorRejectReason, Event, WatchAddRejectReason, WatchAddRejected};
 use crate::resilience::{Backoff, CursorStore, NoopCursorStore};
 
 /// A boxed integrator error returned by a watch-set loader.
@@ -171,6 +174,53 @@ impl WatchSetMirror {
     fn remove_descriptor(&mut self, descriptor: &str) {
         self.descriptors.remove(descriptor);
         self.descriptor_prev.remove(descriptor);
+    }
+
+    /// The part of the mirror a refusal names, for re-sending it: only items the
+    /// caller still holds (a removal since the refusal wins), with their current
+    /// metadata (floors, auto-close, labels). A descriptor is included only at
+    /// the window the refusal named; a later slide already replaced it.
+    fn subset_for(&self, r: &WatchAddRejected) -> WatchSetMirror {
+        let fixed = |b: &Vec<u8>| <[u8; 32]>::try_from(b.as_slice()).ok();
+        let mut out = WatchSetMirror::default();
+        for sh in r.scripthashes.iter().filter_map(fixed) {
+            if let Some(floor) = self.scripts.get(&sh) {
+                out.scripts.insert(sh, *floor);
+            }
+        }
+        for (t, v) in &r.outpoints {
+            if let Some(op) = fixed(t).map(|t| (t, *v)).filter(|op| self.outpoints.contains(op)) {
+                out.outpoints.insert(op);
+            }
+        }
+        for t in r.txids.iter().filter_map(fixed) {
+            if let Some(close) = self.tx_lifecycles.get(&t) {
+                out.tx_lifecycles.insert(t, *close);
+            }
+        }
+        for (t, d) in &r.depth_alarms {
+            if let Some(alarm) = fixed(t).map(|t| (t, *d)).filter(|a| self.depth_alarms.contains(a)) {
+                out.depth_alarms.insert(alarm);
+            }
+        }
+        for (prefix, bits) in &r.prefixes {
+            for (b, p) in &self.prefixes {
+                if b == bits && mask_prefix(p, *b) == *prefix {
+                    out.prefixes.insert((*b, p.clone()));
+                }
+            }
+        }
+        for id in r.scan_pubkeys.iter().filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok()) {
+            if let Some(t) = self.silent_payments.get(&id) {
+                out.silent_payments.insert(id, t.clone());
+            }
+        }
+        if let Some(d) = &r.descriptor
+            && self.descriptors.get(&d.descriptor) == Some(&(d.gap_limit, d.start))
+        {
+            out.descriptors.insert(d.descriptor.clone(), (d.gap_limit, d.start));
+        }
+        out
     }
 
     /// Drop what the server refused to register, so the mirror holds only what
@@ -979,6 +1029,37 @@ struct PendingReanchor {
     deadline: tokio::time::Instant,
 }
 
+/// An add the server refused for its rate limit, waiting to be re-sent from the
+/// mirror (see [`ResilientWatch::handle_event`]). Kept in `self` so a cancelled
+/// [`next`](ResilientWatch::next) resumes it.
+struct PendingAddRetry {
+    /// When the retry is due: the server's `retry_after_secs` or the backoff
+    /// delay for its attempt, whichever is later.
+    deadline: tokio::time::Instant,
+    /// The refusal, naming what to re-send.
+    rejected: WatchAddRejected,
+}
+
+/// One identity per item a refusal names, for the per-item retry budget. The
+/// first byte is the kind, so items of different kinds never collide.
+fn retry_keys(r: &WatchAddRejected) -> Vec<Vec<u8>> {
+    let tagged = |tag: u8, bytes: &[u8]| {
+        let mut k = Vec::with_capacity(1 + bytes.len());
+        k.push(tag);
+        k.extend_from_slice(bytes);
+        k
+    };
+    let mut keys = Vec::new();
+    keys.extend(r.scripthashes.iter().map(|b| tagged(1, b)));
+    keys.extend(r.outpoints.iter().map(|(t, v)| tagged(2, &[t.as_slice(), &v.to_be_bytes()].concat())));
+    keys.extend(r.txids.iter().map(|b| tagged(3, b)));
+    keys.extend(r.depth_alarms.iter().map(|(t, d)| tagged(4, &[t.as_slice(), &d.to_be_bytes()].concat())));
+    keys.extend(r.descriptor.iter().map(|d| tagged(5, d.descriptor.as_bytes())));
+    keys.extend(r.prefixes.iter().map(|(p, bits)| tagged(6, &[p.as_slice(), &bits.to_be_bytes()].concat())));
+    keys.extend(r.scan_pubkeys.iter().map(|b| tagged(7, b)));
+    keys
+}
+
 /// A `Watch` stream that reconnects, re-registers its watch-set, and re-anchors
 /// off the deterministic [`Event::CursorAccepted`] / [`Event::CursorRejected`]
 /// results on the caller's behalf.
@@ -1023,6 +1104,11 @@ pub struct ResilientWatch {
     /// and completing it; keeping it in `self` rather than on `next`'s stack is
     /// what lets a cancelled `next` resume the retry (see [`PendingReanchor`]).
     pending_reanchor: Option<PendingReanchor>,
+    /// Rate-limited adds awaiting their re-send, driven by [`next`](Self::next).
+    pending_add_retries: Vec<PendingAddRetry>,
+    /// Retries spent per refused item ([`retry_keys`]), against the backoff
+    /// budget. Cleared on reconnect, which re-sends the whole mirror anyway.
+    add_retry_attempts: HashMap<Vec<u8>, u32>,
     /// The most recent retryable error, surfaced if `max_retries` is exhausted.
     last_error: Option<StreamError>,
 }
@@ -1043,6 +1129,8 @@ impl ResilientWatch {
             reconnect_attempts: 0,
             reanchor_attempts: 0,
             pending_reanchor: None,
+            pending_add_retries: Vec::new(),
+            add_retry_attempts: HashMap::new(),
             last_error: None,
         }
     }
@@ -1593,8 +1681,25 @@ impl ResilientWatch {
                 }
             }
 
+            // A rate-limited add whose retry is due goes out before the next read.
+            let now = tokio::time::Instant::now();
+            if let Some(i) = self.pending_add_retries.iter().position(|p| p.deadline <= now) {
+                self.send_add_retry(i).await?;
+                continue;
+            }
+            let next_retry = self.pending_add_retries.iter().map(|p| p.deadline).min();
             let stream = self.stream.as_mut().expect("connected");
-            match stream.message().await {
+            // Race the read against the earliest retry so a pending retry does not
+            // hold up live events. `message` is cancel-safe: a read the timer
+            // preempts loses nothing.
+            let msg = match next_retry {
+                Some(deadline) => tokio::select! {
+                    m = stream.message() => m,
+                    _ = tokio::time::sleep_until(deadline) => continue,
+                },
+                None => stream.message().await,
+            };
+            match msg {
                 Ok(Some(ev)) => {
                     self.reconnect_attempts = 0;
                     self.last_error = None;
@@ -1632,6 +1737,37 @@ impl ResilientWatch {
     ) -> Result<Option<Event>, StreamError> {
         if let Some(c) = cur {
             self.resume = Some(c);
+        }
+
+        // A rate-limited add is transient: keep its items in the mirror and
+        // re-send them once the limit allows, absorbing the event, until an item
+        // has spent the backoff budget. Then it is handled like any other
+        // refusal below: dropped from the mirror and surfaced.
+        if let Event::WatchAddRejected(r) = &ev
+            && r.reason == WatchAddRejectReason::RateLimited
+        {
+            let keys = retry_keys(r);
+            let attempt =
+                keys.iter().filter_map(|k| self.add_retry_attempts.get(k)).copied().max().unwrap_or(0);
+            let exhausted = self.config.backoff.max_retries.is_some_and(|max| attempt >= max);
+            if !exhausted {
+                for k in keys {
+                    self.add_retry_attempts.insert(k, attempt.saturating_add(1));
+                }
+                let delay = self
+                    .config
+                    .backoff
+                    .delay_for(attempt)
+                    .max(std::time::Duration::from_secs(r.retry_after_secs.into()));
+                self.pending_add_retries.push(PendingAddRetry {
+                    deadline: tokio::time::Instant::now() + delay,
+                    rejected: r.clone(),
+                });
+                return Ok(None);
+            }
+            for k in keys {
+                self.add_retry_attempts.remove(&k);
+            }
         }
 
         // One-shot watches the server auto-evicts when their terminal event
@@ -1802,11 +1938,37 @@ impl ResilientWatch {
     fn teardown(&mut self) {
         self.handle = None;
         self.stream = None;
+        // The reconnect re-sends the whole mirror, rate-limited items included,
+        // so their pending retries and budgets start over.
+        self.pending_add_retries.clear();
+        self.add_retry_attempts.clear();
         // A deferred re-anchor retry is meaningless once the stream it targeted is
         // gone — the reconnect re-anchors from `resume` itself. Drop it so `next`
         // does not sleep out a stale backoff against a dead handle before
         // reconnecting.
         self.pending_reanchor = None;
+    }
+
+    /// Re-send the items of the `i`th pending rate-limited add that the mirror
+    /// still holds. The entry is removed only after the sends resolve, so a
+    /// cancelled `next` re-sends it; a duplicate add is an idempotent re-assert.
+    async fn send_add_retry(&mut self, i: usize) -> Result<(), StreamError> {
+        let msgs = self.mirror.subset_for(&self.pending_add_retries[i].rejected).control_messages();
+        let res = match &self.handle {
+            Some(h) => {
+                let mut res = Ok(());
+                for msg in msgs {
+                    res = h.send_control(pb::SubscribeControl { msg: Some(msg) }).await;
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                Some(res)
+            }
+            None => None,
+        };
+        self.pending_add_retries.remove(i);
+        self.after_send(res)
     }
 
     /// Resolve a live control-send result: a `ControlClosed` means the stream
@@ -2504,7 +2666,7 @@ mod tests {
         w.handle_event(
             refused(pb::WatchAddRejected {
                 kind: Kind::Outpoints as i32,
-                reason: Reason::RateLimited as i32,
+                reason: Reason::PermissionDenied as i32,
                 outpoints: vec![pb::Outpoint { txid: vec![3u8; 32], vout: 1 }],
                 ..Default::default()
             }),
@@ -2577,7 +2739,7 @@ mod tests {
         w.handle_event(
             refused(pb::WatchAddRejected {
                 kind: Kind::Descriptor as i32,
-                reason: Reason::RateLimited as i32,
+                reason: Reason::QuotaExceeded as i32,
                 descriptor: "wpkh(a)".into(),
                 gap_limit: 20,
                 start: 20,
@@ -2589,6 +2751,96 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(w.mirror.descriptors.get("wpkh(a)"), Some(&(20, 40)));
+    }
+
+    fn zero_backoff(max_retries: Option<u32>) -> Backoff {
+        Backoff {
+            initial: std::time::Duration::ZERO,
+            max: std::time::Duration::ZERO,
+            multiplier: 1.0,
+            max_retries,
+        }
+    }
+
+    fn rate_limited_scripts(shs: &[u8]) -> Event {
+        use pb::watch_add_rejected::{Kind, Reason};
+        refused(pb::WatchAddRejected {
+            kind: Kind::Scripts as i32,
+            reason: Reason::RateLimited as i32,
+            retry_after_secs: 0,
+            scripthashes: shs.iter().map(|b| vec![*b; 32]).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn sent_scripts(rx: &mut tokio::sync::mpsc::Receiver<pb::SubscribeControl>) -> Vec<pb::AddScripts> {
+        let mut out = Vec::new();
+        while let Ok(ctrl) = rx.try_recv() {
+            if let Some(Msg::AddScripts(a)) = ctrl.msg {
+                out.push(a);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn rate_limited_add_is_re_sent_from_the_mirror() {
+        let store = Arc::new(MemStore::default());
+        let (handle, mut rx) = crate::client::WatchHandle::for_test();
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(3))),
+        );
+        w.handle = Some(handle);
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], Some(500)), ([3u8; 32], None)]).await.unwrap();
+        let _ = sent_scripts(&mut rx);
+
+        // The node throttled the add of 2 and 3: the event is absorbed, and both
+        // stay in the mirror for the retry.
+        let out = w.handle_event(rate_limited_scripts(&[2, 3]), None).await.unwrap();
+        assert!(out.is_none(), "a rate-limited add is retried, not surfaced");
+        assert!(w.mirror.scripts.contains_key(&[2u8; 32]) && w.mirror.scripts.contains_key(&[3u8; 32]));
+        assert_eq!(w.pending_add_retries.len(), 1);
+
+        // The caller removes 3 before the retry is due: the removal wins.
+        w.remove_scripts([[3u8; 32]]).await.unwrap();
+        while rx.try_recv().is_ok() {}
+        w.send_add_retry(0).await.unwrap();
+        let sent = sent_scripts(&mut rx);
+        assert_eq!(sent.len(), 1, "one re-send: {sent:?}");
+        assert_eq!(sent[0].scripthashes, vec![vec![2u8; 32]], "only what the caller still holds");
+        assert_eq!(sent[0].min_values, vec![500], "with its current floor");
+        assert!(w.pending_add_retries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_add_is_dropped_and_surfaced_once_the_budget_runs_out() {
+        let store = Arc::new(MemStore::default());
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(1))),
+        );
+        w.add_scripts([([2u8; 32], None)]).await.unwrap();
+        assert!(w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap().is_none(), "retry 1");
+        // The retried add is throttled again: the budget of 1 is spent.
+        let out = w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap();
+        assert!(matches!(out, Some(Event::WatchAddRejected(_))), "surfaced once the budget is spent");
+        assert!(!w.mirror.scripts.contains_key(&[2u8; 32]), "and dropped from the mirror");
+        assert!(w.add_retry_attempts.is_empty(), "its budget is released");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_resets_pending_add_retries() {
+        let store = Arc::new(MemStore::default());
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(3))),
+        );
+        w.add_scripts([([2u8; 32], None)]).await.unwrap();
+        w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap();
+        w.teardown();
+        assert!(w.pending_add_retries.is_empty() && w.add_retry_attempts.is_empty());
+        assert!(w.mirror.scripts.contains_key(&[2u8; 32]), "the reconnect re-sends it with the mirror");
     }
 
     // --- cursor persistence (commit-on-poll) ----------------------------------

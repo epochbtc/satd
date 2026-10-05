@@ -849,10 +849,12 @@ pub enum Event {
     /// (already watched) are not named and stay watched. The server sends
     /// nothing for an add that registered.
     ///
-    /// [`ResilientWatch`](crate::ResilientWatch) drops the named items from its
-    /// mirror before handing this on, so a reconnect does not re-register
-    /// them; re-add them yourself if you want another try (for example after
-    /// [`retry_after_secs`](WatchAddRejected::retry_after_secs) on a rate limit).
+    /// [`ResilientWatch`](crate::ResilientWatch) re-sends a
+    /// [`RateLimited`](WatchAddRejectReason::RateLimited) add itself after the
+    /// server's retry hint, within its backoff budget, and hands the event on
+    /// only once that budget runs out. For any other reason, or then, it drops
+    /// the named items from its mirror before handing this on, so a reconnect
+    /// does not re-register them; re-add them yourself if you want another try.
     WatchAddRejected(WatchAddRejected),
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
