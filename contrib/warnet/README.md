@@ -37,7 +37,7 @@ Warnet renders only image tags shaped like `X.Y[.Z][-suffix]`. Tag the image
 `<satd version>-warnet<N>`:
 
 ```sh
-docker build --build-arg SATD_IMAGE=ghcr.io/epochbtc/satd:0.5.2 \
+docker build --build-arg SATD_IMAGE=ghcr.io/epochbtc/satd:0.6.0 \
   -t satd-warnet:0.6.0-warnet0 contrib/warnet
 ```
 
