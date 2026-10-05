@@ -227,6 +227,14 @@ stream, and the actual outcome arrives on the event stream as exactly one
 `CursorAccepted`/`CursorRejected` or `WatchSetReplaced`/`WatchSetRejected`.
 Drive catch-up off those events, not off the return value.
 
+The incremental `Add*` calls work the same way. One the node does not register
+(over the quota or the rate limit, over a per-connection cap, without
+`stream:watch`, or malformed) is answered with one `*WatchAddRejected` event
+naming the kind, the reason, the numbers behind it and the refused items; none of
+those items is watched. An add that registers produces no event.
+`ResilientWatch` drops the refused items from its mirror before handing the event
+on, so a reconnect does not re-register them.
+
 ## Durable watch: `ResilientWatch`
 
 ```go

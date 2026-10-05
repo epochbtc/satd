@@ -35,10 +35,10 @@ const (
 	// the required capability (stream:subscribe to open, stream:watch to add
 	// watches). A permanent configuration error.
 	KindPermissionDenied
-	// KindQuotaExhausted is gRPC RESOURCE_EXHAUSTED: the subscription cap, a
-	// per-principal rate limit, or the per-token watch quota. The first two are
-	// transient; a genuinely full watch quota is not. Inspect Status's message
-	// to distinguish.
+	// KindQuotaExhausted is gRPC RESOURCE_EXHAUSTED: the subscription cap or a
+	// per-principal rate limit, hit when the stream was opened. Both are
+	// transient. A full watch quota never surfaces here; a refused add arrives
+	// as a WatchAddRejected event.
 	KindQuotaExhausted
 	// KindRateLimited is reserved for explicit rate-limit signaling in the
 	// resilience layer. The current server does not return a status for an

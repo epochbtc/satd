@@ -154,6 +154,7 @@ message NodeEvent {
     SilentPaymentMatched silent_payment_matched = 29;  // BIP 352 scan-key watch match (§7.7)
     MempoolTweak   mempool_tweak       = 30;  // BIP 352 mempool-time tweak, Tier 1.5 (§7.7)
     StatusEvent    status              = 31;  // node-health condition (§7.8)
+    WatchAddRejected watch_add_rejected = 32;  // an incremental watch add the node did not register (§7.3.2)
   }
 }
 ```
@@ -507,6 +508,57 @@ A consumer with an at-least-once delivery contract should drive its catch-up
 state machine off these results rather than treating the `SetCursor` send as
 success. WS/SSE clients have no mid-stream control channel and so never see a
 `SetCursorResult` — they re-anchor by reconnecting with `?from_cursor=`.
+
+#### 7.3.2 Refused watch adds (`WatchAddRejected`)
+
+An incremental `Add*` that the server does not register is answered in-band with
+one `WatchAddRejected` event, and the stream stays up. An add that registers gets
+no event, so a client that sees none can rely on its adds having landed. The add
+is all-or-nothing over its **net-new** items: none of the items the event names is
+watched. Items the message re-asserted (already watched) are not named and stay
+watched; their metadata (a script's `min_value` floor, a silent-payment target's
+labels) still updates, except when a silent-payment add is refused for its cap or
+the rate limit.
+
+```proto
+message WatchAddRejected {
+  enum Kind   { KIND_UNSPECIFIED = 0; SCRIPTS = 1; OUTPOINTS = 2; TRANSACTIONS = 3;
+                DEPTH_ALARMS = 4; DESCRIPTOR = 5; SCRIPT_PREFIXES = 6; SILENT_PAYMENTS = 7; }
+  enum Reason { REASON_UNSPECIFIED = 0; QUOTA_EXCEEDED = 1; RATE_LIMITED = 2;
+                CAP_EXCEEDED = 3; PERMISSION_DENIED = 4; MALFORMED = 5; }
+  Kind   kind = 1;  Reason reason = 2;
+  uint64 required = 3;  uint64 held = 4;  uint64 quota = 5;  uint32 retry_after_secs = 6;
+  // The refused items, as the client named them; only the field for `kind` is set.
+  repeated bytes scripthashes = 7;  repeated Outpoint outpoints = 8;  repeated bytes txids = 9;
+  repeated WatchDepthAlarm depth_alarms = 10;
+  string descriptor = 11;  uint32 gap_limit = 12;  uint32 start = 13;  bool descriptor_kept = 14;
+  repeated ScriptPrefix prefixes = 15;  // masked to `bits`
+  repeated bytes scan_pubkeys = 16;     // b_scan·G; the scan secret is never echoed
+}
+```
+
+| `reason` | Cause | Numbers |
+|---|---|---|
+| `QUOTA_EXCEEDED` | the net-new items' units do not fit the token's watch quota (§9) | `required` units, `held` units already held, `quota` ceiling |
+| `RATE_LIMITED` | the per-principal add rate limit is spent | `retry_after_secs` |
+| `CAP_EXCEEDED` | a per-connection cap: 16 silent-payment targets, 256 descriptors, or the WS entry cap (`streamwsmaxsubscriptions`) | `required` = the count the add would reach, `quota` = the cap |
+| `PERMISSION_DENIED` | the token lacks `stream:watch` | none |
+| `MALFORMED` | the message cannot be applied as a whole: `min_values` not parallel to its scripthashes, an invalid descriptor, or a txid × depth product over the per-message cap | none |
+
+`MALFORMED` echoes the items that parsed, except for an over-cap depth product,
+which echoes none. Individually unparseable items inside an otherwise valid add (a
+scripthash that is not 32 bytes, a prefix outside the allowed bit range, an
+invalid silent-payment key) are skipped without a rejection.
+
+A refused `AddDescriptor` names the descriptor and the window it asked for.
+`descriptor_kept` is true when an earlier window of that descriptor stays watched
+(a refused slide) and false when the descriptor is not watched at all.
+
+On WS the event is the JSON object `{"category": "watch_add_rejected", "kind":
+"scripts", "reason": "quota_exceeded", "required", "held", "quota",
+"retry_after_secs", ...}` with the items under the same field names. Items come back
+the way a WS add names them: scripthashes and scan pubkeys as plain hex, txids in
+display (reversed) hex.
 
 ### 7.4 Transaction lifecycle & confirmation-depth watches
 
@@ -1167,9 +1219,12 @@ prefix watch (§7.5), which is priced by coarseness — units scale inversely wi
 `bits` (a coarser bucket delivers more traffic) rather than a flat one unit — so the
 quota reflects served bandwidth, not item count, for the one watch kind whose cost
 is not one-item-one-match. This bounds the *work* a tenant pins on the node, not the
-message count. Over-quota adds are rejected
-cleanly (`RESOURCE_EXHAUSTED` on gRPC / `429` on WS) without tearing down the
-subscription.
+message count. An over-quota add is refused in-band with a `WatchAddRejected`
+(`QUOTA_EXCEEDED`, §7.3.2) naming the refused items, without tearing down the
+subscription; so is an add the per-add rate limit throttles (`RATE_LIMITED`).
+`RESOURCE_EXHAUSTED` (gRPC) and `429` (WS) are returned only when a stream is
+opened. A `SetWatchSet` replace reports its own outcome as `WatchSetResult`
+(§11.2).
 
 **Lease lifecycle.** Each item holds a `WatchLease` (RAII) tracked **per item** in
 a subscription-scoped `WatchSet`. So `Remove*` returns that item's unit
@@ -1382,7 +1437,7 @@ exhaustion, mirroring the rest of the node's admission controls. All are
 | Key | Default | Bounds |
 |---|---|---|
 | `streamwsmaxconns` | 256 | concurrent `/ws` + `/sse` connections |
-| `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection |
+| `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection; an add past it is refused with `watch_add_rejected` (`cap_exceeded`) |
 | `streamwsmaxmessagebytes` | 262144 | a single inbound WS control frame |
 | `eventsgrpcmaxconns` | 64 | concurrent gRPC streams |
 | `eventsgrpcmaxsubscriptions` | 256 | watch-set size per gRPC stream |
