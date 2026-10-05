@@ -901,6 +901,8 @@ jobs:
       # any other failure (empty/malformed file) aborts the release.
       - name: Build release notes body
         id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/RELEASE_BODY.md"
@@ -922,6 +924,22 @@ jobs:
           fi
           echo "body_path=${body}" >> "$GITHUB_OUTPUT"
 
+          # GitHub's generated PR list compares against the latest release,
+          # pre-releases included, so a final tag cut after an -rc would list
+          # only the PRs since the rc. Compare a final tag with the previous
+          # final release instead; an -rc tag keeps GitHub's own choice. An
+          # empty value (no earlier final release, or the lookup failed) also
+          # leaves the choice to GitHub.
+          prev=""
+          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+            prev=$(gh release list --repo "${GITHUB_REPOSITORY}" \
+                     --exclude-pre-releases --exclude-drafts --limit 20 \
+                     --json tagName --jq '.[].tagName' \
+                   | grep -vx "${GITHUB_REF_NAME}" | head -n 1 || true)
+          fi
+          echo "PR list compares against: ${prev:-GitHub's default}"
+          echo "previous_tag=${prev}" >> "$GITHUB_OUTPUT"
+
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -929,6 +947,7 @@ jobs:
           # GitHub's auto-generated PR list is appended after it.
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: true
+          previous_tag: ${{ steps.notes.outputs.previous_tag }}
           # A tag carrying a pre-release suffix (e.g. v0.1.0-rc1, v0.3.0-pre)
           # is marked as a GitHub pre-release so it never shows as "Latest".
           prerelease: ${{ contains(github.ref_name, '-') }}
