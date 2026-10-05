@@ -978,7 +978,7 @@ impl WatchAddRejected {
             Ok(Reason::Malformed) => WatchAddRejectReason::Malformed,
             Ok(Reason::Unspecified) | Err(_) => WatchAddRejectReason::Unknown,
         };
-        let descriptor = (kind == WatchAddKind::Descriptor).then(|| RejectedDescriptor {
+        let descriptor = (kind == WatchAddKind::Descriptor).then_some(RejectedDescriptor {
             descriptor: r.descriptor,
             gap_limit: r.gap_limit,
             start: r.start,
