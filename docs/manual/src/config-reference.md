@@ -392,7 +392,7 @@ Core ZMQ wire-format compatible.)
 | `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` or `eventsgrpcmtls`; with `eventsgrpcauth`, also requires `eventsgrpctlscert`/`eventsgrpctlskey` so the bearer token is never sent in cleartext). |
 | `eventsgrpcauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on events gRPC (requires `authfile`). |
 | `eventsgrpcmaxconns` | 64 (`0` disables) | restart | satd | Hard cap on simultaneously-open events gRPC connections. |
-| `eventsgrpcmaxsubscriptions` | 256 (`0` disables) | restart | satd | Hard cap on concurrent events gRPC `Subscribe` streams. |
+| `eventsgrpcmaxsubscriptions` | 256 (`0` disables) | restart | satd | Hard cap on concurrent events gRPC `Subscribe` and `Watch` streams. |
 | `eventsgrpctlscert` | off | restart | satd | PEM TLS certificate. Set with `eventsgrpctlskey` to terminate TLS in-process on the `eventsgrpcbind` listener (no separate TLS bind). |
 | `eventsgrpctlskey` | off | restart | satd | PEM TLS private key (required with `eventsgrpctlscert`). |
 | `eventsgrpcmtls` | false | restart | satd | Require mutual TLS (client certificates). Requires `eventsgrpctlscert`/`key` and `eventsgrpcmtlsclientca`. |

@@ -279,8 +279,8 @@ restart-classified; `0` means unlimited.
 | `streamwsmaxsockets` | 1024 | open sockets on the listener, counted at accept and held for the socket's life, an open WebSocket included (`0` disables) |
 | `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection |
 | `streamwsmaxmessagebytes` | 262144 | a single inbound WS control frame |
-| `eventsgrpcmaxconns` | 64 | concurrent gRPC streams |
-| `eventsgrpcmaxsubscriptions` | 256 | watch-set size per gRPC stream |
+| `eventsgrpcmaxconns` | 64 | concurrent gRPC connections |
+| `eventsgrpcmaxsubscriptions` | 256 | concurrent `Subscribe` + `Watch` streams, across all gRPC connections |
 | `streammaxresyncblocks` | 10000 | blocks the matcher will rescan after a lag, bounding catch-up |
 
 Admission shedding runs before authentication and request-body buffering. A
