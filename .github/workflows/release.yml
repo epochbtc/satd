@@ -930,12 +930,20 @@ jobs:
           # final release instead; an -rc tag keeps GitHub's own choice. An
           # empty value (no earlier final release, or the lookup failed) also
           # leaves the choice to GitHub.
+          #
+          # "Previous" is by version, not by creation date: a patch on an
+          # older line (a v0.5.3 shipped after v0.6.0) must not become the
+          # base for the next v0.6.x. The current tag joins the sorted list
+          # and the entry just below it is taken, which also holds on a re-run
+          # after this tag's own release exists.
           prev=""
           if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
-            prev=$(gh release list --repo "${GITHUB_REPOSITORY}" \
-                     --exclude-pre-releases --exclude-drafts --limit 20 \
-                     --json tagName --jq '.[].tagName' \
-                   | grep -vx "${GITHUB_REF_NAME}" | head -n 1 || true)
+            prev=$( { gh release list --repo "${GITHUB_REPOSITORY}" \
+                        --exclude-pre-releases --exclude-drafts --limit 100 \
+                        --json tagName --jq '.[].tagName' || true; } \
+                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                    | { cat; echo "${GITHUB_REF_NAME}"; } | sort -uV \
+                    | awk -v t="${GITHUB_REF_NAME}" '$0 == t { print p; exit } { p = $0 }' || true)
           fi
           echo "PR list compares against: ${prev:-GitHub's default}"
           echo "previous_tag=${prev}" >> "$GITHUB_OUTPUT"
