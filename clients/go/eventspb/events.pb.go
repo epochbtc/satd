@@ -4991,9 +4991,7 @@ func (x *WatchSetRejected) GetQuota() uint64 {
 // The add is all-or-nothing over its NET-NEW items: none of the items echoed
 // here is watched. Items the message re-asserted (already watched) are not
 // echoed and stay watched; their metadata (a script's min_value floor, a
-// silent-payment target's labels) still updates, except when the refusal is
-// CAP_EXCEEDED or RATE_LIMITED on a silent-payment add, which leaves held
-// targets' labels as they were.
+// silent-payment target's labels) still updates.
 //
 // `required`/`quota` carry the numbers behind `reason`:
 //
