@@ -379,6 +379,128 @@ func (WatchSetRejected_Reason) EnumDescriptor() ([]byte, []int) {
 	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{59, 0}
 }
 
+type WatchAddRejected_Kind int32
+
+const (
+	WatchAddRejected_KIND_UNSPECIFIED WatchAddRejected_Kind = 0
+	WatchAddRejected_SCRIPTS          WatchAddRejected_Kind = 1 // AddScripts → scripthashes
+	WatchAddRejected_OUTPOINTS        WatchAddRejected_Kind = 2 // AddOutpoints → outpoints
+	WatchAddRejected_TRANSACTIONS     WatchAddRejected_Kind = 3 // AddTransactions lifecycle watches → txids
+	WatchAddRejected_DEPTH_ALARMS     WatchAddRejected_Kind = 4 // AddTransactions depth alarms → depth_alarms
+	WatchAddRejected_DESCRIPTOR       WatchAddRejected_Kind = 5 // AddDescriptor → descriptor, gap_limit, start
+	WatchAddRejected_SCRIPT_PREFIXES  WatchAddRejected_Kind = 6 // AddScriptPrefixes → prefixes
+	WatchAddRejected_SILENT_PAYMENTS  WatchAddRejected_Kind = 7 // AddSilentPayments → scan_pubkeys
+)
+
+// Enum value maps for WatchAddRejected_Kind.
+var (
+	WatchAddRejected_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "SCRIPTS",
+		2: "OUTPOINTS",
+		3: "TRANSACTIONS",
+		4: "DEPTH_ALARMS",
+		5: "DESCRIPTOR",
+		6: "SCRIPT_PREFIXES",
+		7: "SILENT_PAYMENTS",
+	}
+	WatchAddRejected_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED": 0,
+		"SCRIPTS":          1,
+		"OUTPOINTS":        2,
+		"TRANSACTIONS":     3,
+		"DEPTH_ALARMS":     4,
+		"DESCRIPTOR":       5,
+		"SCRIPT_PREFIXES":  6,
+		"SILENT_PAYMENTS":  7,
+	}
+)
+
+func (x WatchAddRejected_Kind) Enum() *WatchAddRejected_Kind {
+	p := new(WatchAddRejected_Kind)
+	*p = x
+	return p
+}
+
+func (x WatchAddRejected_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (WatchAddRejected_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_satd_events_v1_events_proto_enumTypes[6].Descriptor()
+}
+
+func (WatchAddRejected_Kind) Type() protoreflect.EnumType {
+	return &file_satd_events_v1_events_proto_enumTypes[6]
+}
+
+func (x WatchAddRejected_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use WatchAddRejected_Kind.Descriptor instead.
+func (WatchAddRejected_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{60, 0}
+}
+
+type WatchAddRejected_Reason int32
+
+const (
+	WatchAddRejected_REASON_UNSPECIFIED WatchAddRejected_Reason = 0
+	WatchAddRejected_QUOTA_EXCEEDED     WatchAddRejected_Reason = 1
+	WatchAddRejected_RATE_LIMITED       WatchAddRejected_Reason = 2
+	WatchAddRejected_CAP_EXCEEDED       WatchAddRejected_Reason = 3
+	WatchAddRejected_PERMISSION_DENIED  WatchAddRejected_Reason = 4
+	WatchAddRejected_MALFORMED          WatchAddRejected_Reason = 5
+)
+
+// Enum value maps for WatchAddRejected_Reason.
+var (
+	WatchAddRejected_Reason_name = map[int32]string{
+		0: "REASON_UNSPECIFIED",
+		1: "QUOTA_EXCEEDED",
+		2: "RATE_LIMITED",
+		3: "CAP_EXCEEDED",
+		4: "PERMISSION_DENIED",
+		5: "MALFORMED",
+	}
+	WatchAddRejected_Reason_value = map[string]int32{
+		"REASON_UNSPECIFIED": 0,
+		"QUOTA_EXCEEDED":     1,
+		"RATE_LIMITED":       2,
+		"CAP_EXCEEDED":       3,
+		"PERMISSION_DENIED":  4,
+		"MALFORMED":          5,
+	}
+)
+
+func (x WatchAddRejected_Reason) Enum() *WatchAddRejected_Reason {
+	p := new(WatchAddRejected_Reason)
+	*p = x
+	return p
+}
+
+func (x WatchAddRejected_Reason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (WatchAddRejected_Reason) Descriptor() protoreflect.EnumDescriptor {
+	return file_satd_events_v1_events_proto_enumTypes[7].Descriptor()
+}
+
+func (WatchAddRejected_Reason) Type() protoreflect.EnumType {
+	return &file_satd_events_v1_events_proto_enumTypes[7]
+}
+
+func (x WatchAddRejected_Reason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use WatchAddRejected_Reason.Descriptor instead.
+func (WatchAddRejected_Reason) EnumDescriptor() ([]byte, []int) {
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{60, 1}
+}
+
 type RescanRejected_Reason int32
 
 const (
@@ -424,11 +546,11 @@ func (x RescanRejected_Reason) String() string {
 }
 
 func (RescanRejected_Reason) Descriptor() protoreflect.EnumDescriptor {
-	return file_satd_events_v1_events_proto_enumTypes[6].Descriptor()
+	return file_satd_events_v1_events_proto_enumTypes[8].Descriptor()
 }
 
 func (RescanRejected_Reason) Type() protoreflect.EnumType {
-	return &file_satd_events_v1_events_proto_enumTypes[6]
+	return &file_satd_events_v1_events_proto_enumTypes[8]
 }
 
 func (x RescanRejected_Reason) Number() protoreflect.EnumNumber {
@@ -437,7 +559,7 @@ func (x RescanRejected_Reason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RescanRejected_Reason.Descriptor instead.
 func (RescanRejected_Reason) EnumDescriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{62, 0}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{63, 0}
 }
 
 // Client→server control on the bidirectional Watch stream. A tagged union
@@ -4861,6 +4983,204 @@ func (x *WatchSetRejected) GetQuota() uint64 {
 	return 0
 }
 
+// An incremental watch add (AddScripts, AddOutpoints, AddTransactions,
+// AddDescriptor, AddScriptPrefixes, AddSilentPayments) that the server did not
+// register, delivered in-band on the Watch stream (same pattern as
+// WatchSetResult). Emitted once per refused Add* message and never for one that
+// registered, so a client that sees none can rely on its adds having landed.
+// The add is all-or-nothing over its NET-NEW items: none of the items echoed
+// here is watched. Items the message re-asserted (already watched) are not
+// echoed and stay watched; their metadata (a script's min_value floor, a
+// silent-payment target's labels) still updates, except when the refusal is
+// CAP_EXCEEDED or RATE_LIMITED on a silent-payment add, which leaves held
+// targets' labels as they were.
+//
+// `required`/`quota` carry the numbers behind `reason`:
+//
+//	QUOTA_EXCEEDED    — `required` = units the refused items cost, `held` =
+//	  units the principal already holds, `quota` = its unit ceiling. Remove
+//	  watches or ask for a larger quota.
+//	RATE_LIMITED      — `retry_after_secs` = when the per-principal rate limit
+//	  admits another add. The same add may then succeed.
+//	CAP_EXCEEDED      — `required` = the count the add would reach, `quota` = the
+//	  per-connection cap it hit: 16 silent-payment targets, 256 descriptors, or
+//	  the WS entry cap (`streamwsmaxsubscriptions`).
+//	PERMISSION_DENIED — the token lacks `stream:watch`.
+//	MALFORMED         — the message could not be applied as a whole: a
+//	  `min_values` list not parallel to its scripthashes, an invalid descriptor,
+//	  or a txid × depth product over the per-message cap. Echoes the items
+//	  that parsed, except for an over-cap depth product, which echoes none.
+//
+// Individually unparseable items inside an otherwise valid add (a scripthash
+// that is not 32 bytes, a prefix outside the allowed bit range, an invalid
+// silent-payment key) are skipped without a rejection.
+type WatchAddRejected struct {
+	state          protoimpl.MessageState  `protogen:"open.v1"`
+	Kind           WatchAddRejected_Kind   `protobuf:"varint,1,opt,name=kind,proto3,enum=satd.events.v1.WatchAddRejected_Kind" json:"kind,omitempty"`
+	Reason         WatchAddRejected_Reason `protobuf:"varint,2,opt,name=reason,proto3,enum=satd.events.v1.WatchAddRejected_Reason" json:"reason,omitempty"`
+	Required       uint64                  `protobuf:"varint,3,opt,name=required,proto3" json:"required,omitempty"`
+	Held           uint64                  `protobuf:"varint,4,opt,name=held,proto3" json:"held,omitempty"`
+	Quota          uint64                  `protobuf:"varint,5,opt,name=quota,proto3" json:"quota,omitempty"`
+	RetryAfterSecs uint32                  `protobuf:"varint,6,opt,name=retry_after_secs,json=retryAfterSecs,proto3" json:"retry_after_secs,omitempty"`
+	// The refused items, as the client named them. Only the field for `kind` is set.
+	Scripthashes [][]byte           `protobuf:"bytes,7,rep,name=scripthashes,proto3" json:"scripthashes,omitempty"` // 32 bytes each
+	Outpoints    []*Outpoint        `protobuf:"bytes,8,rep,name=outpoints,proto3" json:"outpoints,omitempty"`
+	Txids        [][]byte           `protobuf:"bytes,9,rep,name=txids,proto3" json:"txids,omitempty"` // lifecycle watches, 32 bytes each
+	DepthAlarms  []*WatchDepthAlarm `protobuf:"bytes,10,rep,name=depth_alarms,json=depthAlarms,proto3" json:"depth_alarms,omitempty"`
+	Descriptor_  string             `protobuf:"bytes,11,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
+	GapLimit     uint32             `protobuf:"varint,12,opt,name=gap_limit,json=gapLimit,proto3" json:"gap_limit,omitempty"` // the window the refused AddDescriptor asked for
+	Start        uint32             `protobuf:"varint,13,opt,name=start,proto3" json:"start,omitempty"`
+	// True when an earlier window of `descriptor` stays watched (a refused slide);
+	// false when the descriptor is not watched at all.
+	DescriptorKept bool            `protobuf:"varint,14,opt,name=descriptor_kept,json=descriptorKept,proto3" json:"descriptor_kept,omitempty"`
+	Prefixes       []*ScriptPrefix `protobuf:"bytes,15,rep,name=prefixes,proto3" json:"prefixes,omitempty"`                          // masked to `bits`
+	ScanPubkeys    [][]byte        `protobuf:"bytes,16,rep,name=scan_pubkeys,json=scanPubkeys,proto3" json:"scan_pubkeys,omitempty"` // silent-payment identities b_scan·G (33 bytes); never the secret
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *WatchAddRejected) Reset() {
+	*x = WatchAddRejected{}
+	mi := &file_satd_events_v1_events_proto_msgTypes[60]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchAddRejected) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchAddRejected) ProtoMessage() {}
+
+func (x *WatchAddRejected) ProtoReflect() protoreflect.Message {
+	mi := &file_satd_events_v1_events_proto_msgTypes[60]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchAddRejected.ProtoReflect.Descriptor instead.
+func (*WatchAddRejected) Descriptor() ([]byte, []int) {
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{60}
+}
+
+func (x *WatchAddRejected) GetKind() WatchAddRejected_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return WatchAddRejected_KIND_UNSPECIFIED
+}
+
+func (x *WatchAddRejected) GetReason() WatchAddRejected_Reason {
+	if x != nil {
+		return x.Reason
+	}
+	return WatchAddRejected_REASON_UNSPECIFIED
+}
+
+func (x *WatchAddRejected) GetRequired() uint64 {
+	if x != nil {
+		return x.Required
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetHeld() uint64 {
+	if x != nil {
+		return x.Held
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetQuota() uint64 {
+	if x != nil {
+		return x.Quota
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetRetryAfterSecs() uint32 {
+	if x != nil {
+		return x.RetryAfterSecs
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetScripthashes() [][]byte {
+	if x != nil {
+		return x.Scripthashes
+	}
+	return nil
+}
+
+func (x *WatchAddRejected) GetOutpoints() []*Outpoint {
+	if x != nil {
+		return x.Outpoints
+	}
+	return nil
+}
+
+func (x *WatchAddRejected) GetTxids() [][]byte {
+	if x != nil {
+		return x.Txids
+	}
+	return nil
+}
+
+func (x *WatchAddRejected) GetDepthAlarms() []*WatchDepthAlarm {
+	if x != nil {
+		return x.DepthAlarms
+	}
+	return nil
+}
+
+func (x *WatchAddRejected) GetDescriptor_() string {
+	if x != nil {
+		return x.Descriptor_
+	}
+	return ""
+}
+
+func (x *WatchAddRejected) GetGapLimit() uint32 {
+	if x != nil {
+		return x.GapLimit
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetStart() uint32 {
+	if x != nil {
+		return x.Start
+	}
+	return 0
+}
+
+func (x *WatchAddRejected) GetDescriptorKept() bool {
+	if x != nil {
+		return x.DescriptorKept
+	}
+	return false
+}
+
+func (x *WatchAddRejected) GetPrefixes() []*ScriptPrefix {
+	if x != nil {
+		return x.Prefixes
+	}
+	return nil
+}
+
+func (x *WatchAddRejected) GetScanPubkeys() [][]byte {
+	if x != nil {
+		return x.ScanPubkeys
+	}
+	return nil
+}
+
 // Deterministic outcome of a RescanBlocks, delivered in-band ahead of any
 // matches it admits (same pattern as SetCursorResult). Emitted exactly once per
 // actionable rescan. On accept, zero or more confirmed watch-match events
@@ -4879,7 +5199,7 @@ type RescanResult struct {
 
 func (x *RescanResult) Reset() {
 	*x = RescanResult{}
-	mi := &file_satd_events_v1_events_proto_msgTypes[60]
+	mi := &file_satd_events_v1_events_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4891,7 +5211,7 @@ func (x *RescanResult) String() string {
 func (*RescanResult) ProtoMessage() {}
 
 func (x *RescanResult) ProtoReflect() protoreflect.Message {
-	mi := &file_satd_events_v1_events_proto_msgTypes[60]
+	mi := &file_satd_events_v1_events_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4904,7 +5224,7 @@ func (x *RescanResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanResult.ProtoReflect.Descriptor instead.
 func (*RescanResult) Descriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{60}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *RescanResult) GetOutcome() isRescanResult_Outcome {
@@ -4964,7 +5284,7 @@ type RescanAccepted struct {
 
 func (x *RescanAccepted) Reset() {
 	*x = RescanAccepted{}
-	mi := &file_satd_events_v1_events_proto_msgTypes[61]
+	mi := &file_satd_events_v1_events_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4976,7 +5296,7 @@ func (x *RescanAccepted) String() string {
 func (*RescanAccepted) ProtoMessage() {}
 
 func (x *RescanAccepted) ProtoReflect() protoreflect.Message {
-	mi := &file_satd_events_v1_events_proto_msgTypes[61]
+	mi := &file_satd_events_v1_events_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4989,7 +5309,7 @@ func (x *RescanAccepted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanAccepted.ProtoReflect.Descriptor instead.
 func (*RescanAccepted) Descriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{61}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *RescanAccepted) GetFromHeight() uint32 {
@@ -5026,7 +5346,7 @@ type RescanRejected struct {
 
 func (x *RescanRejected) Reset() {
 	*x = RescanRejected{}
-	mi := &file_satd_events_v1_events_proto_msgTypes[62]
+	mi := &file_satd_events_v1_events_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5038,7 +5358,7 @@ func (x *RescanRejected) String() string {
 func (*RescanRejected) ProtoMessage() {}
 
 func (x *RescanRejected) ProtoReflect() protoreflect.Message {
-	mi := &file_satd_events_v1_events_proto_msgTypes[62]
+	mi := &file_satd_events_v1_events_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5051,7 +5371,7 @@ func (x *RescanRejected) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanRejected.ProtoReflect.Descriptor instead.
 func (*RescanRejected) Descriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{62}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *RescanRejected) GetReason() RescanRejected_Reason {
@@ -5082,7 +5402,7 @@ type RescanComplete struct {
 
 func (x *RescanComplete) Reset() {
 	*x = RescanComplete{}
-	mi := &file_satd_events_v1_events_proto_msgTypes[63]
+	mi := &file_satd_events_v1_events_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5094,7 +5414,7 @@ func (x *RescanComplete) String() string {
 func (*RescanComplete) ProtoMessage() {}
 
 func (x *RescanComplete) ProtoReflect() protoreflect.Message {
-	mi := &file_satd_events_v1_events_proto_msgTypes[63]
+	mi := &file_satd_events_v1_events_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5107,7 +5427,7 @@ func (x *RescanComplete) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanComplete.ProtoReflect.Descriptor instead.
 func (*RescanComplete) Descriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{63}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *RescanComplete) GetFromHeight() uint32 {
@@ -5165,6 +5485,7 @@ type NodeEvent struct {
 	//	*NodeEvent_SilentPaymentMatched
 	//	*NodeEvent_MempoolTweak
 	//	*NodeEvent_Status
+	//	*NodeEvent_WatchAddRejected
 	Body          isNodeEvent_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -5172,7 +5493,7 @@ type NodeEvent struct {
 
 func (x *NodeEvent) Reset() {
 	*x = NodeEvent{}
-	mi := &file_satd_events_v1_events_proto_msgTypes[64]
+	mi := &file_satd_events_v1_events_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5184,7 +5505,7 @@ func (x *NodeEvent) String() string {
 func (*NodeEvent) ProtoMessage() {}
 
 func (x *NodeEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_satd_events_v1_events_proto_msgTypes[64]
+	mi := &file_satd_events_v1_events_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5197,7 +5518,7 @@ func (x *NodeEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeEvent.ProtoReflect.Descriptor instead.
 func (*NodeEvent) Descriptor() ([]byte, []int) {
-	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{64}
+	return file_satd_events_v1_events_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *NodeEvent) GetSchemaVersion() uint32 {
@@ -5417,6 +5738,15 @@ func (x *NodeEvent) GetStatus() *StatusEvent {
 	return nil
 }
 
+func (x *NodeEvent) GetWatchAddRejected() *WatchAddRejected {
+	if x != nil {
+		if x, ok := x.Body.(*NodeEvent_WatchAddRejected); ok {
+			return x.WatchAddRejected
+		}
+	}
+	return nil
+}
+
 type isNodeEvent_Body interface {
 	isNodeEvent_Body()
 }
@@ -5505,6 +5835,10 @@ type NodeEvent_Status struct {
 	Status *StatusEvent `protobuf:"bytes,31,opt,name=status,proto3,oneof"` // node-health condition (Subscribe `status` category, bit 16)
 }
 
+type NodeEvent_WatchAddRejected struct {
+	WatchAddRejected *WatchAddRejected `protobuf:"bytes,32,opt,name=watch_add_rejected,json=watchAddRejected,proto3,oneof"` // an incremental watch add the server did not register (Watch stream)
+}
+
 func (*NodeEvent_Mempool) isNodeEvent_Body() {}
 
 func (*NodeEvent_Chain) isNodeEvent_Body() {}
@@ -5546,6 +5880,8 @@ func (*NodeEvent_SilentPaymentMatched) isNodeEvent_Body() {}
 func (*NodeEvent_MempoolTweak) isNodeEvent_Body() {}
 
 func (*NodeEvent_Status) isNodeEvent_Body() {}
+
+func (*NodeEvent_WatchAddRejected) isNodeEvent_Body() {}
 
 var File_satd_events_v1_events_proto protoreflect.FileDescriptor
 
@@ -5873,7 +6209,44 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eQUOTA_EXCEEDED\x10\x01\x12\r\n" +
 	"\tMALFORMED\x10\x02\x12\x10\n" +
-	"\fCAP_EXCEEDED\x10\x03\"\x95\x01\n" +
+	"\fCAP_EXCEEDED\x10\x03\"\xa6\a\n" +
+	"\x10WatchAddRejected\x129\n" +
+	"\x04kind\x18\x01 \x01(\x0e2%.satd.events.v1.WatchAddRejected.KindR\x04kind\x12?\n" +
+	"\x06reason\x18\x02 \x01(\x0e2'.satd.events.v1.WatchAddRejected.ReasonR\x06reason\x12\x1a\n" +
+	"\brequired\x18\x03 \x01(\x04R\brequired\x12\x12\n" +
+	"\x04held\x18\x04 \x01(\x04R\x04held\x12\x14\n" +
+	"\x05quota\x18\x05 \x01(\x04R\x05quota\x12(\n" +
+	"\x10retry_after_secs\x18\x06 \x01(\rR\x0eretryAfterSecs\x12\"\n" +
+	"\fscripthashes\x18\a \x03(\fR\fscripthashes\x126\n" +
+	"\toutpoints\x18\b \x03(\v2\x18.satd.events.v1.OutpointR\toutpoints\x12\x14\n" +
+	"\x05txids\x18\t \x03(\fR\x05txids\x12B\n" +
+	"\fdepth_alarms\x18\n" +
+	" \x03(\v2\x1f.satd.events.v1.WatchDepthAlarmR\vdepthAlarms\x12\x1e\n" +
+	"\n" +
+	"descriptor\x18\v \x01(\tR\n" +
+	"descriptor\x12\x1b\n" +
+	"\tgap_limit\x18\f \x01(\rR\bgapLimit\x12\x14\n" +
+	"\x05start\x18\r \x01(\rR\x05start\x12'\n" +
+	"\x0fdescriptor_kept\x18\x0e \x01(\bR\x0edescriptorKept\x128\n" +
+	"\bprefixes\x18\x0f \x03(\v2\x1c.satd.events.v1.ScriptPrefixR\bprefixes\x12!\n" +
+	"\fscan_pubkeys\x18\x10 \x03(\fR\vscanPubkeys\"\x96\x01\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\v\n" +
+	"\aSCRIPTS\x10\x01\x12\r\n" +
+	"\tOUTPOINTS\x10\x02\x12\x10\n" +
+	"\fTRANSACTIONS\x10\x03\x12\x10\n" +
+	"\fDEPTH_ALARMS\x10\x04\x12\x0e\n" +
+	"\n" +
+	"DESCRIPTOR\x10\x05\x12\x13\n" +
+	"\x0fSCRIPT_PREFIXES\x10\x06\x12\x13\n" +
+	"\x0fSILENT_PAYMENTS\x10\a\"~\n" +
+	"\x06Reason\x12\x16\n" +
+	"\x12REASON_UNSPECIFIED\x10\x00\x12\x12\n" +
+	"\x0eQUOTA_EXCEEDED\x10\x01\x12\x10\n" +
+	"\fRATE_LIMITED\x10\x02\x12\x10\n" +
+	"\fCAP_EXCEEDED\x10\x03\x12\x15\n" +
+	"\x11PERMISSION_DENIED\x10\x04\x12\r\n" +
+	"\tMALFORMED\x10\x05\"\x95\x01\n" +
 	"\fRescanResult\x12<\n" +
 	"\baccepted\x18\x01 \x01(\v2\x1e.satd.events.v1.RescanAcceptedH\x00R\baccepted\x12<\n" +
 	"\brejected\x18\x02 \x01(\v2\x1e.satd.events.v1.RescanRejectedH\x00R\brejectedB\t\n" +
@@ -5899,7 +6272,7 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\vfrom_height\x18\x01 \x01(\rR\n" +
 	"fromHeight\x12\x1b\n" +
 	"\tto_height\x18\x02 \x01(\rR\btoHeight\x12\x18\n" +
-	"\amatches\x18\x03 \x01(\x04R\amatches\"\xef\f\n" +
+	"\amatches\x18\x03 \x01(\x04R\amatches\"\xc1\r\n" +
 	"\tNodeEvent\x12%\n" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12/\n" +
 	"\x05stamp\x18\x02 \x01(\v2\x19.satd.events.v1.EdgeStampR\x05stamp\x12.\n" +
@@ -5925,7 +6298,8 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\fblock_tweaks\x18\x1c \x01(\v2\x1b.satd.events.v1.BlockTweaksH\x00R\vblockTweaks\x12\\\n" +
 	"\x16silent_payment_matched\x18\x1d \x01(\v2$.satd.events.v1.SilentPaymentMatchedH\x00R\x14silentPaymentMatched\x12C\n" +
 	"\rmempool_tweak\x18\x1e \x01(\v2\x1c.satd.events.v1.MempoolTweakH\x00R\fmempoolTweak\x125\n" +
-	"\x06status\x18\x1f \x01(\v2\x1b.satd.events.v1.StatusEventH\x00R\x06statusB\x06\n" +
+	"\x06status\x18\x1f \x01(\v2\x1b.satd.events.v1.StatusEventH\x00R\x06status\x12P\n" +
+	"\x12watch_add_rejected\x18  \x01(\v2 .satd.events.v1.WatchAddRejectedH\x00R\x10watchAddRejectedB\x06\n" +
 	"\x04bodyJ\x04\b\x0f\x10\x10R\x1adescriptor_needs_addresses*\xb2\x01\n" +
 	"\vEvictReason\x12\x1c\n" +
 	"\x18EVICT_REASON_UNSPECIFIED\x10\x00\x12\x1a\n" +
@@ -5971,8 +6345,8 @@ func file_satd_events_v1_events_proto_rawDescGZIP() []byte {
 	return file_satd_events_v1_events_proto_rawDescData
 }
 
-var file_satd_events_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_satd_events_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
+var file_satd_events_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
+var file_satd_events_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 67)
 var file_satd_events_v1_events_proto_goTypes = []any{
 	(EvictReason)(0),              // 0: satd.events.v1.EvictReason
 	(StatusKind)(0),               // 1: satd.events.v1.StatusKind
@@ -5980,167 +6354,176 @@ var file_satd_events_v1_events_proto_goTypes = []any{
 	(StatusSeverity)(0),           // 3: satd.events.v1.StatusSeverity
 	(CursorRejected_Reason)(0),    // 4: satd.events.v1.CursorRejected.Reason
 	(WatchSetRejected_Reason)(0),  // 5: satd.events.v1.WatchSetRejected.Reason
-	(RescanRejected_Reason)(0),    // 6: satd.events.v1.RescanRejected.Reason
-	(*SubscribeControl)(nil),      // 7: satd.events.v1.SubscribeControl
-	(*SetWatchOptions)(nil),       // 8: satd.events.v1.SetWatchOptions
-	(*RescanBlocks)(nil),          // 9: satd.events.v1.RescanBlocks
-	(*SetWatchSet)(nil),           // 10: satd.events.v1.SetWatchSet
-	(*WatchLifecycle)(nil),        // 11: satd.events.v1.WatchLifecycle
-	(*WatchDepthAlarm)(nil),       // 12: satd.events.v1.WatchDepthAlarm
-	(*AddDescriptor)(nil),         // 13: satd.events.v1.AddDescriptor
-	(*RemoveDescriptor)(nil),      // 14: satd.events.v1.RemoveDescriptor
-	(*SetCursor)(nil),             // 15: satd.events.v1.SetCursor
-	(*SetCategories)(nil),         // 16: satd.events.v1.SetCategories
-	(*Outpoint)(nil),              // 17: satd.events.v1.Outpoint
-	(*AddScripts)(nil),            // 18: satd.events.v1.AddScripts
-	(*RemoveScripts)(nil),         // 19: satd.events.v1.RemoveScripts
-	(*AddOutpoints)(nil),          // 20: satd.events.v1.AddOutpoints
-	(*RemoveOutpoints)(nil),       // 21: satd.events.v1.RemoveOutpoints
-	(*AddTransactions)(nil),       // 22: satd.events.v1.AddTransactions
-	(*RemoveTransactions)(nil),    // 23: satd.events.v1.RemoveTransactions
-	(*ScriptPrefix)(nil),          // 24: satd.events.v1.ScriptPrefix
-	(*AddScriptPrefixes)(nil),     // 25: satd.events.v1.AddScriptPrefixes
-	(*RemoveScriptPrefixes)(nil),  // 26: satd.events.v1.RemoveScriptPrefixes
-	(*SilentPaymentTarget)(nil),   // 27: satd.events.v1.SilentPaymentTarget
-	(*AddSilentPayments)(nil),     // 28: satd.events.v1.AddSilentPayments
-	(*RemoveSilentPayments)(nil),  // 29: satd.events.v1.RemoveSilentPayments
-	(*OutpointSpent)(nil),         // 30: satd.events.v1.OutpointSpent
-	(*ScriptMatched)(nil),         // 31: satd.events.v1.ScriptMatched
-	(*DescriptorMatch)(nil),       // 32: satd.events.v1.DescriptorMatch
-	(*TxidMatched)(nil),           // 33: satd.events.v1.TxidMatched
-	(*TxidReplaced)(nil),          // 34: satd.events.v1.TxidReplaced
-	(*TxidEvicted)(nil),           // 35: satd.events.v1.TxidEvicted
-	(*TxidUnconfirmed)(nil),       // 36: satd.events.v1.TxidUnconfirmed
-	(*TxidDepthReached)(nil),      // 37: satd.events.v1.TxidDepthReached
-	(*TxidFinalized)(nil),         // 38: satd.events.v1.TxidFinalized
-	(*SpentPrevout)(nil),          // 39: satd.events.v1.SpentPrevout
-	(*PrefixMatched)(nil),         // 40: satd.events.v1.PrefixMatched
-	(*SilentPaymentMatched)(nil),  // 41: satd.events.v1.SilentPaymentMatched
-	(*BlockTweaks)(nil),           // 42: satd.events.v1.BlockTweaks
-	(*TaprootOutput)(nil),         // 43: satd.events.v1.TaprootOutput
-	(*TweakEntry)(nil),            // 44: satd.events.v1.TweakEntry
-	(*MempoolTweak)(nil),          // 45: satd.events.v1.MempoolTweak
-	(*SubscribeRequest)(nil),      // 46: satd.events.v1.SubscribeRequest
-	(*Cursor)(nil),                // 47: satd.events.v1.Cursor
-	(*EdgeStamp)(nil),             // 48: satd.events.v1.EdgeStamp
-	(*MempoolEvent)(nil),          // 49: satd.events.v1.MempoolEvent
-	(*MempoolEnter)(nil),          // 50: satd.events.v1.MempoolEnter
-	(*MempoolLeaveConfirmed)(nil), // 51: satd.events.v1.MempoolLeaveConfirmed
-	(*MempoolLeaveEvicted)(nil),   // 52: satd.events.v1.MempoolLeaveEvicted
-	(*MempoolLeaveReplaced)(nil),  // 53: satd.events.v1.MempoolLeaveReplaced
-	(*ChainEvent)(nil),            // 54: satd.events.v1.ChainEvent
-	(*BlockConnected)(nil),        // 55: satd.events.v1.BlockConnected
-	(*BlockDisconnected)(nil),     // 56: satd.events.v1.BlockDisconnected
-	(*Reorg)(nil),                 // 57: satd.events.v1.Reorg
-	(*Heartbeat)(nil),             // 58: satd.events.v1.Heartbeat
-	(*StatusEvent)(nil),           // 59: satd.events.v1.StatusEvent
-	(*Lagged)(nil),                // 60: satd.events.v1.Lagged
-	(*SetCursorResult)(nil),       // 61: satd.events.v1.SetCursorResult
-	(*CursorAccepted)(nil),        // 62: satd.events.v1.CursorAccepted
-	(*CursorRejected)(nil),        // 63: satd.events.v1.CursorRejected
-	(*WatchSetResult)(nil),        // 64: satd.events.v1.WatchSetResult
-	(*WatchSetAccepted)(nil),      // 65: satd.events.v1.WatchSetAccepted
-	(*WatchSetRejected)(nil),      // 66: satd.events.v1.WatchSetRejected
-	(*RescanResult)(nil),          // 67: satd.events.v1.RescanResult
-	(*RescanAccepted)(nil),        // 68: satd.events.v1.RescanAccepted
-	(*RescanRejected)(nil),        // 69: satd.events.v1.RescanRejected
-	(*RescanComplete)(nil),        // 70: satd.events.v1.RescanComplete
-	(*NodeEvent)(nil),             // 71: satd.events.v1.NodeEvent
-	nil,                           // 72: satd.events.v1.StatusEvent.DetailsEntry
+	(WatchAddRejected_Kind)(0),    // 6: satd.events.v1.WatchAddRejected.Kind
+	(WatchAddRejected_Reason)(0),  // 7: satd.events.v1.WatchAddRejected.Reason
+	(RescanRejected_Reason)(0),    // 8: satd.events.v1.RescanRejected.Reason
+	(*SubscribeControl)(nil),      // 9: satd.events.v1.SubscribeControl
+	(*SetWatchOptions)(nil),       // 10: satd.events.v1.SetWatchOptions
+	(*RescanBlocks)(nil),          // 11: satd.events.v1.RescanBlocks
+	(*SetWatchSet)(nil),           // 12: satd.events.v1.SetWatchSet
+	(*WatchLifecycle)(nil),        // 13: satd.events.v1.WatchLifecycle
+	(*WatchDepthAlarm)(nil),       // 14: satd.events.v1.WatchDepthAlarm
+	(*AddDescriptor)(nil),         // 15: satd.events.v1.AddDescriptor
+	(*RemoveDescriptor)(nil),      // 16: satd.events.v1.RemoveDescriptor
+	(*SetCursor)(nil),             // 17: satd.events.v1.SetCursor
+	(*SetCategories)(nil),         // 18: satd.events.v1.SetCategories
+	(*Outpoint)(nil),              // 19: satd.events.v1.Outpoint
+	(*AddScripts)(nil),            // 20: satd.events.v1.AddScripts
+	(*RemoveScripts)(nil),         // 21: satd.events.v1.RemoveScripts
+	(*AddOutpoints)(nil),          // 22: satd.events.v1.AddOutpoints
+	(*RemoveOutpoints)(nil),       // 23: satd.events.v1.RemoveOutpoints
+	(*AddTransactions)(nil),       // 24: satd.events.v1.AddTransactions
+	(*RemoveTransactions)(nil),    // 25: satd.events.v1.RemoveTransactions
+	(*ScriptPrefix)(nil),          // 26: satd.events.v1.ScriptPrefix
+	(*AddScriptPrefixes)(nil),     // 27: satd.events.v1.AddScriptPrefixes
+	(*RemoveScriptPrefixes)(nil),  // 28: satd.events.v1.RemoveScriptPrefixes
+	(*SilentPaymentTarget)(nil),   // 29: satd.events.v1.SilentPaymentTarget
+	(*AddSilentPayments)(nil),     // 30: satd.events.v1.AddSilentPayments
+	(*RemoveSilentPayments)(nil),  // 31: satd.events.v1.RemoveSilentPayments
+	(*OutpointSpent)(nil),         // 32: satd.events.v1.OutpointSpent
+	(*ScriptMatched)(nil),         // 33: satd.events.v1.ScriptMatched
+	(*DescriptorMatch)(nil),       // 34: satd.events.v1.DescriptorMatch
+	(*TxidMatched)(nil),           // 35: satd.events.v1.TxidMatched
+	(*TxidReplaced)(nil),          // 36: satd.events.v1.TxidReplaced
+	(*TxidEvicted)(nil),           // 37: satd.events.v1.TxidEvicted
+	(*TxidUnconfirmed)(nil),       // 38: satd.events.v1.TxidUnconfirmed
+	(*TxidDepthReached)(nil),      // 39: satd.events.v1.TxidDepthReached
+	(*TxidFinalized)(nil),         // 40: satd.events.v1.TxidFinalized
+	(*SpentPrevout)(nil),          // 41: satd.events.v1.SpentPrevout
+	(*PrefixMatched)(nil),         // 42: satd.events.v1.PrefixMatched
+	(*SilentPaymentMatched)(nil),  // 43: satd.events.v1.SilentPaymentMatched
+	(*BlockTweaks)(nil),           // 44: satd.events.v1.BlockTweaks
+	(*TaprootOutput)(nil),         // 45: satd.events.v1.TaprootOutput
+	(*TweakEntry)(nil),            // 46: satd.events.v1.TweakEntry
+	(*MempoolTweak)(nil),          // 47: satd.events.v1.MempoolTweak
+	(*SubscribeRequest)(nil),      // 48: satd.events.v1.SubscribeRequest
+	(*Cursor)(nil),                // 49: satd.events.v1.Cursor
+	(*EdgeStamp)(nil),             // 50: satd.events.v1.EdgeStamp
+	(*MempoolEvent)(nil),          // 51: satd.events.v1.MempoolEvent
+	(*MempoolEnter)(nil),          // 52: satd.events.v1.MempoolEnter
+	(*MempoolLeaveConfirmed)(nil), // 53: satd.events.v1.MempoolLeaveConfirmed
+	(*MempoolLeaveEvicted)(nil),   // 54: satd.events.v1.MempoolLeaveEvicted
+	(*MempoolLeaveReplaced)(nil),  // 55: satd.events.v1.MempoolLeaveReplaced
+	(*ChainEvent)(nil),            // 56: satd.events.v1.ChainEvent
+	(*BlockConnected)(nil),        // 57: satd.events.v1.BlockConnected
+	(*BlockDisconnected)(nil),     // 58: satd.events.v1.BlockDisconnected
+	(*Reorg)(nil),                 // 59: satd.events.v1.Reorg
+	(*Heartbeat)(nil),             // 60: satd.events.v1.Heartbeat
+	(*StatusEvent)(nil),           // 61: satd.events.v1.StatusEvent
+	(*Lagged)(nil),                // 62: satd.events.v1.Lagged
+	(*SetCursorResult)(nil),       // 63: satd.events.v1.SetCursorResult
+	(*CursorAccepted)(nil),        // 64: satd.events.v1.CursorAccepted
+	(*CursorRejected)(nil),        // 65: satd.events.v1.CursorRejected
+	(*WatchSetResult)(nil),        // 66: satd.events.v1.WatchSetResult
+	(*WatchSetAccepted)(nil),      // 67: satd.events.v1.WatchSetAccepted
+	(*WatchSetRejected)(nil),      // 68: satd.events.v1.WatchSetRejected
+	(*WatchAddRejected)(nil),      // 69: satd.events.v1.WatchAddRejected
+	(*RescanResult)(nil),          // 70: satd.events.v1.RescanResult
+	(*RescanAccepted)(nil),        // 71: satd.events.v1.RescanAccepted
+	(*RescanRejected)(nil),        // 72: satd.events.v1.RescanRejected
+	(*RescanComplete)(nil),        // 73: satd.events.v1.RescanComplete
+	(*NodeEvent)(nil),             // 74: satd.events.v1.NodeEvent
+	nil,                           // 75: satd.events.v1.StatusEvent.DetailsEntry
 }
 var file_satd_events_v1_events_proto_depIdxs = []int32{
-	15, // 0: satd.events.v1.SubscribeControl.set_cursor:type_name -> satd.events.v1.SetCursor
-	16, // 1: satd.events.v1.SubscribeControl.set_categories:type_name -> satd.events.v1.SetCategories
-	18, // 2: satd.events.v1.SubscribeControl.add_scripts:type_name -> satd.events.v1.AddScripts
-	19, // 3: satd.events.v1.SubscribeControl.remove_scripts:type_name -> satd.events.v1.RemoveScripts
-	20, // 4: satd.events.v1.SubscribeControl.add_outpoints:type_name -> satd.events.v1.AddOutpoints
-	21, // 5: satd.events.v1.SubscribeControl.remove_outpoints:type_name -> satd.events.v1.RemoveOutpoints
-	13, // 6: satd.events.v1.SubscribeControl.add_descriptor:type_name -> satd.events.v1.AddDescriptor
-	14, // 7: satd.events.v1.SubscribeControl.remove_descriptor:type_name -> satd.events.v1.RemoveDescriptor
-	22, // 8: satd.events.v1.SubscribeControl.add_transactions:type_name -> satd.events.v1.AddTransactions
-	23, // 9: satd.events.v1.SubscribeControl.remove_transactions:type_name -> satd.events.v1.RemoveTransactions
-	25, // 10: satd.events.v1.SubscribeControl.add_script_prefixes:type_name -> satd.events.v1.AddScriptPrefixes
-	26, // 11: satd.events.v1.SubscribeControl.remove_script_prefixes:type_name -> satd.events.v1.RemoveScriptPrefixes
-	10, // 12: satd.events.v1.SubscribeControl.set_watch_set:type_name -> satd.events.v1.SetWatchSet
-	9,  // 13: satd.events.v1.SubscribeControl.rescan_blocks:type_name -> satd.events.v1.RescanBlocks
-	8,  // 14: satd.events.v1.SubscribeControl.set_watch_options:type_name -> satd.events.v1.SetWatchOptions
-	28, // 15: satd.events.v1.SubscribeControl.add_silent_payments:type_name -> satd.events.v1.AddSilentPayments
-	29, // 16: satd.events.v1.SubscribeControl.remove_silent_payments:type_name -> satd.events.v1.RemoveSilentPayments
-	17, // 17: satd.events.v1.SetWatchSet.outpoints:type_name -> satd.events.v1.Outpoint
-	13, // 18: satd.events.v1.SetWatchSet.descriptors:type_name -> satd.events.v1.AddDescriptor
-	24, // 19: satd.events.v1.SetWatchSet.prefixes:type_name -> satd.events.v1.ScriptPrefix
-	11, // 20: satd.events.v1.SetWatchSet.lifecycles:type_name -> satd.events.v1.WatchLifecycle
-	12, // 21: satd.events.v1.SetWatchSet.depth_alarms:type_name -> satd.events.v1.WatchDepthAlarm
-	27, // 22: satd.events.v1.SetWatchSet.silent_payments:type_name -> satd.events.v1.SilentPaymentTarget
-	47, // 23: satd.events.v1.SetCursor.cursor:type_name -> satd.events.v1.Cursor
-	17, // 24: satd.events.v1.AddOutpoints.outpoints:type_name -> satd.events.v1.Outpoint
-	17, // 25: satd.events.v1.RemoveOutpoints.outpoints:type_name -> satd.events.v1.Outpoint
-	24, // 26: satd.events.v1.AddScriptPrefixes.prefixes:type_name -> satd.events.v1.ScriptPrefix
-	24, // 27: satd.events.v1.RemoveScriptPrefixes.prefixes:type_name -> satd.events.v1.ScriptPrefix
-	27, // 28: satd.events.v1.AddSilentPayments.targets:type_name -> satd.events.v1.SilentPaymentTarget
-	32, // 29: satd.events.v1.ScriptMatched.descriptor_matches:type_name -> satd.events.v1.DescriptorMatch
-	24, // 30: satd.events.v1.PrefixMatched.prefix:type_name -> satd.events.v1.ScriptPrefix
-	39, // 31: satd.events.v1.PrefixMatched.matched_prevouts:type_name -> satd.events.v1.SpentPrevout
-	44, // 32: satd.events.v1.BlockTweaks.entries:type_name -> satd.events.v1.TweakEntry
-	43, // 33: satd.events.v1.TweakEntry.taproot_outputs:type_name -> satd.events.v1.TaprootOutput
-	44, // 34: satd.events.v1.MempoolTweak.entry:type_name -> satd.events.v1.TweakEntry
-	47, // 35: satd.events.v1.SubscribeRequest.from_cursor:type_name -> satd.events.v1.Cursor
-	50, // 36: satd.events.v1.MempoolEvent.enter:type_name -> satd.events.v1.MempoolEnter
-	51, // 37: satd.events.v1.MempoolEvent.leave_confirmed:type_name -> satd.events.v1.MempoolLeaveConfirmed
-	52, // 38: satd.events.v1.MempoolEvent.leave_evicted:type_name -> satd.events.v1.MempoolLeaveEvicted
-	53, // 39: satd.events.v1.MempoolEvent.leave_replaced:type_name -> satd.events.v1.MempoolLeaveReplaced
+	17, // 0: satd.events.v1.SubscribeControl.set_cursor:type_name -> satd.events.v1.SetCursor
+	18, // 1: satd.events.v1.SubscribeControl.set_categories:type_name -> satd.events.v1.SetCategories
+	20, // 2: satd.events.v1.SubscribeControl.add_scripts:type_name -> satd.events.v1.AddScripts
+	21, // 3: satd.events.v1.SubscribeControl.remove_scripts:type_name -> satd.events.v1.RemoveScripts
+	22, // 4: satd.events.v1.SubscribeControl.add_outpoints:type_name -> satd.events.v1.AddOutpoints
+	23, // 5: satd.events.v1.SubscribeControl.remove_outpoints:type_name -> satd.events.v1.RemoveOutpoints
+	15, // 6: satd.events.v1.SubscribeControl.add_descriptor:type_name -> satd.events.v1.AddDescriptor
+	16, // 7: satd.events.v1.SubscribeControl.remove_descriptor:type_name -> satd.events.v1.RemoveDescriptor
+	24, // 8: satd.events.v1.SubscribeControl.add_transactions:type_name -> satd.events.v1.AddTransactions
+	25, // 9: satd.events.v1.SubscribeControl.remove_transactions:type_name -> satd.events.v1.RemoveTransactions
+	27, // 10: satd.events.v1.SubscribeControl.add_script_prefixes:type_name -> satd.events.v1.AddScriptPrefixes
+	28, // 11: satd.events.v1.SubscribeControl.remove_script_prefixes:type_name -> satd.events.v1.RemoveScriptPrefixes
+	12, // 12: satd.events.v1.SubscribeControl.set_watch_set:type_name -> satd.events.v1.SetWatchSet
+	11, // 13: satd.events.v1.SubscribeControl.rescan_blocks:type_name -> satd.events.v1.RescanBlocks
+	10, // 14: satd.events.v1.SubscribeControl.set_watch_options:type_name -> satd.events.v1.SetWatchOptions
+	30, // 15: satd.events.v1.SubscribeControl.add_silent_payments:type_name -> satd.events.v1.AddSilentPayments
+	31, // 16: satd.events.v1.SubscribeControl.remove_silent_payments:type_name -> satd.events.v1.RemoveSilentPayments
+	19, // 17: satd.events.v1.SetWatchSet.outpoints:type_name -> satd.events.v1.Outpoint
+	15, // 18: satd.events.v1.SetWatchSet.descriptors:type_name -> satd.events.v1.AddDescriptor
+	26, // 19: satd.events.v1.SetWatchSet.prefixes:type_name -> satd.events.v1.ScriptPrefix
+	13, // 20: satd.events.v1.SetWatchSet.lifecycles:type_name -> satd.events.v1.WatchLifecycle
+	14, // 21: satd.events.v1.SetWatchSet.depth_alarms:type_name -> satd.events.v1.WatchDepthAlarm
+	29, // 22: satd.events.v1.SetWatchSet.silent_payments:type_name -> satd.events.v1.SilentPaymentTarget
+	49, // 23: satd.events.v1.SetCursor.cursor:type_name -> satd.events.v1.Cursor
+	19, // 24: satd.events.v1.AddOutpoints.outpoints:type_name -> satd.events.v1.Outpoint
+	19, // 25: satd.events.v1.RemoveOutpoints.outpoints:type_name -> satd.events.v1.Outpoint
+	26, // 26: satd.events.v1.AddScriptPrefixes.prefixes:type_name -> satd.events.v1.ScriptPrefix
+	26, // 27: satd.events.v1.RemoveScriptPrefixes.prefixes:type_name -> satd.events.v1.ScriptPrefix
+	29, // 28: satd.events.v1.AddSilentPayments.targets:type_name -> satd.events.v1.SilentPaymentTarget
+	34, // 29: satd.events.v1.ScriptMatched.descriptor_matches:type_name -> satd.events.v1.DescriptorMatch
+	26, // 30: satd.events.v1.PrefixMatched.prefix:type_name -> satd.events.v1.ScriptPrefix
+	41, // 31: satd.events.v1.PrefixMatched.matched_prevouts:type_name -> satd.events.v1.SpentPrevout
+	46, // 32: satd.events.v1.BlockTweaks.entries:type_name -> satd.events.v1.TweakEntry
+	45, // 33: satd.events.v1.TweakEntry.taproot_outputs:type_name -> satd.events.v1.TaprootOutput
+	46, // 34: satd.events.v1.MempoolTweak.entry:type_name -> satd.events.v1.TweakEntry
+	49, // 35: satd.events.v1.SubscribeRequest.from_cursor:type_name -> satd.events.v1.Cursor
+	52, // 36: satd.events.v1.MempoolEvent.enter:type_name -> satd.events.v1.MempoolEnter
+	53, // 37: satd.events.v1.MempoolEvent.leave_confirmed:type_name -> satd.events.v1.MempoolLeaveConfirmed
+	54, // 38: satd.events.v1.MempoolEvent.leave_evicted:type_name -> satd.events.v1.MempoolLeaveEvicted
+	55, // 39: satd.events.v1.MempoolEvent.leave_replaced:type_name -> satd.events.v1.MempoolLeaveReplaced
 	0,  // 40: satd.events.v1.MempoolLeaveEvicted.reason:type_name -> satd.events.v1.EvictReason
-	55, // 41: satd.events.v1.ChainEvent.block_connected:type_name -> satd.events.v1.BlockConnected
-	56, // 42: satd.events.v1.ChainEvent.block_disconnected:type_name -> satd.events.v1.BlockDisconnected
-	57, // 43: satd.events.v1.ChainEvent.reorg:type_name -> satd.events.v1.Reorg
+	57, // 41: satd.events.v1.ChainEvent.block_connected:type_name -> satd.events.v1.BlockConnected
+	58, // 42: satd.events.v1.ChainEvent.block_disconnected:type_name -> satd.events.v1.BlockDisconnected
+	59, // 43: satd.events.v1.ChainEvent.reorg:type_name -> satd.events.v1.Reorg
 	1,  // 44: satd.events.v1.StatusEvent.kind:type_name -> satd.events.v1.StatusKind
 	2,  // 45: satd.events.v1.StatusEvent.state:type_name -> satd.events.v1.StatusState
 	3,  // 46: satd.events.v1.StatusEvent.severity:type_name -> satd.events.v1.StatusSeverity
-	72, // 47: satd.events.v1.StatusEvent.details:type_name -> satd.events.v1.StatusEvent.DetailsEntry
-	47, // 48: satd.events.v1.Lagged.resume_cursor:type_name -> satd.events.v1.Cursor
-	62, // 49: satd.events.v1.SetCursorResult.accepted:type_name -> satd.events.v1.CursorAccepted
-	63, // 50: satd.events.v1.SetCursorResult.rejected:type_name -> satd.events.v1.CursorRejected
-	47, // 51: satd.events.v1.CursorAccepted.from:type_name -> satd.events.v1.Cursor
+	75, // 47: satd.events.v1.StatusEvent.details:type_name -> satd.events.v1.StatusEvent.DetailsEntry
+	49, // 48: satd.events.v1.Lagged.resume_cursor:type_name -> satd.events.v1.Cursor
+	64, // 49: satd.events.v1.SetCursorResult.accepted:type_name -> satd.events.v1.CursorAccepted
+	65, // 50: satd.events.v1.SetCursorResult.rejected:type_name -> satd.events.v1.CursorRejected
+	49, // 51: satd.events.v1.CursorAccepted.from:type_name -> satd.events.v1.Cursor
 	4,  // 52: satd.events.v1.CursorRejected.reason:type_name -> satd.events.v1.CursorRejected.Reason
-	47, // 53: satd.events.v1.CursorRejected.current_head:type_name -> satd.events.v1.Cursor
-	65, // 54: satd.events.v1.WatchSetResult.accepted:type_name -> satd.events.v1.WatchSetAccepted
-	66, // 55: satd.events.v1.WatchSetResult.rejected:type_name -> satd.events.v1.WatchSetRejected
+	49, // 53: satd.events.v1.CursorRejected.current_head:type_name -> satd.events.v1.Cursor
+	67, // 54: satd.events.v1.WatchSetResult.accepted:type_name -> satd.events.v1.WatchSetAccepted
+	68, // 55: satd.events.v1.WatchSetResult.rejected:type_name -> satd.events.v1.WatchSetRejected
 	5,  // 56: satd.events.v1.WatchSetRejected.reason:type_name -> satd.events.v1.WatchSetRejected.Reason
-	68, // 57: satd.events.v1.RescanResult.accepted:type_name -> satd.events.v1.RescanAccepted
-	69, // 58: satd.events.v1.RescanResult.rejected:type_name -> satd.events.v1.RescanRejected
-	6,  // 59: satd.events.v1.RescanRejected.reason:type_name -> satd.events.v1.RescanRejected.Reason
-	48, // 60: satd.events.v1.NodeEvent.stamp:type_name -> satd.events.v1.EdgeStamp
-	47, // 61: satd.events.v1.NodeEvent.cursor:type_name -> satd.events.v1.Cursor
-	49, // 62: satd.events.v1.NodeEvent.mempool:type_name -> satd.events.v1.MempoolEvent
-	54, // 63: satd.events.v1.NodeEvent.chain:type_name -> satd.events.v1.ChainEvent
-	58, // 64: satd.events.v1.NodeEvent.heartbeat:type_name -> satd.events.v1.Heartbeat
-	30, // 65: satd.events.v1.NodeEvent.outpoint_spent:type_name -> satd.events.v1.OutpointSpent
-	31, // 66: satd.events.v1.NodeEvent.script_matched:type_name -> satd.events.v1.ScriptMatched
-	60, // 67: satd.events.v1.NodeEvent.lagged:type_name -> satd.events.v1.Lagged
-	33, // 68: satd.events.v1.NodeEvent.txid_matched:type_name -> satd.events.v1.TxidMatched
-	34, // 69: satd.events.v1.NodeEvent.txid_replaced:type_name -> satd.events.v1.TxidReplaced
-	35, // 70: satd.events.v1.NodeEvent.txid_evicted:type_name -> satd.events.v1.TxidEvicted
-	36, // 71: satd.events.v1.NodeEvent.txid_unconfirmed:type_name -> satd.events.v1.TxidUnconfirmed
-	37, // 72: satd.events.v1.NodeEvent.txid_depth_reached:type_name -> satd.events.v1.TxidDepthReached
-	38, // 73: satd.events.v1.NodeEvent.txid_finalized:type_name -> satd.events.v1.TxidFinalized
-	40, // 74: satd.events.v1.NodeEvent.prefix_matched:type_name -> satd.events.v1.PrefixMatched
-	61, // 75: satd.events.v1.NodeEvent.set_cursor_result:type_name -> satd.events.v1.SetCursorResult
-	64, // 76: satd.events.v1.NodeEvent.set_watch_set_result:type_name -> satd.events.v1.WatchSetResult
-	67, // 77: satd.events.v1.NodeEvent.rescan_result:type_name -> satd.events.v1.RescanResult
-	70, // 78: satd.events.v1.NodeEvent.rescan_complete:type_name -> satd.events.v1.RescanComplete
-	42, // 79: satd.events.v1.NodeEvent.block_tweaks:type_name -> satd.events.v1.BlockTweaks
-	41, // 80: satd.events.v1.NodeEvent.silent_payment_matched:type_name -> satd.events.v1.SilentPaymentMatched
-	45, // 81: satd.events.v1.NodeEvent.mempool_tweak:type_name -> satd.events.v1.MempoolTweak
-	59, // 82: satd.events.v1.NodeEvent.status:type_name -> satd.events.v1.StatusEvent
-	46, // 83: satd.events.v1.NodeEventStream.Subscribe:input_type -> satd.events.v1.SubscribeRequest
-	7,  // 84: satd.events.v1.NodeEventStream.Watch:input_type -> satd.events.v1.SubscribeControl
-	71, // 85: satd.events.v1.NodeEventStream.Subscribe:output_type -> satd.events.v1.NodeEvent
-	71, // 86: satd.events.v1.NodeEventStream.Watch:output_type -> satd.events.v1.NodeEvent
-	85, // [85:87] is the sub-list for method output_type
-	83, // [83:85] is the sub-list for method input_type
-	83, // [83:83] is the sub-list for extension type_name
-	83, // [83:83] is the sub-list for extension extendee
-	0,  // [0:83] is the sub-list for field type_name
+	6,  // 57: satd.events.v1.WatchAddRejected.kind:type_name -> satd.events.v1.WatchAddRejected.Kind
+	7,  // 58: satd.events.v1.WatchAddRejected.reason:type_name -> satd.events.v1.WatchAddRejected.Reason
+	19, // 59: satd.events.v1.WatchAddRejected.outpoints:type_name -> satd.events.v1.Outpoint
+	14, // 60: satd.events.v1.WatchAddRejected.depth_alarms:type_name -> satd.events.v1.WatchDepthAlarm
+	26, // 61: satd.events.v1.WatchAddRejected.prefixes:type_name -> satd.events.v1.ScriptPrefix
+	71, // 62: satd.events.v1.RescanResult.accepted:type_name -> satd.events.v1.RescanAccepted
+	72, // 63: satd.events.v1.RescanResult.rejected:type_name -> satd.events.v1.RescanRejected
+	8,  // 64: satd.events.v1.RescanRejected.reason:type_name -> satd.events.v1.RescanRejected.Reason
+	50, // 65: satd.events.v1.NodeEvent.stamp:type_name -> satd.events.v1.EdgeStamp
+	49, // 66: satd.events.v1.NodeEvent.cursor:type_name -> satd.events.v1.Cursor
+	51, // 67: satd.events.v1.NodeEvent.mempool:type_name -> satd.events.v1.MempoolEvent
+	56, // 68: satd.events.v1.NodeEvent.chain:type_name -> satd.events.v1.ChainEvent
+	60, // 69: satd.events.v1.NodeEvent.heartbeat:type_name -> satd.events.v1.Heartbeat
+	32, // 70: satd.events.v1.NodeEvent.outpoint_spent:type_name -> satd.events.v1.OutpointSpent
+	33, // 71: satd.events.v1.NodeEvent.script_matched:type_name -> satd.events.v1.ScriptMatched
+	62, // 72: satd.events.v1.NodeEvent.lagged:type_name -> satd.events.v1.Lagged
+	35, // 73: satd.events.v1.NodeEvent.txid_matched:type_name -> satd.events.v1.TxidMatched
+	36, // 74: satd.events.v1.NodeEvent.txid_replaced:type_name -> satd.events.v1.TxidReplaced
+	37, // 75: satd.events.v1.NodeEvent.txid_evicted:type_name -> satd.events.v1.TxidEvicted
+	38, // 76: satd.events.v1.NodeEvent.txid_unconfirmed:type_name -> satd.events.v1.TxidUnconfirmed
+	39, // 77: satd.events.v1.NodeEvent.txid_depth_reached:type_name -> satd.events.v1.TxidDepthReached
+	40, // 78: satd.events.v1.NodeEvent.txid_finalized:type_name -> satd.events.v1.TxidFinalized
+	42, // 79: satd.events.v1.NodeEvent.prefix_matched:type_name -> satd.events.v1.PrefixMatched
+	63, // 80: satd.events.v1.NodeEvent.set_cursor_result:type_name -> satd.events.v1.SetCursorResult
+	66, // 81: satd.events.v1.NodeEvent.set_watch_set_result:type_name -> satd.events.v1.WatchSetResult
+	70, // 82: satd.events.v1.NodeEvent.rescan_result:type_name -> satd.events.v1.RescanResult
+	73, // 83: satd.events.v1.NodeEvent.rescan_complete:type_name -> satd.events.v1.RescanComplete
+	44, // 84: satd.events.v1.NodeEvent.block_tweaks:type_name -> satd.events.v1.BlockTweaks
+	43, // 85: satd.events.v1.NodeEvent.silent_payment_matched:type_name -> satd.events.v1.SilentPaymentMatched
+	47, // 86: satd.events.v1.NodeEvent.mempool_tweak:type_name -> satd.events.v1.MempoolTweak
+	61, // 87: satd.events.v1.NodeEvent.status:type_name -> satd.events.v1.StatusEvent
+	69, // 88: satd.events.v1.NodeEvent.watch_add_rejected:type_name -> satd.events.v1.WatchAddRejected
+	48, // 89: satd.events.v1.NodeEventStream.Subscribe:input_type -> satd.events.v1.SubscribeRequest
+	9,  // 90: satd.events.v1.NodeEventStream.Watch:input_type -> satd.events.v1.SubscribeControl
+	74, // 91: satd.events.v1.NodeEventStream.Subscribe:output_type -> satd.events.v1.NodeEvent
+	74, // 92: satd.events.v1.NodeEventStream.Watch:output_type -> satd.events.v1.NodeEvent
+	91, // [91:93] is the sub-list for method output_type
+	89, // [89:91] is the sub-list for method input_type
+	89, // [89:89] is the sub-list for extension type_name
+	89, // [89:89] is the sub-list for extension extendee
+	0,  // [0:89] is the sub-list for field type_name
 }
 
 func init() { file_satd_events_v1_events_proto_init() }
@@ -6187,11 +6570,11 @@ func file_satd_events_v1_events_proto_init() {
 		(*WatchSetResult_Accepted)(nil),
 		(*WatchSetResult_Rejected)(nil),
 	}
-	file_satd_events_v1_events_proto_msgTypes[60].OneofWrappers = []any{
+	file_satd_events_v1_events_proto_msgTypes[61].OneofWrappers = []any{
 		(*RescanResult_Accepted)(nil),
 		(*RescanResult_Rejected)(nil),
 	}
-	file_satd_events_v1_events_proto_msgTypes[64].OneofWrappers = []any{
+	file_satd_events_v1_events_proto_msgTypes[65].OneofWrappers = []any{
 		(*NodeEvent_Mempool)(nil),
 		(*NodeEvent_Chain)(nil),
 		(*NodeEvent_Heartbeat)(nil),
@@ -6213,14 +6596,15 @@ func file_satd_events_v1_events_proto_init() {
 		(*NodeEvent_SilentPaymentMatched)(nil),
 		(*NodeEvent_MempoolTweak)(nil),
 		(*NodeEvent_Status)(nil),
+		(*NodeEvent_WatchAddRejected)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_satd_events_v1_events_proto_rawDesc), len(file_satd_events_v1_events_proto_rawDesc)),
-			NumEnums:      7,
-			NumMessages:   66,
+			NumEnums:      9,
+			NumMessages:   67,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

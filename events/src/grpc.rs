@@ -1410,6 +1410,11 @@ impl NodeEventStream for NodeEventStreamSvc {
         // never drops — "exactly one RescanResult per actionable RescanBlocks").
         let (rescan_reject_tx, rescan_reject_rx) =
             tokio::sync::mpsc::channel::<node::events::RescanRejectReason>(32);
+        // An incremental Add* the watch-set refused, handed to the outbound task
+        // for an in-band WatchAddRejected. Same backpressure contract as the
+        // channels above: blocks on full, never drops.
+        let (add_reject_tx, mut add_reject_rx) =
+            tokio::sync::mpsc::channel::<crate::watchset::AddRejected>(32);
 
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
@@ -1426,6 +1431,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             let rescan_in_flight = rescan_in_flight.clone();
             let rescan_tx = rescan_tx;
             let rescan_reject_tx = rescan_reject_tx;
+            let add_reject_tx = add_reject_tx;
             tokio::spawn(async move {
                 use node::events::CursorRejectReason;
                 use node::events::RescanRejectReason;
@@ -1617,16 +1623,23 @@ impl NodeEventStream for NodeEventStreamSvc {
                         }
                         continue;
                     }
-                    let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                    apply_control(
-                        ctrl,
-                        &handle,
-                        principal.as_ref(),
-                        &category_mask,
-                        &include_raw_tx,
-                        &mut guard,
-                        prefix_bounds,
-                    );
+                    // Scope the guard so it drops before the send below.
+                    let rejected = {
+                        let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                        apply_control(
+                            ctrl,
+                            &handle,
+                            principal.as_ref(),
+                            &category_mask,
+                            &include_raw_tx,
+                            &mut guard,
+                            prefix_bounds,
+                        )
+                    };
+                    if let Some(r) = rejected {
+                        // Outbound gone (stream tearing down) → nothing to deliver.
+                        let _ = add_reject_tx.send(r).await;
+                    }
                 }
                 // Inbound (control) closed. The watch-set is NOT dropped here —
                 // it belongs to the subscription and drops with the outbound
@@ -1776,6 +1789,14 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // by the inbound reader: emit the in-band WatchSetResult.
                     Some(outcome) = ws_result_rx.recv() => {
                         let ev = watch_set_result_to_proto(&edge, &outcome);
+                        if tx_out.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    // An incremental add the watch-set refused: emit the in-band
+                    // WatchAddRejected naming the items that are not watched.
+                    Some(rejected) = add_reject_rx.recv() => {
+                        let ev = watch_add_rejected_to_proto(&edge, &rejected);
                         if tx_out.send(Ok(ev)).await.is_err() {
                             return;
                         }
@@ -2060,6 +2081,8 @@ impl NodeEventStream for NodeEventStreamSvc {
 /// (cross-message), and mints a per-item lease so a later remove frees exactly
 /// that unit. A rejected add is logged and skipped without tearing down the
 /// stream.
+/// Apply one watch-set control message. Returns the refusal of an incremental
+/// `Add*` the watch-set did not register, for the caller to report in-band.
 fn apply_control(
     ctrl: pb::SubscribeControl,
     handle: &node::events::WatchHandle,
@@ -2068,18 +2091,17 @@ fn apply_control(
     include_raw_tx: &AtomicBool,
     watch_set: &mut WatchSet,
     prefix_bounds: (u8, u8),
-) {
+) -> Option<crate::watchset::AddRejected> {
+    use crate::watchset::{AddRejectReason, AddRejected, RejectedItems};
     use pb::subscribe_control::Msg;
     let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
     match ctrl.msg {
         Some(Msg::AddOutpoints(a)) => {
-            watch_set.add_outpoints(
-                principal,
-                a.outpoints.iter().filter_map(parse_outpoint),
-                |ops| {
+            return watch_set
+                .add_outpoints(principal, a.outpoints.iter().filter_map(parse_outpoint), |ops| {
                     handle.add_outpoints(ops);
-                },
-            );
+                })
+                .err();
         }
         Some(Msg::AddScripts(a)) => {
             // Optional per-script `min_value` floors, parallel to `scripthashes`.
@@ -2093,6 +2115,12 @@ fn apply_control(
                     scripthashes = a.scripthashes.len(),
                     "AddScripts min_values length mismatch; ignoring add",
                 );
+                return Some(AddRejected {
+                    reason: AddRejectReason::Malformed,
+                    items: RejectedItems::Scripts(
+                        a.scripthashes.iter().filter_map(|b| parse_scripthash(b)).collect(),
+                    ),
+                });
             } else {
                 // scripthash → floor (0 when no min_values given).
                 let floors: std::collections::HashMap<[u8; 32], u64> = a
@@ -2116,13 +2144,15 @@ fn apply_control(
                         .collect();
                     handle.add_scripthashes_with_floors(&items);
                 };
-                watch_set.add_scripts(
-                    principal,
-                    a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
-                    "scripts",
-                    apply_floors,
-                    apply_floors,
-                );
+                return watch_set
+                    .add_scripts(
+                        principal,
+                        a.scripthashes.iter().filter_map(|b| parse_scripthash(b)),
+                        "scripts",
+                        apply_floors,
+                        apply_floors,
+                    )
+                    .err();
             }
         }
         Some(Msg::RemoveOutpoints(r)) => {
@@ -2145,20 +2175,29 @@ fn apply_control(
             if depths.is_empty() {
                 // Lifecycle watch(es); `auto_close_depth` rides on each (0 = off).
                 let auto_close = a.auto_close_depth;
-                watch_set.add_transactions(principal, txids, |txids| {
-                    handle.add_txids(txids, auto_close);
-                });
+                return watch_set
+                    .add_transactions(principal, txids, |txids| {
+                        handle.add_txids(txids, auto_close);
+                    })
+                    .err();
             } else if let Some(pairs) = bounded_txid_depth_pairs(&txids, &depths) {
                 // Single-shot depth alarms — one item per (txid × distinct depth).
-                watch_set.add_tx_depths(principal, pairs, |items| {
-                    handle.add_tx_depths(items);
-                });
+                return watch_set
+                    .add_tx_depths(principal, pairs, |items| {
+                        handle.add_tx_depths(items);
+                    })
+                    .err();
             } else {
                 warn!(
                     target: "events::grpc",
                     txids = txids.len(), depths = depths.len(),
                     "AddTransactions txid×depth product exceeds cap; rejecting message",
                 );
+                // The product is too large to echo; the kind still says which add.
+                return Some(AddRejected {
+                    reason: AddRejectReason::Malformed,
+                    items: RejectedItems::DepthAlarms(Vec::new()),
+                });
             }
         }
         Some(Msg::RemoveTransactions(r)) => {
@@ -2186,22 +2225,36 @@ fn apply_control(
             // membership so it can be slid or removed cleanly. Charges one unit
             // per net-new script. The client advances `start` to slide the window
             // (gap-limit tracking is client-side); re-asserting reconciles.
+            let refused = |reason, kept| AddRejected {
+                reason,
+                items: RejectedItems::Descriptor {
+                    descriptor: d.descriptor.clone(),
+                    gap_limit: d.gap_limit,
+                    start: d.start,
+                    kept,
+                },
+            };
             match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
                 Ok(scripts) => {
-                    watch_set.add_descriptor(
-                        principal,
-                        d.descriptor.clone(),
-                        scripts,
-                        |shs| {
-                            handle.add_scripthashes(shs);
-                        },
-                        |shs| {
-                            handle.remove_scripthashes(shs);
-                        },
-                    );
+                    return watch_set
+                        .add_descriptor(
+                            principal,
+                            d.descriptor.clone(),
+                            scripts,
+                            |shs| {
+                                handle.add_scripthashes(shs);
+                            },
+                            |shs| {
+                                handle.remove_scripthashes(shs);
+                            },
+                        )
+                        .err()
+                        .map(|(reason, kept)| refused(reason, kept));
                 }
                 Err(e) => {
                     warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
+                    let kept = watch_set.holds_descriptor(&d.descriptor);
+                    return Some(refused(AddRejectReason::Malformed, kept));
                 }
             }
         }
@@ -2227,9 +2280,11 @@ fn apply_control(
                     )
                 })
                 .collect();
-            watch_set.add_prefixes(principal, items, |keys| {
-                handle.add_prefixes(keys);
-            });
+            return watch_set
+                .add_prefixes(principal, items, |keys| {
+                    handle.add_prefixes(keys);
+                })
+                .err();
         }
         Some(Msg::RemoveScriptPrefixes(r)) => {
             let keys: Vec<(u8, u32)> = r
@@ -2323,9 +2378,11 @@ fn apply_control(
                 t.scan_secret.zeroize();
             }
             if !targets.is_empty() {
-                watch_set.add_silent_payments(principal, targets, |ts| {
-                    handle.add_silent_payments(ts);
-                });
+                return watch_set
+                    .add_silent_payments(principal, targets, |ts| {
+                        handle.add_silent_payments(ts);
+                    })
+                    .err();
             }
         }
         Some(Msg::RemoveSilentPayments(r)) => {
@@ -2343,6 +2400,7 @@ fn apply_control(
         }
         None => {}
     }
+    None
 }
 
 /// Build a [`DesiredWatchSet`] from a `SetWatchSet` snapshot: expand each
@@ -2480,6 +2538,89 @@ fn watch_set_result_to_proto(
         body: Some(pb::node_event::Body::SetWatchSetResult(pb::WatchSetResult {
             outcome: Some(outcome),
         })),
+    }
+}
+
+/// Render a refused incremental add as the in-band `WatchAddRejected` node
+/// event. Hashes and txids go out in internal byte order, as everywhere else on
+/// this wire; a prefix goes out masked to its `bits`.
+fn watch_add_rejected_to_proto(
+    edge: &node::events::EdgeIdentity,
+    rejected: &crate::watchset::AddRejected,
+) -> pb::NodeEvent {
+    use crate::watchset::{AddRejectReason, RejectedItems};
+    use bitcoin::hashes::Hash;
+    use pb::watch_add_rejected::{Kind, Reason};
+    let mut r = pb::WatchAddRejected::default();
+    match rejected.reason {
+        AddRejectReason::QuotaExceeded { required, held, quota } => {
+            r.reason = Reason::QuotaExceeded as i32;
+            r.required = required;
+            r.held = held;
+            r.quota = quota;
+        }
+        AddRejectReason::RateLimited { retry_after_secs } => {
+            r.reason = Reason::RateLimited as i32;
+            r.retry_after_secs = retry_after_secs;
+        }
+        AddRejectReason::CapExceeded { requested, limit } => {
+            r.reason = Reason::CapExceeded as i32;
+            r.required = requested;
+            r.quota = limit;
+        }
+        AddRejectReason::PermissionDenied => r.reason = Reason::PermissionDenied as i32,
+        AddRejectReason::Malformed => r.reason = Reason::Malformed as i32,
+    }
+    match &rejected.items {
+        RejectedItems::Scripts(shs) => {
+            r.kind = Kind::Scripts as i32;
+            r.scripthashes = shs.iter().map(|sh| sh.to_vec()).collect();
+        }
+        RejectedItems::Outpoints(ops) => {
+            r.kind = Kind::Outpoints as i32;
+            r.outpoints = ops
+                .iter()
+                .map(|op| pb::Outpoint { txid: op.txid.to_byte_array().to_vec(), vout: op.vout })
+                .collect();
+        }
+        RejectedItems::Transactions(txids) => {
+            r.kind = Kind::Transactions as i32;
+            r.txids = txids.iter().map(|t| t.to_byte_array().to_vec()).collect();
+        }
+        RejectedItems::DepthAlarms(pairs) => {
+            r.kind = Kind::DepthAlarms as i32;
+            r.depth_alarms = pairs
+                .iter()
+                .map(|(t, depth)| pb::WatchDepthAlarm { txid: t.to_byte_array().to_vec(), depth: *depth })
+                .collect();
+        }
+        RejectedItems::Descriptor { descriptor, gap_limit, start, kept } => {
+            r.kind = Kind::Descriptor as i32;
+            r.descriptor = descriptor.clone();
+            r.gap_limit = *gap_limit;
+            r.start = *start;
+            r.descriptor_kept = *kept;
+        }
+        RejectedItems::Prefixes(keys) => {
+            r.kind = Kind::ScriptPrefixes as i32;
+            r.prefixes = keys
+                .iter()
+                .map(|(bits, masked)| pb::ScriptPrefix {
+                    prefix: masked.to_be_bytes()[..usize::from(*bits).div_ceil(8)].to_vec(),
+                    bits: u32::from(*bits),
+                })
+                .collect();
+        }
+        RejectedItems::SilentPayments(ids) => {
+            r.kind = Kind::SilentPayments as i32;
+            r.scan_pubkeys = ids.iter().map(|id| id.to_vec()).collect();
+        }
+    }
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::WatchAddRejected(r)),
     }
 }
 
@@ -5036,6 +5177,7 @@ mod tests {
                 pb::node_event::Body::SilentPaymentMatched(_) => "silent_payment_matched",
                 pb::node_event::Body::MempoolTweak(_) => "mempool_tweak",
                 pb::node_event::Body::Status(_) => "status",
+                pb::node_event::Body::WatchAddRejected(_) => "watch_add_rejected",
             })
             .collect();
         assert!(
@@ -6706,6 +6848,177 @@ mod tests {
 
         drop(ctrl_tx);
         let _ = shutdown_tx.send(true);
+    }
+
+    /// An incremental add the quota cannot hold is answered in-band with a
+    /// `WatchAddRejected` naming the refused items, over the real authenticated
+    /// wire path, and the stream stays up. An add that fits produces no event:
+    /// the next event after it is the following add's refusal, whose `held`
+    /// counts the unit the accepted add took.
+    #[tokio::test]
+    async fn watch_over_quota_add_is_rejected_in_band() {
+        use std::io::Write;
+        // plaintext "grpc-addreject-token" → this sha256.
+        const TOKEN: &str = "grpc-addreject-token";
+        const TOKEN_SHA256: &str =
+            "b2e84d3711de9d1913e2d74a16a487fe4400a7f855e981b3e740a9477dd31700";
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "version = 1\n\
+             [[token]]\nid=\"q1\"\nhash=\"sha256:{TOKEN_SHA256}\"\n\
+             capabilities=[\"stream:subscribe\",\"stream:watch\"]\n\
+             watch_quota=1\n"
+        );
+        let path = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // The node meters quotas with real accounting; `load` alone is unlimited.
+        let store = Arc::new(
+            satd_auth::TokenStore::load(&path)
+                .unwrap()
+                .with_accounting(Arc::new(satd_auth::LocalAccounting::new())),
+        );
+
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            Some(store),
+            Some(Arc::new(MockBlocks { tip: 5 })),
+            None,
+            Some(registry.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+                "http://{actual}"
+            ))
+            .await
+            .expect("connect");
+
+        let add = |shs: &[u8]| pb::SubscribeControl {
+            msg: Some(pb::subscribe_control::Msg::AddScripts(pb::AddScripts {
+                scripthashes: shs.iter().map(|b| vec![*b; 32]).collect(),
+                min_values: vec![],
+            })),
+        };
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(8);
+        // Two scripts against a one-unit quota: refused whole.
+        ctrl_tx.send(add(&[0x01, 0x02])).await.unwrap();
+        let mut req = tonic::Request::new(ReceiverStream::new(ctrl_rx));
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let mut stream = client.watch(req).await.expect("watch").into_inner();
+
+        let next_rejection = |ev: pb::NodeEvent| match ev.body {
+            Some(pb::node_event::Body::WatchAddRejected(r)) => r,
+            other => panic!("expected WatchAddRejected, got {other:?}"),
+        };
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let r = next_rejection(ev);
+        assert_eq!(r.kind, pb::watch_add_rejected::Kind::Scripts as i32);
+        assert_eq!(r.reason, pb::watch_add_rejected::Reason::QuotaExceeded as i32);
+        assert_eq!((r.required, r.held, r.quota), (2, 0, 1));
+        assert_eq!(r.scripthashes, vec![vec![0x01; 32], vec![0x02; 32]]);
+        assert!(!registry.has_watchers(), "a refused add registers nothing");
+
+        // One script fits: no event. Then one more is refused with held = 1.
+        ctrl_tx.send(add(&[0x03])).await.unwrap();
+        ctrl_tx.send(add(&[0x04])).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .expect("timeout")
+            .expect("transport")
+            .expect("stream ended");
+        let r = next_rejection(ev);
+        assert_eq!((r.required, r.held, r.quota), (1, 1, 1), "the accepted add holds the unit");
+        assert_eq!(r.scripthashes, vec![vec![0x04; 32]]);
+        assert!(registry.has_watchers(), "the add that fit is watched");
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// Every kind of refused add encodes its items the way the client sends
+    /// them: txids in internal byte order, a prefix masked and cut to its bits,
+    /// a descriptor with the window it asked for, silent-payment targets by scan
+    /// pubkey.
+    #[test]
+    fn watch_add_rejected_encodes_each_kind() {
+        use crate::watchset::{AddRejectReason, AddRejected, RejectedItems};
+        use bitcoin::hashes::Hash;
+        use pb::watch_add_rejected::{Kind, Reason};
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]));
+        let render = |reason, items| match watch_add_rejected_to_proto(
+            &edge(),
+            &AddRejected { reason, items },
+        )
+        .body
+        {
+            Some(pb::node_event::Body::WatchAddRejected(r)) => r,
+            other => panic!("expected WatchAddRejected, got {other:?}"),
+        };
+
+        let r = render(
+            AddRejectReason::RateLimited { retry_after_secs: 7 },
+            RejectedItems::Outpoints(vec![bitcoin::OutPoint { txid, vout: 3 }]),
+        );
+        assert_eq!((r.kind, r.reason), (Kind::Outpoints as i32, Reason::RateLimited as i32));
+        assert_eq!(r.retry_after_secs, 7);
+        assert_eq!(r.outpoints, vec![pb::Outpoint { txid: vec![0xab; 32], vout: 3 }]);
+
+        let r = render(AddRejectReason::PermissionDenied, RejectedItems::Transactions(vec![txid]));
+        assert_eq!((r.kind, r.reason), (Kind::Transactions as i32, Reason::PermissionDenied as i32));
+        assert_eq!(r.txids, vec![vec![0xab; 32]]);
+
+        let r = render(
+            AddRejectReason::QuotaExceeded { required: 2, held: 5, quota: 6 },
+            RejectedItems::DepthAlarms(vec![(txid, 6)]),
+        );
+        assert_eq!((r.kind, r.required, r.held, r.quota), (Kind::DepthAlarms as i32, 2, 5, 6));
+        assert_eq!(r.depth_alarms, vec![pb::WatchDepthAlarm { txid: vec![0xab; 32], depth: 6 }]);
+
+        let r = render(
+            AddRejectReason::Malformed,
+            RejectedItems::Descriptor { descriptor: "wpkh(x)".into(), gap_limit: 20, start: 40, kept: true },
+        );
+        assert_eq!((r.kind, r.reason), (Kind::Descriptor as i32, Reason::Malformed as i32));
+        assert_eq!((r.descriptor.as_str(), r.gap_limit, r.start, r.descriptor_kept), ("wpkh(x)", 20, 40, true));
+
+        // 12 bits → 2 bytes, low 4 bits of the second byte masked off.
+        let (key, _) = crate::watchset::parse_prefix(&[0xab, 0xcd], 12, 8, 32).unwrap();
+        let r = render(
+            AddRejectReason::CapExceeded { requested: 3, limit: 2 },
+            RejectedItems::Prefixes(vec![key]),
+        );
+        assert_eq!((r.kind, r.required, r.quota), (Kind::ScriptPrefixes as i32, 3, 2));
+        assert_eq!(r.prefixes, vec![pb::ScriptPrefix { prefix: vec![0xab, 0xc0], bits: 12 }]);
+
+        let r = render(
+            AddRejectReason::CapExceeded { requested: 17, limit: 16 },
+            RejectedItems::SilentPayments(vec![[0x02; 33]]),
+        );
+        assert_eq!(r.kind, Kind::SilentPayments as i32);
+        assert_eq!(r.scan_pubkeys, vec![vec![0x02; 33]]);
     }
 
     /// A `SetCursor` that arrives while a previous re-anchor is **actively
