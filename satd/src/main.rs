@@ -1782,10 +1782,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // between block-connected and shutdown is bounded by the broadcast
     // delivery (microseconds) rather than a polling interval.
     //
-    // The IBD connector and the stored-tail drain emit no chain event.
-    // They check the target themselves (the peer manager is built with
-    // it, below), between one block and the next, so that IBD stops at the
-    // target rather than past it (#873).
+    // The IBD connector emits no chain event. It checks the target itself
+    // (the peer manager is built with it, below), between one block and the
+    // next, so that IBD stops at the target rather than past it (#873). The
+    // stored-tail drain emits one (#900) and checks the target as well, so
+    // by the time its event lands here shutdown may already be asked for;
+    // the watcher then leaves it alone rather than announcing it twice.
     if let Some(target_height) = config.stopatheight {
         let mut rx = chain_event_tx.subscribe();
         let stop_tx = shutdown_tx.clone();
@@ -1802,12 +1804,13 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         ..
                     }) => {
                         if height >= target_height {
-                            tracing::info!(
-                                target = target_height,
-                                tip = height,
-                                "-stopatheight reached; broadcasting shutdown"
-                            );
-                            let _ = stop_tx.send(true);
+                            if stop_tx.send_if_modified(|stop| !std::mem::replace(stop, true)) {
+                                tracing::info!(
+                                    target = target_height,
+                                    tip = height,
+                                    "-stopatheight reached; broadcasting shutdown"
+                                );
+                            }
                             return;
                         }
                     }
@@ -1818,12 +1821,13 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                         // re-check the current tip explicitly so we
                         // don't miss the boundary.
                         if chain_state_for_stop.tip_height() >= target_height {
-                            tracing::info!(
-                                target = target_height,
-                                tip = chain_state_for_stop.tip_height(),
-                                "-stopatheight reached after lag-recovery; broadcasting shutdown"
-                            );
-                            let _ = stop_tx.send(true);
+                            if stop_tx.send_if_modified(|stop| !std::mem::replace(stop, true)) {
+                                tracing::info!(
+                                    target = target_height,
+                                    tip = chain_state_for_stop.tip_height(),
+                                    "-stopatheight reached after lag-recovery; broadcasting shutdown"
+                                );
+                            }
                             return;
                         }
                     }
