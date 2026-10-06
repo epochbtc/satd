@@ -7,7 +7,7 @@ nodes:
   - name: tank-0001
     image:
       repository: satd-warnet
-      tag: "0.5.2-warnet0"
+      tag: "0.6.0-warnet0"
       pullPolicy: Never
     addnode:
       - tank-0002
@@ -17,7 +17,7 @@ nodes:
   - name: tank-0003
     image:
       repository: satd-warnet
-      tag: "0.5.2-warnet0"
+      tag: "0.6.0-warnet0"
       pullPolicy: Never
     addnode:
       - tank-0000
