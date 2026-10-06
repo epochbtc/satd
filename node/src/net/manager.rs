@@ -311,6 +311,56 @@ const BG_CATCHUP_PER_PEER_PER_PASS: usize = 16;
 /// genesis→snapshot validation.
 const BG_CATCHUP_FLUSH_EVERY: u64 = 2000;
 
+/// How long the IBD connector waits on one height's block data before it
+/// warns that it is stuck (#904). Blocks arrive out of order from many peers
+/// and the connector takes them in height order, so it waits on some height
+/// for a second or two all through a healthy sync. In the run that set this,
+/// those waits were all under 5 s; the ones worth a warning had the block in
+/// flight on a single peer for 23–60 s.
+const STUCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(10);
+
+/// How often the stuck-wait warning repeats while the wait goes on.
+const STUCK_WAIT_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// The IBD connector's current wait on one height's block data, for the
+/// "Connector stuck waiting for block data" warning.
+#[derive(Debug, Clone, Copy)]
+struct StuckWait {
+    height: u32,
+    since: Instant,
+    warned_at: Option<Instant>,
+}
+
+impl StuckWait {
+    /// Record that the connector is waiting on `height` at `now`, and say
+    /// whether to warn: once the wait passes `STUCK_WAIT_WARN_AFTER`, then
+    /// every `STUCK_WAIT_WARN_EVERY` while it lasts. A wait on a different
+    /// height starts over.
+    fn should_warn(wait: &mut Option<StuckWait>, height: u32, now: Instant) -> bool {
+        if wait.is_none_or(|w| w.height != height) {
+            *wait = Some(StuckWait {
+                height,
+                since: now,
+                warned_at: None,
+            });
+        }
+        let Some(w) = wait.as_mut() else {
+            return false;
+        };
+        if now.duration_since(w.since) < STUCK_WAIT_WARN_AFTER {
+            return false;
+        }
+        if w
+            .warned_at
+            .is_some_and(|t| now.duration_since(t) < STUCK_WAIT_WARN_EVERY)
+        {
+            return false;
+        }
+        w.warned_at = Some(now);
+        true
+    }
+}
+
 /// Per-address reconnect backoff state.
 struct ReconnectState {
     attempts: u32,
@@ -6394,11 +6444,10 @@ impl PeerManager {
         let mut backpressure_paused = false;
         let mut backpressure_pause_started: Option<Instant> = None;
 
-        // Track which height we've already logged as "stuck waiting for
-        // block data" so we don't flood the log when the connector spins
-        // for 5+ minutes on a missing height. One line per stuck height,
-        // plus one refresh every 60s while still stuck.
-        let mut last_stuck_log: Option<(u32, Instant)> = None;
+        // The height the connector is waiting on for block data, and since
+        // when, for the "stuck waiting for block data" warning. It fires
+        // once a wait passes `STUCK_WAIT_WARN_AFTER`, then once a minute.
+        let mut stuck_wait: Option<StuckWait> = None;
 
         'connect: loop {
             // Shutdown: stop between blocks. Left running, the loop went on
@@ -6576,6 +6625,7 @@ impl PeerManager {
                     Ok(_) => {
                         connected_count += 1;
                         retry_count = 0;
+                        stuck_wait = None;
                         // Lock-free progress signal for the stall watchdog.
                         // Must run on every successful connect, before any
                         // subsequent step that takes a lock the watchdog
@@ -6878,16 +6928,14 @@ impl PeerManager {
                 chain_state.connect_phases().enter(ConnectPhase::WaitingForBlockData);
                 // Diagnostic for the wedge class where the connector spins
                 // forever on a HeaderOnly entry whose data never arrives.
-                // Log once per stuck height, then refresh every 60s with a
+                // Once the wait on this height passes the threshold, log a
                 // scheduler-state snapshot so we can see if the downloader
-                // is even trying. Cheap: the scheduler read is a single
-                // RwLock::read() and three HashMap lookups.
-                let should_log = match last_stuck_log {
-                    None => true,
-                    Some((h, _)) if h != next_height => true,
-                    Some((_, t)) => t.elapsed() >= Duration::from_secs(60),
-                };
-                if should_log {
+                // is even trying, and refresh it every 60s. A shorter wait is
+                // out-of-order download working as intended, and warning on
+                // it filled the log with one line per block (#904). Cheap:
+                // the scheduler read is a single RwLock::read() and three
+                // HashMap lookups.
+                if StuckWait::should_warn(&mut stuck_wait, next_height, Instant::now()) {
                     let (
                         in_pending,
                         in_flight,
@@ -6926,9 +6974,11 @@ impl PeerManager {
                         None::<i32>
                     });
                     let entry = chain_state.get_block_index(&hash);
+                    let waited_secs = stuck_wait.map(|w| w.since.elapsed().as_secs());
                     tracing::warn!(
                         height = next_height,
                         %hash,
+                        ?waited_secs,
                         in_pending,
                         in_flight,
                         downloaded,
@@ -6942,7 +6992,6 @@ impl PeerManager {
                         data_pos = entry.as_ref().map(|e| e.data_pos),
                         "Connector stuck waiting for block data; scheduler state for this height"
                     );
-                    last_stuck_log = Some((next_height, Instant::now()));
                 }
                 let (lock, cvar) = &**connect_signal;
                 let mut ready = lock.lock();
@@ -10645,6 +10694,55 @@ mod tests {
             assert_eq!(pacer.after_drain(2, at), AfterDrain::Maintain, "tick {k}");
             pacer.maintained(at);
         }
+    }
+
+    /// A wait shorter than the threshold is out-of-order download, not a
+    /// stall: no warning, however many heights it happens at (#904).
+    #[test]
+    fn stuck_wait_does_not_warn_on_an_ordinary_wait() {
+        let t0 = Instant::now();
+        let mut wait = None;
+        assert!(!StuckWait::should_warn(&mut wait, 100, t0));
+        assert!(!StuckWait::should_warn(&mut wait, 100, t0 + Duration::from_secs(1)));
+        // The next height starts its own wait, so short waits never add up.
+        for (i, height) in (101..120).enumerate() {
+            let at = t0 + Duration::from_secs(2 + 9 * i as u64);
+            assert!(!StuckWait::should_warn(&mut wait, height, at));
+            let later = at + Duration::from_secs(8);
+            assert!(!StuckWait::should_warn(&mut wait, height, later));
+        }
+    }
+
+    /// Past the threshold on one height, the warning fires once, then again
+    /// a minute later while the same wait goes on.
+    #[test]
+    fn stuck_wait_warns_once_past_the_threshold_then_every_minute() {
+        let t0 = Instant::now();
+        let mut wait = None;
+        assert!(!StuckWait::should_warn(&mut wait, 100, t0));
+        let just_before = t0 + STUCK_WAIT_WARN_AFTER - Duration::from_millis(1);
+        assert!(!StuckWait::should_warn(&mut wait, 100, just_before));
+        let first = t0 + STUCK_WAIT_WARN_AFTER;
+        assert!(StuckWait::should_warn(&mut wait, 100, first));
+        assert!(!StuckWait::should_warn(&mut wait, 100, first + Duration::from_secs(1)));
+        let second = first + STUCK_WAIT_WARN_EVERY;
+        assert!(!StuckWait::should_warn(&mut wait, 100, second - Duration::from_millis(1)));
+        assert!(StuckWait::should_warn(&mut wait, 100, second));
+        assert!(!StuckWait::should_warn(&mut wait, 100, second + Duration::from_secs(1)));
+    }
+
+    /// Moving to another height ends the wait, warned or not: the new
+    /// height gets the full threshold before it can warn.
+    #[test]
+    fn stuck_wait_restarts_on_a_new_height() {
+        let t0 = Instant::now();
+        let mut wait = None;
+        assert!(!StuckWait::should_warn(&mut wait, 100, t0));
+        assert!(StuckWait::should_warn(&mut wait, 100, t0 + Duration::from_secs(30)));
+        let moved = t0 + Duration::from_secs(31);
+        assert!(!StuckWait::should_warn(&mut wait, 101, moved));
+        assert!(!StuckWait::should_warn(&mut wait, 101, moved + Duration::from_secs(5)));
+        assert!(StuckWait::should_warn(&mut wait, 101, moved + STUCK_WAIT_WARN_AFTER));
     }
 
     /// A peer relaying a *policy*-rejected tx (fee floor, dust, mempool limits,
