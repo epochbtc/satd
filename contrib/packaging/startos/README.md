@@ -165,9 +165,10 @@ action wrote the store without restarting the node; and the manifest pinned
 an image tag that predates `satd-init`, so the package as first written could
 not have started at all.
 
-`bridgeSubnet` is now checked rather than assumed — the `rpcallowip` range it
-feeds is what admits the OS proxy on the real bridge, and the RPC interface
-answers.
+The package used to pass the bridge's subnet (`10.0.3.0/24`) to satd-init
+as `rpcallowip`, which is what admitted the OS proxy on the real bridge. From
+0.6.0 satd-init writes `rpcallowip=0.0.0.0/0` and reads no subnet, so the
+package passes none.
 
 Also checked, now on every PR that touches this directory: the package
 typechecks against `@start9labs/start-sdk` 2.0.9, `test/networks.test.ts`

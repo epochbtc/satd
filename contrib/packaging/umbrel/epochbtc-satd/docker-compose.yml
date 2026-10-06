@@ -18,13 +18,13 @@ version: "3.7"
 #
 # The tag is bare. The registry has never published a `v`-prefixed tag.
 #
-# Between releases this pins a master commit's `sha-` image, which docker.yml
-# publishes unsigned for exactly this: the status page this package opens
-# onto, and the `upgradechainstate` switch its satd-init writes, first ship
-# in 0.6.0. `contrib/packaging/sync-store.sh` refuses a
-# `sha-` pin, so it cannot reach the store; when 0.6.0 is released, pin that
-# tag and bump `version` with it (a step in the release checklist).
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-5e73b1d@sha256:f1d65419241d2ee7efc56b46f6651a27a9657bd35059619c71dcaf809dc64b36
+# This pins the 0.6.0 release, the image release.yml built and cosign-signed
+# for the v0.6.0 tag. Between releases it may pin a master commit's `sha-`
+# image instead, which docker.yml publishes unsigned for that purpose;
+# `contrib/packaging/sync-store.sh` refuses a `sha-` pin, so such a pin cannot
+# reach the store. Moving the pin to the next release, with `version`, is a
+# step in the release checklist.
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.6.0@sha256:4d963e3cdfd094be26f306d85c6da68f193864ca1f91f0dd31e2df1825bed3d2
 
 services:
   app_proxy:
@@ -72,7 +72,6 @@ services:
     environment:
       NETWORK: ${APP_SATD_NETWORK:-mainnet}
       SATD_MCP: "1"
-      SATD_STACK_SUBNET: "10.21.0.0/16"
       # The name clients reach this node by. Umbrel publishes <hostname>.local
       # over mDNS, and the certificate has to carry that name or every LAN
       # client sees a mismatch.

@@ -3,7 +3,6 @@ import { storeJson } from './fileModels/store.json'
 import { i18n } from './i18n'
 import { sdk } from './sdk'
 import {
-  bridgeSubnet,
   GetBlockchainInfo,
   p2pPorts,
   rootDir,
@@ -98,10 +97,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
      * points `rpc-cookie` at the network's cookie. A package that
      * re-implemented any of that would drift from the stack within a release.
      *
-     * SATD_STACK_SUBNET becomes satd's `rpcallowip`. On StartOS every service
-     * shares one bridge with the OS at 10.0.3.1, so this range is what admits
-     * the OS reverse proxy and other packages; narrower and the RPC interface
-     * answers nothing.
+     * No SATD_STACK_SUBNET: since 0.6.0 satd-init writes
+     * `rpcallowip=0.0.0.0/0` and reads no subnet, so the OS reverse proxy and
+     * other packages on the bridge are admitted without one.
      */
     .addOneshot('satd-init', {
       subcontainer: satdSub,
@@ -111,7 +109,6 @@ export const main = sdk.setupMain(async ({ effects }) => {
         env: {
           NETWORK: network,
           SATD_MCP: '1',
-          SATD_STACK_SUBNET: bridgeSubnet,
           // The name clients reach this server by. StartOS terminates TLS
           // itself, so this only labels satd's own certificate — the one used
           // on the bridge and for MCP.

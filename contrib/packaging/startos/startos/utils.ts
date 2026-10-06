@@ -44,14 +44,6 @@ export const mcpInterfaceId = 'mcp'
 export const peerInterfaceId = 'peer'
 export const statusInterfaceId = 'status'
 
-/**
- * StartOS puts every service container on one bridge, `lxcbr0`, with the OS
- * itself at a fixed 10.0.3.1. satd's `rpcallowip` has to admit that range or
- * the OS reverse proxy — and every other package on the box — is refused at
- * the RPC surface.
- */
-export const bridgeSubnet = '10.0.3.0/24'
-
 export const satdMounts = sdk.Mounts.of().mountVolume({
   volumeId: 'main',
   mountpoint: rootDir,
