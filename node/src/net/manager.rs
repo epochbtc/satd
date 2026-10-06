@@ -6182,7 +6182,12 @@ impl PeerManager {
                 break;
             };
             let fees = Self::compute_block_fee_rates(&block, chain_state);
-            match chain_state.connect_stored_block(&hash) {
+            // Connects and reports the block as `accept_block` does.
+            // `-blocknotify`, block announcement, Electrum and Esplora
+            // subscribers, the streaming API and ZMQ all learn of new blocks
+            // from its `BlockConnected`, and without it every one of them
+            // missed a block that reached the tip here (#900).
+            match chain_state.connect_stored_block_and_report(&hash) {
                 Ok(_) => {
                     chain_state.bump_connect_heartbeat();
                     chain_state
@@ -6190,20 +6195,9 @@ impl PeerManager {
                         .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                     fee_estimator.record_block(&fees);
                     mempool.remove_for_block(&block, block_height);
-                    // Report the block as `accept_block` reports a connect,
-                    // once the mempool no longer holds its transactions.
-                    // `-blocknotify`, block announcement, Electrum and
-                    // Esplora subscribers, the streaming API and ZMQ all
-                    // learn of new blocks from this event, and without it
-                    // every one of them missed a block that reached the tip
-                    // here (#900).
-                    chain_state.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
-                        hash,
-                        height: block_height,
-                    });
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
                     connected += 1;
-                    // `-stopatheight`. The event above reaches the watcher
+                    // `-stopatheight`. The connect's event reaches the watcher
                     // in `main` as well, but only after this walk has gone
                     // on to its next block; checking here stops the walk
                     // at the target rather than past it (#873).
@@ -12643,6 +12637,72 @@ mod tests {
             .collect();
         assert_eq!(got, expected, "one BlockConnected per drained block, in order: {events:?}");
         assert_eq!(events.len(), expected.len(), "and nothing else: {events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every other connect at the tip reports its block before it releases
+    /// `accept_lock`, which is what keeps events in connect order. A drain
+    /// that released the lock first would let a `submitblock` of the child
+    /// connect and report in between, so subscribers heard of the child
+    /// before its parent. The test holds the event sender, so the drain's
+    /// emit blocks, and checks that the drain still holds the lock there.
+    #[test]
+    fn the_stored_tail_drain_reports_a_block_before_releasing_the_accept_lock() {
+        use crate::chain::events::ChainEvent;
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, store_block_without_connecting,
+        };
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let parent = cs.accept_block(&b1).expect("connect block 1").hash();
+        let b2 = build_test_block(parent, 2, 1_707_000_002);
+        let (accepted, err) = cs.accept_headers(&[b2.header]);
+        assert_eq!(accepted, 1, "fixture: header must be accepted ({err:?})");
+        store_block_without_connecting(&cs, &b2, 2);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<ChainEvent>(16);
+        cs.set_chain_event_sender(tx);
+        let chain_state = Arc::new(cs);
+
+        let connected = std::thread::scope(|scope| {
+            // Inside the scope, so a failed assertion drops it and lets the
+            // drain finish before the scope joins it.
+            let sender = chain_state.hold_chain_event_sender_for_test();
+            let drain = scope.spawn(|| {
+                PeerManager::connect_stored_tail(
+                    &chain_state,
+                    &FeeEstimator::new(),
+                    &Arc::new(Mempool::new(1_000_000, 0)),
+                    &Arc::new(TxOrphanage::with_defaults()),
+                    &std::sync::Weak::new(),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while chain_state.tip_height() < 2 {
+                assert!(Instant::now() < deadline, "the drain never connected block 2");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // The tip moves under the lock, so from here the drain either
+            // still holds it, waiting on the sender, or has let it go.
+            let watch_until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < watch_until {
+                assert!(
+                    chain_state.accept_lock_is_held_for_test(),
+                    "the drain released accept_lock before reporting block 2"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(sender);
+            drain.join().expect("drain thread")
+        });
+        assert_eq!(connected, 1);
+        match rx.try_recv() {
+            Ok(ChainEvent::BlockConnected { hash, height }) => {
+                assert_eq!((hash, height), (b2.block_hash(), 2));
+            }
+            other => panic!("expected BlockConnected for block 2, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

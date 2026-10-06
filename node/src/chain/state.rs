@@ -1756,12 +1756,7 @@ impl ChainState {
     /// Emit a chain event. Best-effort: a slow consumer that misses
     /// events sees `RecvError::Lagged`; emission never blocks the
     /// connect/disconnect path.
-    ///
-    /// Crate-visible for the peer manager's stored-tail drain, which
-    /// connects through [`Self::connect_stored_block`] (no event of its
-    /// own, since the IBD connector uses it too) and reports each block
-    /// once the mempool has caught up with it.
-    pub(crate) fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
+    fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
         // Invariant guarding the API-runtime split (see `rpc::access` and the
         // read-only RPC listener): block-level chain events — and therefore
         // block connection / disconnection / reorg — must originate on the
@@ -2782,6 +2777,25 @@ impl ChainState {
     #[cfg(test)]
     pub(crate) fn hold_accept_lock_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.accept_lock.lock()
+    }
+
+    /// Whether any thread holds the accept lock, for tests that prove a
+    /// step happens before it is released.
+    #[cfg(test)]
+    pub(crate) fn accept_lock_is_held_for_test(&self) -> bool {
+        self.accept_lock.is_locked()
+    }
+
+    /// Hold the chain-event sender, so that an emit blocks until the guard
+    /// drops, for tests that look at what an emitter holds at that point.
+    #[cfg(test)]
+    pub(crate) fn hold_chain_event_sender_for_test(
+        &self,
+    ) -> parking_lot::MutexGuard<
+        '_,
+        Option<tokio::sync::broadcast::Sender<crate::chain::events::ChainEvent>>,
+    > {
+        self.chain_event_tx.lock()
     }
 
     /// Get the highest header height stored (may be ahead of block tip during IBD).
@@ -4980,8 +4994,30 @@ impl ChainState {
     /// Connect an already-stored block (DataStored) to the chain tip.
     /// The block's parent must be the current chain tip.
     ///
-    /// Returns the block hash on success.
+    /// Returns the block hash on success. Emits no chain event: the IBD
+    /// connector calls this for every block of a sync.
     pub fn connect_stored_block(&self, hash: &BlockHash) -> Result<BlockHash, ChainError> {
+        self.connect_stored_block_inner(hash, false)
+    }
+
+    /// [`Self::connect_stored_block`] for the stored-tail drain, which
+    /// reports each block as `accept_block` reports a connect (#900): the
+    /// mempool drops the block's transactions, then `BlockConnected` goes
+    /// out, both before `accept_lock` is released. Emitting after the
+    /// release would let a `submitblock` of the child connect and report
+    /// first, so subscribers would hear of the child before its parent.
+    pub(crate) fn connect_stored_block_and_report(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<BlockHash, ChainError> {
+        self.connect_stored_block_inner(hash, true)
+    }
+
+    fn connect_stored_block_inner(
+        &self,
+        hash: &BlockHash,
+        report: bool,
+    ) -> Result<BlockHash, ChainError> {
         use crate::chain::connect_phase::ConnectPhase;
         let phases = &*self.connect_phases;
 
@@ -5139,6 +5175,16 @@ impl ChainState {
 
         // Update MTP cache with this block's timestamp
         self.push_mtp_cache(entry.height, entry.header.time);
+
+        if report {
+            if let Some(mempool) = self.mempool.get() {
+                mempool.remove_for_block(&block, entry.height);
+            }
+            self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                hash: *hash,
+                height: entry.height,
+            });
+        }
 
         phases.enter(ConnectPhase::Idle);
         Ok(*hash)
