@@ -18,6 +18,7 @@ item below is (or will be) written up in full in the in-development
 ### Fixed
 
 - A watch add the streaming server refused (over the token's watch quota, over the per-add rate limit, over a per-connection cap, without `stream:watch`, or malformed) was logged on the node and dropped, so a client could believe it was watching addresses it was not. The server now answers it on the `Watch` stream with a `WatchAddRejected` event (`watch_add_rejected` on WebSocket) naming the reason and the refused items, as the streaming docs promised; both SDKs surface it. `ResilientWatch` re-sends a rate-limited add once the limit allows, within its backoff budget, and stops re-registering other refused items on reconnect. A silent-payment add that only updates the labels of targets already watched no longer spends a rate-limit token.
+- A block that reached the tip through the stored-tail drain, such as one that arrived before its parent, was connected without a chain event: `-blocknotify` did not run for it, it was not announced to peers, and Electrum, Esplora SSE, streaming and ZMQ `hashblock` subscribers never heard of it, so a wallet saw a confirmation in it only at the next block. The drain now reports each block it connects as every other connect at the tip does (#900).
 
 ## Releases
 
