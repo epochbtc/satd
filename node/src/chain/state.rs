@@ -1756,7 +1756,12 @@ impl ChainState {
     /// Emit a chain event. Best-effort: a slow consumer that misses
     /// events sees `RecvError::Lagged`; emission never blocks the
     /// connect/disconnect path.
-    fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
+    ///
+    /// Crate-visible for the peer manager's stored-tail drain, which
+    /// connects through [`Self::connect_stored_block`] (no event of its
+    /// own, since the IBD connector uses it too) and reports each block
+    /// once the mempool has caught up with it.
+    pub(crate) fn emit_chain_event(&self, event: crate::chain::events::ChainEvent) {
         // Invariant guarding the API-runtime split (see `rpc::access` and the
         // read-only RPC listener): block-level chain events — and therefore
         // block connection / disconnection / reorg — must originate on the

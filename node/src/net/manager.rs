@@ -1138,10 +1138,11 @@ impl PeerManager {
     /// Core checks the target on every tip it connects
     /// (`KernelNotifications::blockTip`). Here a connect that emits
     /// `ChainEvent::BlockConnected` reaches the watcher in `main`; the IBD
-    /// connector and the stored-tail drain emit no event, so they call this
-    /// after each connect (#873). Asked for between one connect and the
-    /// next, shutdown also stops a connector at the target rather than past
-    /// it, because the connector checks for shutdown before it connects
+    /// connector emits no event, so it calls this after each connect (#873).
+    /// The stored-tail drain emits one (#900) and calls this too, because the
+    /// watcher hears of it asynchronously. Asked for between one connect and
+    /// the next, shutdown also stops a connector at the target rather than
+    /// past it, because the connector checks for shutdown before it connects
     /// another block.
     fn stop_if_at_height(&self, height: u32) -> bool {
         let Some((target, shutdown)) = self.stop_at_height.as_ref() else {
@@ -6189,10 +6190,23 @@ impl PeerManager {
                         .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                     fee_estimator.record_block(&fees);
                     mempool.remove_for_block(&block, block_height);
+                    // Report the block as `accept_block` reports a connect,
+                    // once the mempool no longer holds its transactions.
+                    // `-blocknotify`, block announcement, Electrum and
+                    // Esplora subscribers, the streaming API and ZMQ all
+                    // learn of new blocks from this event, and without it
+                    // every one of them missed a block that reached the tip
+                    // here (#900).
+                    chain_state.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
+                        hash,
+                        height: block_height,
+                    });
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
                     connected += 1;
-                    // `-stopatheight`, which this connect, like the IBD
-                    // connector's, reports to no chain-event subscriber.
+                    // `-stopatheight`. The event above reaches the watcher
+                    // in `main` as well, but only after this walk has gone
+                    // on to its next block; checking here stops the walk
+                    // at the target rather than past it (#873).
                     if peer_manager.upgrade().is_some_and(|pm| pm.stop_if_at_height(block_height)) {
                         break;
                     }
@@ -12526,9 +12540,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #873: the stored-tail drain, which emits no chain event either,
-    /// stops at `-stopatheight` and asks for shutdown. The manager only
-    /// holds the target; the drain walks its own chain state.
+    /// #873: the stored-tail drain stops at `-stopatheight` and asks for
+    /// shutdown itself, rather than leaving it to the watcher that hears its
+    /// chain events after the walk has moved on. The manager only holds the
+    /// target; the drain walks its own chain state.
     ///
     /// Perturbation: without the check, the walk connects all nine.
     #[test]
@@ -12568,6 +12583,66 @@ mod tests {
         assert_eq!(connected, 4);
         assert_eq!(chain_state.tip_height(), 5, "the drain stops at the target");
         assert!(*shutdown_rx.borrow(), "and asks for shutdown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #900: every block the stored-tail drain connects is reported with one
+    /// `BlockConnected`, in order, as `accept_block` reports its connects.
+    /// `-blocknotify`, block announcement, Electrum, Esplora SSE, streaming
+    /// and ZMQ subscribers hear of new blocks only through that event.
+    ///
+    /// Perturbation: drop the emit from `connect_stored_tail` and no event
+    /// arrives.
+    #[test]
+    fn the_stored_tail_drain_reports_each_block_it_connects() {
+        use crate::chain::events::ChainEvent;
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, store_block_without_connecting,
+        };
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let mut parent = cs.accept_block(&b1).expect("connect block 1").hash();
+        let mut headers = Vec::new();
+        let mut tail = Vec::new();
+        for h in 2..=4u32 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+            tail.push((b, h));
+        }
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 3, "fixture: headers must be accepted ({err:?})");
+        for (b, h) in &tail {
+            store_block_without_connecting(&cs, b, *h);
+        }
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<ChainEvent>(16);
+        cs.set_chain_event_sender(tx);
+        let chain_state = Arc::new(cs);
+
+        let connected = PeerManager::connect_stored_tail(
+            &chain_state,
+            &FeeEstimator::new(),
+            &Arc::new(Mempool::new(1_000_000, 0)),
+            &Arc::new(TxOrphanage::with_defaults()),
+            &std::sync::Weak::new(),
+        );
+        assert_eq!(connected, 3);
+        assert_eq!(chain_state.tip_height(), 4);
+
+        let events: Vec<ChainEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let expected: Vec<(bitcoin::BlockHash, u32)> =
+            tail.iter().map(|(b, h)| (b.block_hash(), *h)).collect();
+        let got: Vec<(bitcoin::BlockHash, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChainEvent::BlockConnected { hash, height } => Some((*hash, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, expected, "one BlockConnected per drained block, in order: {events:?}");
+        assert_eq!(events.len(), expected.len(), "and nothing else: {events:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

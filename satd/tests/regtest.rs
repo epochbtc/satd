@@ -458,6 +458,69 @@ fn test_stopatheight_zero_disabled() {
     node.stop();
 }
 
+/// `-blocknotify` runs for a block that reaches the tip through the
+/// stored-tail drain (#900). A block that arrives before its parent is
+/// stored; once the parent extends the tip, the drain connects it. The drain
+/// emitted no chain event, so `-blocknotify`, like every other chain-event
+/// subscriber, never heard of that block.
+///
+/// Perturbation: drop the emit from `connect_stored_tail` and only the
+/// parent is notified.
+#[test]
+fn blocknotify_runs_for_a_block_the_stored_tail_drain_connects() {
+    let notify_dir = fresh_test_datadir("satd-blocknotify-drain");
+    let notified = notify_dir.join("blocknotify.log");
+    let mut node =
+        TestNode::start(&[&format!("--blocknotify=echo %s >> {}", notified.display())]);
+
+    let template = node.rpc_call("getblocktemplate").unwrap();
+    let t = &template["result"];
+    let genesis: bitcoin::BlockHash = t["previousblockhash"].as_str().unwrap().parse().unwrap();
+    let time = t["curtime"].as_u64().unwrap() as u32;
+    let parent = build_regtest_block(genesis, 1, time, vec![]);
+    let child = build_regtest_block(parent.block_hash(), 2, time + 1, vec![]);
+    let submit = |method: &str, hex: String| {
+        let r = node
+            .rpc_call_with_params(method, vec![serde_json::json!(hex)])
+            .expect("rpc");
+        assert!(r["error"].is_null(), "{method}: {r}");
+    };
+
+    // Both headers first, as a peer announces them before sending blocks;
+    // then the child, which is stored to wait for its parent, then the parent.
+    submit("submitheader", hex::encode(bitcoin::consensus::serialize(&parent.header)));
+    submit("submitheader", hex::encode(bitcoin::consensus::serialize(&child.header)));
+    submit("submitblock", hex::encode(bitcoin::consensus::serialize(&child)));
+    let count = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(count["result"], 0, "fixture: the child waits for its parent");
+    submit("submitblock", hex::encode(bitcoin::consensus::serialize(&parent)));
+
+    // The drain wakes every 500 ms, and the notifier runs each command in turn.
+    let read = || -> Vec<String> {
+        std::fs::read_to_string(&notified)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let deadline = Instant::now() + test_timeout(30);
+    while read().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A little longer, so a second notification for either block shows up.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let count = node.rpc_call("getblockcount").unwrap();
+    assert_eq!(count["result"], 2, "the drain connects the child");
+    assert_eq!(
+        read(),
+        vec![parent.block_hash().to_string(), child.block_hash().to_string()],
+        "-blocknotify runs once for each block, parent then child"
+    );
+    node.stop();
+    let _ = std::fs::remove_dir_all(&notify_dir);
+}
+
 #[test]
 fn test_sat_cli_integration() {
     let mut node = TestNode::start(&[]);
