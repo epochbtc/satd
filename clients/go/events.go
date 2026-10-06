@@ -594,6 +594,74 @@ type WatchSetRejected struct {
 	Quota uint64
 }
 
+// WatchAddRejected reports an incremental watch add (AddScripts, AddOutpoints,
+// ...) that the node did NOT register: over the quota, over the per-add rate
+// limit, over a per-connection cap, without stream:watch, or malformed. None of
+// the items it names is watched. Items the add re-asserted (already watched)
+// are not named and stay watched. The node sends nothing for an add that
+// registered.
+//
+// [ResilientWatch] re-sends a [WatchAddRejectRateLimited] add itself after the
+// node's retry hint, within its backoff budget, and hands the event on only once
+// that budget runs out. For any other reason, or then, it drops the named items
+// from its mirror before handing this on, so a reconnect does not re-register
+// them; re-add them yourself if you want another try. Only the item field for
+// Kind is set.
+type WatchAddRejected struct {
+	// Kind is which kind of add was refused.
+	Kind WatchAddKind
+	// Reason is why it was refused.
+	Reason WatchAddRejectReason
+	// Required is, for [WatchAddRejectQuotaExceeded], the units the refused
+	// items cost; for [WatchAddRejectCapExceeded], the count the add would have
+	// reached. 0 otherwise.
+	Required uint64
+	// Held is, for WatchAddRejectQuotaExceeded, the units the token already
+	// holds. 0 otherwise.
+	Held uint64
+	// Quota is, for WatchAddRejectQuotaExceeded, the token's unit quota; for
+	// WatchAddRejectCapExceeded, the cap. 0 otherwise.
+	Quota uint64
+	// RetryAfterSecs is, for [WatchAddRejectRateLimited], the seconds until the
+	// rate limit admits another add. 0 otherwise.
+	RetryAfterSecs uint32
+	// Scripthashes are refused script watches (32 bytes each).
+	Scripthashes [][]byte
+	// Outpoints are refused outpoint watches.
+	Outpoints []Outpoint
+	// Txids are refused lifecycle watches.
+	Txids [][]byte
+	// DepthAlarms are refused depth alarms.
+	DepthAlarms []DepthAlarm
+	// Descriptor is the refused descriptor and the window it asked for.
+	Descriptor *RejectedDescriptor
+	// Prefixes are refused script prefixes, masked to Bits.
+	Prefixes []ScriptPrefix
+	// ScanPubkeys are refused silent-payment targets, by identity b_scan*G (33
+	// bytes each).
+	ScanPubkeys [][]byte
+}
+
+// DepthAlarm is one (txid, depth) alarm named by a [WatchAddRejected].
+type DepthAlarm struct {
+	// Txid is 32 raw bytes in internal byte order.
+	Txid []byte
+	// Depth is the requested confirmation depth.
+	Depth uint32
+}
+
+// RejectedDescriptor is the descriptor a [WatchAddRejected] names.
+type RejectedDescriptor struct {
+	// Descriptor is the descriptor string the add carried.
+	Descriptor string
+	// GapLimit and Start are the window the add asked for.
+	GapLimit uint32
+	Start    uint32
+	// Kept is true when an earlier window of this descriptor stays watched (a
+	// refused slide), false when the descriptor is not watched at all.
+	Kept bool
+}
+
 // RescanAccepted reports that a bounded historical rescan was ADMITTED.
 // Confirmed watch-matches for the scanned range follow this event (in height
 // order), terminated by a [RescanComplete].
@@ -666,6 +734,7 @@ func (*CursorAccepted) isEvent()        {}
 func (*CursorRejected) isEvent()        {}
 func (*WatchSetReplaced) isEvent()      {}
 func (*WatchSetRejected) isEvent()      {}
+func (*WatchAddRejected) isEvent()      {}
 func (*RescanAccepted) isEvent()        {}
 func (*RescanRejected) isEvent()        {}
 func (*RescanComplete) isEvent()        {}
@@ -852,6 +921,8 @@ func decodeEvent(ev *eventspb.NodeEvent) Event {
 		default:
 			return unknownEvent
 		}
+	case *eventspb.NodeEvent_WatchAddRejected:
+		return watchAddRejectedFromProto(body.WatchAddRejected)
 	case *eventspb.NodeEvent_RescanResult:
 		switch outcome := body.RescanResult.GetOutcome().(type) {
 		case *eventspb.RescanResult_Accepted:
@@ -968,4 +1039,36 @@ func nonEmpty(b []byte) []byte {
 		return nil
 	}
 	return b
+}
+
+func watchAddRejectedFromProto(r *eventspb.WatchAddRejected) *WatchAddRejected {
+	out := &WatchAddRejected{
+		Kind:           WatchAddKind(r.GetKind()),
+		Reason:         WatchAddRejectReason(r.GetReason()),
+		Required:       r.GetRequired(),
+		Held:           r.GetHeld(),
+		Quota:          r.GetQuota(),
+		RetryAfterSecs: r.GetRetryAfterSecs(),
+		Scripthashes:   r.GetScripthashes(),
+		Txids:          r.GetTxids(),
+		ScanPubkeys:    r.GetScanPubkeys(),
+	}
+	for _, o := range r.GetOutpoints() {
+		out.Outpoints = append(out.Outpoints, Outpoint{Txid: o.GetTxid(), Vout: o.GetVout()})
+	}
+	for _, d := range r.GetDepthAlarms() {
+		out.DepthAlarms = append(out.DepthAlarms, DepthAlarm{Txid: d.GetTxid(), Depth: d.GetDepth()})
+	}
+	for _, p := range r.GetPrefixes() {
+		out.Prefixes = append(out.Prefixes, ScriptPrefix{Prefix: p.GetPrefix(), Bits: p.GetBits()})
+	}
+	if out.Kind == WatchAddKindDescriptor {
+		out.Descriptor = &RejectedDescriptor{
+			Descriptor: r.GetDescriptor_(),
+			GapLimit:   r.GetGapLimit(),
+			Start:      r.GetStart(),
+			Kept:       r.GetDescriptorKept(),
+		}
+	}
+	return out
 }

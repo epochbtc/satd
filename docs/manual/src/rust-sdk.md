@@ -466,9 +466,22 @@ retention tiers, which govern what the spend side carries.
 (`PermissionDenied`, a bad URL or token, client-side argument errors).
 `Unauthenticated` is reported non-retryable: re-auth and reconnect rather than
 blind-retrying the same token. `QuotaExhausted` is treated as retryable
-because its common causes, the subscription cap and the per-principal rate
-limit, are transient. A full watch quota is not transient, so inspect the
-boxed status message before retrying a watch-add forever.
+because both of its causes, the subscription cap and the per-principal rate
+limit when a stream is opened, are transient.
+
+A watch add the server refuses is not an error. It arrives on `next()` as
+`Event::WatchAddRejected`, which names the kind, the reason (`QuotaExceeded`,
+`RateLimited`, `CapExceeded`, `PermissionDenied` or `Malformed`), the numbers
+behind it and the refused items; none of those items is watched. An add that
+registers produces no event.
+
+`ResilientWatch` treats a `RateLimited` refusal as transient: it keeps the items
+in its mirror, re-sends them after `retry_after_secs` (or the backoff delay, if
+longer), and absorbs the event. Only when an item has used up the backoff
+budget (`Backoff::max_retries`) is the event handed on. Then, and for every
+other reason, the refused items leave the mirror before the event reaches you,
+so a reconnect does not re-register them (a refused descriptor slide falls back
+to the window the server kept). Re-add them yourself if you want another try.
 
 ## Stability & versioning
 

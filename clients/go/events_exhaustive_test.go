@@ -57,6 +57,24 @@ var bodyFixtures = map[string]fixture{
 		ev:   &eventspb.NodeEvent{Body: &eventspb.NodeEvent_Status{Status: &eventspb.StatusEvent{}}},
 		want: &Status{},
 	},
+	"watch_add_rejected": {
+		ev: &eventspb.NodeEvent{Body: &eventspb.NodeEvent_WatchAddRejected{
+			WatchAddRejected: &eventspb.WatchAddRejected{
+				Kind:        eventspb.WatchAddRejected_DESCRIPTOR,
+				Reason:      eventspb.WatchAddRejected_QUOTA_EXCEEDED,
+				Descriptor_: "wpkh(x)", GapLimit: 20, Start: 40, DescriptorKept: true,
+				Required: 20, Held: 90, Quota: 100,
+			},
+		}},
+		want: &WatchAddRejected{
+			Kind:       WatchAddKindDescriptor,
+			Reason:     WatchAddRejectQuotaExceeded,
+			Required:   20,
+			Held:       90,
+			Quota:      100,
+			Descriptor: &RejectedDescriptor{Descriptor: "wpkh(x)", GapLimit: 20, Start: 40, Kept: true},
+		},
+	},
 	"outpoint_spent": {
 		ev:   &eventspb.NodeEvent{Body: &eventspb.NodeEvent_OutpointSpent{OutpointSpent: &eventspb.OutpointSpent{}}},
 		want: &OutpointSpent{},

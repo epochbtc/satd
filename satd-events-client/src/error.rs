@@ -57,10 +57,10 @@ pub enum StreamError {
     #[error("permission denied: {0}")]
     PermissionDenied(#[source] Box<tonic::Status>),
 
-    /// The server's subscription cap, a per-principal rate limit, or the
-    /// per-token watch quota was hit (gRPC `RESOURCE_EXHAUSTED`). The first two
-    /// are transient (back off and retry); a genuinely full watch quota is not.
-    /// Inspect the boxed status message to distinguish.
+    /// The server's subscription cap or a per-principal rate limit was hit when
+    /// the stream was opened (gRPC `RESOURCE_EXHAUSTED`). Both are transient:
+    /// back off and retry. A full watch quota never surfaces here; a refused
+    /// add arrives as [`Event::WatchAddRejected`](crate::Event::WatchAddRejected).
     #[error("resource exhausted: {0}")]
     QuotaExhausted(#[source] Box<tonic::Status>),
 

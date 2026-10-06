@@ -846,6 +846,73 @@ message WatchSetRejected {
   uint64 quota    = 3; // the unit ceiling (QUOTA) or entry cap (CAP); 0 for MALFORMED
 }
 
+// An incremental watch add (AddScripts, AddOutpoints, AddTransactions,
+// AddDescriptor, AddScriptPrefixes, AddSilentPayments) that the server did not
+// register, delivered in-band on the Watch stream (same pattern as
+// WatchSetResult). Emitted once per refused Add* message and never for one that
+// registered, so a client that sees none can rely on its adds having landed.
+// The add is all-or-nothing over its NET-NEW items: none of the items echoed
+// here is watched. Items the message re-asserted (already watched) are not
+// echoed and stay watched; their metadata (a script's min_value floor, a
+// silent-payment target's labels) still updates.
+//
+// `required`/`quota` carry the numbers behind `reason`:
+//   QUOTA_EXCEEDED    — `required` = units the refused items cost, `held` =
+//     units the principal already holds, `quota` = its unit ceiling. Remove
+//     watches or ask for a larger quota.
+//   RATE_LIMITED      — `retry_after_secs` = when the per-principal rate limit
+//     admits another add. The same add may then succeed.
+//   CAP_EXCEEDED      — `required` = the count the add would reach, `quota` = the
+//     per-connection cap it hit: 16 silent-payment targets, 256 descriptors, or
+//     the WS entry cap (`streamwsmaxsubscriptions`).
+//   PERMISSION_DENIED — the token lacks `stream:watch`.
+//   MALFORMED         — the message could not be applied as a whole: a
+//     `min_values` list not parallel to its scripthashes, an invalid descriptor,
+//     or a txid × depth product over the per-message cap. Echoes the items
+//     that parsed, except for an over-cap depth product, which echoes none.
+// Individually unparseable items inside an otherwise valid add (a scripthash
+// that is not 32 bytes, a prefix outside the allowed bit range, an invalid
+// silent-payment key) are skipped without a rejection.
+message WatchAddRejected {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    SCRIPTS          = 1; // AddScripts → scripthashes
+    OUTPOINTS        = 2; // AddOutpoints → outpoints
+    TRANSACTIONS     = 3; // AddTransactions lifecycle watches → txids
+    DEPTH_ALARMS     = 4; // AddTransactions depth alarms → depth_alarms
+    DESCRIPTOR       = 5; // AddDescriptor → descriptor, gap_limit, start
+    SCRIPT_PREFIXES  = 6; // AddScriptPrefixes → prefixes
+    SILENT_PAYMENTS  = 7; // AddSilentPayments → scan_pubkeys
+  }
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    QUOTA_EXCEEDED     = 1;
+    RATE_LIMITED       = 2;
+    CAP_EXCEEDED       = 3;
+    PERMISSION_DENIED  = 4;
+    MALFORMED          = 5;
+  }
+  Kind   kind             = 1;
+  Reason reason           = 2;
+  uint64 required         = 3;
+  uint64 held             = 4;
+  uint64 quota            = 5;
+  uint32 retry_after_secs = 6;
+  // The refused items, as the client named them. Only the field for `kind` is set.
+  repeated bytes scripthashes          = 7;  // 32 bytes each
+  repeated Outpoint outpoints          = 8;
+  repeated bytes txids                 = 9;  // lifecycle watches, 32 bytes each
+  repeated WatchDepthAlarm depth_alarms = 10;
+  string descriptor                    = 11;
+  uint32 gap_limit                     = 12; // the window the refused AddDescriptor asked for
+  uint32 start                         = 13;
+  // True when an earlier window of `descriptor` stays watched (a refused slide);
+  // false when the descriptor is not watched at all.
+  bool   descriptor_kept               = 14;
+  repeated ScriptPrefix prefixes       = 15; // masked to `bits`
+  repeated bytes scan_pubkeys          = 16; // silent-payment identities b_scan·G (33 bytes); never the secret
+}
+
 // Deterministic outcome of a RescanBlocks, delivered in-band ahead of any
 // matches it admits (same pattern as SetCursorResult). Emitted exactly once per
 // actionable rescan. On accept, zero or more confirmed watch-match events
@@ -933,5 +1000,6 @@ message NodeEvent {
     SilentPaymentMatched silent_payment_matched = 29; // BIP 352 scan-key watch match (Watch stream, §4)
     MempoolTweak mempool_tweak = 30; // BIP 352 mempool-time tweak (Subscribe `tweaks` + mempool_tweaks, §3.5)
     StatusEvent status = 31; // node-health condition (Subscribe `status` category, bit 16)
+    WatchAddRejected watch_add_rejected = 32; // an incremental watch add the server did not register (Watch stream)
   }
 }

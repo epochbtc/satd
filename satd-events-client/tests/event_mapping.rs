@@ -4,7 +4,7 @@
 
 use satd_events_client::{
     proto as pb, CursorRejectReason, DescriptorMatch, Event, EvictReason, StatusKind,
-    StatusSeverity, StatusState,
+    StatusSeverity, StatusState, WatchAddKind, WatchAddRejectReason,
 };
 
 fn node_event(body: pb::node_event::Body) -> pb::NodeEvent {
@@ -200,6 +200,57 @@ fn set_cursor_rejected_maps_reason() {
             current_head: Some(head),
         }
     );
+}
+
+#[test]
+fn watch_add_rejected_maps_reason_numbers_and_items() {
+    use pb::watch_add_rejected::{Kind, Reason};
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
+        kind: Kind::Descriptor as i32,
+        reason: Reason::QuotaExceeded as i32,
+        required: 20,
+        held: 90,
+        quota: 100,
+        descriptor: "wpkh(xpub...)".into(),
+        gap_limit: 20,
+        start: 40,
+        descriptor_kept: true,
+        ..Default::default()
+    }));
+    let Event::WatchAddRejected(r) = Event::from(ev) else {
+        panic!("expected WatchAddRejected");
+    };
+    assert_eq!((r.kind, r.reason), (WatchAddKind::Descriptor, WatchAddRejectReason::QuotaExceeded));
+    assert_eq!((r.required, r.held, r.quota), (20, 90, 100));
+    let d = r.descriptor.expect("a descriptor refusal names its descriptor");
+    assert_eq!((d.descriptor.as_str(), d.gap_limit, d.start, d.kept), ("wpkh(xpub...)", 20, 40, true));
+
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
+        kind: Kind::DepthAlarms as i32,
+        reason: Reason::RateLimited as i32,
+        retry_after_secs: 3,
+        depth_alarms: vec![pb::WatchDepthAlarm { txid: vec![0x22; 32], depth: 6 }],
+        ..Default::default()
+    }));
+    let Event::WatchAddRejected(r) = Event::from(ev) else {
+        panic!("expected WatchAddRejected");
+    };
+    assert_eq!((r.kind, r.reason, r.retry_after_secs), (WatchAddKind::DepthAlarms, WatchAddRejectReason::RateLimited, 3));
+    assert_eq!(r.depth_alarms, vec![(vec![0x22; 32], 6)]);
+    assert!(r.descriptor.is_none(), "only the descriptor kind carries a descriptor");
+}
+
+#[test]
+fn watch_add_rejected_unknown_codes_are_unknown() {
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
+        kind: 99,
+        reason: 99,
+        ..Default::default()
+    }));
+    let Event::WatchAddRejected(r) = Event::from(ev) else {
+        panic!("expected WatchAddRejected");
+    };
+    assert_eq!((r.kind, r.reason), (WatchAddKind::Unknown, WatchAddRejectReason::Unknown));
 }
 
 #[test]
