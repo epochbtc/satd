@@ -3,5 +3,5 @@
 # missing image fail loudly instead of pulling something else.
 image:
   repository: satd-warnet
-  tag: "0.5.2-warnet0"
+  tag: "0.6.0-warnet0"
   pullPolicy: Never

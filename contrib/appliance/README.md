@@ -61,7 +61,7 @@ contrib/appliance/build-in-docker.sh --flavor core --out contrib/appliance/out
 
 # From a published, signed release instead.
 contrib/appliance/build-in-docker.sh --flavor desktop \
-    --satd-source release --satd-version 0.5.2 --out out/
+    --satd-source release --satd-version 0.6.0 --out out/
 
 # With the tools already on the host.
 sudo contrib/appliance/build.sh --flavor core --out out/

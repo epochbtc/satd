@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "consensus"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "bitcoinconsensus",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "electrum-proto"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "esplora-handlers"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "axum 0.8.9",
  "axum-test",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "node-filter-index"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "serde",
@@ -3023,7 +3023,7 @@ dependencies = [
 
 [[package]]
 name = "node-index"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "parking_lot",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "node-sp-index"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "hex",
@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "sat-cli"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -4484,7 +4484,7 @@ dependencies = [
 
 [[package]]
 name = "sat-tui"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -4500,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "satd"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "satd-alert"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "hex",
  "hmac",
@@ -4566,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "satd-auth"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "dashmap",
@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "satd-events"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -4612,7 +4612,7 @@ dependencies = [
 
 [[package]]
 name = "satd-events-client"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "prost",
@@ -4629,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "satd-events-proto"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -4639,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "satd-mcp"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "bytes",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "satd-policy"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "bitcoin",
  "proptest",
@@ -4673,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "satd-psbt"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -5425,7 +5425,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tls-config"
-version = "0.6.0-rc1"
+version = "0.6.0"
 dependencies = [
  "rcgen",
  "reqwest",
