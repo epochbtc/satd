@@ -16,6 +16,7 @@ The split is deliberate:
 
 | File | Release | Status |
 |---|---|---|
+| [`0.6.0.md`](0.6.0.md) | 0.6.0 | Released 2026-10-05 |
 | [`0.5.2.md`](0.5.2.md) | 0.5.2 | Released 2026-09-11 |
 | [`0.5.1.md`](0.5.1.md) | 0.5.1 | Released 2026-09-04 |
 | [`0.5.0.md`](0.5.0.md) | 0.5.0 | Released 2026-08-25 |

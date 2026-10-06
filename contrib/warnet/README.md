@@ -37,8 +37,8 @@ Warnet renders only image tags shaped like `X.Y[.Z][-suffix]`. Tag the image
 `<satd version>-warnet<N>`:
 
 ```sh
-docker build --build-arg SATD_IMAGE=ghcr.io/epochbtc/satd:0.5.2 \
-  -t satd-warnet:0.5.2-warnet0 contrib/warnet
+docker build --build-arg SATD_IMAGE=ghcr.io/epochbtc/satd:0.6.0 \
+  -t satd-warnet:0.6.0-warnet0 contrib/warnet
 ```
 
 `SATD_IMAGE` defaults to `ghcr.io/epochbtc/satd:latest`. Any satd image
@@ -47,7 +47,7 @@ works, including one built from this repository with `docker build -t satd:dev .
 Load the image into the cluster. With [kind](https://kind.sigs.k8s.io/):
 
 ```sh
-kind load docker-image satd-warnet:0.5.2-warnet0 --name <cluster>
+kind load docker-image satd-warnet:0.6.0-warnet0 --name <cluster>
 ```
 
 The examples set `pullPolicy: Never`, so a tank whose image is missing fails
