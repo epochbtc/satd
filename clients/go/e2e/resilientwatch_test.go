@@ -227,7 +227,12 @@ func TestE2EWatchSetLoaderRebuildsFromTruthOnReconnect(t *testing.T) {
 			if err != nil {
 				break
 			}
-			if m, ok := ev.(*satdevents.ScriptMatched); ok && satdevents.DisplayHex(m.Txid) == txid {
+			// Wait for the CONFIRMED match, as primeRW does: only it carries
+			// a cursor. Stopping at the mempool match cut the transport, most
+			// runs, before the confirmed one reached the pump. The reconnect
+			// then had no resume cursor, sent no SetCursor, and the wait for
+			// CursorAccepted below saw only heartbeats until it timed out.
+			if m, ok := ev.(*satdevents.ScriptMatched); ok && m.Confirmed && satdevents.DisplayHex(m.Txid) == txid {
 				registered = true
 				break
 			}
