@@ -100,6 +100,17 @@ Consequences of the single instance:
 |---|---|
 | `SIGTERM` | Clean shutdown. Flushes RocksDB, fsyncs undo files, drains the mempool snapshot, closes listeners. Can take up to 10 minutes under heavy IBD load; most shutdowns finish in under a second. |
 | `SIGINT` | Identical to `SIGTERM`. |
+
+Both are handled from the moment satd starts, including the block replays of
+`-reindex`, `-reindex-chainstate` and `-upgradechainstate`, which run inside
+startup and can take days. A replay stops after the block it is connecting:
+satd flushes what it connected, keeps the rebuild marker, and exits 0. If that
+takes longer than `-maxshutdownsecs`, satd exits without waiting, and the
+replay loses what it connected since its last flush. Anywhere else in startup
+a stop signal ends satd at once. This holds with satd as PID 1 of its PID
+namespace (a container with no init), where the kernel would otherwise drop
+the signal and leave the supervisor to kill satd at the end of its grace
+period.
 | `SIGHUP` | Live config reload. Re-reads `bitcoin.conf` and applies the hot-reloadable subset without dropping the P2P swarm or flushing chainstate. See [Configuration, Tuning & Reload](configuration.md#live-config-reload-sighup). |
 | `SIGUSR1` | Live TLS certificate reload. Re-reads the configured TLS leaf cert and key from disk and swaps them in atomically on every TLS surface, without a restart or dropped connections. |
 | `SIGKILL` | Not clean. RocksDB recovers via WAL replay on the next start. Avoid it; have the supervisor send `SIGTERM` and wait. |
@@ -225,7 +236,8 @@ Properties of the image:
   `SATD_HEALTH_URL` at an HTTP endpoint to gate on that instead — but not at
   `/readyz`, for the reason in [Health and
   readiness](#health-and-readiness).
-- PID 1: `tini`, so SIGTERM forwards to satd cleanly.
+- PID 1: `tini`, so SIGTERM forwards to satd cleanly. satd handles SIGTERM
+  as PID 1 as well, for an image run without an init.
 - Datadir: `/var/lib/satd`, declared as a `VOLUME`.
 - Exposed ports: `8333` (P2P) and `8332` (RPC). Map other ports with
   `-p` per deployment.

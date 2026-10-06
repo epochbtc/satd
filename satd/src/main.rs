@@ -258,6 +258,74 @@ fn remove_rebuild_marker(net_datadir: &std::path::Path, auth: &node::rpc::auth::
     }
 }
 
+/// Act on SIGTERM and SIGINT until startup finishes (#907).
+///
+/// During a block replay a stop is left to the replay, which polls
+/// `startup_stop` between blocks and stops after the block in hand, flushed.
+/// If it has not stopped within `replay_stop_budget` seconds
+/// (`-maxshutdownsecs`), the process exits without it, as the running node's
+/// shutdown does when its flush overruns. Anywhere else in startup the
+/// process ends at once, as it did before satd handled these signals during
+/// startup; see `node::shutdown::exit_by_signal`. Once startup has finished,
+/// the wait loop's own registrations take the signals and this returns.
+///
+/// The signals are registered when this is called, not when the returned
+/// future first runs, so none sent in between is missed.
+fn startup_signals(
+    startup_stop: node::shutdown::StartupStop,
+    replay_stop_budget: Arc<std::sync::atomic::AtomicU64>,
+) -> impl std::future::Future<Output = ()> {
+    use node::shutdown::StopRequest;
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+    async move {
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let overrun = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let (name, kind) = tokio::select! {
+                _ = sigterm.recv() => ("SIGTERM", SignalKind::terminate()),
+                _ = sigint.recv() => ("SIGINT", SignalKind::interrupt()),
+                () = overrun => {
+                    tracing::error!(
+                        budget_secs = replay_stop_budget.load(std::sync::atomic::Ordering::Relaxed),
+                        "The block replay did not stop within -maxshutdownsecs; exiting without \
+                         it. What it connected since its last flush is lost."
+                    );
+                    node::shutdown::exit_now(1);
+                }
+            };
+            match startup_stop.request() {
+                StopRequest::ReplayStops => {
+                    if deadline.is_none() {
+                        let secs = replay_stop_budget
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .max(1);
+                        tracing::info!(
+                            signal = name,
+                            budget_secs = secs,
+                            "Stop requested; the block replay stops after the block in hand"
+                        );
+                        deadline = Some(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(secs),
+                        );
+                    }
+                }
+                StopRequest::ExitNow => {
+                    tracing::info!(signal = name, "Stop requested during startup; exiting");
+                    node::shutdown::exit_by_signal(kind.as_raw_value());
+                }
+                StopRequest::StartupFinished => return,
+            }
+        }
+    }
+}
+
 /// "3 hours ago", for a message about something that started `secs` ago.
 fn describe_ago(secs: u64) -> String {
     let (n, unit) = match secs {
@@ -402,6 +470,31 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // the full config diff/apply machinery.
     let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .expect("Failed to register SIGUSR1 handler");
+    // SIGTERM and SIGINT, for the wait loop at the end of startup. They are
+    // registered here, not there, because startup can run for days: the
+    // block replays of -reindex, -reindex-chainstate and -upgradechainstate
+    // run inside it. With no handler until the loop, a stop signal during a
+    // replay killed it mid-batch, or, with satd as PID 1 of its PID
+    // namespace, was dropped until the supervisor's SIGKILL (#907).
+    // `startup_signals` acts on them until startup finishes.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
+    // SIGINT (Ctrl+C) registered as a persistent `Signal` rather than a fresh
+    // `tokio::signal::ctrl_c()` future per loop iteration. A recreated-each-
+    // iteration future can miss a SIGINT delivered while the loop is busy in a
+    // SIGHUP reload: the new receiver subscribes after the signal driver has
+    // already broadcast, so the delivery is lost. A long-lived `Signal`
+    // coalesces and yields it on the next poll.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("Failed to register SIGINT handler");
+    let startup_stop = node::shutdown::StartupStop::default();
+    // How long a replay gets to stop once asked: `-maxshutdownsecs`, set once
+    // the config is read.
+    let replay_stop_budget = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    tokio::spawn(startup_signals(
+        startup_stop.clone(),
+        replay_stop_budget.clone(),
+    ));
 
     // Config must be parsed before tracing init so --log-format can select
     // the formatter. Config parse errors go to stderr as plain text. The
@@ -414,6 +507,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::shutdown::exit_now(1);
         }
     };
+    replay_stop_budget.store(config.max_shutdown_secs, std::sync::atomic::Ordering::Relaxed);
 
     // Install the user agent (built from -uacomment, already validated during
     // config load) before anything can advertise or report it: peers read it
@@ -1196,6 +1290,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                      without checking the built-in checkpoint set"
                 );
             }
+            cs.set_startup_stop(startup_stop.clone());
             Arc::new(cs)
         }
         Err(e) => {
@@ -1529,20 +1624,42 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // Run reindex replay if requested
     if config.reindex {
         startup_progress.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
-        if let Err(e) = chain_state.reindex_from_flat_files(
+        startup_stop.begin_replay();
+        let end = chain_state.reindex_from_flat_files(
             config.stopatheight,
             Some(startup_progress.clone()),
             reindex_floor,
-        ) {
-            eprintln!("Error during reindex: {}", e);
-            auth.cleanup();
-            node::shutdown::exit_now(1);
+        );
+        let stop_requested = startup_stop.end_replay();
+        match end {
+            Err(e) => {
+                eprintln!("Error during reindex: {}", e);
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+            Ok(node::chain::state::FlatFileReindexEnd::Stopped { height }) => {
+                // The marker stays: the rebuild is not finished.
+                tracing::info!(
+                    height,
+                    "Reindex stopped on request before it finished; restart with --reindex to \
+                     rebuild the block index and chainstate from the block files"
+                );
+                auth.cleanup();
+                return Some(chainstate_db);
+            }
+            Ok(node::chain::state::FlatFileReindexEnd::Finished) => {}
         }
         // Finished, even when `-stopatheight` cut the connect short or the
         // block files ended below the previous tip: the block index then
         // ends where the chainstate does, which is an ordinary node P2P can
         // extend.
         remove_rebuild_marker(&net_datadir, &auth);
+        if stop_requested {
+            // Asked to stop after the replay's last poll: it finished anyway.
+            tracing::info!("Reindex finished; stopping as requested");
+            auth.cleanup();
+            return Some(chainstate_db);
+        }
         // Mirror PR #185's IBD behavior: when `-stopatheight` is set
         // and reindex halts at the target, exit cleanly. The operator's
         // intent is "bring the chainstate to height H and stop"; if we
@@ -1560,11 +1677,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     } else if reindex_chainstate {
         startup_progress.set_phase("reindex_chainstate", "Replaying UTXO set");
-        let outcome = match chain_state.reindex_chainstate(
+        startup_stop.begin_replay();
+        let outcome = chain_state.reindex_chainstate(
             config.stopatheight,
             Some(startup_progress.clone()),
             prev_chainstate_tip,
-        ) {
+        );
+        let stop_requested = startup_stop.end_replay();
+        let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("Error during chainstate reindex: {}", e);
@@ -1572,6 +1692,17 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 node::shutdown::exit_now(1);
             }
         };
+        if outcome.stopped {
+            // The marker stays: the rebuild is not finished.
+            tracing::info!(
+                tip_height = outcome.tip_height,
+                chain_tip_height = outcome.plan_tip_height,
+                "Chainstate rebuild stopped on request before it finished; restart with \
+                 --reindex-chainstate, or set upgradechainstate=1, to rebuild it from genesis"
+            );
+            auth.cleanup();
+            return Some(chainstate_db);
+        }
         // Only a replay that reached the chain's tip is finished. One that
         // `-stopatheight` cut short is the truncated state the marker exists
         // to catch: the blocks above it read as connected in the block index,
@@ -1584,6 +1715,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 chain_tip_height = outcome.plan_tip_height,
                 "Chainstate rebuild stopped short of the chain's tip; it is not finished"
             );
+        }
+        if stop_requested {
+            // Asked to stop after the replay's last poll: it finished anyway.
+            tracing::info!("Chainstate rebuild finished; stopping as requested");
+            auth.cleanup();
+            return Some(chainstate_db);
         }
         if config.stopatheight.is_some() {
             tracing::info!(
@@ -4415,17 +4552,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // daemon keeps running; a bad reload is logged and the running config is
     // kept. Shutdown signals break out of the loop into the graceful-flush path
     // below.
-    // SIGHUP and SIGUSR1 were registered at the top of `run`.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("Failed to register SIGTERM handler");
-    // SIGINT (Ctrl+C) registered as a persistent `Signal` rather than a fresh
-    // `tokio::signal::ctrl_c()` future per loop iteration. A recreated-each-
-    // iteration future can miss a SIGINT delivered while the loop is busy in a
-    // SIGHUP reload: the new receiver subscribes after the signal driver has
-    // already broadcast, so the delivery is lost. A long-lived `Signal`
-    // coalesces and yields it on the next poll.
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .expect("Failed to register SIGINT handler");
+    // SIGHUP, SIGUSR1, SIGTERM and SIGINT were registered at the top of
+    // `run`. From here on, a stop signal is this loop's, not
+    // `startup_signals`'.
+    startup_stop.finish();
     let reload_handles = reload::ReloadHandles {
         cli: cli_snapshot,
         mempool: mempool.clone(),
@@ -4551,6 +4681,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // inside RocksDB harmless.
     let connector_budget = (shutdown_deadline.saturating_sub(shutdown_started.elapsed()) / 2)
         .max(std::time::Duration::from_secs(1));
+    // Each wait that can take a while is announced before it starts, so a
+    // shutdown that runs long says in its last line what it is waiting on
+    // (#907).
+    tracing::info!(
+        tip_height = chain_state.tip_height(),
+        budget_secs = connector_budget.as_secs(),
+        "Shutdown: waiting for the block connector to finish the block in hand"
+    );
     let connector_stopped = {
         let pm = peer_manager.clone();
         tokio::task::spawn_blocking(move || pm.join_connectors(connector_budget))
@@ -4592,6 +4730,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         .max(std::time::Duration::from_secs(1));
     let tip_hash = chain_state.tip_hash().to_string();
     let tip_height = chain_state.tip_height();
+    tracing::info!(
+        dirty_coins = chain_state.store_ref().dirty_count(),
+        budget_secs = flush_deadline.as_secs(),
+        "Shutdown: flushing the UTXO cache to disk"
+    );
     let flush_cs = chain_state.clone();
     let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {

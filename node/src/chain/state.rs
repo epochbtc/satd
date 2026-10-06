@@ -612,6 +612,11 @@ pub struct ChainState {
     /// which either the load's rollback wipes the connector's committed
     /// work or its adoption clobbers the advanced tip — the #567 shape.
     snapshot_load_active: std::sync::atomic::AtomicBool,
+    /// A stop requested by SIGTERM or SIGINT while `satd` is still starting
+    /// up (#907). The startup replays poll it between blocks; see
+    /// [`Self::set_startup_stop`]. Unset in tests that do not need it, and
+    /// then never requested.
+    startup_stop: std::sync::OnceLock<crate::shutdown::StartupStop>,
 }
 
 /// RAII clear for [`ChainState::snapshot_load_active`]. The flag must drop
@@ -636,6 +641,9 @@ pub struct ReplayOutcome {
     pub tip_height: u32,
     /// The tip of the chain it set out to rebuild.
     pub plan_tip_height: u32,
+    /// A stop was requested while `satd` started up (#907), and the replay
+    /// stopped there, flushed.
+    pub stopped: bool,
 }
 
 impl ReplayOutcome {
@@ -644,6 +652,20 @@ impl ReplayOutcome {
     pub fn is_complete(&self) -> bool {
         self.tip_height >= self.plan_tip_height
     }
+}
+
+/// How [`ChainState::reindex_from_flat_files`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatFileReindexEnd {
+    /// The replay is over: it connected every block the files hold on the
+    /// branch it selected, or `-stopatheight`, a block it could not replay or
+    /// a hole in the files ended it short. Either way the block index ends
+    /// where the chainstate does.
+    Finished,
+    /// A stop was requested while `satd` started up (#907). The replay
+    /// stopped at `height`, flushed, with blocks of the selected branch still
+    /// to connect, so the rebuild is not finished.
+    Stopped { height: u32 },
 }
 
 /// What [`ChainState::accept_block`] did with a block it did not reject.
@@ -924,6 +946,7 @@ impl ChainState {
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
                     pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
+                    startup_stop: std::sync::OnceLock::new(),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -1043,6 +1066,7 @@ impl ChainState {
             accept_lock: std::sync::Arc::new(Mutex::new(())),
             pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
+            startup_stop: std::sync::OnceLock::new(),
         })
     }
 
@@ -1051,6 +1075,20 @@ impl ChainState {
     /// Replaces any earlier hook.
     pub fn set_pow_valid_block_hook(&self, hook: PowValidBlockHook) {
         *self.pow_valid_block_hook.write() = Some(hook);
+    }
+
+    /// Hand the startup replays the stop that SIGTERM and SIGINT request
+    /// while `satd` starts up (#907). `-reindex`, `-reindex-chainstate` and
+    /// `-upgradechainstate` poll it between blocks and stop, flushed, after
+    /// the block in hand. Call once, before a replay; later calls are
+    /// ignored.
+    pub fn set_startup_stop(&self, stop: crate::shutdown::StartupStop) {
+        let _ = self.startup_stop.set(stop);
+    }
+
+    /// Whether a stop has been requested of the startup replay in progress.
+    fn replay_stop_requested(&self) -> bool {
+        self.startup_stop.get().is_some_and(|s| s.is_requested())
     }
 
     /// Set the custom signet challenge (BIP 325). Call once, before the
@@ -5377,21 +5415,23 @@ impl ChainState {
             // vanish on exit — the exact shape of the 952914-rollback bug.
             return result.and(Err(ChainError::Storage(e)));
         }
-        result.map(|()| ReplayOutcome {
+        result.map(|stopped| ReplayOutcome {
             tip_height: self.tip_height(),
             plan_tip_height,
+            stopped,
         })
     }
 
     /// Inner replay loop for [`Self::reindex_chainstate`]. Runs under
     /// BulkLoad with the prefetch pipeline; the caller restores Normal write
-    /// mode regardless of how this returns.
+    /// mode regardless of how this returns. Returns whether a requested stop
+    /// (#907) ended it.
     fn reindex_replay(
         &self,
         plan: Arc<crate::chain::replay_plan::ReplayPlan>,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<bool, ChainError> {
         // Periodic durable checkpoint cadence. The dirty-cache threshold
         // (see `flush_threshold`) handles memory pressure; this bounds the
         // replay window on a crash/OOM so progress sticks. 1000 mirrors the
@@ -5445,9 +5485,25 @@ impl ChainState {
         // flush error, etc.) would drop the handle without setting shutdown
         // or joining, leaving detached workers reading the store/block files
         // after a failed reindex.
-        let result = (|| -> Result<(), ChainError> {
+        let result = (|| -> Result<bool, ChainError> {
             let mut height = start_height;
             while let Some(hash) = plan.hash_at(height) {
+                // A stop requested while satd starts up (#907): end after the
+                // block before this one, flushed, so the stop costs at most
+                // one block and the flush. The rebuild marker stays; `satd`
+                // reads `stopped` and exits.
+                if self.replay_stop_requested() {
+                    self.store.flush()?;
+                    self.store.flush_durable()?;
+                    if let Some(p) = &progress {
+                        p.set_current((height - 1) as u64);
+                    }
+                    tracing::info!(
+                        height = height - 1,
+                        "Chainstate rebuild stopped on request, flushed at this height"
+                    );
+                    return Ok(true);
+                }
                 // Prefer the prefetched, pre-processed block; fall back to a
                 // direct read on a miss (cold start, or a worker behind the
                 // cursor). Both paths connect via `connect_block` directly,
@@ -5519,7 +5575,7 @@ impl ChainState {
                     );
                     self.store.flush()?;
                     self.store.flush_durable()?;
-                    return Ok(());
+                    return Ok(false);
                 }
 
                 height += 1;
@@ -5531,7 +5587,7 @@ impl ChainState {
                 p.set_current((height - 1) as u64);
             }
             tracing::info!(height = height - 1, "Chainstate reindex complete");
-            Ok(())
+            Ok(false)
         })();
 
         // Always join the prefetch workers, whether the replay succeeded,
@@ -6042,12 +6098,17 @@ impl ChainState {
     /// instead of reporting a completed reindex. It does not fail: the caller
     /// has already cleared the database, and the node syncs the rest from
     /// peers.
+    ///
+    /// A stop requested while `satd` starts up (#907, see
+    /// [`Self::set_startup_stop`]) ends the scan between block files, or the
+    /// connect between blocks, flushed, and returns
+    /// [`FlatFileReindexEnd::Stopped`].
     pub fn reindex_from_flat_files(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
         prev_tip_height: Option<u32>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<FlatFileReindexEnd, ChainError> {
         use std::collections::HashMap;
 
         // Periodic flush cadence — same reasoning as `reindex_chainstate`:
@@ -6065,10 +6126,21 @@ impl ChainState {
         let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
         let mut scanned: u64 = 0;
         let gap;
+        // A stop requested during the scan (#907) is honored between block
+        // files, so it waits for at most one file's read (128 MiB).
+        let mut scan_file: Option<u32> = None;
+        let mut scan_stopped = false;
         {
             let flat_files = self.flat_files.lock();
             flat_files
                 .for_each_block(|block_bytes, pos| {
+                    if scan_file != Some(pos.file_number) {
+                        scan_file = Some(pos.file_number);
+                        if self.replay_stop_requested() {
+                            scan_stopped = true;
+                            return std::ops::ControlFlow::Break(());
+                        }
+                    }
                     if block_bytes.len() < 80 {
                         return std::ops::ControlFlow::Continue(());
                     }
@@ -6125,6 +6197,16 @@ impl ChainState {
                 })
                 .map_err(|e| ChainError::FlatFile(format!("scan flat files: {}", e)))?;
             gap = flat_files.first_gap();
+        }
+        if scan_stopped {
+            // Nothing has been connected yet, so there is nothing to flush.
+            tracing::info!(
+                scanned,
+                "Reindex stopped on request while scanning the block files"
+            );
+            return Ok(FlatFileReindexEnd::Stopped {
+                height: self.tip_height(),
+            });
         }
         let total = scanned;
         if let Some(p) = &progress {
@@ -6297,6 +6379,23 @@ impl ChainState {
         // failing it (issue #542).
         let mut halted: Option<(BlockHash, u32, String)> = None;
         for hash in &plan.path {
+            // A stop requested while satd starts up (#907): end after the
+            // block before this one, flushed, so the stop costs at most one
+            // block and the flush. The rebuild marker stays.
+            if self.replay_stop_requested() {
+                self.store.flush()?;
+                self.store.flush_durable()?;
+                if let Some(p) = &progress {
+                    p.set_current(connected as u64);
+                }
+                let height = self.tip_height();
+                tracing::info!(
+                    connected,
+                    height,
+                    "Reindex stopped on request, flushed at this height"
+                );
+                return Ok(FlatFileReindexEnd::Stopped { height });
+            }
             let hash = *hash;
             let entry = match header_by_hash.remove(&hash) {
                 Some(v) => v,
@@ -6426,7 +6525,7 @@ impl ChainState {
                 );
                 self.store.flush()?;
                 self.store.flush_durable()?;
-                return Ok(());
+                return Ok(FlatFileReindexEnd::Finished);
             }
         }
 
@@ -6483,7 +6582,7 @@ impl ChainState {
             if let Some(p) = &progress {
                 p.set_current(connected as u64);
             }
-            return Ok(());
+            return Ok(FlatFileReindexEnd::Finished);
         }
 
         // Re-index the side-chain blocks the replay skipped. Only after a full
@@ -6508,7 +6607,7 @@ impl ChainState {
             ),
             None => tracing::info!(connected, "Reindex from flat files complete"),
         }
-        Ok(())
+        Ok(FlatFileReindexEnd::Finished)
     }
 
     /// Write header + `DataStored` index entries for the side-chain blocks a
@@ -20035,6 +20134,100 @@ pub(crate) mod tests {
             "a halted replay must not index side-chain blocks it did not reach"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A regtest chain of `n` blocks on `cs`, returning the block hashes in
+    /// height order.
+    fn build_chain(cs: &ChainState, n: u32, time_base: u32) -> Vec<BlockHash> {
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut hashes = Vec::new();
+        for h in 1..=n {
+            let b = build_test_block(parent, h, time_base + h);
+            parent = cs.accept_block(&b).expect("accept block").hash();
+            hashes.push(parent);
+        }
+        hashes
+    }
+
+    /// #907: a stop requested while `satd` starts up ends a flat-file reindex
+    /// between blocks, flushed. The scan polls once per block file (one
+    /// here), then the connect polls before each block, so the seventh poll
+    /// is the one before block 6.
+    ///
+    /// Perturbation: drop the connect loop's poll and the replay runs to 20.
+    #[test]
+    fn a_requested_stop_ends_a_flat_file_reindex_between_blocks() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 20, 1_701_000_000);
+        let re = reindexing_chain_state_over(&dir);
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(1 + 6);
+        re.set_startup_stop(stop);
+
+        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+
+        assert_eq!(end, FlatFileReindexEnd::Stopped { height: 5 });
+        assert_eq!(re.tip_hash(), hashes[4]);
+        assert_eq!(re.store.dirty_count(), 0, "the stop flushes what it connected");
+        assert!(
+            re.store.get_block_index(&hashes[5]).is_none(),
+            "nothing past the stop is indexed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #907: a stop requested during the scan ends the reindex there, before
+    /// the connect phase starts.
+    ///
+    /// Perturbation: drop the scan's poll and the first connect poll stops
+    /// it instead, in the connect phase.
+    #[test]
+    fn a_requested_stop_ends_a_flat_file_reindex_during_the_scan() {
+        let (cs, dir) = make_chain_state();
+        build_chain(&cs, 3, 1_701_100_000);
+        let re = reindexing_chain_state_over(&dir);
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(1);
+        re.set_startup_stop(stop);
+        let progress = crate::startup_progress::StartupProgress::new();
+
+        let end = re
+            .reindex_from_flat_files(None, Some(progress.clone()), None)
+            .expect("reindex");
+
+        assert_eq!(end, FlatFileReindexEnd::Stopped { height: 0 });
+        assert_eq!(re.tip_height(), 0);
+        assert_eq!(progress.snapshot().phase, "reindex_scan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #907: the same for a chainstate rebuild, which polls before each
+    /// block, so the sixth poll is the one before block 6.
+    ///
+    /// Perturbation: drop the replay loop's poll and the rebuild runs to 20.
+    #[test]
+    fn a_requested_stop_ends_a_chainstate_rebuild_between_blocks() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 20, 1_701_200_000);
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+            tip.height = 0;
+        }
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(6);
+        cs.set_startup_stop(stop);
+
+        let outcome = cs.reindex_chainstate(None, None, None).expect("rebuild");
+
+        assert!(outcome.stopped);
+        assert!(!outcome.is_complete());
+        assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
+        assert_eq!(cs.tip_hash(), hashes[4]);
+        assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

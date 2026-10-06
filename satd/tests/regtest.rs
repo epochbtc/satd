@@ -6456,6 +6456,414 @@ fn a_rebuild_marker_without_a_chainstate_is_removed() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// Blocks in [`replay_fixture`]. A debug build replays a few thousand empty
+/// regtest blocks a second, so this many give a signal sent as the connect
+/// phase starts a second or two to land partway through it.
+const REPLAY_FIXTURE_BLOCKS: u64 = 6000;
+
+/// A stopped regtest datadir holding [`REPLAY_FIXTURE_BLOCKS`] blocks, and
+/// what `gettxoutsetinfo` reported for it. Mined once per test binary, under
+/// the target's scratch directory, and copied for each test, since every
+/// test that replays it changes it.
+fn replay_fixture(tag: &str) -> (std::path::PathBuf, serde_json::Value) {
+    static FIXTURE: std::sync::OnceLock<(std::path::PathBuf, serde_json::Value)> =
+        std::sync::OnceLock::new();
+    let (src, utxos) = FIXTURE.get_or_init(|| {
+        let datadir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("satd-replay-fixture-{}", std::process::id()));
+        common::prepare_empty_dir(&datadir);
+        let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &[]);
+        // In batches the harness's 10 s RPC timeout covers on a loaded runner.
+        for _ in 0..REPLAY_FIXTURE_BLOCKS / 100 {
+            node.rpc_ok(
+                "generatetoaddress",
+                vec![
+                    serde_json::json!(100),
+                    serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
+                ],
+            );
+        }
+        let utxos = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+        node.stop();
+        node.datadir = std::path::PathBuf::new();
+        (datadir, utxos)
+    });
+    let dst = fresh_test_datadir(tag);
+    copy_tree(src, &dst);
+    (dst, utxos.clone())
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// satd started on a datadir for a test that signals it during startup,
+/// before RPC is up, and reads its log.
+struct StartupRun {
+    child: Child,
+    log: std::path::PathBuf,
+    /// The process to signal: `child`, or satd inside the PID namespace
+    /// `child` made.
+    pid: u32,
+}
+
+impl StartupRun {
+    fn command(datadir: &std::path::Path, args: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            env!("CARGO_BIN_EXE_satd").to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", datadir.display()),
+            format!("--rpcport={}", find_available_port()),
+            format!("--port={}", find_available_port()),
+            "--loglevel=info".to_string(),
+        ];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        argv
+    }
+
+    fn spawn_argv(datadir: &std::path::Path, argv: &[String]) -> Self {
+        let log = datadir.join(format!(
+            "satd-startup-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = std::fs::File::create(&log).unwrap();
+        let child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .expect("spawn satd");
+        let pid = child.id();
+        Self { child, log, pid }
+    }
+
+    fn spawn(datadir: &std::path::Path, args: &[&str]) -> Self {
+        Self::spawn_argv(datadir, &Self::command(datadir, args))
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Wait for `needle` in the log, failing if satd exits first.
+    fn wait_for_log(&mut self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.log().contains(needle) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("satd exited ({status}) before logging {needle:?}:\n{}", self.log());
+            }
+            assert!(Instant::now() < deadline, "no {needle:?} within {timeout:?}:\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn signal(&self, signal: &str) {
+        let sent = Command::new("kill")
+            .args([signal, &self.pid.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill {signal} {} failed", self.pid);
+    }
+
+    fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("satd did not exit within {timeout:?}:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// The log line the flat-file replay writes just before its connect phase.
+const REINDEX_CONNECT_STARTS: &str = "Phase 2: selected the most-work branch to replay";
+/// The same for the chainstate replay.
+const CHAINSTATE_REPLAY_STARTS: &str = "Chainstate reindex: selected the most-work branch";
+
+/// Stop a replay with SIGTERM as its connect phase starts, and check how it
+/// ended: exit 0, within Docker's default 10 s grace period, after the line
+/// `stopped`, with the rebuild marker kept.
+fn sigterm_a_replay(run: &mut StartupRun, starts: &str, stopped: &str, datadir: &std::path::Path) {
+    run.wait_for_log(starts, test_timeout(120));
+    let sent = Instant::now();
+    run.signal("-TERM");
+    let status = run.wait_exit(test_timeout(60));
+    let took = sent.elapsed();
+    let log = run.log();
+    if !log.contains("Stop requested; the block replay stops after the block in hand") {
+        assert!(
+            !log.contains("Stop requested during startup"),
+            "the replay finished before the signal reached it; lengthen the fixture:\n{log}"
+        );
+        panic!("the signal never reached satd's startup handler ({status}):\n{log}");
+    }
+    assert_eq!(status.code(), Some(0), "a stopped replay exits 0 ({status}):\n{log}");
+    assert!(log.contains(stopped), "no {stopped:?} in the log:\n{log}");
+    assert!(
+        took < test_timeout(10),
+        "the stop took {took:?}, longer than Docker's default grace period:\n{log}"
+    );
+    assert!(
+        datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        "a stopped replay is not finished, so its marker stays"
+    );
+}
+
+/// #907: SIGTERM partway through the connect phase of a full `-reindex`
+/// stops it after the block in hand. There was no handler until startup
+/// finished, so the signal killed the replay mid-batch.
+///
+/// Perturbation: drop the flat-file connect loop's poll and the replay runs
+/// to the end, then exits by the signal later in startup.
+#[test]
+fn sigterm_stops_a_full_reindex_between_blocks() {
+    let (datadir, before) = replay_fixture("satd-reindex-sigterm");
+    let mut run = StartupRun::spawn(&datadir, &["--reindex"]);
+    sigterm_a_replay(
+        &mut run,
+        REINDEX_CONNECT_STARTS,
+        "Reindex stopped on request, flushed at this height",
+        &datadir,
+    );
+
+    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--reindex"]);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #907: the same for `-reindex-chainstate`.
+///
+/// Perturbation: drop the chainstate replay loop's poll and the replay runs
+/// to the end.
+#[test]
+fn sigterm_stops_a_chainstate_rebuild_between_blocks() {
+    let (datadir, before) = replay_fixture("satd-reindexcs-sigterm");
+    let mut run = StartupRun::spawn(&datadir, &["--reindex-chainstate"]);
+    sigterm_a_replay(
+        &mut run,
+        CHAINSTATE_REPLAY_STARTS,
+        "Chainstate rebuild stopped on request, flushed at this height",
+        &datadir,
+    );
+
+    let mut node =
+        TestNode::start_with_datadir(&datadir, find_available_port(), &["--reindex-chainstate"]);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #907, as PID 1 of its PID namespace, which is how a container without an
+/// init runs satd. The kernel drops a signal from outside the namespace that
+/// PID 1 has no handler for, so `docker stop` waited out its grace period and
+/// killed the replay.
+///
+/// Making a PID namespace takes root here: unprivileged user namespaces are
+/// restricted on Ubuntu, GitHub's runners included. So satd runs under
+/// `sudo -n unshare --pid --fork`, dropped back to this user by `setpriv`. A
+/// machine without passwordless sudo skips the test, except under CI, where
+/// it fails instead.
+///
+/// Perturbation: register SIGTERM at the wait loop again, and the signal is
+/// dropped until the test's own timeout.
+#[test]
+fn sigterm_stops_a_full_reindex_with_satd_as_pid_1() {
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !sudo {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run this test, and it needs passwordless sudo"
+        );
+        eprintln!("skipped: needs passwordless sudo to make a PID namespace");
+        return;
+    }
+    let id = |flag: &str| {
+        let out = Command::new("id").arg(flag).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let (datadir, before) = replay_fixture("satd-reindex-pid1");
+    let mut argv: Vec<String> = [
+        "sudo",
+        "-n",
+        "unshare",
+        "--pid",
+        "--fork",
+        "--kill-child",
+        "setpriv",
+        &format!("--reuid={}", id("-u")),
+        &format!("--regid={}", id("-g")),
+        "--clear-groups",
+        "--",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    argv.extend(StartupRun::command(&datadir, &["--reindex"]));
+    let mut run = StartupRun::spawn_argv(&datadir, &argv);
+    // Signal satd itself, by its PID outside the namespace: the one whose
+    // command line names this datadir and whose PID inside it is 1.
+    let datadir_arg = format!("--datadir={}", datadir.display());
+    let deadline = Instant::now() + test_timeout(30);
+    run.pid = loop {
+        let found = std::fs::read_dir("/proc").unwrap().filter_map(|e| {
+            let pid: u32 = e.ok()?.file_name().to_str()?.parse().ok()?;
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let is_satd = cmdline
+                .split(|b| *b == 0)
+                .next()
+                .is_some_and(|exe| exe.ends_with(b"/satd"));
+            let names_datadir =
+                cmdline.split(|b| *b == 0).any(|arg| arg == datadir_arg.as_bytes());
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            let pid_1 = status
+                .lines()
+                .find_map(|l| l.strip_prefix("NSpid:"))
+                .is_some_and(|ns| ns.split_whitespace().last() == Some("1"));
+            (is_satd && names_datadir && pid_1).then_some(pid)
+        });
+        if let Some(pid) = found.into_iter().next() {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "satd never started as PID 1:\n{}", run.log());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    sigterm_a_replay(
+        &mut run,
+        REINDEX_CONNECT_STARTS,
+        "Reindex stopped on request, flushed at this height",
+        &datadir,
+    );
+
+    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--reindex"]);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #907, during IBD: SIGTERM while a node syncs a chain of large blocks from
+/// a peer stops it with exit 0, inside Docker's default 10 s grace period,
+/// and the log names each wait before it starts, so a stop that runs long
+/// says in its last line what it is waiting on.
+///
+/// The large blocks are about a megabyte each: ten transactions to a block,
+/// each carrying 95 kB of OP_RETURN data.
+///
+/// Perturbation: drop the "Shutdown: waiting for the block connector" line
+/// and the order assertion fails.
+#[test]
+fn sigterm_during_ibd_of_large_blocks_stops_within_the_bound() {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::script::{Builder, PushBytesBuf};
+
+    let p2p_a = find_available_port();
+    let a = TestNode::start(&[&format!("--port={p2p_a}")]);
+    let wallet = DeterministicWallet::from_secret([0x6d; 32]);
+    let addr = wallet.address.to_string();
+    // Coinbases at heights 1..=149 are mature at 249, and below the first
+    // regtest halving, which the spend helper assumes.
+    sp_generate_to(&a, 249, &addr);
+    let data = Builder::new()
+        .push_opcode(OP_RETURN)
+        .push_slice(PushBytesBuf::try_from(vec![0x5a; 95_000]).unwrap())
+        .into_script();
+    for h in 1..150u64 {
+        let (raw, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+            &a,
+            &[(h, &wallet)],
+            &[wallet.address.script_pubkey(), data.clone()],
+            200_000,
+        );
+        // The helper splits the value across both outputs, so the OP_RETURN
+        // burns half the coinbase: allow it.
+        a.rpc_ok(
+            "sendrawtransaction",
+            vec![serde_json::json!(raw), serde_json::json!(0.1), serde_json::json!(50)],
+        );
+    }
+    let mempool_size = || a.rpc_ok("getmempoolinfo", vec![])["size"].as_u64().unwrap();
+    while mempool_size() > 0 {
+        sp_generate_to(&a, 1, &addr);
+    }
+    let tip = get_rpc_u64(&a, "getblockcount").unwrap();
+    assert!(tip >= 249 + 14, "149 transactions of ~380 kWU take 15 blocks, tip {tip}");
+
+    let mut b = TestNode::start(&[&format!("--connect=127.0.0.1:{p2p_a}"), "--loglevel=info"]);
+    // Into the large blocks, and not through them.
+    let deadline = Instant::now() + test_timeout(120);
+    loop {
+        let h = get_rpc_u64(&b, "getblockcount").unwrap_or(0);
+        if h >= 251 {
+            assert!(h < tip, "node B synced the whole chain before the signal; reached {h}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "node B never reached the large blocks");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let sent = Instant::now();
+    let pid = b.process.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    let deadline = Instant::now() + test_timeout(60);
+    let status = loop {
+        if let Some(status) = b.process.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "node B did not exit within 60s of SIGTERM");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let took = sent.elapsed();
+    let log = std::fs::read_to_string(&b.stderr_log).unwrap_or_default();
+    assert_eq!(status.code(), Some(0), "SIGTERM during IBD exits 0 ({status}):\n{log}");
+    assert!(took < test_timeout(10), "the stop took {took:?}:\n{log}");
+    let at = |line: &str| log.find(line).unwrap_or_else(|| panic!("no {line:?} in the log:\n{log}"));
+    let order = [
+        at("SIGTERM received, shutting down"),
+        at("Shutdown: waiting for the block connector to finish the block in hand"),
+        at("Block connector stopped"),
+        at("Shutdown: flushing the UTXO cache to disk"),
+        at("UTXO cache flushed cleanly"),
+        at("satd stopped"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "shutdown steps out of order:\n{log}");
+    let stopped_at: u64 = log[order[2]..]
+        .lines()
+        .next()
+        .and_then(|l| l.rsplit("tip_height=").next())
+        .and_then(|h| h.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no tip height on the connector line:\n{log}"));
+    assert!(stopped_at < tip, "the stop came mid-sync: {stopped_at} of {tip}");
+    eprintln!("stopped at height {stopped_at} of {tip}, {took:?} after SIGTERM");
+}
+
 #[test]
 fn test_rpc_extended_errors_off_by_default() {
     // Default: error responses must be byte-identical to Bitcoin Core —
