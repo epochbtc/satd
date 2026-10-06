@@ -348,6 +348,105 @@ func (r WatchSetRejectReason) String() string {
 	}
 }
 
+// WatchAddKind says which kind of add a [WatchAddRejected] refers to.
+type WatchAddKind int32
+
+// Watch add kinds.
+const (
+	// WatchAddKindUnspecified is proto3's zero value.
+	WatchAddKindUnspecified WatchAddKind = 0
+	// WatchAddKindScripts - AddScripts.
+	WatchAddKindScripts WatchAddKind = 1
+	// WatchAddKindOutpoints - AddOutpoints.
+	WatchAddKindOutpoints WatchAddKind = 2
+	// WatchAddKindTransactions - AddTxLifecycle.
+	WatchAddKindTransactions WatchAddKind = 3
+	// WatchAddKindDepthAlarms - AddDepthAlarms.
+	WatchAddKindDepthAlarms WatchAddKind = 4
+	// WatchAddKindDescriptor - AddDescriptor.
+	WatchAddKindDescriptor WatchAddKind = 5
+	// WatchAddKindScriptPrefixes - AddScriptPrefixes.
+	WatchAddKindScriptPrefixes WatchAddKind = 6
+	// WatchAddKindSilentPayments - AddSilentPayments.
+	WatchAddKindSilentPayments WatchAddKind = 7
+)
+
+// Known reports whether this build recognizes the kind.
+func (k WatchAddKind) Known() bool {
+	return k >= WatchAddKindUnspecified && k <= WatchAddKindSilentPayments
+}
+
+func (k WatchAddKind) String() string {
+	switch k {
+	case WatchAddKindUnspecified:
+		return "unspecified"
+	case WatchAddKindScripts:
+		return "scripts"
+	case WatchAddKindOutpoints:
+		return "outpoints"
+	case WatchAddKindTransactions:
+		return "transactions"
+	case WatchAddKindDepthAlarms:
+		return "depth_alarms"
+	case WatchAddKindDescriptor:
+		return "descriptor"
+	case WatchAddKindScriptPrefixes:
+		return "script_prefixes"
+	case WatchAddKindSilentPayments:
+		return "silent_payments"
+	default:
+		return "unknown(" + strconv.FormatInt(int64(k), 10) + ")"
+	}
+}
+
+// WatchAddRejectReason says why the node refused an incremental add (see
+// [WatchAddRejected]).
+type WatchAddRejectReason int32
+
+// Watch add reject reasons.
+const (
+	// WatchAddRejectUnspecified is proto3's zero value.
+	WatchAddRejectUnspecified WatchAddRejectReason = 0
+	// WatchAddRejectQuotaExceeded - the refused items' unit cost does not fit
+	// the token's watch quota. Remove watches, or ask for a larger quota.
+	WatchAddRejectQuotaExceeded WatchAddRejectReason = 1
+	// WatchAddRejectRateLimited - the token's per-add rate limit is spent. The
+	// same add can succeed after RetryAfterSecs.
+	WatchAddRejectRateLimited WatchAddRejectReason = 2
+	// WatchAddRejectCapExceeded - a per-connection cap: 16 silent-payment
+	// targets, 256 descriptors, or the WebSocket entry cap.
+	WatchAddRejectCapExceeded WatchAddRejectReason = 3
+	// WatchAddRejectPermissionDenied - the token lacks stream:watch.
+	WatchAddRejectPermissionDenied WatchAddRejectReason = 4
+	// WatchAddRejectMalformed - the add could not be applied as a whole. A
+	// client bug: the same add will fail again.
+	WatchAddRejectMalformed WatchAddRejectReason = 5
+)
+
+// Known reports whether this build recognizes the reason.
+func (r WatchAddRejectReason) Known() bool {
+	return r >= WatchAddRejectUnspecified && r <= WatchAddRejectMalformed
+}
+
+func (r WatchAddRejectReason) String() string {
+	switch r {
+	case WatchAddRejectUnspecified:
+		return "unspecified"
+	case WatchAddRejectQuotaExceeded:
+		return "quota_exceeded"
+	case WatchAddRejectRateLimited:
+		return "rate_limited"
+	case WatchAddRejectCapExceeded:
+		return "cap_exceeded"
+	case WatchAddRejectPermissionDenied:
+		return "permission_denied"
+	case WatchAddRejectMalformed:
+		return "malformed"
+	default:
+		return "unknown(" + strconv.FormatInt(int64(r), 10) + ")"
+	}
+}
+
 // RescanRejectReason says why a bounded historical rescan was declined (see
 // [RescanRejected]).
 type RescanRejectReason int32

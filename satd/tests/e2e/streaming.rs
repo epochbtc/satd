@@ -1588,6 +1588,74 @@ async fn ws_max_conns_refuses_second() {
     assert!(second.is_err(), "second ws connection over the cap is refused");
 }
 
+/// An add the token's watch quota cannot hold is answered in-band with a
+/// `WatchAddRejected` naming the refused items, and the stream stays up. An add
+/// that fits produces no event: the next event after it is the following add's
+/// refusal, whose `held` counts the unit the accepted add took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_over_quota_add_is_rejected_in_band() {
+    use satd_events::proto::v1::watch_add_rejected::{Kind, Reason};
+    let fixture = write_authfile(&[TokenSpec {
+        id: "watcher",
+        token: "tok-watch-1",
+        capabilities: &["stream:subscribe", "stream:watch"],
+        rate_limit: None,
+        watch_quota: Some(1),
+    }]);
+    let autharg = format!("--authfile={}", fixture.authfile.display());
+    let sn = start_streaming_args(vec![autharg, "--events-grpc-auth=1".into()], vec![]).await;
+    let mut client = GrpcStreamClient::connect_with_token(sn.grpc_port(), "tok-watch-1").await;
+
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let (tx, mut stream) = client.watch(vec![add_scripts(&[&a, &b])]).await;
+    let ev = next_event_matching(&mut stream, 15, |x| matches!(x, Body::WatchAddRejected(_))).await;
+    let Some(Body::WatchAddRejected(r)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!((r.kind, r.reason), (Kind::Scripts as i32, Reason::QuotaExceeded as i32));
+    assert_eq!((r.required, r.held, r.quota), (2, 0, 1));
+    assert_eq!(r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(), vec![a.clone(), b.clone()]);
+
+    tx.send(add_scripts(&[&a])).await.expect("send add");
+    tx.send(add_scripts(&[&b])).await.expect("send add");
+    let ev = next_event_matching(&mut stream, 15, |x| matches!(x, Body::WatchAddRejected(_))).await;
+    let Some(Body::WatchAddRejected(r)) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!((r.required, r.held, r.quota), (1, 1, 1), "the add that fit holds the unit");
+    assert_eq!(r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(), vec![b]);
+}
+
+/// The WebSocket per-connection entry cap refuses an add in-band with a
+/// `watch_add_rejected` frame, echoing the refused txid in the display hex the
+/// add used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_add_over_entry_cap_is_rejected_in_band() {
+    let sn = start_streaming_args(
+        vec![
+            "--events-grpc-bind=127.0.0.1:0".into(),
+            "--streamws=127.0.0.1:0".into(),
+            "--streamws-max-subscriptions=1".into(),
+        ],
+        vec![],
+    )
+    .await;
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    let first = "11".repeat(32);
+    let second = format!("{}{}", "22".repeat(31), "01");
+    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [first] })).await;
+    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [second] })).await;
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "watch_add_rejected")
+        .await;
+    let body = &ev["body"];
+    assert_eq!(body["kind"], "transactions");
+    assert_eq!(body["reason"], "cap_exceeded");
+    assert_eq!((body["required"].as_u64(), body["quota"].as_u64()), (Some(2), Some(1)));
+    assert_eq!(body["txids"], serde_json::json!([second]));
+}
+
 // ===========================================================================
 // Phase 6: consensus invariant — the event bus never backpressures consensus
 // ===========================================================================

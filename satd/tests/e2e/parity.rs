@@ -502,6 +502,55 @@ mod canonical {
                     ("quota", json!(quota)),
                 ],
             ),
+            Event::WatchAddRejected(r) => obj(
+                "watch_add_rejected",
+                [
+                    ("kind", json!(watch_add_kind_name(r.kind))),
+                    ("reason", json!(watch_add_reject_name(r.reason))),
+                    ("required", json!(r.required)),
+                    ("held", json!(r.held)),
+                    ("quota", json!(r.quota)),
+                    ("retry_after_secs", json!(r.retry_after_secs)),
+                    ("scripthashes", json!(r.scripthashes.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                    (
+                        "outpoints",
+                        json!(r
+                            .outpoints
+                            .iter()
+                            .map(|(t, v)| json!({ "txid": hexs(t), "vout": v }))
+                            .collect::<Vec<_>>()),
+                    ),
+                    ("txids", json!(r.txids.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                    (
+                        "depth_alarms",
+                        json!(r
+                            .depth_alarms
+                            .iter()
+                            .map(|(t, d)| json!({ "txid": hexs(t), "depth": d }))
+                            .collect::<Vec<_>>()),
+                    ),
+                    (
+                        "descriptor",
+                        r.descriptor.as_ref().map_or(Value::Null, |d| {
+                            json!({
+                                "descriptor": d.descriptor,
+                                "gap_limit": d.gap_limit,
+                                "start": d.start,
+                                "kept": d.kept,
+                            })
+                        }),
+                    ),
+                    (
+                        "prefixes",
+                        json!(r
+                            .prefixes
+                            .iter()
+                            .map(|(p, bits)| json!({ "prefix": hexs(p), "bits": bits }))
+                            .collect::<Vec<_>>()),
+                    ),
+                    ("scan_pubkeys", json!(r.scan_pubkeys.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                ],
+            ),
             Event::RescanAccepted { from_height, to_height, clamped } => obj(
                 "rescan_accepted",
                 [
@@ -677,6 +726,34 @@ enum_namer!(
     {
         QuotaExceeded => QuotaExceeded,
         CapExceeded => CapExceeded,
+        Malformed => Malformed,
+    }
+);
+
+enum_namer!(
+    watch_add_kind_name,
+    satd_events_client::WatchAddKind,
+    pb::watch_add_rejected::Kind,
+    {
+        Scripts => Scripts,
+        Outpoints => Outpoints,
+        Transactions => Transactions,
+        DepthAlarms => DepthAlarms,
+        Descriptor => Descriptor,
+        ScriptPrefixes => ScriptPrefixes,
+        SilentPayments => SilentPayments,
+    }
+);
+
+enum_namer!(
+    watch_add_reject_name,
+    satd_events_client::WatchAddRejectReason,
+    pb::watch_add_rejected::Reason,
+    {
+        QuotaExceeded => QuotaExceeded,
+        RateLimited => RateLimited,
+        CapExceeded => CapExceeded,
+        PermissionDenied => PermissionDenied,
         Malformed => Malformed,
     }
 );
