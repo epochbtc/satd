@@ -7,7 +7,12 @@ would otherwise fail for the first time at release time: v0.6.0's did,
 on a quote character inside ${prev:-...}.
 
 ${{ ... }} expressions are replaced with a plain word first; GitHub
-substitutes them before the shell sees the script.
+substitutes them before the shell sees the script. Each block is parsed
+by the shell it runs under (`bash -n` or `sh -n`); other shells are
+skipped.
+
+Usage: check-workflow-run-syntax.py [workflow.yml ...]
+With no arguments, every workflow under .github/workflows is checked.
 """
 
 import glob
@@ -16,6 +21,10 @@ import subprocess
 import sys
 
 import yaml
+
+# A GitHub expression, up to the first `}}` that is not inside one of its
+# single-quoted string literals ('' escapes a quote inside a literal).
+EXPRESSION = re.compile(r"\$\{\{(?:'(?:[^']|'')*'|[^'}]|\}(?!\}))*\}\}")
 
 
 def run_shell(step, job, workflow):
@@ -26,9 +35,12 @@ def run_shell(step, job, workflow):
     return "bash"
 
 
-def main():
+def main(paths):
+    if not paths:
+        paths = sorted(glob.glob(".github/workflows/*.yml")
+                       + glob.glob(".github/workflows/*.yaml"))
     checked = failed = 0
-    for path in sorted(glob.glob(".github/workflows/*.yml")):
+    for path in paths:
         with open(path) as f:
             workflow = yaml.safe_load(f)
         for job_id, job in (workflow.get("jobs") or {}).items():
@@ -36,11 +48,12 @@ def main():
                 script = step.get("run")
                 if script is None:
                     continue
-                if run_shell(step, job, workflow).split()[0] not in ("bash", "sh"):
+                shell = run_shell(step, job, workflow).split()[0]
+                if shell not in ("bash", "sh"):
                     continue
                 checked += 1
-                script = re.sub(r"\$\{\{.*?\}\}", "X", script, flags=re.S)
-                r = subprocess.run(["bash", "-n"], input=script, text=True,
+                script = EXPRESSION.sub("X", script)
+                r = subprocess.run([shell, "-n"], input=script, text=True,
                                    capture_output=True)
                 if r.returncode:
                     failed += 1
@@ -52,4 +65,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
