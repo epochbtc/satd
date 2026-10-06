@@ -245,6 +245,11 @@ nothing and is removed at the next start.
 `-reindex-chainstate -stopatheight=H` stops short on purpose and is refused
 all the same on the next plain start: the node could never advance past H.
 
+A stop signal (SIGTERM or SIGINT) during a rebuild stops it at once: satd
+abandons the block it is connecting, flushes what it had connected, keeps the
+marker and exits 0. See
+"Signals" in [Packaging](packaging.md).
+
 ### Block files that end early
 
 A full `-reindex` can only rebuild what the block files hold. It reads
