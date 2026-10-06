@@ -41,9 +41,9 @@ const (
 	// to distinguish.
 	KindQuotaExhausted
 	// KindRateLimited is reserved for explicit rate-limit signaling in the
-	// resilience layer. The current server does not return a status for an
-	// over-rate SetCursor re-anchor - it drops it silently - so this is not
-	// produced yet.
+	// resilience layer; it is not produced yet. The server answers an
+	// over-rate SetCursor re-anchor in-band, as a CursorRejected event with
+	// CursorRejectRateLimited, not with a status.
 	KindRateLimited
 	// KindReplayUnavailable is reserved. A from_cursor replay against a server
 	// with no block source is a silent server-side fallback to forward-only, so

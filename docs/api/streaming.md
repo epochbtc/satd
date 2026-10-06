@@ -1384,8 +1384,8 @@ exhaustion, mirroring the rest of the node's admission controls. All are
 | `streamwsmaxconns` | 256 | concurrent `/ws` + `/sse` connections |
 | `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection |
 | `streamwsmaxmessagebytes` | 262144 | a single inbound WS control frame |
-| `eventsgrpcmaxconns` | 64 | concurrent gRPC streams |
-| `eventsgrpcmaxsubscriptions` | 256 | watch-set size per gRPC stream |
+| `eventsgrpcmaxconns` | 64 | concurrent gRPC connections |
+| `eventsgrpcmaxsubscriptions` | 256 | concurrent `Subscribe` + `Watch` streams, across all gRPC connections |
 
 Admission shedding runs ahead of authentication and request-body buffering, so a
 connection flood — authenticated or not — is bounded before it does work.
