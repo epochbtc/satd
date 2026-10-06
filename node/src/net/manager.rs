@@ -196,10 +196,80 @@ const MAX_IN_FLIGHT_BLOCKS_PER_PEER: usize = 256;
 /// comes straight back for more (see `run`).
 const EVENTS_PER_DRAIN: usize = 64;
 
-/// Consecutive full drains before the loop takes its normal path anyway.
-/// Bounds how long sustained inbound traffic can defer the maintenance
-/// section; at `EVENTS_PER_DRAIN` apiece this is 512 messages.
-const MAX_FAST_DRAINS: u32 = 8;
+/// How often the manager loop runs its periodic maintenance: stall
+/// detection and the release of stuck IBD heights, work for idle peers, fee
+/// filters, expiries. Every cadence in that section counts these passes
+/// ("every 4 ticks (2s)"), so the pass has to come round on time, however
+/// busy the event queue is (#909).
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What the manager loop does after one drain of the peer event queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterDrain {
+    /// Maintenance is due: run it, then go on draining.
+    Maintain,
+    /// The queue was still full and maintenance is not due: go straight
+    /// back to the queue.
+    DrainAgain,
+    /// The queue is drained and maintenance is not due: wait for the next
+    /// interval tick or a parked pong.
+    Wait,
+}
+
+/// The manager loop's choice after each drain (#909).
+///
+/// Maintenance is due on every interval tick, as before, and also once
+/// `MAINTENANCE_INTERVAL` has passed since it last started, so a queue too
+/// busy to wait for a tick still gets it. It runs after the drain in
+/// progress, however full the queue is. A drain takes at most
+/// `EVENTS_PER_DRAIN` events, so maintenance is late by at most one drain.
+///
+/// 0.6.0 tied maintenance to an interval wake instead, and let a full queue
+/// put it off: a run of fast drains ended in a wait for the next tick, and
+/// the pass after that tick found the queue full again. Under initial block
+/// download the queue is full at every wake, and with an fsync for every
+/// block stored a single drain can take most of a second, so stall detection
+/// ran tens of seconds apart and a block held by one slow peer stayed with it
+/// for up to a minute.
+///
+/// A wake from `drain_now`, for a pong parked behind the queue, is neither a
+/// tick nor late, so it drains and waits (#776): maintenance never runs at
+/// the rate pings arrive.
+#[derive(Debug, Default)]
+struct DrainPacer {
+    /// When maintenance last started; `None` before the first pass.
+    last_maintenance: Option<Instant>,
+    /// An interval tick has woken the loop since maintenance last started.
+    ticked: bool,
+}
+
+impl DrainPacer {
+    /// Record that an interval tick woke the loop.
+    fn ticked(&mut self) {
+        self.ticked = true;
+    }
+
+    /// Decide what follows a drain that took `processed` events, at `now`.
+    fn after_drain(&self, processed: usize, now: Instant) -> AfterDrain {
+        let due = self.ticked
+            || self
+                .last_maintenance
+                .is_none_or(|t| now.duration_since(t) >= MAINTENANCE_INTERVAL);
+        if due {
+            AfterDrain::Maintain
+        } else if processed >= EVENTS_PER_DRAIN {
+            AfterDrain::DrainAgain
+        } else {
+            AfterDrain::Wait
+        }
+    }
+
+    /// Record that maintenance started at `at`.
+    fn maintained(&mut self, at: Instant) {
+        self.last_maintenance = Some(at);
+        self.ticked = false;
+    }
+}
 
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
@@ -3580,19 +3650,16 @@ impl PeerManager {
     /// Run the main event loop. Returns when shutdown signal is received.
     pub async fn run(self: &Arc<Self>) {
         let mut event_rx = self.event_rx.lock().await;
-        let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut sync_interval = tokio::time::interval(MAINTENANCE_INTERVAL);
+        // A busy queue skips the waits that consume ticks. When it quiets,
+        // one late tick is enough: a burst of them would run maintenance back
+        // to back.
+        sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_tip: u32 = 0;
         let mut ticks: u64 = 0;
         let shutdown = self.shutdown.clone();
-        // True when the last wake came from `drain_now` rather than the
-        // interval: a peer's pong is parked behind the queue, and draining
-        // it is the whole of what was asked for. The periodic maintenance
-        // below stays on the interval — running it at the rate pings arrive
-        // would change every cadence in this loop.
-        let mut drain_only = false;
-        // Consecutive iterations that skipped the wait because the event queue
-        // was still full. Reset as soon as one drain comes up short.
-        let mut fast_drains: u32 = 0;
+        // Maintain, drain again, or wait: see `DrainPacer`.
+        let mut pacer = DrainPacer::default();
 
         loop {
             // Manager-loop heartbeat: bumped on every iteration so the
@@ -3645,24 +3712,23 @@ impl PeerManager {
             // out the 60-second wait in Core's `p2p_blockfilters`. So when the
             // queue was still full, come straight back to it.
             //
-            // Bounded, because a fast drain skips the maintenance below:
-            // after `MAX_FAST_DRAINS` in a row we take the normal path even
-            // with a backlog, so stall detection, fee filters and the rest
-            // keep their cadence under sustained load.
-            if processed >= EVENTS_PER_DRAIN && fast_drains < MAX_FAST_DRAINS {
-                fast_drains += 1;
-                drain_only = true;
-                tokio::task::yield_now().await;
-                continue;
-            }
-            fast_drains = 0;
-
-            if drain_only {
-                drain_only = tokio::select! {
-                    _ = sync_interval.tick() => false,
-                    _ = self.drain_now.notified() => true,
-                };
-                continue;
+            // The maintenance below runs on time regardless, at most one
+            // drain late, so stall detection, fee filters and the rest keep
+            // their cadence under sustained load (#909).
+            let now = Instant::now();
+            match pacer.after_drain(processed, now) {
+                AfterDrain::DrainAgain => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                AfterDrain::Wait => {
+                    tokio::select! {
+                        _ = sync_interval.tick() => pacer.ticked(),
+                        _ = self.drain_now.notified() => {}
+                    }
+                    continue;
+                }
+                AfterDrain::Maintain => pacer.maintained(now),
             }
 
             // Check sync progress and request more blocks
@@ -4034,12 +4100,17 @@ impl PeerManager {
                 self.expire_compact_state();
             }
 
-            // Yield to tokio runtime, waking early when a peer is waiting
-            // on the drain above to answer a ping.
-            drain_only = tokio::select! {
-                _ = sync_interval.tick() => false,
-                _ = self.drain_now.notified() => true,
-            };
+            // Back to a queue the last drain left full. Otherwise yield to
+            // the tokio runtime, waking early when a peer is waiting on the
+            // drain above to answer a ping.
+            if processed >= EVENTS_PER_DRAIN {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::select! {
+                    _ = sync_interval.tick() => pacer.ticked(),
+                    _ = self.drain_now.notified() => {}
+                }
+            }
         }
     }
 
@@ -10475,6 +10546,106 @@ impl TxBroadcaster for PeerManager {
 mod tests {
     use super::*;
     use crate::net::peer::{Direction, PeerInfo, PeerState};
+
+    /// Drive the pacer through `secs` of a queue that is full after every
+    /// drain, each drain taking `drain`. Returns when maintenance started.
+    fn maintenance_under_a_full_queue(drain: Duration, secs: u64) -> Vec<Instant> {
+        let t0 = Instant::now();
+        let mut pacer = DrainPacer::default();
+        let mut now = t0;
+        let mut ran = Vec::new();
+        while now < t0 + Duration::from_secs(secs) {
+            match pacer.after_drain(EVENTS_PER_DRAIN, now) {
+                AfterDrain::Maintain => {
+                    pacer.maintained(now);
+                    ran.push(now);
+                }
+                AfterDrain::DrainAgain => {}
+                AfterDrain::Wait => panic!("a full queue must never wait"),
+            }
+            now += drain;
+        }
+        ran
+    }
+
+    /// #909: a queue that stays full, as in initial block download, still
+    /// gets maintenance every `MAINTENANCE_INTERVAL`, at most one drain late,
+    /// whether a drain is quick or, with an fsync per stored block, takes
+    /// most of a second. 0.6.0 let the full queue put maintenance off, and
+    /// stall detection ran tens of seconds apart.
+    ///
+    /// Perturbation: in `after_drain`, check for a full queue before checking
+    /// whether maintenance is due, and maintenance never runs.
+    #[test]
+    fn maintenance_runs_on_time_under_a_queue_that_stays_full() {
+        for drain in [Duration::from_millis(20), Duration::from_millis(600)] {
+            let ran = maintenance_under_a_full_queue(drain, 30);
+            let slowest = ran.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
+            assert!(
+                slowest <= MAINTENANCE_INTERVAL + drain,
+                "{drain:?} drains: maintenance {slowest:?} apart"
+            );
+            let expected = 30_000 / (MAINTENANCE_INTERVAL + drain).as_millis() as usize;
+            assert!(ran.len() >= expected, "{drain:?} drains: {} passes, want {expected}", ran.len());
+        }
+    }
+
+    /// #781's fast drains stay: between maintenance passes a full queue is
+    /// drained again at once rather than once per interval tick.
+    #[test]
+    fn a_full_queue_is_drained_again_until_maintenance_is_due() {
+        let t0 = Instant::now();
+        let mut pacer = DrainPacer::default();
+        assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, t0), AfterDrain::Maintain, "first pass");
+        pacer.maintained(t0);
+        for ms in [1, 100, 499] {
+            let at = t0 + Duration::from_millis(ms);
+            assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, at), AfterDrain::DrainAgain, "{ms} ms");
+        }
+        let due = t0 + MAINTENANCE_INTERVAL;
+        assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, due), AfterDrain::Maintain);
+    }
+
+    /// A drained queue waits for the next wake until maintenance is due.
+    /// That holds for a wake from `drain_now` too (#776): pongs parked
+    /// behind the queue arrive at the rate peers ping, and maintenance must
+    /// not run at that rate.
+    #[test]
+    fn a_drained_queue_waits_until_maintenance_is_due() {
+        let t0 = Instant::now();
+        let mut pacer = DrainPacer::default();
+        pacer.maintained(t0);
+        for ms in [10, 20, 30, 250, 499] {
+            let at = t0 + Duration::from_millis(ms);
+            assert_eq!(pacer.after_drain(1, at), AfterDrain::Wait, "{ms} ms");
+        }
+        assert_eq!(pacer.after_drain(0, t0 + MAINTENANCE_INTERVAL), AfterDrain::Maintain);
+    }
+
+    /// An idle loop runs maintenance at every interval tick, as before,
+    /// even when a tick finds it less than `MAINTENANCE_INTERVAL` after the
+    /// last pass started because that pass began late, behind a slower
+    /// drain. Skipping such a tick would stretch every cadence counted in
+    /// ticks.
+    ///
+    /// Perturbation: make maintenance due by time alone and the tick after a
+    /// 40 ms drain is skipped.
+    #[test]
+    fn an_idle_loop_maintains_at_every_tick() {
+        let t0 = Instant::now();
+        let mut pacer = DrainPacer::default();
+        // Each tick's drain takes this long before the pass decides.
+        let drains_ms = [0u64, 40, 2, 0, 15, 1, 30, 0];
+        for (k, d) in drains_ms.iter().enumerate() {
+            let tick = t0 + MAINTENANCE_INTERVAL * k as u32;
+            if k > 0 {
+                pacer.ticked();
+            }
+            let at = tick + Duration::from_millis(*d);
+            assert_eq!(pacer.after_drain(2, at), AfterDrain::Maintain, "tick {k}");
+            pacer.maintained(at);
+        }
+    }
 
     /// A peer relaying a *policy*-rejected tx (fee floor, dust, mempool limits,
     /// RBF, conflicts, non-standard) must NOT accrue ban score — banning for
