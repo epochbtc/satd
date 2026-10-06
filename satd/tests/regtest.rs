@@ -6461,7 +6461,7 @@ fn a_rebuild_marker_without_a_chainstate_is_removed() {
 /// phase starts a second or two to land partway through it.
 const REPLAY_FIXTURE_BLOCKS: u64 = 6000;
 
-/// A stopped regtest datadir holding [`REPLAY_FIXTURE_BLOCKS`] blocks, and
+/// A stopped regtest datadir holding at least [`REPLAY_FIXTURE_BLOCKS`] blocks, and
 /// what `gettxoutsetinfo` reported for it. Mined once per test binary, under
 /// the target's scratch directory, and copied for each test, since every
 /// test that replays it changes it.
@@ -6473,15 +6473,22 @@ fn replay_fixture(tag: &str) -> (std::path::PathBuf, serde_json::Value) {
             .join(format!("satd-replay-fixture-{}", std::process::id()));
         common::prepare_empty_dir(&datadir);
         let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &[]);
-        // In batches the harness's 10 s RPC timeout covers on a loaded runner.
-        for _ in 0..REPLAY_FIXTURE_BLOCKS / 100 {
-            node.rpc_ok(
+        // Small batches, until the chain is long enough. With other tests
+        // running beside it, a call can outlast the harness's 10 s RPC
+        // timeout, and a call that timed out may still have mined its blocks,
+        // so a failed call is not retried by count: the height decides.
+        let deadline = Instant::now() + test_timeout(900);
+        let mut height = 0;
+        while height < REPLAY_FIXTURE_BLOCKS {
+            assert!(Instant::now() < deadline, "mining the replay fixture stalled at {height}");
+            let _ = node.rpc_call_with_params(
                 "generatetoaddress",
                 vec![
-                    serde_json::json!(100),
+                    serde_json::json!(25),
                     serde_json::json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
                 ],
             );
+            height = get_rpc_u64(&node, "getblockcount").unwrap_or(height);
         }
         let utxos = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
         node.stop();
