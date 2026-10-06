@@ -945,7 +945,7 @@ jobs:
                     | { cat; echo "${GITHUB_REF_NAME}"; } | sort -uV \
                     | awk -v t="${GITHUB_REF_NAME}" '$0 == t { print p; exit } { p = $0 }' || true)
           fi
-          echo "PR list compares against: ${prev:-GitHub's default}"
+          echo "PR list compares against: ${prev:-the GitHub default}"
           echo "previous_tag=${prev}" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release

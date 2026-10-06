@@ -392,6 +392,15 @@ jobs:
         env:
           ACTIONLINT_VERSION: '1.7.7'
 
+      # actionlint leaves the embedded scripts alone, so a syntax error in a
+      # step that only runs on a tag would first fail at release time.
+      - name: Parse the workflow run scripts
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/wf-venv
+          /tmp/wf-venv/bin/pip install -q 'pyyaml==6.0.2'
+          /tmp/wf-venv/bin/python scripts/ci/check-workflow-run-syntax.py
+
       # Every canary script, workflow and Rust harness that runs a pinned
       # downstream image must take it from scripts/canary/PINS, and every image
       # there must be pinned by digest. Offline; the freshness half runs weekly
