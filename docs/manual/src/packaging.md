@@ -103,8 +103,9 @@ Consequences of the single instance:
 
 Both are handled from the moment satd starts, including the block replays of
 `-reindex`, `-reindex-chainstate` and `-upgradechainstate`, which run inside
-startup and can take days. A replay stops after the block it is connecting:
-satd flushes what it connected, keeps the rebuild marker, and exits 0. If that
+startup and can take days. A replay stops at once: satd abandons the block it
+is connecting, flushes what it had connected, keeps the rebuild marker, and
+exits 0. If that
 takes longer than `-maxshutdownsecs`, satd exits without waiting, and the
 replay loses what it connected since its last flush. Anywhere else in startup
 a stop signal ends satd at once. This holds with satd as PID 1 of its PID

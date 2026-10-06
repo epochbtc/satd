@@ -164,7 +164,8 @@ pub fn exit_now_on_panic<T>(f: impl FnOnce() -> T) -> T {
 /// `-reindex-chainstate` and `-upgradechainstate`, which run for hours or
 /// days. `satd` registers the signals as it starts instead, and records a
 /// request here. A replay polls [`StartupStop::is_requested`] between blocks
-/// and stops after the block in hand, flushed. Every other part of startup
+/// and while it connects one, abandons the block in progress, and stops at
+/// the last block it connected, flushed. Every other part of startup
 /// ends the process at once, as it did before satd handled the signals.
 ///
 /// Clones share one state.
@@ -187,7 +188,7 @@ struct StartupStopState {
 /// What [`StartupStop::request`] found running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRequest {
-    /// A replay is running, and stops after the block it is connecting.
+    /// A replay is running, and stops at the last block it connected.
     ReplayStops,
     /// Nothing running can stop part-way: end the process now.
     ExitNow,

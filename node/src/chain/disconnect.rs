@@ -491,6 +491,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -572,6 +573,7 @@ mod tests {
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &Default::default(),
                 phase_tracker: None,
+                interrupt: None,
             })
             .unwrap()
         };
@@ -644,6 +646,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
         assert!(
@@ -699,6 +702,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -781,6 +785,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -967,6 +972,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -1102,6 +1108,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -1184,6 +1191,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -1249,6 +1257,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -1319,6 +1328,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
         store.write_batch(reconnect_batch).unwrap();
@@ -1394,6 +1404,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
             })
                 .unwrap();
 
@@ -1509,6 +1520,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
         let written = connect_batch.spent_puts.clone();
@@ -1593,6 +1605,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -1692,6 +1705,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -1808,6 +1822,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
         let mut undo = connect_batch

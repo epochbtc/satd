@@ -107,6 +107,12 @@ pub enum ConnectError {
     /// ordinal.
     #[error("transaction ordinal space exhausted")]
     TxSeqOverflow,
+    /// The caller's [`ConnectParams::interrupt`] asked the connect to stop,
+    /// and it was abandoned part-way. Says nothing about the block. Nothing
+    /// of it reached the store, since a connect only builds a batch and the
+    /// caller writes it.
+    #[error("block connect interrupted")]
+    Interrupted,
 }
 
 impl ConnectError {
@@ -129,7 +135,10 @@ impl ConnectError {
         match self {
             #[cfg(feature = "block-filter-index")]
             Self::FilterIndexEmit(_) => false,
-            Self::SpIndexEmit(_) | Self::ChainTxGap { .. } | Self::TxSeqOverflow => false,
+            Self::SpIndexEmit(_)
+            | Self::ChainTxGap { .. }
+            | Self::TxSeqOverflow
+            | Self::Interrupted => false,
             e => !e.is_mutation_class(),
         }
     }
@@ -372,6 +381,13 @@ pub struct ConnectParams<'a> {
     /// any height in history, so this is not bounded to a window near the
     /// cursor the way the block's own MTP is.
     pub replay_plan: Option<&'a crate::chain::replay_plan::ReplayPlan>,
+    /// Polled during the connect; once it returns `true` the connect stops
+    /// and returns [`ConnectError::Interrupted`]. Set by the startup replays
+    /// so a stop request (#907) does not wait out the block in hand: on a
+    /// slow disk its coin lookups alone can take seconds. Polled after each
+    /// chunk of coin lookups, after the lookups, and every 64 transactions
+    /// of script verification. `None` everywhere else.
+    pub interrupt: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 /// Connect a block, logging Core's line if it fails.
@@ -396,7 +412,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
         address_index, filter_index, sp_index, phase_tracker,
-        replay_plan,
+        replay_plan, interrupt,
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
@@ -404,7 +420,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
         address_index, sp_index, phase_tracker,
-        replay_plan,
+        replay_plan, interrupt,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -430,6 +446,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
     let phase_tracker = *phase_tracker;
+    // Whether the caller has asked the connect to stop. See
+    // `ConnectParams::interrupt`.
+    let interrupt = *interrupt;
+    let interrupted = || interrupt.is_some_and(|stop| stop());
     // Small closure to keep phase-entry call sites short. Each phase
     // boundary is one line; absent-tracker (tests, reorg replay) is a
     // single null-check, well below verification cost.
@@ -564,7 +584,17 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         let outpoints: Vec<OutPoint> = external_lookups.iter()
             .map(|(_, _, op)| *op)
             .collect();
-        let coins = store.get_coins_batch(&outpoints);
+        // One batch, unless the caller may interrupt: then in chunks, with
+        // a poll after each, since on a slow disk these lookups are most of
+        // a block's connect time.
+        let chunk = if interrupt.is_some() { 1024 } else { outpoints.len() };
+        let mut coins = Vec::with_capacity(outpoints.len());
+        for part in outpoints.chunks(chunk) {
+            coins.extend(store.get_coins_batch(part));
+            if interrupted() {
+                return Err(ConnectError::Interrupted);
+            }
+        }
         external_lookups.iter()
             .zip(coins)
             .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
@@ -572,6 +602,9 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             })
             .collect()
     };
+    if interrupted() {
+        return Err(ConnectError::Interrupted);
+    }
 
     // Process each transaction: resolve UTXOs sequentially, defer script verification
     mark(crate::chain::connect_phase::ConnectPhase::PerTxValidate);
@@ -949,9 +982,14 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     // ShadowVerifier — it dispatches to background workers and never blocks here.
     // All N threads run the primary (authoritative) engine.
     if !verify_queue.is_empty() {
+        // Polled every this many transactions of script verification.
+        const INTERRUPT_EVERY: usize = 64;
         if verify_queue.len() <= 1 || num_threads <= 1 {
             mark(crate::chain::connect_phase::ConnectPhase::VerifyJoin);
-            for (tx, prev_outputs) in &verify_queue {
+            for (i, (tx, prev_outputs)) in verify_queue.iter().enumerate() {
+                if i.is_multiple_of(INTERRUPT_EVERY) && interrupted() {
+                    return Err(ConnectError::Interrupted);
+                }
                 script_verifier
                     .verify_transaction(tx, prev_outputs, height)
                     // `reason()`, not the whole error: Core's
@@ -963,6 +1001,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         } else {
             let queue_ref = &verify_queue;
             let chunk_size = verify_queue.len().div_ceil(num_threads);
+            let interrupted = &interrupted;
 
             mark(crate::chain::connect_phase::ConnectPhase::VerifyDispatch);
             let errors: Vec<ConnectError> = std::thread::scope(|s| {
@@ -971,7 +1010,11 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                     .map(|chunk| {
                         s.spawn(move || {
                             let mut errs = Vec::new();
-                            for (tx, prev_outputs) in chunk {
+                            for (i, (tx, prev_outputs)) in chunk.iter().enumerate() {
+                                if i.is_multiple_of(INTERRUPT_EVERY) && interrupted() {
+                                    errs.push(ConnectError::Interrupted);
+                                    break;
+                                }
                                 if let Err(e) = script_verifier
                                     .verify_transaction(tx, prev_outputs, height)
                                 {
@@ -996,7 +1039,11 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 }
                 all_errors
             });
-            if let Some(err) = errors.into_iter().next() {
+            // A verdict a worker reached outranks another worker's stop.
+            if let Some(err) = errors
+                .into_iter()
+                .min_by_key(|e| matches!(e, ConnectError::Interrupted))
+            {
                 return Err(err);
             }
         }
@@ -1146,6 +1193,7 @@ mod tests {
         assert!(!ConnectError::ChainTxGap { parent: BlockHash::all_zeros() }.is_verdict_on_block());
         assert!(!ConnectError::SpIndexEmit("x".into()).is_verdict_on_block());
         assert!(!ConnectError::TxSeqOverflow.is_verdict_on_block());
+        assert!(!ConnectError::Interrupted.is_verdict_on_block());
         #[cfg(feature = "block-filter-index")]
         assert!(!ConnectError::FilterIndexEmit("x".into()).is_verdict_on_block());
     }
@@ -1179,6 +1227,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         }).unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
@@ -1223,6 +1272,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -1331,6 +1381,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -1669,6 +1720,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
 
         let verdict = match &result {
@@ -1690,6 +1742,59 @@ mod tests {
     }
 
     // ── BIP 68 sequence-lock tests ────────────────────────────────────
+
+    /// #907: a connect its caller interrupts stops with `Interrupted` and
+    /// returns no batch, so nothing of the block reaches the store. The stop
+    /// is polled after each chunk of coin lookups, after the lookups, and
+    /// before each 64 transactions of script verification: three polls for
+    /// this block, and a stop at any of them ends the connect.
+    ///
+    /// Perturbation: drop any one poll and the count, or the stop at it,
+    /// fails.
+    #[test]
+    fn an_interrupted_connect_stops_with_no_batch() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (store, outpoint, _) = make_test_store_with_coin(50, false);
+        let block = make_block_spending(outpoint, 60, 2, 10, 0);
+        let run = |stop_on: u32| {
+            let polls = AtomicU32::new(0);
+            let interrupt = || polls.fetch_add(1, Ordering::SeqCst) + 1 >= stop_on;
+            let result = connect_block(&ConnectParams {
+                replay_plan: None,
+                store: &store,
+                block: &block,
+                height: 60,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+                precomputed_txids: None,
+                address_index: &Default::default(),
+                sp_index: &Default::default(),
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &Default::default(),
+                phase_tracker: None,
+                interrupt: Some(&interrupt),
+            });
+            (result, polls.load(Ordering::SeqCst))
+        };
+
+        let (result, polls) = run(u32::MAX);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(polls, 3, "one lookup chunk, after the lookups, one verification batch");
+        for stop_on in 1..=3 {
+            let (result, polls) = run(stop_on);
+            assert!(
+                matches!(result, Err(ConnectError::Interrupted)),
+                "a stop at poll {stop_on}: {:?}",
+                result.err()
+            );
+            assert_eq!(polls, stop_on, "nothing runs past the stop");
+        }
+    }
 
     #[test]
     fn test_bip68_height_lock_met() {
@@ -1714,6 +1819,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -1741,6 +1847,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(matches!(result, Err(ConnectError::SequenceLockNotMet)));
     }
@@ -1768,6 +1875,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -1795,6 +1903,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -1822,6 +1931,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -1851,6 +1961,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -1878,6 +1989,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -1905,6 +2017,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
     }
@@ -1932,6 +2045,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -2170,6 +2284,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -2238,6 +2353,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -2317,6 +2433,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -2377,6 +2494,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
     }
 
@@ -2483,6 +2601,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(matches!(result, Err(ConnectError::MissingOrSpentInput { .. })));
     }
@@ -2510,6 +2629,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(matches!(result, Err(ConnectError::PrematureCoinbaseSpend)));
     }
@@ -2537,6 +2657,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok());
     }
@@ -2637,6 +2758,7 @@ mod tests {
                     #[cfg(feature = "block-filter-index")]
                     filter_index: &filter_index,
                     phase_tracker: None,
+                    interrupt: None,
                 }
             };
         }
@@ -2729,6 +2851,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
     }
@@ -2797,6 +2920,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             matches!(result, Err(ConnectError::SequenceLockNotMet)),
@@ -2877,6 +3001,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseValue)),
@@ -2978,6 +3103,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
     }
@@ -3077,6 +3203,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         match result {
             Err(ConnectError::MissingOrSpentInput { .. }) => {}
@@ -3108,6 +3235,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
     }
@@ -3183,6 +3311,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadCoinbaseHeight)),
@@ -3260,6 +3389,7 @@ mod tests {
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &Default::default(),
                 phase_tracker: None,
+                interrupt: None,
             })
             .map(|_| ())
         }
@@ -3371,6 +3501,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             matches!(result, Err(ConnectError::BadAmounts)),
@@ -3402,6 +3533,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3536,6 +3668,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             result.is_ok(),
@@ -3581,6 +3714,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             result.is_ok(),
@@ -3621,6 +3755,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         });
         assert!(
             result.is_ok(),
@@ -3657,6 +3792,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3705,6 +3841,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3761,6 +3898,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3804,6 +3942,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3840,6 +3979,7 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3880,6 +4020,7 @@ mod tests {
             sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3915,6 +4056,7 @@ mod tests {
             sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 
@@ -3954,6 +4096,7 @@ mod tests {
             sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
+            interrupt: None,
         })
         .unwrap();
 

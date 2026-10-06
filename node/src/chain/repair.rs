@@ -270,6 +270,7 @@ pub fn repair_lost_connect_delta(
         #[cfg(feature = "block-filter-index")]
         filter_index: &Default::default(),
         phase_tracker: None,
+        interrupt: None,
     })?;
 
     // connect_block stamps the batch as the new tip; the node's real

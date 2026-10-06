@@ -1016,6 +1016,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
             phase_tracker: None,
+            interrupt: None,
         })?;
         store.write_batch(batch)?;
 
@@ -1079,8 +1080,9 @@ impl ChainState {
 
     /// Hand the startup replays the stop that SIGTERM and SIGINT request
     /// while `satd` starts up (#907). `-reindex`, `-reindex-chainstate` and
-    /// `-upgradechainstate` poll it between blocks and stop, flushed, after
-    /// the block in hand. Call once, before a replay; later calls are
+    /// `-upgradechainstate` poll it between blocks and while they connect
+    /// one, and stop at the last block connected, flushed. Call once, before
+    /// a replay; later calls are
     /// ignored.
     pub fn set_startup_stop(&self, stop: crate::shutdown::StartupStop) {
         let _ = self.startup_stop.set(stop);
@@ -4405,6 +4407,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
+            interrupt: None,
         })?;
 
         // Atomic commit
@@ -5198,6 +5201,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
+            interrupt: None,
         })?;
 
         // Atomic commit
@@ -5485,24 +5489,23 @@ impl ChainState {
         // flush error, etc.) would drop the handle without setting shutdown
         // or joining, leaving detached workers reading the store/block files
         // after a failed reindex.
+        // A stop requested while satd starts up (#907) ends the replay at
+        // `height`, the last block connected, flushed. The rebuild marker
+        // stays; `satd` reads `stopped` and exits.
+        let stop_here = |height: u32| -> Result<bool, ChainError> {
+            self.store.flush()?;
+            self.store.flush_durable()?;
+            if let Some(p) = &progress {
+                p.set_current(height as u64);
+            }
+            tracing::info!(height, "Chainstate rebuild stopped on request, flushed at this height");
+            Ok(true)
+        };
         let result = (|| -> Result<bool, ChainError> {
             let mut height = start_height;
             while let Some(hash) = plan.hash_at(height) {
-                // A stop requested while satd starts up (#907): end after the
-                // block before this one, flushed, so the stop costs at most
-                // one block and the flush. The rebuild marker stays; `satd`
-                // reads `stopped` and exits.
                 if self.replay_stop_requested() {
-                    self.store.flush()?;
-                    self.store.flush_durable()?;
-                    if let Some(p) = &progress {
-                        p.set_current((height - 1) as u64);
-                    }
-                    tracing::info!(
-                        height = height - 1,
-                        "Chainstate rebuild stopped on request, flushed at this height"
-                    );
-                    return Ok(true);
+                    return stop_here(height - 1);
                 }
                 // Prefer the prefetched, pre-processed block; fall back to a
                 // direct read on a miss (cold start, or a worker behind the
@@ -5510,9 +5513,18 @@ impl ChainState {
                 // bypassing the `DataStored` precondition the IBD connect
                 // methods enforce — after `clear_chainstate` the block-index
                 // entries are still `Valid` from the original sync.
-                match prefetch.take_block(height) {
-                    Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(&plan, pre)?,
-                    _ => self.reindex_connect_direct(&plan, height, hash)?,
+                let connected = match prefetch.take_block(height) {
+                    Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(&plan, pre),
+                    _ => self.reindex_connect_direct(&plan, height, hash),
+                };
+                match connected {
+                    Ok(()) => {}
+                    // The stop arrived during this block's connect, which
+                    // abandoned it: the chainstate is at the block before.
+                    Err(ChainError::Connect(connect::ConnectError::Interrupted)) => {
+                        return stop_here(height - 1);
+                    }
+                    Err(e) => return Err(e),
                 }
                 prefetch.advance_cursor(height + 1);
                 self.bump_connect_heartbeat();
@@ -5818,6 +5830,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
+            interrupt: Some(&|| self.replay_stop_requested()),
         })?;
         let _chain_mutation = self.begin_chain_mutation();
         self.write_chain_batch(batch)?;
@@ -5916,6 +5929,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
+            interrupt: Some(&|| self.replay_stop_requested()),
         })?;
         let _chain_mutation = self.begin_chain_mutation();
         self.write_chain_batch(batch)?;
@@ -6378,23 +6392,22 @@ impl ChainState {
         // handling after the loop for why this stops the replay rather than
         // failing it (issue #542).
         let mut halted: Option<(BlockHash, u32, String)> = None;
+        // A stop requested while satd starts up (#907) ends the replay at the
+        // last block connected, flushed. The rebuild marker stays.
+        let stop_here = |connected: u32| -> Result<FlatFileReindexEnd, ChainError> {
+            self.store.flush()?;
+            self.store.flush_durable()?;
+            if let Some(p) = &progress {
+                p.set_current(connected as u64);
+            }
+            let height = self.tip_height();
+            tracing::info!(connected, height, "Reindex stopped on request, flushed at this height");
+            Ok(FlatFileReindexEnd::Stopped { height })
+        };
+        let stop_requested = || self.replay_stop_requested();
         for hash in &plan.path {
-            // A stop requested while satd starts up (#907): end after the
-            // block before this one, flushed, so the stop costs at most one
-            // block and the flush. The rebuild marker stays.
-            if self.replay_stop_requested() {
-                self.store.flush()?;
-                self.store.flush_durable()?;
-                if let Some(p) = &progress {
-                    p.set_current(connected as u64);
-                }
-                let height = self.tip_height();
-                tracing::info!(
-                    connected,
-                    height,
-                    "Reindex stopped on request, flushed at this height"
-                );
-                return Ok(FlatFileReindexEnd::Stopped { height });
+            if stop_requested() {
+                return stop_here(connected);
             }
             let hash = *hash;
             let entry = match header_by_hash.remove(&hash) {
@@ -6443,7 +6456,7 @@ impl ChainState {
                 if use_noop { &noop } else { &*self.script_verifier };
 
             let mtp = self.get_median_time_past(height);
-            let batch = connect::connect_block(&connect::ConnectParams {
+            let batch = match connect::connect_block(&connect::ConnectParams {
                 replay_plan: None,
                 store: &*self.store,
                 block: &block,
@@ -6461,7 +6474,14 @@ impl ChainState {
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &self.filter_index,
                 phase_tracker: None,
-            })?;
+                interrupt: Some(&stop_requested),
+            }) {
+                Ok(batch) => batch,
+                // The stop arrived during this block's connect, which
+                // abandoned it: the chainstate is at the block before.
+                Err(connect::ConnectError::Interrupted) => return stop_here(connected),
+                Err(e) => return Err(e.into()),
+            };
             let _chain_mutation = self.begin_chain_mutation();
             self.write_chain_batch(batch)?;
 
@@ -6923,6 +6943,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &no_filter_index,
             phase_tracker: None,
+            interrupt: None,
             replay_plan: None,
         };
         match connect::connect_block(&params) {
@@ -7346,6 +7367,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
                         phase_tracker: None,
+                        interrupt: None,
                     })
                     .inspect_err(|e| {
                         if e.is_verdict_on_block() {
@@ -7505,6 +7527,7 @@ impl ChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
+            interrupt: None,
         });
         let batch = match connect_attempt {
             Ok(b) => b,
@@ -9212,6 +9235,7 @@ impl ChainState {
                     #[cfg(feature = "block-filter-index")]
                     filter_index: &self.filter_index,
                     phase_tracker: None,
+                    interrupt: None,
                 })
                 .inspect_err(|err| {
                     if err.is_verdict_on_block() {
@@ -20152,8 +20176,9 @@ pub(crate) mod tests {
 
     /// #907: a stop requested while `satd` starts up ends a flat-file reindex
     /// between blocks, flushed. The scan polls once per block file (one
-    /// here), then the connect polls before each block, so the seventh poll
-    /// is the one before block 6.
+    /// here); then each block is polled before its connect and once inside
+    /// it, after its coin lookups. So block k's polls are 2k and 2k + 1, and
+    /// the twelfth is the one before block 6.
     ///
     /// Perturbation: drop the connect loop's poll and the replay runs to 20.
     #[test]
@@ -20162,7 +20187,7 @@ pub(crate) mod tests {
         let hashes = build_chain(&cs, 20, 1_701_000_000);
         let re = reindexing_chain_state_over(&dir);
         let stop = crate::shutdown::StartupStop::default();
-        stop.request_on_poll(1 + 6);
+        stop.request_on_poll(12);
         re.set_startup_stop(stop);
 
         let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
@@ -20202,8 +20227,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #907: the same for a chainstate rebuild, which polls before each
-    /// block, so the sixth poll is the one before block 6.
+    /// #907: the same for a chainstate rebuild, which has no scan, so block
+    /// k's polls are 2k - 1 and 2k, and the eleventh is the one before block
+    /// 6.
     ///
     /// Perturbation: drop the replay loop's poll and the rebuild runs to 20.
     #[test]
@@ -20218,13 +20244,68 @@ pub(crate) mod tests {
             tip.height = 0;
         }
         let stop = crate::shutdown::StartupStop::default();
-        stop.request_on_poll(6);
+        stop.request_on_poll(11);
         cs.set_startup_stop(stop);
 
         let outcome = cs.reindex_chainstate(None, None, None).expect("rebuild");
 
         assert!(outcome.stopped);
         assert!(!outcome.is_complete());
+        assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
+        assert_eq!(cs.tip_hash(), hashes[4]);
+        assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #907: a stop requested while a block is being connected abandons that
+    /// block: the replay ends at the block before, flushed, as if the stop
+    /// had come between them. The thirteenth poll is the one inside block
+    /// 6's connect (see the test above).
+    ///
+    /// Perturbation: map `ConnectError::Interrupted` like any other connect
+    /// error and the reindex fails; drop the poll inside the connect and the
+    /// thirteenth poll lands before block 12 instead.
+    #[test]
+    fn a_requested_stop_abandons_the_block_a_flat_file_reindex_is_connecting() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 20, 1_701_700_000);
+        let re = reindexing_chain_state_over(&dir);
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(13);
+        re.set_startup_stop(stop);
+
+        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+
+        assert_eq!(end, FlatFileReindexEnd::Stopped { height: 5 });
+        assert_eq!(re.tip_hash(), hashes[4]);
+        assert_eq!(re.store.dirty_count(), 0, "the stop flushes what it connected");
+        assert!(re.store.get_block_index(&hashes[5]).is_none(), "block 6 was abandoned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #907: the same for a chainstate rebuild. The twelfth poll is the one
+    /// inside block 6's connect.
+    ///
+    /// Perturbation: map `ConnectError::Interrupted` like any other connect
+    /// error and the rebuild fails.
+    #[test]
+    fn a_requested_stop_abandons_the_block_a_chainstate_rebuild_is_connecting() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 20, 1_701_800_000);
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+            tip.height = 0;
+        }
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(12);
+        cs.set_startup_stop(stop);
+
+        let outcome = cs.reindex_chainstate(None, None, None).expect("rebuild");
+
+        assert!(outcome.stopped);
         assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
         assert_eq!(cs.tip_hash(), hashes[4]);
         assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");

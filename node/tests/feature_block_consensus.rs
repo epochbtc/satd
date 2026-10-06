@@ -276,6 +276,7 @@ fn connect(store: &dyn Store, block: &Block, height: u32, mtp: u32) -> Satd {
         filter_index: &Default::default(),
         sp_index: &Default::default(),
         phase_tracker: None,
+        interrupt: None,
     })
     .map(|_| ())
     .map_err(|e| e.to_string())

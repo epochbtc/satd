@@ -261,7 +261,8 @@ fn remove_rebuild_marker(net_datadir: &std::path::Path, auth: &node::rpc::auth::
 /// Act on SIGTERM and SIGINT until startup finishes (#907).
 ///
 /// During a block replay a stop is left to the replay, which polls
-/// `startup_stop` between blocks and stops after the block in hand, flushed.
+/// `startup_stop` between blocks and while it connects one, and stops at the
+/// last block it connected, flushed.
 /// If it has not stopped within `replay_stop_budget` seconds
 /// (`-maxshutdownsecs`), the process exits without it, as the running node's
 /// shutdown does when its flush overruns. Anywhere else in startup the
@@ -309,7 +310,7 @@ fn startup_signals(
                         tracing::info!(
                             signal = name,
                             budget_secs = secs,
-                            "Stop requested; the block replay stops after the block in hand"
+                            "Stop requested; the block replay stops at the last block it connected"
                         );
                         deadline = Some(
                             tokio::time::Instant::now() + std::time::Duration::from_secs(secs),

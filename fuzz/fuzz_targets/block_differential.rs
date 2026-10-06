@@ -249,6 +249,7 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         // accept/reject, and index emission is not part of that verdict.
         sp_index: &Default::default(),
         phase_tracker: None,
+        interrupt: None,
     })
     .is_ok()
 }
