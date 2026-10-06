@@ -826,8 +826,7 @@ type SubscribeControl_AddSilentPayments struct {
 	// (MAX_SP_TARGETS_PER_CONNECTION = 16); charges one watch-quota unit per
 	// target. Scan secrets are held in-memory per-connection only, zeroized on
 	// drop, and never persisted or logged (§4, D3). Requires the stream:watch
-	// capability. Server-side matching lands in a later change; this tag
-	// reserves the schema slot.
+	// capability.
 	AddSilentPayments *AddSilentPayments `protobuf:"bytes,16,opt,name=add_silent_payments,json=addSilentPayments,proto3,oneof"`
 }
 
@@ -2981,7 +2980,6 @@ func (x *SilentPaymentMatched) GetRawTx() []byte {
 // `entries` list is empty for an indexed block with no eligible transactions
 // (distinguishing "indexed, none" from "not indexed"). The envelope carries the
 // standard durable cursor, so tweak subscriptions resume exactly like any other.
-// Live emit + index-backed replay land in a later change; this reserves the slot.
 //
 // BYTE ORDER: every hash and txid in this file — here and in TweakEntry,
 // SilentPaymentMatched, and the watch messages — is serialized in *internal*

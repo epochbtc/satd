@@ -64,9 +64,11 @@ pub enum StreamError {
     #[error("resource exhausted: {0}")]
     QuotaExhausted(#[source] Box<tonic::Status>),
 
-    /// Reserved for explicit rate-limit signaling in the resilience layer. The
-    /// current server does not return a status for an over-rate `SetCursor`
-    /// re-anchor — it silently drops it — so this is not produced yet.
+    /// Reserved for explicit rate-limit signaling in the resilience layer; not
+    /// produced yet. The server answers an over-rate `SetCursor` re-anchor
+    /// in-band, as [`Event::CursorRejected`](crate::Event::CursorRejected) with
+    /// [`CursorRejectReason::RateLimited`](crate::CursorRejectReason::RateLimited),
+    /// not with a status.
     #[error("rate limited")]
     RateLimited {
         /// Suggested backoff before retrying, if known.
