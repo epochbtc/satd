@@ -156,6 +156,128 @@ pub fn exit_now_on_panic<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// A stop asked for, by SIGTERM or SIGINT, while the node is still starting
+/// up (#907).
+///
+/// The running node's own handler takes those signals only once startup has
+/// finished, and startup includes the block replays of `-reindex`,
+/// `-reindex-chainstate` and `-upgradechainstate`, which run for hours or
+/// days. `satd` registers the signals as it starts instead, and records a
+/// request here. A replay polls [`StartupStop::is_requested`] between blocks
+/// and while it connects one, abandons the block in progress, and stops at
+/// the last block it connected, flushed. Every other part of startup
+/// ends the process at once, as it did before satd handled the signals.
+///
+/// Clones share one state.
+#[derive(Clone, Default)]
+pub struct StartupStop(std::sync::Arc<parking_lot::Mutex<StartupStopState>>);
+
+#[derive(Default)]
+struct StartupStopState {
+    requested: bool,
+    replaying: bool,
+    finished: bool,
+    /// Test seam: the poll of [`StartupStop::is_requested`] that requests a
+    /// stop, so a test can stop a replay at a chosen block.
+    #[cfg(test)]
+    request_on_poll: Option<u64>,
+    #[cfg(test)]
+    polls: u64,
+}
+
+/// What [`StartupStop::request`] found running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    /// A replay is running, and stops at the last block it connected.
+    ReplayStops,
+    /// Nothing running can stop part-way: end the process now.
+    ExitNow,
+    /// Startup is over; the running node's own handler has the signal.
+    StartupFinished,
+}
+
+impl StartupStop {
+    /// Record a stop request, and say who acts on it.
+    pub fn request(&self) -> StopRequest {
+        let mut s = self.0.lock();
+        if s.finished {
+            return StopRequest::StartupFinished;
+        }
+        s.requested = true;
+        if s.replaying {
+            StopRequest::ReplayStops
+        } else {
+            StopRequest::ExitNow
+        }
+    }
+
+    /// Whether a stop has been requested. A replay polls this between blocks.
+    pub fn is_requested(&self) -> bool {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut s = self.0.lock();
+        #[cfg(test)]
+        {
+            s.polls += 1;
+            if s.request_on_poll == Some(s.polls) {
+                s.requested = true;
+            }
+        }
+        s.requested
+    }
+
+    /// A replay that polls [`Self::is_requested`] is starting. From here
+    /// until [`Self::end_replay`], a request leaves the stop to it.
+    pub fn begin_replay(&self) {
+        self.0.lock().replaying = true;
+    }
+
+    /// The replay has returned. Returns whether a stop was requested, before
+    /// or during it: the caller then ends startup itself, since a request
+    /// that arrived after the replay's last poll was left to it.
+    pub fn end_replay(&self) -> bool {
+        let mut s = self.0.lock();
+        s.replaying = false;
+        s.requested
+    }
+
+    /// Startup is over. Later requests are the running node's.
+    pub fn finish(&self) {
+        self.0.lock().finished = true;
+    }
+
+    /// Request a stop on the `n`th poll of [`Self::is_requested`], counting
+    /// from 1.
+    #[cfg(test)]
+    pub(crate) fn request_on_poll(&self, n: u64) {
+        let mut s = self.0.lock();
+        s.request_on_poll = Some(n);
+        s.polls = 0;
+    }
+}
+
+/// End the process the way the default action of `signal` (SIGTERM or
+/// SIGINT) would have, for a stop requested in a part of startup that cannot
+/// stop part-way.
+///
+/// Before #907 such a signal killed the process at once, and a supervisor
+/// treats death by SIGTERM as a clean stop, so the default action is
+/// restored and the signal raised again. PID 1 of a PID namespace ignores a
+/// signal whose action is the default, which is how a containerised replay
+/// used to run until its SIGKILL. There the raise returns, and the process
+/// exits with the status a shell reports for death by the signal, 128 plus
+/// its number.
+pub fn exit_by_signal(signal: libc::c_int) -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    // SAFETY: restoring a signal's default action and raising it take no
+    // pointers; neither can leave the process in an unsound state.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    exit_now(128 + signal)
+}
+
 /// Filename of the marker inside the network datadir.
 pub const MARKER_FILENAME: &str = ".clean_shutdown";
 
@@ -277,6 +399,42 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// #907. Outside a replay a stop ends the process; inside one it is left
+    /// to the replay, which `end_replay` then reports; once startup has
+    /// finished it is the running node's, and is not recorded here.
+    #[test]
+    fn a_startup_stop_goes_to_whoever_can_act_on_it() {
+        let stop = StartupStop::default();
+        assert!(!stop.is_requested());
+        assert_eq!(stop.request(), StopRequest::ExitNow);
+        assert!(stop.is_requested());
+
+        let stop = StartupStop::default();
+        stop.begin_replay();
+        assert!(!stop.end_replay(), "no request, nothing to report");
+        stop.begin_replay();
+        assert_eq!(stop.request(), StopRequest::ReplayStops);
+        assert_eq!(stop.request(), StopRequest::ReplayStops, "a second request changes nothing");
+        assert!(stop.is_requested(), "the replay sees it");
+        assert!(stop.end_replay(), "and so does its caller");
+        assert_eq!(stop.request(), StopRequest::ExitNow, "after the replay, startup exits");
+
+        let stop = StartupStop::default();
+        stop.finish();
+        assert_eq!(stop.request(), StopRequest::StartupFinished);
+        assert!(!stop.is_requested(), "the running node's stop is not recorded here");
+    }
+
+    /// The clones a replay and the signal watcher hold are one stop.
+    #[test]
+    fn startup_stop_clones_share_one_state() {
+        let stop = StartupStop::default();
+        let replay = stop.clone();
+        stop.begin_replay();
+        assert_eq!(stop.request(), StopRequest::ReplayStops);
+        assert!(replay.is_requested());
     }
 
     #[test]
