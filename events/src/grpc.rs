@@ -64,8 +64,9 @@ pub struct GrpcLimits {
     /// Hard cap on simultaneously-open TCP connections. A connection beyond
     /// the cap is dropped at accept (the client sees a connection reset).
     pub max_conns: usize,
-    /// Hard cap on concurrent `Subscribe` streams across all connections. A
-    /// `Subscribe` beyond the cap is rejected with `RESOURCE_EXHAUSTED`.
+    /// Hard cap on concurrent `Subscribe` and `Watch` streams across all
+    /// connections. A stream beyond the cap is rejected with
+    /// `RESOURCE_EXHAUSTED`.
     pub max_subscriptions: usize,
     /// Minimum allowed bit-length for a script-prefix watch (§7.5).
     pub prefix_min_bits: u8,
@@ -602,10 +603,11 @@ impl EventSink for GrpcEventSink {
 
 struct NodeEventStreamSvc {
     publisher: std::sync::Arc<node::events::EventPublisher>,
-    /// Live count of active `Subscribe` streams, shared across all
-    /// connections. Bounded by `max_subscriptions` (when non-zero).
+    /// Live count of active `Subscribe` and `Watch` streams, shared across
+    /// all connections. Bounded by `max_subscriptions` (when non-zero).
     active_subs: Arc<AtomicUsize>,
-    /// Hard cap on concurrent `Subscribe` streams. `0` disables the cap.
+    /// Hard cap on concurrent `Subscribe` and `Watch` streams. `0` disables
+    /// the cap.
     max_subscriptions: usize,
     /// Read-only block-index access for durable cursor replay; `None`
     /// disables replay (forward-only).
