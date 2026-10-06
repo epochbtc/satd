@@ -11,9 +11,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet — 0.6.0 was cut on 2026-10-05. Add a one-line bullet here for every
-user-facing change, and the full write-up to the next
-`docs/release-notes/<version>-pre.md`.
+Bound for **0.6.1**, a patch release on the 0.6 line. This is an index: every
+item below is (or will be) written up in full in the in-development
+[`docs/release-notes/0.6.1-pre.md`](docs/release-notes/0.6.1-pre.md).
+
+### Fixed
+
+- A watch add the streaming server refused (over the token's watch quota, over the per-add rate limit, over a per-connection cap, without `stream:watch`, or malformed) was logged on the node and dropped, so a client could believe it was watching addresses it was not. The server now answers it on the `Watch` stream with a `WatchAddRejected` event (`watch_add_rejected` on WebSocket) naming the reason and the refused items, as the streaming docs promised; both SDKs surface it. `ResilientWatch` re-sends a rate-limited add once the limit allows, within its backoff budget, and stops re-registering other refused items on reconnect. A silent-payment add that only updates the labels of targets already watched no longer spends a rate-limit token.
 
 ## Releases
 
