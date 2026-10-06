@@ -378,6 +378,7 @@ impl BackgroundChainState {
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
             phase_tracker: None,
+            interrupt: None,
         })?;
 
         // SplitStore routes: block_index/height/txindex → shared store,
