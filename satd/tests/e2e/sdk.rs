@@ -12,13 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use satd_events_client::{
-    Categories, Cursor, Event, FileCursorStore, PrefixWatcher, ResilientConfig, StatusKind,
-    StatusSeverity, StatusState, StreamClient, StreamError, SubscribeOptions,
+    Categories, Cursor, Event, FileCursorStore, PrefixWatcher, ResilientConfig,
+    ResilientWatchConfig, StatusKind, StatusSeverity, StatusState, StreamClient, StreamError,
+    SubscribeOptions,
 };
 
 use crate::common::{
     block1_coinbase_txid, build_signed_p2wpkh_spend_seq, display_to_internal_hex, e2e_test_timeout,
-    DeterministicWallet, StreamingNode,
+    write_authfile, DeterministicWallet, StreamingNode, TokenSpec,
 };
 
 const WALLET_SEED: u8 = 0x11;
@@ -211,6 +212,59 @@ async fn sdk_watch_outpoint_spent_mempool_then_confirmed() {
     .await;
     let Event::OutpointSpent { confirmed, .. } = ev else { unreachable!() };
     assert!(confirmed, "second match is confirmed");
+}
+
+/// A watch add the node throttles for its rate limit is re-sent by
+/// `ResilientWatch` once the limit allows: the payment to that script is still
+/// seen, and the refusal never reaches the caller. With `rate_limit = "1/s"`,
+/// opening the Watch spends the only token, so the replayed `AddScripts` is
+/// throttled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
+    let fixture = write_authfile(&[TokenSpec {
+        id: "rl",
+        token: "tok-rate-limited",
+        capabilities: &["stream:subscribe", "stream:watch"],
+        rate_limit: Some("1/s"),
+        watch_quota: None,
+    }]);
+    let autharg: &'static str =
+        Box::leak(format!("--authfile={}", fixture.authfile.display()).into_boxed_str());
+    let (sn, wallet) = matured_node_args(vec![autharg, "--events-grpc-auth=1"]).await;
+    let dest = DeterministicWallet::from_secret([0x66; 32]).address.script_pubkey();
+    let scripthash: [u8; 32] = {
+        use bitcoin::hashes::{sha256, Hash};
+        sha256::Hash::hash(dest.as_bytes()).to_byte_array()
+    };
+
+    let client = StreamClient::builder(format!("http://127.0.0.1:{}", sn.grpc_port()))
+        .insecure_bearer_token("tok-rate-limited")
+        .connect()
+        .await
+        .expect("connect with the token");
+    let mut watch = client.resilient_watch(ResilientWatchConfig::new());
+    watch.add_scripts([(scripthash, None)]).await.expect("add_scripts");
+
+    // Pull events in the background until the match arrives; anything else that
+    // reaches the caller first must not be the refusal.
+    let matched = tokio::spawn(async move {
+        loop {
+            match watch.next().await.expect("no stream error") {
+                Event::ScriptMatched { scripthash: sh, .. } => return sh,
+                Event::WatchAddRejected(r) => panic!("a rate-limited add reached the caller: {r:?}"),
+                _ => {}
+            }
+        }
+    });
+    // Past the 1 s retry hint, so the re-sent add has landed.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let (_spend_txid, paid) = broadcast_spend(&sn, &wallet, 0x66, 10_000).await;
+    assert_eq!(paid, dest);
+    let sh = tokio::time::timeout(e2e_test_timeout(20), matched)
+        .await
+        .expect("the throttled script matched within the timeout")
+        .expect("watch task");
+    assert_eq!(sh, scripthash.to_vec(), "the re-sent watch delivered the payment");
 }
 
 /// A privacy-preserving prefix watch: register a coarse bucket, receive the

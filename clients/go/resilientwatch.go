@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/epochbtc/satd/clients/go/eventspb"
 )
@@ -192,6 +193,10 @@ type ResilientWatch struct {
 	// reanchorAttempts counts consecutive transient re-anchor rejections, driving
 	// the in-place retry backoff.
 	reanchorAttempts uint32
+	// addRetryAttempts counts the retries each rate-limited add item has spent
+	// (keyed by retryKeys), against the backoff budget. Cleared on reconnect,
+	// which re-sends the whole mirror anyway.
+	addRetryAttempts map[string]uint32
 	// reloadRollback is the mirror as it stood before an in-flight Reload's
 	// SetWatchSet, restored if the node rejects it. Nil when none is in flight.
 	reloadRollback *WatchSet
@@ -595,6 +600,66 @@ func (w *ResilientWatch) editErr(ctx context.Context, send func(*WatchHandle) er
 
 func (w *ResilientWatch) teardownLocked() {
 	w.handle = nil
+	// The reconnect re-sends the whole mirror, rate-limited items included, so
+	// their budgets start over; a pending retry for the old stream does nothing.
+	w.addRetryAttempts = nil
+}
+
+// scheduleAddRetryLocked arranges for the items of a rate-limited add to be
+// re-sent after the node's hint or the backoff delay, whichever is later. It
+// reports false, scheduling nothing, once an item has spent the budget. Called
+// with mu held.
+func (w *ResilientWatch) scheduleAddRetryLocked(ctx context.Context, e *WatchAddRejected, backoff Backoff) bool {
+	keys := retryKeys(e)
+	var attempt uint32
+	for _, k := range keys {
+		if a := w.addRetryAttempts[k]; a > attempt {
+			attempt = a
+		}
+	}
+	if backoff.MaxRetries > 0 && attempt >= backoff.MaxRetries {
+		for _, k := range keys {
+			delete(w.addRetryAttempts, k)
+		}
+		return false
+	}
+	if w.addRetryAttempts == nil {
+		w.addRetryAttempts = map[string]uint32{}
+	}
+	for _, k := range keys {
+		w.addRetryAttempts[k] = attempt + 1
+	}
+	delay := backoff.DelayFor(attempt)
+	if hint := time.Duration(e.RetryAfterSecs) * time.Second; hint > delay {
+		delay = hint
+	}
+	h := w.handle
+	time.AfterFunc(delay, func() { w.resendRefused(ctx, h, e) })
+	return true
+}
+
+// resendRefused re-sends what the mirror still holds of a rate-limited add, on
+// the stream it was refused on. A removal since the refusal wins, and a stream
+// replaced in the meantime got the whole mirror on reconnect. mu is held across
+// the send, as for caller edits, so a concurrent edit cannot reorder with it.
+func (w *ResilientWatch) resendRefused(ctx context.Context, h *WatchHandle, e *WatchAddRejected) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if h == nil || w.handle != h {
+		return
+	}
+	msgs, err := w.mirror.subsetFor(e).controlMessages()
+	if err != nil {
+		return
+	}
+	for _, m := range msgs {
+		if err := h.SendControl(ctx, m); err != nil {
+			if errors.Is(err, ErrControlClosed) {
+				w.teardownLocked()
+			}
+			return
+		}
+	}
 }
 
 func (w *ResilientWatch) commitDue(ctx context.Context) error {
@@ -750,6 +815,17 @@ func (w *ResilientWatch) handleEvent(ctx context.Context, ev Event, cur *Cursor,
 	// completed txid. The node reports the REQUESTED threshold as depth (the
 	// alarm's identity), so that is the exact key to drop.
 	switch e := ev.(type) {
+	case *WatchAddRejected:
+		// A rate limit is transient: keep the items and re-send them once the
+		// limit allows, absorbing the event, until an item has spent the backoff
+		// budget.
+		if e.Reason == WatchAddRejectRateLimited && w.scheduleAddRetryLocked(ctx, e, backoff) {
+			w.mu.Unlock()
+			return true, nil
+		}
+		// Otherwise the node does not hold these items, so a reconnect must not
+		// re-register them.
+		w.mirror.forgetRejected(e)
 	case *TxidDepthReached:
 		if t, ok := txid32(e.Txid); ok {
 			w.mirror.removeDepthAlarms([][32]byte{t}, []uint32{e.Depth})

@@ -192,6 +192,52 @@ func render(ev satdevents.Event) map[string]any {
 			"required": e.Required,
 			"quota":    e.Quota,
 		})
+	case *satdevents.WatchAddRejected:
+		scripthashes := make([]any, 0, len(e.Scripthashes))
+		for _, b := range e.Scripthashes {
+			scripthashes = append(scripthashes, hexb(b))
+		}
+		outpoints := make([]any, 0, len(e.Outpoints))
+		for _, o := range e.Outpoints {
+			outpoints = append(outpoints, map[string]any{"txid": hexb(o.Txid), "vout": o.Vout})
+		}
+		txids := make([]any, 0, len(e.Txids))
+		for _, b := range e.Txids {
+			txids = append(txids, hexb(b))
+		}
+		alarms := make([]any, 0, len(e.DepthAlarms))
+		for _, a := range e.DepthAlarms {
+			alarms = append(alarms, map[string]any{"txid": hexb(a.Txid), "depth": a.Depth})
+		}
+		prefixes := make([]any, 0, len(e.Prefixes))
+		for _, p := range e.Prefixes {
+			prefixes = append(prefixes, map[string]any{"prefix": hexb(p.Prefix), "bits": p.Bits})
+		}
+		scanPubkeys := make([]any, 0, len(e.ScanPubkeys))
+		for _, b := range e.ScanPubkeys {
+			scanPubkeys = append(scanPubkeys, hexb(b))
+		}
+		var descriptor any
+		if d := e.Descriptor; d != nil {
+			descriptor = map[string]any{
+				"descriptor": d.Descriptor, "gap_limit": d.GapLimit, "start": d.Start, "kept": d.Kept,
+			}
+		}
+		return obj("watch_add_rejected", map[string]any{
+			"kind":             enumName(eventspb.WatchAddRejected_Kind_name, int32(e.Kind)),
+			"reason":           enumName(eventspb.WatchAddRejected_Reason_name, int32(e.Reason)),
+			"required":         e.Required,
+			"held":             e.Held,
+			"quota":            e.Quota,
+			"retry_after_secs": e.RetryAfterSecs,
+			"scripthashes":     scripthashes,
+			"outpoints":        outpoints,
+			"txids":            txids,
+			"depth_alarms":     alarms,
+			"descriptor":       descriptor,
+			"prefixes":         prefixes,
+			"scan_pubkeys":     scanPubkeys,
+		})
 	case *satdevents.RescanAccepted:
 		return obj("rescan_accepted", map[string]any{
 			"from_height": e.FromHeight, "to_height": e.ToHeight, "clamped": e.Clamped,

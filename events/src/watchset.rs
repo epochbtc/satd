@@ -21,8 +21,9 @@
 //! reserved in one [`Principal::acquire_watch`] call, then split into per-item
 //! leases via [`WatchLease::split_off_one`] (which moves units without touching
 //! the store). If the reservation does not fit the quota, none of the add's
-//! items are registered — the protocol has no per-item ack, so a partial add
-//! would be a silent partial failure.
+//! net-new items are registered, and the add returns an [`AddRejected`] naming
+//! them, which the carrier reports in-band (`WatchAddRejected`). A partial add
+//! would leave the client unable to tell which items it holds.
 //!
 //! A `WatchSet` is held behind the subscription-scoped `Arc<Mutex<..>>` shared
 //! by the inbound control reader and the outbound stream, so the quota is tied
@@ -103,6 +104,85 @@ pub(crate) type DescriptorWindow = Vec<(u32, u32, Scripthash)>;
 /// type `WatchHandle::add_prefixes` takes. `bits` is the prefix length; the
 /// `u32` is the top 32 bits of `sha256(spk)` masked to `bits`.
 type PrefixKey = (u8, u32);
+
+/// Why an incremental `Add*` registered none of its net-new items. The carrier
+/// reports it in-band as a `WatchAddRejected` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddRejectReason {
+    /// The net-new items cost `required` units; the principal already holds
+    /// `held` of its `quota`.
+    QuotaExceeded { required: u64, held: u64, quota: u64 },
+    /// The per-principal add rate limit is spent.
+    RateLimited { retry_after_secs: u32 },
+    /// A per-connection cap: the add would bring the count to `requested`, past
+    /// `limit`.
+    CapExceeded { requested: u64, limit: u64 },
+    /// The principal lacks the `stream:watch` capability.
+    PermissionDenied,
+    /// The carrier could not apply the message as a whole (a `min_values` list
+    /// that is not parallel to its scripthashes, an invalid descriptor, a txid ×
+    /// depth product over [`MAX_TXID_DEPTH_PAIRS`]).
+    Malformed,
+}
+
+/// The items a rejected add named, in registry form. None of them is watched.
+/// Only the add's net-new items appear: items it re-asserted were already
+/// watched and stay watched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RejectedItems {
+    Scripts(Vec<Scripthash>),
+    Outpoints(Vec<OutPoint>),
+    Transactions(Vec<Txid>),
+    DepthAlarms(Vec<(Txid, u32)>),
+    /// The descriptor and the window the add asked for. `kept` is true when an
+    /// earlier window of the same descriptor stays watched.
+    Descriptor { descriptor: String, gap_limit: u32, start: u32, kept: bool },
+    Prefixes(Vec<PrefixKey>),
+    /// Silent-payment targets by identity `b_scan·G`, never the scan secret.
+    SilentPayments(Vec<[u8; 33]>),
+}
+
+/// An incremental add the watch-set refused, for the carrier to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddRejected {
+    pub reason: AddRejectReason,
+    pub items: RejectedItems,
+}
+
+/// Map a quota-store refusal to the reason the client is told.
+fn watch_reject_reason(reject: satd_auth::WatchReject) -> AddRejectReason {
+    match reject {
+        satd_auth::WatchReject::MissingCapability(_) => AddRejectReason::PermissionDenied,
+        satd_auth::WatchReject::QuotaExceeded(q) => AddRejectReason::QuotaExceeded {
+            required: q.requested,
+            held: q.current,
+            quota: q.max,
+        },
+    }
+}
+
+/// The per-connection entry cap an incremental add is checked against: the
+/// watch-set's size across all kinds, and its cap (`0` = none).
+#[derive(Debug, Clone, Copy)]
+struct Room {
+    len: usize,
+    cap: usize,
+}
+
+impl Room {
+    /// Refuse an add that brings `adding` new entries to a set already at its
+    /// cap. A set below the cap takes the whole add, so one message may
+    /// overshoot by its own size, itself bounded by the inbound frame cap.
+    fn check(self, adding: usize) -> Result<(), AddRejectReason> {
+        if self.cap != 0 && adding > 0 && self.len >= self.cap {
+            return Err(AddRejectReason::CapExceeded {
+                requested: (self.len + adding) as u64,
+                limit: self.cap as u64,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Cap on the coarseness multiplier's shift. A prefix `bits` below `K_MAX`
 /// charges `1 << (K_MAX - bits)` units — honest bandwidth pricing (a coarser
@@ -306,9 +386,27 @@ pub(crate) struct WatchSet {
     /// node-side matcher registry (§4.3) — never copied into the carrier's
     /// bookkeeping.
     silent_payments: HashMap<[u8; 33], Option<satd_auth::WatchLease>>,
+    /// Per-connection entry cap on incremental adds (`0` = none). WS sets
+    /// `streamwsmaxsubscriptions`; gRPC, whose bound is the quota, has none.
+    entry_cap: usize,
 }
 
 impl WatchSet {
+    /// A watch-set whose incremental adds are refused once it holds `entry_cap`
+    /// entries across all kinds (`0` = no cap).
+    pub(crate) fn with_entry_cap(entry_cap: usize) -> Self {
+        Self { entry_cap, ..Self::default() }
+    }
+
+    /// The per-connection entry cap (`0` = none).
+    pub(crate) fn entry_cap(&self) -> usize {
+        self.entry_cap
+    }
+
+    fn room(&self) -> Room {
+        Room { len: self.len(), cap: self.entry_cap }
+    }
+
     /// Add outpoints, charging the quota only for items not already watched and
     /// registering the net-new ones via `register`. All-or-nothing per call.
     pub(crate) fn add_outpoints(
@@ -316,8 +414,10 @@ impl WatchSet {
         principal: Option<&satd_auth::Principal>,
         incoming: impl IntoIterator<Item = OutPoint>,
         register: impl FnOnce(&[OutPoint]),
-    ) {
-        add_items(&mut self.outpoints, principal, incoming, "outpoints", register, |_| {});
+    ) -> Result<(), AddRejected> {
+        let room = self.room();
+        add_items(&mut self.outpoints, principal, incoming, "outpoints", room, register, |_| {})
+            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Outpoints(items) })
     }
 
     /// Add **directly-watched** scripthashes (an `AddScripts` control message).
@@ -338,11 +438,14 @@ impl WatchSet {
         kind: &'static str,
         register: impl FnOnce(&[Scripthash]),
         reassert: impl FnOnce(&[Scripthash]),
-    ) {
+    ) -> Result<(), AddRejected> {
         let items: Vec<Scripthash> = incoming.into_iter().collect();
         // The registry/lease/floor handling is unchanged: `add_items` charges
         // net-new (scripts not already in `scripts`) and refreshes re-asserts.
-        add_items(&mut self.scripts, principal, items.iter().copied(), kind, register, reassert);
+        let room = self.room();
+        let added =
+            add_items(&mut self.scripts, principal, items.iter().copied(), kind, room, register, reassert)
+                .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Scripts(items) });
         // Reconcile direct ownership for whatever is now watched: every script
         // that ended up in `scripts` (net-new committed, or already held) and is
         // not yet a direct owner becomes one. A net-new that failed the quota is
@@ -352,6 +455,7 @@ impl WatchSet {
                 *self.script_owners.entry(*s).or_insert(0) += 1;
             }
         }
+        added
     }
 
     /// Remove **direct** ownership of scripthashes (a `RemoveScripts` control
@@ -381,7 +485,8 @@ impl WatchSet {
     /// entered are added. `register` / `reassert` / `unregister` mirror the
     /// other paths. All-or-nothing on quota: if the net-new scripts do not fit,
     /// the whole (re)assert is rejected and the descriptor's membership is left
-    /// unchanged.
+    /// unchanged. On rejection the `bool` is true when the descriptor was already
+    /// held, so its earlier window stays watched.
     pub(crate) fn add_descriptor(
         &mut self,
         principal: Option<&satd_auth::Principal>,
@@ -389,7 +494,7 @@ impl WatchSet {
         derived: impl IntoIterator<Item = (u32, u32, Scripthash)>,
         register: impl FnOnce(&[Scripthash]),
         unregister: impl FnOnce(&[Scripthash]),
-    ) {
+    ) -> Result<(), (AddRejectReason, bool)> {
         // Dedup the new membership, preserving first-seen order. `new_coords` runs
         // parallel to `new`, carrying each scripthash's `(branch, index)` from the
         // expansion (first occurrence wins if a script recurs across branches).
@@ -415,7 +520,13 @@ impl WatchSet {
                 cap = MAX_DESCRIPTORS_PER_CONNECTION,
                 "descriptor count cap reached; rejecting new descriptor",
             );
-            return;
+            return Err((
+                AddRejectReason::CapExceeded {
+                    requested: self.descriptors.len() as u64 + 1,
+                    limit: MAX_DESCRIPTORS_PER_CONNECTION as u64,
+                },
+                false,
+            ));
         }
 
         let old: Vec<Scripthash> = self.descriptors.get(&descriptor).cloned().unwrap_or_default();
@@ -429,11 +540,14 @@ impl WatchSet {
             to_add.iter().copied().filter(|s| !self.scripts.contains_key(s)).collect();
 
         if !net_new.is_empty() {
-            if !reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", register) {
-                // Quota/rate rejected the net-new batch: change nothing
+            let room = self.room();
+            if let Err(reason) =
+                reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", room, register)
+            {
+                // Quota/rate/cap rejected the net-new batch: change nothing
                 // (membership, ownership, and the prior window all stay as they
                 // were).
-                return;
+                return Err((reason, !is_new_descriptor));
             }
         } else if !to_add.is_empty() || old_set.iter().any(|s| !new_set.contains(s)) {
             // Membership changed (scripts entered the window from another owner,
@@ -451,7 +565,7 @@ impl WatchSet {
                     retry_after_secs,
                     "descriptor re-assert rate-limited; skipping",
                 );
-                return;
+                return Err((AddRejectReason::RateLimited { retry_after_secs }, !is_new_descriptor));
             }
         }
         // Commit ownership for every script that gained this descriptor.
@@ -479,6 +593,7 @@ impl WatchSet {
         }
 
         self.descriptors.insert(descriptor, new);
+        Ok(())
     }
 
     /// Remove a descriptor entirely (a `RemoveDescriptor` control message),
@@ -835,6 +950,11 @@ impl WatchSet {
     /// the exact BIP-389 branch and absolute index the server derived it at, so a
     /// client needs no positional arithmetic. Empty for a directly-watched
     /// (non-descriptor) script. The carrier attaches this to `ScriptMatched`.
+    /// Whether `descriptor` has a window watched on this connection.
+    pub(crate) fn holds_descriptor(&self, descriptor: &str) -> bool {
+        self.descriptors.contains_key(descriptor)
+    }
+
     pub(crate) fn descriptor_attribution(
         &self,
         scripthash: &Scripthash,
@@ -872,8 +992,10 @@ impl WatchSet {
         principal: Option<&satd_auth::Principal>,
         incoming: impl IntoIterator<Item = Txid>,
         register: impl FnOnce(&[Txid]),
-    ) {
-        add_items(&mut self.txids, principal, incoming, "transactions", register, |_| {});
+    ) -> Result<(), AddRejected> {
+        let room = self.room();
+        add_items(&mut self.txids, principal, incoming, "transactions", room, register, |_| {})
+            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Transactions(items) })
     }
 
     /// Remove txids, releasing each removed item's quota unit.
@@ -892,8 +1014,10 @@ impl WatchSet {
         principal: Option<&satd_auth::Principal>,
         incoming: impl IntoIterator<Item = (Txid, u32)>,
         register: impl FnOnce(&[(Txid, u32)]),
-    ) {
-        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", register, |_| {});
+    ) -> Result<(), AddRejected> {
+        let room = self.room();
+        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", room, register, |_| {})
+            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::DepthAlarms(items) })
     }
 
     /// Remove depth alarms, releasing each removed pair's quota unit.
@@ -913,20 +1037,23 @@ impl WatchSet {
         principal: Option<&satd_auth::Principal>,
         incoming: impl IntoIterator<Item = (PrefixKey, u64)>,
         register: impl FnOnce(&[PrefixKey]),
-    ) {
+    ) -> Result<(), AddRejected> {
         // Collect the (key → cost) of net-new buckets up front so the priced
         // charge can read each item's cost. `add_items_priced` re-derives the
         // cost via the closure; a HashMap lookup keeps the two in lockstep.
         let costs: HashMap<PrefixKey, u64> = incoming.into_iter().collect();
+        let room = self.room();
         add_items_priced(
             &mut self.prefixes,
             principal,
             costs.keys().copied(),
             |k| costs.get(k).copied().unwrap_or(1),
             "prefixes",
+            room,
             register,
             |_| {},
-        );
+        )
+        .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Prefixes(items) })
     }
 
     /// Remove prefix watches, releasing each removed bucket's (multi-unit) lease.
@@ -951,13 +1078,15 @@ impl WatchSet {
     /// push the retained count over the cap, the whole add is shed (like a
     /// descriptor over its cap). All-or-nothing on quota. `register` receives the
     /// net-new targets AND the re-asserted ones so the caller applies label
-    /// updates in the matcher.
+    /// updates in the matcher. A re-assert is free (no rate token) and its label
+    /// update applies even when the add's net-new targets are refused; a
+    /// rejection names only the net-new targets, by identity.
     pub(crate) fn add_silent_payments(
         &mut self,
         principal: Option<&satd_auth::Principal>,
         targets: Vec<node::events::SpWatchTarget>,
         register: impl FnOnce(&[node::events::SpWatchTarget]),
-    ) {
+    ) -> Result<(), AddRejected> {
         // Partition into net-new (identity not yet held) and re-asserts (held;
         // may carry a changed label set). Dedup within the message.
         let mut seen = HashSet::new();
@@ -975,8 +1104,20 @@ impl WatchSet {
             }
         }
         if net_new.is_empty() && reassert.is_empty() {
-            return;
+            return Ok(());
         }
+        // A re-asserted target is already inside every limit, so its label update
+        // is free and always applies, like a re-asserted script's floor in
+        // `add_items_priced`. Only net-new targets are charged, and only they can
+        // be refused.
+        if net_new.is_empty() {
+            register(&reassert);
+            return Ok(());
+        }
+        let rejected = |reason, net_new: &[node::events::SpWatchTarget]| AddRejected {
+            reason,
+            items: RejectedItems::SilentPayments(net_new.iter().map(|t| t.scan_pubkey()).collect()),
+        };
         // Per-connection SP cap: only net-new grows the retained set.
         if self.silent_payments.len() + net_new.len() > MAX_SP_TARGETS_PER_CONNECTION {
             warn!(
@@ -986,11 +1127,29 @@ impl WatchSet {
                 cap = MAX_SP_TARGETS_PER_CONNECTION,
                 "silent-payment target cap exceeded; skipping add",
             );
-            return;
+            let reason = AddRejectReason::CapExceeded {
+                requested: (self.silent_payments.len() + net_new.len()) as u64,
+                limit: MAX_SP_TARGETS_PER_CONNECTION as u64,
+            };
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
+            return Err(rejected(reason, &net_new));
         }
-        // Per-add rate limit (mirrors `add_items_priced`): one token per
-        // effective add/update, after the empty short-circuit so a fully-empty
-        // message cannot burn the bucket.
+        if let Err(reason) = self.room().check(net_new.len()) {
+            warn!(
+                target: "events::watchset",
+                kind = "silent_payments",
+                "watch-set at per-connection entry cap; skipping add",
+            );
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
+            return Err(rejected(reason, &net_new));
+        }
+        // Per-add rate limit (mirrors `add_items_priced`): one token per add
+        // with net-new targets, after the short-circuits above so a re-assert
+        // or an empty message cannot burn the bucket.
         if let Some(p) = principal
             && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
         {
@@ -1000,8 +1159,12 @@ impl WatchSet {
                 retry_after_secs,
                 "watch add rate-limited; skipping",
             );
-            return;
+            if !reassert.is_empty() {
+                register(&reassert);
+            }
+            return Err(rejected(AddRejectReason::RateLimited { retry_after_secs }, &net_new));
         }
+        let new_ids: Vec<[u8; 33]> = net_new.iter().map(|t| t.scan_pubkey()).collect();
         // Register net-new first (indices `[0, n_new)`) then the re-asserts, and
         // call `register` (an `FnOnce`) exactly once with the final slice.
         let n_new = net_new.len();
@@ -1013,7 +1176,7 @@ impl WatchSet {
                 // free. `acquire_watch` only when there is something to charge.
                 let batch = if n_new > 0 {
                     match p.acquire_watch(n_new as u64) {
-                        Ok(b) => Some(b),
+                        Ok(b) => Ok(Some(b)),
                         Err(reject) => {
                             warn!(
                                 target: "events::watchset",
@@ -1021,14 +1184,14 @@ impl WatchSet {
                                 reject = ?reject,
                                 "watch add rejected (capability or quota)",
                             );
-                            None
+                            Err(watch_reject_reason(reject))
                         }
                     }
                 } else {
-                    None
+                    Ok(None)
                 };
                 match batch {
-                    Some(mut b) => {
+                    Ok(Some(mut b)) => {
                         register(&to_register);
                         for t in to_register.iter().take(n_new) {
                             let lease = b.split_off(1);
@@ -1038,10 +1201,19 @@ impl WatchSet {
                             );
                             self.silent_payments.insert(t.scan_pubkey(), lease);
                         }
+                        Ok(())
                     }
-                    // Nothing net-new (n_new == 0) or quota denied: apply only
-                    // the re-asserted label updates; retain nothing new.
-                    None => register(&to_register[n_new..]),
+                    // Nothing net-new: apply the re-asserted label updates.
+                    Ok(None) => {
+                        register(&to_register[n_new..]);
+                        Ok(())
+                    }
+                    // Quota denied: the re-asserted label updates still apply;
+                    // nothing new is retained.
+                    Err(reason) => {
+                        register(&to_register[n_new..]);
+                        Err(AddRejected { reason, items: RejectedItems::SilentPayments(new_ids) })
+                    }
                 }
             }
             // Auth disabled (loopback trust): unlimited, no lease.
@@ -1050,6 +1222,7 @@ impl WatchSet {
                 for t in to_register.iter().take(n_new) {
                     self.silent_payments.insert(t.scan_pubkey(), None);
                 }
+                Ok(())
             }
         }
     }
@@ -1077,32 +1250,40 @@ impl WatchSet {
     }
 }
 
+/// An add's refusal and the net-new items it refused, in registry form.
+type Refused<T> = (AddRejectReason, Vec<T>);
+
 fn add_items<T: Eq + Hash + Copy>(
     held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
     principal: Option<&satd_auth::Principal>,
     incoming: impl IntoIterator<Item = T>,
     kind: &'static str,
+    room: Room,
     register: impl FnOnce(&[T]),
     reassert: impl FnOnce(&[T]),
-) {
+) -> Result<(), Refused<T>> {
     // The common case: every item costs exactly one unit.
-    add_items_priced(held, principal, incoming, |_| 1, kind, register, reassert);
+    add_items_priced(held, principal, incoming, |_| 1, kind, room, register, reassert)
 }
 
 /// Generalization of [`add_items`] where each item carries its own quota cost
 /// (`cost`). The whole net-new batch is reserved atomically as `sum(cost)` units,
 /// then split into per-item leases via [`WatchLease::split_off`], so a removal
 /// returns exactly that item's units. Used by the coarseness-priced prefix add;
-/// `add_items` is the `cost = 1` specialization.
+/// `add_items` is the `cost = 1` specialization. A refusal returns the net-new
+/// items, none of which is registered; re-asserted items are refreshed either
+/// way.
+#[allow(clippy::too_many_arguments)] // the shared add path's knobs stay unbundled
 fn add_items_priced<T: Eq + Hash + Copy>(
     held: &mut HashMap<T, Option<satd_auth::WatchLease>>,
     principal: Option<&satd_auth::Principal>,
     incoming: impl IntoIterator<Item = T>,
     cost: impl Fn(&T) -> u64,
     kind: &'static str,
+    room: Room,
     register: impl FnOnce(&[T]),
     reassert: impl FnOnce(&[T]),
-) {
+) -> Result<(), Refused<T>> {
     // Partition `incoming` into net-new items (not yet watched) and re-asserted
     // items (already watched). Both are deduped within this message via `seen`.
     let mut seen = HashSet::new();
@@ -1132,7 +1313,14 @@ fn add_items_priced<T: Eq + Hash + Copy>(
     if net_new.is_empty() {
         // No new watches to charge — re-assert-only or empty add. The metadata
         // refresh above (if any) has already run.
-        return;
+        return Ok(());
+    }
+
+    // Per-connection entry cap (WS `streamwsmaxsubscriptions`). Checked before
+    // the rate limit so a capped add does not spend a token.
+    if let Err(reason) = room.check(net_new.len()) {
+        warn!(target: "events::watchset", kind, "watch-set at per-connection entry cap; skipping add");
+        return Err((reason, net_new));
     }
 
     // Per-add rate limit (C4): bound the RATE of EFFECTIVE watch-adds — those
@@ -1144,8 +1332,8 @@ fn add_items_priced<T: Eq + Hash + Copy>(
     // operator should size the policy with headroom for the expected add
     // cadence — e.g. a descriptor sliding window spends one token per
     // AddDescriptor slide. Operator/loopback and no-policy principals always
-    // Allow. An over-budget add is shed without tearing down the stream — no
-    // per-message ack, same posture as the quota-reject path below.
+    // Allow. An over-budget add is refused without tearing down the stream, and
+    // the carrier reports it in-band like the quota-reject path below.
     if let Some(p) = principal
         && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
     {
@@ -1155,7 +1343,7 @@ fn add_items_priced<T: Eq + Hash + Copy>(
             retry_after_secs,
             "watch add rate-limited; skipping",
         );
-        return;
+        return Err((AddRejectReason::RateLimited { retry_after_secs }, net_new));
     }
     let total: u64 = net_new.iter().map(&cost).sum();
     match principal {
@@ -1178,6 +1366,7 @@ fn add_items_priced<T: Eq + Hash + Copy>(
                     );
                     held.insert(it, lease);
                 }
+                Ok(())
             }
             Err(reject) => {
                 warn!(
@@ -1186,6 +1375,7 @@ fn add_items_priced<T: Eq + Hash + Copy>(
                     reject = ?reject,
                     "watch add rejected (capability or quota)",
                 );
+                Err((watch_reject_reason(reject), net_new))
             }
         },
         // Auth disabled (loopback trust): unlimited, no lease.
@@ -1194,25 +1384,31 @@ fn add_items_priced<T: Eq + Hash + Copy>(
             for it in net_new {
                 held.insert(it, None);
             }
+            Ok(())
         }
     }
 }
 
 /// Reserve quota for a batch of net-new scripthashes (one unit each), all-or-
 /// nothing, inserting each with its split lease and calling `register` on
-/// success. Returns whether the batch was committed (always `true` when auth is
-/// disabled or the batch is empty). Mirrors the net-new arm of
-/// [`add_items_priced`], but *reports* success so a descriptor (re)assert can
-/// stay atomic — rejecting the whole window rather than partially registering.
+/// success. Returns why the batch was refused (it always commits when auth is
+/// disabled and no entry cap applies, or the batch is empty). Mirrors the
+/// net-new arm of [`add_items_priced`] so a descriptor (re)assert can stay
+/// atomic — rejecting the whole window rather than partially registering.
 fn reserve_scripts(
     held: &mut HashMap<Scripthash, Option<satd_auth::WatchLease>>,
     principal: Option<&satd_auth::Principal>,
     net_new: &[Scripthash],
     kind: &'static str,
+    room: Room,
     register: impl FnOnce(&[Scripthash]),
-) -> bool {
+) -> Result<(), AddRejectReason> {
     if net_new.is_empty() {
-        return true;
+        return Ok(());
+    }
+    if let Err(reason) = room.check(net_new.len()) {
+        warn!(target: "events::watchset", kind, "watch-set at per-connection entry cap; skipping add");
+        return Err(reason);
     }
     // Per-add rate limit (C4): one effective add = one token, checked after the
     // empty short-circuit so a no-op cannot burn the bucket.
@@ -1225,7 +1421,7 @@ fn reserve_scripts(
             retry_after_secs,
             "watch add rate-limited; skipping",
         );
-        return false;
+        return Err(AddRejectReason::RateLimited { retry_after_secs });
     }
     match principal {
         Some(p) => match p.acquire_watch(net_new.len() as u64) {
@@ -1239,7 +1435,7 @@ fn reserve_scripts(
                     );
                     held.insert(*s, lease);
                 }
-                true
+                Ok(())
             }
             Err(reject) => {
                 warn!(
@@ -1248,7 +1444,7 @@ fn reserve_scripts(
                     reject = ?reject,
                     "watch add rejected (capability or quota)",
                 );
-                false
+                Err(watch_reject_reason(reject))
             }
         },
         // Auth disabled (loopback trust): unlimited, no lease.
@@ -1257,7 +1453,7 @@ fn reserve_scripts(
             for s in net_new {
                 held.insert(*s, None);
             }
-            true
+            Ok(())
         }
     }
 }
@@ -1318,7 +1514,7 @@ mod tests {
         let mut registered = 0;
         ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |items| {
             registered = items.len();
-        });
+        }).unwrap();
         assert_eq!(registered, 3);
         assert_eq!(q.current("tenant"), 3, "three items charged 3 units");
         assert_eq!(ws.len(), 3);
@@ -1337,14 +1533,14 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {});
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 2);
 
         // A SEPARATE message re-asserts op(1) and adds op(3): only op(3) is new.
         let mut registered = Vec::new();
         ws.add_outpoints(Some(&p), [op(1, 0), op(3, 0)], |items| {
             registered = items.to_vec();
-        });
+        }).unwrap();
         assert_eq!(registered, vec![op(3, 0)], "only the net-new item registers");
         assert_eq!(q.current("tenant"), 3, "the re-asserted item is not double-charged");
     }
@@ -1373,7 +1569,7 @@ mod tests {
         let mut ws = WatchSet::default();
 
         let mut net_new = Vec::new();
-        ws.add_scripts(Some(&p), [sh(1), sh(2)], "scripts", |s| net_new = s.to_vec(), |_| {});
+        ws.add_scripts(Some(&p), [sh(1), sh(2)], "scripts", |s| net_new = s.to_vec(), |_| {}).unwrap();
         assert_eq!(net_new, vec![sh(1), sh(2)], "first add registers both as net-new");
         assert_eq!(q.current("tenant"), 2);
 
@@ -1387,7 +1583,7 @@ mod tests {
             "scripts",
             |s| net_new2 = s.to_vec(),
             |s| reasserted = s.to_vec(),
-        );
+        ).unwrap();
         assert_eq!(net_new2, vec![sh(3)], "only the new script registers");
         assert_eq!(reasserted, vec![sh(1)], "the held script is surfaced for refresh");
         assert_eq!(q.current("tenant"), 3, "re-assert charges no extra quota");
@@ -1401,7 +1597,7 @@ mod tests {
             "scripts",
             |_| net_new3 = true,
             |s| reasserted3 = s.to_vec(),
-        );
+        ).unwrap();
         assert!(!net_new3, "no net-new registration on a re-assert-only add");
         assert_eq!(reasserted3, vec![sh(1), sh(2)], "both held scripts are surfaced");
         assert_eq!(q.current("tenant"), 3, "re-assert-only add charges nothing");
@@ -1423,11 +1619,11 @@ mod tests {
         );
         let mut ws = WatchSet::default();
 
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {});
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap();
         // Bucket now empty. Re-assert sh(1): a net-new add here would be
         // throttled, but a re-assert must bypass the rate limiter entirely.
         let mut reasserted = Vec::new();
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |s| reasserted = s.to_vec());
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |s| reasserted = s.to_vec()).unwrap();
         assert_eq!(reasserted, vec![sh(1)], "re-assert fires even with an empty rate bucket");
     }
 
@@ -1439,10 +1635,81 @@ mod tests {
 
         // Three net-new items but quota is 2 → the whole add is rejected.
         let mut registered = false;
-        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| registered = true);
+        let rejected = ws
+            .add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| registered = true)
+            .unwrap_err();
         assert!(!registered, "an add that overflows quota registers nothing");
         assert_eq!(q.current("tenant"), 0, "no units charged on a rejected add");
         assert_eq!(ws.len(), 0);
+        assert_eq!(
+            rejected,
+            AddRejected {
+                reason: AddRejectReason::QuotaExceeded { required: 3, held: 0, quota: 2 },
+                items: RejectedItems::Outpoints(vec![op(1, 0), op(2, 0), op(3, 0)]),
+            },
+            "the refusal names the cost, the quota and every refused item",
+        );
+    }
+
+    #[test]
+    fn refused_add_names_only_its_net_new_items() {
+        let (p, acct) = tenant(2);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap();
+
+        // op(1) is a re-assert (held, free); op(2) and op(3) need 2 units but only
+        // 1 is free, so they are refused and op(1) stays watched.
+        let rejected = ws
+            .add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| {})
+            .unwrap_err();
+        assert_eq!(rejected.reason, AddRejectReason::QuotaExceeded { required: 2, held: 1, quota: 2 });
+        assert_eq!(
+            rejected.items,
+            RejectedItems::Outpoints(vec![op(2, 0), op(3, 0)]),
+            "a re-asserted item is still watched, so it is not named",
+        );
+        assert_eq!(ws.len(), 1);
+        assert_eq!(q.current("tenant"), 1);
+    }
+
+    #[test]
+    fn add_without_stream_watch_is_refused_as_permission_denied() {
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("reader"),
+            CapabilitySet::EMPTY.with(Capability::StreamSubscribe),
+            Some(10),
+            None,
+            acct,
+        );
+        let mut ws = WatchSet::default();
+        let rejected = ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap_err();
+        assert_eq!(rejected.reason, AddRejectReason::PermissionDenied);
+        assert_eq!(rejected.items, RejectedItems::Scripts(vec![sh(1)]));
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn entry_cap_refuses_growth_but_not_reasserts() {
+        let mut ws = WatchSet::with_entry_cap(2);
+        ws.add_outpoints(None, [op(1, 0), op(2, 0)], |_| {}).unwrap();
+        // At the cap, a message that only re-asserts held items grows nothing.
+        ws.add_outpoints(None, [op(1, 0)], |_| {}).unwrap();
+        let mut registered = false;
+        let rejected = ws
+            .add_scripts(None, [sh(9)], "scripts", |_| registered = true, |_| {})
+            .unwrap_err();
+        assert!(!registered);
+        assert_eq!(
+            rejected,
+            AddRejected {
+                reason: AddRejectReason::CapExceeded { requested: 3, limit: 2 },
+                items: RejectedItems::Scripts(vec![sh(9)]),
+            },
+            "the cap spans every kind of watch",
+        );
+        assert_eq!(ws.len(), 2);
     }
 
     fn txid(b: u8) -> Txid {
@@ -1457,7 +1724,7 @@ mod tests {
         let mut ws = WatchSet::default();
         ws.add_transactions(Some(&p), [txid(1), txid(2)], |items| {
             assert_eq!(items.len(), 2)
-        });
+        }).unwrap();
         assert_eq!(q.current("tenant"), 2, "two txids charge 2 units");
         ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
@@ -1488,7 +1755,7 @@ mod tests {
         // Two depths on the SAME txid are two distinct items → two units.
         ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 3)], |items| {
             assert_eq!(items.len(), 2)
-        });
+        }).unwrap();
         assert_eq!(q.current("tenant"), 2, "(X,1) and (X,3) charge 2 units");
         assert_eq!(ws.len(), 2);
 
@@ -1496,7 +1763,7 @@ mod tests {
         let mut reg = Vec::new();
         ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 6)], |items| {
             reg = items.to_vec()
-        });
+        }).unwrap();
         assert_eq!(reg, vec![(txid(1), 6)], "only the net-new pair registers");
         assert_eq!(q.current("tenant"), 3);
 
@@ -1511,7 +1778,7 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {});
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap();
 
         let mut called = false;
         ws.remove_outpoints([op(9, 9)], |_| called = true);
@@ -1524,7 +1791,7 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {});
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 2);
         drop(ws);
         assert_eq!(q.current("tenant"), 0, "full teardown releases all leases");
@@ -1537,7 +1804,7 @@ mod tests {
         // No principal → no quota, items still tracked for dedup/removal.
         ws.add_outpoints(None, [op(1, 0), op(1, 0), op(2, 0)], |items| {
             registered = items.len();
-        });
+        }).unwrap();
         assert_eq!(registered, 2, "intra-message dedup still applies");
         assert_eq!(ws.len(), 2);
     }
@@ -1559,7 +1826,7 @@ mod tests {
         let mut ws = WatchSet::default();
 
         let mut reg1 = 0;
-        ws.add_outpoints(Some(&p), [op(1, 0)], |items| reg1 = items.len());
+        ws.add_outpoints(Some(&p), [op(1, 0)], |items| reg1 = items.len()).unwrap();
         assert_eq!(reg1, 1, "first add is within the burst");
         assert_eq!(q.current("tenant"), 1);
 
@@ -1567,7 +1834,12 @@ mod tests {
         // registered or charged, and the existing watch-set is intact (no
         // teardown).
         let mut reg2 = 0;
-        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg2 = items.len());
+        let rejected = ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg2 = items.len()).unwrap_err();
+        assert!(
+            matches!(rejected.reason, AddRejectReason::RateLimited { retry_after_secs } if retry_after_secs >= 1),
+            "a throttled add says when to retry: {rejected:?}",
+        );
+        assert_eq!(rejected.items, RejectedItems::Outpoints(vec![op(2, 0)]));
         assert_eq!(reg2, 0, "rate-limited add registers nothing");
         assert_eq!(q.current("tenant"), 1, "rate-limited add charges no quota");
         assert_eq!(ws.len(), 1, "earlier watch remains after a shed add");
@@ -1608,7 +1880,7 @@ mod tests {
         let c32 = parse_prefix(&[0x11, 0x22, 0x33, 0x44], 32, 8, 32).unwrap(); // 1 unit
 
         let mut reg = 0;
-        ws.add_prefixes(Some(&p), [c24, c32], |keys| reg = keys.len());
+        ws.add_prefixes(Some(&p), [c24, c32], |keys| reg = keys.len()).unwrap();
         assert_eq!(reg, 2);
         assert_eq!(q.current("tenant"), (1 << 8) + 1, "coarseness-priced units");
         assert_eq!(ws.len(), 2, "two buckets = two items regardless of unit cost");
@@ -1625,11 +1897,11 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
         let a = parse_prefix(&[0xaa, 0xbb], 16, 8, 32).unwrap();
-        ws.add_prefixes(Some(&p), [a], |_| {});
+        ws.add_prefixes(Some(&p), [a], |_| {}).unwrap();
         let charged = q.current("tenant");
 
         let mut called = false;
-        ws.add_prefixes(Some(&p), [a], |_| called = true);
+        ws.add_prefixes(Some(&p), [a], |_| called = true).unwrap();
         assert!(!called, "re-asserted bucket registers nothing");
         assert_eq!(q.current("tenant"), charged, "dedup: the bucket is not double-charged");
     }
@@ -1642,7 +1914,15 @@ mod tests {
         // A k=24 prefix costs 1<<8 = 256 units > quota 10 → whole add rejected.
         let c = parse_prefix(&[0xaa, 0xbb, 0xcc], 24, 8, 32).unwrap();
         let mut registered = false;
-        ws.add_prefixes(Some(&p), [c], |_| registered = true);
+        let rejected = ws.add_prefixes(Some(&p), [c], |_| registered = true).unwrap_err();
+        assert_eq!(
+            rejected,
+            AddRejected {
+                reason: AddRejectReason::QuotaExceeded { required: 1 << 8, held: 0, quota: 10 },
+                items: RejectedItems::Prefixes(vec![c.0]),
+            },
+            "a prefix refusal states its coarseness price",
+        );
         assert!(!registered, "a prefix add that overflows quota registers nothing");
         assert_eq!(q.current("tenant"), 0);
         assert_eq!(ws.len(), 0);
@@ -1669,10 +1949,10 @@ mod tests {
         );
         let mut ws = WatchSet::default();
 
-        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {});
-        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}); // duplicate → no-op, free
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap();
+        ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap(); // duplicate → no-op, free
         let mut reg3 = 0;
-        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg3 = items.len());
+        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg3 = items.len()).unwrap();
 
         assert_eq!(reg3, 1, "a no-op duplicate must not have spent the rate budget");
         assert_eq!(ws.len(), 2, "both distinct watches registered");
@@ -1693,7 +1973,7 @@ mod tests {
             win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
-        );
+        ).unwrap();
         assert_eq!(registered, vec![sh(1), sh(2), sh(3)], "every derived script registers");
         assert_eq!(q.current("tenant"), 3, "one unit per derived script");
         assert_eq!(ws.len(), 3);
@@ -1712,7 +1992,7 @@ mod tests {
         let mut ws = WatchSet::default();
 
         // Directly watch sh(2), then a descriptor whose window also contains it.
-        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {});
+        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 1);
         let mut registered = Vec::new();
         ws.add_descriptor(
@@ -1721,7 +2001,7 @@ mod tests {
             win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
-        );
+        ).unwrap();
         // sh(2) was already watched → only sh(1), sh(3) are net-new.
         assert_eq!(registered, vec![sh(1), sh(3)], "the shared script is not re-charged");
         assert_eq!(q.current("tenant"), 3, "sh1 + sh2(direct) + sh3");
@@ -1747,8 +2027,8 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D1".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
-        ws.add_descriptor(Some(&p), "D2".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D1".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "D2".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
         // sh(2) shared → charged once; total sh1 + sh2 + sh3.
         assert_eq!(q.current("tenant"), 3);
         assert_eq!(ws.len(), 3);
@@ -1771,7 +2051,7 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 3);
 
         // Slide the window forward: {1,2,3} → {3,4,5}. 1,2 leave; 4,5 enter; 3 stays.
@@ -1783,7 +2063,7 @@ mod tests {
             win(&[sh(3), sh(4), sh(5)]),
             |s| registered = s.to_vec(),
             |s| unregistered = s.to_vec(),
-        );
+        ).unwrap();
         assert_eq!(registered, vec![sh(4), sh(5)], "scripts entering the window register");
         let mut u = unregistered.clone();
         u.sort();
@@ -1798,7 +2078,7 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 1);
 
         // A direct RemoveScripts does not touch descriptor ownership.
@@ -1817,12 +2097,17 @@ mod tests {
 
         // A 3-script descriptor does not fit → the whole add is rejected.
         let mut registered = false;
-        ws.add_descriptor(
+        let rejected = ws.add_descriptor(
             Some(&p),
             "D".into(),
             win(&[sh(1), sh(2), sh(3)]),
             |_| registered = true,
             |_| {},
+        );
+        assert_eq!(
+            rejected,
+            Err((AddRejectReason::QuotaExceeded { required: 3, held: 0, quota: 2 }, false)),
+            "a new descriptor that does not fit is refused and not kept",
         );
         assert!(!registered, "an over-quota descriptor registers nothing");
         assert_eq!(q.current("tenant"), 0, "no units charged");
@@ -1832,12 +2117,31 @@ mod tests {
     }
 
     #[test]
+    fn refused_descriptor_slide_keeps_the_earlier_window() {
+        let (p, acct) = tenant(2);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
+
+        // Sliding to two new scripts needs 2 units with only 1 free.
+        let rejected = ws.add_descriptor(Some(&p), "D".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {});
+        assert_eq!(
+            rejected,
+            Err((AddRejectReason::QuotaExceeded { required: 2, held: 1, quota: 2 }, true)),
+            "a refused slide reports that the earlier window is kept",
+        );
+        assert!(ws.holds_descriptor("D"));
+        assert!(ws.scripts.contains_key(&sh(1)), "the earlier window still watches its script");
+        assert_eq!(q.current("tenant"), 1);
+    }
+
+    #[test]
     fn re_adding_an_identical_descriptor_window_is_idempotent() {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
         // Same descriptor, same window: nothing net-new, nothing released.
         let mut registered = false;
         let mut unregistered = false;
@@ -1847,7 +2151,7 @@ mod tests {
             win(&[sh(1), sh(2)]),
             |_| registered = true,
             |_| unregistered = true,
-        );
+        ).unwrap();
         assert!(!registered && !unregistered, "a no-op re-assert touches nothing");
         assert_eq!(q.current("tenant"), 2, "no double-charge");
 
@@ -1933,7 +2237,7 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
         // sh1 watched as a DIRECT script.
-        ws.add_scripts(Some(&p), [sh(1)], "s", |_| {}, |_| {});
+        ws.add_scripts(Some(&p), [sh(1)], "s", |_| {}, |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 1);
 
         // Reload covers the same scripthash via a DESCRIPTOR instead — the exact
@@ -2135,14 +2439,25 @@ mod tests {
         // script, so each past the first has an empty net-new set — exactly the
         // "free descriptor" path (no quota unit, no rate token) the cap bounds.
         for i in 0..MAX_DESCRIPTORS_PER_CONNECTION {
-            ws.add_descriptor(None, format!("D{i}"), win(&[sh(1)]), |_| {}, |_| {});
+            ws.add_descriptor(None, format!("D{i}"), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
         }
         assert_eq!(ws.descriptors.len(), MAX_DESCRIPTORS_PER_CONNECTION);
 
         // One more *distinct* descriptor is rejected outright — the map, which is
         // invisible to the quota and to `len()`, does not grow past the cap.
         let mut registered = false;
-        ws.add_descriptor(None, "overflow".into(), win(&[sh(1)]), |_| registered = true, |_| {});
+        let rejected =
+            ws.add_descriptor(None, "overflow".into(), win(&[sh(1)]), |_| registered = true, |_| {});
+        assert_eq!(
+            rejected,
+            Err((
+                AddRejectReason::CapExceeded {
+                    requested: MAX_DESCRIPTORS_PER_CONNECTION as u64 + 1,
+                    limit: MAX_DESCRIPTORS_PER_CONNECTION as u64,
+                },
+                false,
+            )),
+        );
         assert!(!registered, "a descriptor rejected by the cap registers nothing");
         assert_eq!(
             ws.descriptors.len(),
@@ -2154,7 +2469,7 @@ mod tests {
         // Re-asserting (sliding) an already-retained descriptor at the cap still
         // works — the count cap must never block a window slide.
         let mut slid = Vec::new();
-        ws.add_descriptor(None, "D0".into(), win(&[sh(2)]), |s| slid = s.to_vec(), |_| {});
+        ws.add_descriptor(None, "D0".into(), win(&[sh(2)]), |s| slid = s.to_vec(), |_| {}).unwrap();
         assert_eq!(
             ws.descriptors.len(),
             MAX_DESCRIPTORS_PER_CONNECTION,
@@ -2183,7 +2498,7 @@ mod tests {
     fn attribution_reports_descriptor_branch_and_index() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(10), sh(11), sh(12)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(10), sh(11), sh(12)]), |_| {}, |_| {}).unwrap();
         // `win` models a single-branch /0/* window: branch 0, index = position.
         assert_eq!(attrib(&ws, sh(10)), vec![("D".to_string(), 0, 0)]);
         assert_eq!(attrib(&ws, sh(11)), vec![("D".to_string(), 0, 1)]);
@@ -2197,7 +2512,7 @@ mod tests {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
         let two_branch = vec![(0u32, 7u32, sh(1)), (1u32, 7u32, sh(2))];
-        ws.add_descriptor(Some(&p), "M".into(), two_branch, |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "M".into(), two_branch, |_| {}, |_| {}).unwrap();
         assert_eq!(attrib(&ws, sh(1)), vec![("M".to_string(), 0, 7)], "external branch");
         assert_eq!(attrib(&ws, sh(2)), vec![("M".to_string(), 1, 7)], "change branch, same index");
     }
@@ -2206,7 +2521,7 @@ mod tests {
     fn direct_scripts_have_no_attribution() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {});
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap();
         assert!(ws.descriptor_attribution(&sh(1)).is_empty());
     }
 
@@ -2214,8 +2529,8 @@ mod tests {
     fn overlapping_descriptors_attribute_a_shared_script_to_both() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
-        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(9), sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(9), sh(2)]), |_| {}, |_| {}).unwrap();
         // sh(2) is offset 1 in A and offset 1 in B.
         let mut got = attrib(&ws, sh(2));
         got.sort();
@@ -2226,9 +2541,9 @@ mod tests {
     fn sliding_a_window_updates_offsets_and_drops_departed_scripts() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
         // Slide: {1,2,3} → {3,4,5}. sh(3) moves from offset 2 to offset 0.
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(3), sh(4), sh(5)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(3), sh(4), sh(5)]), |_| {}, |_| {}).unwrap();
         assert_eq!(attrib(&ws, sh(3)), vec![("D".to_string(), 0, 0)], "surviving script re-offset");
         assert_eq!(attrib(&ws, sh(4)), vec![("D".to_string(), 0, 1)]);
         assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "departed script loses attribution");
@@ -2238,8 +2553,8 @@ mod tests {
     fn removing_a_descriptor_clears_attribution_but_keeps_shared() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {});
-        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(2)]), |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(2)]), |_| {}, |_| {}).unwrap();
         ws.remove_descriptor("A", |_| {});
         assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "A's exclusive script cleared");
         assert_eq!(attrib(&ws, sh(2)), vec![("B".to_string(), 0, 0)], "B still attributes the shared script");
@@ -2265,19 +2580,55 @@ mod tests {
         let mut registered = 0;
         ws.add_silent_payments(Some(&p), vec![sp_target(1), sp_target(2)], |ts| {
             registered = ts.len();
-        });
+        }).unwrap();
         assert_eq!(registered, 2);
         assert_eq!(q.current("tenant"), 2, "two SP targets charge 2 units");
         assert_eq!(ws.len(), 2);
 
         // Re-asserting a held identity is not double-charged.
-        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {});
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap();
         assert_eq!(q.current("tenant"), 2, "re-asserted identity is not recharged");
 
         let mut unregistered = 0;
         ws.remove_silent_payments([sp_target(1).scan_pubkey()], |ids| unregistered = ids.len());
         assert_eq!(unregistered, 1);
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn sp_reassert_is_free_and_applies_when_new_targets_are_refused() {
+        use satd_auth::RatePolicy;
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(100),
+            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            acct,
+        );
+        let mut ws = WatchSet::default();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap(); // the only token
+
+        // A label-only re-assert needs no token: it applies and nothing is refused.
+        let mut applied = Vec::new();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |ts| {
+            applied = ts.iter().map(|t| t.scan_pubkey()).collect();
+        })
+        .unwrap();
+        assert_eq!(applied, vec![sp_target(1).scan_pubkey()]);
+
+        // A new target with the bucket empty is refused; the re-assert in the
+        // same message still applies, and only the new target is named.
+        let mut applied = Vec::new();
+        let rejected = ws
+            .add_silent_payments(Some(&p), vec![sp_target(1), sp_target(2)], |ts| {
+                applied = ts.iter().map(|t| t.scan_pubkey()).collect();
+            })
+            .unwrap_err();
+        assert!(matches!(rejected.reason, AddRejectReason::RateLimited { .. }), "{rejected:?}");
+        assert_eq!(rejected.items, RejectedItems::SilentPayments(vec![sp_target(2).scan_pubkey()]));
+        assert_eq!(applied, vec![sp_target(1).scan_pubkey()], "the re-assert's labels still apply");
         assert_eq!(ws.len(), 1);
     }
 
@@ -2291,7 +2642,7 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {});
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap();
         assert_eq!(ws.len(), 1);
         assert_eq!(q.current("tenant"), 1);
 
@@ -2299,7 +2650,7 @@ mod tests {
         let mut forwarded: Vec<[u8; 33]> = Vec::new();
         ws.add_silent_payments(Some(&p), vec![sp_target(1)], |ts| {
             forwarded = ts.iter().map(|t| t.scan_pubkey()).collect();
-        });
+        }).unwrap();
         assert_eq!(
             forwarded,
             vec![id1],
@@ -2314,13 +2665,24 @@ mod tests {
         // No quota bound (loopback): only the SP cap gates the add.
         let mut ws = WatchSet::default();
         let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(sp_target).collect();
-        ws.add_silent_payments(None, full, |_| {});
+        ws.add_silent_payments(None, full, |_| {}).unwrap();
         assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION);
-        // One more target over the cap is shed whole; the set is unchanged.
-        let mut registered = true;
-        ws.add_silent_payments(None, vec![sp_target(200)], |_| registered = true);
-        // (register is a no-op closure marker; assert by size instead.)
-        let _ = registered;
+        // One more target over the cap is refused whole; the set is unchanged.
+        let mut registered = false;
+        let rejected =
+            ws.add_silent_payments(None, vec![sp_target(200)], |_| registered = true).unwrap_err();
+        assert!(!registered, "an over-cap target reaches no matcher");
+        assert_eq!(
+            rejected,
+            AddRejected {
+                reason: AddRejectReason::CapExceeded {
+                    requested: MAX_SP_TARGETS_PER_CONNECTION as u64 + 1,
+                    limit: MAX_SP_TARGETS_PER_CONNECTION as u64,
+                },
+                items: RejectedItems::SilentPayments(vec![sp_target(200).scan_pubkey()]),
+            },
+            "an SP refusal names the target by identity",
+        );
         assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION, "over-cap add is shed");
     }
 

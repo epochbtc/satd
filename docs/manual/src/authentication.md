@@ -198,8 +198,9 @@ never authenticate.
 - **Watch quota.** The streaming watch-set is metered in units. One
   scripthash costs one unit, and prefix watches are priced by coarseness. A
   token holds units through an RAII lease, so a disconnect releases its
-  quota automatically. A watch add over quota is rejected without tearing
-  down the subscription.
+  quota automatically. A watch add over quota is refused with an in-band
+  `WatchAddRejected` event naming the refused items, without tearing down the
+  subscription.
 
 Operator and loopback principals are unlimited.
 

@@ -64,8 +64,11 @@ scripts, outpoints, transactions, script prefixes, and descriptors, and
 `SetWatchSet`. `SetWatchSet` is an atomic whole-set replace: the client sends
 the complete desired watch-set in one message, and the server reconciles it
 under its lock by effective coverage, replying with a deterministic
-`WatchSetResult`. New subscription kinds can be added without protocol
-breakage.
+`WatchSetResult`. An incremental `Add*` the server does not register (over the
+quota or the rate limit, over a per-connection cap, without `stream:watch`, or
+malformed) is answered with one `WatchAddRejected` event that names the refused
+items; an add that registers gets no event. New subscription kinds can be added
+without protocol breakage.
 
 Match events delivered on the per-subscriber `Watch` channel include:
 
@@ -216,9 +219,12 @@ requires a token store (`-streamwsauth` / `-eventsgrpcauth`, backed by
 
 The quota unit is one watched item; N items cost N units. Each item holds an
 RAII `WatchLease`, so `Remove*` returns its unit immediately, and a long-lived
-client can rotate a sliding watch-set without exhausting quota. Over-quota adds
-are rejected (`RESOURCE_EXHAUSTED` on gRPC, `429` on WebSocket) without tearing
-down the subscription.
+client can rotate a sliding watch-set without exhausting quota. An over-quota
+add is refused with a `WatchAddRejected` event (`QUOTA_EXCEEDED`, with the units
+required, held and allowed) without tearing down the subscription, and so is an
+add the per-add rate limit throttles (`RATE_LIMITED`, with a retry-after hint).
+`RESOURCE_EXHAUSTED` (gRPC) and `429` (WebSocket) are returned only when a stream
+is opened.
 
 ## Transport encryption (events gRPC TLS / mTLS)
 
@@ -277,7 +283,7 @@ restart-classified; `0` means unlimited.
 |---|---|---|
 | `streamwsmaxconns` | 256 | concurrent `/ws` + `/sse` connections |
 | `streamwsmaxsockets` | 1024 | open sockets on the listener, counted at accept and held for the socket's life, an open WebSocket included (`0` disables) |
-| `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection |
+| `streamwsmaxsubscriptions` | 256 | watch-set size per WS connection; an add past it is refused with `watch_add_rejected` |
 | `streamwsmaxmessagebytes` | 262144 | a single inbound WS control frame |
 | `eventsgrpcmaxconns` | 64 | concurrent gRPC connections |
 | `eventsgrpcmaxsubscriptions` | 256 | concurrent `Subscribe` + `Watch` streams, across all gRPC connections |

@@ -352,3 +352,23 @@ func generatorPubkey() [33]byte {
 	copy(out[:], raw)
 	return out
 }
+
+// TestRefusedDescriptorSlidesFallBackPastEveryRefusal: with two slides in
+// flight and both refused, the window to replay is the one held before either,
+// not the first refused one.
+func TestRefusedDescriptorSlidesFallBackPastEveryRefusal(t *testing.T) {
+	m := NewWatchSet().AddDescriptor("wpkh(c)", 20, 0).AddDescriptor("wpkh(c)", 20, 20).AddDescriptor("wpkh(c)", 20, 40)
+	for _, start := range []uint32{20, 40} {
+		m.forgetRejected(&WatchAddRejected{
+			Kind:       WatchAddKindDescriptor,
+			Reason:     WatchAddRejectQuotaExceeded,
+			Descriptor: &RejectedDescriptor{Descriptor: "wpkh(c)", GapLimit: 20, Start: start, Kept: true},
+		})
+	}
+	if got := m.descriptors["wpkh(c)"]; got != (descriptorWindow{gapLimit: 20, start: 0}) {
+		t.Fatalf("window = %+v, want the one held before both refused slides (start 0)", got)
+	}
+	if len(m.descriptorHistory) != 0 {
+		t.Errorf("history not cleared: %v", m.descriptorHistory)
+	}
+}
