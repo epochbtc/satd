@@ -61,6 +61,11 @@ def main(paths):
                     print(f"::error file={path}::job {job_id}, {name}: "
                           f"{r.stderr.strip()}")
     print(f"{checked} run blocks parsed, {failed} failed")
+    if checked == 0:
+        # A wrong working directory or a moved workflows directory would
+        # otherwise pass having checked nothing.
+        print("::error::no run blocks found to check")
+        return 1
     return 1 if failed else 0
 
 
