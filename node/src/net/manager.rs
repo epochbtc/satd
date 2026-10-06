@@ -317,7 +317,12 @@ const BG_CATCHUP_FLUSH_EVERY: u64 = 2000;
 /// for a second or two all through a healthy sync. In the run that set this,
 /// those waits were all under 5 s; the ones worth a warning had the block in
 /// flight on a single peer for 23–60 s.
-const STUCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(10);
+///
+/// Above the 15 s after which the scheduler takes a block at the connect
+/// cursor back from a peer and asks another (`release_stale_inflight`), with
+/// room for the maintenance pass that does it: a wait that release ends is
+/// the sync handling a slow peer, not a stuck connector.
+const STUCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(20);
 
 /// How often the stuck-wait warning repeats while the wait goes on.
 const STUCK_WAIT_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -10704,12 +10709,14 @@ mod tests {
         let mut wait = None;
         assert!(!StuckWait::should_warn(&mut wait, 100, t0));
         assert!(!StuckWait::should_warn(&mut wait, 100, t0 + Duration::from_secs(1)));
-        // The next height starts its own wait, so short waits never add up.
+        // The next height starts its own wait, so waits just under the
+        // threshold, such as one a stale-block release ends at 15 s, never
+        // add up.
+        let under = STUCK_WAIT_WARN_AFTER - Duration::from_secs(1);
         for (i, height) in (101..120).enumerate() {
-            let at = t0 + Duration::from_secs(2 + 9 * i as u64);
+            let at = t0 + Duration::from_secs(2) + STUCK_WAIT_WARN_AFTER * i as u32;
             assert!(!StuckWait::should_warn(&mut wait, height, at));
-            let later = at + Duration::from_secs(8);
-            assert!(!StuckWait::should_warn(&mut wait, height, later));
+            assert!(!StuckWait::should_warn(&mut wait, height, at + under));
         }
     }
 
