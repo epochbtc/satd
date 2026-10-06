@@ -6389,40 +6389,36 @@ fn upgradechainstate_never_downgrades() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
-/// A full `-reindex` that did not finish rebuilt the block index only
-/// partway, so only another `-reindex` can finish it; a chainstate rebuild
-/// trusts the block index. (`-reindex -stopatheight` is a finished reindex,
-/// so the marker is written by hand, as an interruption leaves it.)
+/// #906: a full `-reindex` that satd 0.6.0 left unfinished runs again from
+/// genesis on any start, plain included. 0.6.0 refused every start but
+/// `--reindex`, and its marker does not record whether its wipe had
+/// finished, so it cannot be continued. (The marker is written by hand, as
+/// 0.6.0 left it: no `resumable` field.)
+///
+/// Perturbation: default `resumable` to true and the start tries to
+/// continue over a complete chain the marker does not describe.
 #[test]
-fn an_interrupted_full_reindex_is_refused_until_reindex_is_given() {
+fn a_full_reindex_left_by_0_6_0_runs_again_on_any_start() {
     let (datadir, rpcport, before) = stopped_indexed_datadir("satd-reindex-interrupted");
     let net = datadir.join("regtest");
-    node::rebuild_marker::write(
-        &net,
-        &node::rebuild_marker::RebuildMarker::now(
-            node::rebuild_marker::RebuildKind::Full,
-            "0.6.0",
-            node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION,
-            Some(10),
+    std::fs::write(
+        net.join(node::rebuild_marker::MARKER_FILENAME),
+        format!(
+            "{{\"kind\":\"full\",\"started_unix\":1790000000,\"satd_version\":\"0.6.0\",\
+             \"schema\":{},\"prev_tip_height\":10}}\n",
+            node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION
         ),
     )
     .unwrap();
 
-    for flags in [
-        &["--txindex=1"][..],
-        &["--txindex=1", "--reindex-chainstate"],
-        &["--txindex=1", "--upgradechainstate=1"],
-    ] {
-        let (status, stderr) = run_satd_until_exit(&datadir, flags, test_timeout(60));
-        assert!(!status.success(), "{flags:?}: {stderr}");
-        assert!(stderr.contains("Restart with --reindex to"), "{flags:?}: {stderr}");
-    }
-
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
-        &["--txindex=1", "--addressindex=1", "--reindex"],
+        &["--txindex=1", "--addressindex=1", "--loglevel=info"],
     );
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    assert!(log.contains("running it again from genesis"), "{log}");
+    assert!(log.contains("Reindexing: clearing database"), "{log}");
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
     let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&after), utxo_summary(&before));
@@ -6639,7 +6635,8 @@ fn sigterm_a_replay(run: &mut StartupRun, starts: &str, stopped: &str, datadir: 
 
 /// #907: SIGTERM partway through the connect phase of a full `-reindex`
 /// stops it at the last block it connected. There was no handler until startup
-/// finished, so the signal killed the replay mid-batch.
+/// finished, so the signal killed the replay mid-batch. With #906 a plain
+/// start then continues it.
 ///
 /// Perturbation: drop the flat-file connect loop's poll and the replay runs
 /// to the end, then exits by the signal later in startup.
@@ -6654,10 +6651,7 @@ fn sigterm_stops_a_full_reindex_between_blocks() {
         &datadir,
     );
 
-    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--reindex"]);
-    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
-    assert_eq!(utxo_summary(&after), utxo_summary(&before));
-    node.stop();
+    plain_start_continues_the_reindex(&datadir, &before);
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
@@ -6770,11 +6764,134 @@ fn sigterm_stops_a_full_reindex_with_satd_as_pid_1() {
         &datadir,
     );
 
-    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--reindex"]);
-    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
-    assert_eq!(utxo_summary(&after), utxo_summary(&before));
-    node.stop();
+    plain_start_continues_the_reindex(&datadir, &before);
     let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// The block files under `datadir`, with their sizes.
+fn blk_files(datadir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut files: Vec<_> = std::fs::read_dir(datadir.join("regtest").join("blocks"))
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            (name.starts_with("blk") && name.ends_with(".dat"))
+                .then(|| (name, e.metadata().unwrap().len()))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Start satd with no rebuild flag on a datadir an interrupted full
+/// `-reindex` left, and check that it continued that reindex (#906): it says
+/// so, wipes nothing, writes no block file, finishes the rebuild, and ends
+/// on the UTXO set `before` describes. Returns the height it continued from.
+fn plain_start_continues_the_reindex(
+    datadir: &std::path::Path,
+    before: &serde_json::Value,
+) -> u64 {
+    let files = blk_files(datadir);
+    let mut node =
+        TestNode::start_with_datadir(datadir, find_available_port(), &["--loglevel=info"]);
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    let line = log
+        .lines()
+        .find(|l| l.contains("Continuing the interrupted reindex"))
+        .unwrap_or_else(|| panic!("a plain start must continue the reindex:\n{log}"));
+    assert!(
+        !log.contains("Reindexing: clearing database"),
+        "a continued reindex keeps what it flushed:\n{log}"
+    );
+    let height: u64 = line
+        .split(" height=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|h| h.parse().ok())
+        .unwrap_or_else(|| panic!("no height on {line:?}"));
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(before));
+    node.stop();
+    assert_eq!(blk_files(datadir), files, "a continued reindex writes no block file");
+    assert!(
+        !datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        "the continued reindex finished, so its marker is gone"
+    );
+    height
+}
+
+/// #906: a full `-reindex` killed partway through its connect phase
+/// continues on the next plain start from the height it had flushed, from
+/// the block files: nothing is downloaded, no block file is written, and the
+/// UTXO set matches an uninterrupted run's. It used to need `--reindex`
+/// again, and then started over from genesis.
+///
+/// The kill waits for the second flush of the connect phase, so the first,
+/// at height 1000, is durable.
+///
+/// Perturbation: route `ContinueFullReindex` to `RestartFullReindex` and the
+/// start clears the database.
+#[test]
+fn a_killed_full_reindex_continues_from_the_block_files() {
+    let (datadir, before) = replay_fixture("satd-reindex-kill");
+    let mut run = StartupRun::spawn(&datadir, &["--reindex"]);
+    run.wait_for_log(REINDEX_CONNECT_STARTS, test_timeout(120));
+    let deadline = Instant::now() + test_timeout(60);
+    loop {
+        let log = run.log();
+        let connect = log.find(REINDEX_CONNECT_STARTS).unwrap();
+        if log[connect..].matches("Flushing write cache to disk").count() >= 2 {
+            break;
+        }
+        assert!(!log.contains("Reindex from flat files complete"), "lengthen the fixture:\n{log}");
+        assert!(Instant::now() < deadline, "no second flush:\n{log}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    run.signal("-KILL");
+    run.wait_exit(test_timeout(30));
+    let log = run.log();
+    assert!(!log.contains("Reindex from flat files complete"), "lengthen the fixture:\n{log}");
+
+    let height = plain_start_continues_the_reindex(&datadir, &before);
+    assert!(height >= 1000, "it continued from height {height}, below the durable flush at 1000");
+    assert!(height < REPLAY_FIXTURE_BLOCKS, "it continued from height {height}");
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #906: killed before it has connected or flushed anything, during the
+/// block-file scan, a full `-reindex` still continues on the next plain
+/// start rather than starting over: the wipe had finished and genesis was
+/// stored before the scan began, so the start finds genesis indexed and
+/// writes it to the block files no second time.
+///
+/// Perturbation: route `ContinueFullReindex` to `RestartFullReindex` and the
+/// start clears the database.
+#[test]
+fn a_full_reindex_killed_before_it_connects_anything_continues() {
+    // The kill has to land before the replay's first flush, a few hundred
+    // milliseconds after the scan starts. A test thread held off the CPU
+    // longer than that misses it; the killed run's log shows when, and the
+    // attempt is made again on a fresh copy.
+    for attempt in 1..=3 {
+        let (datadir, before) = replay_fixture("satd-reindex-kill-scan");
+        let mut run = StartupRun::spawn(&datadir, &["--reindex"]);
+        run.wait_for_log("Phase 1: scanning the block files", test_timeout(120));
+        run.signal("-KILL");
+        run.wait_exit(test_timeout(30));
+        let log = run.log();
+        let scan = log.find("Phase 1: scanning the block files").unwrap();
+        if log[scan..].contains("Flushing write cache to disk") {
+            eprintln!("attempt {attempt}: the kill landed after the first flush; again");
+            let _ = std::fs::remove_dir_all(&datadir);
+            continue;
+        }
+
+        let height = plain_start_continues_the_reindex(&datadir, &before);
+        assert_eq!(height, 0, "nothing had been flushed");
+        let _ = std::fs::remove_dir_all(&datadir);
+        return;
+    }
+    panic!("three kills in a row landed after the replay's first flush");
 }
 
 /// #907, during IBD: SIGTERM while a node syncs a chain of large blocks from
