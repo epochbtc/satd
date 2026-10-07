@@ -154,6 +154,11 @@ export const main = sdk.setupMain(async ({ effects }) => {
         // `--chain=` because there are bare flags for the test networks but
         // none for mainnet.
         command: ['satd', `--datadir=${rootDir}`, `--chain=${network}`],
+        // StartOS runs every daemon with its own RUST_LOG
+        // (`warn,start_core=debug`), and satd honors RUST_LOG over its
+        // default of `info`. Without this the service log shows warnings
+        // only: no sync progress, no reindex phases, no shutdown steps.
+        env: { RUST_LOG: 'info' },
         user: 'satd',
         // A node writing out its chainstate should not be killed mid-flush.
         sigtermTimeout: 600_000,
