@@ -349,8 +349,7 @@ behaviour.
 - **Mempool-derived messages** (mempool transactions on hashtx/rawtx,
   sequence A/R) are published in the order satd's mempool emitted them. That
   is the mempool-sequence order except under concurrent mutation, where
-  adjacent events may swap, and for a package's ephemeral-dust parent, which
-  is announced after the child it was admitted with.
+  adjacent events may swap.
 - **No ordering is promised *between* the two groups**, on a shared socket or
   within `hashtx`/`rawtx`/`sequence`.
 - **`A`/`R` sequence values are exact**, so a consumer can reconcile against

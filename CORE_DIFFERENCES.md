@@ -368,9 +368,10 @@ New integrations should use the streaming API. Where satd differs:
    the streaming API. Core's `interface_zmq.py` asserts the interleaving and
    is skipped in the functional-test harness for that reason.
 2. **Within the mempool group,** adjacent events may swap under concurrent
-   mutation, and an ephemeral-dust package parent is announced after the
-   child it was admitted with. Every `A`/`R` still carries the exact
-   sequence number its change took.
+   mutation. When a package's child replaces mempool transactions, satd
+   admits an ephemeral-dust parent before removing them, so the parent's `A`
+   precedes their `R`; Core removes them first. Every `A`/`R` still carries
+   the exact sequence number its change took.
 3. **Loss before the publisher.** The event bus drops events under an
    extreme burst rather than slow the node; those leave no sequence gap. A
    lag at the publisher's own receiver does: every notifier skips a sequence
