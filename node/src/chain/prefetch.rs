@@ -113,13 +113,14 @@ pub fn prefetch_block(
     // 4. Context-free block validation, off the connect thread.
     //
     // Nothing else re-derives the block from its own bytes: the record framing
-    // in the flat files carries no checksum (`scan_one_file` checks magic and
-    // length only), and a bit flipped inside a transaction payload leaves the
-    // 80-byte header hashing correctly. Without this the corrupted block
-    // connects, its UTXO delta lands, and the reindex reports success —
-    // Bitcoin Core runs `CheckBlock` on every block during reindex for this
-    // reason. Returning `None` hands the block to the direct-read path, which
-    // repeats the check and fails the replay with the specific error.
+    // in the flat files carries no checksum (the `-reindex` scan reads the
+    // header and checks the length only), and a bit flipped inside a
+    // transaction payload leaves the 80-byte header hashing correctly.
+    // Without this the corrupted block connects, its UTXO delta lands, and the
+    // reindex reports success — Bitcoin Core runs `CheckBlock` on every block
+    // during reindex for this reason. Returning `None` hands the block to the
+    // direct-read path, which repeats the check and fails the replay with the
+    // specific error.
     if let Err(e) = crate::validation::block::check_block(&block, network, height) {
         tracing::warn!(
             height,
