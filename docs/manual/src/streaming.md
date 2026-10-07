@@ -325,23 +325,27 @@ starting at 0. Each event produces Core's messages in Core's order:
 
 | Event | Messages |
 |---|---|
-| block connected | `hashtx` and `rawtx` per transaction, coinbase first; `sequence C`; then `hashblock` and `rawblock` if the block is the new tip and the node is not in initial block download |
+| block connected | `hashtx` and `rawtx` per transaction, coinbase first; `sequence C`; then `hashblock` and `rawblock` if the block is a new tip (see below) and the node is not in initial block download |
 | block disconnected | `hashtx` and `rawtx` per transaction; `sequence D` |
 | mempool accept | `hashtx`, `rawtx`, `sequence A` |
 | mempool removal, except by a block | `sequence R` |
 
 `sequence A` and `R` carry the mempool sequence number the change took, the
 counter `getrawmempool(false, true)` reports as `mempool_sequence`, so a
-consumer can line a snapshot up with the stream. A reorg announces only its
-new tip on `hashblock` and `rawblock`, and `invalidateblock` announces nothing
-there, as in Core.
+consumer can line a snapshot up with the stream. A reorg announces on
+`hashblock` and `rawblock` none of the blocks it connects until its chain has
+more work than the old tip, then each block from there to its new tip. A
+reorg to a chain one block longer than the old one therefore announces only
+its new tip. `invalidateblock` announces nothing there. Both are Core's
+behaviour.
 
 **Ordering.** satd guarantees:
 
 - **Block-derived messages** (hashblock, rawblock, block transactions on
   hashtx/rawtx, sequence C/D) are published in chain order. A reorg publishes
   D for each disconnected block newest first, then C for each connected block
-  oldest first, then one hashblock/rawblock for the new tip.
+  oldest first, each block with more work than the old tip followed by its
+  hashblock/rawblock.
 - **Mempool-derived messages** (mempool transactions on hashtx/rawtx,
   sequence A/R) are published in the order satd's mempool emitted them. That
   is the mempool-sequence order except under concurrent mutation, where

@@ -374,7 +374,10 @@ New integrations should use the streaming API. Where satd differs:
 3. **Loss before the publisher.** The event bus drops events under an
    extreme burst rather than slow the node; those leave no sequence gap. A
    lag at the publisher's own receiver does: every notifier skips a sequence
-   number. Core never drops before publishing.
+   number. Core never drops before publishing. If the lost events include
+   the marker that opens a reorg, the publisher cannot tell the reorg's
+   blocks from new ones and announces each of them on `hashblock` and
+   `rawblock`.
 4. **Mempool sequence gaps.** The mempool sequence number counts every
    change, including those to quarantined transactions (with a `policyfile`
    loaded) and to an ephemeral-dust parent unwound from a failed package,

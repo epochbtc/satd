@@ -370,8 +370,9 @@ fn template_time(node: &TestNode) -> u32 {
 }
 
 /// A reorg publishes `D` for each disconnected block newest first, `C` for
-/// each connected block oldest first, and one `hashblock` / `rawblock`: for
-/// the new tip only, as Core announces a tip change once.
+/// each connected block oldest first, and here one `hashblock` / `rawblock`,
+/// for the new tip: the old chain was two blocks past the fork, so the new
+/// chain's third block is the first with more work, and the last.
 #[test]
 fn zmq_reorg_single_tip_update() {
     let port = find_available_port();
@@ -426,6 +427,59 @@ fn zmq_reorg_single_tip_update() {
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0].body, serialize(&b3));
     assert_eq!(m.last().unwrap().topic, "rawblock");
+    assert!(sub.drain(Duration::from_millis(500)).is_empty());
+    node.stop();
+}
+
+/// A reorg to a chain several blocks longer, in one step, announces each
+/// block from the first one with more work than the old tip, as Core does:
+/// Core announces after each step of `ActivateBestChain`, and a reorg's first
+/// step ends at that block. Branch A is one block past the fork and branch B
+/// five; `reconsiderblock` moves the tip from A's to B's in one reorg. On the
+/// same steps Core v31.1 publishes this sequence and announces B2 to B5.
+#[test]
+fn zmq_reorg_announces_each_block_past_the_old_tip() {
+    let port = find_available_port();
+    let mut node = TestNode::start(&[
+        &format!("--zmqpubhashblock={}", tcp(port)),
+        &format!("--zmqpubsequence={}", tcp(port)),
+    ]);
+    let addr = wallet().address.to_string();
+    let other = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let mut sub = Sub::connect(&tcp(port), &[""]);
+    sync_up(&node, &mut [&mut sub], &addr);
+
+    let a1 = mine(&node, 1, &addr).remove(0);
+    node.rpc_ok("invalidateblock", vec![json!(a1)]);
+    let b = mine(&node, 5, &other);
+    node.rpc_ok("reconsiderblock", vec![json!(a1)]);
+    node.rpc_ok("invalidateblock", vec![json!(b[0])]);
+    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), a1, "fixture: A active, B stored");
+    sub.drain(Duration::from_millis(500));
+
+    node.rpc_ok("reconsiderblock", vec![json!(b[0])]);
+    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), b[4]);
+    let got: Vec<String> = sub
+        .take(10)
+        .iter()
+        .map(|m| {
+            let (hash, label) = if m.topic == "sequence" {
+                let (h, l, _) = m.sequence();
+                (h, l.to_string())
+            } else {
+                (m.hash_hex(), m.topic.clone())
+            };
+            let name = if hash == a1 { "A1".to_string() } else { format!("B{}", b.iter().position(|h| *h == hash).unwrap() + 1) };
+            format!("{label} {name}")
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "D A1", "C B1", "C B2", "hashblock B2", "C B3", "hashblock B3", "C B4", "hashblock B4", "C B5",
+            "hashblock B5",
+        ],
+    );
     assert!(sub.drain(Duration::from_millis(500)).is_empty());
     node.stop();
 }

@@ -17,7 +17,7 @@
 //!
 //! | Event | Messages |
 //! |---|---|
-//! | block connected | per transaction `hashtx`, `rawtx`; then `sequence C`; then, if the block is the new tip and the node is not in initial block download, `hashblock`, `rawblock` |
+//! | block connected | per transaction `hashtx`, `rawtx`; then `sequence C`; then, if Core would announce the block as a new tip and the node is not in initial block download, `hashblock`, `rawblock` |
 //! | block disconnected | per transaction `hashtx`, `rawtx`; then `sequence D` |
 //! | mempool accept | `hashtx`, `rawtx`, `sequence A` |
 //! | mempool removal other than by a block | `sequence R` |
@@ -58,6 +58,9 @@ pub trait CoreZmqChain: Send + Sync + 'static {
     /// Whether the node is in initial block download, when Core publishes no
     /// `hashblock` / `rawblock`.
     fn in_initial_block_download(&self) -> bool;
+    /// A block's cumulative chain work from its index entry, big-endian, so
+    /// two values compare as numbers.
+    fn chain_work(&self, hash: &BlockHash) -> Option<[u8; 32]>;
 }
 
 impl CoreZmqChain for ChainState {
@@ -67,6 +70,10 @@ impl CoreZmqChain for ChainState {
 
     fn tx_count(&self, hash: &BlockHash) -> Option<usize> {
         self.get_block_index(hash).map(|e| e.num_tx as usize).filter(|n| *n > 0)
+    }
+
+    fn chain_work(&self, hash: &BlockHash) -> Option<[u8; 32]> {
+        self.get_block_index(hash).map(|e| e.chainwork)
     }
 
     fn in_initial_block_download(&self) -> bool {
@@ -122,11 +129,20 @@ pub struct CoreZmqSink {
     status: Arc<CoreZmqStatus>,
     chain: Arc<dyn CoreZmqChain>,
     mempool: Arc<dyn CoreZmqMempool>,
-    /// The tip a reorg is heading for, and its height, from the `Reorg`
-    /// marker that opens the reorg's events. The side blocks it connects on
-    /// the way publish no `hashblock`: Core announces only the reorg's final
-    /// tip.
-    pending_reorg: Option<(BlockHash, u32)>,
+    /// The reorg in progress, from the `Reorg` marker that opens its events.
+    pending_reorg: Option<PendingReorg>,
+}
+
+/// A reorg in progress. The blocks it connects before its chain has more
+/// work than the old tip publish no `hashblock` / `rawblock`; see
+/// [`CoreZmqSink::is_tip_update`].
+#[derive(Clone, Copy)]
+struct PendingReorg {
+    /// The tip the reorg is heading for, and its height.
+    tip: BlockHash,
+    to_height: u32,
+    /// The old tip's chain work, `None` if it could not be read.
+    old_work: Option<[u8; 32]>,
 }
 
 impl CoreZmqSink {
@@ -243,8 +259,12 @@ impl CoreZmqSink {
             // Core is silent on a removal by block inclusion: the block's own
             // messages carry the transaction.
             NodeEventBody::Mempool(MempoolEvent::LeaveConfirmed { .. }) => {}
-            NodeEventBody::Chain(ChainEvent::Reorg { new_tip, to_height, .. }) => {
-                self.pending_reorg = Some((*new_tip, *to_height));
+            NodeEventBody::Chain(ChainEvent::Reorg { old_tip, new_tip, to_height, .. }) => {
+                self.pending_reorg = Some(PendingReorg {
+                    tip: *new_tip,
+                    to_height: *to_height,
+                    old_work: self.chain.chain_work(old_tip),
+                });
             }
             NodeEventBody::Chain(ChainEvent::BlockDisconnected { hash, .. }) => {
                 self.block_disconnected(*hash).await;
@@ -360,21 +380,34 @@ impl CoreZmqSink {
 
     /// Whether a connected block is a tip update Core would announce on
     /// `hashblock` / `rawblock`.
+    ///
+    /// Core announces the tip after each step of `ActivateBestChain`, and a
+    /// step ends at the first block with more work than the tip it started
+    /// from (`validation.cpp`, "We're in a better position than we were").
+    /// So a reorg announces nothing until its chain has more work than the
+    /// old tip, then every block from there to its new tip.
     fn is_tip_update(&mut self, hash: BlockHash, height: u32) -> bool {
-        if let Some((tip, tip_height)) = self.pending_reorg {
-            if hash == tip {
+        if let Some(reorg) = self.pending_reorg {
+            if hash == reorg.tip || height > reorg.to_height {
+                // At the reorg's target, or above it: the reorg is over.
+                // `invalidateblock` disconnects back to the fork point and
+                // connects nothing, so the next block is a new one even if it
+                // has no more work than the invalidated tip.
                 self.pending_reorg = None;
-            } else if height <= tip_height {
-                // A side block the reorg connects on its way to `tip`.
+            } else if !self.past_old_tip(&reorg, &hash) {
                 return false;
-            } else {
-                // Above the reorg's target, so the reorg is over without a
-                // block connected at it: `invalidateblock` disconnects back to
-                // the fork point and stops there. This is a new block.
-                self.pending_reorg = None;
             }
         }
         !self.chain.in_initial_block_download()
+    }
+
+    /// Whether a block a reorg connects has more work than the reorg's old
+    /// tip. Without both values, only the reorg's target is announced.
+    fn past_old_tip(&self, reorg: &PendingReorg, hash: &BlockHash) -> bool {
+        match (reorg.old_work, self.chain.chain_work(hash)) {
+            (Some(old), Some(work)) => work > old,
+            _ => false,
+        }
     }
 
     async fn block_connected(&mut self, hash: BlockHash, height: u32) {
@@ -484,6 +517,7 @@ mod tests {
     #[derive(Default)]
     struct FakeChain {
         blocks: Mutex<HashMap<BlockHash, Block>>,
+        work: Mutex<HashMap<BlockHash, u64>>,
         ibd: AtomicBool,
         reads: std::sync::atomic::AtomicUsize,
     }
@@ -498,6 +532,12 @@ mod tests {
         }
         fn in_initial_block_download(&self) -> bool {
             self.ibd.load(Ordering::Relaxed)
+        }
+        fn chain_work(&self, hash: &BlockHash) -> Option<[u8; 32]> {
+            let work = *self.work.lock().unwrap().get(hash)?;
+            let mut be = [0u8; 32];
+            be[24..].copy_from_slice(&work.to_be_bytes());
+            Some(be)
         }
     }
 
@@ -550,6 +590,14 @@ mod tests {
         fn add_block(&self, b: &Block) -> BlockHash {
             let hash = b.block_hash();
             self.chain.blocks.lock().unwrap().insert(hash, b.clone());
+            hash
+        }
+
+        /// A block at `height` on a chain where every block has the same
+        /// work, so its chain work is its height.
+        fn add_block_at(&self, b: &Block, height: u64) -> BlockHash {
+            let hash = self.add_block(b);
+            self.chain.work.lock().unwrap().insert(hash, height);
             hash
         }
 
@@ -718,18 +766,23 @@ mod tests {
         m.iter().filter(|(t, _, _)| t == "hashblock").map(|(_, b, _)| b.clone()).collect()
     }
 
-    /// A reorg's side blocks connect without a tip update; only the block
-    /// the `Reorg` marker names is announced.
-    #[tokio::test]
-    async fn reorg_announces_only_the_new_tip() {
-        let notifiers = vec![
+    fn hashblock_and_sequence() -> Vec<CoreZmqNotifier> {
+        vec![
             CoreZmqNotifier { topic: CoreZmqTopic::HashBlock, address: "tcp://127.0.0.1:0".into(), hwm: 0 },
             CoreZmqNotifier { topic: CoreZmqTopic::Sequence, address: "tcp://127.0.0.1:0".into(), hwm: 0 },
-        ];
-        let mut rig = Rig::new(notifiers).await;
+        ]
+    }
+
+    /// A reorg one block longer than the old chain: `b2` only matches the
+    /// old tip's work, so the new tip `b3` is the one block announced.
+    #[tokio::test]
+    async fn a_one_block_longer_reorg_announces_only_its_new_tip() {
+        let mut rig = Rig::new(hashblock_and_sequence()).await;
         let mut sub = rig.sub(0, &[""]).await;
-        let (a1, a2) = (rig.add_block(&block(1, 1)), rig.add_block(&block(2, 1)));
-        let (b1, b2, b3) = (rig.add_block(&block(3, 1)), rig.add_block(&block(4, 1)), rig.add_block(&block(5, 1)));
+        let (a1, a2) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
+        let b1 = rig.add_block_at(&block(3, 1), 1);
+        let b2 = rig.add_block_at(&block(4, 1), 2);
+        let b3 = rig.add_block_at(&block(5, 1), 3);
 
         rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: a2, to_height: 3, new_tip: b3 }).await;
         rig.chain(ChainEvent::BlockDisconnected { hash: a2, height: 2 }).await;
@@ -742,28 +795,80 @@ mod tests {
         assert_eq!(hashblocks(&m), [rev(b3.as_byte_array())]);
 
         // The reorg is over: the next block is an ordinary tip update.
-        let b4 = rig.add_block(&block(6, 1));
+        let b4 = rig.add_block_at(&block(6, 1), 4);
         rig.chain(ChainEvent::BlockConnected { hash: b4, height: 4 }).await;
         let m = recv_n(&mut sub, 2).await;
         assert_eq!(hashblocks(&m), [rev(b4.as_byte_array())]);
+    }
+
+    /// A reorg from a two-block branch to a five-block one: nothing is
+    /// announced until `b3` has more work than the old tip `a2`, then each
+    /// block is, right after its `C`, as Core announces after each step of
+    /// `ActivateBestChain`.
+    #[tokio::test]
+    async fn a_reorg_announces_each_block_past_the_old_tips_work() {
+        let mut rig = Rig::new(hashblock_and_sequence()).await;
+        let mut sub = rig.sub(0, &[""]).await;
+        let (a1, a2) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
+        let b: Vec<BlockHash> = (0..5u8).map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1)).collect();
+
+        rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: a2, to_height: 5, new_tip: b[4] }).await;
+        rig.chain(ChainEvent::BlockDisconnected { hash: a2, height: 2 }).await;
+        rig.chain(ChainEvent::BlockDisconnected { hash: a1, height: 1 }).await;
+        for (i, hash) in b.iter().enumerate() {
+            rig.chain(ChainEvent::BlockConnected { hash: *hash, height: i as u32 + 1 }).await;
+        }
+        let m = recv_n(&mut sub, 10).await;
+        let labels: Vec<String> = m
+            .iter()
+            .map(|(t, body, _)| match t.as_str() {
+                "sequence" => format!("{}", body[32] as char),
+                _ => format!("hashblock {}", b.iter().position(|h| rev(h.as_byte_array()) == *body).unwrap() + 1),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["D", "D", "C", "C", "C", "hashblock 3", "C", "hashblock 4", "C", "hashblock 5"],
+        );
+        assert_quiet(&mut sub).await;
+    }
+
+    /// If the old tip's work can't be read, a reorg announces only the tip
+    /// its marker names.
+    #[tokio::test]
+    async fn a_reorg_without_the_old_tips_work_announces_only_its_new_tip() {
+        let mut rig = Rig::new(hashblock_and_sequence()).await;
+        let mut sub = rig.sub(0, &["hashblock"]).await;
+        let a1 = rig.add_block(&block(1, 1));
+        let b: Vec<BlockHash> = (0..3u8).map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1)).collect();
+
+        rig.chain(ChainEvent::Reorg { from_height: 1, old_tip: a1, to_height: 3, new_tip: b[2] }).await;
+        rig.chain(ChainEvent::BlockDisconnected { hash: a1, height: 1 }).await;
+        for (i, hash) in b.iter().enumerate() {
+            rig.chain(ChainEvent::BlockConnected { hash: *hash, height: i as u32 + 1 }).await;
+        }
+        let m = recv_n(&mut sub, 1).await;
+        assert_eq!(hashblocks(&m), [rev(b[2].as_byte_array())]);
+        assert_quiet(&mut sub).await;
     }
 
     /// `invalidateblock` emits a `Reorg` marker naming the fork point as the
     /// new tip and connects nothing. No block ever matches that tip, so the
     /// pending reorg must end with the next block above it, which is an
     /// ordinary tip update. Holding out for a match would mute `hashblock`
-    /// from then on.
+    /// from then on. `next` has only the invalidated tip's work, so it is
+    /// the height that ends the reorg, not the work.
     #[tokio::test]
     async fn a_disconnect_only_reorg_does_not_mute_later_blocks() {
         let notifiers =
             vec![CoreZmqNotifier { topic: CoreZmqTopic::HashBlock, address: "tcp://127.0.0.1:0".into(), hwm: 0 }];
         let mut rig = Rig::new(notifiers).await;
         let mut sub = rig.sub(0, &["hashblock"]).await;
-        let (parent, invalid) = (rig.add_block(&block(1, 1)), rig.add_block(&block(2, 1)));
+        let (parent, invalid) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
 
         rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: invalid, to_height: 1, new_tip: parent }).await;
         rig.chain(ChainEvent::BlockDisconnected { hash: invalid, height: 2 }).await;
-        let next = rig.add_block(&block(3, 1));
+        let next = rig.add_block_at(&block(3, 1), 2);
         rig.chain(ChainEvent::BlockConnected { hash: next, height: 2 }).await;
         let m = recv_n(&mut sub, 1).await;
         assert_eq!(hashblocks(&m), [rev(next.as_byte_array())]);
