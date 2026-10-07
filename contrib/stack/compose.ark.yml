@@ -13,12 +13,10 @@
 #   satd  ->  NBXplorer  ->  arkd-wallet  ->  arkd
 #
 # arkd v0.9 splits the wallet into its own service, and that wallet's chain
-# backend is NBXplorer — not Esplora, and not Bitcoin Core's ZMQ. That
-# matters here for two reasons. satd implements no raw ZMQ topics, so a
-# backend that needed them would rule Ark out entirely; and NBXplorer
-# against satd is already a PR-gating canary in this repository, so the one
-# link in this chain that touches satd is the link that is continuously
-# tested.
+# backend is NBXplorer — not Esplora, and not Bitcoin Core's ZMQ — and
+# NBXplorer against satd is already a PR-gating canary in this repository,
+# so the one link in this chain that touches satd is the link that is
+# continuously tested.
 #
 # Postgres is NBXplorer's, not Ark's. If you are already running
 # compose.btcpay.yml you have NBXplorer and Postgres; run one or the other,

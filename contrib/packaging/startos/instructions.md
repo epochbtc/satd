@@ -90,8 +90,8 @@ other service.
 - **No wallet.** satd is a node. Use a wallet app such as Sparrow against the
   Electrum interface.
 - **Other services cannot use satd in place of Bitcoin Core.** satd speaks
-  Core's JSON-RPC, but it does not publish the `rawblock` and `rawtx` ZMQ
-  topics that Lightning implementations in bitcoind mode require.
+  Core's JSON-RPC and can publish Core's ZMQ topics, but this package does
+  not offer itself to other services as a Bitcoin Core substitute.
 - **English only.** There are no translations yet.
 
 ## Backups

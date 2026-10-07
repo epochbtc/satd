@@ -138,10 +138,10 @@ config whose password is the literal string `password`.
 ## Why LND runs in Neutrino mode
 
 LND's `bitcoind` backend needs Bitcoin Core's raw ZMQ topics
-(`zmqpubrawblock` / `zmqpubrawtx`). satd does not implement them — it
-rejects those settings outright, and `CORE_DIFFERENCES.md` records that as
-deliberate. Neutrino needs no ZMQ: it pulls BIP 157/158 filter headers and
-filters over P2P, which satd serves because the stack sets
+(`zmqpubrawblock` / `zmqpubrawtx`). satd publishes them as of 0.7.0, but this
+overlay predates that and stays on Neutrino, the configuration it was built
+and tested with. Neutrino needs no ZMQ: it pulls BIP 157/158 filter headers
+and filters over P2P, which satd serves because the stack sets
 `peerblockfilters=1`.
 
 Core Lightning is unaffected — its `bcli` plugin polls JSON-RPC — which is

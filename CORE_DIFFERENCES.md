@@ -339,10 +339,70 @@ gRPC server + ZMQ publisher sinks for chain + mempool envelopes. Edge
 identity (node ID + region) and heartbeat included in every envelope.
 
 Bitcoin Core ships `-zmqpub*` raw-topic publication (one ZMQ topic per
-event type, raw bytes). satd ships a structured event envelope instead,
-designed for operator pipelines that want to consume across many nodes
-with consistent shape and provenance. Core's per-topic ZMQ model is
-**intentionally not** implemented — see "Intentional exclusions" below.
+event type, raw bytes, no provenance or replay). satd's recommended
+integration surface is the structured event envelope, designed for
+consumers that need cursors, replay, explicit removal reasons and reorg
+markers. Core's `-zmqpub*` topics are provided as well, for compatibility
+with software written against Core; see the next section.
+
+### Bitcoin Core ZMQ (`-zmqpub*`)
+
+satd publishes Core's `hashblock`, `hashtx`, `rawblock`, `rawtx` and
+`sequence` topics, configured with Core's options, so LND's `bitcoind`
+backend, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. The
+messages are Core's byte for byte (topic, body, per-notifier sequence
+number), each event produces Core's messages in Core's order, the options
+and addresses behave as Core's (multi-valued, `unix:`, shared sockets, a
+non-fatal bind failure), and `getzmqnotifications` answers in Core's shape.
+New integrations should use the streaming API. Where satd differs:
+
+1. **Ordering between block and mempool messages.** Core puts every
+   notification in one total order. satd publishes block-derived messages
+   (hashblock, rawblock, a block's transactions on hashtx/rawtx, sequence
+   C/D) in chain order and mempool-derived ones (mempool transactions on
+   hashtx/rawtx, sequence A/R) in the mempool's order, but promises no order
+   between the two groups. Consumers that use one socket per topic, as
+   Umbrel's apps and LND do, cannot observe the difference: two sockets have
+   no mutual order on Core either. A consumer that rebuilds a mempool from
+   `sequence` alone, without checking a `getrawmempool` snapshot, should use
+   the streaming API. Core's `interface_zmq.py` asserts the interleaving and
+   is skipped in the functional-test harness for that reason.
+2. **Within the mempool group,** adjacent events may swap under concurrent
+   mutation, and an ephemeral-dust package parent is announced after the
+   child it was admitted with. Every `A`/`R` still carries the exact
+   sequence number its change took.
+3. **Loss before the publisher.** The event bus drops events under an
+   extreme burst rather than slow the node; those leave no sequence gap. A
+   lag at the publisher's own receiver does: every notifier skips a sequence
+   number. Core never drops before publishing.
+4. **Mempool sequence gaps.** The mempool sequence number counts every
+   change, including those to quarantined transactions (with a `policyfile`
+   loaded) and to an ephemeral-dust parent unwound from a failed package,
+   which publish nothing. `getrawmempool(false, true)` does not list those
+   transactions either, so a snapshot and the stream still agree.
+5. **No messages for blocks connected during initial block download or
+   `-reindex`.** Core publishes each such block's transactions and
+   `sequence C` (and, like satd, no `hashblock`/`rawblock`). satd publishes
+   from the moment blocks connect at the tip; a consumer that needs the
+   transactions of blocks from the initial sync reads them from the chain
+   (RPC, Esplora, or the streaming API's cursor replay).
+6. **A per-subscriber byte cap** of 256 MiB of unsent messages applies on
+   top of the high-water mark, since a thousand queued blocks would be
+   gigabytes.
+7. **A block that cannot be read** (pruned away, or unreadable) loses its
+   hashtx/rawtx/rawblock messages, which are counted; its `sequence` and
+   `hashblock` messages are still sent. Core instead stops that notifier for
+   good.
+8. **Addresses.** `ipc://<path>` is accepted as well as Core's `unix:<path>`.
+   An existing socket file at the path is replaced, but any other file there
+   fails the bind instead of being deleted, and satd removes its socket file
+   on shutdown (libzmq unlinks whatever is at the path at bind and leaves a
+   named socket file behind). `tcp://<interface name>:<port>`, `ipc://*` and
+   abstract-namespace addresses are not supported and fail the bind.
+9. **`-eventszmqbind` is unchanged and separate.** Its `hashtx` and
+   `hashblock` topics share Core's wire format but not Core's per-event
+   content; use `-zmqpub*` for Core semantics. A bind failure there is fatal,
+   where a `-zmqpub*` bind failure, as in Core, only turns ZMQ off.
 
 ### MCP server (`satd-mcp`)
 
@@ -614,13 +674,6 @@ These surfaces will not ship. Each is a deliberate scope decision.
 
 - **`MemPool` P2P message.** Rarely used; mostly by bloom filter
   clients.
-
-- **Bitcoin Core-style `-zmqpub*` raw topic publication.** Core's
-  per-topic ZMQ model (one topic per event type, raw bytes) is replaced
-  by the structured event envelope on `satd-events` (gRPC + ZMQ frames
-  with edge identity + heartbeat). Migration path for Core operators
-  consuming `-zmqpubrawblock` etc. is documented in the events crate
-  README.
 
 - **GPG release signing.** See `STABILITY_POLICY.md` — minisign +
   cosign keyless + SSH sigs, no GPG even as fallback.

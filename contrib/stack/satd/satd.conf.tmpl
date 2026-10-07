@@ -92,7 +92,8 @@ metricsbind=0.0.0.0
 metricsport=@METRICS_PORT@
 
 # --- events -----------------------------------------------------------------
-# Core-compatible hashblock/hashtx plus satd's own JSON topics. Raw block and
-# transaction topics do not exist here; that is why the Lightning overlay runs
-# LND in Neutrino mode rather than bitcoind mode.
+# satd's own ZMQ socket: the event envelope and satd's JSON topics, plus
+# hashblock/hashtx in Core's wire format. Bitcoin Core's topics, rawblock and
+# rawtx included, are the separate zmqpub* options, which this stack does not
+# set: the Lightning overlay runs LND in Neutrino mode.
 eventszmqbind=tcp://0.0.0.0:@ZMQ_PORT@
