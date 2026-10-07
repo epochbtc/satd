@@ -229,26 +229,40 @@ by itself, because the block index already records those blocks as connected.
 
 So satd writes a marker, `.chainstate_rebuild` in the network datadir, before
 the wipe, and removes it only once the rebuild has reached the chain's tip. A
-start that finds it refuses, naming the flag that finishes the job:
+start that finds it acts on it:
 
 | Unfinished rebuild | Plain start | `-upgradechainstate=1` | `-reindex-chainstate` | `-reindex` |
 |---|---|---|---|---|
 | `-reindex-chainstate` (or an upgrade) | refuses | restarts it from genesis | restarts it | runs |
-| `-reindex` | refuses | refuses | refuses | restarts it |
+| `-reindex` | continues it | continues it | continues it | continues it |
 
-A full `-reindex` that did not finish also left the block index partway, and a
-chainstate rebuild trusts the block index, so only `-reindex` finishes it.
-Nothing resumes where it stopped: each restart replays from genesis. If the
-chainstate directory itself is gone (removed to resync), the marker protects
-nothing and is removed at the next start.
+A full `-reindex` that did not finish is finished on any start, whatever the
+flags. It continues from the height it last flushed: satd scans the block
+files again, checks each block it had already replayed against them (the
+index entry's header, file position, height and chainwork), and connects the
+rest. Nothing is downloaded and no block file is written. The replay flushes
+at least every 1000 blocks, so a kill costs at most that much replay, plus the
+scan.
+
+It runs again from genesis instead when it cannot be continued: its wipe may
+not have finished, satd 0.6.0 started it (0.6.0 did not record whether the wipe
+had finished), the chainstate is from another schema, or the blocks it
+replayed no longer match the block files. In the last case satd says so and
+exits without changing anything, and the next start runs the reindex from
+genesis. A chainstate rebuild trusts the block index, so it cannot finish a
+full one.
+
+An unfinished chainstate rebuild is not continued: its flags restart it from
+genesis. If the chainstate directory itself is gone (removed to resync), the
+marker protects nothing and is removed at the next start.
 
 `-reindex-chainstate -stopatheight=H` stops short on purpose and is refused
 all the same on the next plain start: the node could never advance past H.
 
 A stop signal (SIGTERM or SIGINT) during a rebuild stops it at once: satd
 abandons the block it is connecting, flushes what it had connected, keeps the
-marker and exits 0. See
-"Signals" in [Packaging](packaging.md).
+marker and exits 0, and the next start continues a full `-reindex` from there.
+See "Signals" in [Packaging](packaging.md).
 
 ### Block files that end early
 

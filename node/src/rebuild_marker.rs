@@ -10,10 +10,10 @@
 //!
 //! This marker does. `satd` writes it before the wipe and removes it only
 //! once the rebuild has completed, and reads it before opening the chain
-//! database, so a start after an interrupted rebuild can refuse (or, with
-//! `-upgradechainstate`, restart the rebuild) instead of serving the
-//! truncated state. It sits in the network datadir beside the
-//! clean-shutdown marker.
+//! database, so a start after an interrupted rebuild can continue or restart
+//! a full `-reindex`, and refuse (or, with `-upgradechainstate`, restart) a
+//! chainstate rebuild, instead of serving the truncated state. It sits in
+//! the network datadir beside the clean-shutdown marker.
 
 use std::fs;
 use std::io::{self, Write};
@@ -49,6 +49,13 @@ pub struct RebuildMarker {
     pub schema: u32,
     /// The tip height before the wipe, when there was one.
     pub prev_tip_height: Option<u32>,
+    /// The wipe finished and the rebuilt database is durable from genesis,
+    /// so an interrupted full `-reindex` can be continued from what it
+    /// flushed (#906). Until then the database may be partly wiped, and only
+    /// a restart from genesis is safe. Absent in a marker satd 0.6.0 wrote,
+    /// which reads as `false`.
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 impl RebuildMarker {
@@ -68,6 +75,7 @@ impl RebuildMarker {
             satd_version: satd_version.to_string(),
             schema,
             prev_tip_height,
+            resumable: false,
         }
     }
 }
@@ -200,17 +208,40 @@ mod tests {
             &RebuildMarker {
                 kind: RebuildKind::Full,
                 started_unix: 1_790_000_000,
-                satd_version: "0.6.0".into(),
+                satd_version: "0.6.1".into(),
                 schema: 7,
                 prev_tip_height: None,
+                resumable: true,
             },
         )
         .unwrap();
         let text = fs::read_to_string(path(dir.path())).unwrap();
         assert_eq!(
             text,
-            "{\"kind\":\"full\",\"started_unix\":1790000000,\"satd_version\":\"0.6.0\",\
-             \"schema\":7,\"prev_tip_height\":null}\n"
+            "{\"kind\":\"full\",\"started_unix\":1790000000,\"satd_version\":\"0.6.1\",\
+             \"schema\":7,\"prev_tip_height\":null,\"resumable\":true}\n"
         );
+    }
+
+    /// satd 0.6.0 wrote no `resumable` field. Its marker reads as not
+    /// resumable: 0.6.0 did not record whether its wipe had finished, so a
+    /// reindex it left is restarted, never continued (#906).
+    #[test]
+    fn a_marker_without_resumable_reads_as_not_resumable() {
+        let dir = tempdir();
+        fs::write(
+            path(dir.path()),
+            "{\"kind\":\"full\",\"started_unix\":1790000000,\"satd_version\":\"0.6.0\",\
+             \"schema\":7,\"prev_tip_height\":12}\n",
+        )
+        .unwrap();
+        match read(dir.path()) {
+            Some(Found::Marker(m)) => {
+                assert_eq!(m.kind, RebuildKind::Full);
+                assert_eq!(m.prev_tip_height, Some(12));
+                assert!(!m.resumable);
+            }
+            other => panic!("a 0.6.0 marker must read: {other:?}"),
+        }
     }
 }

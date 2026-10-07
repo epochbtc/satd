@@ -105,21 +105,36 @@ enum InterruptedRebuild {
     /// An explicit `-reindex` / `-reindex-chainstate` starts a new rebuild,
     /// which clears whatever the old one left.
     Proceed,
+    /// A full `-reindex` interrupted after its wipe had finished: continue it
+    /// from what it flushed (#906), on any start.
+    ContinueFullReindex,
+    /// A full `-reindex` interrupted before its wipe had finished, or by a
+    /// satd that did not record whether it had (0.6.0), or at another
+    /// chainstate schema: run it again from genesis, on any start.
+    RestartFullReindex,
     /// `-upgradechainstate`: restart the chainstate rebuild from genesis.
     RestartChainstateRebuild,
     /// Refuse to start, with this message.
     Refuse(String),
 }
 
-/// Decide what a start does with an unfinished rebuild's marker. A plain
-/// start refuses: the UTXO set and indexes on disk end wherever the last
-/// durable flush reached, but were stamped complete before the rebuild
-/// began, so nothing else would stop them being served as whole.
+/// Decide what a start does with an unfinished rebuild's marker. The UTXO
+/// set and indexes on disk end wherever the last durable flush reached, but
+/// were stamped complete before the rebuild began, so nothing else would
+/// stop them being served as whole.
 ///
-/// A full `-reindex` can only be finished by another one: the block index
-/// itself was being rebuilt, and a chainstate rebuild trusts the block
-/// index. An unreadable marker says a rebuild did not finish without saying
-/// which, so only an explicit flag (the operator's call) gets past it.
+/// A full `-reindex` is finished on any start, whatever the flags: the
+/// operator asked for it, it downloads nothing, and refusing would leave a
+/// node that a package passing `--reindex` once can never start again. It
+/// continues from what it flushed when its marker says the wipe had
+/// finished at this chainstate schema, and runs again from genesis
+/// otherwise. A chainstate rebuild cannot finish it: the block index itself
+/// was being rebuilt, and a chainstate rebuild trusts the block index.
+///
+/// An interrupted chainstate rebuild refuses a plain start; its flags
+/// restart it. An unreadable marker says a rebuild did not finish without
+/// saying which, so only an explicit flag (the operator's call) gets past
+/// it.
 fn interrupted_rebuild_action(
     found: &node::rebuild_marker::Found,
     reindex: bool,
@@ -130,18 +145,10 @@ fn interrupted_rebuild_action(
     use node::rebuild_marker::{Found, RebuildKind};
     match found {
         Found::Marker(m) if m.kind == RebuildKind::Full => {
-            if reindex {
-                InterruptedRebuild::Proceed
+            if m.resumable && m.schema == node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION {
+                InterruptedRebuild::ContinueFullReindex
             } else {
-                InterruptedRebuild::Refuse(format!(
-                    "Error: a full -reindex started by satd {} {} was interrupted before it \
-                     finished, so the block index and the chainstate are both incomplete. \
-                     Restart with --reindex to rebuild them from the block files. \
-                     -reindex-chainstate and -upgradechainstate cannot finish it: they rebuild \
-                     from the block index.",
-                    m.satd_version,
-                    describe_ago(now_unix.saturating_sub(m.started_unix)),
-                ))
+                InterruptedRebuild::RestartFullReindex
             }
         }
         Found::Marker(m) => {
@@ -324,6 +331,29 @@ fn startup_signals(
                 StopRequest::StartupFinished => return,
             }
         }
+    }
+}
+
+/// Record in the rebuild marker whether an interrupted full `-reindex` can be
+/// continued (#906). Not fatal: a marker left saying `false` costs a restart
+/// from genesis, and one left saying `true` is checked against the block
+/// files before anything is built on it.
+fn set_rebuild_marker_resumable(net_datadir: &std::path::Path, resumable: bool) {
+    let result = match node::rebuild_marker::read(net_datadir) {
+        Some(node::rebuild_marker::Found::Marker(mut m)) => {
+            m.resumable = resumable;
+            node::rebuild_marker::write(net_datadir, &m).map_err(|e| e.to_string())
+        }
+        Some(node::rebuild_marker::Found::Unreadable(e)) => Err(e),
+        None => Err("it is missing".to_string()),
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            resumable,
+            error = %e,
+            "Could not update the rebuild marker; an interruption may restart the reindex \
+             from genesis instead of continuing it"
+        );
     }
 }
 
@@ -741,6 +771,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // on below, so everything from here on reads this, never
     // `config.reindex_chainstate`.
     let mut reindex_chainstate = config.reindex_chainstate;
+    // The effective `-reindex`: an interrupted full reindex turns it on
+    // below, so everything from here on reads this, never `config.reindex`.
+    let mut reindex = config.reindex;
+    // Set when that reindex continues from what it flushed (#906) rather
+    // than starting from genesis.
+    let mut continue_reindex = false;
     let explicit_rebuild = config.reindex || config.reindex_chainstate;
 
     // A rebuild that did not finish. Its wipe stamped the schema and marked
@@ -768,6 +804,24 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::time::now_secs(),
         ) {
             InterruptedRebuild::Proceed => {}
+            InterruptedRebuild::ContinueFullReindex => {
+                tracing::warn!(
+                    "A full -reindex was interrupted before it finished; continuing it from the \
+                     block files where it stopped. Nothing is downloaded."
+                );
+                reindex = true;
+                continue_reindex = true;
+                // The full reindex rebuilds the chainstate too.
+                reindex_chainstate = false;
+            }
+            InterruptedRebuild::RestartFullReindex => {
+                tracing::warn!(
+                    "A full -reindex was interrupted before it finished, at a point it cannot \
+                     be continued from; running it again from genesis. Nothing is downloaded."
+                );
+                reindex = true;
+                reindex_chainstate = false;
+            }
             InterruptedRebuild::RestartChainstateRebuild => {
                 tracing::warn!(
                     "A chainstate rebuild was interrupted before it finished; restarting it \
@@ -796,7 +850,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             storage_tuning,
         )
     };
-    let raw_store = match open_store(config.reindex || reindex_chainstate) {
+    // A continued reindex opens its own chainstate, at this schema, and keeps
+    // it: the schema check applies.
+    let raw_store = match open_store((reindex && !continue_reindex) || reindex_chainstate) {
         Ok(s) => s,
         // `-upgradechainstate`: an older schema is rebuilt, unprompted, by
         // the `-reindex-chainstate` path below. Only when older: a newer
@@ -1029,9 +1085,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     let mut reindex_floor: Option<u32> = None;
 
     // Handle -reindex: clear everything, will rebuild from flat files
-    if config.reindex {
-        startup_progress.set_phase("clearing_db", "Clearing chain database for reindex...");
-        tracing::info!("Reindexing: clearing database, will rebuild from block files");
+    if reindex {
         let prev_height = store
             .get_tip()
             .and_then(|h| store.get_block_index(&h).map(|e| e.height));
@@ -1041,6 +1095,20 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             prior_shutdown.as_ref().map(|r| r.tip_height),
             config.prune > 0 || config.prune_manual,
         );
+    }
+    if reindex && continue_reindex {
+        // Keep what the interrupted run flushed; the replay checks it against
+        // the block files before connecting anything on top of it.
+        tracing::info!(
+            height = ?store.get_tip().and_then(|h| store.get_block_index(&h).map(|e| e.height)),
+            "Reindexing: keeping the chainstate the interrupted reindex flushed"
+        );
+    } else if reindex {
+        startup_progress.set_phase("clearing_db", "Clearing chain database for reindex...");
+        tracing::info!("Reindexing: clearing database, will rebuild from block files");
+        let prev_height = store
+            .get_tip()
+            .and_then(|h| store.get_block_index(&h).map(|e| e.height));
         write_rebuild_marker(
             &net_datadir,
             node::rebuild_marker::RebuildKind::Full,
@@ -1623,16 +1691,49 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     }
 
     // Run reindex replay if requested
-    if config.reindex {
+    if reindex {
+        // From here an interruption can be continued (#906): the wipe has
+        // finished, and genesis, which `ChainState::new` seeded, is indexed,
+        // so a continued run never appends it to the block files again. The
+        // seed went to the database with its write-ahead log on, which a
+        // kill does not lose; the durable flush makes it survive a power cut
+        // too. A run that is already continuing has this set.
+        if !continue_reindex {
+            if let Err(e) = chain_state.flush_durable() {
+                eprintln!("Error flushing the cleared chain database before the reindex: {e}");
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+            set_rebuild_marker_resumable(&net_datadir, true);
+        }
         startup_progress.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
         startup_stop.begin_replay();
-        let end = chain_state.reindex_from_flat_files(
-            config.stopatheight,
-            Some(startup_progress.clone()),
-            reindex_floor,
-        );
+        let end = if continue_reindex {
+            chain_state.resume_reindex_from_flat_files(
+                config.stopatheight,
+                Some(startup_progress.clone()),
+                reindex_floor,
+            )
+        } else {
+            chain_state.reindex_from_flat_files(
+                config.stopatheight,
+                Some(startup_progress.clone()),
+                reindex_floor,
+            )
+        };
         let stop_requested = startup_stop.end_replay();
         match end {
+            Err(node::chain::state::ChainError::ReindexCannotResume(reason)) => {
+                // Nothing was changed. The next start runs the reindex again
+                // from genesis instead.
+                set_rebuild_marker_resumable(&net_datadir, false);
+                eprintln!(
+                    "Error: the interrupted reindex cannot be continued: {reason}. Nothing was \
+                     changed. Start satd again to run the reindex from genesis."
+                );
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
             Err(e) => {
                 eprintln!("Error during reindex: {}", e);
                 auth.cleanup();
@@ -1642,8 +1743,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 // The marker stays: the rebuild is not finished.
                 tracing::info!(
                     height,
-                    "Reindex stopped on request before it finished; restart with --reindex to \
-                     rebuild the block index and chainstate from the block files"
+                    "Reindex stopped on request before it finished; the next start continues it \
+                     from the block files"
                 );
                 auth.cleanup();
                 return Some(chainstate_db);
@@ -1737,7 +1838,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // touches the in-memory best-header pointer (seeded at genesis when the
     // index started empty). Re-seed it from the rebuilt tip before the audit
     // below, so the pointer is never left behind the active chain.
-    if config.reindex || reindex_chainstate {
+    if reindex || reindex_chainstate {
         chain_state.refresh_best_header_to_tip();
 
         // Re-run the ancestry audit on what the replay actually rebuilt, for
@@ -5616,9 +5717,17 @@ mod interrupted_rebuild_tests {
             kind,
             started_unix: NOW - 3 * 3_600,
             satd_version: "0.6.0".into(),
-            schema: 7,
+            schema: node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION,
             prev_tip_height: Some(967_870),
+            resumable: false,
         })
+    }
+
+    fn resumable(found: Found, schema: u32) -> Found {
+        match found {
+            Found::Marker(m) => Found::Marker(RebuildMarker { resumable: true, schema, ..m }),
+            other => other,
+        }
     }
 
     fn act(found: &Found, reindex: bool, chainstate: bool, upgrade: bool) -> InterruptedRebuild {
@@ -5645,21 +5754,41 @@ mod interrupted_rebuild_tests {
         assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
     }
 
+    /// #906: an interrupted full `-reindex` is finished on any start,
+    /// whatever the flags. It continues when its marker says the wipe had
+    /// finished at this schema, and runs again from genesis otherwise: a
+    /// marker satd 0.6.0 wrote, a wipe that may not have finished, or a
+    /// chainstate another schema wrote.
+    ///
+    /// Perturbation: drop the schema comparison and the last assertion
+    /// fails.
     #[test]
-    fn an_interrupted_full_reindex_needs_reindex() {
-        let m = marker(RebuildKind::Full);
-        for (chainstate, upgrade) in [(false, false), (true, false), (false, true), (true, true)] {
-            match act(&m, false, chainstate, upgrade) {
-                InterruptedRebuild::Refuse(msg) => {
-                    assert!(msg.contains("Restart with --reindex to"), "{msg}")
-                }
-                other => panic!(
-                    "only --reindex may pass (chainstate={chainstate} upgrade={upgrade}), got {other:?}"
-                ),
-            }
+    fn an_interrupted_full_reindex_is_finished_on_any_start() {
+        let current = node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION;
+        let flags = [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ];
+        let not_resumable = marker(RebuildKind::Full);
+        let continuable = resumable(marker(RebuildKind::Full), current);
+        let other_schema = resumable(marker(RebuildKind::Full), current - 1);
+        for (reindex, chainstate, upgrade) in flags {
+            assert_eq!(
+                act(&continuable, reindex, chainstate, upgrade),
+                InterruptedRebuild::ContinueFullReindex,
+            );
+            assert_eq!(
+                act(&not_resumable, reindex, chainstate, upgrade),
+                InterruptedRebuild::RestartFullReindex,
+            );
+            assert_eq!(
+                act(&other_schema, reindex, chainstate, upgrade),
+                InterruptedRebuild::RestartFullReindex,
+            );
         }
-        assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
-        assert_eq!(act(&m, true, false, true), InterruptedRebuild::Proceed);
     }
 
     /// An unreadable marker does not say which rebuild it was, so the flag
