@@ -34,8 +34,8 @@ use tokio::sync::watch;
 
 /// The categories `help` prints, in order. `rpc_help.py::test_categories`
 /// asserts exactly this list and this order.
-const HELP_CATEGORIES: [&str; 6] =
-    ["Blockchain", "Control", "Mining", "Network", "Rawtransactions", "Util"];
+const HELP_CATEGORIES: [&str; 7] =
+    ["Blockchain", "Control", "Mining", "Network", "Rawtransactions", "Util", "Zmq"];
 
 /// The `help` listing: every registered method, in exactly one category.
 ///
@@ -174,6 +174,8 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("pauseindex", "Util"),
     ("resumeindex", "Util"),
     ("validateaddress", "Util"),
+    // == Zmq ==
+    ("getzmqnotifications", "Zmq"),
     // == hidden ==
     // Core's own category for a command `help` answers for but never
     // advertises. The listing walks HELP_CATEGORIES, which does not
@@ -237,6 +239,9 @@ pub struct ServerListenerStatus {
     inner: RwLock<ServerListenerStatusInner>,
     /// The Stratum server, once bound; `getstratuminfo` reads it.
     stratum: RwLock<Option<crate::stratum::StratumHandle>>,
+    /// The Core-compatible ZMQ publisher, once every `-zmqpub*` address is
+    /// bound; `getzmqnotifications` and `/metrics` read it.
+    core_zmq: RwLock<Option<Arc<crate::events::core_zmq::CoreZmqStatus>>>,
 }
 
 #[derive(Default, Clone)]
@@ -277,6 +282,13 @@ impl ServerListenerStatus {
     /// The Stratum server, once bound.
     pub fn stratum_handle(&self) -> Option<crate::stratum::StratumHandle> {
         self.stratum.read().clone()
+    }
+    pub fn set_core_zmq(&self, status: Arc<crate::events::core_zmq::CoreZmqStatus>) {
+        *self.core_zmq.write() = Some(status);
+    }
+    /// The Core-compatible ZMQ publisher, if it is running.
+    pub fn core_zmq(&self) -> Option<Arc<crate::events::core_zmq::CoreZmqStatus>> {
+        self.core_zmq.read().clone()
     }
     pub fn set_stratum_v2(&self, bind: String) {
         self.inner.write().stratum_v2 = Some(bind);
@@ -3703,6 +3715,16 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(match handle {
             Some(h) => h.info(),
             None => crate::stratum::StratumHandle::disabled_info(),
+        })
+    })?;
+
+    // Core's `getzmqnotifications` (`src/zmq/zmqrpc.cpp`): one object per
+    // `-zmqpub*` notifier, or `[]` when none is configured or binding failed,
+    // which leaves ZMQ off as in Core.
+    module.register_method("getzmqnotifications", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(match ctx.listener_status.core_zmq() {
+            Some(status) => status.notifications_json(),
+            None => serde_json::json!([]),
         })
     })?;
 

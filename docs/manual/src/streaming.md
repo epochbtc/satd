@@ -42,9 +42,10 @@ the source of truth.
 3. **Server-Sent Events** (`GET /sse`). A read-only JSON firehose with no
    control channel, for browser and `curl` consumers.
 
-A Core-compatible ZMQ PUB sink remains for legacy parity. It carries the
-firehose bodies only, not per-subscriber watch matches, and uses Core's
-per-topic sequence numbers.
+A satd-native ZMQ PUB sink (`-eventszmqbind`) carries the firehose bodies
+only, not per-subscriber watch matches. It is not Bitcoin Core's ZMQ: for
+software written against Core's `-zmqpub*` topics, see
+[Bitcoin Core ZMQ compatibility](#bitcoin-core-zmq-compatibility) below.
 
 WebSocket and SSE bind a dedicated `--streamws` port; they do not upgrade on
 the Core-compatible JSON-RPC port. The stream stays a distinct service on a
@@ -291,6 +292,104 @@ restart-classified; `0` means unlimited.
 
 Admission shedding runs before authentication and request-body buffering. A
 connection flood, authenticated or not, is bounded before it does any work.
+
+## Bitcoin Core ZMQ compatibility
+
+satd also publishes Bitcoin Core's ZMQ notifications, for software written
+against Core: LND's `bitcoind` backend, Umbrel's Bitcoin apps, pool software
+that waits for `hashblock`, and anything else that subscribes to Core's
+topics. It is a compatibility surface. New integrations should use the
+streaming API above, which has cursors, replay, explicit removal reasons and
+reorg markers that ZMQ cannot carry.
+
+Configure it exactly as on Core, on the command line or in `bitcoin.conf`:
+
+```ini
+zmqpubrawblock=tcp://127.0.0.1:28332
+zmqpubrawtx=tcp://127.0.0.1:28333
+zmqpubhashblock=tcp://127.0.0.1:28334
+zmqpubsequence=tcp://127.0.0.1:28335
+zmqpubhashtx=tcp://127.0.0.1:28336
+```
+
+Each option may be given more than once, and each value is a notifier. Topics
+that name the same address share one socket. `unix:<path>` binds a Unix
+socket, as on Core, and satd also accepts libzmq's own `ipc://<path>`
+spelling. `-zmqpub<topic>hwm=<n>` sets a topic's high-water mark (default
+1000; 0 is unlimited). `getzmqnotifications` lists the notifiers, in Core's
+shape.
+
+**What matches Core.** Every message is byte-for-byte what Core sends: the
+topic, the body, and the per-notifier sequence number in the third frame,
+starting at 0. Each event produces Core's messages in Core's order:
+
+| Event | Messages |
+|---|---|
+| block connected | `hashtx` and `rawtx` per transaction, coinbase first; `sequence C`; then `hashblock` and `rawblock` if the block is a new tip (see below) and the node is not in initial block download |
+| block disconnected | `hashtx` and `rawtx` per transaction; `sequence D` |
+| mempool accept | `hashtx`, `rawtx`, `sequence A` |
+| mempool removal, except by a block | `sequence R` |
+
+`sequence A` and `R` carry the mempool sequence number the change took, the
+counter `getrawmempool(false, true)` reports as `mempool_sequence`, so a
+consumer can line a snapshot up with the stream. A reorg announces on
+`hashblock` and `rawblock` none of the blocks it connects until its chain has
+more work than the old tip, then each block from there to its new tip. A
+reorg to a chain one block longer than the old one therefore announces only
+its new tip. `invalidateblock` announces nothing there. Both are Core's
+behaviour.
+
+**Ordering.** satd guarantees:
+
+- **Block-derived messages** (hashblock, rawblock, block transactions on
+  hashtx/rawtx, sequence C/D) are published in chain order. A reorg publishes
+  D for each disconnected block newest first, then C for each connected block
+  oldest first, each block with more work than the old tip followed by its
+  hashblock/rawblock.
+- **Mempool-derived messages** (mempool transactions on hashtx/rawtx,
+  sequence A/R) are published in the order satd's mempool emitted them. That
+  is the mempool-sequence order except under concurrent mutation, where
+  adjacent events may swap, and for a package's ephemeral-dust parent, which
+  is announced after the child it was admitted with.
+- **No ordering is promised *between* the two groups**, on a shared socket or
+  within `hashtx`/`rawtx`/`sequence`.
+- **`A`/`R` sequence values are exact**, so a consumer can reconcile against
+  `getrawmempool(false, true)`.
+
+Core puts the two groups in one total order. No consumer that subscribes to
+one topic per socket, as Umbrel's apps and LND do, can tell the difference:
+two sockets have no ordering between them on Core either. A consumer that
+rebuilds a mempool purely from the `sequence` stream, without checking it
+against a snapshot, can drift around a reorg, whose returned transactions
+may be announced before its blocks, and in the narrow window where a
+transaction is admitted and mined within about a millisecond; it should use
+the streaming API instead.
+
+**Where it differs.** Messages are published from the moment blocks connect
+at the tip: blocks connected during initial block download or `-reindex`
+produce none (Core publishes their transactions and `sequence C`). A
+subscriber that cannot keep up loses messages past its high-water mark, and
+also past 256 MiB of queued data whatever the mark, since a thousand queued
+blocks would be gigabytes. If the publisher itself falls behind the node's
+event bus, every notifier skips a sequence number, so subscribers see the
+gap. A block that cannot be read from disk loses its transaction and
+`rawblock` messages (counted in `satd_zmq_block_read_failures_total`); Core
+instead stops that notifier for good. `CORE_DIFFERENCES.md` has the full list.
+
+**Failure.** As on Core, an address that cannot be bound is not fatal: the
+node logs the error and runs with ZMQ off, and `getzmqnotifications` returns
+`[]`. An address with one colon and an invalid port stops the node at
+startup with Core's `Invalid port specified in -zmqpub<topic>` error.
+
+**Monitoring.** `/metrics` exports `satd_zmq_messages_total{topic}`,
+`satd_zmq_subscribers`, `satd_zmq_subscriber_drops_total`,
+`satd_zmq_events_lagged_total`, `satd_zmq_rawtx_unavailable_total` and
+`satd_zmq_block_read_failures_total` while the publisher runs.
+
+`-eventszmqbind` is a separate, satd-native ZMQ socket that carries the event
+envelope (`nodeevent`) and satd's own topics. Its `hashtx` and `hashblock`
+share Core's wire format but not Core's per-event content; use `-zmqpub*` for
+Core semantics.
 
 ## Consensus-safety invariants
 

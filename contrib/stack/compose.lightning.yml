@@ -10,13 +10,12 @@
 # ## Why Neutrino and not bitcoind mode
 #
 # LND's bitcoind backend requires Bitcoin Core's raw ZMQ topics
-# (zmqpubrawblock / zmqpubrawtx). satd does not implement them — it rejects
-# those settings outright, and CORE_DIFFERENCES.md records that as
-# deliberate. Neutrino needs no ZMQ at all: it pulls BIP 157/158 filter
-# headers and filters over P2P, which satd serves with `peerblockfilters=1`
-# (set in the base config). This is the same configuration the repository's
-# LND canary proves on every PR, so the overlay is a packaging of a tested
-# path rather than a new claim.
+# (zmqpubrawblock / zmqpubrawtx). satd publishes them as of 0.7.0, but this
+# overlay predates that and stays on Neutrino. Neutrino needs no ZMQ at all:
+# it pulls BIP 157/158 filter headers and filters over P2P, which satd
+# serves with `peerblockfilters=1` (set in the base config). This is the same
+# configuration the repository's LND Neutrino canary proves on every PR, so
+# the overlay is a packaging of a tested path rather than a new claim.
 #
 # LND supports mainnet, signet and regtest here. testnet4 is not offered:
 # the pinned LND release predates its testnet4 support.

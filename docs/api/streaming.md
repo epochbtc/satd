@@ -3,8 +3,10 @@
 A push-based consumption surface for downstream indexers, wallets, Lightning
 nodes, exchanges, watchtowers, and explorers: a real-time event firehose plus
 live, cursor-resumable watch subscriptions, served over gRPC, WebSocket/SSE, and
-(for legacy parity) ZMQ. One schema — the protobuf definition in `satd.events.v1`
-is the source of truth — mapped to JSON for the WebSocket transport.
+a satd-native ZMQ socket. One schema — the protobuf definition in `satd.events.v1`
+is the source of truth — mapped to JSON for the WebSocket transport. Bitcoin
+Core's own ZMQ topics (`-zmqpub*`) are a separate compatibility surface outside
+this spec (§3).
 
 The surface is strictly **publish/read-only and decoupled from consensus**: it
 consumes the node's existing chain/mempool broadcasts and re-reads blocks the node
@@ -48,7 +50,8 @@ already provides:
 | `NodeEvent` envelope (schema v1, edge-stamped, monotonic `seq`) | `node::events` | The wire event type, extended additively below |
 | Broadcast firehose (`broadcast::Sender<NodeEvent>`, cap 4096) | `node::events::publisher` | Live event source |
 | gRPC `NodeEventStream` (`satd.events.v1`) | `events::grpc` | The native transport (§3, §7.3) |
-| Core-compatible ZMQ PUB | `events::zmq` | Legacy sink, carried unchanged |
+| satd-native ZMQ PUB (`-eventszmqbind`) | `events::zmq` | Envelope sink, carried unchanged |
+| Bitcoin Core ZMQ (`-zmqpub*`) | `events::core_zmq`, `events::zmtp` | A compatibility projection of the firehose, outside this spec (§3) |
 | Electrum per-scripthash registry, status-hash | `electrum-proto` | Pattern reused; not the new surface |
 | Esplora REST + SSE (`PermitStream` / `WatchLease` RAII) | `esplora-handlers` | SSE firehose pattern reused (§3) |
 | `SpendIndex` (outpoint → spending input, persistent) | `node-index::spend_*` | The *query* side; the *live* notifier (§7) is the other half |
@@ -76,10 +79,18 @@ would drag a Go toolchain into a build that already contends with bindgen /
 libclang / musl-static. Hand-mapping a stable, narrow `oneof` surface is cheaper
 than owning that toolchain.
 
-A Core-compatible **ZMQ PUB** sink remains for legacy parity. It carries the
-firehose bodies only — not the per-subscriber watch matches — and uses Core's
-per-topic sequence numbers; gaps are detected the Core way (sequence jumps), so it
-does not carry the in-band lag signal (§6.4).
+A satd-native **ZMQ PUB** sink (`-eventszmqbind`) carries the firehose bodies
+only — not the per-subscriber watch matches — and uses per-topic sequence
+numbers; gaps are detected the Core way (sequence jumps), so it does not carry
+the in-band lag signal (§6.4).
+
+Bitcoin Core's `-zmqpub*` topics (`hashblock`, `hashtx`, `rawblock`, `rawtx`,
+`sequence`) are also published, byte for byte as Core sends them, for software
+written against Core. They are a compatibility projection of the same firehose
+and not part of this protocol: no envelope, no cursor, no watch-set, and no
+order promised between block- and mempool-derived messages. The Operator
+Manual's streaming chapter documents them, and `CORE_DIFFERENCES.md` lists how
+they differ from Core's.
 
 ### 3.1 Listener placement
 
@@ -268,7 +279,8 @@ This preserves the core safety property — the server stays **drop-on-lag and n
 backpressures the publisher** (§10) — while removing its sharp edge: the client is
 told, in-band, exactly where to resume. The cost is that recovery is the client's
 responsibility, which is the right place for it (only the client knows its own
-durability needs). ZMQ keeps Core's behavior and does not carry `Lagged`.
+durability needs). ZMQ, native or Core's, does not carry `Lagged`: a lag shows
+as a sequence-number gap, as on Core.
 
 ## 7. Watch-set subscriptions
 

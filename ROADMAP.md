@@ -131,7 +131,8 @@ The cumulative upload cap is application state with block-serving semantics — 
 **Status: ✅ Shipped.** A push-based, streaming-first node-consumption API: a
 real-time event firehose plus live, cursor-resumable watch subscriptions keyed
 on outpoints, scripts, descriptors, and transaction ids — served over gRPC,
-JSON/WebSocket, SSE, and a Core-compatible ZMQ sink. The generalizing primitive
+JSON/WebSocket, SSE, and a satd-native ZMQ sink (Bitcoin Core's `-zmqpub*`
+topics are published separately, for compatibility). The generalizing primitive
 is **outpoint subscription**: channel-close detection, watchtower triggers,
 deposit confirmation, and theft monitoring all reduce to it, and address-watching
 is outpoint-watching with a derivation rule on top. Durable confirmed-side

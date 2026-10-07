@@ -333,7 +333,7 @@ tr:hover td { background: var(--copper-soft); }
         <h3>Deliberately different</h3>
         <ul>
           <li><strong>Native serving surfaces</strong> — Esplora REST, Electrum, BIP 157/158 serving, Prometheus metrics, all in one process over one chainstate.</li>
-          <li><strong>Structured streaming API</strong> — replaces Core's raw ZMQ topics with a cursor-replayable event envelope + Rust/Go SDKs.</li>
+          <li><strong>Structured streaming API</strong> — a cursor-replayable event envelope + Rust/Go SDKs, beside Core's own ZMQ topics for software written against Core.</li>
           <li><strong>Operator sovereignty</strong> — a total, cost-bounded relay-policy language; hot config reload on <code>SIGHUP</code>; native TLS everywhere.</li>
           <li><strong>No wallet</strong> — keyless by charter; PSBT construction/analysis served, signing pushed client-side.</li>
         </ul>
@@ -1577,7 +1577,7 @@ message EdgeStamp {
 pub const EXPLICIT_ONLY_CATEGORIES: u32 = CATEGORY_TWEAKS | CATEGORY_STATUS;</code></pre></div>
     <p>Replay reads the durable block store (there is no separate event log), resolves heights by walking <code>prev_blockhash</code> from the tip rather than the pollutable height index, caps spans at 10,000 blocks, and de-dups the replay→live seam by <code>(height, hash)</code> — keying on the hash is what makes a reorg at the seam correct.</p>
     <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
-    Core ships <code>-zmqpub*</code>: one raw-bytes ZMQ topic per event type, no provenance, no ordering guarantee across topics, no replay — a missed message is simply gone, so every consumer rebuilds state by polling RPC. satd deliberately does not implement Core's topic scheme; the structured envelope replaces it, with a documented migration path.</div>
+    Core ships <code>-zmqpub*</code>: one raw-bytes ZMQ topic per event type, no provenance, no ordering guarantee across topics, no replay — a missed message is simply gone, so every consumer rebuilds state by polling RPC. satd publishes those topics too, byte for byte, so Core's consumers work unchanged; the structured envelope is what it recommends for anything new.</div>
   </div>
 </section>
 
@@ -1734,7 +1734,6 @@ pub struct Hook {</code></pre></div>
       <tr><td>Wallet (BDB legacy, WIF-keyed RPCs, descriptor GUI)</td><td>Keyless daemon by charter — no private keys in the process, ever.</td><td class="satd">Full PSBT construction/decode/analyze/combine/finalize over RPC; <code>sat-cli signpsbtwithkey</code> signs <em>client-side</em>, key read from stdin, never traverses RPC.</td></tr>
       <tr><td>BIP 37 bloom filters</td><td>Deprecated in Core since v0.19; privacy leak and DoS vector.</td><td class="satd">BIP 157/158 compact filters, indexed and served natively.</td></tr>
       <tr><td><code>MemPool</code> P2P message</td><td>Rarely used outside bloom-filter clients.</td><td class="satd">The mempool subscription stream over RPC/WS.</td></tr>
-      <tr><td>Core-style <code>-zmqpub*</code> raw topics</td><td>One raw-bytes topic per event type; no provenance, no replay.</td><td class="satd">Structured event envelope (gRPC + ZMQ frames) with node identity, heartbeat, and cursor replay.</td></tr>
       <tr><td>GPG release signing</td><td>Project-wide signing-stack decision.</td><td class="satd">minisign (artifacts) + cosign keyless (containers) + SSH signatures (git tags).</td></tr>
     </table></div>
   </div>
@@ -1748,7 +1747,7 @@ pub struct Hook {</code></pre></div>
     <ul>
       <li><strong>Script shadow validation</strong> — every mainnet script from genesis through ~945k blocks executed on both the Rust engine and <code>libbitcoinconsensus</code>, asserting identical accept/reject. Zero divergence.</li>
       <li><strong>Differential block-acceptance battery</strong> — static fixtures ported from Core's own block-acceptance tests, plus a generative fuzzer that dual-submits adversarial blocks to satd <em>and a live bitcoind</em> and asserts identical verdicts.</li>
-      <li><strong>Third-party client canaries (PR-gating)</strong> — BDK, Bitcoin Core interop, LND Neutrino, Electrum, Core Lightning, NBXplorer, BTCPay run against every PR. Each canary has caught real compatibility bugs before merge.</li>
+      <li><strong>Third-party client canaries (PR-gating)</strong> — BDK, Bitcoin Core interop, LND Neutrino, LND in bitcoind mode, Electrum, Core Lightning, NBXplorer, BTCPay run against every PR. Each canary has caught real compatibility bugs before merge.</li>
       <li><strong>Fuzzing</strong> — a standalone cargo-fuzz workspace under nightly + sanitizers, run on a schedule.</li>
       <li><strong>Reproducible builds</strong> — Nix flake instead of Core's Guix; musl-static binaries so the tested artifact is the shipped artifact.</li>
     </ul>

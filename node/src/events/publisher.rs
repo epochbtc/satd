@@ -329,7 +329,17 @@ impl EventPublisher {
             if ring.len() == self.replay_ring_cap {
                 ring.pop_front();
             }
-            ring.push_back(env.clone());
+            // The replay ring serves the streaming carriers, which never send
+            // `raw_tx`; keeping it would pin up to a ring's worth of
+            // transactions in memory for nothing.
+            let retained = match &env.body {
+                NodeEventBody::Mempool(ev) => NodeEvent {
+                    body: NodeEventBody::Mempool(ev.without_raw_tx()),
+                    ..env.clone()
+                },
+                _ => env.clone(),
+            };
+            ring.push_back(retained);
         }
         // `send` returns `Err(SendError)` only when there are no active
         // receivers. That's the no-sinks-configured case — silent drop
@@ -644,6 +654,8 @@ mod tests {
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
             time: 1_700_000_000,
+            mempool_sequence: byte as u64,
+            raw_tx: None,
         }
     }
 

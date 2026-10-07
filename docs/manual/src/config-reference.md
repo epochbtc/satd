@@ -380,9 +380,9 @@ startup error.
 
 ## Events
 
-(satd-specific event bus. The `eventszmq*` spelling is satd's; Core uses
-per-topic `-zmqpub*=<addr>` flags. The `hashtx`/`hashblock` payloads are
-Core ZMQ wire-format compatible.)
+(satd-specific event bus. The `eventszmq*` keys configure satd's own ZMQ
+socket, which carries the event envelope; for Bitcoin Core's ZMQ topics, use
+the `zmqpub*` keys in [Bitcoin Core ZMQ](#bitcoin-core-zmq) below.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
@@ -416,6 +416,34 @@ Core ZMQ wire-format compatible.)
 | `eventszmqmpreplace` | on when bound | restart | satd | Enable `mpreplace` topic (RBF replacement; JSON). |
 | `eventszmqmpconfirm` | on when bound | restart | satd | Enable `mpconfirm` topic (mempool tx confirmed; JSON). |
 | `eventszmqnodeevent` | on when bound | restart | satd | Enable `nodeevent` topic (full envelope JSON). |
+
+## Bitcoin Core ZMQ
+
+Bitcoin Core's ZMQ notifications, with Core's messages byte for byte. Each
+address key may be given more than once; every value is a notifier, and
+notifiers on the same address share a socket. `unix:<path>` binds a Unix
+socket (reported as `ipc://<path>`); `ipc://<path>` is also accepted. An
+address that cannot be bound turns ZMQ off and the node keeps running, as in
+Core; an address with one `:` and an invalid port stops startup. See
+[Bitcoin Core ZMQ compatibility](streaming.md#bitcoin-core-zmq-compatibility)
+for what each topic publishes and the ordering guarantee.
+
+| Key | Default | Reload | Compat | Description |
+|---|---|---|---|---|
+| `zmqpubhashblock` | off | restart | core | Publish each new tip's hash on `hashblock` at `<address>` (not during initial block download). |
+| `zmqpubhashtx` | off | restart | core | Publish the txid of each mempool admission and of each transaction in a connected or disconnected block on `hashtx`. |
+| `zmqpubrawblock` | off | restart | core | Publish each new tip's serialized block on `rawblock` (not during initial block download). |
+| `zmqpubrawtx` | off | restart | core | Publish each mempool admission and each transaction in a connected or disconnected block, serialized with its witness, on `rawtx`. |
+| `zmqpubsequence` | off | restart | core | Publish `sequence` records: `C`/`D` for a connected/disconnected block, `A`/`R` with the mempool sequence number for a mempool admission/removal. |
+| `zmqpubhashblockhwm` | 1000 | restart | core | Outbound high-water mark of the `hashblock` notifiers, in messages per subscriber; 0 is unlimited. A value that is not a number reads as 0 and a negative one keeps 1000, as in Core. |
+| `zmqpubhashtxhwm` | 1000 | restart | core | As `zmqpubhashblockhwm`, for `hashtx`. |
+| `zmqpubrawblockhwm` | 1000 | restart | core | As `zmqpubhashblockhwm`, for `rawblock`. |
+| `zmqpubrawtxhwm` | 1000 | restart | core | As `zmqpubhashblockhwm`, for `rawtx`. |
+| `zmqpubsequencehwm` | 1000 | restart | core | As `zmqpubhashblockhwm`, for `sequence`. |
+
+A socket shared by several topics takes the first one's high-water mark, in
+the order the table lists them. On top of it, a subscriber with more than
+256 MiB of unsent messages loses further ones until it catches up.
 
 ## Webhooks / notifications
 
@@ -510,7 +538,6 @@ warning names the satd equivalent where one exists. This covers the long tail:
 | Key(s) | Warning guidance |
 |---|---|
 | `rest` | satd ships native Esplora REST instead of Core's `/rest/`; enable with `-esplora` (on by default). |
-| `zmqpub*` (`hashtx`/`hashblock`/`rawtx`/`rawblock`/`sequence` + `*hwm`) | Core's per-topic ZMQ is replaced by the events bus (`-eventszmqbind` + `-eventszmqhashtx`/`-eventszmqhashblock`, Core wire-format). |
 | `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
 | `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown, as in Core v30.) |
 | `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |

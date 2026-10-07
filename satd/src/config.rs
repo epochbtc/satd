@@ -1,6 +1,7 @@
 use bitcoin::Network;
 use clap::CommandFactory;
 use clap::Parser;
+use node::events::core_zmq::{CoreZmqNotifier, CoreZmqTopic, DEFAULT_ZMQ_SNDHWM};
 use node::mempool::pool::PrevoutMetaLevel;
 use node::rpc::allowip::IpAllowEntry;
 use std::collections::HashMap;
@@ -1412,6 +1413,14 @@ pub struct Config {
     pub events_zmq_mpreplace: Option<bool>,
     pub events_zmq_mpconfirm: Option<bool>,
     pub events_zmq_nodeevent: Option<bool>,
+    /// Bitcoin Core's `-zmqpub<topic>=<address>` notifiers, in Core's
+    /// notifier order: topics alphabetically, then each topic's addresses
+    /// in option order. A `unix:` prefix is already rewritten to `ipc://`.
+    /// Empty when ZMQ is not configured.
+    pub zmq_pub: Vec<(CoreZmqTopic, String)>,
+    /// `-zmqpub<topic>hwm` per topic (indexed by [`CoreZmqTopic::index`]),
+    /// as Core applies it: default 1000, 0 for unlimited.
+    pub zmq_hwm: [i64; 5],
     // No-op compatibility flags (accepted but ignored)
     #[allow(dead_code)]
     pub server: bool,
@@ -3796,6 +3805,12 @@ impl Config {
         // --log-format selects the formatter), so direct
         // `tracing::warn!` calls would silently drop on the floor.
         let mut pending_notes: Vec<ConfigNote> = std::mem::take(&mut include_notes);
+        // Resolved in a helper, to keep this function's debug-build stack
+        // frame from growing.
+        let zmq = resolve_zmq_pub(cli.zmq_pub_args, config_file.as_ref(), section, &file_get)?;
+        pending_notes.extend(
+            zmq.notes.into_iter().map(|message| ConfigNote { level: NoteLevel::Warn, message }),
+        );
         // Surface warnings for recognized-but-unsupported Core keys that were
         // skipped (drop-in bitcoin.conf compatibility) so the operator knows
         // each ignored line, even though the node started.
@@ -4579,8 +4594,23 @@ impl Config {
             events_zmq_nodeevent: cli
                 .events_zmq_nodeevent
                 .or_else(|| file_get("eventszmqnodeevent").and_then(|v| parse_bool(&v))),
+            zmq_pub: zmq.zmq_pub,
+            zmq_hwm: zmq.zmq_hwm,
             pending_notes,
         })
+    }
+
+    /// The `-zmqpub*` notifiers, in Core's notifier order, each with its
+    /// topic's high-water mark.
+    pub fn zmq_notifiers(&self) -> Vec<CoreZmqNotifier> {
+        self.zmq_pub
+            .iter()
+            .map(|(topic, address)| CoreZmqNotifier {
+                topic: *topic,
+                address: address.clone(),
+                hwm: self.zmq_hwm[topic.index()],
+            })
+            .collect()
     }
 
     /// Drain operator-facing notes that the resolver collected before
@@ -5829,6 +5859,11 @@ pub struct CliArgs {
     /// stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
     pub rpc_whitelist_args: RpcWhitelistArgs,
+
+    /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
+    /// hand-built for the same stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub zmq_pub_args: ZmqPubArgs,
 
     #[arg(
         long,
@@ -7223,6 +7258,182 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
     }
 }
 
+/// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags (see
+/// [`CliArgs::zmq_pub_args`]), indexed by [`CoreZmqTopic::index`].
+#[derive(Debug, Clone, Default)]
+pub struct ZmqPubArgs {
+    /// Every `-zmqpub<topic>=<address>` value, in command-line order.
+    pub addresses: [Vec<String>; 5],
+    /// The last `-zmqpub<topic>hwm=<n>`, unparsed: Core reads a value that is
+    /// not a number as 0, so clap must not refuse one.
+    pub hwm: [Option<String>; 5],
+}
+
+/// Help text is Core's own (v31.1 `src/init.cpp:617-626`).
+const ZMQ_PUB_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    ("zmqpubhashblock", "ADDRESS", StratumArgKind::TextList, "Enable publish hash block in <address>"),
+    ("zmqpubhashtx", "ADDRESS", StratumArgKind::TextList, "Enable publish hash transaction in <address>"),
+    ("zmqpubrawblock", "ADDRESS", StratumArgKind::TextList, "Enable publish raw block in <address>"),
+    ("zmqpubrawtx", "ADDRESS", StratumArgKind::TextList, "Enable publish raw transaction in <address>"),
+    ("zmqpubsequence", "ADDRESS", StratumArgKind::TextList, "Enable publish hash block and tx sequence in <address>"),
+    ("zmqpubhashblockhwm", "N", StratumArgKind::Text, "Set publish hash block outbound message high water mark (default: 1000)"),
+    ("zmqpubhashtxhwm", "N", StratumArgKind::Text, "Set publish hash transaction outbound message high water mark (default: 1000)"),
+    ("zmqpubrawblockhwm", "N", StratumArgKind::Text, "Set publish raw block outbound message high water mark (default: 1000)"),
+    ("zmqpubrawtxhwm", "N", StratumArgKind::Text, "Set publish raw transaction outbound message high water mark (default: 1000)"),
+    ("zmqpubsequencehwm", "N", StratumArgKind::Text, "Set publish hash sequence message high water mark (default: 1000)"),
+];
+
+impl clap::Args for ZmqPubArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in ZMQ_PUB_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for ZmqPubArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut args = Self::default();
+        for topic in CoreZmqTopic::ALL {
+            args.addresses[topic.index()] =
+                m.remove_many(topic.option()).map(|v| v.collect()).unwrap_or_default();
+            args.hwm[topic.index()] = m.remove_one(topic.hwm_option());
+        }
+        Ok(args)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// The resolved `-zmqpub*` [`Config`] fields.
+struct ZmqPubFields {
+    zmq_pub: Vec<(CoreZmqTopic, String)>,
+    zmq_hwm: [i64; 5],
+    notes: Vec<String>,
+}
+
+/// Core's `LocaleIndependentAtoi<int64_t>`: surrounding whitespace and a
+/// leading `+` allowed, the leading digits read, anything after them
+/// ignored, out-of-range saturated, and 0 for a value with no leading
+/// number at all.
+fn core_atoi_i64(value: &str) -> i64 {
+    let s = value.trim();
+    let s = match s.strip_prefix('+') {
+        Some(rest) if rest.starts_with('-') => return 0,
+        Some(rest) => rest,
+        None => s,
+    };
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    if end == 0 {
+        return 0;
+    }
+    let mut n: i64 = 0;
+    for b in digits[..end].bytes() {
+        let d = i64::from(b - b'0');
+        n = match n.checked_mul(10).and_then(|n| if negative { n.checked_sub(d) } else { n.checked_add(d) }) {
+            Some(n) => n,
+            None => return if negative { i64::MIN } else { i64::MAX },
+        };
+    }
+    n
+}
+
+/// Resolve the `-zmqpub*` options the way Core's
+/// `CZMQNotificationInterface::Create` reads them.
+///
+/// - An address option is multi-valued, and every value is a notifier. Core
+///   takes the command line's values, then the config file's network
+///   section's, then its default section's (`GetSettingsList`), so all three
+///   count, in that order.
+/// - A `unix:` prefix becomes libzmq's `ipc://`, the form Core stores and
+///   reports. A literal `ipc://` address is also accepted, which Core's
+///   startup check refuses; see `CORE_DIFFERENCES.md`.
+/// - An address with exactly one `:` must have a port of 1-65535, or startup
+///   fails with Core's `Invalid port specified in -zmqpub<topic>: '<value>'`
+///   (`CheckHostPortOptions`). Nothing else is checked here: an address that
+///   cannot be bound turns ZMQ off at startup, as in Core.
+/// - A high-water mark is single-valued (command line last, then the config
+///   file's first). Core reads it with `GetIntArg`, which takes a value that
+///   is not a number as 0 (unlimited), then narrows it to an `int` and
+///   ignores a negative result, keeping the default of 1000.
+#[inline(never)]
+fn resolve_zmq_pub(
+    cli: ZmqPubArgs,
+    config_file: Option<&ConfigFile>,
+    section: &str,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<ZmqPubFields, String> {
+    let mut zmq_pub = Vec::new();
+    let mut zmq_hwm = [DEFAULT_ZMQ_SNDHWM; 5];
+    let mut notes = Vec::new();
+    let ZmqPubArgs { addresses, hwm } = cli;
+    for (topic, (cli_values, cli_hwm)) in CoreZmqTopic::ALL.into_iter().zip(addresses.into_iter().zip(hwm)) {
+        let option = topic.option();
+        let mut values = cli_values;
+        if let Some(cf) = config_file {
+            if let Some(v) = cf.sections.get(section).and_then(|s| s.get(option)) {
+                values.extend(v.iter().cloned());
+            }
+            if let Some(v) = cf.global.get(option) {
+                values.extend(v.iter().cloned());
+            }
+        }
+        for value in values {
+            let local = value.starts_with("unix:") || value.starts_with("ipc://");
+            if !local && rpcbind_port_is_invalid(&value) {
+                return Err(format!("Invalid port specified in -{option}: '{value}'"));
+            }
+            let address = match value.strip_prefix("unix:") {
+                Some(path) => format!("ipc://{path}"),
+                None => value,
+            };
+            zmq_pub.push((topic, address));
+        }
+
+        let hwm_option = topic.hwm_option();
+        if let Some(raw) = cli_hwm.or_else(|| file_get(hwm_option)) {
+            let parsed = core_atoi_i64(&raw);
+            // Core's `static_cast<int>`: keep the low 32 bits.
+            let narrowed = i64::from(parsed as i32);
+            if narrowed >= 0 {
+                zmq_hwm[topic.index()] = narrowed;
+                if raw.trim().parse::<i64>() != Ok(narrowed) {
+                    notes.push(format!(
+                        "-{hwm_option}={raw:?} is read as {narrowed}, as Bitcoin Core reads it{}",
+                        if narrowed == 0 { " (no limit)" } else { "" }
+                    ));
+                }
+            } else {
+                notes.push(format!(
+                    "-{hwm_option}={raw:?} is negative; the default of {DEFAULT_ZMQ_SNDHWM} applies, \
+                     as in Bitcoin Core"
+                ));
+            }
+        }
+    }
+    Ok(ZmqPubFields { zmq_pub, zmq_hwm, notes })
+}
+
 /// The resolved Stratum [`Config`] fields.
 struct StratumFields {
     stratum: bool,
@@ -8565,6 +8776,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "eventszmqmpreplace",
     "eventszmqmpconfirm",
     "eventszmqnodeevent",
+    // Bitcoin Core's ZMQ notifications.
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+    "zmqpubsequence",
+    "zmqpubhashblockhwm",
+    "zmqpubhashtxhwm",
+    "zmqpubrawblockhwm",
+    "zmqpubrawtxhwm",
+    "zmqpubsequencehwm",
     // Webhooks / notifications
     "blocknotify",
     "alertnotify",
@@ -8638,11 +8860,6 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
     ("debuglogfile", "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime."),
     ("shrinkdebugfile", "satd logs to stdout/journald and has no debug.log to shrink; manage retention via journald or your container runtime."),
     ("printtoconsole", "satd always logs to stdout; there is no debug.log alternative to toggle."),
-    ("zmqpubhashtx", "use -eventszmqbind + -eventszmqhashtx (Core wire-format) instead of per-topic -zmqpub* flags."),
-    ("zmqpubhashblock", "use -eventszmqbind + -eventszmqhashblock (Core wire-format) instead of per-topic -zmqpub* flags."),
-    ("zmqpubrawtx", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-tx publication is not currently provided. See CORE_DIFFERENCES.md."),
-    ("zmqpubrawblock", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model; raw-block publication is not currently provided. See CORE_DIFFERENCES.md."),
-    ("zmqpubsequence", "satd's events bus (-eventszmqbind) replaces Core's per-topic -zmqpub* model. See CORE_DIFFERENCES.md."),
     // The *notify shell-hook family. satd honors -blocknotify, -alertnotify,
     // -startupnotify and -shutdownnotify for Core convenience (see
     // KNOWN_CONFIG_KEYS), but the supported way to build on satd is the
@@ -8773,6 +8990,7 @@ pub const DEBUG_CATEGORIES: &[&str] = &[
     "txpackages",
     "txreconciliation",
     "validation",
+    "zmq",
 ];
 
 pub(crate) fn debug_category_target(category: &str) -> Option<&'static str> {
@@ -8786,6 +9004,8 @@ pub(crate) fn debug_category_target(category: &str) -> Option<&'static str> {
         // satd's own: Core has no Stratum server. Per-miner connection,
         // share and status lines for verifying a mining device.
         "stratum" => Some("node::stratum"),
+        // Both ZMQ publishers: Core's `-zmqpub*` and satd's `-eventszmqbind`.
+        "zmq" => Some("events::zmq"),
         _ => None,
     }
 }
@@ -10930,6 +11150,7 @@ testactivationheight=bip34@2
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
             rpc_whitelist_args: RpcWhitelistArgs::default(),
+            zmq_pub_args: ZmqPubArgs::default(),
             authfile: None,
             rpcauthbearer: None,
             rpccookiefile: None,
@@ -11246,6 +11467,7 @@ testactivationheight=bip34@2
             rpcreadonlymtlsclientallow: Vec::new(),
             rpcauth: Vec::new(),
             rpc_whitelist_args: RpcWhitelistArgs::default(),
+            zmq_pub_args: ZmqPubArgs::default(),
             authfile: None,
             rpcauthbearer: None,
             rpccookiefile: None,
@@ -14842,7 +15064,6 @@ notarealkey=1
         // Where a skipped key has a satd replacement, the warning points to it.
         let cases = [
             ("rest", "-esplora"),
-            ("zmqpubrawtx", "-eventszmqbind"),
             ("peerbloomfilters", "-blockfilterindex"),
             ("maxorphantx", "removed in Bitcoin Core v30"),
         ];
@@ -15061,7 +15282,7 @@ notarealkey=1
 
     #[test]
     fn debug_directives_unknown_category_is_noop() {
-        let (all, dirs) = debug_directives(&["qt".to_string(), "zmq".to_string()], &[]);
+        let (all, dirs) = debug_directives(&["qt".to_string(), "walletdb".to_string()], &[]);
         assert!(!all);
         assert!(dirs.is_empty());
     }
@@ -15078,6 +15299,145 @@ notarealkey=1
         let argv = normalize_args(args.iter().map(|s| s.to_string()).collect());
         let cli = CliArgs::try_parse_from(argv).expect("clap parse");
         Config::from_cli(cli).expect("config build")
+    }
+
+    /// A config built from `args` (Core spelling allowed) and, if given, a
+    /// `bitcoin.conf` with `conf` as its content.
+    fn zmq_config(args: &[&str], conf: Option<&str>) -> Result<Config, String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut argv: Vec<String> = vec!["satd".into(), format!("-datadir={}", dir.path().display())];
+        if let Some(conf) = conf {
+            let path = dir.path().join("bitcoin.conf");
+            std::fs::write(&path, conf).unwrap();
+            argv.push(format!("-conf={}", path.display()));
+        } else {
+            argv.push("-regtest".into());
+        }
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let (argv, _) = filter_unsupported_core_cli_args(normalize_args(argv))?;
+        let cli = CliArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
+        Config::from_cli(cli)
+    }
+
+    fn notifier_table(cfg: &Config) -> Vec<(&'static str, String, i64)> {
+        cfg.zmq_notifiers()
+            .into_iter()
+            .map(|n| (n.topic.notifier_type(), n.address, n.hwm))
+            .collect()
+    }
+
+    /// Core's notifier order (topics alphabetically, then each topic's values
+    /// in option order: command line, the network section, the default
+    /// section), `unix:` rewritten to `ipc://`, and each topic's HWM.
+    #[test]
+    fn zmqpub_options_resolve_in_cores_notifier_order() {
+        let conf = "regtest=1\nzmqpubrawtx=tcp://127.0.0.1:3\nzmqpubrawtxhwm=7\n\
+                    [regtest]\nzmqpubrawtx=tcp://127.0.0.1:2\nzmqpubhashblock=unix:/tmp/h.sock\n";
+        let cfg = zmq_config(
+            &["-zmqpubsequence=tcp://127.0.0.1:9", "-zmqpubrawtx=tcp://127.0.0.1:1"],
+            Some(conf),
+        )
+        .unwrap();
+        assert_eq!(
+            notifier_table(&cfg),
+            vec![
+                ("pubhashblock", "ipc:///tmp/h.sock".to_string(), 1000),
+                ("pubrawtx", "tcp://127.0.0.1:1".to_string(), 7),
+                ("pubrawtx", "tcp://127.0.0.1:2".to_string(), 7),
+                ("pubrawtx", "tcp://127.0.0.1:3".to_string(), 7),
+                ("pubsequence", "tcp://127.0.0.1:9".to_string(), 1000),
+            ]
+        );
+        // No option, no notifier.
+        assert!(zmq_config(&[], None).unwrap().zmq_pub.is_empty());
+    }
+
+    /// The HWM is single-valued: the command line's last value wins, then
+    /// the config file's first, the network section ahead of the default
+    /// one.
+    #[test]
+    fn zmqpub_hwm_precedence_is_cores() {
+        let conf = "regtest=1\nzmqpubhashtxhwm=11\n[regtest]\nzmqpubhashtxhwm=22\nzmqpubhashtxhwm=33\n";
+        let cfg = zmq_config(&["-zmqpubhashtx=tcp://127.0.0.1:1"], Some(conf)).unwrap();
+        assert_eq!(cfg.zmq_hwm[CoreZmqTopic::HashTx.index()], 22);
+        let cfg = zmq_config(
+            &["-zmqpubhashtx=tcp://127.0.0.1:1", "-zmqpubhashtxhwm=5", "-zmqpubhashtxhwm=6"],
+            Some(conf),
+        )
+        .unwrap();
+        assert_eq!(cfg.zmq_hwm[CoreZmqTopic::HashTx.index()], 6);
+    }
+
+    /// Core reads the HWM with `GetIntArg` and narrows it to an `int`: a value
+    /// that is not a number is 0 (no limit), trailing junk is ignored, and a
+    /// negative result keeps the default. Every one of these starts the node.
+    #[test]
+    fn zmqpub_hwm_values_read_as_core_reads_them() {
+        for (value, want, noted) in [
+            ("0", 0, false),
+            ("250", 250, false),
+            ("+12", 12, false),
+            ("12abc", 12, true),
+            ("abc", 0, true),
+            ("-5", 1000, true),
+            ("4294967296", 0, true),
+            ("2147483648", 1000, true),
+        ] {
+            let cfg = zmq_config(
+                &["-zmqpubrawblock=tcp://127.0.0.1:1", &format!("-zmqpubrawblockhwm={value}")],
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(cfg.zmq_hwm[CoreZmqTopic::RawBlock.index()], want, "{value}");
+            let note = cfg.pending_notes.iter().any(|n| n.message.contains("zmqpubrawblockhwm"));
+            assert_eq!(note, noted, "{value}: {:?}", cfg.pending_notes);
+        }
+        assert_eq!(core_atoi_i64("99999999999999999999"), i64::MAX);
+        assert_eq!(core_atoi_i64("-99999999999999999999"), i64::MIN);
+        assert_eq!(core_atoi_i64(" 42 "), 42);
+        assert_eq!(core_atoi_i64("+-1"), 0);
+    }
+
+    /// Core's `CheckHostPortOptions`: one colon and a port that is not
+    /// 1-65535 refuses to start, with Core's message. Several colons, none,
+    /// `unix:` and (a satd extension) `ipc://` pass, and binding decides.
+    #[test]
+    fn zmqpub_port_validation_matches_core() {
+        for bad in ["127.0.0.1:abc", "localhost:0", "[::1]:70000", ":x"] {
+            let err = zmq_config(&[&format!("-zmqpubrawtx={bad}")], None).expect_err(bad);
+            assert_eq!(err, format!("Invalid port specified in -zmqpubrawtx: '{bad}'"));
+        }
+        let conf = "regtest=1\nzmqpubsequence=host:notaport\n";
+        let err = zmq_config(&[], Some(conf)).expect_err("config file values are checked too");
+        assert_eq!(err, "Invalid port specified in -zmqpubsequence: 'host:notaport'");
+        for ok in [
+            "tcp://127.0.0.1:28332",
+            "tcp://[::1]:28332",
+            "tcp://*:28332",
+            "foo",
+            "unix:/tmp/a.sock",
+            "ipc:///tmp/a.sock",
+            "localhost:28332",
+        ] {
+            zmq_config(&[&format!("-zmqpubrawtx={ok}")], None).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+    }
+
+    /// The ten keys are honoured now, so neither the config file nor the
+    /// command line may skip them as unsupported Core options.
+    #[test]
+    fn zmqpub_keys_are_honoured_not_skipped() {
+        for topic in CoreZmqTopic::ALL {
+            for key in [topic.option(), topic.hwm_option()] {
+                assert!(is_known_config_key(key), "{key}");
+                let cf = ConfigFile::parse(&format!("{key}=1\n")).unwrap();
+                assert!(cf.ignored.is_empty(), "{key}: {:?}", cf.ignored);
+                let args = normalize_args(vec!["satd".into(), format!("-{key}=1")]);
+                let (kept, warnings) = filter_unsupported_core_cli_args(args).unwrap();
+                assert_eq!(kept.len(), 2, "{key} was dropped");
+                assert!(warnings.is_empty(), "{key}: {warnings:?}");
+            }
+        }
     }
 
     #[test]

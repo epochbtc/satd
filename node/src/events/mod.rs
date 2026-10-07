@@ -11,6 +11,8 @@
 //! raw broadcasts directly — this module is purely additive.
 //!
 //! Module layout:
+//! - [`core_zmq`] — what the node sees of the Bitcoin Core-compatible ZMQ
+//!   publisher (`-zmqpub*`): topics, the notifier table, counters.
 //! - [`envelope`] — `NodeEvent`, `NodeEventBody`, `EdgeStamp`, `EdgeIdentity`.
 //! - [`publisher`] — `EventPublisher` daemon-level service that bridges
 //!   the internal broadcasts into envelopes, drives a 1 Hz heartbeat,
@@ -19,6 +21,7 @@
 //! - [`status`] — `StatusEvent` node-health conditions (`status` category).
 //! - [`schema`] — schema-version constant and evolution rules.
 
+pub mod core_zmq;
 pub mod drain;
 pub mod envelope;
 pub mod publisher;

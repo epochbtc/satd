@@ -135,6 +135,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "verifytxoutproof"
         | "gettxoutsetinfo"
         | "getwarnings"
+        | "getzmqnotifications"
         | "getaddednodeinfo"
         | "getaddressbalance"
         | "getaddresshistory"

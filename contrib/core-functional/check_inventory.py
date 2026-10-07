@@ -28,7 +28,9 @@ TAXONOMY = {
     "no-wallet": "needs the legacy Core wallet, which satd does not implement",
     "no-tool": "needs a Core-only binary (bitcoin-tx/-util/-wallet/-chainstate/bench)",
     "no-qt": "needs the Qt GUI",
-    "no-core-zmq": "needs Core's ZMQ topics; satd's ZMQ carries the satd-events wire",
+    "zmq-ordering": "asserts Core's ordering between block and mempool ZMQ messages, "
+                    "which satd does not reproduce (it publishes Core's messages "
+                    "byte for byte; see CORE_DIFFERENCES.md)",
     "no-ipc": "needs Core's multiprocess/IPC interface",
     "no-usdt": "needs USDT tracepoints",
     "core-internal": "asserts on Core implementation details satd does not share "

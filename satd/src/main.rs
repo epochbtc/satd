@@ -2344,6 +2344,54 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             }
         }
     }
+    // Bitcoin Core's `-zmqpub*` notifications. Bound here, before the mempool
+    // is loaded from mempool.dat and before P2P starts, so that a transaction
+    // re-admitted from disk publishes its `sequence A`, as in Core. A failed
+    // bind is not fatal: Core logs it and runs with ZMQ off, and
+    // `getzmqnotifications` answers `[]`. (`-eventszmqbind` stays fatal.)
+    let mut core_zmq_status: Option<Arc<node::events::core_zmq::CoreZmqStatus>> = None;
+    if !config.zmq_pub.is_empty() {
+        use node::events::core_zmq::CoreZmqTopic;
+        // `rawtx` must publish a transaction even if it has left the mempool
+        // by the time its event is read, so the event carries it. `hashtx`
+        // needs only the txid the event already has.
+        let wants_tx = config
+            .zmq_pub
+            .iter()
+            .any(|(t, _)| matches!(t, CoreZmqTopic::RawTx));
+        mempool.set_emit_raw_tx(wants_tx);
+        // Bound on the API runtime, so the listener and every subscriber's
+        // tasks run there rather than on the consensus core.
+        let notifiers = config.zmq_notifiers();
+        let chain: Arc<dyn satd_events::CoreZmqChain> = chain_state.clone();
+        let pool: Arc<dyn satd_events::CoreZmqMempool> = mempool.clone();
+        let bound = api_handle
+            .spawn(async move { satd_events::CoreZmqSink::bind(notifiers, chain, pool).await })
+            .await;
+        match bound {
+            Ok(Ok(sink)) => {
+                tracing::info!(
+                    target: "events",
+                    endpoints = ?sink.local_endpoints(),
+                    notifiers = config.zmq_pub.len(),
+                    "Bitcoin Core ZMQ notifications enabled",
+                );
+                core_zmq_status = Some(sink.status());
+                event_sinks.push(Box::new(sink));
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "{e}; Bitcoin Core ZMQ notifications are disabled (as Bitcoin Core does on a \
+                     failed bind)"
+                );
+                mempool.set_emit_raw_tx(false);
+            }
+            Err(e) => {
+                tracing::error!("Bitcoin Core ZMQ bind task failed: {e}; ZMQ notifications are disabled");
+                mempool.set_emit_raw_tx(false);
+            }
+        }
+    }
     if !event_sinks.is_empty() {
         // Spawn the external sink tasks (events gRPC server, ZMQ PUB) on the
         // isolated API runtime: `attach_sinks` calls `tokio::spawn`
@@ -3156,6 +3204,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     }
     if let Some(addr) = streamws_bound {
         listener_status.set_streamws(addr);
+    }
+    if let Some(status) = core_zmq_status {
+        listener_status.set_core_zmq(status);
     }
 
     // Optional JSON-RPC TLS surface. Bitcoin Core's RPC is HTTP-only;

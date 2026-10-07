@@ -291,6 +291,7 @@ belongs in that set.
 
 ## Extending
 
-`debuglog_map.toml` rules for `core-log` rows, and the `core-net-policy` and
-`no-core-zmq` buckets — Core-topic ZMQ is a plausible small satd feature with
-real ecosystem value, and would convert a whole category.
+`debuglog_map.toml` rules for `core-log` rows, and the `core-net-policy`
+bucket. (Core-topic ZMQ, once listed here, has shipped: `interface_zmq.py`
+now skips only for the ordering it asserts between block and mempool
+messages, `zmq-ordering`.)

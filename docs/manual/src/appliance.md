@@ -248,10 +248,12 @@ The firewall is default-deny inbound, and `sshd` is off until
 ## Why LND runs in Neutrino mode
 
 LND's `bitcoind` backend requires Bitcoin Core's raw ZMQ topics
-(`zmqpubrawblock` / `zmqpubrawtx`). satd does not implement them and rejects
-those settings; see [CORE_DIFFERENCES.md]. Neutrino needs no ZMQ — it pulls
-BIP 157/158 filter headers and filters over P2P, which satd serves because
-every deliverable here sets `peerblockfilters=1`.
+(`zmqpubrawblock` / `zmqpubrawtx`). satd publishes them as of 0.7.0 (see
+[Bitcoin Core ZMQ compatibility](streaming.md#bitcoin-core-zmq-compatibility)),
+but the appliance predates that and keeps LND on Neutrino, the configuration
+it was built and tested with. Neutrino needs no ZMQ — it pulls BIP 157/158
+filter headers and filters over P2P, which satd serves because every
+deliverable here sets `peerblockfilters=1`.
 
 Core Lightning is unaffected: its `bcli` plugin polls JSON-RPC, so it runs
 as an ordinary full-node client.
@@ -270,11 +272,10 @@ satd  ->  NBXplorer  ->  arkd-wallet  ->  arkd
 ```
 
 arkd v0.9 splits the wallet into its own service, and that wallet's chain
-backend is **NBXplorer** — not Esplora, and not Core's ZMQ. Two things
-follow. satd implements no raw ZMQ topics, so a backend that needed them
-would have ruled Ark out entirely; and NBXplorer against satd is already a
-PR-gating canary in this repository, so the single link in that chain which
-touches satd is the link that is continuously tested.
+backend is **NBXplorer** — not Esplora, and not Core's ZMQ — and NBXplorer
+against satd is already a PR-gating canary in this repository, so the single
+link in that chain which touches satd is the link that is continuously
+tested.
 
 First run is two steps, because arkd will not start without a signer key and
 its wallet must then be created and unlocked:
@@ -329,5 +330,3 @@ Not yet covered: `aarch64` on Umbrel, and StartOS backup/restore.
 Every probe that verifies a certificate is paired with the negative control
 that the same handshake without the CA must fail. A probe that would pass
 unverified proves nothing about the certificate.
-
-[CORE_DIFFERENCES.md]: https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md

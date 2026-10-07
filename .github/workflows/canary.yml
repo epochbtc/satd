@@ -723,6 +723,55 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # LND bitcoind-mode canary — runs a real LND node with satd as its
+  # `bitcoind` backend: JSON-RPC for chain queries and Bitcoin Core's ZMQ
+  # topics (`-zmqpubrawblock` / `-zmqpubrawtx`, one port each, as Umbrel lays
+  # them out) for blocks and mempool transactions. Asserts LND syncs to
+  # satd's tip, sees a payment made outside it as unconfirmed before any block
+  # (rawtx), and confirms it after exactly one block (rawblock, delivered
+  # without waiting for a later message). LND also checks
+  # `getzmqnotifications` at startup and refuses to run without both topics.
+  canary-lnd-bitcoind:
+    name: canary / LND bitcoind
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          # Third-party apt sources dropped first; see the LND Neutrino job.
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run LND bitcoind canary
+        run: bash scripts/canary/lnd-bitcoind-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lnd-bitcoind-canary-logs
+          path: /tmp/satd-canary-lnd-bitcoind.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Electrum reference-wallet canary — runs the actual Electrum wallet
   # (spesmilo/electrum, the canonical client) headless against satd's
   # Electrum server. Unlike the BDK canary (electrum-client library) and

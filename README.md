@@ -81,6 +81,7 @@ satd is built with these priorities in mind:
 *   **Core-Compatible:** Accepts standard `bitcoin.conf` and CLI flags (`-prune`, `-txindex`, `-assumevalid`). Supports standard `.cookie` auth. AssumeUTXO fast-sync is supported via the `loadtxoutset` RPC (Core's snapshot files load directly). *Note: While AssumeUTXO support is fully implemented and compatible with existing commonly-distributed snapshots, we do not create or distribute these snapshots ourselves; users must find their own source for trusted snapshots.*
 *   **Mempool Stream:** `subscribemempool` JSON-RPC WS subscription with explicit eviction/replacement reasons.
 *   **Events Bus:** gRPC + ZMQ publishers for chain and mempool events (`satd-events`).
+*   **Bitcoin Core ZMQ:** Core's `-zmqpub*` topics (`hashblock`, `hashtx`, `rawblock`, `rawtx`, `sequence`) byte for byte, so LND's `bitcoind` backend and other ZMQ consumers work unchanged.
 *   **Reorg Logging:** Persistent reorg log with an optional webhook.
 
 *(See [`CORE_DIFFERENCES.md`](CORE_DIFFERENCES.md) for a full catalog of intentional deviations and features explicitly out of scope, such as the legacy wallet).*

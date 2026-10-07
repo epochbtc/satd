@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 grpc = ["dep:tonic", "dep:prost", "dep:satd-events-proto", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript", "dep:tls-config", "dep:tokio-rustls"]
-zmq = ["dep:zeromq"]
+zmq = ["dep:zeromq", "dep:bytes", "dep:socket2"]
 ws = ["dep:axum", "dep:futures-util", "dep:tokio-stream", "dep:satd-auth", "dep:miniscript"]
 
 [dependencies]
@@ -39,6 +39,10 @@ tokio-rustls = { workspace = true, optional = true }
 
 # zmq feature
 zeromq = { workspace = true, optional = true }
+# In-tree ZMTP 3.0 PUB transport (`zmtp`): shared message bodies, and
+# SO_KEEPALIVE on accepted subscriber connections.
+bytes = { version = "1", optional = true }
+socket2 = { version = "0.6", optional = true }
 
 # ws feature (JSON-over-WebSocket + SSE firehose transport)
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"], optional = true }
@@ -54,3 +58,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # self-signed cert, tokio-rustls drives the client side of the handshake.
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
+
+[[example]]
+name = "zmtp_pub"
+required-features = ["zmq"]

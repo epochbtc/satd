@@ -32,9 +32,10 @@ source "$HERE/PIN"
 # Sparse set: the functional suite plus the data files some tests read.
 # share/rpcauth is referenced as RPCAUTH= in the generated config.ini; tests
 # that build RPC credentials invoke it directly.
-# src/rpc is fetched for gen-named-params.py, which derives satd's
-# named-parameter table from Core's own RPCHelpMan declarations.
-SPARSE_PATHS=(test/functional src/test/data share/rpcauth src/rpc)
+# src/rpc and src/zmq (where getzmqnotifications is declared) are fetched for
+# gen-named-params.py, which derives satd's named-parameter table from Core's
+# own RPCHelpMan declarations.
+SPARSE_PATHS=(test/functional src/test/data share/rpcauth src/rpc src/zmq)
 
 have_pin() {
     [[ -f "$CORE_DIR/.satd-core-commit" ]] &&

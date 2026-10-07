@@ -3495,6 +3495,8 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
     use node::mempool::events::{EvictReason as RustReason, MempoolEvent as Mp};
     use pb::mempool_event::Body as MpBody;
 
+    // `mempool_sequence` and `raw_tx` are in-process fields for the Core ZMQ
+    // publisher; the streaming wire format does not carry them.
     let body = match ev {
         Mp::Enter {
             txid,
@@ -3502,6 +3504,8 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
             vsize,
             fee_rate_sat_per_kvb,
             time,
+            mempool_sequence: _,
+            raw_tx: _,
         } => MpBody::Enter(pb::MempoolEnter {
             txid: txid.as_raw_hash().to_byte_array().to_vec(),
             fee: *fee,
@@ -3513,12 +3517,13 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
             txid,
             block_hash,
             height,
+            mempool_sequence: _,
         } => MpBody::LeaveConfirmed(pb::MempoolLeaveConfirmed {
             txid: txid.as_raw_hash().to_byte_array().to_vec(),
             block_hash: block_hash.as_raw_hash().to_byte_array().to_vec(),
             height: *height,
         }),
-        Mp::LeaveEvicted { txid, reason } => MpBody::LeaveEvicted(pb::MempoolLeaveEvicted {
+        Mp::LeaveEvicted { txid, reason, mempool_sequence: _ } => MpBody::LeaveEvicted(pb::MempoolLeaveEvicted {
             txid: txid.as_raw_hash().to_byte_array().to_vec(),
             reason: match reason {
                 RustReason::FullPool => pb::EvictReason::FullPool as i32,
@@ -3531,6 +3536,7 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
         Mp::LeaveReplaced {
             txid,
             replacing_txid,
+            mempool_sequence: _,
         } => MpBody::LeaveReplaced(pb::MempoolLeaveReplaced {
             txid: txid.as_raw_hash().to_byte_array().to_vec(),
             replacing_txid: replacing_txid.as_raw_hash().to_byte_array().to_vec(),
@@ -4636,6 +4642,8 @@ mod tests {
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
             time: 1_700_000_000,
+            mempool_sequence: 1,
+            raw_tx: None,
         }
     }
 
@@ -4668,6 +4676,7 @@ mod tests {
                     bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
                 ),
                 reason: rust,
+                mempool_sequence: 1,
             };
             let pb_ev = mempool_event_to_proto(&ev);
             match pb_ev.body.unwrap() {

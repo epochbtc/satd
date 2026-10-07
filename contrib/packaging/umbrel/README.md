@@ -153,15 +153,13 @@ declares `implements: [bitcoin]`, and a dependent like `electrs` declares
 to `APP_BITCOIN_<VAR>`, and that variable set is what a substitute owes its
 dependents.
 
-satd cannot honour it. Two of those exports it can — it accepts Core-format
-`rpcauth`, so `RPC_USER`/`RPC_PASS` are reachable — but
-`ZMQ_RAWBLOCK_PORT` and `ZMQ_RAWTX_PORT` name topics satd does not publish.
-It serves Core-compatible `hashblock`/`hashtx` and its own JSON topics, which
-is exactly why the reference stack runs LND in Neutrino mode rather than
-bitcoind mode. There is no way to declare "implements `bitcoin`, except the
-raw topics": a dependent that needs them would install cleanly against satd
-and then fail at runtime, and the ones that do not need them would work.
-Shipping that is worse than not offering the substitution at all.
+Before 0.7.0 satd could not honour it. It accepts Core-format `rpcauth`, so
+`RPC_USER`/`RPC_PASS` were reachable, but `ZMQ_RAWBLOCK_PORT` and
+`ZMQ_RAWTX_PORT` named topics satd did not publish, and there is no way to
+declare "implements `bitcoin`, except the raw topics": a dependent that needs
+them would install cleanly against satd and then fail at runtime.
 
-Revisit this if satd grows raw block and transaction ZMQ topics. Until then
-satd runs standalone and dependent apps keep using Core.
+satd 0.7.0 publishes Bitcoin Core's ZMQ topics (`-zmqpub*`, one port per
+topic as the `bitcoin` app exports them), which removes that obstacle.
+Declaring `implements: [bitcoin]` is separate packaging work, and until it
+ships satd runs standalone and dependent apps keep using Core.

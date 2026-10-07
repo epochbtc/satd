@@ -816,6 +816,8 @@ mod tests {
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
             time: 1_700_000_000,
+            mempool_sequence: 1,
+            raw_tx: None,
         });
         let env = NodeEvent::new(stamp(), body);
         let v = serde_json::to_value(&env).unwrap();
@@ -837,6 +839,7 @@ mod tests {
                 replacing_txid: Txid::from_raw_hash(
                     bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
                 ),
+                mempool_sequence: 1,
             }),
         );
         let env_c = NodeEvent::new(

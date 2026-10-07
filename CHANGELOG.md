@@ -15,7 +15,19 @@ Bound for **0.7.0**, a minor release on the 0.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.7.0-pre.md`](docs/release-notes/0.7.0-pre.md).
 
-Nothing yet.
+### Added
+
+- Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
+  `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
+  so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering
+  between block and mempool messages differs from Core; the streaming API
+  remains the recommended interface.
+
+### Fixed
+
+- A reorg of more than about 30 blocks could overflow the chain-event channel,
+  and streaming subscribers silently missed blocks from it; the channel now
+  holds 1024 events.
 
 ## Releases
 

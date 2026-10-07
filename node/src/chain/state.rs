@@ -15450,6 +15450,58 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A reorg emits its whole tail (marker, every disconnect, every connect)
+    /// back to back under the accept lock, before any subscriber gets to run.
+    /// The production channel has to hold all of it: a 100-block reorg is 202
+    /// events, and at the old capacity of 64 the subscriber came back to
+    /// `Lagged` and a hole where most of the reorg had been.
+    #[test]
+    fn chain_event_capacity_survives_long_reorg() {
+        use crate::chain::events::{CHAIN_EVENT_BROADCAST_CAPACITY, ChainEvent};
+        const DEPTH: u32 = 100;
+        let (cs, dir) = make_chain_state();
+        let (chain_tx, mut chain_rx) =
+            tokio::sync::broadcast::channel::<ChainEvent>(CHAIN_EVENT_BROADCAST_CAPACITY);
+        cs.set_chain_event_sender(chain_tx);
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut prev = genesis_hash;
+        for h in 1..=DEPTH {
+            let b = build_test_block(prev, h, 1_300_000_000 + h);
+            prev = cs.accept_block(&b).expect("accept A").hash();
+        }
+        let old_tip = prev;
+        while chain_rx.try_recv().is_ok() {}
+
+        // One block longer, so its last block triggers the reorg.
+        let mut prev = genesis_hash;
+        for h in 1..=DEPTH + 1 {
+            let b = build_test_block(prev, h, 1_300_100_000 + h);
+            prev = cs.accept_block(&b).expect("accept B").hash();
+        }
+        assert_eq!(cs.tip_hash(), prev, "premise: the longer branch is active");
+
+        let mut events = Vec::new();
+        loop {
+            match chain_rx.try_recv() {
+                Ok(ev) => events.push(ev),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(e) => panic!("subscriber lost reorg events: {e:?} after {}", events.len()),
+            }
+        }
+        assert_eq!(events.len(), 1 + DEPTH as usize + (DEPTH as usize + 1));
+        assert!(
+            matches!(events[0], ChainEvent::Reorg { old_tip: o, new_tip: n, .. } if o == old_tip && n == prev),
+            "{:?}",
+            events[0]
+        );
+        let disconnected = events.iter().filter(|e| matches!(e, ChainEvent::BlockDisconnected { .. })).count();
+        let connected = events.iter().filter(|e| matches!(e, ChainEvent::BlockConnected { .. })).count();
+        assert_eq!((disconnected, connected), (DEPTH as usize, DEPTH as usize + 1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_reorg_back_to_previously_disconnected_branch() {
         // Stale-Valid fork-point regression: a previously disconnected

@@ -37,7 +37,8 @@ on any of them cannot contend with the threads that connect blocks:
 
 - Esplora REST and SSE
 - the Electrum protocol server
-- the events gRPC and ZMQ sinks, and the streaming WS/SSE (`streamws`)
+- the events gRPC and ZMQ sinks (satd's `-eventszmqbind` and Bitcoin Core's
+  `-zmqpub*`), and the streaming WS/SSE (`streamws`)
 - the Prometheus `/metrics`, `/healthz`, and `/readyz` endpoints
 - the opt-in read-only JSON-RPC listener (`-rpcreadonlybind`)
 

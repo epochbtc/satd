@@ -8,7 +8,9 @@
 //! broadcast will see `RecvError::Lagged` and miss events, but the
 //! mempool's consensus path never blocks on broadcast send.
 
-use bitcoin::{BlockHash, Txid};
+use std::sync::Arc;
+
+use bitcoin::{BlockHash, Transaction, Txid};
 use serde::Serialize;
 
 /// Reason a mempool tx was evicted by policy (distinct from confirmed
@@ -53,6 +55,14 @@ impl EvictReason {
 
 /// Event emitted on a mempool state transition. Serialized to the WS
 /// subscription payload verbatim (the `kind` tag discriminates).
+///
+/// The `mempool_sequence` and `raw_tx` fields are in-process only: they are
+/// `#[serde(skip)]`, the gRPC mapping does not carry them, and no streaming
+/// wire format changes because of them. They exist for the Bitcoin
+/// Core-compatible ZMQ publisher (`-zmqpub*`), whose `sequence` topic reports
+/// Core's mempool sequence number and whose `rawtx` topic needs the
+/// transaction even when it has already left the mempool by the time the
+/// event is published.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MempoolEvent {
@@ -63,20 +73,42 @@ pub enum MempoolEvent {
         vsize: u64,
         fee_rate_sat_per_kvb: u64,
         time: u64,
+        /// The mempool sequence number this addition took: the counter
+        /// `getrawmempool(false, true)` reports, read *before* the addition
+        /// incremented it, as Core's `sequence` ZMQ topic carries it.
+        #[serde(skip)]
+        mempool_sequence: u64,
+        /// The transaction, captured at admission. `Some` only while
+        /// [`Mempool::set_emit_raw_tx`](crate::mempool::pool::Mempool::set_emit_raw_tx)
+        /// is on, which a `-zmqpubrawtx` publisher turns on.
+        #[serde(skip)]
+        raw_tx: Option<Arc<Transaction>>,
     },
     /// Transaction confirmed in a block and removed from the mempool.
     LeaveConfirmed {
         txid: Txid,
         block_hash: BlockHash,
         height: u32,
+        /// The mempool sequence number the removal took (see `Enter`).
+        #[serde(skip)]
+        mempool_sequence: u64,
     },
     /// Transaction removed by policy (not confirmation, not replacement).
-    LeaveEvicted { txid: Txid, reason: EvictReason },
+    LeaveEvicted {
+        txid: Txid,
+        reason: EvictReason,
+        /// The mempool sequence number the removal took (see `Enter`).
+        #[serde(skip)]
+        mempool_sequence: u64,
+    },
     /// Transaction replaced by a conflicting RBF candidate. `replacing_txid`
     /// is the txid of the incoming tx that caused the eviction.
     LeaveReplaced {
         txid: Txid,
         replacing_txid: Txid,
+        /// The mempool sequence number the removal took (see `Enter`).
+        #[serde(skip)]
+        mempool_sequence: u64,
     },
 }
 
@@ -88,6 +120,29 @@ impl MempoolEvent {
             | Self::LeaveEvicted { txid, .. }
             | Self::LeaveReplaced { txid, .. } => txid,
         }
+    }
+
+    /// The mempool sequence number the transition took (see
+    /// [`MempoolEvent::Enter`]).
+    pub fn mempool_sequence(&self) -> u64 {
+        match self {
+            Self::Enter { mempool_sequence, .. }
+            | Self::LeaveConfirmed { mempool_sequence, .. }
+            | Self::LeaveEvicted { mempool_sequence, .. }
+            | Self::LeaveReplaced { mempool_sequence, .. } => *mempool_sequence,
+        }
+    }
+
+    /// This event without the captured transaction, for buffers that keep
+    /// events around after they are published: a ring of `Enter`s must not
+    /// pin a few hundred transactions in memory for a reader that only wants
+    /// their txids.
+    pub fn without_raw_tx(&self) -> Self {
+        let mut ev = self.clone();
+        if let Self::Enter { raw_tx, .. } = &mut ev {
+            *raw_tx = None;
+        }
+        ev
     }
 }
 
@@ -169,11 +224,75 @@ mod tests {
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
             time: 1_700_000_000,
+            mempool_sequence: 1,
+            raw_tx: None,
         };
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "enter");
         assert_eq!(j["fee"], 100);
         assert_eq!(j["vsize"], 250);
+    }
+
+    /// The fields the Core-compatible ZMQ publisher reads are in-process only:
+    /// no JSON carrier (WS, SSE, the `nodeevent` ZMQ topic) may start sending
+    /// them, or a subscriber pinned to the documented shape would see new keys.
+    #[test]
+    fn mempool_event_internal_fields_not_serialized() {
+        let raw = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let events = [
+            MempoolEvent::Enter {
+                txid: tx(1),
+                fee: 100,
+                vsize: 250,
+                fee_rate_sat_per_kvb: 400,
+                time: 1_700_000_000,
+                mempool_sequence: 7,
+                raw_tx: Some(Arc::new(raw)),
+            },
+            MempoolEvent::LeaveConfirmed {
+                txid: tx(2),
+                block_hash: bh(9),
+                height: 42,
+                mempool_sequence: 8,
+            },
+            MempoolEvent::LeaveEvicted {
+                txid: tx(3),
+                reason: EvictReason::Expiry,
+                mempool_sequence: 9,
+            },
+            MempoolEvent::LeaveReplaced {
+                txid: tx(4),
+                replacing_txid: tx(5),
+                mempool_sequence: 10,
+            },
+        ];
+        let expected_keys: [&[&str]; 4] = [
+            &["kind", "txid", "fee", "vsize", "fee_rate_sat_per_kvb", "time"],
+            &["kind", "txid", "block_hash", "height"],
+            &["kind", "txid", "reason"],
+            &["kind", "txid", "replacing_txid"],
+        ];
+        for (ev, keys) in events.iter().zip(expected_keys) {
+            let j = serde_json::to_value(ev).unwrap();
+            let mut got: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+            let mut want = keys.to_vec();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "{ev:?}");
+        }
+        assert_eq!(
+            events.iter().map(MempoolEvent::mempool_sequence).collect::<Vec<_>>(),
+            [7, 8, 9, 10]
+        );
+        let MempoolEvent::Enter { raw_tx, .. } = events[0].without_raw_tx() else {
+            unreachable!()
+        };
+        assert!(raw_tx.is_none(), "without_raw_tx drops the transaction");
     }
 
     #[test]
@@ -182,6 +301,7 @@ mod tests {
             txid: tx(2),
             block_hash: bh(9),
             height: 42,
+            mempool_sequence: 1,
         };
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "leave_confirmed");
@@ -208,7 +328,7 @@ mod tests {
                 | EvictReason::Policy
                 | EvictReason::Reorg => {}
             }
-            let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason };
+            let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason, mempool_sequence: 1 };
             let j = serde_json::to_value(&ev).unwrap();
             assert_eq!(j["kind"], "leave_evicted");
             assert_eq!(j["reason"], expected);
@@ -220,6 +340,7 @@ mod tests {
         let ev = MempoolEvent::LeaveReplaced {
             txid: tx(4),
             replacing_txid: tx(5),
+            mempool_sequence: 1,
         };
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "leave_replaced");
