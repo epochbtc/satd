@@ -396,7 +396,8 @@ reason = "no-usdt"
 [[test]]
 file = "interface_zmq.py"
 status = "skip"
-reason = "no-core-zmq"
+reason = "zmq-ordering"
+note = "measured 2026-10-07 with pyzmq, each sub-test run on its own: test_basic (tcp and ipc), test_mempool_sync, test_multiple_interfaces and test_ipv6 pass. test_sequence passes the mempool-sequence and RBF parts, then L401 expects D for the disconnected block and receives A for the transaction the reorg re-admitted; test_reorg L296 expects the disconnected coinbase on hashtx and receives the re-admitted transaction. satd re-admits a reorg's transactions before it reports the reorg's blocks, and promises no order between block and mempool messages"
 
 [[test]]
 file = "mempool_accept.py"

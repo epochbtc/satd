@@ -45,7 +45,7 @@ what satd deliberately is:
 |---|---|
 | `no-wallet` | The test drives the legacy Core wallet. satd is walletless by design — see [CORE_DIFFERENCES.md](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md). |
 | `no-tool` | The test drives a Core-only binary (`bitcoin-tx`, `bitcoin-util`, `bitcoin-wallet`, `bitcoin-chainstate`, `bench_bitcoin`). |
-| `no-core-zmq` | The test uses Core's ZMQ topics. satd's ZMQ carries the [satd-events](streaming.md) wire instead. |
+| `zmq-ordering` | The test asserts Core's ordering between block and mempool ZMQ messages. satd publishes Core's ZMQ messages byte for byte but promises no order between those two groups; see [Bitcoin Core ZMQ compatibility](streaming.md#bitcoin-core-zmq-compatibility). |
 | `no-ipc`, `no-usdt`, `no-qt` | Core interfaces satd does not ship. |
 | `core-internal` | The test asserts on Core implementation details satd does not share — LevelDB files, `blk*.dat` layout, `settings.json`. |
 | `core-net-policy` | The test asserts on Core-specific net artifacts: `anchors.dat`, asmap, banlist format. |

@@ -123,8 +123,9 @@ ENABLE_CLI=true
 # satd is walletless by design (the legacy Core wallet is out of scope).
 ENABLE_WALLET=false
 ENABLE_WALLET_TOOL=false
-# satd's ZMQ carries the satd-events wire, not Core's hashblock/rawtx topics.
-ENABLE_ZMQ=false
+# satd publishes Core's -zmqpub* topics. The framework reads this to expect
+# the "Zmq" help category (rpc_help.py) and to let interface_zmq.py run.
+ENABLE_ZMQ=true
 # Core-only build products and interfaces satd does not ship.
 BUILD_BENCH=false
 BUILD_BITCOIN_TX=false
