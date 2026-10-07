@@ -125,12 +125,20 @@ fn scan_for_op_success(script: &[u8], script_flags: u32) -> Option<Result<(), Sc
 }
 
 /// Check if an opcode is an OP_SUCCESSx (BIP342).
+///
+/// Bitcoin Core's `IsOpSuccess` (src/script/script.cpp:364-370), ranges
+/// copied as written there.
 fn is_op_success(opcode: u8) -> bool {
     matches!(
         opcode,
-        0x50 | 0x62 | 0x7e | 0x7f | 0x89 | 0x8a | 0x8d | 0x8e
-            | 0x95..=0x99 | 0xbb..=0xfe
+        80 | 98 | 126..=129 | 131..=134 | 137..=138 | 141..=142 | 149..=153 | 187..=254
     )
+}
+
+/// Core's `CScript::IsPayToAnchor(version, program)`
+/// (src/script/script.cpp:215-221): witness v1 with the 2-byte program 0x4e73.
+fn is_pay_to_anchor(wit_version: u8, program: &[u8]) -> bool {
+    wit_version == 1 && program == [0x4e, 0x73]
 }
 
 /// Verify a witness program (v0 P2WPKH, v0 P2WSH, v1 Taproot).
@@ -259,6 +267,10 @@ pub fn verify_witness_program(
             }
             return Ok(());
         }
+    } else if !is_p2sh && is_pay_to_anchor(wit_version, program) {
+        // Pay-to-anchor is spendable without being discouraged, as in Core
+        // (src/script/interpreter.cpp:1990).
+        return Ok(());
     } else {
         if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
             return Err(ScriptError::DiscourageUpgradableWitnessProgram);
@@ -372,3 +384,7 @@ fn witness_serialized_size(stack: &[StackItem]) -> usize {
     }
     size
 }
+
+#[cfg(test)]
+#[path = "witness_opsuccess_tests.rs"]
+mod opsuccess_tests;
