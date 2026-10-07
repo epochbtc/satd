@@ -10184,14 +10184,21 @@ impl PeerManager {
                                 flow.queued();
                             }
                             // Nothing more is read until the manager has
-                            // served this request (`reading_paused`).
-                            if let (NetworkMessage::GetData(_), Some(q)) = (&msg, &send_queue) {
+                            // served this request (`reading_paused`), so it
+                            // is served now rather than at the manager's next
+                            // tick: a peer fetching blocks sends one `getdata`
+                            // after another.
+                            let getdata = matches!(msg, NetworkMessage::GetData(_));
+                            if let (true, Some(q)) = (getdata, &send_queue) {
                                 q.note_getdata_forwarded();
                             }
                             event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
+                            if let (true, Some(wake)) = (getdata, &drain_now) {
+                                wake.notify_one();
+                            }
                         }
                         None => {
                             // Reader task ended (error or timeout)
@@ -10233,6 +10240,9 @@ impl PeerManager {
                                         .send(NetEvent::GetDataResume { id })
                                         .await
                                         .map_err(|e| e.to_string())?;
+                                    if let Some(wake) = &drain_now {
+                                        wake.notify_one();
+                                    }
                                 }
                             }
                         }

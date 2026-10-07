@@ -569,6 +569,8 @@ struct Loop {
     msg_tx: crate::net::send_queue::PeerSender,
     read_tx: mpsc::Sender<NetworkMessage>,
     disconnect: Arc<tokio::sync::Notify>,
+    /// The manager's drain wake-up.
+    drain_now: Arc<tokio::sync::Notify>,
     stats: Arc<PeerStats>,
     far: tokio::net::TcpStream,
     task: tokio::task::JoinHandle<Result<(), String>>,
@@ -581,8 +583,9 @@ async fn run_loop() -> Loop {
     let msg_tx = crate::net::send_queue::PeerSender::from(msg_tx);
     let (read_tx, mut read_rx) = mpsc::channel::<NetworkMessage>(64);
     let disconnect = Arc::new(tokio::sync::Notify::new());
+    let drain_now = Arc::new(tokio::sync::Notify::new());
     let queue = msg_tx.queue().clone();
-    let (s, d) = (stats.clone(), disconnect.clone());
+    let (s, d, w) = (stats.clone(), disconnect.clone(), drain_now.clone());
     let task = tokio::spawn(async move {
         let _keep = _reader;
         PeerManager::peer_write_loop(
@@ -593,13 +596,13 @@ async fn run_loop() -> Loop {
             &mut read_rx,
             Some(s),
             Some(Arc::new(crate::net::flow::PeerFlow::new())),
-            None,
+            Some(w),
             Some(d),
             Some(queue),
         )
         .await
     });
-    Loop { id: 7, event_rx, msg_tx, read_tx, disconnect, stats, far, task }
+    Loop { id: 7, event_rx, msg_tx, read_tx, disconnect, drain_now, stats, far, task }
 }
 
 /// Queue big messages until the socket stops taking bytes: the far end is
@@ -672,6 +675,9 @@ async fn reading_waits_for_a_getdata_to_be_served() {
     l.read_tx.send(NetworkMessage::SendHeaders).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv()).await.unwrap();
     assert!(matches!(first, Some(NetEvent::MessageReceived { msg: NetworkMessage::GetData(_), .. })));
+    tokio::time::timeout(Duration::from_secs(1), l.drain_now.notified())
+        .await
+        .expect("the manager is woken to serve the getdata, not left to its next tick");
     let early = tokio::time::timeout(Duration::from_millis(300), l.event_rx.recv()).await;
     assert!(early.is_err(), "nothing after the getdata is read before it is served");
 
@@ -719,6 +725,9 @@ async fn the_loop_asks_for_more_once_the_queue_drains() {
     .await
     .expect("a resume is asked for");
     assert_eq!(ev, l.id);
+    tokio::time::timeout(Duration::from_secs(1), l.drain_now.notified())
+        .await
+        .expect("the manager is woken to serve it");
     assert_eq!(queue.queued_bytes(), 0);
     l.disconnect.notify_one();
     let _ = l.task.await;
