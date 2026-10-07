@@ -6,12 +6,19 @@
 use bitcoin::BlockHash;
 use serde::Serialize;
 
-/// Capacity of the chain-event broadcast channel. Sized so a slow
-/// consumer can pause for a few seconds at typical block cadence
-/// (~10 min mainnet, ~10 s regtest under stress) without missing
-/// events. Lagged consumers see `RecvError::Lagged` and resync from
-/// chain state — same contract as the mempool channel.
-pub const CHAIN_EVENT_BROADCAST_CAPACITY: usize = 64;
+/// Capacity of the chain-event broadcast channel.
+///
+/// A reorg is the largest burst the chain produces in one go: one `Reorg`
+/// marker, one `BlockDisconnected` per block it unwinds and one
+/// `BlockConnected` per block it connects, all sent back to back under the
+/// accept lock. At the old capacity of 64 a reorg of more than about 30
+/// blocks could overrun the ring before the event-bus bridge drained it, and
+/// the bridge dropped the overflow with only a log line, so a streaming or
+/// ZMQ subscriber silently missed blocks. 1024 covers a reorg of 500 blocks
+/// with room to spare; `ChainEvent` is 76 bytes, so the ring holds 76 KiB.
+/// Lagged consumers still see `RecvError::Lagged` and resync from chain
+/// state — same contract as the mempool channel.
+pub const CHAIN_EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 /// Chain-tip transition. A reorg emits one `Reorg` marker (fork point and
 /// new tip) followed by one `BlockDisconnected` per disconnected block and

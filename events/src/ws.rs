@@ -2390,6 +2390,8 @@ mod tests {
                 vsize: 1,
                 fee_rate_sat_per_kvb: 1,
                 time: 1,
+                mempool_sequence: 1,
+                raw_tx: None,
             }),
         )
     }

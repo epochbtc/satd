@@ -2763,10 +2763,10 @@ pub async fn run_watch_matcher(
                 // (LeaveConfirmed) is intentionally NOT handled here — the
                 // confirmed leg is sourced from scan_block, which also catches
                 // txs that were never in this node's mempool.
-                Ok(MempoolEvent::LeaveReplaced { txid, replacing_txid }) => {
+                Ok(MempoolEvent::LeaveReplaced { txid, replacing_txid, .. }) => {
                     registry.notify_replaced(txid, replacing_txid);
                 }
-                Ok(MempoolEvent::LeaveEvicted { txid, reason }) => {
+                Ok(MempoolEvent::LeaveEvicted { txid, reason, .. }) => {
                     registry.notify_evicted(txid, reason);
                 }
                 Ok(_) => {}
