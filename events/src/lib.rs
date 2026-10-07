@@ -3,7 +3,8 @@
 //! only the dependencies they need:
 //!
 //! - `grpc` — `tonic`-based server-streaming gRPC adapter.
-//! - `zmq`  — Bitcoin Core-compatible ZMQ PUB sockets.
+//! - `zmq`  — ZMQ PUB sockets: the satd-native `-eventszmqbind` sink and
+//!   Bitcoin Core's `-zmqpub*` notifications.
 //!
 //! The bus core lives in `node::events`; this crate only contains the
 //! adapter-side glue.
@@ -29,6 +30,13 @@ pub mod zmq;
 // In-tree ZMTP 3.0 PUB server for the Core-compatible `-zmqpub*` topics.
 #[cfg(feature = "zmq")]
 pub mod zmtp;
+
+// Bitcoin Core's `-zmqpub*` notifications, published from the event bus.
+#[cfg(feature = "zmq")]
+pub mod core_zmq;
+
+#[cfg(feature = "zmq")]
+pub use core_zmq::{CoreZmqBindError, CoreZmqChain, CoreZmqMempool, CoreZmqSink};
 
 #[cfg(feature = "zmq")]
 pub use zmq::{ZmqEventSink, ZmqEventSinkError, ZmqTopicConfig};

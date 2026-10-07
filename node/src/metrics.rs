@@ -307,6 +307,9 @@ impl MetricsContext {
         if let Some(stratum) = self.listeners.as_ref().and_then(|l| l.stratum_handle()) {
             render_stratum(&mut out, stratum.stats());
         }
+        if let Some(zmq) = self.listeners.as_ref().and_then(|l| l.core_zmq()) {
+            render_core_zmq(&mut out, &zmq);
+        }
         metric(
             &mut out,
             "satd_peer_ping_timeouts_total",
@@ -755,6 +758,67 @@ fn render_stratum(out: &mut String, stats: &crate::stratum::StratumStats) {
         "gauge",
     );
     let _ = writeln!(out, "satd_stratum_hashrate_hashes_per_second {}", stats.miners.hashrate());
+}
+
+/// The Core-compatible ZMQ publisher (`-zmqpub*`). Rendered only while it
+/// runs, so a node without `-zmqpub*`, or whose bind failed, exports none of
+/// these.
+fn render_core_zmq(out: &mut String, zmq: &crate::events::core_zmq::CoreZmqStatus) {
+    use crate::events::core_zmq::CoreZmqTopic;
+    metric_header(
+        out,
+        "satd_zmq_messages_total",
+        "Messages published on the Bitcoin Core-compatible ZMQ topics, by topic. Counts every message a notifier sends, subscribed to or not.",
+        "counter",
+    );
+    for topic in CoreZmqTopic::ALL {
+        metric_sample(
+            out,
+            "satd_zmq_messages_total",
+            &[("topic", topic.name())],
+            zmq.messages_total(topic),
+        );
+    }
+    metric(
+        out,
+        "satd_zmq_subscribers",
+        "Subscribers connected to the Core-compatible ZMQ sockets.",
+        "gauge",
+        &[],
+        zmq.subscribers(),
+    );
+    metric(
+        out,
+        "satd_zmq_subscriber_drops_total",
+        "Core-compatible ZMQ messages dropped for a subscriber whose queue was at its high-water mark or its byte cap.",
+        "counter",
+        &[],
+        zmq.subscriber_drops_total(),
+    );
+    metric(
+        out,
+        "satd_zmq_events_lagged_total",
+        "Node events the Core-compatible ZMQ publisher fell too far behind to read. Each lag shows its subscribers a sequence-number gap.",
+        "counter",
+        &[],
+        zmq.events_lagged_total(),
+    );
+    metric(
+        out,
+        "satd_zmq_rawtx_unavailable_total",
+        "Admitted transactions whose rawtx message was skipped because the transaction was no longer available.",
+        "counter",
+        &[],
+        zmq.rawtx_unavailable_total(),
+    );
+    metric(
+        out,
+        "satd_zmq_block_read_failures_total",
+        "Blocks whose hashtx, rawtx and rawblock messages were skipped because the block could not be read.",
+        "counter",
+        &[],
+        zmq.block_read_failures_total(),
+    );
 }
 
 fn metric(
@@ -1977,6 +2041,43 @@ mod tests {
         let mut out = String::new();
         render_stratum(&mut out, &stats);
         assert!(out.contains("satd_stratum_miners 0"), "a disconnected miner leaves the gauge: {out}");
+    }
+
+    #[test]
+    fn core_zmq_metrics_are_valid_exposition_format() {
+        use crate::events::core_zmq::{CoreZmqNotifier, CoreZmqSocketStats, CoreZmqStatus, CoreZmqTopic};
+        struct Socket;
+        impl CoreZmqSocketStats for Socket {
+            fn subscriber_count(&self) -> usize {
+                2
+            }
+            fn dropped_total(&self) -> u64 {
+                5
+            }
+        }
+        let socket: std::sync::Arc<dyn CoreZmqSocketStats> = std::sync::Arc::new(Socket);
+        let notifier = CoreZmqNotifier {
+            topic: CoreZmqTopic::RawTx,
+            address: "tcp://127.0.0.1:28333".into(),
+            hwm: 1000,
+        };
+        let status = CoreZmqStatus::new(vec![notifier], vec![std::sync::Arc::downgrade(&socket)]);
+        status.record_message(CoreZmqTopic::RawTx);
+        status.record_message(CoreZmqTopic::RawTx);
+        status.record_events_lagged(3);
+        let mut out = String::new();
+        render_core_zmq(&mut out, &status);
+        assert_one_header_per_family(&out);
+        assert!(out.contains("satd_zmq_messages_total{topic=\"rawtx\"} 2"), "{out}");
+        assert!(out.contains("satd_zmq_messages_total{topic=\"hashblock\"} 0"), "{out}");
+        assert!(out.contains("satd_zmq_subscribers 2"), "{out}");
+        assert!(out.contains("satd_zmq_subscriber_drops_total 5"), "{out}");
+        assert!(out.contains("satd_zmq_events_lagged_total 3"), "{out}");
+        // A closed socket stops counting rather than keeping it alive.
+        drop(socket);
+        let mut out = String::new();
+        render_core_zmq(&mut out, &status);
+        assert!(out.contains("satd_zmq_subscribers 0"), "{out}");
     }
 
     #[test]

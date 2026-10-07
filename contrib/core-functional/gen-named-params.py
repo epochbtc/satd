@@ -337,6 +337,8 @@ def core_sources(bitcoin_dir):
     import glob
     paths = sorted(glob.glob(os.path.join(bitcoin_dir, "src/rpc/*.cpp")))
     paths += sorted(glob.glob(os.path.join(bitcoin_dir, "src/wallet/rpc/*.cpp")))
+    # getzmqnotifications lives with the ZMQ code, not under src/rpc.
+    paths += sorted(glob.glob(os.path.join(bitcoin_dir, "src/zmq/zmqrpc.cpp")))
     if not paths:
         sys.exit(f"no Core RPC sources under {bitcoin_dir}/src/rpc")
     return paths
