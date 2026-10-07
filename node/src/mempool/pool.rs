@@ -2501,8 +2501,30 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
-        let accepted =
-            self.accept_transaction_unexpired(tx, chain_state, script_verifier, source, allow_quarantined)?;
+        self.accept_transaction_led(tx, chain_state, script_verifier, source, allow_quarantined, Vec::new())
+    }
+
+    /// [`Self::accept_transaction`], emitting `lead` ahead of the
+    /// transaction's own events if it is accepted and dropping it if not.
+    /// [`Self::accept_package`] passes the `Enter` of each dust parent whose
+    /// place in the pool depends on this transaction.
+    fn accept_transaction_led(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        source: TxSource,
+        allow_quarantined: bool,
+        lead: Vec<MempoolEvent>,
+    ) -> Result<Txid, MempoolError> {
+        let accepted = self.accept_transaction_unexpired(
+            tx,
+            chain_state,
+            script_verifier,
+            source,
+            allow_quarantined,
+            lead,
+        )?;
         // Core expires the pool after every acceptance (`LimitMempoolSize` in
         // `MemPoolAccept::Finalize`), so `-mempoolexpiry` is enforced at the
         // moment the pool changes, not up to a timer tick later.
@@ -2517,6 +2539,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         source: TxSource,
         allow_quarantined: bool,
+        lead: Vec<MempoolEvent>,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
@@ -3156,6 +3179,11 @@ impl Mempool {
         // are best-effort but keeping the lock duration tight is the rule.
         drop(inner);
 
+        // Inserted before anything this acceptance changed, so their sequence
+        // numbers are lower.
+        for event in lead {
+            self.emit(event);
+        }
         // `evicted_full_pool` is always drawn from the incoming tx's own class
         // (`evict_lowest_fee_entries` filters to `quarantined`). Acting-class
         // evictions go on the standard stream as before; quarantine-class
@@ -5510,8 +5538,10 @@ impl Mempool {
         // bypass_limits (zero fee allowed).
         let mut parents_to_accept: Vec<Txid> = Vec::new();
         // The mempool sequence number each admitted ephemeral parent took,
-        // for its `Enter`, which is emitted only after the unwind below.
+        // for its `Enter`, which waits for the child that sweeps its dust.
         let mut parent_sequence: HashMap<Txid, u64> = HashMap::new();
+        // The admitted ephemeral parents whose `Enter` has gone out.
+        let mut announced: HashSet<Txid> = HashSet::new();
         let mut children_to_accept: Vec<Txid> = Vec::new();
 
         // First identify which deferred txs are parents and which are children.
@@ -5696,15 +5726,45 @@ impl Mempool {
                 continue;
             }
 
-            match self.accept_transaction(
+            // The admitted dust parents this child sweeps stay in the pool
+            // only if it is accepted (the unwind below), so their `Enter`s go
+            // out with its own, ahead of them and in the order the parents
+            // went in. A subscriber sees each parent before the child that
+            // spends it, as Core announces a package, and never sees a parent
+            // the unwind removes.
+            let mut swept: Vec<(u64, Txid)> = parent_sequence
+                .iter()
+                .filter(|(parent, _)| !announced.contains(*parent))
+                .filter(|(parent, _)| {
+                    ephemeral_parents.get(*parent).is_some_and(|parent_tx| {
+                        Self::dust_output_indices(parent_tx, cfg.dust_relay_fee)
+                            .iter()
+                            .all(|&di| {
+                                child_tx.input.iter().any(|i| {
+                                    i.previous_output.txid == **parent && i.previous_output.vout == di
+                                })
+                            })
+                    })
+                })
+                .map(|(parent, seq)| (*seq, *parent))
+                .collect();
+            swept.sort_unstable();
+            let lead: Vec<MempoolEvent> = swept
+                .iter()
+                .filter_map(|(seq, parent)| self.dust_parent_enter(parent, *seq))
+                .collect();
+
+            match self.accept_transaction_led(
                 child_tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
+                lead,
             ) {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
+                    announced.extend(swept.iter().map(|(_, parent)| *parent));
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&txid) {
                         accepted_results.push(AcceptedMember::from_entry(
@@ -5749,40 +5809,31 @@ impl Mempool {
         // parent had been accepted.
         accepted_results.retain(|m| !stranded.contains(&m.txid));
 
-        // Announce the ephemeral parents that survived.
+        // Announce any ephemeral parent that survived without a child from the
+        // loop above announcing it.
         //
         // `accept_transaction_bypass_fee` inserts without emitting, and it has
         // to: at that point the parent's fate still depends on a child that has
-        // not been through acceptance. Emitting there and retracting here would
-        // put an Enter/Leave pair on the stream for a transaction that was never
-        // really in the mempool. Emitting once, after the unwind, means a
-        // subscriber sees exactly what stayed -- and every member of an accepted
-        // package gets its `Enter`, which is what a consumer reconstructing
-        // mempool membership from the stream needs.
+        // not been through acceptance. Emitting there and retracting after the
+        // unwind would put an Enter/Leave pair on the stream for a transaction
+        // that was never really in the mempool. The sweeping child normally
+        // carries the `Enter`; a parent whose dust was swept some other way (a
+        // shape `submitpackage`'s topology check refuses) is announced here,
+        // so every member of an accepted package still gets its `Enter`, which
+        // is what a consumer reconstructing mempool membership from the stream
+        // needs.
         for parent_txid in &parents_to_accept {
             // Every parent still in `accepted_txids` here was admitted by the
             // bypass above, which recorded its sequence number.
-            if !accepted_txids.contains(parent_txid) {
+            if !accepted_txids.contains(parent_txid) || announced.contains(parent_txid) {
                 continue;
             }
             let Some(&mempool_sequence) = parent_sequence.get(parent_txid) else {
                 continue;
             };
-            let Some(entry) = self.get(parent_txid) else {
-                continue;
-            };
-            // The parent's number is lower than the child's, which was
-            // announced as it was accepted: on the stream this `Enter` follows
-            // one with a higher sequence.
-            self.emit(MempoolEvent::Enter {
-                txid: *parent_txid,
-                fee: entry.fee,
-                vsize: policy::weight_to_vsize(entry.weight as u64),
-                fee_rate_sat_per_kvb: entry.fee_rate,
-                time: entry.time,
-                mempool_sequence,
-                raw_tx: self.raw_tx_for_event(&entry.tx),
-            });
+            if let Some(event) = self.dust_parent_enter(parent_txid, mempool_sequence) {
+                self.emit(event);
+            }
         }
 
         // Determine package_msg.
@@ -5911,6 +5962,22 @@ impl Mempool {
         PackageResult { package_msg, tx_results, replaced }
     }
 
+    /// The `Enter` of an ephemeral dust parent, which
+    /// [`Self::accept_transaction_bypass_fee`] admitted without one, with the
+    /// sequence number its insert took. `None` if it is no longer in the pool.
+    fn dust_parent_enter(&self, txid: &Txid, mempool_sequence: u64) -> Option<MempoolEvent> {
+        let entry = self.get(txid)?;
+        Some(MempoolEvent::Enter {
+            txid: *txid,
+            fee: entry.fee,
+            vsize: policy::weight_to_vsize(entry.weight as u64),
+            fee_rate_sat_per_kvb: entry.fee_rate,
+            time: entry.time,
+            mempool_sequence,
+            raw_tx: self.raw_tx_for_event(&entry.tx),
+        })
+    }
+
     /// Remove any ephemeral dust parent that made it into the mempool without
     /// the child that was supposed to sweep its dust.
     ///
@@ -5982,10 +6049,10 @@ impl Mempool {
             self.sync_unbroadcast_len(&inner);
         }
 
-        // No `LeaveEvicted`: the `Enter` for these is emitted by the caller
-        // *after* this runs, precisely so an unwound parent is never announced
-        // in the first place. A subscriber sees nothing rather than a pair it
-        // has to reconcile.
+        // No `LeaveEvicted`: the caller emits a parent's `Enter` only with the
+        // accepted child that sweeps its dust, or *after* this runs, precisely
+        // so an unwound parent is never announced in the first place. A
+        // subscriber sees nothing rather than a pair it has to reconcile.
         for txid in &removed {
             accepted_txids.remove(txid);
         }
@@ -12306,14 +12373,114 @@ mod tests {
         }
         assert!(entered.contains_key(&parent_txid), "the dust parent entered silently");
         assert!(entered.contains_key(&child_txid), "the child entered silently");
-        // The parent went in first and keeps the number it took then, though
-        // its `Enter` is announced after the child's.
+        // The parent went in first and keeps the number it took then.
         assert_eq!(
             (entered[&parent_txid], entered[&child_txid]),
             (1, 2),
             "each member carries the sequence number its insert took"
         );
         assert_eq!(mp.acting_txids_with_sequence().1, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every mempool event a package caused, in the order it was emitted.
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<MempoolEvent>) -> Vec<MempoolEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// Core announces a package's parent before its child (`SubmitPackage`
+    /// notifies in package order), and a consumer replaying the stream into
+    /// a mempool expects a transaction's inputs to be there when it arrives.
+    /// The dust parent is admitted silently, so its `Enter` has to be put
+    /// back in front of the child's, and exactly once.
+    #[test]
+    fn a_dust_parent_is_announced_before_its_child() {
+        let op = outpoint(0xCB);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(event_tx);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x7B), (50_000 - dust, 0x7C)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0x7D)],
+        );
+        let child_txid = child.compute_txid();
+
+        let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+        assert_eq!(msg, "success", "{results:?}");
+
+        let stream: Vec<(Txid, u64)> = drain_events(&mut rx)
+            .iter()
+            .map(|ev| (*ev.txid(), ev.mempool_sequence()))
+            .collect();
+        assert_eq!(stream, vec![(parent_txid, 1), (child_txid, 2)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The parent goes in before the child's acceptance replaces anything, so
+    /// its `Enter` also goes ahead of the child's `LeaveReplaced`: the stream
+    /// stays in sequence order.
+    #[test]
+    fn a_dust_parent_is_announced_ahead_of_what_its_child_replaces() {
+        let op = outpoint(0xCC);
+        let op2 = outpoint(0xCD);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(event_tx);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let original = tx_from(&[op2], &[(49_000, 0x7E)]);
+        let original_txid = original.compute_txid();
+        mp.accept_transaction(original, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("original");
+
+        let parent = tx_from(&[op], &[(dust, 0x7F), (50_000 - dust, 0x80)]);
+        let parent_txid = parent.compute_txid();
+        // Sweeps the dust and spends `original`'s coin with far more fee.
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+                op2,
+            ],
+            &[(90_000, 0x81)],
+        );
+        let child_txid = child.compute_txid();
+
+        let r = mp.accept_package_with(vec![parent, child], &cs, &NoopVerifier, None);
+        assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+        assert_eq!(r.replaced, vec![original_txid]);
+
+        let stream: Vec<(&'static str, Txid, u64)> = drain_events(&mut rx)
+            .iter()
+            .map(|ev| {
+                let kind = match ev {
+                    MempoolEvent::Enter { .. } => "enter",
+                    MempoolEvent::LeaveReplaced { .. } => "replaced",
+                    _ => "other",
+                };
+                (kind, *ev.txid(), ev.mempool_sequence())
+            })
+            .collect();
+        assert_eq!(
+            stream,
+            vec![
+                ("enter", original_txid, 1),
+                ("enter", parent_txid, 2),
+                ("replaced", original_txid, 3),
+                ("enter", child_txid, 4),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
