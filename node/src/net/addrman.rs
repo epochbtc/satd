@@ -426,20 +426,23 @@ impl AddrMan {
     /// Core never has two entries in one slot (a collision evicts or is
     /// refused), and `getrawaddrman` keys its JSON objects by slot, so a
     /// collision here must not be reported twice under one key. Entries are
-    /// placed in address order and a taken slot moves on to the next free
-    /// one, which keeps the result deterministic for a given key.
+    /// placed in address order, which keeps the result deterministic for a
+    /// given key. A taken slot moves to the next free position in the same
+    /// bucket, wrapping within it: Core keeps every entry in the bucket its
+    /// formula gives, so one group's tried entries never span more than
+    /// `TRIED_BUCKETS_PER_GROUP` buckets. Only a full bucket spills into the
+    /// next one with room, since the flat map can hold more of one group
+    /// than Core's buckets would.
     pub fn positions(&self) -> Vec<(AddrSlot, &AddrEntry)> {
         let mut entries: Vec<&AddrEntry> = self.entries.values().collect();
         entries.sort_by_key(|e| e.addr);
-        let mut new = FreeSlots::new(NEW_BUCKET_COUNT * BUCKET_SIZE);
-        let mut tried = FreeSlots::new(TRIED_BUCKET_COUNT * BUCKET_SIZE);
+        let mut new = TakenSlots::new(NEW_BUCKET_COUNT);
+        let mut tried = TakenSlots::new(TRIED_BUCKET_COUNT);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let mut slot = self.derived_slot(e);
             let table = if e.tried { &mut tried } else { &mut new };
-            let index = table.take(slot.bucket * BUCKET_SIZE + slot.position);
-            slot.bucket = index / BUCKET_SIZE;
-            slot.position = index % BUCKET_SIZE;
+            (slot.bucket, slot.position) = table.take(slot.bucket, slot.position);
             out.push((slot, e));
         }
         out
@@ -517,29 +520,33 @@ impl AddrMan {
 /// slots it walked at the one it claimed, so later claims skip a run they
 /// have already crossed instead of stepping through it slot by slot, which
 /// goes quadratic once many entries share a group's few buckets.
-struct FreeSlots {
-    next: Vec<u32>,
+/// The slots [`AddrMan::positions`] has handed out in one table, as one bit
+/// per position in a mask per bucket.
+struct TakenSlots {
+    buckets: Vec<u64>,
 }
 
-impl FreeSlots {
-    fn new(capacity: u64) -> Self {
-        FreeSlots { next: (0..capacity as u32).collect() }
+const _: () = assert!(BUCKET_SIZE == u64::BITS as u64);
+
+impl TakenSlots {
+    fn new(buckets: u64) -> Self {
+        TakenSlots { buckets: vec![0; buckets as usize] }
     }
 
-    /// Only called while a slot is free (see the `MAX_ENTRIES` assertions).
-    fn take(&mut self, start: u64) -> u64 {
-        let mut free = start as u32;
-        while self.next[free as usize] != free {
-            free = self.next[free as usize];
+    /// The first free position at or after `position` in `bucket`, wrapping
+    /// within the bucket; if the bucket is full, the same search in the next
+    /// bucket that is not. Only called while a slot is free (see the
+    /// `MAX_ENTRIES` assertions).
+    fn take(&mut self, bucket: u64, position: u64) -> (u64, u64) {
+        let mut bucket = bucket as usize;
+        while self.buckets[bucket] == u64::MAX {
+            bucket = (bucket + 1) % self.buckets.len();
         }
-        let mut i = start as u32;
-        while i != free {
-            let after = self.next[i as usize];
-            self.next[i as usize] = free;
-            i = after;
-        }
-        self.next[free as usize] = (free + 1) % self.next.len() as u32;
-        u64::from(free)
+        let free = !self.buckets[bucket];
+        let offset = u64::from(free.rotate_right(position as u32).trailing_zeros());
+        let position = (position + offset) % BUCKET_SIZE;
+        self.buckets[bucket] |= 1 << position;
+        (bucket as u64, position)
     }
 }
 
@@ -907,8 +914,9 @@ mod tests {
         assert_eq!(unique.len(), 300);
     }
 
-    /// The placement `positions` replaced: probe one slot at a time from
-    /// the derived slot. It must land every entry where this does.
+    /// The placement `positions` makes, one slot at a time: the derived
+    /// bucket's positions from the derived one, wrapping within the bucket,
+    /// then the next bucket's from the same position, and so on.
     fn probed_positions(a: &AddrMan) -> Vec<(AddrSlot, SocketAddr)> {
         let mut entries: Vec<&AddrEntry> = a.entries.values().collect();
         entries.sort_by_key(|e| e.addr);
@@ -917,23 +925,29 @@ mod tests {
             .into_iter()
             .map(|e| {
                 let mut slot = a.derived_slot(e);
+                let (start_bucket, start_position) = (slot.bucket, slot.position);
                 let buckets = if e.tried { TRIED_BUCKET_COUNT } else { NEW_BUCKET_COUNT };
-                let mut index = slot.bucket * BUCKET_SIZE + slot.position;
-                while !taken.insert((e.tried, index)) {
-                    index = (index + 1) % (buckets * BUCKET_SIZE);
+                let probe = (0..buckets).flat_map(|b| {
+                    (0..BUCKET_SIZE).map(move |p| {
+                        ((start_bucket + b) % buckets, (start_position + p) % BUCKET_SIZE)
+                    })
+                });
+                for (bucket, position) in probe {
+                    if taken.insert((e.tried, bucket, position)) {
+                        (slot.bucket, slot.position) = (bucket, position);
+                        break;
+                    }
                 }
-                slot.bucket = index / BUCKET_SIZE;
-                slot.position = index % BUCKET_SIZE;
                 (slot, e.addr)
             })
             .collect()
     }
 
     /// Tried entries in one /16 share its eight buckets (512 slots), so most
-    /// of 3000 overflow into long runs of taken slots; new entries from one
-    /// source group share its 64 buckets. Placement matches a linear probe.
+    /// of 3000 overflow them; new entries from one source group share its 64
+    /// buckets. Placement matches a slot-by-slot probe.
     #[test]
-    fn positions_match_a_linear_probe_under_heavy_collision() {
+    fn positions_match_a_slot_by_slot_probe_under_heavy_collision() {
         let mut a = AddrMan::new();
         for i in 0..3000u32 {
             a.mark_good(sa(&format!("10.244.{}.{}:18444", i / 256, i % 256)), 1);
@@ -948,18 +962,49 @@ mod tests {
         assert_eq!(placed, probed_positions(&a));
     }
 
-    /// Claims go to the first free slot at or after the start, wrapping, and
-    /// the table fills completely.
+    /// A claim takes the first free position at or after the start in its
+    /// own bucket, wrapping to the bucket's first position and not into the
+    /// next bucket. Only a full bucket sends it on, and the last bucket
+    /// wraps to the first.
     #[test]
-    fn free_slots_claim_the_next_free_slot_and_wrap() {
-        let mut f = FreeSlots::new(8);
-        let claims: Vec<u64> = [6, 6, 6, 7, 3, 2, 1, 0].into_iter().map(|s| f.take(s)).collect();
-        assert_eq!(claims, [6, 7, 0, 1, 3, 2, 4, 5]);
+    fn taken_slots_stay_in_their_bucket_until_it_is_full() {
+        let mut t = TakenSlots::new(3);
+        assert_eq!(t.take(1, 62), (1, 62));
+        assert_eq!(t.take(1, 62), (1, 63));
+        assert_eq!(t.take(1, 63), (1, 0));
+        assert_eq!(t.take(1, 0), (1, 1));
+        for _ in 4..BUCKET_SIZE {
+            t.take(1, 5);
+        }
+        assert_eq!(t.take(1, 40), (2, 40));
+        for _ in 1..BUCKET_SIZE {
+            t.take(2, 0);
+        }
+        assert_eq!(t.take(2, 7), (0, 7));
+    }
+
+    /// The `getrawaddrman` flake: 32 tried entries in one /16 sometimes came
+    /// out in nine buckets, when two shared a derived slot at a bucket's last
+    /// position and the second moved to the next bucket's first. With room
+    /// in every bucket, each entry must keep its derived bucket, whatever
+    /// the key.
+    #[test]
+    fn a_collision_keeps_the_entry_in_its_derived_bucket() {
+        for k in 0..500u64 {
+            let mut a = AddrMan::new();
+            a.slot_key = (k, k.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            for i in 0..32u8 {
+                a.mark_good(sa(&format!("10.244.{i}.5:18444")), 1);
+            }
+            for (slot, e) in a.positions() {
+                assert_eq!(slot.bucket, a.derived_slot(e).bucket, "key {k}: {}", e.addr);
+            }
+        }
     }
 
     /// The worst case: every entry tried and in one /16. The tried table has
-    /// exactly `MAX_ENTRIES` slots, so every slot ends up used once. A
-    /// slot-by-slot probe steps over some 50 million taken slots here.
+    /// exactly `MAX_ENTRIES` slots, so every slot ends up used once, nearly
+    /// all of them by entries the group's eight full buckets sent on.
     #[test]
     fn positions_fill_a_full_tried_table_from_one_group() {
         let mut a = AddrMan::new();
