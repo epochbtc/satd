@@ -33,6 +33,10 @@ mod webhooks;
 // promise.
 #[path = "e2e/parity.rs"]
 mod parity;
+// Electrum status hash against `get_history`: the status a client is told must
+// equal sha256 over the history as `get_history` returns it.
+#[path = "e2e/electrum_status.rs"]
+mod electrum_status;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,

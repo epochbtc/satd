@@ -124,6 +124,13 @@ Two long-lived push subscriptions are supported, both counted against
   history changes, in the mempool or confirmed. The index is updated inside
   the same `connect_block` / `disconnect_block` batch as the chainstate, so
   a subscriber can never observe a status out of sync with the tip.
+  The status is the protocol's sha256 over `tx_hash:height:` for each
+  history row, in the order `blockchain.scripthash.get_history` returns
+  them: confirmed transactions by height and position in the block, then
+  mempool transactions, height `0` (all inputs confirmed) before `-1`
+  (spends an unconfirmed parent), then by txid as displayed. A client can
+  therefore check an announced status by hashing the `get_history` answer
+  as received.
 
 `blockchain.tweaks.subscribe` also pushes notifications, but it is a bounded
 chunk rather than a standing subscription — it ends itself with

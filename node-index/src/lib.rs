@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod cursor;
+pub mod history;
 pub mod keys;
 pub mod spend_keys;
 pub mod spend_trait;
@@ -21,6 +22,10 @@ pub mod types;
 
 pub use config::AddressIndexConfig;
 pub use cursor::{BackfillCursor, BackfillState};
+pub use history::{
+    HistoryRow, MempoolTxFacts, history_rows, history_status_hash, mempool_history_rows,
+    sort_confirmed_rows, sort_mempool_rows,
+};
 pub use keys::{
     AddrFundingKey, AddrFundingKeyV3, AddrFundingKeyV3Payload, AddrFundingRow, AddrFundingRowV3,
     AddrSpendingKey, AddrSpendingKeyV3, AddrSpendingKeyV3Payload, AddrSpendingRow,

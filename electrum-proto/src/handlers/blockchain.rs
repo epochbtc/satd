@@ -17,14 +17,14 @@
 use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use node_index::scripthash_of;
+use node_index::{history_rows, mempool_history_rows, scripthash_of};
 use serde_json::{Value, json};
 
 use crate::dispatch::{require_array, require_array_range};
 use crate::error::JsonRpcError;
 use crate::merkle::compute_merkle_branch;
 use crate::state::ElectrumState;
-use crate::status::{compute_status_hash, status_hash_to_json};
+use crate::status::{compute_status_hash, mempool_facts, status_hash_to_json};
 use crate::types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
     ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
@@ -126,68 +126,40 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
     let cap = state.config.max_history_entries;
 
-    // Round-3 review H1: ask the index for at most `cap + 1` DISTINCT
-    // (height, txid) entries — the only wire-relevant dimension.
-    // The address-index schema emits one row per matching output AND
-    // per matching input, so a fixed raw-row duplicate factor is
-    // unsound; a scripthash with many outputs per tx could see a raw
-    // scan truncate before reaching `cap + 1` distinct entries and
-    // silently return a partial history. The new helper streams
-    // funding+spending in lockstep and dedupes inline so it stops
-    // only at storage exhaustion or `cap + 1` distinct pairs.
-    let pairs = state
-        .address_index
-        .confirmed_distinct_history_limited(&sh.0, cap.saturating_add(1))
-        .map_err(JsonRpcError::from_index)?;
+    // The rows come out in Electrum history order — confirmed by height
+    // and block position, then mempool with height 0 before -1, then
+    // display txid — from the same helper the subscribe status and the
+    // notifier hash. A client checks the announced status by hashing this
+    // response in the order it arrives, so the two must agree row for row.
+    //
+    // Asking for `cap + 1` rows bounds the work: confirmed rows are read
+    // as at most `cap + 1` DISTINCT `(height, txid)` entries (round-3
+    // review H1 — the schema has one row per matching output AND input,
+    // so a raw-row bound could silently truncate), and mempool rows are
+    // added only while there is room.
+    let mempool = state.mempool.as_ref();
+    let rows = history_rows(
+        state.address_index.as_ref(),
+        &sh.0,
+        cap.saturating_add(1),
+        |txid| mempool_facts(mempool, txid),
+    )
+    .map_err(JsonRpcError::from_index)?;
 
-    if pairs.len() > cap {
+    if rows.len() > cap {
         return Err(JsonRpcError::history_too_large(cap));
     }
 
-    let mut out: Vec<HistoryEntry> = pairs
+    // `fee` (sats) is set on mempool rows only, from the live mempool
+    // entry, which pre-computes it at admission.
+    let out: Vec<HistoryEntry> = rows
         .into_iter()
-        .map(|(h, t)| HistoryEntry {
-            height: h as i64,
-            tx_hash: TxidHex(t),
-            fee: None,
+        .map(|r| HistoryEntry {
+            height: r.height,
+            tx_hash: TxidHex(r.txid),
+            fee: r.fee_sat,
         })
         .collect();
-
-    // Mempool entries come last, in protocol-canonical "txid order"
-    // (which matches the ascending-txid order our mempool index
-    // produces today). Each carries a signed `height` per electrs's
-    // `Height::as_i64`: `-1` if it spends an unconfirmed parent, `0`
-    // otherwise. `fee` (sats) comes from the live mempool entry which
-    // already pre-computes it at admission.
-    //
-    // Round-2 review M1: enforce the cap as we push — a scripthash
-    // with `cap` confirmed entries plus any mempool entries previously
-    // pushed past the cap silently.
-    let mempool_pool = state.mempool.as_ref();
-    let mempool = state.address_index.mempool_history(&sh.0);
-    let mut mp_txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
-    mp_txids.sort();
-    for t in mp_txids {
-        if out.len() >= cap {
-            return Err(JsonRpcError::history_too_large(cap));
-        }
-        let (height, fee) = match mempool_pool.get(&t) {
-            Some(entry) => {
-                let h = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool_pool) {
-                    -1
-                } else {
-                    0
-                };
-                (h, Some(entry.fee))
-            }
-            None => (0, None), // raced with eviction; best-effort
-        };
-        out.push(HistoryEntry {
-            height,
-            tx_hash: TxidHex(t),
-            fee,
-        });
-    }
 
     Ok(serde_json::to_value(&out).unwrap())
 }
@@ -289,29 +261,17 @@ pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Va
 
 pub fn scripthash_get_mempool(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_mempool")?;
-    let mempool_pool = state.mempool.as_ref();
-    let mempool = state.address_index.mempool_history(&sh.0);
-    let mut txids: Vec<bitcoin::Txid> = mempool.into_iter().map(|m| m.txid).collect();
-    txids.sort();
-    let out: Vec<HistoryEntry> = txids
+    // The mempool part of `get_history`, in the same order.
+    let mempool = state.mempool.as_ref();
+    let out: Vec<HistoryEntry> =
+        mempool_history_rows(state.address_index.as_ref(), &sh.0, |txid| {
+            mempool_facts(mempool, txid)
+        })
         .into_iter()
-        .map(|t| {
-            let (height, fee) = match mempool_pool.get(&t) {
-                Some(entry) => {
-                    let h = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool_pool) {
-                        -1
-                    } else {
-                        0
-                    };
-                    (h, Some(entry.fee))
-                }
-                None => (0, None),
-            };
-            HistoryEntry {
-                height,
-                tx_hash: TxidHex(t),
-                fee,
-            }
+        .map(|r| HistoryEntry {
+            height: r.height,
+            tx_hash: TxidHex(r.txid),
+            fee: r.fee_sat,
         })
         .collect();
     Ok(serde_json::to_value(&out).unwrap())
