@@ -2168,9 +2168,12 @@ fn fill_mempool_past_the_block_sigop_limit(node: &TestNode) -> (usize, u64) {
 /// counts it. Every input in the fixture above spends a P2WPKH coinbase.
 fn template_tx_sigop_cost(tx: &bitcoin::Transaction) -> u64 {
     let p2wpkh = DeterministicWallet::from_secret([0x5c; 32]).address.script_pubkey();
-    tx.total_sigop_cost(|_| {
-        Some(bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh.clone() })
-    }) as u64
+    let prevout = bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh };
+    node::validation::sigops::transaction_sigop_cost(
+        tx,
+        &vec![prevout; tx.input.len()],
+        node::validation::sigops::SigOpFlags::P2shWitness,
+    )
 }
 
 /// A template must stay under the block sigop limit. `create_template`
