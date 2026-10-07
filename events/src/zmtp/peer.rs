@@ -208,7 +208,7 @@ where
         r = run(stream, &shared) => r,
     };
     if let Err(e) = result {
-        debug!(target: "events::zmtp", error = %e, "ZMTP subscriber closed");
+        debug!(target: "events::zmq::zmtp", error = %e, "ZMTP subscriber closed");
     }
 }
 

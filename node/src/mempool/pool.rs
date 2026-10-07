@@ -39,8 +39,8 @@ use node_sp_index::{compute_tweak, TweakEntry};
 /// cost is one allocation at startup — `MempoolEvent` is an 88-byte flat
 /// enum, so the ring is ~2.8 MiB. The one pointer in
 /// it, `Enter`'s `raw_tx`, is `None` unless a Core-compatible `-zmqpubrawtx`
-/// or `-zmqpubhashtx` publisher is configured; a slot's transaction is freed
-/// once every receiver has read it.
+/// publisher is configured; a slot's transaction is freed once every
+/// receiver has read it.
 ///
 /// A burst past this bound still drops, and that is by design, not a gap:
 /// `docs/api/streaming.md` §10 makes "never backpressure the publisher" a
@@ -1217,9 +1217,9 @@ pub struct Mempool {
     /// bridge something to emit. Same private-zero-counter default as `sp_gate`.
     mempool_tweaks_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
     /// Whether `Enter` events carry the admitted transaction (`raw_tx`). Off
-    /// unless a Core-compatible `-zmqpubrawtx` / `-zmqpubhashtx` publisher is
-    /// configured, so a node without one never clones a transaction for an
-    /// event. See [`Self::set_emit_raw_tx`].
+    /// unless a Core-compatible `-zmqpubrawtx` publisher is configured, so a
+    /// node without one never clones a transaction for an event. See
+    /// [`Self::set_emit_raw_tx`].
     emit_raw_tx: std::sync::atomic::AtomicBool,
 }
 
@@ -1409,9 +1409,8 @@ impl Mempool {
     /// publisher runs behind the event bus, so by the time it reads an
     /// `Enter` the transaction may be gone from the pool; carrying it on the
     /// event is the only way not to lose it. Set once at startup, before the
-    /// mempool is loaded from disk, when a `-zmqpubrawtx` or `-zmqpubhashtx`
-    /// publisher is configured; every other node leaves it off and pays
-    /// nothing.
+    /// mempool is loaded from disk, when a `-zmqpubrawtx` publisher is
+    /// configured; every other node leaves it off and pays nothing.
     pub fn set_emit_raw_tx(&self, on: bool) {
         self.emit_raw_tx.store(on, std::sync::atomic::Ordering::Relaxed);
     }

@@ -4546,6 +4546,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "zeromq",
 ]
 
 [[package]]

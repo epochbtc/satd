@@ -80,7 +80,7 @@ pub enum MempoolEvent {
         mempool_sequence: u64,
         /// The transaction, captured at admission. `Some` only while
         /// [`Mempool::set_emit_raw_tx`](crate::mempool::pool::Mempool::set_emit_raw_tx)
-        /// is on, which a `-zmqpubrawtx` or `-zmqpubhashtx` publisher turns on.
+        /// is on, which a `-zmqpubrawtx` publisher turns on.
         #[serde(skip)]
         raw_tx: Option<Arc<Transaction>>,
     },

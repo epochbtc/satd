@@ -28,6 +28,7 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
+use node::events::core_zmq::CoreZmqTopic;
 use node::chain::state::ChainState;
 use node::index::address::SubscriptionRegistry;
 use node::mempool::pool::{Mempool, MempoolConfig, PolicyReloadKind};
@@ -536,6 +537,40 @@ fn field_specs() -> Vec<FieldSpec> {
             }
         };
     }
+    // restart-required, for one topic's share of the `-zmqpub*` fields:
+    // its addresses, or its high-water mark. One key changing reports only
+    // that key, though the five topics share `zmq_pub`.
+    macro_rules! restart_zmqpub {
+        ($key:expr, $topic:expr) => {
+            FieldSpec {
+                key: $key,
+                diff: |old, new| {
+                    let pick = |c: &Config| -> Vec<String> {
+                        c.zmq_pub.iter().filter(|(t, _)| *t == $topic).map(|(_, a)| a.clone()).collect()
+                    };
+                    let o = format!("{:?}", pick(old));
+                    let n = format!("{:?}", pick(new));
+                    if o != n { Some((o, n)) } else { None }
+                },
+                apply: None,
+                sensitive: false,
+            }
+        };
+    }
+    macro_rules! restart_zmqpubhwm {
+        ($key:expr, $topic:expr) => {
+            FieldSpec {
+                key: $key,
+                diff: |old, new| {
+                    let o = old.zmq_hwm[$topic.index()].to_string();
+                    let n = new.zmq_hwm[$topic.index()].to_string();
+                    if o != n { Some((o, n)) } else { None }
+                },
+                apply: None,
+                sensitive: false,
+            }
+        };
+    }
     // live: report if changed AND push to the running node via `$apply`
     // (`fn(&Config, &ReloadHandles)`).
     macro_rules! live {
@@ -1015,6 +1050,16 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventszmqmpreplace", events_zmq_mpreplace),
         restart!("eventszmqmpconfirm", events_zmq_mpconfirm),
         restart!("eventszmqnodeevent", events_zmq_nodeevent),
+        restart_zmqpub!("zmqpubhashblock", CoreZmqTopic::HashBlock),
+        restart_zmqpub!("zmqpubhashtx", CoreZmqTopic::HashTx),
+        restart_zmqpub!("zmqpubrawblock", CoreZmqTopic::RawBlock),
+        restart_zmqpub!("zmqpubrawtx", CoreZmqTopic::RawTx),
+        restart_zmqpub!("zmqpubsequence", CoreZmqTopic::Sequence),
+        restart_zmqpubhwm!("zmqpubhashblockhwm", CoreZmqTopic::HashBlock),
+        restart_zmqpubhwm!("zmqpubhashtxhwm", CoreZmqTopic::HashTx),
+        restart_zmqpubhwm!("zmqpubrawblockhwm", CoreZmqTopic::RawBlock),
+        restart_zmqpubhwm!("zmqpubrawtxhwm", CoreZmqTopic::RawTx),
+        restart_zmqpubhwm!("zmqpubsequencehwm", CoreZmqTopic::Sequence),
         // Streaming WS/SSE transport: the listener is bound on the API
         // runtime at startup; changing the bind/auth posture requires a
         // restart (same disposition as the events-grpc listener).

@@ -220,16 +220,16 @@ async fn accept_loop(listener: Listener, shared: Arc<Shared>, shutdown: watch::R
         let accepted = match &listener {
             Listener::Tcp(l) => l.accept().await.map(|(stream, peer)| {
                 configure_tcp(&stream, &shared);
-                debug!(target: "events::zmtp", %peer, "ZMTP subscriber connected");
+                debug!(target: "events::zmq::zmtp", %peer, "ZMTP subscriber connected");
                 tokio::spawn(peer::serve(stream, shared.clone(), shutdown.clone()));
             }),
             Listener::Ipc(l) => l.accept().await.map(|(stream, _)| {
-                debug!(target: "events::zmtp", "ZMTP subscriber connected (ipc)");
+                debug!(target: "events::zmq::zmtp", "ZMTP subscriber connected (ipc)");
                 tokio::spawn(peer::serve(stream, shared.clone(), shutdown.clone()));
             }),
         };
         if let Err(e) = accepted {
-            warn!(target: "events::zmtp", error = %e, "ZMTP accept failed");
+            warn!(target: "events::zmq::zmtp", error = %e, "ZMTP accept failed");
             tokio::time::sleep(ACCEPT_RETRY).await;
         }
     }
@@ -240,11 +240,11 @@ async fn accept_loop(listener: Listener, shared: Arc<Shared>, shutdown: watch::R
 /// last segment of a message.
 fn configure_tcp(stream: &tokio::net::TcpStream, shared: &Shared) {
     if let Err(e) = stream.set_nodelay(true) {
-        debug!(target: "events::zmtp", error = %e, "TCP_NODELAY not set");
+        debug!(target: "events::zmq::zmtp", error = %e, "TCP_NODELAY not set");
     }
     let sock = socket2::SockRef::from(stream);
     if let Err(e) = sock.set_keepalive(true) {
-        debug!(target: "events::zmtp", error = %e, "SO_KEEPALIVE not set");
+        debug!(target: "events::zmq::zmtp", error = %e, "SO_KEEPALIVE not set");
     }
     #[cfg(test)]
     if sock.keepalive().unwrap_or(false) {
