@@ -10,6 +10,12 @@ const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
 /// deleted; the option exists so a prune can be exercised in a test.
 pub const FAST_PRUNE_FILE_SIZE: u64 = 0x10000;
 
+/// How much [`FlatFileManager::for_each_block_header`] reads at the start of
+/// a record. Records smaller than this share one read with the records after
+/// them; a larger one costs one read of this size, of which the scan uses 88
+/// bytes. A disk read costs at least a page anyway.
+const HEADER_SCAN_CHUNK: usize = 4096;
+
 /// The all-zero XOR key: on-disk bytes are stored as-is (plaintext).
 const ZERO_XOR_KEY: [u8; 8] = [0u8; 8];
 
@@ -215,6 +221,11 @@ pub struct FlatFileManager {
     /// [`PendingRecord`] is still alive. Shared with those handles, which
     /// release their count when they drop, without this manager's lock.
     pending: PendingCounts,
+    /// Bytes the block scans ([`Self::for_each_block`],
+    /// [`Self::for_each_block_in_files`] and
+    /// [`Self::for_each_block_header`]) have read from the block files since
+    /// this manager opened. A `-reindex` logs what its scan read from it.
+    scan_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// Sum the sizes of every `blk*.dat` in `dir`.
@@ -306,7 +317,14 @@ impl FlatFileManager {
             max_file_size: MAX_FILE_SIZE,
             highest_height: std::collections::HashMap::new(),
             pending: PendingCounts::default(),
+            scan_bytes: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Bytes the block scans have read from the block files since this
+    /// manager opened.
+    pub fn scan_bytes_read(&self) -> u64 {
+        self.scan_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total bytes of block data on disk — `getblockchaininfo`'s
@@ -473,12 +491,13 @@ impl FlatFileManager {
             // Cut the torn record off rather than appending past it. Adopting
             // the torn EOF would keep the offsets honest but leave a record
             // whose length field describes bytes that were never written, and
-            // the sequential scanners (`for_each_block`, used by `-reindex`
-            // and the hole repair) have no resynchronization: they read that
-            // length, step over it, land mid-stream, and `break` — silently
-            // dropping every remaining block in a file that can hold 128 MB of
-            // them. Truncation is safe by construction, since `current_pos`
-            // was never advanced and so no `block_index` entry can reference
+            // the sequential scanners (`for_each_block_header`, used by
+            // `-reindex`, and `for_each_block_in_files`, used by the hole
+            // repair) have no resynchronization: they read that length, step
+            // over it, land mid-stream, and `break` — silently dropping every
+            // remaining block in a file that can hold 128 MB of them.
+            // Truncation is safe by construction, since `current_pos` was
+            // never advanced and so no `block_index` entry can reference
             // anything at or after `record_start`.
             // The write error is what the caller needs to see, so it wins.
             // A truncation failure is strictly worse — it leaves the torn
@@ -717,11 +736,11 @@ impl FlatFileManager {
 
     /// Stream every block in `blk*.dat` files, invoking `visit` for each.
     ///
-    /// Used by `-reindex` to rebuild the block index from flat files without
-    /// holding all blocks in memory at once. The previous `scan_all_blocks`
-    /// API returned `Vec<(Vec<u8>, FlatFilePos)>`, which forced ~900 GB of
-    /// resident memory on a fully-synced mainnet (945k × ~1 MB) and OOM-
-    /// killed the process during reindex.
+    /// The previous `scan_all_blocks` API returned
+    /// `Vec<(Vec<u8>, FlatFilePos)>`, which forced ~900 GB of resident memory
+    /// on a fully-synced mainnet (945k × ~1 MB) and OOM-killed the process
+    /// during reindex. `-reindex` needs only the headers, and reads only
+    /// those through [`Self::for_each_block_header`].
     ///
     /// Files are read into a 128 MB buffer (one whole `blk*.dat` at a time),
     /// then walked record-by-record. The visitor sees each block's payload
@@ -824,6 +843,8 @@ impl FlatFileManager {
             Ok(d) => d,
             Err(_) => return Ok(std::ops::ControlFlow::Continue(())),
         };
+        self.scan_bytes
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         xor_in_place(&mut data, &self.xor_key, 0);
         let key = &self.xor_key;
         let mut offset = 0usize;
@@ -868,6 +889,127 @@ impl FlatFileManager {
             offset += 8 + size;
         }
         Ok(std::ops::ControlFlow::Continue(()))
+    }
+
+    /// Stream the header of every block in the `blk*.dat` files without
+    /// reading the rest of each block.
+    ///
+    /// The records and positions are those [`Self::for_each_block`] yields,
+    /// in the same order. Zero padding and a record that runs past the end
+    /// of its file end a file the same way. The visitor sees the first
+    /// `min(len, 80)` bytes of each record's payload, so it gets the
+    /// 80-byte header of any record long enough to hold one.
+    ///
+    /// `-reindex` plans its chain from the headers alone. Reading each file
+    /// whole to get them read the entire chain, about 700 GB on mainnet,
+    /// before the first block connected, and again on every start that
+    /// continued an interrupted reindex (#916). This reads each record's
+    /// 8-byte framing and the start of its payload, then seeks to the next
+    /// record, so a block larger than [`HEADER_SCAN_CHUNK`] costs one read
+    /// of that size.
+    ///
+    /// Returns the total number of blocks visited.
+    pub fn for_each_block_header<F>(&self, mut visit: F) -> std::io::Result<u64>
+    where
+        F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
+    {
+        let mut count = 0u64;
+        for file_num in 0u32.. {
+            let path = self.file_path(file_num);
+            if !path.exists() {
+                break;
+            }
+            if let std::ops::ControlFlow::Break(()) =
+                self.scan_one_file_headers(&path, file_num, &mut count, &mut visit)
+            {
+                return Ok(count);
+            }
+        }
+        Ok(count)
+    }
+
+    /// [`Self::scan_one_file`] for [`Self::for_each_block_header`]: the same
+    /// record walk over the file's length, reading `HEADER_SCAN_CHUNK` bytes
+    /// wherever the next record's framing and header are not already in
+    /// hand.
+    fn scan_one_file_headers<F>(
+        &self,
+        path: &std::path::Path,
+        file_num: u32,
+        count: &mut u64,
+        visit: &mut F,
+    ) -> std::ops::ControlFlow<()>
+    where
+        F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
+    {
+        // `scan_one_file` skips a file it cannot read.
+        let Ok(mut file) = File::open(path) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let key = &self.xor_key;
+        // De-obfuscated bytes of the file, from offset `buf_start`.
+        let mut buf: Vec<u8> = Vec::with_capacity(HEADER_SCAN_CHUNK);
+        let mut buf_start = 0u64;
+        let mut offset = 0u64;
+        while offset + 8 <= len {
+            // The framing and up to 80 header bytes, as far as the file goes.
+            let want = (len - offset).min(88);
+            if offset + want > buf_start + buf.len() as u64 {
+                let n = (len - offset).min(HEADER_SCAN_CHUNK as u64) as usize;
+                buf.resize(n, 0);
+                let read = file
+                    .seek(SeekFrom::Start(offset))
+                    .and_then(|_| file.read_exact(&mut buf));
+                if let Err(e) = read {
+                    // `scan_one_file` reads a file whole, so a read error
+                    // drops the whole file there. Here the records before it
+                    // have been handed out already; drop the rest, and say so.
+                    tracing::warn!(
+                        file = %path.display(),
+                        offset,
+                        "block file scan: read failed, skipping the rest of the file: {e}"
+                    );
+                    return std::ops::ControlFlow::Continue(());
+                }
+                self.scan_bytes
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                xor_in_place(&mut buf, key, offset);
+                buf_start = offset;
+            }
+            let at = (offset - buf_start) as usize;
+            let framing = &buf[at..at + 8];
+            // Zero padding: see `scan_one_file`.
+            if framing
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == key[((offset + i as u64) % 8) as usize])
+            {
+                break;
+            }
+            let size = u32::from_le_bytes([framing[4], framing[5], framing[6], framing[7]]) as u64;
+            if size == 0 || offset + 8 + size > len {
+                break;
+            }
+            // In hand: the payload fits the file, so `want` covered it up to
+            // 80 bytes.
+            let head = size.min(80) as usize;
+            if let std::ops::ControlFlow::Break(()) = visit(
+                &buf[at + 8..at + 8 + head],
+                FlatFilePos {
+                    file_number: file_num,
+                    data_pos: offset as u32,
+                },
+            ) {
+                *count += 1;
+                return std::ops::ControlFlow::Break(());
+            }
+            *count += 1;
+            offset += 8 + size;
+        }
+        std::ops::ControlFlow::Continue(())
     }
 }
 
@@ -1307,10 +1449,11 @@ mod tests {
 
     /// A write that fails partway must leave the file *scannable*. Adopting the
     /// torn EOF and appending after it keeps offsets honest but leaves a record
-    /// whose length field describes bytes that were never written — and
-    /// `for_each_block` (used by `-reindex`) has no resynchronization: it steps
-    /// over that phantom length, lands mid-stream, and stops, silently dropping
-    /// every remaining block in a file that can hold 128 MB of them.
+    /// whose length field describes bytes that were never written — and the
+    /// scans (`-reindex` uses `for_each_block_header`) have no
+    /// resynchronization: they step over that phantom length, land
+    /// mid-stream, and stop, silently dropping every remaining block in a file
+    /// that can hold 128 MB of them.
     #[test]
     fn a_torn_record_is_truncated_so_the_file_stays_scannable() {
         let dir = temp_dir("torn-record-truncate");
@@ -1554,6 +1697,83 @@ mod tests {
         assert_eq!(seen, payloads.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #916: the header scan yields the records the full scan does, at the
+    /// same positions, and ends each file where it does: on raw zero padding
+    /// under the key, and on a record that runs past the end of its file.
+    /// The records straddle the scan's 4 KiB reads, and some are shorter
+    /// than a header.
+    ///
+    /// Perturbation: drop the de-obfuscation of the scan's reads and the
+    /// keyed half fails; drop the padding or the length check and the scan
+    /// yields a record the full scan does not.
+    #[test]
+    fn the_header_scan_yields_the_records_the_full_scan_does() {
+        let magic = [0xf9, 0xbe, 0xb4, 0xd9];
+        let files: [&[usize]; 3] = [
+            &[40, 80, 200, 4090, 5000, 100_000, 120, 6],
+            &[300, 9000, 77],
+            &[1, 81, 8000, 4005, 4006, 70],
+        ];
+        // File 0's padding starts at a multiple of 8, where this key's last
+        // four bytes read as a length of 16: without the padding check, the
+        // padding would pass for records.
+        for key in [ZERO_XOR_KEY, [0x8f, 0x1a, 0x00, 0xc4, 0x10, 0x00, 0x00, 0x00]] {
+            let dir = temp_dir("header-scan");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("xor.dat"), key).unwrap();
+            for (n, sizes) in files.iter().enumerate() {
+                let mut image = Vec::new();
+                for (i, &size) in sizes.iter().enumerate() {
+                    image.extend_from_slice(&magic);
+                    image.extend_from_slice(&(size as u32).to_le_bytes());
+                    image.extend((0..size).map(|b| (b * 31 + i * 7 + n) as u8));
+                }
+                if n == 1 {
+                    // A record that claims more than the file holds.
+                    image.extend_from_slice(&magic);
+                    image.extend_from_slice(&50_000u32.to_le_bytes());
+                    image.extend_from_slice(&[0x44; 100]);
+                }
+                naive_xor(&mut image, &key, 0);
+                if n == 0 {
+                    assert_eq!(image.len() % 8, 0);
+                    // Core's preallocation: raw zeros, never obfuscated.
+                    image.extend_from_slice(&[0u8; 4096]);
+                }
+                std::fs::write(dir.join(format!("blk{n:05}.dat")), &image).unwrap();
+            }
+            let mgr = FlatFileManager::new(&dir).unwrap();
+
+            let mut full = Vec::new();
+            let full_count = mgr
+                .for_each_block(|data, pos| {
+                    full.push((data[..data.len().min(80)].to_vec(), pos.file_number, pos.data_pos));
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap();
+            let full_bytes = mgr.scan_bytes_read();
+            let mut headers = Vec::new();
+            let header_count = mgr
+                .for_each_block_header(|data, pos| {
+                    headers.push((data.to_vec(), pos.file_number, pos.data_pos));
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap();
+            let header_bytes = mgr.scan_bytes_read() - full_bytes;
+
+            assert_eq!(full.len(), 17, "key {key:?}: every whole record, nothing after");
+            assert_eq!(headers, full, "key {key:?}");
+            assert_eq!(header_count, full_count, "key {key:?}");
+            // At most one read per record, plus one per file for what ends it.
+            assert!(
+                header_bytes <= (17 + 3) * HEADER_SCAN_CHUNK as u64,
+                "key {key:?}: the header scan read {header_bytes} bytes"
+            );
+            assert!(header_bytes < full_bytes / 2, "key {key:?}: {header_bytes} of {full_bytes}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Core zero-preallocates the tail of the current blk file with raw
