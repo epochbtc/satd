@@ -26,6 +26,10 @@ pub use grpc::{GrpcEventSink, GrpcEventSinkError, GrpcLimits, GrpcTlsParams};
 #[cfg(feature = "zmq")]
 pub mod zmq;
 
+// In-tree ZMTP 3.0 PUB server for the Core-compatible `-zmqpub*` topics.
+#[cfg(feature = "zmq")]
+pub mod zmtp;
+
 #[cfg(feature = "zmq")]
 pub use zmq::{ZmqEventSink, ZmqEventSinkError, ZmqTopicConfig};
 
