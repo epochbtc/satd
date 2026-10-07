@@ -24,7 +24,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The auto-generated cookie credential (`__cookie__:<hex>`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CookieCredential {
     /// Where the cookie file lives (for cleanup on shutdown).
     pub path: PathBuf,
@@ -34,7 +34,7 @@ pub struct CookieCredential {
 }
 
 /// A `-rpcuser`/`-rpcpassword` pair.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserPassCredential {
     /// Username.
     pub username: String,
@@ -45,7 +45,7 @@ pub struct UserPassCredential {
 /// One parsed Bitcoin-Core `-rpcauth=user:salt$hash` entry. `salt`'s ASCII bytes
 /// are the HMAC key (Core's `rpcauth.py` does `salt.encode('utf-8')`); `hash` is
 /// the expected 32-byte tag.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcAuthCredential {
     /// Username.
     pub username: String,
@@ -53,6 +53,34 @@ pub struct RpcAuthCredential {
     pub salt: String,
     /// Expected 32-byte HMAC-SHA256 tag.
     pub hash: Vec<u8>,
+}
+
+// The credentials' `Debug` output names each credential but never shows its
+// secret: the cookie token, the password, or the rpcauth salt and tag (which
+// together allow offline password guessing). `OperatorCreds` and the
+// `RpcAuth` handle that holds it derive `Debug` over these.
+impl std::fmt::Debug for CookieCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CookieCredential")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for UserPassCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserPassCredential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RpcAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcAuthCredential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Zero or more operator credentials of the three Core-compatible kinds. A
@@ -224,5 +252,34 @@ mod tests {
         assert_eq!(c.matching_user("alice", "secret"), Some("alice"));
         assert_eq!(c.matching_user("alice", "tok"), None);
         assert_eq!(c.matching_user("bob", "secret"), None);
+    }
+
+    #[test]
+    fn debug_output_names_credentials_without_their_secrets() {
+        let hash = vec![0xa5u8; 32];
+        let c = OperatorCreds {
+            cookie: Some(CookieCredential {
+                path: PathBuf::from("/tmp/x.cookie"),
+                token: "CookieTokenMarker".into(),
+            }),
+            userpass: vec![UserPassCredential {
+                username: "alice".into(),
+                password: "PasswordMarker".into(),
+            }],
+            rpcauth: vec![RpcAuthCredential {
+                username: "bob".into(),
+                salt: "SaltMarker".into(),
+                hash: hash.clone(),
+            }],
+        };
+        for shown in [format!("{c:?}"), format!("{c:#?}")] {
+            for secret in ["CookieTokenMarker", "PasswordMarker", &format!("{hash:?}")] {
+                assert!(!shown.contains(secret), "Debug shows {secret}: {shown}");
+            }
+            // What identifies a credential is still there.
+            for name in ["x.cookie", "alice", "bob"] {
+                assert!(shown.contains(name), "Debug lost {name}: {shown}");
+            }
+        }
     }
 }
