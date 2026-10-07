@@ -6083,8 +6083,8 @@ impl ChainState {
     /// Used by `-reindex` when the chain database has been cleared.
     ///
     /// Three passes:
-    ///   1. Stream every record in the flat files, parsing only the 80-byte
-    ///      header. Build `header_by_hash` and the `parent → children`
+    ///   1. Stream every record in the flat files, reading only the 80-byte
+    ///      header (#916). Build `header_by_hash` and the `parent → children`
     ///      multimap. At the current mainnet height (~950k blocks, which
     ///      hashbrown rounds up to 2^21 buckets) that is ~254 MB for
     ///      `header_by_hash` and ~166 MB for `children` including its
@@ -6193,13 +6193,15 @@ impl ChainState {
         let mut scanned: u64 = 0;
         let gap;
         // A stop requested during the scan (#907) is honored between block
-        // files, so it waits for at most one file's read (128 MiB).
+        // files, so it waits for at most one file's headers.
         let mut scan_file: Option<u32> = None;
         let mut scan_stopped = false;
+        let scan_bytes;
         {
             let flat_files = self.flat_files.lock();
+            let bytes_before = flat_files.scan_bytes_read();
             flat_files
-                .for_each_block(|block_bytes, pos| {
+                .for_each_block_header(|block_bytes, pos| {
                     if scan_file != Some(pos.file_number) {
                         scan_file = Some(pos.file_number);
                         if self.replay_stop_requested() {
@@ -6262,6 +6264,7 @@ impl ChainState {
                     std::ops::ControlFlow::Continue(())
                 })
                 .map_err(|e| ChainError::FlatFile(format!("scan flat files: {}", e)))?;
+            scan_bytes = flat_files.scan_bytes_read() - bytes_before;
             gap = flat_files.first_gap();
         }
         if scan_stopped {
@@ -6279,7 +6282,11 @@ impl ChainState {
             p.set_total(total);
             p.set_current(total);
         }
-        tracing::info!(scanned, "Phase 1: indexed block headers from flat files");
+        tracing::info!(
+            scanned,
+            bytes_read = scan_bytes,
+            "Phase 1: indexed block headers from flat files"
+        );
         // The scan stops at the first missing file number, so every file
         // above a hole goes unread. Name the hole: it is the likeliest reason
         // the replay ends short, and the file is what the operator can
@@ -6552,8 +6559,9 @@ impl ChainState {
             self.require_extends_tip(&block.header, height)?;
             // The block files are the *sole* source of truth on this path —
             // the block index is being rebuilt from them — and their framing
-            // carries no checksum. `scan_one_file` validated magic and length;
-            // this is what validates the payload (issue #505).
+            // carries no checksum, and the scan read only the header and
+            // checked that the length fits the file; this is what validates
+            // the payload (issue #505).
             if let Err(e) = validation::block::check_block(&block, self.network, height) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
@@ -19832,8 +19840,8 @@ pub(crate) mod tests {
     /// A block whose payload was corrupted after it was written must fail the
     /// replay (issue #505).
     ///
-    /// The flat-file record framing carries no checksum — `scan_one_file`
-    /// validates magic and length — so a bit flipped inside a transaction
+    /// The flat-file record framing carries no checksum — the scan reads the
+    /// header and checks the length — so a bit flipped inside a transaction
     /// payload leaves the 80-byte header hashing correctly. It passes the PoW
     /// re-check, it passes the planned-record check, and before this it was
     /// connected: the corrupted UTXO delta landed and the reindex reported
@@ -20677,6 +20685,57 @@ pub(crate) mod tests {
         assert_eq!(end, FlatFileReindexEnd::Stopped { height: 8 });
         assert_eq!(re.tip_height(), 8);
         assert_eq!(progress.snapshot().phase, "reindex_resume_check");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #916: a reindex scan reads each record's header, not the block. A
+    /// continued reindex read every block file whole before it connected
+    /// anything, so each start read the whole chain again. Each block here
+    /// carries 32 KB of unspendable output, eight times the scan's read.
+    ///
+    /// Perturbation: scan with `for_each_block` and both runs read every
+    /// byte of the block files.
+    #[test]
+    fn a_reindex_scan_reads_the_block_headers_not_the_blocks() {
+        let (cs, dir) = make_chain_state();
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut hashes = Vec::new();
+        for h in 1..=12u32 {
+            let mut b = build_test_block(parent, h, 1_702_000_000 + h);
+            b.txdata[0].output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a; 32_000]),
+            });
+            b.header.merkle_root = b.compute_merkle_root().unwrap();
+            grind_test_pow(&mut b);
+            parent = cs.accept_block(&b).expect("accept block").hash();
+            hashes.push(parent);
+        }
+        let on_disk = cs.flat_files.lock().size_on_disk();
+        assert!(on_disk > 12 * 32_000, "{on_disk}");
+
+        let whole = reindexing_chain_state_over(&dir);
+        whole.reindex_from_flat_files(None, None, None).expect("uninterrupted reindex");
+        let fresh_read = whole.flat_files.lock().scan_bytes_read();
+        let (expected, _) = crate::storage::compressed_coin::hash_utxo_set(&*whole.store).unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        let before = re.flat_files.lock().scan_bytes_read();
+        let end = re.resume_reindex_from_flat_files(None, None, None).expect("continued run");
+        let resume_read = re.flat_files.lock().scan_bytes_read() - before;
+
+        assert_eq!(end, FlatFileReindexEnd::Finished);
+        assert_eq!(re.tip_hash(), hashes[11]);
+        let (got, _) = crate::storage::compressed_coin::hash_utxo_set(&*re.store).unwrap();
+        assert_eq!(got, expected, "the continued reindex ends on the same UTXO set");
+        for (run, read) in [("fresh", fresh_read), ("continued", resume_read)] {
+            assert!(read > 0, "the {run} scan read nothing");
+            assert!(
+                read * 5 < on_disk,
+                "the {run} scan read {read} of the block files' {on_disk} bytes"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
