@@ -142,6 +142,11 @@ pub enum ChainError {
     /// it again), so the wrapped string carries it rather than this text.
     #[error("block index updated, but re-activating the best chain failed: {0}")]
     ReactivationFailed(String),
+    /// An interrupted `-reindex` cannot be continued: the chain it stored is
+    /// not the start of the one the block files hold now (#906). The caller
+    /// starts the reindex over.
+    #[error("the interrupted reindex cannot be continued: {0}")]
+    ReindexCannotResume(String),
 }
 
 /// Outcome of [`ChainState::resume_pending_snapshot`] at startup.
@@ -6117,13 +6122,59 @@ impl ChainState {
     /// [`Self::set_startup_stop`]) ends the scan between block files, or the
     /// connect between blocks, flushed, and returns
     /// [`FlatFileReindexEnd::Stopped`].
+    ///
+    /// The chainstate must be empty, at genesis: this starts a reindex.
+    /// [`Self::resume_reindex_from_flat_files`] continues one.
     pub fn reindex_from_flat_files(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
         prev_tip_height: Option<u32>,
     ) -> Result<FlatFileReindexEnd, ChainError> {
+        self.replay_flat_files(stop_at, progress, prev_tip_height, false)
+    }
+
+    /// Continue a full `-reindex` that was interrupted (#906), from the height
+    /// its chainstate was flushed to.
+    ///
+    /// The block files are scanned and the chain to replay is planned exactly
+    /// as [`Self::reindex_from_flat_files`] does. The chain the interrupted
+    /// run stored must then be the start of that plan, entry for entry,
+    /// against the headers and positions the scan read from the files (see
+    /// `check_resumable_prefix`); the replay connects the rest. Nothing is
+    /// downloaded and no block file is written. A stored chain that is not
+    /// the plan's start fails with [`ChainError::ReindexCannotResume`], having
+    /// changed nothing, and the caller starts the reindex over.
+    pub fn resume_reindex_from_flat_files(
+        &self,
+        stop_at: Option<u32>,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+        prev_tip_height: Option<u32>,
+    ) -> Result<FlatFileReindexEnd, ChainError> {
+        self.replay_flat_files(stop_at, progress, prev_tip_height, true)
+    }
+
+    /// The flat-file replay behind [`Self::reindex_from_flat_files`] and
+    /// [`Self::resume_reindex_from_flat_files`].
+    fn replay_flat_files(
+        &self,
+        stop_at: Option<u32>,
+        progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+        prev_tip_height: Option<u32>,
+        resume: bool,
+    ) -> Result<FlatFileReindexEnd, ChainError> {
         use std::collections::HashMap;
+
+        // A fresh reindex starts on the empty chainstate the caller's wipe
+        // left: connecting the plan from block 1 over anything else would
+        // fail at block 1, or, where the stored chain differs, build on it.
+        let resume_from = self.tip_height();
+        if !resume && resume_from > 0 {
+            return Err(ChainError::InvalidArgument(format!(
+                "a reindex must start from an empty chainstate; this one is at height \
+                 {resume_from}"
+            )));
+        }
 
         // Periodic flush cadence — same reasoning as `reindex_chainstate`:
         // without it the in-memory dirty set held weeks of writes for a
@@ -6136,6 +6187,7 @@ impl ChainState {
         if let Some(p) = &progress {
             p.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
         }
+        tracing::info!(resume, "Phase 1: scanning the block files for block headers");
         let mut header_by_hash: HashMap<BlockHash, HeaderRef> = HashMap::new();
         let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
         let mut scanned: u64 = 0;
@@ -6363,6 +6415,44 @@ impl ChainState {
         // resident (~166 MB on mainnet) for the entire multi-day connect phase,
         // competing with the coin cache.
         drop(children);
+
+        // Resuming (#906): the stored chain must be the plan's start before
+        // anything is connected on top of it.
+        if resume_from > 0 {
+            if let Some(p) = &progress {
+                p.set_phase(
+                    "reindex_resume_check",
+                    "Checking the blocks the interrupted reindex replayed",
+                );
+                p.set_total(resume_from as u64);
+                p.set_current(0);
+            }
+            if !self.check_resumable_prefix(
+                &plan,
+                &header_by_hash,
+                resume_from,
+                progress.as_deref(),
+            )? {
+                tracing::info!(
+                    height = resume_from,
+                    "Reindex stopped on request while it checked the blocks it had replayed"
+                );
+                return Ok(FlatFileReindexEnd::Stopped {
+                    height: resume_from,
+                });
+            }
+            for hash in &plan.path[..resume_from as usize] {
+                header_by_hash.remove(hash);
+            }
+        }
+        if resume {
+            tracing::info!(
+                height = resume_from,
+                tip_height = plan.tip_height,
+                "Continuing the interrupted reindex from the height it had flushed; the blocks \
+                 below it match the block files"
+            );
+        }
         let connect_target_height = plan.tip_height;
         // `-stopatheight` caps the connect target when it lands below the tip.
         let target_height = stop_at
@@ -6370,8 +6460,16 @@ impl ChainState {
             .unwrap_or(connect_target_height);
 
         if let Some(p) = &progress {
-            p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
+            if resume {
+                p.set_phase(
+                    "reindex_connect",
+                    &format!("Replaying blocks (phase 2/2), continued from height {resume_from}"),
+                );
+            } else {
+                p.set_phase("reindex_connect", "Replaying blocks (phase 2/2)");
+            }
             p.set_total(target_height as u64);
+            p.set_current(resume_from as u64);
             p.set_stop_height(stop_at.map(|h| h as u64));
             // Switch the ETA into driver-controlled mode up front so the
             // generic linear estimate never briefly shows a bogus tiny ETA
@@ -6382,11 +6480,15 @@ impl ChainState {
         // Weight-aware ETA over the heavy connect phase (reused from IBD). The
         // connect target is the true genesis-reachable tip height (not the raw
         // phase-1 record count), so the estimate converges on the real finish.
-        let mut eta_est =
-            crate::ibd_eta::IbdEtaEstimator::new(0, target_height, self.network == Network::Bitcoin);
+        let mut eta_est = crate::ibd_eta::IbdEtaEstimator::new(
+            resume_from,
+            target_height,
+            self.network == Network::Bitcoin,
+        );
         let mut interval_start = std::time::Instant::now();
-        let mut last_interval: u32 = 0;
+        let mut last_interval: u32 = resume_from / 1000;
 
+        // Blocks connected by this run; the progress gauge counts heights.
         let mut connected: u32 = 0;
         // Set when a block on the planned path cannot be replayed. See the
         // handling after the loop for why this stops the replay rather than
@@ -6398,14 +6500,27 @@ impl ChainState {
             self.store.flush()?;
             self.store.flush_durable()?;
             if let Some(p) = &progress {
-                p.set_current(connected as u64);
+                p.set_current((resume_from + connected) as u64);
             }
             let height = self.tip_height();
             tracing::info!(connected, height, "Reindex stopped on request, flushed at this height");
             Ok(FlatFileReindexEnd::Stopped { height })
         };
         let stop_requested = || self.replay_stop_requested();
-        for hash in &plan.path {
+        // A resumed run that already reached `-stopatheight` has nothing to
+        // connect, and, like any run `-stopatheight` ends, indexes no side
+        // chains.
+        if let Some(target) = stop_at
+            && resume_from >= target
+        {
+            tracing::info!(
+                height = resume_from,
+                target,
+                "The interrupted reindex had already reached -stopatheight"
+            );
+            return Ok(FlatFileReindexEnd::Finished);
+        }
+        for hash in &plan.path[resume_from as usize..] {
             if stop_requested() {
                 return stop_here(connected);
             }
@@ -6519,7 +6634,7 @@ impl ChainState {
             if let Some(p) = &progress
                 && connected.is_multiple_of(100)
             {
-                p.set_current(connected as u64);
+                p.set_current((resume_from + connected) as u64);
                 p.set_eta(eta_est.estimate_eta(height, target_height));
             }
             if connected.is_multiple_of(10_000) {
@@ -6535,7 +6650,7 @@ impl ChainState {
                 && height >= target
             {
                 if let Some(p) = &progress {
-                    p.set_current(connected as u64);
+                    p.set_current((resume_from + connected) as u64);
                 }
                 tracing::info!(
                     connected,
@@ -6600,7 +6715,7 @@ impl ChainState {
             self.store.flush()?;
             self.store.flush_durable()?;
             if let Some(p) = &progress {
-                p.set_current(connected as u64);
+                p.set_current((resume_from + connected) as u64);
             }
             return Ok(FlatFileReindexEnd::Finished);
         }
@@ -6615,7 +6730,7 @@ impl ChainState {
         self.store.flush()?;
         self.store.flush_durable()?;
         if let Some(p) = &progress {
-            p.set_current(connected as u64);
+            p.set_current((resume_from + connected) as u64);
         }
         match short_of {
             Some(required) => tracing::warn!(
@@ -6628,6 +6743,130 @@ impl ChainState {
             None => tracing::info!(connected, "Reindex from flat files complete"),
         }
         Ok(FlatFileReindexEnd::Finished)
+    }
+
+    /// Check that the chain an interrupted `-reindex` stored is the start of
+    /// the one `plan` replays (#906), before continuing it from `height`.
+    ///
+    /// A full reindex rebuilds the block index from the block files alone,
+    /// so every entry at or below the stored tip was written by the
+    /// interrupted run, from a record the scan has just read again. That is
+    /// what this checks, entry for entry: each planned block up to `height`
+    /// is indexed at its planned height as connected (`Valid`), with the
+    /// header the block files hold, at the position the scan found it, and
+    /// with the chainwork its ancestors' headers add up to; and the stored
+    /// tip is the planned block at `height`. What the continued replay reads
+    /// from those entries (the parent link, the chainwork, the timestamps a
+    /// median time past is taken over) is then backed by the block files, as
+    /// it is in a replay from genesis.
+    ///
+    /// Above the tip, every height row must name the planned block at its
+    /// height. A connect that moves no coins (a block that spends nothing and
+    /// whose every output is unspendable) bypasses the coin cache's buffer,
+    /// so a kill before the next flush leaves that block's rows durable above
+    /// the stored tip. Over the same block files the replay writes them again,
+    /// unchanged; a row naming any other block would outlive the replay,
+    /// along with the index entry and undo data written beside it.
+    ///
+    /// Anything else fails: block files that changed between the runs, a
+    /// branch that now has more work, an entry some other tool wrote.
+    /// Continuing would build a chainstate the block files do not describe,
+    /// so the caller starts the reindex over instead. Nothing is written
+    /// either way.
+    ///
+    /// Costs one index read per stored block and one pass over the height
+    /// index, against the days a mainnet replay takes. A stop requested
+    /// meanwhile (#907) is polled every 1000 entries and ends the check with
+    /// `Ok(false)`.
+    fn check_resumable_prefix(
+        &self,
+        plan: &ReindexPlan,
+        header_by_hash: &std::collections::HashMap<BlockHash, ReindexHeaderRef>,
+        height: u32,
+        progress: Option<&crate::startup_progress::StartupProgress>,
+    ) -> Result<bool, ChainError> {
+        let fail = |reason: String| -> Result<bool, ChainError> {
+            tracing::error!(height, reason = %reason, "The interrupted reindex cannot be continued");
+            Err(ChainError::ReindexCannotResume(reason))
+        };
+        if height > plan.tip_height {
+            return fail(format!(
+                "it stored the chain to height {height}, but the block files hold it only to \
+                 height {}",
+                plan.tip_height
+            ));
+        }
+        let tip = self.tip_hash();
+        if plan.path[height as usize - 1] != tip {
+            return fail(format!(
+                "its tip at height {height}, {tip}, is not on the chain the block files hold"
+            ));
+        }
+        // Rows arrive in key order, which is not numeric; report the lowest.
+        let mut stray: Option<(u32, BlockHash)> = None;
+        if let Err(e) = self.store.for_each_height_hash(&mut |h, hash| {
+            if h > height
+                && plan.path.get(h as usize - 1) != Some(&hash)
+                && stray.is_none_or(|(at, _)| h < at)
+            {
+                stray = Some((h, hash));
+            }
+        }) {
+            return fail(format!("its height index could not be read: {e}"));
+        }
+        if let Some((h, hash)) = stray {
+            return fail(format!(
+                "its height index names block {hash} at height {h}, above its tip, and the \
+                 block files do not hold that block there"
+            ));
+        }
+        let genesis = bitcoin::constants::genesis_block(self.network).block_hash();
+        let Some(mut chainwork) = self.store.get_block_index(&genesis).map(|e| e.chainwork) else {
+            return fail("genesis is not in the block index".to_string());
+        };
+        for (i, hash) in plan.path[..height as usize].iter().enumerate() {
+            if i.is_multiple_of(1000) && self.replay_stop_requested() {
+                return Ok(false);
+            }
+            let h = i as u32 + 1;
+            let Some(file) = header_by_hash.get(hash) else {
+                return fail(format!("block {hash} at height {h} was not scanned"));
+            };
+            let Some(entry) = self.store.get_block_index(hash) else {
+                return fail(format!("block {hash} at height {h} is not in the block index"));
+            };
+            chainwork = add_u256(&chainwork, &work_for_bits(file.header.bits));
+            if entry.height != h
+                || entry.status != BlockStatus::Valid
+                || entry.header != file.header
+                || entry.file_number != file.pos.file_number
+                || entry.data_pos != file.pos.data_pos
+                || entry.chainwork != chainwork
+            {
+                return fail(format!(
+                    "the index entry for block {hash} does not match the block files: it is \
+                     at height {} ({h} planned), {:?}, in blk{:05}.dat at offset {} (scanned \
+                     in blk{:05}.dat at {}), header {}, chainwork {}",
+                    entry.height,
+                    entry.status,
+                    entry.file_number,
+                    entry.data_pos,
+                    file.pos.file_number,
+                    file.pos.data_pos,
+                    if entry.header == file.header { "matches" } else { "differs" },
+                    if entry.chainwork == chainwork { "matches" } else { "differs" },
+                ));
+            }
+            if let Some(p) = progress
+                && h.is_multiple_of(1000)
+            {
+                p.set_current(h as u64);
+            }
+        }
+        if let Some(p) = progress {
+            p.set_current(height as u64);
+        }
+        Ok(true)
     }
 
     /// Write header + `DataStored` index entries for the side-chain blocks a
@@ -20309,6 +20548,172 @@ pub(crate) mod tests {
         assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
         assert_eq!(cs.tip_hash(), hashes[4]);
         assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906: a reindex that stopped part-way continues from the height it
+    /// reached and ends on the UTXO set an uninterrupted one builds. The
+    /// continued run connects only the rest: replaying from block 1 over a
+    /// tip at 8 would fail `require_extends_tip` at block 1.
+    ///
+    /// Perturbation: the prefix is skipped twice over, by slicing the path
+    /// and by dropping its headers from the scan's map. Undo both and the
+    /// resume fails at block 1; either alone still skips it.
+    #[test]
+    fn a_stopped_reindex_continues_from_where_it_stopped() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 30, 1_701_300_000);
+        let whole = reindexing_chain_state_over(&dir);
+        whole.reindex_from_flat_files(None, None, None).expect("uninterrupted reindex");
+        let (expected, _) = crate::storage::compressed_coin::hash_utxo_set(&*whole.store).unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        assert_eq!(re.tip_height(), 8);
+        let progress = crate::startup_progress::StartupProgress::new();
+        let end = re
+            .resume_reindex_from_flat_files(None, Some(progress.clone()), None)
+            .expect("continued run");
+
+        assert_eq!(end, FlatFileReindexEnd::Finished);
+        assert_eq!(re.tip_hash(), hashes[29]);
+        let (got, _) = crate::storage::compressed_coin::hash_utxo_set(&*re.store).unwrap();
+        assert_eq!(got, expected, "the continued reindex ends on the same UTXO set");
+        assert_eq!(progress.snapshot().current, 30, "progress counts heights, not this run's blocks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906: a stored chain the block files do not back is never built on.
+    /// Every entry up to the stored tip is checked against the scan; one
+    /// that points elsewhere fails the resume with `ReindexCannotResume`,
+    /// and nothing is connected.
+    ///
+    /// Perturbation: drop the position comparison from
+    /// `check_resumable_prefix` and the resume succeeds.
+    #[test]
+    fn a_reindex_does_not_continue_over_an_entry_the_files_do_not_back() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 12, 1_701_400_000);
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        let mut entry = re.store.get_block_index(&hashes[2]).unwrap();
+        entry.data_pos += 1;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hashes[2], entry));
+        re.store.write_batch(batch).unwrap();
+
+        let err = re
+            .resume_reindex_from_flat_files(None, None, None)
+            .expect_err("the resume must refuse");
+
+        assert!(matches!(err, ChainError::ReindexCannotResume(_)), "{err}");
+        assert!(err.to_string().contains(&hashes[2].to_string()), "{err}");
+        assert_eq!(re.tip_hash(), hashes[7], "nothing was connected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906: above the stored tip, a height row must name the planned block
+    /// at its height. A connect that moved no coins can leave such a row
+    /// behind a kill, and the replay writes it again; a row naming another
+    /// block would outlive the replay, so the resume fails instead.
+    ///
+    /// Perturbation: drop the height-index pass from `check_resumable_prefix`
+    /// and the second resume succeeds.
+    #[test]
+    fn a_reindex_does_not_continue_under_a_height_row_the_files_do_not_back() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 12, 1_701_800_000);
+        let row_above_tip = |re: &ChainState, hash: BlockHash| {
+            let mut batch = crate::storage::StoreBatch::default();
+            batch.height_hash_puts.push((10, hash));
+            re.store.write_batch(batch).unwrap();
+        };
+
+        let planned = reindexing_chain_state_over(&dir);
+        planned.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        row_above_tip(&planned, hashes[9]);
+        let end = planned
+            .resume_reindex_from_flat_files(None, None, None)
+            .expect("a row naming the planned block is no obstacle");
+        assert_eq!(end, FlatFileReindexEnd::Finished);
+        assert_eq!(planned.tip_hash(), hashes[11]);
+
+        let stray = BlockHash::from_byte_array([0x5a; 32]);
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        row_above_tip(&re, stray);
+        let err = re
+            .resume_reindex_from_flat_files(None, None, None)
+            .expect_err("the resume must refuse");
+
+        assert!(matches!(err, ChainError::ReindexCannotResume(_)), "{err}");
+        assert!(err.to_string().contains(&stray.to_string()), "{err}");
+        assert_eq!(re.tip_hash(), hashes[7], "nothing was connected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906 with #907: a stop requested while a continued reindex checks the
+    /// blocks it had replayed ends it there, having connected nothing. The
+    /// scan of these block files polls once, so the second poll is the
+    /// check's first.
+    ///
+    /// Perturbation: drop the check's poll and the connect loop's first poll
+    /// stops it instead, in the connect phase.
+    #[test]
+    fn a_requested_stop_ends_a_continued_reindex_during_its_check() {
+        let (cs, dir) = make_chain_state();
+        build_chain(&cs, 12, 1_701_900_000);
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        let stop = crate::shutdown::StartupStop::default();
+        stop.request_on_poll(2);
+        re.set_startup_stop(stop);
+        let progress = crate::startup_progress::StartupProgress::new();
+
+        let end = re
+            .resume_reindex_from_flat_files(None, Some(progress.clone()), None)
+            .expect("continued run");
+
+        assert_eq!(end, FlatFileReindexEnd::Stopped { height: 8 });
+        assert_eq!(re.tip_height(), 8);
+        assert_eq!(progress.snapshot().phase, "reindex_resume_check");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906: a fresh reindex refuses a chainstate that is not empty. Its
+    /// connect starts at block 1, so over a stored chain it would fail there,
+    /// or, over a stored chain that differs, build on it.
+    #[test]
+    fn a_fresh_reindex_refuses_a_chainstate_past_genesis() {
+        let (cs, dir) = make_chain_state();
+        build_chain(&cs, 6, 1_701_500_000);
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(3), None, None).expect("first run");
+
+        let err = re.reindex_from_flat_files(None, None, None).expect_err("must refuse");
+
+        assert!(matches!(err, ChainError::InvalidArgument(_)), "{err}");
+        assert_eq!(re.tip_height(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #906: a continued reindex that had already reached `-stopatheight`
+    /// connects nothing more and, like any run `-stopatheight` ends, indexes
+    /// no side chain.
+    #[test]
+    fn a_continued_reindex_past_stopatheight_connects_nothing() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 6, 1_701_600_000);
+        let stale = build_test_block(hashes[1], 3, 1_701_600_103);
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(Some(4), None, None).expect("first run");
+
+        let end = re.resume_reindex_from_flat_files(Some(2), None, None).expect("resume");
+
+        assert_eq!(end, FlatFileReindexEnd::Finished);
+        assert_eq!(re.tip_hash(), hashes[3]);
+        assert!(re.store.get_block_index(&stale_hash).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
