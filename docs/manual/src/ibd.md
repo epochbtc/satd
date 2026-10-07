@@ -242,7 +242,8 @@ files again, checks each block it had already replayed against them (the
 index entry's header, file position, height and chainwork), and connects the
 rest. Nothing is downloaded and no block file is written. The replay flushes
 at least every 1000 blocks, so a kill costs at most that much replay, plus the
-scan.
+scan. The scan reads each block's header, not the whole block: at most 4 KiB
+per block.
 
 It runs again from genesis instead when it cannot be continued: its wipe may
 not have finished, satd 0.6.0 started it (0.6.0 did not record whether the wipe
