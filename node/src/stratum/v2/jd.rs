@@ -599,14 +599,15 @@ fn commits_to_height(script: &[u8], height: u32) -> bool {
 /// opcodes whose count cannot be known in advance, and the scriptSig is
 /// bounded at 20 per byte, the most any opcode counts (`OP_CHECKMULTISIG`).
 fn coinbase_sigop_cost_bound(coinbase: &Transaction, hole: std::ops::Range<usize>) -> u64 {
-    let outputs: usize = coinbase.output.iter().map(|o| o.script_pubkey.count_sigops_legacy()).sum();
+    use crate::validation::sigops::{MAX_PUBKEYS_PER_MULTISIG, WITNESS_SCALE_FACTOR, script_sigop_count};
+    let outputs: u64 = coinbase.output.iter().map(|o| script_sigop_count(&o.script_pubkey, false)).sum();
     let script = &coinbase.input[0].script_sig;
     let script_sigops = if hole.is_empty() || hole_inside_one_push(script, &hole) {
-        script.count_sigops_legacy()
+        script_sigop_count(script, false)
     } else {
-        20 * script.len()
+        MAX_PUBKEYS_PER_MULTISIG * script.len() as u64
     };
-    4 * (outputs + script_sigops) as u64
+    WITNESS_SCALE_FACTOR * (outputs + script_sigops)
 }
 
 /// Whether a single push's data covers all of `hole`.
@@ -697,7 +698,8 @@ mod tests {
             by_wtxid: txs
                 .iter()
                 .map(|t| {
-                    let sigops = t.total_sigop_cost(|_| None) as u64;
+                    // Legacy only: these spend made-up outpoints.
+                    let sigops = 4 * crate::validation::sigops::legacy_sigop_count(t);
                     (t.compute_wtxid(), (t.clone(), FEE, t.weight().to_wu(), sigops))
                 })
                 .collect(),
@@ -1010,14 +1012,17 @@ mod tests {
         assert_eq!(coinbase_sigop_cost_bound(&coinbase(pushed.clone()), 4..12), 80, "the output's 20, exactly");
         // Filled with OP_CHECKMULTISIG bytes it still counts only the output.
         let filled = [&pushed[..4], &[0xae; 8]].concat();
-        assert_eq!(coinbase(filled).total_sigop_cost(|_| None), 80);
+        let cost = |tx: &Transaction| {
+            crate::validation::sigops::transaction_sigop_cost(tx, &[], crate::validation::sigops::SigOpFlags::P2shWitness)
+        };
+        assert_eq!(cost(&coinbase(filled)), 80);
 
         // The same hole with no push around it: 12 bytes of scriptSig at 20.
         let raw = [&[0x02, 0x41, 0x01][..], &[0; 8], &[0x51]].concat();
         let bound = coinbase_sigop_cost_bound(&coinbase(raw.clone()), 3..11);
         assert_eq!(bound, 80 + 4 * 20 * 12);
         let worst = [&raw[..3], &[0xae; 8], &raw[11..]].concat();
-        assert!(coinbase(worst).total_sigop_cost(|_| None) as u64 <= bound, "the bound holds for the worst filling");
+        assert!(cost(&coinbase(worst)) <= bound, "the bound holds for the worst filling");
     }
 
     #[test]

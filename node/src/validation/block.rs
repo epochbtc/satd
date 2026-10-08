@@ -138,17 +138,12 @@ pub fn check_block(
     // p2sh sigops", but it is a hard ceiling a block cannot talk its way out
     // of, and it fires ahead of `bad-txns-inputs-missingorspent`.
     // `connect_block` still applies the full accurate count.
-    let mut legacy_sigops: usize = 0;
+    let mut legacy_sigops: u64 = 0;
     for tx in &block.txdata {
-        for input in &tx.input {
-            legacy_sigops = legacy_sigops.saturating_add(input.script_sig.count_sigops_legacy());
-        }
-        for output in &tx.output {
-            legacy_sigops =
-                legacy_sigops.saturating_add(output.script_pubkey.count_sigops_legacy());
-        }
+        legacy_sigops =
+            legacy_sigops.saturating_add(crate::validation::sigops::legacy_sigop_count(tx));
     }
-    if legacy_sigops.saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_SIGOPS_COST {
+    if legacy_sigops.saturating_mul(WITNESS_SCALE_FACTOR as u64) > MAX_BLOCK_SIGOPS_COST as u64 {
         return Err(ValidationError::BadBlockSigops);
     }
 
