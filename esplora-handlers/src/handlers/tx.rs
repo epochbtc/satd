@@ -195,6 +195,10 @@ pub struct VinJson {
     pub prevout: Option<PrevOutJson>,
     pub scriptsig: String,
     pub scriptsig_asm: String,
+    /// Witness stack items, hex. Left out when the input has no witness
+    /// (every legacy input), as upstream Esplora does: its `witness` is an
+    /// `Option` set only for a non-empty witness.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<String>,
     pub is_coinbase: bool,
     pub sequence: u32,
@@ -555,3 +559,7 @@ pub fn build_mempool_tx_json(
 
 #[allow(dead_code)]
 fn _block_unused(_: Block) {}
+
+#[cfg(test)]
+#[path = "tx_esplorapaging_tests.rs"]
+mod esplorapaging_tests;

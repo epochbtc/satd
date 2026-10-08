@@ -73,7 +73,7 @@ address-index docs) and `--txindex=1` (auto-enabled by the reconciliation in
 | GET | `/block/:hash/raw` | `application/octet-stream`: raw block bytes. |
 | GET | `/block/:hash/status` | JSON: `{in_best_chain, height?, next_best?}`. |
 | GET | `/block/:hash/txs` | JSON: first 25 txs in full Esplora shape (`{txid, version, locktime, vin, vout, size, weight, fee, status}`). |
-| GET | `/block/:hash/txs/:start_index` | JSON: 25 txs starting at `start_index`. Empty array past the end. |
+| GET | `/block/:hash/txs/:start_index` | JSON: 25 txs starting at `start_index`, which must be a multiple of 25 (400 otherwise). At or past the end of the block: 404 `start index out of range`. |
 | GET | `/block/:hash/txid/:index` | `text/plain`: txid at the given block-tx index. |
 | GET | `/block/:hash/txids` | JSON: array of every txid in the block. |
 
@@ -101,10 +101,10 @@ format differs from Electrum's.
 | Method | URL | Returns |
 |---|---|---|
 | GET | `/address/:address` <br> `/scripthash/:hash` | JSON: `{address, chain_stats, mempool_stats}`. Each `*_stats` block: `{tx_count, funded_txo_count, funded_txo_sum, spent_txo_count, spent_txo_sum}`. |
-| GET | `/address/:address/txs` <br> `/scripthash/:hash/txs` | JSON: up to 50 mempool txs followed by first 25 confirmed (newest first). |
+| GET | `/address/:address/txs` <br> `/scripthash/:hash/txs` | JSON: up to 50 mempool txs followed by first 25 confirmed (newest first). With `?after_txid=<txid>`, the history after that tx: the next 25 confirmed when it is confirmed, or the mempool txs after it followed by the first 25 confirmed when it is unconfirmed. 422 `after_txid not found` when it is in neither. |
 | GET | `/address/:address/txs/chain` <br> `/scripthash/:hash/txs/chain` | JSON: 25 confirmed txs, newest first. |
 | GET | `/address/:address/txs/chain/:last_seen_txid` <br> `/scripthash/:hash/txs/chain/:last_seen_txid` | JSON: next 25 confirmed txs strictly older than `last_seen_txid`. Unknown cursor returns an empty array, not 404. |
-| GET | `/address/:address/txs/mempool` <br> `/scripthash/:hash/txs/mempool` | JSON: up to 50 mempool txs. No paging. |
+| GET | `/address/:address/txs/mempool` <br> `/scripthash/:hash/txs/mempool` | JSON: up to 50 mempool txs, in the order this node admitted them. No paging. |
 | GET | `/address/:address/utxo` <br> `/scripthash/:hash/utxo` | JSON: live UTXOs (confirmed + mempool funding) with `{txid, vout, value, status}`. |
 
 Wrong-network addresses return 400, as do malformed addresses and bad
@@ -117,7 +117,7 @@ scripthash hex (non-hex characters or wrong length).
 | GET | `/mempool` | JSON: `{count, vsize, total_fee, fee_histogram}`. `fee_histogram` is `[[feerate_sat_vb, vsize], …]` descending by feerate. |
 | GET | `/mempool/txids` | JSON: array of every mempool txid. |
 | GET | `/mempool/recent` | JSON: up to 10 newest mempool txs by admission timestamp; each `{txid, fee, vsize, value}`. |
-| GET | `/fee-estimates` | JSON: object mapping confirmation target (string) to feerate (sat/vB, float). Standard targets: 1..25, 144, 504, 1008. Floor 1.0 sat/vB. |
+| GET | `/fee-estimates` | JSON: object mapping confirmation target (string) to feerate (sat/vB, float). Standard targets: 1..25, 144, 504, 1008. A target the node has no estimate for is left out, and the object is `{}` when there is none (see below). Never below the minimum relay feerate. |
 
 ### Root
 
@@ -159,10 +159,31 @@ the standard endpoints (`/address/:addr` or `/blocks/tip/{hash,height}`).
   format.
 - **Pagination cursors.** `/address/:addr/txs/chain/:last_seen_txid` starts the
   next page strictly after the cursor in the descending list. An unknown cursor
-  returns an empty array, so clients with stale state get `[]` rather than 404.
-- **Combined `/txs`.** Returns up to 50 mempool transactions followed by the
-  first 25 confirmed, in that order. Mempool entries appear in the index's
-  HashSet iteration order, not strictly time-ordered.
+  returns an empty array, so clients with stale state get `[]` rather than 404,
+  as blockstream.info does.
+- **Combined `/txs` and `?after_txid=`.** Returns up to 50 mempool transactions
+  followed by the first 25 confirmed, in that order. Mempool entries are in the
+  order this node admitted them (oldest first, then by txid), as upstream lists
+  them; the confirmed ones are newest first. `?after_txid=<txid>` is
+  mempool.space's paging cursor ("load more"): it continues after a transaction
+  from an earlier page. A confirmed cursor gives the next 25 confirmed
+  transactions, the same page as `/txs/chain/:last_seen_txid`; a mempool cursor
+  gives the mempool transactions after it and then the first 25 confirmed. A
+  cursor in neither list is 422 `after_txid not found`, a malformed one 400, and
+  an empty one is the first page. mempool.space also takes `max_txs`; satd does
+  not.
+- **Block pages.** `/block/:hash/txs/:start_index` answers 404
+  `start index out of range` at or past the end of the block, and 400
+  `start index must be a multiple of 25` for an unaligned start inside it, as
+  mempool.space does. blockstream.info answers 400 for both.
+- **`witness` on `vin`.** Present only when the input has a witness. A legacy
+  (non-segwit) input carries no `witness` key, as upstream.
+- **`/fee-estimates` without a fee signal.** A target is left out when the
+  node has no estimate for it: no mempool signal at that depth and no
+  confirmed-block fee history, as during IBD or right after startup. With no
+  estimate for any target the answer is `{}`. Upstream Esplora leaves out the
+  targets bitcoind cannot estimate in the same way; clients such as BDK pick the
+  nearest listed target at or below the one they want.
 - **`fee` field on tx JSON.** `null` when at least one prevout cannot be
   resolved (for example, txindex disabled or the previous tx pruned). `Some(0)`
   for coinbase. Otherwise `sum_inputs - sum_outputs`.
@@ -229,9 +250,9 @@ blockstream.info and mempool.space within these constraints:
   `p2sh`, `v0_p2wpkh`, `v0_p2wsh`, `v1_p2tr`, `op_return`, `multisig`, and
   `unknown`, matching upstream. Non-standard scripts serialize with
   `scriptpubkey_address: null`.
-- **Mempool ordering.** `/address/:addr/txs/mempool` returns entries in HashSet
-  iteration order, not strictly time-ordered. Upstream's contract is "up to
-  50" with no order specified.
+- **Mempool ordering.** `/address/:addr/txs/mempool` returns entries in the
+  order this node admitted them (oldest first, then by txid), the order
+  upstream Esplora keeps them in. Upstream's contract is "up to 50".
 - **Fee histogram bucketing** uses fixed boundaries spanning realistic mainnet
   fee regimes: 1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500,
   1000 sat/vB.

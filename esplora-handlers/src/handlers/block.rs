@@ -6,7 +6,8 @@
 //! - `GET /block/:hash/txs`          → first 25 txs as JSON array (PR 4
 //!   fills the full vin/vout/status shape; PR 3 returns a minimal
 //!   `{txid}` stub so paging and indexing work)
-//! - `GET /block/:hash/txs/:i`       → 25 txs starting at `i`
+//! - `GET /block/:hash/txs/:i`       → 25 txs starting at `i` (a multiple
+//!   of 25; 404 `start index out of range` at or past the end)
 //! - `GET /block/:hash/txid/:i`      → `<txid hex>` for tx at index `i`
 //! - `GET /block/:hash/txids`        → array of every txid in the block
 //!
@@ -199,19 +200,9 @@ pub async fn block_txs_page(
         .chain
         .get_block_index(&hash)
         .ok_or(EsploraError::NotFound)?;
-    // Empty page on out-of-range matches upstream Esplora's
-    // pagination contract — clients distinguish "block missing" (404)
-    // from "no more txs at this offset" (empty array). Saturating
-    // arithmetic prevents a `usize::MAX` request from panicking on
-    // overflow (review H5).
-    if start_index >= block.txdata.len() {
-        return Ok(Json(Vec::new()));
-    }
-    let end = start_index
-        .saturating_add(BLOCK_TXS_PAGE)
-        .min(block.txdata.len());
-    let mut out = Vec::with_capacity(end - start_index);
-    for tx in &block.txdata[start_index..end] {
+    let page = block_page_bounds(block.txdata.len(), start_index)?;
+    let mut out = Vec::with_capacity(page.len());
+    for tx in &block.txdata[page] {
         out.push(build_block_tx_json(
             &state,
             tx,
@@ -223,6 +214,34 @@ pub async fn block_txs_page(
     Ok(Json(out))
 }
 
+/// The transactions `/block/:hash/txs/:start_index` serves: up to 25 from
+/// `start_index`. A start at or past the end of the block is 404
+/// `start index out of range`, and a start that is not a multiple of 25 is
+/// 400, in that order, as mempool.space's electrs answers (`rest.rs`, the
+/// `block/:hash/txs` route). Blockstream's electrs answers 400 for both,
+/// with the same texts. The range check comes first and needs no
+/// arithmetic, so `usize::MAX` cannot overflow (review H5).
+fn block_page_bounds(
+    tx_count: usize,
+    start_index: usize,
+) -> EsploraResult<std::ops::Range<usize>> {
+    if start_index >= tx_count {
+        return Err(EsploraError::NotFoundReason(
+            "start index out of range".to_string(),
+        ));
+    }
+    if !start_index.is_multiple_of(BLOCK_TXS_PAGE) {
+        return Err(EsploraError::BadRequest(format!(
+            "start index must be a multiple of {BLOCK_TXS_PAGE}"
+        )));
+    }
+    let end = start_index.saturating_add(BLOCK_TXS_PAGE).min(tx_count);
+    Ok(start_index..end)
+}
+
+#[cfg(test)]
+#[path = "block_esplorapaging_tests.rs"]
+mod esplorapaging_tests;
 
 /// Reusable helper exposed for the `/blocks` page summary in
 /// `chain::collect_blocks_descending`. Returns

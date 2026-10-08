@@ -12217,11 +12217,11 @@ fn test_esplora_block_txids_and_paging() {
     node.stop();
 }
 
-/// `/block/:hash/txs/:start_index` returns an empty array for an
-/// in-range-but-past-end offset, and tolerates `usize::MAX` without
-/// panicking. (Review H5.)
+/// `/block/:hash/txs/:start_index` answers 404 `start index out of range`
+/// for an offset at or past the end of the block, as upstream Esplora does,
+/// and tolerates `usize::MAX` without panicking. (Review H5.)
 #[test]
-fn test_esplora_block_txs_pagination_past_end_returns_empty() {
+fn test_esplora_block_txs_pagination_past_end_is_404() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
@@ -12233,17 +12233,21 @@ fn test_esplora_block_txs_pagination_past_end_returns_empty() {
         .trim()
         .to_string();
 
-    // Offset == len → empty array, not 404 / panic.
+    // Offset == len → 404 `start index out of range`, not an empty page.
     let r = esplora_get(esplora_port, &format!("/block/{}/txs/1", tip));
-    assert_eq!(r.status(), 200);
-    let arr: Vec<serde_json::Value> = r.json().unwrap();
-    assert!(arr.is_empty());
+    assert_eq!(r.status(), 404);
+    assert_eq!(r.text().unwrap(), "start index out of range");
 
-    // usize::MAX must be saturated, not overflow-panic.
+    // usize::MAX must not overflow-panic.
     let r2 = esplora_get(esplora_port, &format!("/block/{}/txs/{}", tip, usize::MAX));
-    assert_eq!(r2.status(), 200);
-    let arr2: Vec<serde_json::Value> = r2.json().unwrap();
-    assert!(arr2.is_empty());
+    assert_eq!(r2.status(), 404);
+    assert_eq!(r2.text().unwrap(), "start index out of range");
+
+    // The first page itself is still served.
+    let r3 = esplora_get(esplora_port, &format!("/block/{}/txs/0", tip));
+    assert_eq!(r3.status(), 200);
+    let arr3: Vec<serde_json::Value> = r3.json().unwrap();
+    assert_eq!(arr3.len(), 1);
 
     node.stop();
 }
@@ -14102,27 +14106,20 @@ fn test_esplora_mempool_with_tx_reports_summary_txids_and_recent() {
     node.stop();
 }
 
-/// `GET /fee-estimates` returns a complete map keyed by every standard
-/// confirmation target — entries default to 1.0 sat/vB when the node
-/// lacks confirmed-block fee samples (regtest mempool is normally empty).
+/// `GET /fee-estimates` leaves out every target the node has no estimate
+/// for. A fresh regtest node has an empty mempool and no confirmed-block fee
+/// samples, so there is no estimate at all and the answer is `{}`, as
+/// upstream Esplora answers when bitcoind cannot estimate any target. It
+/// used to report the 1 sat/vB floor for every target.
 #[test]
-fn test_esplora_fee_estimates_returns_complete_map() {
+fn test_esplora_fee_estimates_empty_without_a_fee_signal() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let r = esplora_get(esplora_port, "/fee-estimates");
     assert_eq!(r.status(), 200);
     let body: serde_json::Value = r.json().unwrap();
-    let obj = body.as_object().unwrap();
-    // Standard targets: 1..25 + 144, 504, 1008.
-    for t in [1u32, 2, 3, 6, 10, 25, 144, 504, 1008] {
-        let v = obj
-            .get(&t.to_string())
-            .unwrap_or_else(|| panic!("missing target {t}"));
-        let f = v.as_f64().expect("feerate is a number");
-        // Floor is 1.0 sat/vB so consumers always have a usable value.
-        assert!(f >= 1.0, "target {} feerate {} below 1.0 floor", t, f);
-    }
+    assert_eq!(body, serde_json::json!({}), "no target has an estimate");
     node.stop();
 }
 
