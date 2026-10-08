@@ -1,0 +1,573 @@
+//! The addresses a peer may hand the node, and the outbound dials the node
+//! starts from them: Core's address rate limit (`ProcessAddrs`), and the
+//! separate limits on automatic and manual connections (`semOutbound`,
+//! `semAddnode`; `net.cpp` `ThreadOpenConnections`,
+//! `ThreadOpenAddedConnections`), against a live `PeerManager`.
+
+use super::*;
+use crate::net::flow::InFlight;
+use std::sync::atomic::AtomicUsize;
+
+fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
+    use crate::chain::state::AssumeValid;
+    use crate::storage::db::InMemoryStore;
+    use crate::storage::flatfile::FlatFileManager;
+    use crate::validation::script::NoopVerifier;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Box::new(InMemoryStore::new());
+    let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+    let chain_state = Arc::new(
+        ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    (over(chain_state), dir)
+}
+
+fn over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
+    let mempool = Arc::new(Mempool::new(1_000_000, 0));
+    let fee_estimator = Arc::new(FeeEstimator::new());
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+}
+
+/// Out of IBD, so the automatic outbound target is 8 rather than 64: a
+/// peer has announced a headers tip the node's tip is within 24 of.
+fn leave_ibd(pm: &PeerManager) {
+    pm.headers_tip.store(1, Ordering::Relaxed);
+    assert!(!pm.is_ibd(), "fixture: out of IBD");
+}
+
+fn add_peer(pm: &PeerManager, info: PeerInfo) {
+    let (tx, _rx) = mpsc::channel::<NetworkMessage>(8);
+    pm.peers.write().insert(
+        info.id,
+        PeerHandle {
+            info,
+            msg_tx: tx.into(),
+            disconnect: Arc::new(tokio::sync::Notify::new()),
+            flow: Arc::new(crate::net::flow::PeerFlow::new()),
+            last_getheaders_sent: None,
+            last_mempool_served: None,
+            fee_filter_sent: None,
+            stats: PeerStats::new(NetTotals::new()),
+        },
+    );
+}
+
+/// A connected peer.
+fn peer(id: PeerId, addr: SocketAddr, direction: Direction) -> PeerInfo {
+    let mut info = PeerInfo::new(id, addr, direction);
+    info.state = PeerState::Connected;
+    info
+}
+
+/// `n` connected automatic (`outbound-full-relay`) peers, ids from 1000.
+fn fill_automatic(pm: &PeerManager, n: usize) {
+    for i in 0..n {
+        let addr = SocketAddr::from(([203, 0, 113, i as u8 + 1], 8333));
+        add_peer(pm, peer(1000 + i as PeerId, addr, Direction::Outbound));
+    }
+}
+
+/// `n` addresses, each in a /16 of its own so the address book's
+/// per-group limit does not apply, starting at first octet `base`.
+fn spread(base: u8, n: usize) -> Vec<SocketAddr> {
+    (0..n)
+        .map(|i| SocketAddr::from(([base + (i / 250) as u8, (i % 250) as u8, 7, 7], 8333)))
+        .collect()
+}
+
+fn addr_msg(addrs: &[SocketAddr]) -> NetworkMessage {
+    NetworkMessage::Addr(
+        addrs
+            .iter()
+            .map(|a| (1_700_000_000, Address::new(a, ServiceFlags::NETWORK | ServiceFlags::WITNESS)))
+            .collect(),
+    )
+}
+
+fn addr_counts(pm: &PeerManager, id: PeerId) -> (u64, u64) {
+    let peers = pm.peers.read();
+    let rate = &peers.get(&id).expect("peer").info.addr_rate;
+    (rate.processed, rate.rate_limited)
+}
+
+/// A listener on loopback that accepts every connection and keeps it open,
+/// counting the accepts.
+struct Listener {
+    addr: SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Listener {
+    async fn bind() -> Self {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = socket.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        Self { addr, accepts, task }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn listeners(n: usize) -> Vec<Listener> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        out.push(Listener::bind().await);
+    }
+    out
+}
+
+fn total_accepts(ls: &[Listener]) -> usize {
+    ls.iter().map(Listener::accepts).sum()
+}
+
+/// Wait until `cond` holds.
+async fn wait_for(pm: &PeerManager, cond: impl Fn() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !cond() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: {what} (in flight {:?}, dialling {:?}, backoff {:?})",
+            pm.dials_in_flight.lock(),
+            pm.pending_connections.read(),
+            pm.reconnect_backoff.read().iter().map(|(a, s)| (*a, s.attempts)).collect::<Vec<_>>(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait for the dials a reconnect tick started to finish, one way or the
+/// other: nothing is in flight any more.
+async fn settle(pm: &PeerManager) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let in_flight = {
+            let d = pm.dials_in_flight.lock();
+            d.automatic + d.added_node
+        };
+        if in_flight == 0 && pm.pending_connections.read().is_empty() && pm.pending_onion_dials.read().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "dials still in flight");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Accepts land on the listener tasks a moment after the dial returns.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+// ---- Address rate limit ----
+
+/// Core gives each peer a token bucket for the addresses it announces: one
+/// token to start, 0.1 a second after that. satd took every entry of every
+/// `addr`, so one peer could put a thousand addresses into the address book
+/// and onto the dial list per message. A peer with the `addr` permission is
+/// not limited, as in Core.
+#[test]
+fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
+    let (pm, _dir) = mk_pm();
+    let limited = SocketAddr::from(([127, 0, 0, 1], 40001));
+    add_peer(&pm, peer(1, limited, Direction::Inbound));
+    pm.handle_message(1, addr_msg(&spread(1, 1000)), InFlight::adopt(None));
+    assert_eq!(addr_counts(&pm, 1), (1, 999), "one token: one address processed, the rest rate-limited");
+    assert_eq!(pm.addrman.read().len(), 1, "one address reached the address book");
+    assert_eq!(pm.learned_addrs.read().iter().count(), 1, "and the dial list");
+
+    let mut exempt = peer(2, SocketAddr::from(([127, 0, 0, 1], 40002)), Direction::Inbound);
+    exempt.permissions.addr = true;
+    add_peer(&pm, exempt);
+    pm.handle_message(2, addr_msg(&spread(20, 1000)), InFlight::adopt(None));
+    assert_eq!(addr_counts(&pm, 2), (1000, 0), "the addr permission takes them all");
+    assert_eq!(pm.addrman.read().len(), 1001);
+}
+
+/// Core adds `MAX_ADDR_TO_SEND` tokens when it sends a peer `getaddr`, so
+/// the answer is taken whole. satd sends one to an addr-fetch peer, and to
+/// outbound peers under a proxy.
+#[test]
+fn the_answer_to_a_getaddr_is_taken_whole() {
+    let (pm, _dir) = mk_pm();
+    add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 1], 8333)), Direction::Outbound));
+    pm.note_getaddr_sent(1);
+    pm.handle_message(1, addr_msg(&spread(1, 1000)), InFlight::adopt(None));
+    let (processed, limited) = addr_counts(&pm, 1);
+    assert_eq!((processed, limited), (1000, 0));
+}
+
+/// The same limit applies to `addrv2`.
+#[test]
+fn addrv2_is_rate_limited_too() {
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    let (pm, _dir) = mk_pm();
+    add_peer(&pm, peer(1, SocketAddr::from(([127, 0, 0, 1], 40001)), Direction::Inbound));
+    let msg = NetworkMessage::AddrV2(
+        spread(1, 500)
+            .into_iter()
+            .map(|a| AddrV2Message {
+                time: 1_700_000_000,
+                services: ServiceFlags::NETWORK,
+                addr: match a.ip() {
+                    IpAddr::V4(v4) => AddrV2::Ipv4(v4),
+                    IpAddr::V6(v6) => AddrV2::Ipv6(v6),
+                },
+                port: a.port(),
+            })
+            .collect(),
+    );
+    pm.handle_message(1, msg, InFlight::adopt(None));
+    assert_eq!(addr_counts(&pm, 1), (1, 499));
+}
+
+// ---- The automatic dial list ----
+
+/// Only an address the address book holds goes on the dial list. The book
+/// keeps at most 64 new addresses per network group; satd put every
+/// gossiped address on the dial list whether the book took it or not.
+#[test]
+fn an_address_the_book_has_no_room_for_is_not_dialled() {
+    let (pm, _dir) = mk_pm();
+    let source = IpAddr::from([198, 51, 100, 1]);
+    let one_group: Vec<SocketAddr> =
+        (0..100).map(|i| SocketAddr::from(([44, 1, (i / 250) as u8, (i % 250) as u8 + 1], 8333))).collect();
+    for a in &one_group {
+        pm.add_learned_addr_from(*a, 9, source);
+    }
+    let book = pm.addrman.read().len();
+    assert_eq!(book, 64, "fixture: the book's per-group limit");
+    assert_eq!(pm.learned_addrs.read().iter().count(), 64, "the dial list holds what the book holds");
+    for a in &one_group[..64] {
+        assert!(pm.learned_addrs.read().contains(a));
+    }
+    // An address the book already holds, announced again, stays listed once.
+    pm.add_learned_addr_from(one_group[0], 9, source);
+    assert_eq!(pm.learned_addrs.read().iter().count(), 64);
+}
+
+/// The list holds each address once and stops at its cap.
+#[test]
+fn the_dial_list_stops_at_its_cap() {
+    let mut list = LearnedAddrs::default();
+    let all: Vec<SocketAddr> = (0..=MAX_LEARNED_ADDRS as u32)
+        .map(|i| SocketAddr::from((std::net::Ipv4Addr::from(0x0b00_0000 + i), 8333)))
+        .collect();
+    for a in &all[..MAX_LEARNED_ADDRS] {
+        assert!(list.push(*a));
+    }
+    assert!(!list.push(all[0]), "a duplicate is refused");
+    assert!(!list.push(all[MAX_LEARNED_ADDRS]), "past the cap is refused");
+    assert_eq!(list.iter().count(), MAX_LEARNED_ADDRS);
+}
+
+// ---- Outbound dials ----
+
+/// The automatic limit counts the dials in flight along with the peers.
+/// satd counted connected peers only, so a reconnect tick started a dial
+/// for every eligible learned address at once: twenty listeners, three
+/// automatic peers connected and a target of eight got twenty dials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_tick_starts_no_more_automatic_dials_than_free_slots() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 3);
+    let ls = listeners(20).await;
+    for l in &ls {
+        pm.learned_addrs.write().push(l.addr);
+    }
+
+    pm.reconnect_tick();
+    wait_for(&pm, || total_accepts(&ls) >= 5, "five dials reach a listener").await;
+    settle(&pm).await;
+    assert_eq!(total_accepts(&ls), 5, "five free slots, five dials");
+    assert_eq!(pm.automatic_outbound_peers(), 8, "the target is reached");
+
+    // Full now: the next tick starts nothing.
+    pm.reconnect_tick();
+    settle(&pm).await;
+    assert_eq!(total_accepts(&ls), 5);
+}
+
+/// Manual connections are outside the automatic target, as in Core, where
+/// added nodes have their own limit (`semAddnode`). satd counted them
+/// against it, and redialled named peers only while the automatic count
+/// was below the target: with eight automatic peers, an added node was not
+/// dialled at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_added_node_is_dialled_with_the_automatic_slots_full() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 8);
+    let l = Listener::bind().await;
+    assert!(pm.addnode_add(&l.addr.to_string(), PeerAddr::Socket(l.addr)));
+
+    pm.reconnect_tick();
+    wait_for(&pm, || l.accepts() == 1, "the added node is dialled").await;
+    settle(&pm).await;
+    let conn_type = pm.peers.read().values().find(|h| h.info.addr == l.addr).map(|h| h.info.conn_type);
+    assert_eq!(conn_type, Some(ConnType::Manual));
+
+    // The automatic limit still holds for an automatic dial.
+    let spare = Listener::bind().await;
+    let err = pm.connect_outbound(spare.addr).await.expect_err("the automatic slots are full");
+    assert_eq!(err, "max outbound connections reached");
+}
+
+/// Core's `MAX_ADDNODE_CONNECTIONS`: eight added nodes at a time. The other
+/// manual connections (`-connect`, `-seednode`) have no limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn added_nodes_stop_at_eight_and_other_manual_peers_do_not() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let added = listeners(10).await;
+    for l in &added {
+        assert!(pm.addnode_add(&l.addr.to_string(), PeerAddr::Socket(l.addr)));
+    }
+    let connect = listeners(10).await;
+    for l in &connect {
+        assert!(pm.add_peer_addr(PeerAddr::Socket(l.addr)));
+    }
+
+    pm.reconnect_tick();
+    wait_for(
+        &pm,
+        || total_accepts(&added) >= MAX_ADDNODE_CONNECTIONS && total_accepts(&connect) >= 10,
+        "the dials reach their listeners",
+    )
+    .await;
+    settle(&pm).await;
+    assert_eq!(total_accepts(&added), MAX_ADDNODE_CONNECTIONS, "eight added nodes");
+    assert_eq!(total_accepts(&connect), 10, "every other manual peer");
+    assert_eq!(pm.added_node_peers(), MAX_ADDNODE_CONNECTIONS);
+
+    // One added node goes away: the next tick dials one more.
+    let gone = pm
+        .peers
+        .read()
+        .iter()
+        .find(|(_, h)| added.iter().any(|l| l.addr == h.info.addr))
+        .map(|(id, _)| *id)
+        .unwrap();
+    pm.peers.write().remove(&gone);
+    pm.reconnect_tick();
+    wait_for(&pm, || total_accepts(&added) > MAX_ADDNODE_CONNECTIONS, "a ninth dial").await;
+    settle(&pm).await;
+    assert_eq!(total_accepts(&added), MAX_ADDNODE_CONNECTIONS + 1);
+}
+
+/// `addnode onetry` is outside every limit, as Core's takes no grant, and
+/// answers success for a peer already connected, as Core's answers null.
+/// satd refused it with "max outbound connections reached" once the
+/// automatic peers were all connected, and with "already connected".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onetry_is_outside_the_limits_and_succeeds_for_a_connected_peer() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 8);
+    let l = Listener::bind().await;
+    let target = PeerAddr::Socket(l.addr);
+
+    pm.connect_peer_addr_onetry(&target, None).await.expect("onetry with the automatic slots full");
+    wait_for(&pm, || l.accepts() == 1, "the onetry dial reaches the listener").await;
+
+    pm.connect_peer_addr_onetry(&target, None).await.expect("onetry to a connected peer");
+    settle(&pm).await;
+    assert_eq!(l.accepts(), 1, "no second connection");
+
+    // A dial that fails is still reported.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_addr = closed.local_addr().unwrap();
+    drop(closed);
+    assert!(pm.connect_peer_addr_onetry(&PeerAddr::Socket(closed_addr), None).await.is_err());
+}
+
+/// A peer the operator named waits at most a minute between dials, Core's
+/// added-node retry interval. satd backed it off to five minutes, like a
+/// learned address.
+#[test]
+fn a_manual_peers_backoff_stops_at_a_minute() {
+    let mut manual = ReconnectState::new();
+    let mut automatic = ReconnectState::new();
+    for _ in 0..10 {
+        manual.record_failure(MANUAL_RECONNECT_MAX_BACKOFF);
+        automatic.record_failure(AUTOMATIC_RECONNECT_MAX_BACKOFF);
+    }
+    assert_eq!(manual.backoff_duration(MANUAL_RECONNECT_MAX_BACKOFF), Duration::from_secs(60));
+    assert_eq!(automatic.backoff_duration(AUTOMATIC_RECONNECT_MAX_BACKOFF), Duration::from_secs(300));
+}
+
+/// A failed dial backs off, and in the reconnect loop that is per address:
+/// a manual peer's failure uses the manual cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_manual_redial_backs_off_by_the_manual_cap() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    assert!(pm.addnode_add(&addr.to_string(), PeerAddr::Socket(addr)));
+    for _ in 0..10 {
+        pm.reconnect_backoff.write().entry(addr).or_insert_with(ReconnectState::new).next_attempt =
+            Instant::now();
+        pm.reconnect_tick();
+        settle(&pm).await;
+    }
+    let backoff = pm.reconnect_backoff.read();
+    let state = backoff.get(&addr).expect("a backoff entry");
+    assert_eq!(state.attempts, 10);
+    assert!(
+        state.next_attempt <= Instant::now() + MANUAL_RECONNECT_MAX_BACKOFF,
+        "the next dial is at most a minute away"
+    );
+}
+
+/// Backoff ends when a dial to that address connects, and not otherwise.
+/// satd cleared every address's backoff whenever the tip moved, which
+/// during IBD is every tick, so nothing ever backed off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_tip_leaves_reconnect_backoff_alone() {
+    use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+    let (cs, dir) = make_chain_state();
+    let chain_state = Arc::new(cs);
+    let pm = over(chain_state.clone());
+    let waiting = SocketAddr::from(([198, 51, 100, 9], 8333));
+    {
+        let mut backoff = pm.reconnect_backoff.write();
+        let state = backoff.entry(waiting).or_insert_with(ReconnectState::new);
+        for _ in 0..3 {
+            state.record_failure(AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        }
+    }
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    chain_state
+        .accept_block(&build_test_block(genesis, 1, 1_707_000_000))
+        .expect("connect block 1");
+
+    let pm_run = pm.clone();
+    let run = tokio::spawn(async move { pm_run.run().await });
+    // The run loop sees the new tip on its first maintenance pass, 500 ms in.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let attempts = pm.reconnect_backoff.read().get(&waiting).map(|s| s.attempts);
+    run.abort();
+    *pm.ibd.write() = None;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(attempts, Some(3), "a new tip does not clear backoff");
+}
+
+/// The other half: a dial that connects clears its address's backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_that_connects_clears_its_backoff() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let l = Listener::bind().await;
+    pm.learned_addrs.write().push(l.addr);
+    {
+        let mut backoff = pm.reconnect_backoff.write();
+        let state = backoff.entry(l.addr).or_insert_with(ReconnectState::new);
+        state.record_failure(AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        state.record_failure(AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        state.next_attempt = Instant::now();
+    }
+    pm.reconnect_tick();
+    wait_for(&pm, || l.accepts() == 1, "the address is dialled").await;
+    settle(&pm).await;
+    assert_eq!(pm.reconnect_backoff.read().get(&l.addr).map(|s| s.attempts), Some(0));
+}
+
+// ---- Bans and dials ----
+
+fn ban(pm: &PeerManager, target: crate::net::ban::BanTarget) {
+    let now = crate::time::now_secs();
+    pm.ban_list.write().add(&target, now, now + 3600).expect("ban");
+}
+
+/// Core checks bans for automatic connections only: a manual one is opened
+/// by the name the operator gave, banned or not (`OpenNetworkConnection`,
+/// `net.cpp`). satd skipped a banned added node in the reconnect loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banned_manual_peer_is_dialled_and_a_banned_learned_one_is_not() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let manual = Listener::bind().await;
+    let learned = Listener::bind().await;
+    assert!(pm.addnode_add(&manual.addr.to_string(), PeerAddr::Socket(manual.addr)));
+    pm.learned_addrs.write().push(learned.addr);
+    ban(&pm, crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([127, 0, 0, 1]))));
+
+    pm.reconnect_tick();
+    wait_for(&pm, || manual.accepts() == 1, "the banned added node is dialled").await;
+    settle(&pm).await;
+    assert_eq!(learned.accepts(), 0, "the banned learned address is not");
+    let err = pm
+        .connect_peer_addr_automatic(&PeerAddr::Socket(learned.addr))
+        .await
+        .expect_err("nor does a seed dial reach it");
+    assert!(err.contains("banned"), "{err}");
+    assert_eq!(learned.accepts(), 0);
+}
+
+/// The same for onion peers. satd never looked at the ban of an onion host
+/// in the reconnect loop or when gossip named one, so `setban <host>.onion`,
+/// or a ban for misbehaviour, did not stop automatic dials to it. With no
+/// proxy here every onion dial fails, which records a backoff entry: that
+/// entry is the trace of a dial attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banned_onion_host_is_neither_learned_nor_dialled_automatically() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let host = |c: char| format!("{}.onion", c.to_string().repeat(56));
+    let (banned, open, named) = (host('a'), host('b'), host('c'));
+
+    // Learned before the ban, so only the reconnect loop can hold it back.
+    pm.add_onion_connect_addr(banned.clone(), 8333);
+    pm.add_onion_connect_addr(open.clone(), 8333);
+    assert!(pm.add_peer_addr(PeerAddr::Onion { host: named.clone(), port: 8333 }));
+    for h in [&banned, &named] {
+        ban(&pm, crate::net::ban::BanTarget::Onion(h.clone()));
+    }
+
+    pm.reconnect_tick();
+    let tried = |h: &str| pm.onion_reconnect_backoff.read().contains_key(&format!("{h}:8333"));
+    wait_for(&pm, || tried(&open) && tried(&named), "the open host and the named one are dialled").await;
+    settle(&pm).await;
+    assert!(!tried(&banned), "the banned learned host is not");
+
+    // Gossip naming a banned host does not add it.
+    let later = host('d');
+    ban(&pm, crate::net::ban::BanTarget::Onion(later.clone()));
+    pm.add_onion_connect_addr(later.clone(), 8333);
+    pm.add_onion_connect_addr(host('e'), 8333);
+    let listed = |h: &str| {
+        pm.connect_peer_addrs.read().iter().any(|a| matches!(a, PeerAddr::Onion { host, .. } if host == h))
+    };
+    assert!(!listed(&later), "a banned onion host is not learned");
+    assert!(listed(&host('e')), "an open one is");
+}

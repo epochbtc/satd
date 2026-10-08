@@ -97,6 +97,23 @@ const MAX_ONION_DIALS_PER_TICK: usize = 16;
 /// attempts once a minute (`ThreadOpenAddedConnections`).
 const MANUAL_TARGET_RELOOKUP: Duration = Duration::from_secs(60);
 
+/// Core's `MAX_ADDNODE_CONNECTIONS` (`net.h`): added nodes (`-addnode`,
+/// `addnode add`) connected or being connected at once. Counted apart from
+/// the automatic outbound target (`semAddnode`).
+const MAX_ADDNODE_CONNECTIONS: usize = 8;
+
+/// The longest a peer the operator named waits between two dials. Core's
+/// `ThreadOpenAddedConnections` tries its added nodes again every 60
+/// seconds; automatic candidates back off to 300 seconds.
+const MANUAL_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The longest an automatic dial candidate waits between two dials.
+const AUTOMATIC_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Cap on the automatic dial list. Only an address the address book holds
+/// gets on it (seeds aside), so this is the book's own size.
+const MAX_LEARNED_ADDRS: usize = crate::net::addrman::MAX_ENTRIES;
+
 /// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
 /// host name), with the address it currently resolves to.
 #[derive(Debug, Clone)]
@@ -394,20 +411,98 @@ impl ReconnectState {
         }
     }
 
-    /// Backoff delay: 10s, 20s, 40s, 80s, 160s, capped at 300s.
-    fn backoff_duration(&self) -> Duration {
+    /// Backoff delay: 10s, 20s, 40s, 80s, 160s, capped at `max`
+    /// ([`MANUAL_RECONNECT_MAX_BACKOFF`] or
+    /// [`AUTOMATIC_RECONNECT_MAX_BACKOFF`]).
+    fn backoff_duration(&self, max: Duration) -> Duration {
         let secs = 10u64.saturating_mul(1u64 << self.attempts.min(5));
-        Duration::from_secs(secs.min(300))
+        Duration::from_secs(secs).min(max)
     }
 
-    fn record_failure(&mut self) {
+    fn record_failure(&mut self, max: Duration) {
         self.attempts = self.attempts.saturating_add(1);
-        self.next_attempt = Instant::now() + self.backoff_duration();
+        self.next_attempt = Instant::now() + self.backoff_duration(max);
     }
 
     fn reset(&mut self) {
         self.attempts = 0;
         self.next_attempt = Instant::now();
+    }
+}
+
+/// The addresses the node learned for itself, as the reconnect loop dials
+/// them: in the order they arrived, each once, at most
+/// [`MAX_LEARNED_ADDRS`]. This was a plain `Vec` searched end to end on
+/// every insert, with no cap.
+#[derive(Debug, Default)]
+struct LearnedAddrs {
+    order: Vec<SocketAddr>,
+    members: HashSet<SocketAddr>,
+}
+
+impl LearnedAddrs {
+    /// Append `addr`. False, changing nothing, if it is already on the
+    /// list or the list is full.
+    fn push(&mut self, addr: SocketAddr) -> bool {
+        if self.members.len() >= MAX_LEARNED_ADDRS || !self.members.insert(addr) {
+            return false;
+        }
+        self.order.push(addr);
+        true
+    }
+
+    #[cfg(test)]
+    fn contains(&self, addr: &SocketAddr) -> bool {
+        self.members.contains(addr)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &SocketAddr> {
+        self.order.iter()
+    }
+}
+
+/// The limit an outbound dial counts against, from the moment it passes the
+/// capacity check until its peer is in the peer map, where it is counted
+/// instead. Core's counting semaphores: a grant is taken before the dial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialBudget {
+    /// The node's own connections: the reconnect loop's and the seeds'.
+    /// Together with the automatic peers already connected, at most the
+    /// automatic outbound target (8, or 64 during IBD). Core's
+    /// `semOutbound`.
+    Automatic,
+    /// An added node (`-addnode`, `addnode add`): at most
+    /// [`MAX_ADDNODE_CONNECTIONS`] at once, apart from the automatic target.
+    /// Core's `semAddnode`.
+    AddedNode,
+    /// No limit: the other manual connections (`-connect`, `-seednode`),
+    /// which Core opens without a grant.
+    Unlimited,
+}
+
+/// Outbound dials in flight, per [`DialBudget`].
+#[derive(Debug, Default)]
+struct DialsInFlight {
+    automatic: usize,
+    added_node: usize,
+}
+
+/// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
+/// a reservation taken in the reconnect loop can travel with the dial it
+/// spawns.
+struct DialSlot {
+    pm: Arc<PeerManager>,
+    budget: DialBudget,
+}
+
+impl Drop for DialSlot {
+    fn drop(&mut self) {
+        let mut in_flight = self.pm.dials_in_flight.lock();
+        match self.budget {
+            DialBudget::Automatic => in_flight.automatic = in_flight.automatic.saturating_sub(1),
+            DialBudget::AddedNode => in_flight.added_node = in_flight.added_node.saturating_sub(1),
+            DialBudget::Unlimited => {}
+        }
     }
 }
 
@@ -531,6 +626,10 @@ mod p2pbounds_tests;
 #[cfg(test)]
 #[path = "manager_peerpunish_tests.rs"]
 mod peerpunish_tests;
+
+#[cfg(test)]
+#[path = "manager_addrdials_tests.rs"]
+mod addrdials_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -768,13 +867,13 @@ pub struct PeerManager {
     /// Addresses the node learned for itself: `addr`/`addrv2` gossip, the
     /// address book at startup, DNS seeds. The reconnect loop dials them only
     /// while `automatic_outbound` is on, as `outbound-full-relay`
-    /// connections. Only addresses the address book would take get here
-    /// (`AddrMan::admits`).
+    /// connections. A gossiped address gets here only if the address book
+    /// holds it, a seed only if the book would take it (`AddrMan::admits`).
     ///
     /// Kept apart from `manual_addrs`. This list used to hold both, and
     /// `spawn_peer` called any peer on it `manual`, so every peer reached
     /// through gossip was reported, whitelisted and counted as one (#866).
-    learned_addrs: RwLock<Vec<SocketAddr>>,
+    learned_addrs: RwLock<LearnedAddrs>,
     /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
     automatic_outbound: std::sync::atomic::AtomicBool,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
@@ -925,6 +1024,10 @@ pub struct PeerManager {
     /// onion equivalent, stopping the reconnect loop from opening a second
     /// connection to an onion peer it's already dialing/connected to.
     pending_onion_dials: RwLock<HashSet<String>>,
+    /// Outbound dials in flight, per [`DialBudget`]: counted against the
+    /// automatic outbound target and the added-node limit along with the
+    /// peers already connected. See [`Self::reserve_dial`].
+    dials_in_flight: parking_lot::Mutex<DialsInFlight>,
     /// Ban duration in seconds (default: 86400). Atomic for live SIGHUP
     /// reload (applies to bans created after the change).
     ban_duration_secs: AtomicU64,
@@ -1148,7 +1251,7 @@ impl PeerManager {
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
-            learned_addrs: RwLock::new(Vec::new()),
+            learned_addrs: RwLock::new(LearnedAddrs::default()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
@@ -1192,6 +1295,7 @@ impl PeerManager {
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
             pending_connections: RwLock::new(HashSet::new()),
             pending_onion_dials: RwLock::new(HashSet::new()),
+            dials_in_flight: parking_lot::Mutex::new(DialsInFlight::default()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             peer_connect_timeout_secs: AtomicU64::new(DEFAULT_PEER_CONNECT_TIMEOUT_SECS as u64),
@@ -1820,13 +1924,22 @@ impl PeerManager {
         // Linux dials the local host, or, off regtest, one that is not
         // publicly routable. Core refuses both in `AddrManImpl::AddSingle`
         // (v31.1 `src/addrman.cpp:554`) and dials only from its book.
+        //
+        // Nor does an address the book admits but has no room for (its
+        // per-group or total cap). Pushing that too put every gossiped
+        // address on the dial list, past the bounds the book keeps. An
+        // address the book already holds is pushed again; the list holds
+        // each address once.
         {
             let mut book = self.addrman.write();
             if !book.admits(&addr) {
                 tracing::debug!(%addr, "Ignoring a gossiped address the address book does not take");
                 return;
             }
-            book.add_from(addr, now_unix_secs(), services, source);
+            if !book.add_from(addr, now_unix_secs(), services, source) && !book.contains(&addr) {
+                tracing::debug!(%addr, "Not dialling a gossiped address the address book has no room for");
+                return;
+            }
         }
         self.push_learned(addr);
     }
@@ -1860,10 +1973,7 @@ impl PeerManager {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return;
         }
-        let mut addrs = self.learned_addrs.write();
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
+        self.learned_addrs.write().push(addr);
     }
 
     /// Bitcoin Core's `m_use_addrman_outgoing`: whether the node may dial
@@ -1907,6 +2017,11 @@ impl PeerManager {
         if self.is_onion_connected(&host) {
             return;
         }
+        // Core looks no further at a banned address it is told about, as the
+        // clearnet arms do; the reconnect loop would not dial it either.
+        if self.ban_list.read().is_onion_banned(&host, crate::time::now_secs()) {
+            return;
+        }
         let mut addrs = self.connect_peer_addrs.write();
         let already = addrs
             .iter()
@@ -1933,9 +2048,7 @@ impl PeerManager {
         // not been applied yet, and `may_dial` holds these back under it.
         let mut addrs = self.learned_addrs.write();
         for a in picks {
-            if !addrs.contains(&a) {
-                addrs.push(a);
-            }
+            addrs.push(a);
         }
         tracing::info!(loaded = self.addrman.read().len(), "Loaded persistent address book");
     }
@@ -2396,6 +2509,50 @@ impl PeerManager {
             .count()
     }
 
+    /// Core's address rate limit (`ProcessAddrs`; see
+    /// [`crate::net::addr_rate`]): refill the peer's token bucket, then keep
+    /// the entries of its `addr` / `addrv2` that find a token, taken in a
+    /// random order so the sender does not choose which ones get through. A
+    /// peer with the `addr` permission keeps them all.
+    ///
+    /// satd took every entry of every message: any peer could put up to a
+    /// thousand addresses per message into the address book and onto the
+    /// dial list, as often as it liked.
+    fn rate_limit_addrs<T>(&self, id: PeerId, mut addrs: Vec<T>) -> Vec<T> {
+        use rand::seq::SliceRandom;
+        addrs.shuffle(&mut rand::thread_rng());
+        let mut peers = self.peers.write();
+        let Some(handle) = peers.get_mut(&id) else {
+            return Vec::new();
+        };
+        let exempt = handle.info.permissions.addr;
+        let bucket = &mut handle.info.addr_rate;
+        bucket.refill(crate::time::now_micros());
+        let before = bucket.rate_limited;
+        addrs.retain(|_| bucket.admit(exempt));
+        let limited = bucket.rate_limited - before;
+        if limited > 0 {
+            tracing::debug!("Rate-limited {limited} addresses from peer={id}");
+        }
+        addrs
+    }
+
+    /// Count `n` addresses from peer `id` as processed
+    /// (`getpeerinfo.addr_processed`).
+    fn note_addrs_processed(&self, id: PeerId, n: u64) {
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.addr_rate.processed += n;
+        }
+    }
+
+    /// Note a `getaddr` sent to peer `id`: its answer may carry another
+    /// `MAX_ADDR_TO_SEND` addresses past the rate limit, as in Core.
+    fn note_getaddr_sent(&self, id: PeerId) {
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.addr_rate.getaddr_sent();
+        }
+    }
+
     /// An addr-fetch connection exists to collect one batch of addresses and
     /// go. Core requires more than one entry before treating the answer as
     /// complete, so a peer that only announces itself does not end the
@@ -2508,18 +2665,122 @@ impl PeerManager {
             .min(max_connections.load(Ordering::Relaxed))
     }
 
-    /// Check outbound connection limit.
-    fn check_outbound_limit(&self) -> Result<(), String> {
-        let max_outbound = if self.is_ibd() {
+    /// The automatic outbound target: 8, capped by `-maxconnections`, or 64
+    /// during IBD.
+    fn automatic_outbound_target(&self) -> usize {
+        if self.is_ibd() {
             MAX_OUTBOUND_IBD
         } else {
             self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND)
-        };
-        let outbound = self.outbound_count();
-        if outbound >= max_outbound {
-            return Err("max outbound connections reached".to_string());
         }
-        Ok(())
+    }
+
+    /// Outbound peers that count against the automatic target: every one
+    /// but the manual connections, which Core counts apart (`semAddnode`,
+    /// or no limit at all), connected or still in the handshake.
+    fn automatic_outbound_peers(&self) -> usize {
+        self.peers
+            .read()
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Outbound
+                    && h.info.conn_type != ConnType::Manual
+                    && h.info.state != PeerState::Disconnected
+            })
+            .count()
+    }
+
+    /// The added nodes the operator listed, at the addresses they resolve to.
+    fn added_node_addrs(&self) -> Vec<PeerAddr> {
+        self.addnode_entries
+            .read()
+            .iter()
+            .filter(|e| e.listed)
+            .filter_map(|e| e.resolved.clone())
+            .collect()
+    }
+
+    /// Manual peers that are added nodes, connected or still in the
+    /// handshake: what [`MAX_ADDNODE_CONNECTIONS`] counts.
+    fn added_node_peers(&self) -> usize {
+        let added = self.added_node_addrs();
+        self.peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::Manual && h.info.state != PeerState::Disconnected)
+            .filter(|h| {
+                added.iter().any(|a| match (a, h.info.onion_host.as_deref()) {
+                    (PeerAddr::Socket(sa), None) => *sa == h.info.addr,
+                    (PeerAddr::Onion { host, .. }, Some(peer_host)) => host == peer_host,
+                    _ => false,
+                })
+            })
+            .count()
+    }
+
+    /// The [`DialBudget`] a dial to `target` counts against. `conn_type` is
+    /// the dial's: `None` for an automatic dial, which is manual after all
+    /// when the operator named the peer (as `spawn_peer` will type it),
+    /// `Some(Manual)` for a dial the operator asked for. A typed
+    /// `addconnection` dial holds its own reservation instead.
+    fn dial_budget(&self, target: &PeerAddr, conn_type: Option<ConnType>) -> DialBudget {
+        let manual = match (conn_type, target) {
+            (Some(ConnType::Manual), _) => true,
+            (Some(_), _) => return DialBudget::Unlimited,
+            (None, PeerAddr::Socket(sa)) => self.untyped_outbound_conn_type(sa, None) == ConnType::Manual,
+            (None, PeerAddr::Onion { host, port }) => {
+                let placeholder = SocketAddr::from(([0, 0, 0, 0], *port));
+                self.untyped_outbound_conn_type(&placeholder, Some(host)) == ConnType::Manual
+            }
+        };
+        if !manual {
+            DialBudget::Automatic
+        } else if self.added_node_addrs().contains(target) {
+            DialBudget::AddedNode
+        } else {
+            DialBudget::Unlimited
+        }
+    }
+
+    /// Take a place for one dial in `budget`, or refuse when the budget is
+    /// spent. The place is held until the returned slot drops, which a
+    /// dial that connected does only after its peer is in `peers`.
+    ///
+    /// The check counts the dials already in flight along with the peers,
+    /// and it and the reservation happen under one lock. satd used to count
+    /// connected outbound peers only, manual ones included: each reconnect
+    /// tick started a dial for every eligible address at once (the limit
+    /// could not see them until they connected), and a full set of
+    /// automatic peers left no room for an added node or `addnode onetry`.
+    /// Core takes a grant from a counting semaphore before each dial:
+    /// `semOutbound` for automatic connections, `semAddnode` for added
+    /// nodes, none for `-connect` and `onetry` (`net.cpp`
+    /// `ThreadOpenConnections`, `ThreadOpenAddedConnections`;
+    /// `rpc/net.cpp` `addnode`).
+    fn reserve_dial(self: &Arc<Self>, budget: DialBudget) -> Result<DialSlot, String> {
+        let mut in_flight = self.dials_in_flight.lock();
+        match budget {
+            DialBudget::Automatic => {
+                // `addconnection`'s reservations take automatic slots too.
+                let open = self.automatic_outbound_peers()
+                    + in_flight.automatic
+                    + self.pending_typed_dials.read().len();
+                if open >= self.automatic_outbound_target() {
+                    return Err("max outbound connections reached".to_string());
+                }
+                in_flight.automatic += 1;
+            }
+            DialBudget::AddedNode => {
+                if self.added_node_peers() + in_flight.added_node >= MAX_ADDNODE_CONNECTIONS {
+                    return Err(format!(
+                        "addnode connections are limited to {MAX_ADDNODE_CONNECTIONS} at a time"
+                    ));
+                }
+                in_flight.added_node += 1;
+            }
+            DialBudget::Unlimited => {}
+        }
+        Ok(DialSlot { pm: Arc::clone(self), budget })
     }
 
     /// Connect to an outbound peer with no caller-chosen type, as the
@@ -2534,8 +2795,8 @@ impl PeerManager {
     /// `conn_type` is `Some(Manual)` for a dial the operator asked for
     /// ([`Self::connect_peer_addr_with`]), and one of `addconnection`'s four
     /// types for that RPC. `None` is an automatic dial, classified by
-    /// `spawn_peer`. A manual or automatic dial takes the historical single
-    /// outbound cap; `addconnection`'s types take Core's per-type ones.
+    /// `spawn_peer`. A manual or automatic dial counts against its
+    /// [`DialBudget`]; `addconnection`'s types take Core's per-type limits.
     pub async fn connect_outbound_as(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -2624,9 +2885,11 @@ impl PeerManager {
         Ok(())
     }
 
-    /// `connect_outbound_as`, with the per-type reservation optional:
-    /// `add_connection` has already taken it and holds the grant across the
-    /// spawned dial.
+    /// `connect_outbound_as`, with the reservation optional. `reserve` false
+    /// takes no place in any limit here: `add_connection` has already taken
+    /// its per-type one and the reconnect loop its [`DialSlot`], each held
+    /// across the spawned dial, and an `addnode onetry` has none, as Core
+    /// opens one without a grant.
     async fn connect_outbound_inner(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -2649,15 +2912,16 @@ impl PeerManager {
         if !crate::net::is_valid(addr.ip()) {
             return Err(format!("{addr} is not a valid address to connect to"));
         }
-        // Take the capacity check and the per-type reservation together, so
-        // two callers cannot both pass the same free slot.
+        // Take the capacity check and the reservation together, so two
+        // callers cannot both pass the same free slot.
+        let manual_or_automatic = matches!(conn_type, None | Some(ConnType::Manual));
+        let _dial_slot = if manual_or_automatic && reserve {
+            Some(self.reserve_dial(self.dial_budget(&PeerAddr::Socket(addr), conn_type))?)
+        } else {
+            None
+        };
         let _typed_slot = match conn_type {
-            // A manual dial is capped as an automatic one is, as it always
-            // was; it has no per-type reservation to take.
-            None | Some(ConnType::Manual) => {
-                self.check_outbound_limit()?;
-                None
-            }
+            None | Some(ConnType::Manual) => None,
             Some(t) if reserve => {
                 let mut pending = self.pending_typed_dials.write();
                 self.check_outbound_limit_for(t, &pending)?;
@@ -2746,10 +3010,27 @@ impl PeerManager {
         port: u16,
         conn_type: Option<ConnType>,
     ) -> Result<(), String> {
+        self.connect_outbound_onion_inner(host, port, conn_type, true).await
+    }
+
+    /// `connect_outbound_onion`, with the [`DialSlot`] optional, as in
+    /// [`Self::connect_outbound_inner`].
+    async fn connect_outbound_onion_inner(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+        conn_type: Option<ConnType>,
+        reserve: bool,
+    ) -> Result<(), String> {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
-        self.check_outbound_limit()?;
+        let _dial_slot = if reserve {
+            let target = PeerAddr::Onion { host: host.to_string(), port };
+            Some(self.reserve_dial(self.dial_budget(&target, conn_type))?)
+        } else {
+            None
+        };
 
         // Dedupe by onion host BEFORE any network I/O. Onion peers all share
         // the `0.0.0.0` placeholder socket, so `is_addr_connected` /
@@ -2817,8 +3098,10 @@ impl PeerManager {
 
     /// Dial a peer the operator asked for (either socket or .onion), there
     /// and then: `-connect`, `-addnode` and `-seednode` at startup and on
-    /// reload, `addnode add`, `addnode onetry`, and a named peer whose
-    /// name resolved. The connection is `manual`.
+    /// reload, `addnode add`, and a named peer whose name resolved. The
+    /// connection is `manual`; an added node counts against
+    /// [`MAX_ADDNODE_CONNECTIONS`]. `addnode onetry` is
+    /// [`Self::connect_peer_addr_onetry`].
     pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
         self.connect_peer_addr_with(addr, None).await
     }
@@ -2845,11 +3128,53 @@ impl PeerManager {
         }
     }
 
+    /// `addnode <addr> onetry`: one manual dial, outside every limit, as
+    /// Core's `onetry` opens its connection without a grant (`rpc/net.cpp`
+    /// `addnode`). A peer already connected, or being dialled, is left as
+    /// it is and the call succeeds: Core's `OpenNetworkConnection` returns
+    /// without dialling a host it is connected to, and `onetry` answers
+    /// null either way. A dial that fails is reported.
+    ///
+    /// satd refused `onetry` with "max outbound connections reached" once
+    /// the automatic outbound peers were all connected, and with "already
+    /// connected" for a connected peer.
+    pub async fn connect_peer_addr_onetry(
+        self: &Arc<Self>,
+        addr: &PeerAddr,
+        use_v2: Option<bool>,
+    ) -> Result<(), String> {
+        if self.is_peer_addr_connected(addr) || self.is_dial_in_flight(addr) {
+            tracing::debug!(%addr, "addnode onetry: already connected or connecting");
+            return Ok(());
+        }
+        match addr {
+            PeerAddr::Socket(sa) => {
+                self.connect_outbound_inner(*sa, Some(ConnType::Manual), use_v2, false).await
+            }
+            PeerAddr::Onion { host, port } => {
+                self.connect_outbound_onion_inner(host, *port, Some(ConnType::Manual), false).await
+            }
+        }
+    }
+
+    /// Whether a dial to `addr` is under way.
+    fn is_dial_in_flight(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Socket(sa) => self.pending_connections.read().contains(sa),
+            PeerAddr::Onion { host, .. } => self.pending_onion_dials.read().contains(host),
+        }
+    }
+
     /// Dial `addr` as one of the node's own automatic dials: the reconnect
     /// loop's, and a seed's. No type is chosen here; `spawn_peer` reports
     /// the connection `manual` if the operator named the peer and
     /// `outbound-full-relay` otherwise.
     pub async fn connect_peer_addr_automatic(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        // An automatic connection is not opened to a banned address, as in
+        // Core; a peer the operator named is dialled regardless.
+        if !self.is_manual_target(addr) && self.is_peer_addr_banned(addr) {
+            return Err(format!("{addr} is banned"));
+        }
         match addr {
             PeerAddr::Socket(sa) => self.connect_outbound(*sa).await,
             PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port, None).await,
@@ -3660,11 +3985,190 @@ impl PeerManager {
         Self::onion_connected_in(&self.peers.read(), host)
     }
 
+    /// One pass of the reconnect loop, every 10 seconds of the run loop:
+    /// redial the peers the operator named, then fill the free automatic
+    /// outbound slots from the addresses the node learned.
+    ///
+    /// The two halves are apart, as in Core, where
+    /// `ThreadOpenAddedConnections` and the `-connect` loop run separately
+    /// from `ThreadOpenConnections` (`net.cpp`). satd ran one pass, and only
+    /// while the outbound count, manual peers included, was below the
+    /// automatic target: on a node with its automatic peers connected, an
+    /// added node that dropped, or whose first dial failed, was not dialled
+    /// again.
+    fn reconnect_tick(self: &Arc<Self>) {
+        let now = Instant::now();
+        // Clean expired bans
+        {
+            let now_secs = crate::time::now_secs();
+            self.ban_list.write().prune_expired(now_secs);
+            self.flush_banlist();
+        }
+        self.redial_manual_peers(now);
+        self.dial_automatic_peers(now);
+    }
+
+    /// Whether `target` is a peer the operator named.
+    fn is_manual_target(&self, target: &PeerAddr) -> bool {
+        match target {
+            PeerAddr::Socket(sa) => self.manual_addrs.read().contains(sa),
+            PeerAddr::Onion { host, .. } => self.manual_onion_hosts.read().contains(host),
+        }
+    }
+
+    /// The manual half of [`Self::reconnect_tick`]: every peer the operator
+    /// named (`-connect`, `-addnode` / `addnode add`, `-seednode`) that is
+    /// not connected, whatever the automatic outbound count. Added nodes stop
+    /// at [`MAX_ADDNODE_CONNECTIONS`], and the one past it waits for a later
+    /// tick, as Core's added-node thread waits for a grant; the others have
+    /// no limit. A failed dial backs off to at most
+    /// [`MANUAL_RECONNECT_MAX_BACKOFF`], Core's added-node retry interval.
+    ///
+    /// A ban does not stop these dials. Core opens a manual connection by
+    /// the name the operator gave and checks bans only for the automatic
+    /// ones (`OpenNetworkConnection`, `net.cpp`); satd skipped a banned
+    /// manual peer here.
+    fn redial_manual_peers(self: &Arc<Self>, now: Instant) {
+        let mut targets: Vec<PeerAddr> =
+            self.manual_addrs.read().iter().map(|a| PeerAddr::Socket(*a)).collect();
+        let onion: Vec<PeerAddr> = self.connect_peer_addrs.read().clone();
+        targets.extend(onion.into_iter().filter(|a| self.is_manual_target(a)));
+        for target in targets {
+            if !self.redial_due(&target, now) {
+                continue;
+            }
+            let Ok(slot) = self.reserve_dial(self.dial_budget(&target, None)) else {
+                continue;
+            };
+            self.spawn_redial(target, slot, MANUAL_RECONNECT_MAX_BACKOFF);
+        }
+    }
+
+    /// The automatic half of [`Self::reconnect_tick`]: learned addresses,
+    /// then onion peers learned from `addrv2` gossip, one dial each until the
+    /// automatic outbound target is reached, the dials in flight counted
+    /// (`reserve_dial`). Under `-connect` the node dials none of them; see
+    /// [`Self::may_dial`]. A banned address is skipped, an onion host
+    /// included (`setban <host>.onion`, or a ban for misbehaviour), as Core
+    /// skips a banned address for an automatic connection; satd checked
+    /// the bans of clearnet addresses only.
+    fn dial_automatic_peers(self: &Arc<Self>, now: Instant) {
+        // An address the operator also named is offered by the manual half,
+        // and `spawn_peer` makes it the manual connection it is: Core makes
+        // no automatic connection to an added node (`AddedNodesContain`,
+        // v31.1 `src/net.cpp:2883`).
+        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        for addr in learned {
+            if self.is_manual_target(&PeerAddr::Socket(addr)) || !self.may_dial(&addr) {
+                continue;
+            }
+            let target = PeerAddr::Socket(addr);
+            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
+                continue;
+            }
+            match self.reserve_dial(DialBudget::Automatic) {
+                Ok(slot) => self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF),
+                Err(_) => return,
+            }
+        }
+
+        // `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up
+        // to MAX_ONION_CONNECT_ADDRS), and every onion dial holds a circuit
+        // through the one proxy, so on top of the free slots a tick starts
+        // no more than a burst of them.
+        let onion: Vec<PeerAddr> = self.connect_peer_addrs.read().clone();
+        let mut budget = Self::onion_dial_budget(
+            self.automatic_outbound_target(),
+            self.automatic_outbound_peers(),
+            self.dials_in_flight.lock().automatic,
+        );
+        for target in onion.into_iter().filter(|a| !self.is_manual_target(a)) {
+            // Under `-connect`, only the peers the operator named.
+            if budget == 0 || !self.automatic_outbound.load(Ordering::Relaxed) {
+                break;
+            }
+            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
+                continue;
+            }
+            match self.reserve_dial(DialBudget::Automatic) {
+                Ok(slot) => {
+                    budget -= 1;
+                    self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Whether the reconnect loop should dial `target` now: it is neither
+    /// connected nor being dialled, and not backing off. Bans are the
+    /// caller's to check: they hold for automatic dials only.
+    fn redial_due(&self, target: &PeerAddr, now: Instant) -> bool {
+        match target {
+            PeerAddr::Socket(sa) => {
+                !self.is_addr_connected(sa)
+                    && !self.pending_connections.read().contains(sa)
+                    && self
+                        .reconnect_backoff
+                        .read()
+                        .get(sa)
+                        .is_none_or(|state| now >= state.next_attempt)
+            }
+            PeerAddr::Onion { host, .. } => {
+                !self.is_onion_connected(host)
+                    && !self.pending_onion_dials.read().contains(host)
+                    && self
+                        .onion_reconnect_backoff
+                        .read()
+                        .get(&target.to_string())
+                        .is_none_or(|state| now >= state.next_attempt)
+            }
+        }
+    }
+
+    /// Dial `target` for the reconnect loop in a task of its own, holding the
+    /// place `slot` took for it, and keep its backoff: cleared when the dial
+    /// connects, longer (up to `max_backoff`) when it fails. Only a
+    /// connection clears it.
+    fn spawn_redial(self: &Arc<Self>, target: PeerAddr, slot: DialSlot, max_backoff: Duration) {
+        let pm = Arc::clone(self);
+        tokio::spawn(async move {
+            let _slot = slot;
+            let result = match &target {
+                PeerAddr::Socket(sa) => pm.connect_outbound_inner(*sa, None, None, false).await,
+                PeerAddr::Onion { host, port } => {
+                    pm.connect_outbound_onion_inner(host, *port, None, false).await
+                }
+            };
+            if let Err(e) = &result {
+                tracing::debug!(%target, "Reconnect failed: {e}");
+            }
+            let connected = result.is_ok();
+            let update = |state: &mut ReconnectState| {
+                if connected {
+                    state.reset();
+                } else {
+                    state.record_failure(max_backoff);
+                }
+            };
+            match &target {
+                PeerAddr::Socket(sa) => {
+                    update(pm.reconnect_backoff.write().entry(*sa).or_insert_with(ReconnectState::new))
+                }
+                PeerAddr::Onion { .. } => update(
+                    pm.onion_reconnect_backoff
+                        .write()
+                        .entry(target.to_string())
+                        .or_insert_with(ReconnectState::new),
+                ),
+            }
+        });
+    }
+
     /// How many new onion dials the reconnect loop may start this tick: the
-    /// open outbound slots (counting in-flight dials, which `outbound_count`
-    /// excludes because they aren't `Connected` yet) capped by the per-tick
-    /// burst limit. Without counting `in_flight`, a single tick could spawn a
-    /// dial for every gossip-discovered onion at once.
+    /// open automatic outbound slots (counting dials in flight) capped by the
+    /// per-tick burst limit. Without counting `in_flight`, a single tick
+    /// could spawn a dial for every gossip-discovered onion at once.
     fn onion_dial_budget(target: usize, outbound: usize, in_flight: usize) -> usize {
         target
             .saturating_sub(outbound + in_flight)
@@ -3683,6 +4187,17 @@ impl PeerManager {
     fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
         let now = crate::time::now_secs();
         self.ban_list.read().is_banned(&addr.ip(), now)
+    }
+
+    /// Whether `addr` is banned: a socket address by its IP (and any subnet
+    /// holding it), an onion one by its host.
+    fn is_peer_addr_banned(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Socket(sa) => self.is_addr_banned(sa),
+            PeerAddr::Onion { host, .. } => {
+                self.ban_list.read().is_onion_banned(host, crate::time::now_secs())
+            }
+        }
     }
 
     /// Add ban score to a peer. Once the score reaches [`BAN_THRESHOLD`] the
@@ -3869,14 +4384,13 @@ impl PeerManager {
             let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
 
             // When chain advances, immediately request more blocks (don't wait for timer)
+            // Reconnect backoff is not reset here: a dial's backoff ends when
+            // a dial to that address succeeds. Resetting every address's on
+            // each new tip, which during IBD is every tick, meant no address
+            // ever backed off.
             let tip_advanced = tip != last_tip;
             if tip_advanced {
                 last_tip = tip;
-                // Reset reconnect backoff on chain progress
-                let mut backoff = self.reconnect_backoff.write();
-                for state in backoff.values_mut() {
-                    state.reset();
-                }
             }
 
             // IBD scheduler maintenance
@@ -4058,13 +4572,13 @@ impl PeerManager {
                 }
             }
 
-            // Every 20 ticks (10 seconds), reconnect if below outbound target.
-            // Skipped entirely while networking is paused (`networkactive=0` /
-            // `setnetworkactive false`): otherwise each tick would spawn dials
-            // that immediately fail the gate, churning backoff state and logs.
-            // Named peers are looked up again on the same tick, whatever the
-            // outbound count: an added node is a manual connection, which
-            // Core dials outside the outbound target.
+            // Every 20 ticks (10 seconds), redial the peers the operator
+            // named and fill the automatic outbound slots
+            // (`reconnect_tick`). Skipped entirely while networking is paused
+            // (`networkactive=0` / `setnetworkactive false`): otherwise each
+            // tick would spawn dials that immediately fail the gate, churning
+            // backoff state and logs. Named peers are looked up again on the
+            // same tick.
             if ticks.is_multiple_of(20)
                 && self.is_network_active()
                 && self.manual_targets_due(Instant::now())
@@ -4072,157 +4586,7 @@ impl PeerManager {
                 tokio::spawn(Arc::clone(self).refresh_manual_targets());
             }
             if ticks.is_multiple_of(20) && self.is_network_active() {
-                let outbound = self.outbound_count();
-                let target = if self.is_ibd() { MAX_OUTBOUND_IBD } else { MAX_OUTBOUND };
-                let need_peers = outbound < target;
-                if need_peers {
-                    // The peers the operator named first, then those the node
-                    // learned. An address on both lists is offered once, and
-                    // `spawn_peer` makes it the manual connection it is: Core
-                    // makes no automatic connection to an added node
-                    // (`AddedNodesContain`, v31.1 `src/net.cpp:2883`).
-                    let manual: HashSet<SocketAddr> = self.manual_addrs.read().clone();
-                    let learned: Vec<SocketAddr> = self
-                        .learned_addrs
-                        .read()
-                        .iter()
-                        .filter(|a| !manual.contains(a))
-                        .copied()
-                        .collect();
-                    let addrs: Vec<SocketAddr> = manual.into_iter().chain(learned).collect();
-
-                    let now = Instant::now();
-
-                    // Clean expired bans
-                    {
-                        let now_secs = crate::time::now_secs();
-                        self.ban_list.write().prune_expired(now_secs);
-                        self.flush_banlist();
-                    }
-
-                    for addr in addrs {
-                        // Under `-connect`, only the peers the operator named.
-                        if !self.may_dial(&addr) {
-                            continue;
-                        }
-                        // Skip if already connected
-                        if self.is_addr_connected(&addr) {
-                            continue;
-                        }
-                        // Skip if banned
-                        if self.is_addr_banned(&addr) {
-                            continue;
-                        }
-                        // Check backoff timer
-                        {
-                            let backoff = self.reconnect_backoff.read();
-                            if let Some(state) = backoff.get(&addr)
-                                && now < state.next_attempt {
-                                    continue;
-                                }
-                        }
-
-                        // Don't exceed target
-                        if self.check_outbound_limit().is_err() {
-                            break;
-                        }
-
-                        let pm = Arc::clone(self);
-                        tokio::spawn(async move {
-                            match pm.connect_outbound(addr).await {
-                                Ok(_) => {
-                                    let mut backoff = pm.reconnect_backoff.write();
-                                    backoff
-                                        .entry(addr)
-                                        .or_insert_with(ReconnectState::new)
-                                        .reset();
-                                }
-                                Err(e) => {
-                                    tracing::debug!(%addr, "Reconnect failed: {}", e);
-                                    let mut backoff = pm.reconnect_backoff.write();
-                                    backoff
-                                        .entry(addr)
-                                        .or_insert_with(ReconnectState::new)
-                                        .record_failure();
-                                }
-                            }
-                        });
-                    }
-
-                    // Also reconnect .onion peers — with the same discipline the
-                    // clearnet loop above has. `connect_peer_addrs` is fillable
-                    // from untrusted addrv2 gossip (up to MAX_ONION_CONNECT_ADDRS),
-                    // so spawning a dial per entry with no cap would let one peer
-                    // drive hundreds of concurrent SOCKS dials through the single
-                    // proxy every tick. Bound new dials this tick by the open
-                    // slot budget (counting in-flight dials, which
-                    // `outbound_count()` excludes) and a per-tick burst cap; skip
-                    // already-connected / in-flight hosts; and back off failures
-                    // (onion-host-keyed, since `reconnect_backoff` is SocketAddr-
-                    // keyed).
-                    let onion_addrs = self.connect_peer_addrs.read().clone();
-                    let mut budget = Self::onion_dial_budget(
-                        target,
-                        self.outbound_count(),
-                        self.pending_onion_dials.read().len(),
-                    );
-                    for peer_addr in onion_addrs {
-                        if budget == 0 {
-                            break;
-                        }
-                        // Under `-connect`, only the peers the operator named.
-                        let manual = match &peer_addr {
-                            PeerAddr::Onion { host, .. } => {
-                                self.manual_onion_hosts.read().contains(host)
-                            }
-                            PeerAddr::Socket(sa) => self.manual_addrs.read().contains(sa),
-                        };
-                        if !manual && !self.automatic_outbound.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        let already = match &peer_addr {
-                            PeerAddr::Onion { host, .. } => {
-                                self.is_onion_connected(host)
-                                    || self.pending_onion_dials.read().contains(host)
-                            }
-                            PeerAddr::Socket(sa) => self.is_addr_connected(sa),
-                        };
-                        if already {
-                            continue;
-                        }
-                        let key = peer_addr.to_string();
-                        {
-                            let backoff = self.onion_reconnect_backoff.read();
-                            if let Some(state) = backoff.get(&key)
-                                && now < state.next_attempt
-                            {
-                                continue;
-                            }
-                        }
-                        budget -= 1;
-                        let pm = Arc::clone(self);
-                        tokio::spawn(async move {
-                            let key = peer_addr.to_string();
-                            match pm.connect_peer_addr_automatic(&peer_addr).await {
-                                Ok(_) => {
-                                    pm.onion_reconnect_backoff
-                                        .write()
-                                        .entry(key)
-                                        .or_insert_with(ReconnectState::new)
-                                        .reset();
-                                }
-                                Err(e) => {
-                                    tracing::debug!(%peer_addr, "Onion reconnect failed: {}", e);
-                                    pm.onion_reconnect_backoff
-                                        .write()
-                                        .entry(key)
-                                        .or_insert_with(ReconnectState::new)
-                                        .record_failure();
-                                }
-                            }
-                        });
-                    }
-                }
+                self.reconnect_tick();
             }
 
             // Drop addr-fetch connections whose peer never sent a usable
@@ -4430,12 +4794,20 @@ impl PeerManager {
                     self.add_ban_score(id, 100, &format!("addr message size = {}", addrs.len()));
                     return;
                 }
+                let count = addrs.len();
+                let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
                 let source = self.peer_ip(id);
-                for (_, addr) in &addrs {
-                    if relay_addrs
-                        && let Ok(sock_addr) = addr.socket_addr()
+                let mut processed = 0u64;
+                for (_, addr) in &admitted {
+                    let sock_addr = addr.socket_addr().ok();
+                    // Core looks no further at a banned address, and does
+                    // not count it processed.
+                    if sock_addr.is_some_and(|sa| self.is_addr_banned(&sa)) {
+                        continue;
+                    }
+                    processed += 1;
+                    if let Some(sock_addr) = sock_addr
                         && !self.is_addr_connected(&sock_addr)
-                        && !self.is_addr_banned(&sock_addr)
                     {
                         self.add_learned_addr_from(
                             sock_addr,
@@ -4444,7 +4816,8 @@ impl PeerManager {
                         );
                     }
                 }
-                self.note_addr_fetch_answered(id, addrs.len());
+                self.note_addrs_processed(id, processed);
+                self.note_addr_fetch_answered(id, count);
             }
             NetworkMessage::GetAddr => {
                 // Respond with our declared external addresses (-externalip)
@@ -4584,8 +4957,11 @@ impl PeerManager {
                     self.add_ban_score(id, 100, &format!("addrv2 message size = {}", addrs.len()));
                     return;
                 }
+                let count = addrs.len();
+                let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
                 let source = self.peer_ip(id);
-                for addr_msg in addrs.iter().filter(|_| relay_addrs) {
+                let mut processed = 0u64;
+                for addr_msg in &admitted {
                     match &addr_msg.addr {
                         // BIP 155 TorV3: `socket_addr()` can't represent these,
                         // so derive the .onion host and queue it for dialing.
@@ -4593,14 +4969,23 @@ impl PeerManager {
                             if onion_routing && addr_msg.port != 0 =>
                         {
                             let host = crate::net::peer::torv3_to_onion_host(pubkey);
+                            if self.ban_list.read().is_onion_banned(&host, crate::time::now_secs()) {
+                                continue;
+                            }
+                            processed += 1;
                             self.add_onion_connect_addr(host, addr_msg.port);
                         }
                         // IPv4 / IPv6 (and, under a proxy, anything else with a
                         // socket form) flow through the clearnet address book.
                         _ => {
-                            if let Ok(sock_addr) = addr_msg.socket_addr()
+                            let sock_addr = addr_msg.socket_addr().ok();
+                            // As for `addr`.
+                            if sock_addr.is_some_and(|sa| self.is_addr_banned(&sa)) {
+                                continue;
+                            }
+                            processed += 1;
+                            if let Some(sock_addr) = sock_addr
                                 && !self.is_addr_connected(&sock_addr)
-                                && !self.is_addr_banned(&sock_addr)
                             {
                                 self.add_learned_addr_from(
                                     sock_addr,
@@ -4611,7 +4996,8 @@ impl PeerManager {
                         }
                     }
                 }
-                self.note_addr_fetch_answered(id, addrs.len());
+                self.note_addrs_processed(id, processed);
+                self.note_addr_fetch_answered(id, count);
             }
             NetworkMessage::SendAddrV2 => {
                 let mut peers = self.peers.write();
@@ -9823,6 +10209,8 @@ impl PeerManager {
         // connection is about to be dropped.
         let conn_type = self.conn_type_of(id);
         if conn_type == ConnType::AddrFetch {
+            // Room for the answer, before it can arrive.
+            self.note_getaddr_sent(id);
             writer
                 .send(NetworkMessage::GetAddr)
                 .await
@@ -9879,6 +10267,7 @@ impl PeerManager {
             && conn_type != ConnType::AddrFetch
             && (self.proxy.is_some() || self.onion_proxy.is_some())
         {
+            self.note_getaddr_sent(id);
             writer.send(NetworkMessage::GetAddr)
                 .await
                 .map_err(|e| format!("send getaddr: {}", e))?;

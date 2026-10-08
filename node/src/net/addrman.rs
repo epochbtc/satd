@@ -38,7 +38,7 @@ use std::path::Path;
 
 /// Hard cap on total stored addresses (new + tried). Keeps `peers.dat`
 /// and memory bounded; well above what a single node needs to bootstrap.
-const MAX_ENTRIES: usize = 16_384;
+pub const MAX_ENTRIES: usize = 16_384;
 /// Per-network-group cap in the *new* table (eclipse resistance: stop one
 /// `/16`/ASN from flooding the book with addresses).
 const MAX_NEW_PER_GROUP: usize = 64;
@@ -315,6 +315,11 @@ impl AddrMan {
         entry.last_success = now;
         entry.last_seen = now;
         entry.attempts = 0;
+    }
+
+    /// Whether the book holds `addr`, in either table.
+    pub fn contains(&self, addr: &SocketAddr) -> bool {
+        self.entries.contains_key(addr)
     }
 
     /// Record a failed connection attempt.

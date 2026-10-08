@@ -2922,14 +2922,16 @@ pub async fn start(
                 }
             }
             "onetry" => {
-                // A single, un-remembered attempt — block on it and surface the
-                // result, matching the prior satd behavior (now onion-capable).
+                // A single, un-remembered attempt — block on it and surface a
+                // failed dial, as satd always has (now onion-capable). Like
+                // Core's, it is outside the outbound limits, and a peer
+                // already connected answers null.
                 let addr = ctx.peer_manager
                     .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 ctx.peer_manager
-                    .connect_peer_addr_with(&addr, v2transport)
+                    .connect_peer_addr_onetry(&addr, v2transport)
                     .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
