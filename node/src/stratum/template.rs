@@ -393,7 +393,11 @@ pub(crate) mod tests {
             let weight = coinbase.weight().to_wu() as usize;
             assert!(weight <= COINBASE_WEIGHT_RESERVE, "{payout}: {weight} WU");
             // A coinbase's sigop cost, as `connect_block` counts it.
-            let sigops = coinbase.total_sigop_cost(|_| None) as u64;
+            let sigops = crate::validation::sigops::transaction_sigop_cost(
+                &coinbase,
+                &[],
+                crate::validation::sigops::SigOpFlags::P2shWitness,
+            );
             assert!(sigops <= COINBASE_SIGOPS_RESERVE, "{payout}: {sigops} sigop cost");
             if payout.is_p2pkh() {
                 assert_eq!(sigops, 4, "the P2PKH payout's OP_CHECKSIG counts, and nothing else");

@@ -302,31 +302,21 @@ fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
                 == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
 }
 
-/// Block-level signature-operation cost for one transaction, height-gated to
-/// match Bitcoin Core's `GetTransactionSigOpCost`. Below P2SH activation only
-/// legacy sigops count (scaled by the witness factor); at/after it the full
-/// BIP 141 witness-aware cost applies. Witness sigops are naturally zero
-/// before any witness data exists, so the single `>= P2SH` gate is exact
-/// across the P2SH→segwit range. `spent` maps each input's prevout to the
-/// output it spends (empty for coinbase, which Core counts as legacy-only).
-fn transaction_sigop_cost(
-    tx: &Transaction,
-    network: Network,
-    height: u32,
-    spent: &HashMap<OutPoint, TxOut>,
-) -> u64 {
-    if height >= crate::validation::script::activation_heights(network).p2sh {
-        tx.total_sigop_cost(|op| spent.get(op).cloned()) as u64
+/// Block-level signature-operation cost for one transaction: Bitcoin Core's
+/// `GetTransactionSigOpCost` (see [`crate::validation::sigops`]). At and
+/// after P2SH activation it counts with `SCRIPT_VERIFY_P2SH |
+/// SCRIPT_VERIFY_WITNESS`, the flags Core's `GetBlockScriptFlags` gives
+/// every block but its exceptions; below it, legacy sigops only (issue #724
+/// tracks that height gate). `prevouts` holds the output each input spends,
+/// in input order; a coinbase's are not read.
+fn transaction_sigop_cost(tx: &Transaction, network: Network, height: u32, prevouts: &[TxOut]) -> u64 {
+    use crate::validation::sigops::{self, SigOpFlags};
+    let flags = if height >= crate::validation::script::activation_heights(network).p2sh {
+        SigOpFlags::P2shWitness
     } else {
-        let mut legacy: usize = 0;
-        for input in &tx.input {
-            legacy = legacy.saturating_add(input.script_sig.count_sigops_legacy());
-        }
-        for output in &tx.output {
-            legacy = legacy.saturating_add(output.script_pubkey.count_sigops_legacy());
-        }
-        (legacy.saturating_mul(4)) as u64
-    }
+        SigOpFlags::Legacy
+    };
+    sigops::transaction_sigop_cost(tx, prevouts, flags)
 }
 
 /// Parameters for block connection. Groups the many inputs needed by connect_block
@@ -490,9 +480,6 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     // Block-wide signature-operation cost accumulator (Core: nSigOpsCost),
     // checked against MAX_BLOCK_SIGOPS_COST as each transaction is processed.
     let mut block_sigops: u64 = 0;
-    // Reused per-tx prevout lookup for sigop counting; cleared each iteration
-    // to avoid per-transaction allocation on the hot connect path.
-    let mut sigop_spent: HashMap<OutPoint, TxOut> = HashMap::new();
     // BIP 30: enforce the no-overwrite-of-an-unspent-txid rule unless this
     // block is past the buried BIP 34 height or is a grandfathered exception.
     let enforce_bip30 =
@@ -864,15 +851,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
 
             total_fees += sum_inputs - sum_outputs;
 
-            // Block sigop-cost accounting for this (non-coinbase) tx. Build
-            // the prevout lookup now, before `prev_outputs` is moved into the
-            // verify queue below.
-            sigop_spent.clear();
-            for (input, prevout) in tx.input.iter().zip(prev_outputs.iter()) {
-                sigop_spent.insert(input.previous_output, prevout.clone());
-            }
+            // Block sigop-cost accounting for this (non-coinbase) tx, before
+            // `prev_outputs` is moved into the verify queue below.
             block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, network, height, &sigop_spent));
+                .saturating_add(transaction_sigop_cost(tx, network, height, &prev_outputs));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -892,9 +874,8 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             // Coinbase: no resolved inputs to spend; its sigop cost is
             // legacy-only (scriptSig + output scriptPubkeys) and still counts
             // toward the block-wide limit, matching Core.
-            sigop_spent.clear();
             block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, network, height, &sigop_spent));
+                .saturating_add(transaction_sigop_cost(tx, network, height, &[]));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1164,6 +1145,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
 
     Ok(batch)
 }
+
+#[cfg(test)]
+#[path = "connect_sigops_tests.rs"]
+mod sigops_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1485,7 +1470,6 @@ mod tests {
 
     #[test]
     fn test_transaction_sigop_cost_p2sh_gate() {
-        use std::collections::HashMap;
         // A coinbase whose output carries 10 bare OP_CHECKMULTISIG opcodes:
         // 10 * 20 = 200 legacy sigops → cost 800 regardless of gate (no
         // P2SH/witness data present, so both paths agree).
@@ -1504,15 +1488,14 @@ mod tests {
             }],
             output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }],
         };
-        let empty: HashMap<OutPoint, TxOut> = HashMap::new();
         // 10 OP_CHECKMULTISIG * 20 legacy sigops * 4 (witness scale) = 800.
         let mainnet_p2sh =
             crate::validation::script::activation_heights(Network::Bitcoin).p2sh;
-        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, 0, &empty), 800);
-        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, mainnet_p2sh, &empty), 800);
+        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, 0, &[]), 800);
+        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, mainnet_p2sh, &[]), 800);
         // Regtest/signet: P2SH active from genesis, so the witness-aware
         // path is taken even at height 0 (same cost here — no P2SH data).
-        assert_eq!(transaction_sigop_cost(&cb, Network::Regtest, 0, &empty), 800);
+        assert_eq!(transaction_sigop_cost(&cb, Network::Regtest, 0, &[]), 800);
     }
 
     // ── helpers for connect_block tests ───────────────────────────────

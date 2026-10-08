@@ -74,6 +74,34 @@ pub trait ScriptVerifier: Send + Sync {
         height: u32,
     ) -> Result<(), ScriptError>;
 
+    /// [`verify_transaction`](Self::verify_transaction), except that a
+    /// failure may come back with a coarse reason. Pass it to
+    /// [`name_failure`](Self::name_failure) for the specific one. Finding
+    /// that name can mean running a second script engine over the input, so
+    /// a caller holding a lock can verify with this, release the lock, and
+    /// name the failure afterwards.
+    fn verify_transaction_unnamed(
+        &self,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+        height: u32,
+    ) -> Result<(), ScriptError> {
+        self.verify_transaction(tx, prev_outputs, height)
+    }
+
+    /// Give a failure from
+    /// [`verify_transaction_unnamed`](Self::verify_transaction_unnamed) its
+    /// specific reason. The verdict never changes; only the reason can.
+    fn name_failure(
+        &self,
+        _tx: &Transaction,
+        _prev_outputs: &[TxOut],
+        _height: u32,
+        err: ScriptError,
+    ) -> ScriptError {
+        err
+    }
+
     /// If this verifier runs in shadow mode, return the shadow engine.
     /// Currently unused — ShadowVerifier handles async dispatch internally.
     fn shadow_verifier(&self) -> Option<&dyn ScriptVerifier> {
@@ -309,8 +337,12 @@ impl ConsensusVerifier {
 /// revisited: libconsensus has already rejected this input and that stands.
 /// This runs only on the failure path, and only to write the message.
 ///
+/// Only the input that failed is run. libconsensus has already passed every
+/// input before it, so running those again would repeat that work for
+/// nothing.
+///
 /// If the two engines disagree about this input — the native one finding it
-/// valid — there is no name to borrow, and the coarse error is reported as
+/// valid — there is no name to borrow, and `None` leaves the coarse error as
 /// it was. That disagreement is a parity bug worth knowing about, so it is
 /// logged rather than papered over.
 fn name_script_failure(
@@ -318,23 +350,46 @@ fn name_script_failure(
     prev_outputs: &[TxOut],
     flags: u32,
     input: usize,
-    coarse: bitcoinconsensus::Error,
-) -> String {
-    match consensus::verify_transaction(tx, prev_outputs, flags) {
-        Err((idx, consensus::Error::ErrScript(e))) if idx == input => e.as_str().to_string(),
-        _ => {
+) -> Option<String> {
+    let (txin, prev) = (tx.input.get(input)?, prev_outputs.get(input)?);
+    // The BIP 341 signature hash commits to every spent output; nothing
+    // else reads them (as in `consensus::verify_transaction`).
+    let checker_prevs: &[TxOut] =
+        if flags & consensus::VERIFY_TAPROOT != 0 { prev_outputs } else { &[] };
+    let checker = consensus::sighash::TxSignatureChecker::new(tx, input, prev.value, checker_prevs);
+    let witness: Vec<Vec<u8>> = txin.witness.iter().map(|w| w.to_vec()).collect();
+    match consensus::verify::verify_script(
+        txin.script_sig.as_bytes(),
+        prev.script_pubkey.as_bytes(),
+        &witness,
+        flags,
+        &checker,
+    ) {
+        Err(e) => Some(e.as_str().to_string()),
+        Ok(()) => {
             tracing::debug!(
                 input,
                 "the native engine does not agree that this input fails; \
                  reporting the coarse error"
             );
-            format!("{coarse:?}")
+            None
         }
     }
 }
 
 impl ScriptVerifier for ConsensusVerifier {
     fn verify_transaction(
+        &self,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+        height: u32,
+    ) -> Result<(), ScriptError> {
+        self.verify_transaction_unnamed(tx, prev_outputs, height)
+            .map_err(|e| self.name_failure(tx, prev_outputs, height, e))
+    }
+
+    /// libconsensus alone. A failure carries its coarse `ERR_SCRIPT`.
+    fn verify_transaction_unnamed(
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
@@ -374,11 +429,26 @@ impl ScriptVerifier for ConsensusVerifier {
             )
             .map_err(|e| ScriptError::VerifyFailed {
                 input: input_index,
-                reason: name_script_failure(tx, prev_outputs, flags, input_index, e),
+                reason: format!("{e:?}"),
             })?;
         }
 
         Ok(())
+    }
+
+    fn name_failure(
+        &self,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+        height: u32,
+        err: ScriptError,
+    ) -> ScriptError {
+        let input = err.input();
+        let flags = script_verify_flags(self.network, height);
+        match name_script_failure(tx, prev_outputs, flags, input) {
+            Some(reason) => ScriptError::VerifyFailed { input, reason },
+            None => err,
+        }
     }
 }
 
@@ -647,6 +717,30 @@ impl ScriptVerifier for ShadowVerifier {
         result
     }
 
+    /// The primary engine's unnamed verify, with the same shadow dispatch.
+    fn verify_transaction_unnamed(
+        &self,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+        height: u32,
+    ) -> Result<(), ScriptError> {
+        let result = self.primary.verify_transaction_unnamed(tx, prev_outputs, height);
+        if result.is_ok() {
+            self.dispatch_shadow(tx, prev_outputs, height);
+        }
+        result
+    }
+
+    fn name_failure(
+        &self,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+        height: u32,
+        err: ScriptError,
+    ) -> ScriptError {
+        self.primary.name_failure(tx, prev_outputs, height, err)
+    }
+
     fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
         self.enqueue(ShadowWork {
             tx_bytes: bitcoin::consensus::serialize(tx),
@@ -678,6 +772,10 @@ impl Drop for ShadowVerifier {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "script_naming_tests.rs"]
+mod naming_tests;
 
 #[cfg(test)]
 mod tests {
