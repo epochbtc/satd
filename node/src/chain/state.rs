@@ -3395,41 +3395,53 @@ impl ChainState {
         }
     }
 
-    /// Compute median time past (MTP) for a given height.
-    /// MTP is the median of the timestamps of the previous 11 blocks.
+    /// The median time past a block at `height` is validated against: the
+    /// median of the timestamps of the previous 11 blocks (Core's
+    /// `pindexPrev->GetMedianTimePast()`). For consensus.
+    ///
+    /// Served from the MTP cache when it holds the whole window, else from
+    /// the store through [`connect::get_median_time_past`], which refuses a
+    /// window with a missing block ([`connect::ConnectError::MedianTimeWindowGap`])
+    /// rather than take the median of the blocks it found.
+    pub fn median_time_past_for_connect(&self, height: u32) -> Result<u32, connect::ConnectError> {
+        match self.cached_mtp_window(height) {
+            Some(timestamps) => Ok(connect::median_of(timestamps)),
+            None => connect::get_median_time_past(&*self.store, height),
+        }
+    }
+
+    /// [`median_time_past_for_connect`](Self::median_time_past_for_connect)
+    /// for the mempool, block templates and RPCs, which need a value even
+    /// from a damaged index: a window with a missing block gives the median
+    /// of the blocks found, and 0 when none are. Never use it for a block's
+    /// validity.
     pub fn get_median_time_past(&self, height: u32) -> u32 {
-        let start = height.saturating_sub(11);
-        let range_len = (height - start) as usize;
-
-        // Try to satisfy entirely from cache
-        let cache = self.mtp_cache.lock();
-        let mut timestamps: Vec<u32> = Vec::with_capacity(range_len);
-        for h in start..height {
-            if let Some((_, ts)) = cache.iter().find(|(ch, _)| *ch == h) {
-                timestamps.push(*ts);
-            }
+        if let Some(timestamps) = self.cached_mtp_window(height) {
+            return connect::median_of(timestamps);
         }
-        drop(cache);
-
-        if timestamps.len() == range_len && !timestamps.is_empty() {
-            // Cache hit — all timestamps found
-            timestamps.sort();
-            return timestamps[timestamps.len() / 2];
-        }
-
-        // Cache miss — fall back to store lookups
-        timestamps.clear();
+        let start = height.saturating_sub(connect::MEDIAN_TIME_SPAN);
+        let mut timestamps: Vec<u32> = Vec::new();
         for h in start..height {
             if let Some(hash) = self.store.get_block_hash_by_height(h)
                 && let Some(entry) = self.store.get_block_index(&hash) {
                     timestamps.push(entry.header.time);
                 }
         }
-        if timestamps.is_empty() {
-            return 0;
-        }
-        timestamps.sort();
-        timestamps[timestamps.len() / 2]
+        connect::median_of(timestamps)
+    }
+
+    /// The MTP window for a block at `height` (the timestamps at heights
+    /// `height - 11 .. height`), if the MTP cache holds every one of them.
+    fn cached_mtp_window(&self, height: u32) -> Option<Vec<u32>> {
+        let start = height.saturating_sub(connect::MEDIAN_TIME_SPAN);
+        let cache = self.mtp_cache.lock();
+        let timestamps: Vec<u32> = (start..height)
+            .map_while(|h| cache.iter().find(|(ch, _)| *ch == h).map(|(_, ts)| *ts))
+            .collect();
+        // The empty window (height 0) goes to the store path, as it always
+        // has; both give 0.
+        (!timestamps.is_empty() && timestamps.len() == (height - start) as usize)
+            .then_some(timestamps)
     }
 
     /// Authoritative active-chain lookup: the hash of the block at `height` on
@@ -4393,7 +4405,7 @@ impl ChainState {
         // never read it, so for the bulk of IBD blocks "MTP comes from the
         // branch being connected" was simply not in force. Normally a cache
         // hit, since the previous block pushed its own entry.
-        let mtp = self.get_median_time_past(pre.height);
+        let mtp = self.median_time_past_for_connect(pre.height)?;
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: None,
             store: &*self.store,
@@ -5187,7 +5199,7 @@ impl ChainState {
         let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
 
         // Connect block
-        let mtp = self.get_median_time_past(entry.height);
+        let mtp = self.median_time_past_for_connect(entry.height)?;
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: None,
             store: &*self.store,
@@ -5915,7 +5927,7 @@ impl ChainState {
         // locktimes, so that is a consensus input, and having the two replay
         // paths derive it from different sources made it depend on whether the
         // prefetcher happened to hit — which at replay startup it never does.
-        let mtp = connect::median_time_past_with_plan(&*self.store, Some(plan), height);
+        let mtp = connect::median_time_past_with_plan(&*self.store, Some(plan), height)?;
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: Some(plan),
             store: &*self.store,
@@ -6578,7 +6590,7 @@ impl ChainState {
             let verifier: &dyn ScriptVerifier =
                 if use_noop { &noop } else { &*self.script_verifier };
 
-            let mtp = self.get_median_time_past(height);
+            let mtp = self.median_time_past_for_connect(height)?;
             let batch = match connect::connect_block(&connect::ConnectParams {
                 replay_plan: None,
                 store: &*self.store,
@@ -7168,7 +7180,9 @@ impl ChainState {
         // building an address or filter index for a block that is not being
         // connected is pure cost. `flat_pos` is likewise only stamped into the
         // discarded batch.
-        let mtp = connect::get_median_time_past(store_ref, height);
+        // A window with a missing block is damage to this node's index, not a
+        // verdict on the block: an error, like the missing parent above.
+        let mtp = connect::get_median_time_past(store_ref, height)?;
         let no_address_index = crate::index::address::AddressIndexConfig::default();
         let no_sp_index = crate::index::silent_payments::SpIndexConfig::default();
         #[cfg(feature = "block-filter-index")]
@@ -7632,7 +7646,7 @@ impl ChainState {
                     let noop = NoopVerifier;
                     let verifier: &dyn ScriptVerifier =
                         if use_noop { &noop } else { &*self.script_verifier };
-                    let mtp = self.get_median_time_past(side_entry.height);
+                    let mtp = self.median_time_past_for_connect(side_entry.height)?;
                     let side_flat_pos = FlatFilePos {
                         file_number: side_entry.file_number,
                         data_pos: side_entry.data_pos,
@@ -7795,9 +7809,11 @@ impl ChainState {
         // If the triggering block fails inside an in-progress reorg, roll
         // the chain back to the pre-reorg active chain before returning
         // the error — otherwise the failed candidate would leave the
-        // node permanently advanced onto a partial side-chain prefix.
-        let mtp = self.get_median_time_past(new_height);
-        let connect_attempt = connect::connect_block(&connect::ConnectParams {
+        // node permanently advanced onto a partial side-chain prefix. An MTP
+        // window this node cannot read fails the same way, as a connect
+        // failure that is not a verdict on the block.
+        let mtp = self.median_time_past_for_connect(new_height);
+        let connect_attempt = mtp.and_then(|mtp| connect::connect_block(&connect::ConnectParams {
             replay_plan: None,
             store: &*self.store,
             block,
@@ -7816,7 +7832,7 @@ impl ChainState {
             filter_index: &self.filter_index,
             phase_tracker: None,
             interrupt: None,
-        });
+        }));
         let batch = match connect_attempt {
             Ok(b) => b,
             Err(e) => {
@@ -9500,7 +9516,7 @@ impl ChainState {
                 let noop = NoopVerifier;
                 let verifier: &dyn ScriptVerifier =
                     if use_noop { &noop } else { &*self.script_verifier };
-                let mtp = self.get_median_time_past(e.height);
+                let mtp = self.median_time_past_for_connect(e.height)?;
                 let flat_pos = FlatFilePos {
                     file_number: e.file_number,
                     data_pos: e.data_pos,
@@ -9938,6 +9954,10 @@ impl ChainState {
 #[cfg(test)]
 #[path = "state_blockaccept_tests.rs"]
 mod blockaccept_tests;
+
+#[cfg(test)]
+#[path = "state_consharden_tests.rs"]
+mod consharden_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
@@ -20104,7 +20124,7 @@ pub(crate) mod tests {
         // store lookups are what run. Warm entries here would mask that.
         cs.mtp_cache.lock().clear();
 
-        let planned_mtp = connect::median_time_past_with_plan(&*cs.store, Some(&plan), 13);
+        let planned_mtp = connect::median_time_past_with_plan(&*cs.store, Some(&plan), 13).unwrap();
         let indexed_mtp = cs.get_median_time_past(13);
         assert_eq!(planned_mtp, BASE + 700, "MTP of the branch being replayed");
         assert_eq!(indexed_mtp, BASE + 650, "MTP the polluted rows produce");

@@ -353,7 +353,7 @@ impl BackgroundChainState {
             }
         };
 
-        let mtp = connect::get_median_time_past(store_ref, new_height);
+        let mtp = connect::get_median_time_past(store_ref, new_height)?;
         // The background runs with secondary indexes disabled.
         let addr_index = crate::index::address::AddressIndexConfig::default();
         #[cfg(feature = "block-filter-index")]
