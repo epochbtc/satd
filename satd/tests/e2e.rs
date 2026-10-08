@@ -37,6 +37,10 @@ mod parity;
 // equal sha256 over the history as `get_history` returns it.
 #[path = "e2e/electrum_status.rs"]
 mod electrum_status;
+// Esplora paging (`after_txid`, block page bounds) and tx JSON field omission
+// against upstream Esplora's rules.
+#[path = "e2e/esplora_paging.rs"]
+mod esplora_paging;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
@@ -1306,33 +1310,18 @@ fn test_e2e_esplora_mempool_detail_tracks_broadcast() {
 }
 
 #[test]
-fn test_e2e_esplora_fee_estimates_keys() {
-    // /fee-estimates must always return the full target set so
-    // BDK / mempool-sdk consumers can index into it without
-    // missing-key handling. Confirmation targets are pinned in
-    // `mempool::FEE_TARGETS`.
+fn test_e2e_esplora_fee_estimates_empty_without_a_fee_signal() {
+    // /fee-estimates leaves out every target the node has no estimate
+    // for, as upstream Esplora leaves out the targets bitcoind cannot
+    // estimate; clients (BDK's `convert_fee_rate`) take the nearest
+    // listed target at or below the one they want. A fresh regtest node
+    // has an empty mempool and no confirmed-block fee samples, so no
+    // target has an estimate and the answer is `{}` rather than the
+    // 1 sat/vB floor for every target.
     let mut e2e = E2eNode::boot_with(&esplora_e2e_args());
     let esplora = esplora_for(&e2e);
     let v = esplora_get_json(&esplora, "/fee-estimates");
-    let obj = v.as_object().expect("fee-estimates object");
-    // Sentinel keys from the FEE_TARGETS array in mempool.rs — must
-    // always be present even on a fresh chain (the handler falls back
-    // to 1.0 sat/vB when the estimator has no data).
-    for target in ["1", "2", "6", "10", "20", "144", "504", "1008"] {
-        let v = obj.get(target).unwrap_or_else(|| {
-            panic!(
-                "fee-estimates missing target '{}'; got keys {:?}",
-                target,
-                obj.keys().collect::<Vec<_>>()
-            )
-        });
-        assert!(
-            v.as_f64().is_some_and(|f| f > 0.0),
-            "fee-estimates['{}'] must be positive float, got {}",
-            target,
-            v
-        );
-    }
+    assert_eq!(v, serde_json::json!({}), "no target has an estimate");
     e2e.node.stop();
 }
 
