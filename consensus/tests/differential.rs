@@ -12,7 +12,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
-use helpers::{parse_flags, parse_script};
+use helpers::{parse_flags, parse_script, parse_witness_row, TAPROOT_OUTPUT_MARKER};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -169,6 +169,7 @@ fn differential_script_tests() {
     let mut mismatched = 0;
     let mut skipped = 0;
     let mut total = 0;
+    let mut taproot_rows = 0;
 
     for test in &tests {
         if test.is_string() {
@@ -177,27 +178,20 @@ fn differential_script_tests() {
         let arr = test.as_array().unwrap();
 
         total += 1;
+        let mut taproot_output: Option<Vec<u8>> = None;
 
         let (witness_items, script_sig_str, script_pubkey_str, flags_str, n_value): (Vec<Vec<u8>>, &str, &str, &str, u64) =
             if arr[0].is_array() {
                 if arr.len() < 5 { skipped += 1; continue; }
                 let wit_arr = arr[0].as_array().unwrap();
                 let spk_str = arr[2].as_str().unwrap();
-                if spk_str.contains("#TAPROOTOUTPUT#") { skipped += 1; continue; }
                 let amount = if let Some(v) = wit_arr.last() {
                     if v.is_number() { (v.as_f64().unwrap() * 1e8) as u64 } else { 0 }
                 } else { 0 };
-                let mut has_special = false;
-                let wit: Vec<Vec<u8>> = wit_arr[..wit_arr.len() - 1]
-                    .iter()
-                    .map(|v| {
-                        let s = v.as_str().unwrap();
-                        if s.starts_with('#') { has_special = true; Vec::new() }
-                        else { hex::decode(s).unwrap() }
-                    })
-                    .collect();
-                if has_special { skipped += 1; continue; }
-                (wit, arr[1].as_str().unwrap(), spk_str, arr[3].as_str().unwrap(), amount)
+                // Hex items, or Core's #SCRIPT# / #CONTROLBLOCK# taproot markers.
+                let row = parse_witness_row(&wit_arr[..wit_arr.len() - 1]);
+                taproot_output = row.taproot_output;
+                (row.stack, arr[1].as_str().unwrap(), spk_str, arr[3].as_str().unwrap(), amount)
             } else {
                 if arr.len() < 4 || !arr[0].is_string() { skipped += 1; continue; }
                 (Vec::new(), arr[0].as_str().unwrap(), arr[1].as_str().unwrap(),
@@ -213,7 +207,12 @@ fn differential_script_tests() {
         let safe_flags = cpp_safe_flags(script_flags);
 
         let script_sig = parse_script(script_sig_str);
-        let script_pubkey = parse_script(script_pubkey_str);
+        let script_pubkey = if script_pubkey_str == TAPROOT_OUTPUT_MARKER {
+            taproot_rows += 1;
+            taproot_output.take().expect("no tapscript leaf to build the output from")
+        } else {
+            parse_script(script_pubkey_str)
+        };
 
         let credit_tx = build_crediting_tx(&script_pubkey, n_value);
         let spend_tx = build_spending_tx(&script_sig, &witness_items, &credit_tx);
@@ -249,9 +248,11 @@ fn differential_script_tests() {
     }
 
     eprintln!(
-        "\nDifferential script_tests: {matched} matched, {mismatched} mismatched, {skipped} skipped out of {total}"
+        "\nDifferential script_tests: {matched} matched, {mismatched} mismatched, {skipped} skipped out of {total} \
+         ({taproot_rows} taproot rows)"
     );
     assert_eq!(mismatched, 0, "{mismatched} differential mismatches in script_tests");
+    assert_eq!(taproot_rows, 5, "taproot rows run");
 }
 
 // =========================================================================
