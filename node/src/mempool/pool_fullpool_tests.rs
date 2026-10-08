@@ -408,3 +408,66 @@ fn a_script_failure_is_named_after_the_pool_is_released() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const HELD: QuarantineScope = QuarantineScope { relay: true, template: true };
+
+/// An acting parent with a held child, and a better-paying acting entry.
+/// The held child never emitted an `Enter`, so it must not be reported as
+/// leaving the standard stream when it goes with its parent.
+fn parent_with_held_child(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf, Txid, Txid) {
+    let (cs, mp, dir) = env(tags);
+    let parent = admit(&mp, &cs, spend(&[prev(tags[0])], COIN_VALUE, 100, 1, tags[0]));
+    admit(&mp, &cs, spend(&[prev(tags[1])], COIN_VALUE, 2_000, 1, tags[1]));
+    let child = mp.insert_tx_scoped_for_test(
+        spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 1_000, 1, 0x40),
+        HELD,
+    );
+    // Unexpired, so the expiry sweep after an admission leaves it alone.
+    mp.inner.write().entries.get_mut(&child).unwrap().time = crate::time::now_secs();
+    (cs, mp, dir, parent, child)
+}
+
+/// Admission evicts the acting parent, and the held child with it, and
+/// reports only the parent.
+#[test]
+fn a_held_descendant_evicted_on_admission_is_not_reported() {
+    let (cs, mp, dir, parent, child) = parent_with_held_child(&[1, 2, 3]);
+    set_max(&mp, mp.acting_bytes());
+    let mut rx = events(&mp);
+
+    admit(&mp, &cs, spend(&[prev(3)], COIN_VALUE, 10_000, 1, 3));
+    let now = pool(&mp);
+    assert!(!now.contains(&parent) && !now.contains(&child));
+    assert_eq!(evicted(&mut rx), vec![parent], "a held entry was reported leaving the standard stream");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same on a live `-maxmempool` decrease.
+#[test]
+fn a_held_descendant_trimmed_on_reload_is_not_reported() {
+    let (_cs, mp, dir, parent, child) = parent_with_held_child(&[1, 2]);
+    let mut rx = events(&mp);
+
+    let cfg = MempoolConfig { max_size_bytes: mp.acting_bytes() - 1, ..mp.config.read().clone() };
+    mp.reload_policy(cfg);
+    let now = pool(&mp);
+    assert!(!now.contains(&parent) && !now.contains(&child));
+    assert_eq!(evicted(&mut rx), vec![parent], "a held entry was reported leaving the standard stream");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The test insert helpers index spends as every admission does, so a pool
+/// built with them has the shape eviction expects.
+#[test]
+fn test_inserted_entries_index_their_spends() {
+    let mp = Mempool::new(1_000_000, 0);
+    let parent = mp.insert_tx_scoped_for_test(spend(&[prev(1)], COIN_VALUE, 100, 1, 1), QuarantineScope::acting());
+    let child = spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 100, 1, 2);
+    let child_txid = child.compute_txid();
+    mp.insert_entry_for_test(child_txid, child, 1);
+    let inner = mp.inner.read();
+    assert_eq!(inner.spends.get(&prev(1)), Some(&parent));
+    assert_eq!(inner.spends.get(&OutPoint { txid: parent, vout: 0 }), Some(&child_txid));
+}

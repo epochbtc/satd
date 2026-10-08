@@ -1560,6 +1560,17 @@ impl Mempool {
         }
     }
 
+    /// `LeaveEvicted` for each evicted entry that was acting. A held entry
+    /// never emitted an `Enter`, so a `Leave` for it would be a phantom that
+    /// leaks a withheld txid (§10).
+    fn emit_evicted(&self, evicted: &[(Txid, QuarantineScope)], reason: EvictReason) {
+        for (txid, scope) in evicted {
+            if scope.is_acting() {
+                self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason });
+            }
+        }
+    }
+
     /// Emit a quarantine-class event on the separate channel (§10). Best-effort,
     /// no-op when no sender is wired.
     fn emit_quarantine(&self, event: QuarantineEvent) {
@@ -1640,20 +1651,21 @@ impl Mempool {
         // Core never leaves the pool over `-maxmempool`: every admission ends
         // in `LimitMempoolSize` → `TrimToSize` (src/validation.cpp). Left over a
         // lowered limit, the pool refused every admission until it drained.
-        let evicted = {
+        let none = HashSet::new();
+        let (acting, held) = {
             let mut inner = self.inner.write();
             let over = inner.acting_bytes().saturating_sub(max_size_bytes);
-            let evicted = Self::evict_lowest_fee_entries(&mut inner, over, false, incremental_relay_fee);
-            // A held entry never emitted an `Enter`, so its eviction emits no
-            // `LeaveEvicted` (§10), as in `accept_transaction`.
+            let acting =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, false, incremental_relay_fee, &none);
             let over = inner.quarantine_bytes.saturating_sub(quarantine_max_bytes);
-            Self::evict_lowest_fee_entries(&mut inner, over, true, incremental_relay_fee);
+            let held =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, true, incremental_relay_fee, &none);
             self.sync_unbroadcast_len(&inner);
-            evicted
+            (acting, held)
         };
-        for txid in &evicted {
-            self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason: EvictReason::FullPool });
-        }
+        // Reported as admission reports them: only what was acting.
+        self.emit_evicted(&acting, EvictReason::FullPool);
+        self.emit_evicted(&held, EvictReason::Policy);
     }
 
     /// Load (or replace) the transaction-filtering ruleset from a file. Returns
@@ -3043,7 +3055,7 @@ impl Mempool {
             return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
         }
 
-        let mut evicted_full_pool: Vec<Txid> = Vec::new();
+        let mut evicted_full_pool: Vec<(Txid, QuarantineScope)> = Vec::new();
         if needs_room {
             // Evict lowest-fee-rate entries *of this class* until the pool,
             // with this transaction in it, is back within its limit: Core's
@@ -3068,11 +3080,7 @@ impl Mempool {
             if class_bytes_after + tx_size > class_budget {
                 drop(inner);
                 // The evicted entries are gone whether or not this one gets in.
-                if !quarantined {
-                    for evicted_txid in &evicted_full_pool {
-                        self.emit(MempoolEvent::LeaveEvicted { txid: *evicted_txid, reason: evict_reason });
-                    }
-                }
+                self.emit_evicted(&evicted_full_pool, evict_reason);
                 return Err(MempoolError::MempoolFull);
             }
         }
@@ -3157,19 +3165,10 @@ impl Mempool {
         // are best-effort but keeping the lock duration tight is the rule.
         drop(inner);
 
-        // `evicted_full_pool` is always drawn from the incoming tx's own class
-        // (`evict_lowest_fee_entries` filters to `quarantined`). Acting-class
-        // evictions go on the standard stream as before; quarantine-class
-        // evictions never emitted an `Enter`, so a `LeaveEvicted` for them would
-        // be a phantom Leave leaking a withheld txid (§10) — suppress it.
-        if !quarantined {
-            for evicted_txid in &evicted_full_pool {
-                self.emit(MempoolEvent::LeaveEvicted {
-                    txid: *evicted_txid,
-                    reason: evict_reason,
-                });
-            }
-        }
+        // Acting-class evictions go on the standard stream as before;
+        // quarantine-class ones never emitted an `Enter`, so a `LeaveEvicted`
+        // for them would be a phantom Leave leaking a withheld txid (§10).
+        self.emit_evicted(&evicted_full_pool, evict_reason);
         for conflict_txid in &replaced {
             self.emit(MempoolEvent::LeaveReplaced {
                 txid: *conflict_txid,
@@ -6176,6 +6175,9 @@ impl Mempool {
             incremental_relay_fee,
             &HashSet::new(),
         )
+        .into_iter()
+        .map(|(txid, _)| txid)
+        .collect()
     }
 
     /// [`evict_lowest_fee_entries`](Self::evict_lowest_fee_entries), never
@@ -6188,13 +6190,17 @@ impl Mempool {
     /// The cost follows what is evicted, not the size of the pool: one pass
     /// builds a heap of the class, each eviction pops it, and descendants come
     /// from the `spends` index.
+    ///
+    /// Each evicted txid comes with the scope it had: a held descendant of an
+    /// evicted acting entry goes with it, but never emitted an `Enter`, so it
+    /// gets no `LeaveEvicted` (§10).
     fn evict_lowest_fee_entries_except(
         inner: &mut MempoolInner,
         bytes_needed: usize,
         want_quarantined: bool,
         incremental_relay_fee: u64,
         keep: &HashSet<Txid>,
-    ) -> Vec<Txid> {
+    ) -> Vec<(Txid, QuarantineScope)> {
         if bytes_needed == 0 {
             return Vec::new();
         }
@@ -6281,6 +6287,7 @@ impl Mempool {
             }
         }
 
+        let mut evicted = Vec::with_capacity(to_remove.len());
         for txid in &to_remove {
             if let Some(entry) = inner.entries.remove(txid) {
                 let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
@@ -6290,13 +6297,14 @@ impl Mempool {
                 }
                 inner.unbroadcast.remove(txid);
                 tracing::debug!(%txid, fee_rate = entry.fee_rate, "Evicted low-fee tx from mempool");
+                evicted.push((*txid, entry.scope));
             }
         }
 
-        if !to_remove.is_empty() {
-            tracing::info!(evicted = to_remove.len(), "Mempool eviction complete");
+        if !evicted.is_empty() {
+            tracing::info!(evicted = evicted.len(), "Mempool eviction complete");
         }
-        to_remove
+        evicted
     }
 
     /// Keep the lock-free `unbroadcast_len` mirror coherent with the map.
@@ -6491,6 +6499,11 @@ impl Mempool {
     #[cfg(test)]
     pub(crate) fn insert_entry_for_test(&self, txid: Txid, tx: Transaction, fee_rate: u64) {
         let mut inner = self.inner.write();
+        // Every admission indexes the entry's spends, and eviction finds
+        // descendants through them.
+        for input in &tx.input {
+            inner.spends.insert(input.previous_output, txid);
+        }
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -6668,6 +6681,11 @@ impl Mempool {
         let txid = tx.compute_txid();
         let tx_size = bitcoin::consensus::serialize(&tx).len();
         let mut inner = self.inner.write();
+        // Every admission indexes the entry's spends, and eviction finds
+        // descendants through them.
+        for input in &tx.input {
+            inner.spends.insert(input.previous_output, txid);
+        }
         inner.entries.insert(
             txid,
             MempoolEntry {
