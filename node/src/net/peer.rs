@@ -338,9 +338,13 @@ impl PeerInfo {
     }
 
     /// Update peer info after receiving their version message.
-    pub fn set_version(&mut self, version: VersionMessage) {
+    pub fn set_version(&mut self, mut version: VersionMessage) {
         self.services = version.services;
         self.best_height = version.start_height;
+        // Core keeps the user agent only as `SanitizeString(strSubVer)`
+        // (`cleanSubVer`): it is logged and reported in `getpeerinfo.subver`,
+        // and the raw string can carry line breaks and escape sequences.
+        version.user_agent = crate::net::limits::sanitize_string(&version.user_agent);
         self.user_agent = version.user_agent.clone();
         // The peer's own `fRelay` is kept on the stored `version` message;
         // `relays_txs()` is the answer to "do *we* relay to them", which
