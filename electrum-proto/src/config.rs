@@ -107,9 +107,11 @@ pub struct ElectrumConfig {
     pub max_conns: usize,
     /// Per-connection scripthash subscription cap (PR-4 enforces).
     pub max_subs_per_conn: usize,
-    /// Wall-clock timeout per inbound request. Enforced around the
-    /// dispatch path so a slow handler can't pin a connection slot
-    /// indefinitely (review-round-1 M2).
+    /// Wall-clock timeout per inbound request. The request runs on the
+    /// blocking pool; past the timeout the client gets an error and the
+    /// connection is closed. The handler's work cannot be interrupted, so
+    /// the connection keeps its slot (`max_conns`) until that work ends
+    /// (review-round-1 M2).
     pub request_timeout: Duration,
     /// Max requests in a single JSON-RPC batch. Excess batches are
     /// rejected with `bad_request` (review-round-1 M5).
