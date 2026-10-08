@@ -627,8 +627,15 @@ fn build_combined_txs(
     let end = mempool_from
         .saturating_add(MEMPOOL_TXS_LIMIT)
         .min(mempool.len());
-    let mut out = render_mempool_txs(state, &mempool[mempool_from..end])?;
+    // The confirmed page is read after the membership checks above, so a
+    // transaction that confirmed in between is on it: drop it from the
+    // mempool part too, so it is listed once, as confirmed.
     let page = confirmed_page(state, sh, None)?.unwrap_or_default();
+    let on_page: std::collections::HashSet<Txid> = page.iter().map(|(_, t)| *t).collect();
+    let served = without_confirmed(mempool[mempool_from..end].to_vec(), |t| {
+        Ok(on_page.contains(t))
+    })?;
+    let mut out = render_mempool_txs(state, &served)?;
     out.extend(render_confirmed_txs(state, &page)?);
     Ok(out)
 }
