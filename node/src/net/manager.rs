@@ -10441,6 +10441,10 @@ fn historical_block_storable(
     canonical_at_height == Some(block_hash)
 }
 
+#[cfg(test)]
+#[path = "manager_blockaccept_tests.rs"]
+mod blockaccept_tests;
+
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
 /// Standalone so the `block_processor` thread — which doesn't have a
