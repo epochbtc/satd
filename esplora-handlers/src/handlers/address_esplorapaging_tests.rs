@@ -10,31 +10,70 @@ fn txid(byte: u8) -> Txid {
     Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
 }
 
-// Where a confirmed cursor continues, and that a cursor outside the
-// confirmed history is `None` (422 here), is the address index's
-// `confirmed_txs_newest_first`, tested in `node`.
+/// The index's confirmed page stand-in: `cursor` is confirmed when it is
+/// one of `confirmed` (newest first), and the page is what follows it.
+fn confirmed_after(
+    confirmed: &[Txid],
+) -> impl FnOnce(&Txid) -> EsploraResult<Option<Vec<(u32, Txid)>>> + '_ {
+    move |cursor| {
+        Ok(confirmed
+            .iter()
+            .position(|t| t == cursor)
+            .map(|i| confirmed[i + 1..].iter().map(|t| (7, *t)).collect()))
+    }
+}
 
 #[test]
-fn without_after_txid_the_page_starts_at_the_first_mempool_tx() {
-    let mempool = [(txid(1), ()), (txid(2), ())];
-    assert_eq!(mempool_start(&mempool, None), Some(0));
-    assert_eq!(mempool_start::<()>(&[], None), Some(0));
+fn after_txid_in_the_confirmed_history_continues_after_it() {
+    let mempool = [txid(1), txid(2)];
+    let confirmed = [txid(10), txid(11), txid(12)];
+    assert_eq!(
+        locate_after_txid(&mempool, &txid(10), confirmed_after(&confirmed)).unwrap(),
+        Some(AfterTxid::Confirmed(vec![(7, txid(11)), (7, txid(12))]))
+    );
+    // The oldest confirmed transaction: the rest of the history is empty.
+    assert_eq!(
+        locate_after_txid(&mempool, &txid(12), confirmed_after(&confirmed)).unwrap(),
+        Some(AfterTxid::Confirmed(Vec::new()))
+    );
 }
 
 #[test]
 fn after_txid_in_the_mempool_continues_after_it() {
-    let mempool = [(txid(1), ()), (txid(2), ())];
-    assert_eq!(mempool_start(&mempool, Some(txid(1))), Some(1));
-    // The last mempool transaction: the rest is the confirmed history.
-    assert_eq!(mempool_start(&mempool, Some(txid(2))), Some(2));
+    let mempool = [txid(1), txid(2)];
+    let confirmed = [txid(10)];
+    assert_eq!(
+        locate_after_txid(&mempool, &txid(1), confirmed_after(&confirmed)).unwrap(),
+        Some(AfterTxid::Mempool(1))
+    );
+    assert_eq!(
+        locate_after_txid(&mempool, &txid(2), confirmed_after(&confirmed)).unwrap(),
+        Some(AfterTxid::Mempool(2))
+    );
+}
+
+/// Between a block connecting and the mempool dropping its transactions, a
+/// transaction can be in both lists. The confirmed history is where it ends
+/// up, so the cursor continues there, after it, instead of restarting the
+/// confirmed history from its newest entry (the cursor itself).
+#[test]
+fn after_txid_in_both_lists_resolves_to_the_confirmed_one() {
+    let mempool = [txid(1), txid(10)];
+    let confirmed = [txid(10), txid(11)];
+    assert_eq!(
+        locate_after_txid(&mempool, &txid(10), confirmed_after(&confirmed)).unwrap(),
+        Some(AfterTxid::Confirmed(vec![(7, txid(11))]))
+    );
 }
 
 #[test]
-fn after_txid_outside_the_mempool_continues_in_the_confirmed_history() {
-    assert_eq!(mempool_start(&[(txid(1), ())], Some(txid(10))), None);
-    assert_eq!(mempool_start::<()>(&[], Some(txid(10))), None);
+fn after_txid_outside_the_history_is_422_after_txid_not_found() {
+    assert_eq!(
+        locate_after_txid(&[txid(1)], &txid(99), confirmed_after(&[txid(10)])).unwrap(),
+        None
+    );
+    assert_eq!(locate_after_txid(&[], &txid(99), confirmed_after(&[])).unwrap(), None);
 
-    // In neither list: 422 `after_txid not found`.
     let err = after_txid_not_found();
     assert_eq!(err.to_string(), "after_txid not found");
     assert_eq!(err.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -57,15 +96,29 @@ fn after_txid_query_parses_or_is_a_bad_request() {
 #[test]
 fn mempool_rows_sort_in_admission_order_then_by_txid() {
     let mut rows = vec![
-        (300u64, txid(1), ()),
-        (200, txid(9), ()),
-        (100, txid(3), ()),
-        (200, txid(2), ()),
+        (300u64, txid(1)),
+        (200, txid(9)),
+        (100, txid(3)),
+        (200, txid(2)),
     ];
     sort_in_admission_order(&mut rows);
-    let order: Vec<(u64, Txid)> = rows.into_iter().map(|(t, id, ())| (t, id)).collect();
     assert_eq!(
-        order,
+        rows,
         vec![(100, txid(3)), (200, txid(2)), (200, txid(9)), (300, txid(1))]
+    );
+}
+
+/// A transaction both lists hold (a block just connected, the mempool has
+/// not dropped it yet) is listed once, as confirmed.
+#[test]
+fn mempool_rows_already_confirmed_are_listed_only_as_confirmed() {
+    let confirmed: std::collections::HashSet<Txid> = [txid(10), txid(11)].into_iter().collect();
+    assert_eq!(
+        without_confirmed(vec![txid(1), txid(10), txid(2)], |t| Ok(confirmed.contains(t))).unwrap(),
+        vec![txid(1), txid(2)]
+    );
+    assert_eq!(
+        without_confirmed(vec![txid(1), txid(2)], |_| Ok(false)).unwrap(),
+        vec![txid(1), txid(2)]
     );
 }
