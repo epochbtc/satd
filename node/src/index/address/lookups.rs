@@ -273,6 +273,21 @@ impl AddressIndex for RocksAddressIndex {
         Ok(out)
     }
 
+    fn confirmed_txs_in_chain_order(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Result<Vec<(u32, bitcoin::Txid)>, IndexError> {
+        // The rows leave the store in `(height, txid)` order. Within a
+        // block the Electrum order is block position, which is the order
+        // of the transactions' chain ordinals; the ordinal families are
+        // written whenever the address index is on. Only blocks holding
+        // more than one of this script's transactions are looked up.
+        let mut rows = self.confirmed_distinct_history_limited(sh, limit)?;
+        node_index::sort_confirmed_rows(&mut rows, |txid| self.store.get_tx_seq(txid));
+        Ok(rows)
+    }
+
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         self.utxos_limited(sh, usize::MAX)
     }
@@ -321,6 +336,10 @@ impl AddressIndex for RocksAddressIndex {
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         self.subs.subscribe(sh)
+    }
+
+    fn seed_status(&self, sh: Scripthash, status_hash: [u8; 32]) {
+        self.subs.seed_status(sh, status_hash);
     }
 }
 

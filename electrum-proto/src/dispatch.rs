@@ -375,6 +375,10 @@ fn handle_scripthash_subscribe(
         ScripthashHex(sh),
     )
     .map_err(JsonRpcError::from_index)?;
+    // Record the answer so the next event that leaves the status
+    // unchanged does not push it straight back. The registry only takes
+    // it while this connection is the scripthash's sole subscriber.
+    state.address_index.seed_status(sh, h);
     Ok(match crate::status::status_hash_to_json(h) {
         Some(s) => Value::String(s),
         None => Value::Null,
