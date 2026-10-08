@@ -50,6 +50,9 @@ fn an_empty_body_buffered_before_its_parent_does_not_bar_the_real_block() {
     assert!(pm.ibd.read().is_none(), "fixture: a synced node, not IBD");
     let in_flight = || crate::net::flow::InFlight::new(None);
 
+    // Only a block the node asked for waits for an unknown parent, as one
+    // fetched after an `inv` does.
+    pm.note_blocks_requested(7, &[b5.block_hash()]);
     pm.handle_message(7, NetworkMessage::Block(empty5), in_flight());
     pm.handle_message(7, NetworkMessage::Headers(vec![b4.header, b5.header]), in_flight());
     pm.handle_message(7, NetworkMessage::Block(b4.clone()), in_flight());
