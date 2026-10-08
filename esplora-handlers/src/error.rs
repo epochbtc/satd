@@ -8,8 +8,17 @@ use axum::response::{IntoResponse, Response};
 pub enum EsploraError {
     #[error("not found")]
     NotFound,
+    /// 404 carrying upstream Esplora's own text, for the cases where
+    /// upstream answers with a reason rather than a bare "not found"
+    /// (`start index out of range`).
+    #[error("{0}")]
+    NotFoundReason(String),
     #[error("{0}")]
     BadRequest(String),
+    /// 422, mempool.space's answer for an `after_txid` cursor that is not
+    /// in the history (`after_txid not found`).
+    #[error("{0}")]
+    Unprocessable(String),
     #[error("address index disabled — restart with --addressindex=1 to enable")]
     IndexDisabled,
     #[error("service unavailable")]
@@ -48,7 +57,9 @@ impl IntoResponse for EsploraError {
     fn into_response(self) -> Response {
         let status = match &self {
             EsploraError::NotFound => StatusCode::NOT_FOUND,
+            EsploraError::NotFoundReason(_) => StatusCode::NOT_FOUND,
             EsploraError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            EsploraError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             EsploraError::IndexDisabled => StatusCode::SERVICE_UNAVAILABLE,
             EsploraError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             EsploraError::Forbidden(_) => StatusCode::FORBIDDEN,
