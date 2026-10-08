@@ -50,6 +50,9 @@ const MIN_PACKET_LEN: usize = 1 + 16;
 /// `MAX_PROTOCOL_MESSAGE_LENGTH` (4 MB) payload; `decrypt_packet_len` also
 /// counts the header byte and the 16-byte tag.
 const MAX_V2_PACKET_LEN: usize = 1 + 12 + 4_000_000 + 1 + 16;
+/// How far a packet buffer is grown ahead of the bytes received: Core's
+/// `MAX_RESERVE_AHEAD` (`V2Transport::ReceivedBytes`).
+const MAX_RESERVE_AHEAD: usize = 256 * 1024;
 
 /// Errors from the v2 message codec.
 #[derive(Debug, thiserror::Error)]
@@ -154,14 +157,19 @@ async fn read_exact_buffered<S: AsyncRead + Unpin>(
     leftover: &mut Vec<u8>,
     n: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut out = vec![0u8; n];
     let from_leftover = leftover.len().min(n);
-    if from_leftover > 0 {
-        out[..from_leftover].copy_from_slice(&leftover[..from_leftover]);
-        leftover.drain(..from_leftover);
-    }
-    if from_leftover < n {
-        stream.read_exact(&mut out[from_leftover..]).await?;
+    let mut out = Vec::with_capacity(n.min(from_leftover + MAX_RESERVE_AHEAD));
+    out.extend_from_slice(&leftover[..from_leftover]);
+    leftover.drain(..from_leftover);
+    // Grown as the bytes arrive and never more than MAX_RESERVE_AHEAD past
+    // them, as Core's `V2Transport` does: sizing it from the length alone let
+    // a peer that announced a large packet and sent nothing hold that much
+    // memory per connection.
+    while out.len() < n {
+        let start = out.len();
+        let end = n.min(start + MAX_RESERVE_AHEAD);
+        out.resize(end, 0);
+        stream.read_exact(&mut out[start..end]).await?;
     }
     Ok(out)
 }
@@ -230,15 +238,18 @@ async fn recv_v2<S: AsyncRead + Unpin>(
 }
 
 /// Encode, encrypt, and write a single `NetworkMessage` as a genuine v2
-/// packet. Returns the number of on-wire (ciphertext-framed) bytes written.
+/// packet, counting the bytes as the socket takes them (see
+/// [`crate::net::connection::write_counted`]). Returns the number of on-wire
+/// (ciphertext-framed) bytes written.
 async fn send_v2<S: AsyncWrite + Unpin>(
     stream: &mut S,
     cipher: &mut OutboundCipher,
     msg: NetworkMessage,
+    counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<usize> {
     let contents = encode_message(msg);
     let packet = cipher.encrypt_to_vec(&contents, PacketType::Genuine, None);
-    stream.write_all(&packet).await?;
+    crate::net::connection::write_counted(stream, &packet, counters).await?;
     Ok(packet.len())
 }
 
@@ -457,9 +468,8 @@ impl V2Connection {
     /// (handshake) path, counted once counters are attached.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let cmd = msg.cmd();
-        let n = send_v2(&mut self.stream, self.cipher.outbound(), msg).await?;
+        let n = send_v2(&mut self.stream, self.cipher.outbound(), msg, self.counters.as_ref()).await?;
         if let Some(c) = &self.counters {
-            c.record_sent(n);
             c.attribute_sent(cmd, n);
         }
         Ok(())
@@ -493,9 +503,8 @@ impl V2Writer {
     /// (ciphertext-framed) bytes if counters are set.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let cmd = msg.cmd();
-        let n = send_v2(&mut self.stream, &mut self.cipher, msg).await?;
+        let n = send_v2(&mut self.stream, &mut self.cipher, msg, self.counters.as_ref()).await?;
         if let Some(c) = &self.counters {
-            c.record_sent(n);
             c.attribute_sent(cmd, n);
         }
         Ok(())
@@ -700,3 +709,7 @@ mod tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+#[path = "v2transport_bounds_tests.rs"]
+mod bounds_tests;
