@@ -818,7 +818,7 @@ async fn main() {
         }
         Ok(None) => None,
         Err(e) => {
-            eprintln!("error: cannot read {}: {e}", conf_path.display());
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
