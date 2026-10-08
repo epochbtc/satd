@@ -278,6 +278,33 @@ fn getdata_resumes_as_the_queue_drains() {
     assert_eq!(pm.upload_bytes.load(Ordering::Relaxed) - charged_before, charged as u64);
 }
 
+/// A `MSG_CMPCT_BLOCK` entry whose `cmpctblock` could not be queued stays
+/// first in the backlog, like every other entry, to be served once the
+/// queue drains. It was popped as answered with nothing sent.
+#[test]
+fn a_compact_block_entry_that_cannot_be_queued_is_kept() {
+    let (pm, _dir) = mk_pm();
+    let chain = mine_big(&pm, 3, 10);
+    let tip = *chain.last().unwrap();
+    let mut rx = add_peer(&pm, 1, addr(1), 1);
+    let sender = pm.peer_sender(1).unwrap();
+    sender.try_send(NetworkMessage::Verack).unwrap();
+
+    let mut not_found = Vec::new();
+    assert!(
+        !pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), &mut not_found),
+        "nothing could be queued, so the entry is not answered"
+    );
+    assert!(not_found.is_empty());
+
+    assert_eq!(rx.try_recv().unwrap(), NetworkMessage::Verack);
+    assert!(pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), &mut not_found));
+    match rx.try_recv() {
+        Ok(NetworkMessage::CmpctBlock(c)) => assert_eq!(c.compact_block.header.block_hash(), tip),
+        other => panic!("expected the cmpctblock, got {other:?}"),
+    }
+}
+
 // ---- Peer text ----
 
 /// Core keeps a peer's user agent only after `SanitizeString` (`cleanSubVer`)
