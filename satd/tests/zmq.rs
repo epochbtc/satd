@@ -12,7 +12,8 @@ use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Block, BlockHash, Transaction};
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
-    build_signed_p2wpkh_spend_seq, find_available_port, test_timeout,
+    build_signed_p2wpkh_spend_seq, build_signed_p2wpkh_spend_to_outputs, find_available_port,
+    test_timeout,
 };
 use serde_json::json;
 use zeromq::{Socket, SocketRecv};
@@ -314,6 +315,84 @@ fn zmq_block_republishes_mempool_txs() {
     assert_eq!(m[3].body, hex::decode(&raw).unwrap());
     assert_eq!(m[4].sequence(), (hash.clone(), 'C', None));
     assert!(sub.drain(Duration::from_millis(500)).is_empty(), "no R for a mined transaction");
+    node.stop();
+}
+
+/// Sign every input of `tx` as a P2WPKH spend by `w` of the given amounts.
+fn sign_p2wpkh_inputs(tx: &mut Transaction, w: &DeterministicWallet, amounts: &[u64]) {
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    let secp = Secp256k1::new();
+    let spk = w.address.script_pubkey();
+    let mut cache = SighashCache::new(tx.clone());
+    for (i, amount) in amounts.iter().enumerate() {
+        let sighash = cache
+            .p2wpkh_signature_hash(i, &spk, bitcoin::Amount::from_sat(*amount), EcdsaSighashType::All)
+            .expect("sighash");
+        let mut sig = secp
+            .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &w.sk)
+            .serialize_der()
+            .to_vec();
+        sig.push(EcdsaSighashType::All as u8);
+        tx.input[i].witness = bitcoin::Witness::from_slice(&[sig, w.pk.to_bytes()]);
+    }
+}
+
+/// A `submitpackage` parent that pays no fee and carries ephemeral dust is
+/// announced before the child that sweeps the dust, as Core announces a
+/// package (`SubmitPackage` notifies in package order). Each `sequence A`
+/// carries the number its admission took.
+#[test]
+fn zmq_package_parent_before_child() {
+    let (mut node, mut sub, w) = mempool_fixture();
+    let before = mempool_sequence(&node);
+    let spk = w.address.script_pubkey();
+    let coin = 50 * 100_000_000;
+
+    let (parent_raw, parent_txid) = build_signed_p2wpkh_spend_to_outputs(
+        &node,
+        &w,
+        vec![
+            bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: spk.clone() },
+            bitcoin::TxOut { value: bitcoin::Amount::from_sat(coin), script_pubkey: spk.clone() },
+        ],
+    );
+    let parent: Transaction = deserialize(&hex::decode(&parent_raw).unwrap()).unwrap();
+    let mut child = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: (0..2)
+            .map(|vout| bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint { txid: parent.compute_txid(), vout },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            })
+            .collect(),
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(coin - 10_000),
+            script_pubkey: spk,
+        }],
+    };
+    sign_p2wpkh_inputs(&mut child, &w, &[0, coin]);
+    let child_txid = child.compute_txid().to_string();
+
+    let r = node.rpc_ok(
+        "submitpackage",
+        vec![json!([parent_raw, hex::encode(serialize(&child))])],
+    );
+    assert_eq!(r["package_msg"], "success", "{r}");
+
+    let m = sub.take(6);
+    let topics: Vec<&str> = m.iter().map(|m| m.topic.as_str()).collect();
+    assert_eq!(topics, ["hashtx", "rawtx", "sequence", "hashtx", "rawtx", "sequence"]);
+    assert_eq!(m[0].hash_hex(), parent_txid);
+    assert_eq!(m[1].body, hex::decode(&parent_raw).unwrap());
+    assert_eq!(m[2].sequence(), (parent_txid, 'A', Some(before)));
+    assert_eq!(m[3].hash_hex(), child_txid);
+    assert_eq!(m[4].body, serialize(&child));
+    assert_eq!(m[5].sequence(), (child_txid, 'A', Some(before + 1)));
+    assert!(sub.drain(Duration::from_millis(500)).is_empty());
     node.stop();
 }
 
