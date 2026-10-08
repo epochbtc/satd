@@ -149,3 +149,49 @@ impl Default for ElectrumConfig {
         }
     }
 }
+
+/// How many connections, each holding `max_subs_per_conn` scripthash
+/// subscriptions, fill a server-wide registry of `registry_cap`
+/// scripthashes (`--addrindexsubscriptions`), when that takes fewer than
+/// `max_conns` connections. Past that point every other client's subscribe
+/// is refused, though connection slots are still free. `None` when only
+/// all `max_conns` connections together can fill it (or no subscription is
+/// allowed at all), so the per-connection cap or the connection cap binds
+/// first.
+pub fn connections_to_fill_registry(
+    max_subs_per_conn: usize,
+    max_conns: usize,
+    registry_cap: usize,
+) -> Option<usize> {
+    if max_subs_per_conn == 0 {
+        return None;
+    }
+    let n = registry_cap.div_ceil(max_subs_per_conn);
+    (n < max_conns).then_some(n)
+}
+
+#[cfg(test)]
+mod electrumbounds_tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_let_ten_connections_fill_the_registry() {
+        assert_eq!(
+            connections_to_fill_registry(
+                DEFAULT_MAX_SUBS_PER_CONN,
+                DEFAULT_MAX_CONNS,
+                node_index::config::DEFAULT_MAX_SUBSCRIPTIONS,
+            ),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_registry_sized_for_every_connection_is_never_filled_first() {
+        assert_eq!(connections_to_fill_registry(1_000, 64, 64_000), None);
+        assert_eq!(connections_to_fill_registry(1_000, 64, 63_001), None);
+        assert_eq!(connections_to_fill_registry(1_000, 64, 63_000), Some(63));
+        assert_eq!(connections_to_fill_registry(1_000, 64, 1), Some(1));
+        assert_eq!(connections_to_fill_registry(0, 64, 10_000), None);
+    }
+}

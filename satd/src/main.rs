@@ -2857,6 +2857,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // index mutation and notification fire as a single unit; this
     // task only handles `BlockConnected` / `BlockDisconnected` events
     // that affect every subscribed scripthash with confirmed history.
+    // Both tasks stay on the core runtime, where block connection emits
+    // the events they consume, but run their status recomputes (a read of
+    // every subscribed history) on the blocking pool, so a heavy
+    // subscription set never occupies a core worker.
     {
         let task_index = address_index_concrete.clone();
         let task_registry = address_index_concrete.subscription_registry();
@@ -4070,6 +4074,28 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             max_broadcast_package_txs: config.electrum_max_broadcast_package_txs,
             fee_histogram_ttl: std::time::Duration::from_secs(config.electrum_fee_histogram_ttl),
         };
+        // The registry of subscribed scripthashes is server-wide and shared
+        // with Esplora's SSE streams. Say so when fewer connections than
+        // `-electrummaxconns` can fill it at their own cap.
+        if let Some(n) = electrum_proto::config::connections_to_fill_registry(
+            config.electrum_max_subs_per_conn,
+            config.electrum_max_conns,
+            config.addrindexsubscriptions,
+        ) {
+            tracing::info!(
+                connections = n,
+                addrindexsubscriptions = config.addrindexsubscriptions,
+                electrummaxsubsperconn = config.electrum_max_subs_per_conn,
+                electrummaxconns = config.electrum_max_conns,
+                "Electrum: {n} connections at -electrummaxsubsperconn fill the server-wide \
+                 subscription registry (-addrindexsubscriptions), after which further \
+                 subscribes are refused; for every connection to reach its own cap, set \
+                 -addrindexsubscriptions to at least {}",
+                config
+                    .electrum_max_subs_per_conn
+                    .saturating_mul(config.electrum_max_conns),
+            );
+        }
         let electrum_extras: std::sync::Arc<dyn electrum_proto::ElectrumExtras> =
             std::sync::Arc::new(electrum_proto::RocksElectrumExtras::new(
                 chain_state.clone(),
