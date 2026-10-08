@@ -14,7 +14,7 @@
 //! for the initial response.
 
 use node::mempool::pool::Mempool;
-use node_index::{AddressIndex, IndexError, status_hash};
+use node_index::{AddressIndex, IndexError, MempoolTxFacts, history_rows, history_status_hash};
 
 use crate::handlers::blockchain::mempool_tx_has_unconfirmed_inputs;
 use crate::types::ScripthashHex;
@@ -27,49 +27,30 @@ use crate::types::ScripthashHex;
 /// can surface a JSON-RPC error rather than silently returning the
 /// empty-history sentinel.
 ///
-/// `mempool` is required for height-tagging unconfirmed entries:
-/// `0` for unconfirmed-no-deps, `-1` for unconfirmed-with-deps.
-/// Mirrors `romanz/electrs`'s `Height::as_i64`.
+/// The hash covers the same rows, in the same order, that
+/// `blockchain.scripthash.get_history` returns (see
+/// [`node_index::history`]): a client checks the status by hashing that
+/// response as it arrived. `mempool` supplies each mempool row's height,
+/// `0` for unconfirmed-no-deps and `-1` for unconfirmed-with-deps
+/// (`romanz/electrs`'s `Height::as_i64`).
 pub fn compute_status_hash(
     idx: &dyn AddressIndex,
     mempool: &Mempool,
     sh: ScripthashHex,
 ) -> Result<[u8; 32], IndexError> {
-    let confirmed = idx.confirmed_history(&sh.0)?;
+    let rows = history_rows(idx, &sh.0, usize::MAX, |txid| mempool_facts(mempool, txid))?;
+    Ok(history_status_hash(&rows))
+}
 
-    // Adapt to the (height, txid) shape `node_index::status_hash`
-    // expects. Funding and spending entries that share `(height, txid)`
-    // collapse to a single entry per the Electrum spec — the status
-    // hash sees one row per `(height, txid)` regardless of how many
-    // funding / spending rows exist within it.
-    let mut pairs: Vec<(i64, bitcoin::Txid)> = confirmed
-        .iter()
-        .map(|e| (e.height() as i64, e.txid()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    pairs.dedup();
-
-    // Mempool entries — tag with -1 if they spend an unconfirmed
-    // parent, 0 otherwise (electrs `Height::Unconfirmed`).
-    for mp in idx.mempool_history(&sh.0) {
-        let height = match mempool.get(&mp.txid) {
-            Some(entry) => {
-                if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool) {
-                    -1
-                } else {
-                    0
-                }
-            }
-            // Tx left mempool between mempool_history and our get;
-            // best-effort fallback to unconfirmed-no-deps. The next
-            // `LeaveConfirmed` / `LeaveEvicted` event will trigger a
-            // recompute so this value is short-lived.
-            None => 0,
-        };
-        pairs.push((height, mp.txid));
-    }
-
-    Ok(status_hash(&pairs))
+/// What an Electrum history row needs about a mempool transaction, or
+/// `None` once it has left the mempool (the row is then left out, as
+/// electrs does).
+pub(crate) fn mempool_facts(mempool: &Mempool, txid: &bitcoin::Txid) -> Option<MempoolTxFacts> {
+    let entry = mempool.get(txid)?;
+    Some(MempoolTxFacts {
+        has_unconfirmed_inputs: mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool),
+        fee_sat: entry.fee,
+    })
 }
 
 /// Render a 32-byte status hash as the protocol-canonical JSON value.
@@ -195,19 +176,32 @@ mod tests {
     }
 
     #[test]
-    fn mempool_entry_without_deps_uses_height_zero() {
+    fn mempool_row_that_left_the_mempool_is_left_out() {
+        // The address mempool index is updated by its own task, so it can
+        // still list a tx the mempool has already dropped. Like electrs, the
+        // history leaves that row out rather than guessing a height and
+        // reporting no fee, and the status covers the same rows.
         let idx = FakeIndex::default();
         let mp = empty_mempool();
+        let txid_conf = fixture_txid(0x31);
         let txid_mp = fixture_txid(0x30);
+        idx.confirmed.lock().push(HistoryEntry::Funding {
+            height: 100,
+            txid: txid_conf,
+            vout: 0,
+            amount_sat: 1000,
+        });
         idx.mempool
             .lock()
-            
             .push(MempoolHistoryEntry { txid: txid_mp });
 
         let got = compute_status_hash(&idx, &mp, ScripthashHex([0xcc; 32])).unwrap();
-        // mempool tx not in `mp.get(...)` — fallback path tags it as 0.
-        let expected = node_index::status_hash(&[(0, txid_mp)]);
-        assert_eq!(got, expected);
+        assert_eq!(got, node_index::status_hash(&[(100, txid_conf)]));
+        assert_ne!(
+            got,
+            node_index::status_hash(&[(100, txid_conf), (0, txid_mp)]),
+            "a departed mempool tx must not be hashed with a guessed height"
+        );
     }
 
     #[test]

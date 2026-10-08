@@ -84,7 +84,7 @@ impl MempoolAddrIndex {
     /// Record a tx admission: `funding` lists the (scripthash,
     /// amount_sat) pairs for outputs; `spending` lists the
     /// (scripthash, amount_sat) for resolved inputs.
-    fn add_tx(
+    pub(super) fn add_tx(
         &mut self,
         txid: Txid,
         funding: &[(Scripthash, u64)],

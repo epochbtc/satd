@@ -16,19 +16,19 @@
 //! )
 //! ```
 //!
-//! ordered by `(height_or_zero, txid)`, with mempool entries assigned
-//! `height = 0`. The trailing colon after the last entry is included
-//! per Electrum-server convention. An empty-history scripthash has
-//! status `[0u8; 32]` (the sha256 of the empty string is the
-//! Electrum canonical "no data" sentinel — but the protocol uses
-//! the all-zero array; we mirror that).
+//! over the history in Electrum history order — confirmed rows by height
+//! and block position, then mempool rows, height `0` before `-1` — which
+//! is the order `get_history` lists it in. [`crate::history`] builds the
+//! rows in that order; the hash takes them as given. The trailing colon
+//! after the last entry is included per Electrum-server convention. An
+//! empty-history scripthash has status `[0u8; 32]`, which the wire layer
+//! sends as `null`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bitcoin::Txid;
 use parking_lot::Mutex;
-use bitcoin::hashes::{Hash, sha256};
 use tokio::sync::broadcast;
 
 use crate::keys::Scripthash;
@@ -194,54 +194,67 @@ impl SubscriptionRegistry {
             status_hash,
         });
     }
+
+    /// Record `status_hash` as the status the subscriber that just
+    /// subscribed to `sh` was answered with, so the next
+    /// [`maybe_notify`](Self::maybe_notify) that finds the same status does
+    /// not push it again. Without it, the first block or mempool event
+    /// after a subscribe re-pushed the unchanged status (a `null` for an
+    /// unused address).
+    ///
+    /// Seeds only a channel whose one receiver is the caller's, and only
+    /// while no status is recorded for it:
+    ///
+    /// - With a second receiver present, that subscriber may not have seen
+    ///   this status. Recording it would make `maybe_notify` treat the
+    ///   status as already delivered and swallow the push that subscriber
+    ///   still needs.
+    /// - A recorded status came from a `maybe_notify` push to the caller's
+    ///   receiver. A push queued while the subscribe was being answered
+    ///   reaches the client after the answer, so the pushed value, not the
+    ///   answer, is what the client last saw. Keeping it costs at most one
+    ///   redundant push; overwriting it could suppress a push the client
+    ///   needs.
+    ///
+    /// The caller must hold a receiver for `sh` (call this right after the
+    /// [`subscribe`](Self::subscribe) that returned it) and must have
+    /// computed `status_hash` after that subscribe.
+    pub fn seed_status(&self, sh: Scripthash, status_hash: [u8; 32]) {
+        // The channels lock is held across the seed so no second
+        // subscriber can join between the receiver count and the write.
+        let channels = self.channels.lock();
+        if channels.get(&sh).map(|tx| tx.receiver_count()) != Some(1) {
+            return;
+        }
+        self.last_status.lock().entry(sh).or_insert(status_hash);
+    }
 }
 
-/// Compute the Electrum status hash for a scripthash given the
-/// already-height-tagged history.
+/// Compute the Electrum status hash over `entries`, taken in the order
+/// given.
 ///
 /// `entries` is `(height, txid)` per row, where `height` is signed:
 /// - positive: confirmed block height
 /// - `0`: unconfirmed mempool tx with no unconfirmed inputs
 /// - `-1`: unconfirmed tx that spends an unconfirmed parent
 ///
-/// Mirrors the `Height` enum in `romanz/electrs` v0.11.1 src/status.rs:
-/// ```text
-/// Height::Confirmed { height: usize }     -> i64::try_from(height)
-/// Height::Unconfirmed { has_unconfirmed_inputs: false } -> 0
-/// Height::Unconfirmed { has_unconfirmed_inputs: true }  -> -1
-/// ```
-///
-/// Sorting is by `(height, txid)` ascending — negative heights for
-/// chained mempool txs sort first, then `0` for plain mempool, then
-/// positive heights in block order.
+/// The rows must already be in Electrum history order (confirmed by
+/// height and block position, then mempool `0` before `-1`, then display
+/// txid); [`crate::history::history_rows`] builds them that way. The hash
+/// does not re-sort: a client hashes `get_history` in the order it
+/// arrives, so the status has to cover the same order.
 ///
 /// Returns the all-zero hash for an empty history (canonical
 /// "no data" sentinel). Otherwise sha256 of
 /// `"<txid>:<height>:<txid>:<height>:..."`.
 pub fn status_hash(entries: &[(i64, Txid)]) -> [u8; 32] {
-    if entries.is_empty() {
-        return [0u8; 32];
-    }
-
-    let mut sorted: Vec<(i64, Txid)> = entries.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut concat = String::new();
-    for (h, t) in &sorted {
-        // Electrum hex encoding of txid: hex of byte-reversed (display)
-        // form, which is what `Txid::to_string()` produces in rust-
-        // bitcoin.
-        concat.push_str(&t.to_string());
-        concat.push(':');
-        concat.push_str(&h.to_string());
-        concat.push(':');
-    }
-    sha256::Hash::hash(concat.as_bytes()).to_byte_array()
+    crate::history::status_hash_of(entries.iter().copied())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
 
     fn fixture_txid(byte: u8) -> Txid {
         Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
@@ -263,12 +276,20 @@ mod tests {
     }
 
     #[test]
-    fn test_address_index_status_hash_stable_under_input_reordering() {
+    fn test_address_index_status_hash_follows_input_order() {
+        // The hash covers rows in the order given, which is the order
+        // `get_history` lists them in. Re-sorting here is what made the
+        // status disagree with the history a client hashes.
         let txid_a = fixture_txid(0x10);
         let txid_b = fixture_txid(0x20);
         let h1 = status_hash(&[(50, txid_a), (60, txid_b)]);
         let h2 = status_hash(&[(60, txid_b), (50, txid_a)]);
-        assert_eq!(h1, h2);
+        assert_ne!(h1, h2);
+        let text = format!("{txid_a}:50:{txid_b}:60:");
+        assert_eq!(
+            h1,
+            bitcoin::hashes::sha256::Hash::hash(text.as_bytes()).to_byte_array()
+        );
     }
 
     #[test]
@@ -464,5 +485,80 @@ mod tests {
             .expect("recv timeout")
             .expect("recv ok");
         assert_eq!(got3.status_hash, h2);
+    }
+
+    #[tokio::test]
+    async fn test_address_index_seed_status_suppresses_the_unchanged_push() {
+        use tokio::time::{Duration, timeout};
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh = [0x31; 32];
+        let mut rx = reg.subscribe(sh).unwrap();
+
+        // The subscriber was answered `h0`; a recompute that finds `h0`
+        // again has nothing new to say.
+        let h0 = [0x50; 32];
+        reg.seed_status(sh, h0);
+        reg.maybe_notify(sh, h0);
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "an unchanged status must not be pushed after the subscribe answer"
+        );
+
+        // A real change still goes out.
+        let h1 = [0x51; 32];
+        reg.maybe_notify(sh, h1);
+        let got = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timeout — a changed status was not pushed")
+            .expect("recv ok");
+        assert_eq!(got.status_hash, h1);
+    }
+
+    #[tokio::test]
+    async fn test_address_index_seed_status_skips_a_shared_channel() {
+        // A second subscriber may not have seen the seeding subscriber's
+        // answer, so the seed must not mark it delivered.
+        use tokio::time::{Duration, timeout};
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh = [0x32; 32];
+        let mut rx_a = reg.subscribe(sh).unwrap();
+        let mut rx_b = reg.subscribe(sh).unwrap();
+
+        let h = [0x60; 32];
+        reg.seed_status(sh, h);
+        reg.maybe_notify(sh, h);
+        for rx in [&mut rx_a, &mut rx_b] {
+            let got = timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .expect("recv timeout — push swallowed by a seed on a shared channel")
+                .expect("recv ok");
+            assert_eq!(got.status_hash, h);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_address_index_seed_status_keeps_a_pushed_status() {
+        // A status already pushed to the subscriber is what it last saw;
+        // a seed must not replace it.
+        use tokio::time::{Duration, timeout};
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh = [0x33; 32];
+        let mut rx = reg.subscribe(sh).unwrap();
+
+        let pushed = [0x70; 32];
+        reg.maybe_notify(sh, pushed);
+        let _ = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv ok");
+
+        let answered = [0x71; 32];
+        reg.seed_status(sh, answered);
+        reg.maybe_notify(sh, answered);
+        let got = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timeout — the seed overwrote the pushed status")
+            .expect("recv ok");
+        assert_eq!(got.status_hash, answered);
     }
 }
