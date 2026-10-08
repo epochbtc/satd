@@ -52,9 +52,10 @@ enum MisbehaviourAction {
     Keep(&'static str),
     /// Disconnected; its address is not banned.
     Disconnect,
-    /// Disconnected, and this banned for `-bantime`.
+    /// Disconnected, and the address it names banned for `-bantime`.
     Ban(crate::net::ban::BanTarget),
 }
+
 /// Keepalive cadence: how often each peer is sent a `ping` when none is
 /// outstanding. Bitcoin Core's `PING_INTERVAL` (net_processing.h).
 ///
