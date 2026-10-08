@@ -22,6 +22,10 @@
 //! handlers still surface a 503 if either turns out disabled at request
 //! time so an operator running a degraded configuration sees a clear
 //! signal rather than partial data.
+//!
+//! Every handler does its index and store reads on the blocking pool
+//! ([`crate::blocking`]): a busy script's history is a long synchronous
+//! read, and the request timeout could not answer before it ended.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -32,6 +36,7 @@ use bitcoin::{Address, Network, OutPoint, Transaction, Txid};
 use node_index::{HistoryEntry, Scripthash, scripthash_of};
 use serde::{Deserialize, Serialize};
 
+use crate::blocking::off_worker;
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::tx::{TxJson, TxStatusJson, build_confirmed_tx_json};
 use crate::state::EsploraState;
@@ -88,7 +93,7 @@ pub async fn address_info(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_address_info(&state, &addr, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &addr, &sh)).await?))
 }
 
 pub async fn address_txs_combined(
@@ -98,7 +103,7 @@ pub async fn address_txs_combined(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(build_combined_txs(&state, &sh, after_txid)?))
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
 }
 
 pub async fn address_txs_chain(
@@ -106,7 +111,7 @@ pub async fn address_txs_chain(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_chain_txs(&state, &sh, None)?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
 }
 
 pub async fn address_txs_chain_paged(
@@ -115,7 +120,7 @@ pub async fn address_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(build_chain_txs(&state, &sh, Some(last_seen))?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
 }
 
 pub async fn address_txs_mempool(
@@ -123,7 +128,7 @@ pub async fn address_txs_mempool(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_mempool_txs(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
 }
 
 pub async fn address_utxo(
@@ -131,7 +136,7 @@ pub async fn address_utxo(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_utxos(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
 }
 
 // ── Scripthash handlers (parallel set) ─────────────────────────────
@@ -141,7 +146,7 @@ pub async fn scripthash_info(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_address_info(&state, &hash, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &hash, &sh)).await?))
 }
 
 pub async fn scripthash_txs_combined(
@@ -151,7 +156,7 @@ pub async fn scripthash_txs_combined(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(build_combined_txs(&state, &sh, after_txid)?))
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
 }
 
 pub async fn scripthash_txs_chain(
@@ -159,7 +164,7 @@ pub async fn scripthash_txs_chain(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_chain_txs(&state, &sh, None)?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
 }
 
 pub async fn scripthash_txs_chain_paged(
@@ -168,7 +173,7 @@ pub async fn scripthash_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(build_chain_txs(&state, &sh, Some(last_seen))?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
 }
 
 pub async fn scripthash_txs_mempool(
@@ -176,7 +181,7 @@ pub async fn scripthash_txs_mempool(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_mempool_txs(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
 }
 
 pub async fn scripthash_utxo(
@@ -184,8 +189,12 @@ pub async fn scripthash_utxo(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_utxos(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
 }
+
+#[cfg(test)]
+#[path = "address_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 // ── Parsing ────────────────────────────────────────────────────────
 
@@ -473,37 +482,6 @@ fn build_mempool_stats(state: &EsploraState, sh: &Scripthash) -> AddressStatsJso
 
 // ── Tx pagination ──────────────────────────────────────────────────
 
-/// One distinct confirmed tx touching `sh`, ordered by (height, txid).
-#[derive(Debug, Clone, Copy)]
-struct ConfirmedTxRef {
-    txid: Txid,
-    height: u32,
-}
-
-/// Walk the confirmed history once and reduce to the set of distinct
-/// (height, txid) pairs. Returned ascending by `(height, txid)`; callers
-/// reverse for newest-first display.
-fn distinct_confirmed_txs(history: &[HistoryEntry]) -> Vec<ConfirmedTxRef> {
-    let mut seen: BTreeSet<(u32, Txid)> = BTreeSet::new();
-    for entry in history {
-        seen.insert((entry.height(), entry.txid()));
-    }
-    seen.into_iter()
-        .map(|(height, txid)| ConfirmedTxRef { txid, height })
-        .collect()
-}
-
-/// The script's distinct confirmed transactions, newest first.
-fn confirmed_txs_newest_first(
-    state: &EsploraState,
-    sh: &Scripthash,
-) -> EsploraResult<Vec<ConfirmedTxRef>> {
-    let history = state.address_index.confirmed_history(sh)?;
-    let mut txs = distinct_confirmed_txs(&history);
-    txs.reverse();
-    Ok(txs)
-}
-
 /// The script's mempool transactions in the order this node admitted them
 /// (oldest first), ties broken by txid. Upstream Esplora keeps a script's
 /// mempool history in insertion order and lists it that way. A fixed order
@@ -535,30 +513,18 @@ fn sort_in_admission_order<T>(rows: &mut [(u64, Txid, T)]) {
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 }
 
-/// Where an `after_txid` cursor continues the combined `/txs` history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AfterTxid {
-    /// The cursor is one of the script's mempool transactions: continue with
-    /// the mempool transactions from this index, then the confirmed history
-    /// from its start.
-    Mempool(usize),
-    /// The cursor is confirmed: continue with the confirmed history (newest
-    /// first) from this index.
-    Confirmed(usize),
-}
-
-/// Find `cursor` in the script's mempool list (in `/txs` order) or in its
-/// confirmed list (newest first) and return the index just after it.
-/// `None` when it is in neither, which `/txs` answers with 422
-/// `after_txid not found`.
-fn locate_after_txid(mempool: &[Txid], confirmed: &[Txid], cursor: &Txid) -> Option<AfterTxid> {
-    if let Some(i) = mempool.iter().position(|t| t == cursor) {
-        return Some(AfterTxid::Mempool(i + 1));
+/// Where the mempool part of a combined `/txs` page starts: at the first
+/// mempool transaction without a cursor, just after the cursor when it is
+/// one of `mempool`. `None` when the cursor is not in the mempool list, so
+/// the page is the confirmed history after it.
+fn mempool_start<T>(mempool: &[(Txid, T)], after_txid: Option<Txid>) -> Option<usize> {
+    match after_txid {
+        None => Some(0),
+        Some(cursor) => mempool
+            .iter()
+            .position(|(txid, _)| *txid == cursor)
+            .map(|i| i + 1),
     }
-    confirmed
-        .iter()
-        .position(|t| t == cursor)
-        .map(|i| AfterTxid::Confirmed(i + 1))
 }
 
 /// `/address/:addr/txs` and `/scripthash/:hash/txs` — combined: up to 50
@@ -579,30 +545,20 @@ fn build_combined_txs(
     after_txid: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
     let mempool = mempool_txs_in_admission_order(state, sh);
-    let confirmed = confirmed_txs_newest_first(state, sh)?;
-    let (mempool_from, confirmed_from) = match after_txid {
-        None => (Some(0), 0),
-        Some(cursor) => {
-            let mempool_ids: Vec<Txid> = mempool.iter().map(|(txid, _)| *txid).collect();
-            let confirmed_ids: Vec<Txid> = confirmed.iter().map(|t| t.txid).collect();
-            match locate_after_txid(&mempool_ids, &confirmed_ids, &cursor) {
-                Some(AfterTxid::Mempool(i)) => (Some(i), 0),
-                Some(AfterTxid::Confirmed(i)) => (None, i),
-                None => return Err(after_txid_not_found()),
-            }
-        }
-    };
-    let mut out = match mempool_from {
+    let (mut out, confirmed_after) = match mempool_start(&mempool, after_txid) {
         Some(from) => {
             let end = from.saturating_add(MEMPOOL_TXS_LIMIT).min(mempool.len());
-            render_mempool_txs(state, &mempool[from..end])?
+            (render_mempool_txs(state, &mempool[from..end])?, None)
         }
-        None => Vec::new(),
+        None => (Vec::new(), after_txid),
     };
-    let end = confirmed_from
-        .saturating_add(CONFIRMED_TXS_PAGE)
-        .min(confirmed.len());
-    out.extend(render_confirmed_txs(state, &confirmed[confirmed_from..end])?);
+    // Without a cursor the page always exists; with one, `None` means the
+    // cursor is not in the confirmed history either.
+    let page = state
+        .address_index
+        .confirmed_txs_newest_first(sh, confirmed_after, CONFIRMED_TXS_PAGE)?
+        .ok_or_else(after_txid_not_found)?;
+    out.extend(render_confirmed_txs(state, &page)?);
     Ok(out)
 }
 
@@ -613,40 +569,37 @@ fn build_combined_txs(
 /// empty page (the upstream contract: clients use the previous page's
 /// final txid; "unknown" only happens if the index changed under them
 /// or they hand-crafted a request).
+///
+/// The index reads the page from the cursor down rather than the whole
+/// history (`AddressIndex::confirmed_txs_newest_first`), so walking a long
+/// history page by page costs each page, not the history, per request.
 fn build_chain_txs(
     state: &EsploraState,
     sh: &Scripthash,
     last_seen: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
-    let txs = confirmed_txs_newest_first(state, sh)?;
-
-    let start = match last_seen {
-        None => 0,
-        Some(tx) => match txs.iter().position(|t| t.txid == tx) {
-            Some(p) => p + 1,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let end = start
-        .saturating_add(CONFIRMED_TXS_PAGE)
-        .min(txs.len());
-
-    render_confirmed_txs(state, &txs[start..end])
+    match state
+        .address_index
+        .confirmed_txs_newest_first(sh, last_seen, CONFIRMED_TXS_PAGE)?
+    {
+        Some(page) => render_confirmed_txs(state, &page),
+        None => Ok(Vec::new()),
+    }
 }
 
-/// Render confirmed transactions in full Esplora shape.
+/// Render confirmed `(height, txid)` transactions in full Esplora shape.
 fn render_confirmed_txs(
     state: &EsploraState,
-    page: &[ConfirmedTxRef],
+    page: &[(u32, Txid)],
 ) -> EsploraResult<Vec<TxJson>> {
     let mut out = Vec::with_capacity(page.len());
-    for t in page {
+    for (height, txid) in page {
         // Render full Esplora-shape tx JSON. Requires txindex (to find
         // the containing block); if disabled, surface as 503 — see
         // module-level note. The reconciliation in `satd/src/config.rs`
         // auto-enables txindex when esplora is on, so this is a defense
         // against operator overrides that won't normally fire.
-        let json = build_confirmed_tx_json(state, &t.txid, t.height)?;
+        let json = build_confirmed_tx_json(state, txid, *height)?;
         out.push(json);
     }
     Ok(out)

@@ -3840,6 +3840,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 network: config.network,
                 config: Arc::new(esplora_cfg),
                 sse_semaphore: sse_cap,
+                work_permits: esplora_handlers::work_permits_for(config.esplora_max_conns),
             };
             // Auth/CORS/prefix validation surfaces here. A misconfigured
             // auth scheme is a user-visible exit, not a silent fall-back
