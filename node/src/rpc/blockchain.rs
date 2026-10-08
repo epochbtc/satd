@@ -807,9 +807,25 @@ pub fn get_block_header(
     Ok(result)
 }
 
-/// `gettxout` — query a single UTXO.
+/// `gettxout` against the chain's UTXO set alone (`include_mempool=false`).
 pub fn get_tx_out(
     chain_state: &ChainState,
+    txid_str: &str,
+    vout: u32,
+) -> Result<Value, (i32, String)> {
+    get_tx_out_view(chain_state, None, txid_str, vout)
+}
+
+/// `gettxout` — query a single UTXO.
+///
+/// With `mempool` (Core's `include_mempool`, default true) the answer is
+/// Core's `CCoinsViewMemPool` view (src/rpc/blockchain.cpp): an output a
+/// pool transaction spends is `null`, and an output a pool transaction
+/// creates is reported with `confirmations: 0`. Only the acting class counts,
+/// as on every standard surface.
+pub fn get_tx_out_view(
+    chain_state: &ChainState,
+    mempool: Option<&Mempool>,
     txid_str: &str,
     vout: u32,
 ) -> Result<Value, (i32, String)> {
@@ -818,6 +834,34 @@ pub fn get_tx_out(
         .map_err(|_| (-5, "Invalid txid".to_string()))?;
 
     let outpoint = bitcoin::OutPoint { txid, vout };
+
+    let unit = default_unit();
+    if let Some(mempool) = mempool {
+        // Core: `if (!mempool.isSpent(out)) coin = view.GetCoin(out);`
+        if mempool.spending_tx_acting(&outpoint).is_some() {
+            return Ok(Value::Null);
+        }
+        // A pool transaction with this txid answers for every one of its
+        // outputs, as `CCoinsViewMemPool::GetCoin` checks the pool first.
+        if let Some(output) = mempool.acting_output(&outpoint) {
+            let Some(output) = output else {
+                return Ok(Value::Null);
+            };
+            let (tip_hash, _) = chain_state.tip_snapshot();
+            let mut response = json!({
+                "bestblock": tip_hash.to_string(),
+                "confirmations": 0,
+                "value": format_amount(output.value.to_sat(), unit),
+                "scriptPubKey": {
+                    "asm": format!("{}", output.script_pubkey),
+                    "hex": hex::encode(output.script_pubkey.as_bytes()),
+                },
+                "coinbase": false,
+            });
+            annotate_units(&mut response, unit);
+            return Ok(response);
+        }
+    }
 
     // `bestblock` is not decoration: it names the chain state the unspent
     // verdict belongs to, and clients use `gettxout` as *the* UTXO-existence
@@ -855,7 +899,6 @@ pub fn get_tx_out(
         return Ok(Value::Null);
     };
 
-    let unit = default_unit();
     let value = format_amount(coin.amount, unit);
     // `saturating_sub`: `coin.height` above the tip is not reachable for a coin
     // read under the same snapshot, but the subtraction must not be the thing

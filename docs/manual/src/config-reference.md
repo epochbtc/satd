@@ -44,8 +44,8 @@ track Bitcoin Core v30.
 
 > **Note.** Compatibility is pinned to Bitcoin Core v30, a frozen and
 > verifiable surface. Keys Core adds in v31 or later (for example
-> `limitclustercount`, `limitclustersize`, `privatebroadcast`,
-> `txospenderindex`) are not recognized and are rejected as typos until the
+> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are not
+> recognized and are rejected as typos until the
 > pin is bumped. Keys Core removed at or before v30 (for example `upnp`,
 > `maxorphantx`) are likewise not honored. A `bitcoin.conf` migrated from a
 > newer Core that contains a v31+ key stops satd at startup with an "unknown
@@ -264,12 +264,12 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains the flag. |
-| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB. |
+| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB, measured by the serialized size of the transactions held. Bitcoin Core measures its memory use instead, so at the same setting satd holds more transactions than Core and uses more memory than the figure. |
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |
 | `datacarriersize` | 83 bytes | hot | core | Maximum `OP_RETURN` size in bytes (`0` = reject all). |
-| `limitclustercount` | 64 | hot | core | Do not accept a transaction directly or indirectly connected to this many or more other unconfirmed transactions. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. Exceeding the limit is rejected as `too-large-cluster`. |
+| `limitclustercount` | 64 | hot | core | Do not accept a transaction with more than this many unconfirmed ancestors in the mempool; it is rejected as `too-large-cluster`. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. satd counts ancestors only: unlike Bitcoin Core, which also bounds descendants, it does not limit how many transactions descend from one. |
 | `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. Deprecated alongside `limitancestorcount`, and likewise no longer gates admission. |
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |

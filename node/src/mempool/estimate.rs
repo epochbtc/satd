@@ -766,6 +766,7 @@ mod tests {
             weight,
             fee_rate,
             time: 0,
+            height: 0,
             fee_delta: 0,
             sigop_cost,
             prev_scripthashes: Vec::new(),

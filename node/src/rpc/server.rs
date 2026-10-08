@@ -1772,35 +1772,18 @@ pub async fn start(
         // extension — a numeric value sets maxfeerate and leaves quarantine
         // off.
         let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
-        let (maxfeerate_btc_per_kvb, allow_quarantined) = match &maxfeerate_raw {
-            None | Some(serde_json::Value::Null) => (0.10_f64, false),
-            Some(serde_json::Value::Bool(b)) => (0.10, *b),
-            Some(serde_json::Value::Number(n)) => {
-                let f = n.as_f64().unwrap_or(0.10);
-                (f, false)
-            }
-            Some(serde_json::Value::String(s)) => {
-                let f: f64 = s.parse().unwrap_or(0.10);
-                (f, false)
-            }
-            _ => (0.10, false),
-        };
+        let allow_quarantined = matches!(maxfeerate_raw, Some(serde_json::Value::Bool(true)));
         // Core's third arg is `maxburnamount` (AMOUNT: numeric or string,
         // BTC, default 0).
         let maxburnamount_raw: Option<serde_json::Value> = args.raw("maxburnamount")?;
         args.check()?;
-        let maxburnamount_sat: u64 = match &maxburnamount_raw {
-            None | Some(serde_json::Value::Null) => 0,
-            Some(serde_json::Value::Number(n)) => {
-                let f = n.as_f64().unwrap_or(0.0);
-                (f * 100_000_000.0).round() as u64
-            }
-            Some(serde_json::Value::String(s)) => {
-                let f: f64 = s.parse().unwrap_or(0.0);
-                (f * 100_000_000.0).round() as u64
-            }
-            _ => 0,
-        };
+        // Both limits are read as Core reads them (`AmountFromValue`,
+        // `ParseFeeRate`), in Core's order: the burn limit, the decode, the
+        // burn check, then the fee rate. The old parser turned a negative
+        // value into 0 (no limit at all), anything it could not read into
+        // the default, and let a rate of 1 BTC/kvB or more through: a caller
+        // who passes a limit to be protected got none, and no error.
+        let maxburnamount_sat = parse_btc_amount_arg(maxburnamount_raw.as_ref(), 0)?;
 
         // Decode the transaction for pre-submit checks.
         let tx_bytes = hex::decode(&hex_tx)
@@ -1821,53 +1804,21 @@ pub async fn start(
             }
         }
 
-        let maxfeerate_sat_per_kvb = (maxfeerate_btc_per_kvb * 100_000_000.0).round() as u64;
+        // The bool is satd's `allowquarantined` in the `maxfeerate` slot, and
+        // leaves the fee rate at its default.
+        let maxfeerate_sat_per_kvb = match &maxfeerate_raw {
+            Some(serde_json::Value::Bool(_)) => 10_000_000,
+            other => parse_fee_rate_arg(other.as_ref(), 10_000_000)?,
+        };
 
-        // Pre-flight: test_accept to get fee info for maxfeerate check,
-        // and to detect already-confirmed transactions.
-        let txid = tx.compute_txid();
-
-        // Check if already confirmed.
-        if ctx.chain_state.get_tx_location(&txid).is_some() {
-            return Err(ErrorObjectOwned::owned(
-                -27,
-                "Transaction outputs already in utxo set",
-                None::<()>,
-            ));
-        }
-
-        // test_accept to get fee/vsize without actually accepting.
-        match ctx.mempool.test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier()) {
-            Ok((_accepted_txid, vsize, fees)) => {
-                // maxfeerate check.
-                let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
-                if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
-                    return Err(ErrorObjectOwned::owned(
-                        -25,
-                        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
-                        None::<()>,
-                    ));
-                }
-            }
-            Err(
-                crate::mempool::pool::MempoolError::AlreadyExists
-                | crate::mempool::pool::MempoolError::SameNonWitnessData,
-            ) => {
-                // Already in mempool, or the same txid with another witness
-                // is — we'll re-announce the resident one below.
-            }
-            Err(_) => {
-                // The pre-flight exists only to price the transaction for
-                // `maxfeerate` and to spot an already-confirmed txid. It must
-                // not decide acceptance: `test_accept` does not consult the
-                // policy engine, so the §6.2/§7 deferred-standardness path —
-                // where an `allow` rule forgives a non-standard shape such as
-                // dust — never gets a say here, and a transaction the node
-                // would really accept would be refused. Fall through and let
-                // the actual submission below rule on it; that path reports
-                // Core's own reject reason and error code via `rpc_code`.
-            }
-        }
+        // Already confirmed (`-27`), and the `maxfeerate` cap.
+        rawtx::send_raw_transaction_preflight(
+            &ctx.chain_state,
+            &ctx.mempool,
+            &tx,
+            maxfeerate_sat_per_kvb,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?;
 
         // Actually submit and broadcast.
         let result = ctx
@@ -2196,12 +2147,7 @@ pub async fn start(
             // finds a confirmed transaction forever, so a fully-spent one was
             // reported as "already known" where Core says `missing-inputs`,
             // its own inputs having been spent.
-            let any_output_unspent = (0..tx.output.len() as u32).any(|vout| {
-                ctx.chain_state
-                    .get_coin(&bitcoin::OutPoint { txid: txid_check, vout })
-                    .is_some()
-            });
-            if any_output_unspent {
+            if rawtx::has_output_in_utxo_set(&ctx.chain_state, tx) {
                 // `wtxid` is on *every* Core result, including the refusals.
                 // Omitting it here made `mempool_accept.py` fail on a
                 // `KeyError` before it could compare anything.
@@ -2501,8 +2447,11 @@ pub async fn start(
         let mut args = Args::new(&params);
         let txid: String = args.required("txid")?;
         let vout: u32 = args.required("n")?;
+        // Core's `include_mempool`, default true.
+        let include_mempool: Option<bool> = args.optional("include_mempool")?;
         args.check()?;
-        blockchain::get_tx_out(&ctx.chain_state, &txid, vout)
+        let mempool = include_mempool.unwrap_or(true).then_some(ctx.mempool.as_ref());
+        blockchain::get_tx_out_view(&ctx.chain_state, mempool, &txid, vout)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

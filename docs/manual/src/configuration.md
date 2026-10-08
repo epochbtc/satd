@@ -69,7 +69,7 @@ data with Bitcoin Core requires a patched fork such as Bitcoin Knots:
 | `--datacarriersize=<bytes>` | `83` | The maximum permitted size of an `OP_RETURN` script. Anything larger is rejected as non-standard. |
 | `--dustrelayfee=<sat/kvB>` | `3000` | The threshold used to calculate dust. Raising it forces transactions that create tiny, unspendable UTXOs to pay higher fees. |
 | `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects non-standard bare multisig setups, a construction often used for data storage. |
-| `--limitclustercount=<N>` | `64` | Do not accept a transaction directly or indirectly connected to `N` or more other unconfirmed transactions. This is the limit that gates admission; `64` is also the maximum, so the option can only lower it. Exceeding it is rejected as `too-large-cluster`. |
+| `--limitclustercount=<N>` | `64` | Do not accept a transaction with more than `N` unconfirmed ancestors in the mempool; it is rejected as `too-large-cluster`. This is the limit that gates admission; `64` is also the maximum, so the option can only lower it. satd counts ancestors only: unlike Bitcoin Core, which also bounds descendants, it does not limit how many transactions descend from one. |
 | `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `--limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `--limitdescendantcount=<N>` | `25` | Maximum unconfirmed descendant count. Deprecated alongside `--limitancestorcount`, and likewise no longer gates admission. |
 
