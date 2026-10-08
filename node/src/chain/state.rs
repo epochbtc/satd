@@ -7380,11 +7380,13 @@ impl ChainState {
         // in full.
         //
         // The entry is the `HeaderOnly` row a header announcement would have
-        // left, so every outcome below matches the headers-first path: a
-        // connect writes the `Valid` entry over it, a verdict marks it
-        // `Invalid`, and any other failure leaves a known header whose block
-        // is not stored. The best-header pointer is not moved here; a
-        // successful connect moves it at the end.
+        // left. A connect writes the `Valid` entry over it and a verdict marks
+        // it `Invalid`, as on the headers-first path. Any other failure is
+        // damage to this node's own storage and leaves a known header whose
+        // block is not stored. Unlike an announced header, that one has not
+        // moved the best-header pointer, which moves here only after a
+        // successful connect: a restart seeds the pointer from the index, and
+        // a descendant header or another copy of the block reaches it.
         if prev_hash == current_tip && self.store.get_block_index(&block_hash).is_none() {
             let entry = BlockIndexEntry {
                 header: block.header,
