@@ -28,11 +28,16 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let mempool_min_fee = format_feerate_sat_per_kvb(info.mempool_min_fee, unit);
     let incremental = format_feerate_sat_per_kvb(info.incremental_relay_fee, unit);
 
+    // Core's `MempoolInfoToJSON` (src/rpc/mempool.cpp): `loaded` is whether
+    // the startup load of `mempool.dat` has finished, `bytes` the sum of the
+    // virtual sizes, `usage` memory (estimated here), and `total_fee` the
+    // base fees.
     let mut response = json!({
-        "loaded": true,
+        "loaded": mempool.load_tried(),
         "size": info.size,
-        "bytes": info.bytes,
-        "usage": info.bytes,
+        "bytes": info.vsize,
+        "usage": info.usage,
+        "total_fee": format_amount(info.total_fee, unit),
         "maxmempool": info.max_size,
         "mempoolminfee": mempool_min_fee,
         "minrelaytxfee": min_fee,
@@ -1626,6 +1631,90 @@ fn script_type(script: &bitcoin::Script) -> &'static str {
     }
 }
 
+/// Whether one of `tx`'s outputs is still an unspent coin: how Core tells
+/// that a transaction is already confirmed, from the UTXO set alone
+/// (`BroadcastTransaction`, src/node/transaction.cpp, and `PreChecks`'
+/// `txn-already-known`, src/validation.cpp).
+pub fn has_output_in_utxo_set(chain_state: &ChainState, tx: &Transaction) -> bool {
+    let txid = tx.compute_txid();
+    (0..tx.output.len() as u32).any(|vout| chain_state.get_coin(&OutPoint { txid, vout }).is_some())
+}
+
+/// What a transaction's inputs are worth minus what its outputs pay, with
+/// each input found in the UTXO set or among the pool's outputs. `None` when
+/// an input is found in neither or the outputs pay more than the inputs.
+fn fee_from_inputs(chain_state: &ChainState, mempool: &Mempool, tx: &Transaction) -> Option<u64> {
+    let mut sum_in: u64 = 0;
+    for input in &tx.input {
+        let op = input.previous_output;
+        let value = match chain_state.get_coin(&op) {
+            Some(coin) => coin.amount,
+            None => mempool.with_entries(|entries| {
+                entries
+                    .get(&op.txid)
+                    .and_then(|e| e.tx.output.get(op.vout as usize))
+                    .map(|o| o.value.to_sat())
+            })?,
+        };
+        sum_in = sum_in.checked_add(value)?;
+    }
+    let sum_out = tx
+        .output
+        .iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))?;
+    sum_in.checked_sub(sum_out)
+}
+
+/// `sendrawtransaction`'s checks before it submits, in the order of Core's
+/// `BroadcastTransaction` (src/node/transaction.cpp):
+///
+/// 1. An output still in the UTXO set means the transaction is confirmed:
+///    `-27`. This reads the coins, as Core does, so it holds with or without
+///    `-txindex`; the txindex also finds a transaction whose outputs are all
+///    spent, which Core answers as missing inputs.
+/// 2. With a `maxfeerate` (non-zero `max_fee_rate_sat_per_kvb`), a dry run
+///    prices the transaction, and a fee above the cap is `-25`.
+///
+/// The dry run does not decide acceptance. `test_accept` does not consult
+/// the policy engine, so with a ruleset loaded the submission can admit a
+/// transaction the dry run refused (an `allow` rule forgiving a standardness
+/// failure, or `allowquarantined`). The cap still applies to it: the fee is
+/// then worked out from the inputs. Without a ruleset the submission refuses
+/// whatever the dry run refused and reports why.
+pub fn send_raw_transaction_preflight(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    tx: &Transaction,
+    max_fee_rate_sat_per_kvb: u64,
+) -> Result<(), (i32, String)> {
+    if has_output_in_utxo_set(chain_state, tx) {
+        return Err((-27, "Transaction outputs already in utxo set".to_string()));
+    }
+    // Core: a zero fee rate makes `max_tx_fee` zero, and it skips the dry run.
+    if max_fee_rate_sat_per_kvb == 0 {
+        return Ok(());
+    }
+    use crate::mempool::pool::MempoolError;
+    let priced = match mempool.test_accept(tx, chain_state, chain_state.script_verifier()) {
+        Ok((_txid, vsize, fee)) => Some((fee, vsize as u64)),
+        // Already in the pool: the submission re-announces the resident one.
+        Err(MempoolError::AlreadyExists | MempoolError::SameNonWitnessData) => None,
+        Err(_) if mempool.has_policy() => fee_from_inputs(chain_state, mempool, tx)
+            .map(|fee| (fee, crate::mempool::policy::weight_to_vsize(tx.weight().to_wu()))),
+        Err(_) => None,
+    };
+    if let Some((fee, vsize)) = priced {
+        let feerate_sat_per_kvb = fee.saturating_mul(1000) / vsize.max(1);
+        if feerate_sat_per_kvb > max_fee_rate_sat_per_kvb {
+            return Err((
+                -25,
+                "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True when an output should be counted toward the burn amount for the
 /// `sendrawtransaction` `maxburnamount` check. Matches Core's
 /// `(out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps())`
@@ -1878,6 +1967,10 @@ pub fn verify_tx_out_proof(
 }
 
 #[cfg(test)]
+#[path = "rawtx_mempoolrpc_tests.rs"]
+mod mempoolrpc_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::mempool::pool::Mempool;
@@ -1952,7 +2045,8 @@ mod tests {
 
         assert_eq!(info["size"], 0);
         assert_eq!(info["bytes"], 0);
-        assert_eq!(info["loaded"], true);
+        // No load has been attempted on a pool built here.
+        assert_eq!(info["loaded"], false);
         assert_eq!(info["maxmempool"], 1_000_000);
     }
 

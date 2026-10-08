@@ -4504,10 +4504,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             chain_state.script_verifier(),
             &net_datadir,
         ) {
-            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 => {
+            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 => {
                 tracing::info!(
                     accepted = stats.accepted,
                     skipped = stats.skipped,
+                    expired = stats.expired,
                     "Re-admitted persisted mempool from mempool.dat"
                 );
             }
@@ -4515,6 +4516,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => tracing::warn!(error = %e, "Failed to load persisted mempool"),
         }
     }
+    // `getmempoolinfo.loaded`: the load attempt is over, whatever it found.
+    // Core sets this after `LoadMempool` whether or not `-persistmempool` is
+    // on (src/init.cpp).
+    mempool.set_load_tried(true);
 
     // Spawn P2P event loop
     {
