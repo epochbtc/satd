@@ -237,6 +237,9 @@ pub struct NotifyBundle {
 /// to those with active subscribers) and fires the corresponding
 /// `StatusUpdate` notifications. The mutate-then-notify ordering is
 /// guaranteed by running both inside the single `tokio::select!` arm.
+/// The recompute reads subscribed histories from the index, so it runs
+/// on the blocking pool; the arm waits for it before taking the next
+/// event.
 pub async fn mempool_index_task(
     index: Arc<RwLock<MempoolAddrIndex>>,
     mempool: Arc<Mempool>,
@@ -273,12 +276,13 @@ pub async fn mempool_index_task(
                             idx.scripthashes_for(&txid)
                         };
                         if let Some(bundle) = &notify {
-                            crate::index::address::notifier::recompute_for(
-                                &bundle.index,
-                                &bundle.registry,
-                                &mempool,
-                                &touched,
-                            );
+                            crate::index::address::notifier::recompute_for_off_thread(
+                                bundle.index.clone(),
+                                bundle.registry.clone(),
+                                mempool.clone(),
+                                touched,
+                            )
+                            .await;
                         }
                     }
                     Ok(MempoolEvent::LeaveConfirmed { txid, .. })
@@ -293,12 +297,13 @@ pub async fn mempool_index_task(
                             touched
                         };
                         if let Some(bundle) = &notify {
-                            crate::index::address::notifier::recompute_for(
-                                &bundle.index,
-                                &bundle.registry,
-                                &mempool,
-                                &touched,
-                            );
+                            crate::index::address::notifier::recompute_for_off_thread(
+                                bundle.index.clone(),
+                                bundle.registry.clone(),
+                                mempool.clone(),
+                                touched,
+                            )
+                            .await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -308,23 +313,38 @@ pub async fn mempool_index_task(
                         // by acting-only events (a quarantined admission emits
                         // no `Enter`), so the resync must match or the address
                         // index would leak the quarantine class into history.
-                        let snapshot: Vec<(Txid, bitcoin::Transaction)> = mempool
-                            .get_acting_entries()
-                            .into_iter()
-                            .map(|(txid, e)| (txid, e.tx))
-                            .collect();
-                        index.write().resync_from(
-                            &snapshot, &chain_state, &mempool,
+                        //
+                        // A walk over the whole mempool plus a pass over
+                        // every subscribed history: the blocking pool's
+                        // work, not a runtime worker's.
+                        let (index, mempool, chain_state, notify) = (
+                            index.clone(),
+                            mempool.clone(),
+                            chain_state.clone(),
+                            notify.as_ref().map(|b| (b.index.clone(), b.registry.clone())),
                         );
-                        // After resync, recompute every active subscriber
-                        // so anyone who was waiting on a missed event
-                        // converges on the truth.
-                        if let Some(bundle) = &notify {
-                            crate::index::address::notifier::recompute_all_active(
-                                &bundle.index,
-                                &bundle.registry,
-                                &mempool,
+                        let resync = tokio::task::spawn_blocking(move || {
+                            let snapshot: Vec<(Txid, bitcoin::Transaction)> = mempool
+                                .get_acting_entries()
+                                .into_iter()
+                                .map(|(txid, e)| (txid, e.tx))
+                                .collect();
+                            index.write().resync_from(
+                                &snapshot, &chain_state, &mempool,
                             );
+                            // After resync, recompute every active subscriber
+                            // so anyone who was waiting on a missed event
+                            // converges on the truth.
+                            if let Some((addr_index, registry)) = notify {
+                                crate::index::address::notifier::recompute_all_active(
+                                    &addr_index,
+                                    &registry,
+                                    &mempool,
+                                );
+                            }
+                        });
+                        if let Err(e) = resync.await {
+                            tracing::error!(error = %e, "address mempool index resync failed");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

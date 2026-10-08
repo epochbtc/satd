@@ -335,6 +335,42 @@ pub(crate) fn resolve_funding_rows_for(
     out
 }
 
+/// The address row under a reverse cursor of `addr_funding_v3` or
+/// `addr_spending_v3`, or `None` once the cursor has left `prefix` or the
+/// family. A read error ends the walk the same way, and is logged.
+fn addr_row_at(
+    it: &rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
+    prefix: &[u8],
+    spending: bool,
+) -> Option<crate::storage::AddrRowKey> {
+    if !it.valid() {
+        if let Err(e) = it.status() {
+            tracing::error!(
+                target: "storage",
+                error = %e,
+                "address-history reverse scan failed; the history page ends here"
+            );
+        }
+        return None;
+    }
+    let key = it.key()?;
+    if key.len() != crate::index::address::KEY_LEN_V3 || &key[..prefix.len()] != prefix {
+        return None;
+    }
+    let (txseq, index) = if spending {
+        let p = crate::index::address::decode_spending_key_v3(key)?;
+        (p.txseq, p.vin)
+    } else {
+        let p = crate::index::address::decode_funding_key_v3(key)?;
+        (p.txseq, p.vout)
+    };
+    Some(crate::storage::AddrRowKey {
+        txseq,
+        spending,
+        index,
+    })
+}
+
 /// Resolve raw v3 spending rows into the public `(AddrSpendingKey,
 /// prev_outpoint)` shape and put them in the documented
 /// `(height, txid, vin)` order.
@@ -3126,6 +3162,80 @@ impl Store for RocksDbStore {
         resolve_spending_rows_for(self, sh, raw)
     }
 
+    fn addr_rows_desc(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        below: Option<u64>,
+        min_txs: usize,
+    ) -> crate::storage::AddrRowsDesc {
+        use crate::storage::{AddrRowKey, AddrRowsDesc};
+        use node_index::{KEY_LEN_V3, SCRIPTHASH_PREFIX_LEN, TXSEQ_LEN, TXSEQ_MAX};
+
+        let top = match below {
+            Some(0) => return AddrRowsDesc::default(),
+            Some(b) => (b - 1).min(TXSEQ_MAX),
+            None => TXSEQ_MAX,
+        };
+        let prefix = &sh[..SCRIPTHASH_PREFIX_LEN];
+        // The largest key an ordinal of `top` or less can have: the
+        // prefix, `top`, and an all-ones output index.
+        let mut target = [0xFFu8; KEY_LEN_V3];
+        target[..SCRIPTHASH_PREFIX_LEN].copy_from_slice(prefix);
+        target[SCRIPTHASH_PREFIX_LEN..SCRIPTHASH_PREFIX_LEN + TXSEQ_LEN]
+            .copy_from_slice(&node_index::encode_txseq(TxSeq(top)));
+
+        // Both families carry a 16-byte prefix extractor. The walk runs in
+        // total order rather than relying on prefix-mode seek semantics
+        // for a reverse scan, and checks the prefix on every key itself.
+        let funding_cf = self.cf(CF_ADDR_FUNDING_V3);
+        let spending_cf = self.cf(CF_ADDR_SPENDING_V3);
+        let reverse_from = |cf: &Arc<BoundColumnFamily<'_>>| {
+            let mut opts = rocksdb::ReadOptions::default();
+            opts.set_total_order_seek(true);
+            let mut it = self.db.raw_iterator_cf_opt(cf, opts);
+            it.seek_for_prev(target);
+            it
+        };
+        let mut cursors = [
+            (reverse_from(&funding_cf), false),
+            (reverse_from(&spending_cf), true),
+        ];
+
+        // Merge the two families newest first, stopping at the first
+        // ordinal past `min_txs` so no transaction's rows are split.
+        let mut rows: Vec<AddrRowKey> = Vec::new();
+        let mut seen = 0usize;
+        let mut last: Option<u64> = None;
+        loop {
+            let mut next: Option<(usize, AddrRowKey)> = None;
+            for (i, (it, spending)) in cursors.iter().enumerate() {
+                if let Some(row) = addr_row_at(it, prefix, *spending)
+                    && next.is_none_or(|(_, newest)| row > newest)
+                {
+                    next = Some((i, row));
+                }
+            }
+            let Some((i, row)) = next else {
+                return AddrRowsDesc {
+                    rows,
+                    next_below: None,
+                };
+            };
+            if last != Some(row.txseq) {
+                if seen >= min_txs.max(1) {
+                    return AddrRowsDesc {
+                        rows,
+                        next_below: last,
+                    };
+                }
+                seen += 1;
+                last = Some(row.txseq);
+            }
+            rows.push(row);
+            cursors[i].0.prev();
+        }
+    }
+
     fn spent_complete(&self) -> bool {
         // Default to false when the metadata key is missing — that
         // shouldn't happen post-`open()` but we'd rather under-claim
@@ -3748,6 +3858,10 @@ impl Store for RocksDbStore {
 #[cfg(test)]
 #[path = "rocksdb_store_storefault_tests.rs"]
 mod storefault_tests;
+
+#[cfg(test)]
+#[path = "rocksdb_store_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 #[cfg(test)]
 mod tests {

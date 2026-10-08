@@ -59,6 +59,20 @@ pub(crate) struct StoreControls {
     /// IBD connector's compaction backpressure reads. `InMemoryStore` has no
     /// levels and reports 0, so the pause is otherwise unreachable.
     chainstate_l0_files: Arc<AtomicU64>,
+    /// How many ordinals `txids_of_seqs` has been asked to resolve. The
+    /// call count above shows batching; this shows how much of a history
+    /// a read resolved, which is the cost a paged read must keep to the
+    /// page.
+    ordinals_resolved: Arc<AtomicU64>,
+    /// How many address-history reads (`iter_addr_funding`,
+    /// `addr_rows_desc`) the store has served.
+    addr_reads: Arc<AtomicU64>,
+    /// How many address rows those reads (and `iter_addr_spending`)
+    /// returned: how much of a history a caller read.
+    addr_rows_served: Arc<AtomicU64>,
+    /// Milliseconds every address-history read sleeps first: what a long
+    /// read of a busy scripthash looks like to the thread that makes it.
+    addr_read_delay_ms: Arc<AtomicU64>,
 }
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
@@ -166,11 +180,36 @@ impl StoreControls {
         self.txids_of_seqs_calls.load(Ordering::SeqCst)
     }
 
-    /// Zero both ordinal-read counters, so a test can set up state
+    /// Zero the ordinal-read counters, so a test can set up state
     /// without the setup's reads counting against the assertion.
     pub(crate) fn reset_ordinal_read_counts(&self) {
         self.get_tx_seq_calls.store(0, Ordering::SeqCst);
         self.txids_of_seqs_calls.store(0, Ordering::SeqCst);
+        self.ordinals_resolved.store(0, Ordering::SeqCst);
+        self.addr_rows_served.store(0, Ordering::SeqCst);
+    }
+
+    /// How many address rows the store has returned since the last
+    /// [`reset_ordinal_read_counts`](Self::reset_ordinal_read_counts).
+    pub(crate) fn addr_rows_served(&self) -> u64 {
+        self.addr_rows_served.load(Ordering::SeqCst)
+    }
+
+    /// How many ordinals `txids_of_seqs` has resolved since the last
+    /// reset, counting each one asked for.
+    pub(crate) fn ordinals_resolved(&self) -> u64 {
+        self.ordinals_resolved.load(Ordering::SeqCst)
+    }
+
+    /// How many address-history reads the store has served.
+    pub(crate) fn addr_reads(&self) -> u64 {
+        self.addr_reads.load(Ordering::SeqCst)
+    }
+
+    /// Make every address-history read sleep `delay` first.
+    pub(crate) fn set_addr_read_delay(&self, delay: std::time::Duration) {
+        self.addr_read_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 }
 
@@ -199,6 +238,21 @@ impl ControllableStore {
         }
     }
 
+    fn served(&self, rows: usize) {
+        self.controls
+            .addr_rows_served
+            .fetch_add(rows as u64, Ordering::SeqCst);
+    }
+
+    /// Count an address-history read and apply the configured delay.
+    fn addr_read(&self) {
+        self.controls.addr_reads.fetch_add(1, Ordering::SeqCst);
+        let ms = self.controls.addr_read_delay_ms.load(Ordering::SeqCst);
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+
     /// A store that behaves exactly like [`InMemoryStore`] until told otherwise
     /// — including its hardcoded "the index is on and complete".
     pub(crate) fn new() -> Self {
@@ -214,6 +268,10 @@ impl ControllableStore {
                 txids_of_seqs_calls: Arc::new(AtomicU64::new(0)),
                 block_index_scans: Arc::new(AtomicU64::new(0)),
                 chainstate_l0_files: Arc::new(AtomicU64::new(0)),
+                ordinals_resolved: Arc::new(AtomicU64::new(0)),
+                addr_reads: Arc::new(AtomicU64::new(0)),
+                addr_rows_served: Arc::new(AtomicU64::new(0)),
+                addr_read_delay_ms: Arc::new(AtomicU64::new(0)),
             },
         }
     }
@@ -353,6 +411,9 @@ impl Store for ControllableStore {
         self.controls
             .txids_of_seqs_calls
             .fetch_add(1, Ordering::SeqCst);
+        self.controls
+            .ordinals_resolved
+            .fetch_add(seqs.len() as u64, Ordering::SeqCst);
         self.inner.txids_of_seqs(seqs)
     }
     fn block_of_seq(&self, seq: u64) -> Option<(u64, u32)> {
@@ -365,10 +426,26 @@ impl Store for ControllableStore {
         self.inner.clear_all()
     }
     fn iter_addr_funding(&self, sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
-        self.inner.iter_addr_funding(sh)
+        self.addr_read();
+        let rows = self.inner.iter_addr_funding(sh);
+        self.served(rows.len());
+        rows
+    }
+    fn addr_rows_desc(
+        &self,
+        sh: &Scripthash,
+        below: Option<u64>,
+        min_txs: usize,
+    ) -> crate::storage::AddrRowsDesc {
+        self.addr_read();
+        let run = self.inner.addr_rows_desc(sh, below, min_txs);
+        self.served(run.rows.len());
+        run
     }
     fn iter_addr_spending(&self, sh: &Scripthash) -> Vec<(AddrSpendingKey, OutPoint)> {
-        self.inner.iter_addr_spending(sh)
+        let rows = self.inner.iter_addr_spending(sh);
+        self.served(rows.len());
+        rows
     }
     fn lookup_spends_of_tx(&self, txid: &Txid) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
         self.inner.lookup_spends_of_tx(txid)
