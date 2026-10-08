@@ -381,6 +381,21 @@ On an AssumeUTXO node the history below the snapshot base is legitimately
 unvalidated until the background chainstate reaches it. That is recognised and
 logged at `INFO`, not treated as damage.
 
+### A coin the database cannot read
+
+If RocksDB cannot read a coin from the chainstate (an I/O error or a checksum
+mismatch), or a coin's row does not decode, satd stops at once, as Bitcoin Core
+does. The log and stderr say `Error reading from database, shutting down`,
+with the outpoint and the error. satd does not carry on as if the coin were
+spent: that would refuse a valid block that spends it, and record the block as
+invalid across restarts.
+
+The stop is an `abort()` (the process ends with `SIGABRT`), so no shutdown
+flush runs. The next start replays the blocks after the last flush from the
+block files, as after any crash. If the error comes back after a restart, the
+disk or the datadir is damaged: check the disk, then rebuild the UTXO set with
+`-reindex-chainstate`, or audit a copy of the datadir first (below).
+
 ### Auditing a suspect datadir offline
 
 `satd-chainstate-audit` answers the question the startup checks cannot afford
