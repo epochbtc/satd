@@ -411,6 +411,12 @@ pub enum NetEvent {
         id: PeerId,
         msg: NetworkMessage,
     },
+    /// The peer's queue has drained back under the send buffer while some
+    /// of its `getdata` entries are still unserved: serve more of them. Sent
+    /// by the peer's write loop; see [`crate::net::send_queue`].
+    GetDataResume {
+        id: PeerId,
+    },
 }
 
 /// A block handed to the block processor: the peer it came from, that peer's
@@ -447,7 +453,9 @@ struct RecentBlock {
 /// Handle for sending messages to a specific peer.
 struct PeerHandle {
     info: PeerInfo,
-    msg_tx: mpsc::Sender<NetworkMessage>,
+    /// The peer's outbound queue. It counts the bytes queued, which Core's
+    /// send-buffer limit is measured in; see [`crate::net::send_queue`].
+    msg_tx: crate::net::send_queue::PeerSender,
     /// Last time we sent this peer a `getheaders`, for rate-limiting
     /// announcement-triggered header discovery (anti-DoS). `None` until the
     /// first send.
@@ -481,10 +489,12 @@ struct PeerHandle {
     flow: Arc<crate::net::flow::PeerFlow>,
 }
 
-/// A message's type as Core names it in a log line.
+/// A message's type as Core names it in a log line. A type satd does not
+/// know is the peer's own text, sanitized as Core's `SanitizeString(msg_type)`
+/// does, so it cannot break a log line.
 fn handshake_msg_type(msg: &NetworkMessage) -> String {
     match msg {
-        NetworkMessage::Unknown { command, .. } => command.to_string(),
+        NetworkMessage::Unknown { command, .. } => crate::net::limits::sanitize_string(command.as_ref()),
         m => m.cmd().to_string(),
     }
 }
@@ -496,14 +506,15 @@ fn log_received(id: PeerId, msg: &NetworkMessage) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    let cmd = match msg {
-        NetworkMessage::Unknown { command, .. } => command.to_string(),
-        m => m.cmd().to_string(),
-    };
+    let cmd = handshake_msg_type(msg);
     let raw = bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone());
     let payload = bitcoin::consensus::serialize(&raw).len().saturating_sub(24);
     tracing::debug!("received: {cmd} ({payload} bytes) peer={id}");
 }
+
+#[cfg(test)]
+#[path = "manager_p2pbounds_tests.rs"]
+mod p2pbounds_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -2950,7 +2961,7 @@ impl PeerManager {
                 id,
                 PeerHandle {
                     info,
-                    msg_tx,
+                    msg_tx: msg_tx.into(),
                     disconnect: Arc::new(tokio::sync::Notify::new()),
                     flow: Arc::new(crate::net::flow::PeerFlow::new()),
                     last_getheaders_sent: None,
@@ -3747,6 +3758,9 @@ impl PeerManager {
                     Ok(NetEvent::PeerDisconnected { id }) => {
                         self.handle_peer_disconnected(id);
                     }
+                    Ok(NetEvent::GetDataResume { id }) => {
+                        self.resume_getdata(id);
+                    }
                     Ok(NetEvent::MessageReceived { id, msg }) => {
                         // The socket task counted this message in as it was
                         // handed over; the guard counts it out once the work
@@ -4257,9 +4271,20 @@ impl PeerManager {
             // against that peer's outstanding ping and does not forward it.
             NetworkMessage::Pong(_) => {}
             NetworkMessage::Inv(inventory) => {
+                // Core's `MAX_INV_SZ` (`net_processing.cpp` INV).
+                if inventory.len() > MAX_INV_PER_MSG {
+                    self.add_ban_score(id, 100, &format!("inv message size = {}", inventory.len()));
+                    return;
+                }
                 self.handle_inv(id, inventory);
             }
             NetworkMessage::Headers(headers) => {
+                // Core's `MAX_HEADERS_RESULTS`, checked before any header in
+                // the message is looked at.
+                if headers.len() > crate::net::limits::MAX_HEADERS_RESULTS {
+                    self.add_ban_score(id, 100, &format!("headers message size = {}", headers.len()));
+                    return;
+                }
                 self.handle_headers(id, headers);
             }
             NetworkMessage::Block(block) => {
@@ -4279,6 +4304,12 @@ impl PeerManager {
             }
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
+                // The write loop stopped reading this peer when it handed the
+                // request over. Whatever is left unserved keeps it stopped;
+                // see `serve_getdata`.
+                if let Some(sender) = self.peer_sender(id) {
+                    sender.queue().note_getdata_handled();
+                }
             }
             NetworkMessage::SendCmpct(msg) => {
                 // Only version 2 (witness) compact blocks are spoken; Core
@@ -4330,6 +4361,13 @@ impl PeerManager {
                 // Otherwise this is the message that latches the link's
                 // addr relay on, inbound included.
                 let relay_addrs = self.setup_address_relay(id);
+                // Core's `ProcessAddrs`: past `MAX_ADDR_TO_SEND` entries the
+                // message is misbehaviour and nothing in it is stored. A link
+                // that relays no addresses ignores it whatever its size.
+                if relay_addrs && addrs.len() > crate::net::limits::MAX_ADDR_TO_SEND {
+                    self.add_ban_score(id, 100, &format!("addr message size = {}", addrs.len()));
+                    return;
+                }
                 let source = self.peer_ip(id);
                 for (_, addr) in &addrs {
                     if relay_addrs
@@ -4479,6 +4517,11 @@ impl PeerManager {
                 // As above: a block-relay-only link relays no addresses in
                 // either direction, and anything else latches on.
                 let relay_addrs = self.setup_address_relay(id);
+                // As for `addr`.
+                if relay_addrs && addrs.len() > crate::net::limits::MAX_ADDR_TO_SEND {
+                    self.add_ban_score(id, 100, &format!("addrv2 message size = {}", addrs.len()));
+                    return;
+                }
                 let source = self.peer_ip(id);
                 for addr_msg in addrs.iter().filter(|_| relay_addrs) {
                     match &addr_msg.addr {
@@ -4524,6 +4567,13 @@ impl PeerManager {
                 self.disconnect_by_id(id);
             }
             NetworkMessage::NotFound(inventory) => {
+                // Core looks at a `notfound` only up to
+                // `MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER`
+                // entries, and ignores a longer one whole, without penalty.
+                if inventory.len() > crate::net::limits::MAX_NOTFOUND_SZ {
+                    tracing::debug!(id, count = inventory.len(), "ignoring an oversized notfound");
+                    return;
+                }
                 // Authoritative "I don't have this" from the peer. Until
                 // this commit we logged at debug and did nothing, so the
                 // height stayed in_flight for the full 60s
@@ -4583,24 +4633,20 @@ impl PeerManager {
                     handle.info.prefers_headers = true;
                 }
             }
+            // Each request is checked as Core's `PrepareBlockFilterRequest`
+            // does, including whether filters are served at all.
             #[cfg(feature = "block-filter-index")]
-            NetworkMessage::GetCFilters(req) => {
-                if self.peer_serve_filters_ready() {
-                    self.handle_get_cfilters(id, req);
-                }
-                // Silent drop per BIP 157 when not serving.
-            }
+            NetworkMessage::GetCFilters(req) => self.handle_get_cfilters(id, req),
             #[cfg(feature = "block-filter-index")]
-            NetworkMessage::GetCFHeaders(req) => {
-                if self.peer_serve_filters_ready() {
-                    self.handle_get_cfheaders(id, req);
-                }
-            }
+            NetworkMessage::GetCFHeaders(req) => self.handle_get_cfheaders(id, req),
             #[cfg(feature = "block-filter-index")]
-            NetworkMessage::GetCFCheckpt(req) => {
-                if self.peer_serve_filters_ready() {
-                    self.handle_get_cfcheckpt(id, req);
-                }
+            NetworkMessage::GetCFCheckpt(req) => self.handle_get_cfcheckpt(id, req),
+            // Built without filters: no filter type is served, and Core
+            // disconnects a peer that asks for one it does not serve.
+            #[cfg(not(feature = "block-filter-index"))]
+            NetworkMessage::GetCFilters(_) | NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFCheckpt(_) => {
+                tracing::debug!("peer requested unsupported block filter type, disconnecting peer={id}");
+                self.disconnect_by_id(id);
             }
             _ => {}
         }
@@ -7753,42 +7799,104 @@ impl PeerManager {
         );
     }
 
-    /// `getcfilters` handler per BIP 157.
-    /// Validates filter type, range bounds, and active-chain stop hash;
-    /// silent-drops any violation. On success, replies with one
-    /// `CFilter` per height in the requested range (BIP 157 specifies
-    /// per-height responses, not a batched form).
+    /// Core's `PrepareBlockFilterRequest`: the checks a BIP 157 request
+    /// passes before it is served. Returns the stop block's height and the
+    /// index to serve from.
+    ///
+    /// A request satd will not answer as asked disconnects the peer, as in
+    /// Core (`fDisconnect`, no misbehaviour): a filter type it does not serve
+    /// (any type, while it serves no filters), a stop hash it does not know
+    /// or would not serve, a start above the stop, or a range of
+    /// `max_height_diff` heights or more. satd used to ignore them all.
+    ///
+    /// A stop hash off the active chain that Core would still serve (a block
+    /// its `BlockRequestAllowed` admits) is ignored without a disconnect:
+    /// satd keeps filters for the active chain only, so it has nothing to
+    /// send, but the request is not one Core would hold against the peer.
+    #[cfg(feature = "block-filter-index")]
+    fn prepare_block_filter_request(
+        &self,
+        id: PeerId,
+        filter_type: u8,
+        start_height: u32,
+        stop_hash: bitcoin::BlockHash,
+        max_height_diff: u32,
+    ) -> Option<(u32, Arc<dyn node_filter_index::FilterIndex>)> {
+        if filter_type != node_filter_index::FILTER_TYPE_BASIC || !self.peer_serve_filters_ready() {
+            tracing::debug!(
+                "peer requested unsupported block filter type: {filter_type}, disconnecting peer={id}"
+            );
+            self.disconnect_by_id(id);
+            return None;
+        }
+        let stop_height = match self.chain_state.get_block_index(&stop_hash) {
+            Some(e) if self.chain_state.active_chain_contains(&stop_hash, e.height) => e.height,
+            Some(e) if self.stale_block_request_allowed(&e) => {
+                tracing::debug!("no filters for block {stop_hash} off the active chain, peer={id}");
+                return None;
+            }
+            _ => {
+                tracing::debug!("peer requested invalid block hash: {stop_hash}, disconnecting peer={id}");
+                self.disconnect_by_id(id);
+                return None;
+            }
+        };
+        if start_height > stop_height {
+            tracing::debug!(
+                "peer sent invalid getcfilters/getcfheaders with start height {start_height} and \
+                 stop height {stop_height}, disconnecting peer={id}"
+            );
+            self.disconnect_by_id(id);
+            return None;
+        }
+        if stop_height - start_height >= max_height_diff {
+            tracing::debug!(
+                "peer requested too many cfilters/cfheaders: {} / {max_height_diff}, disconnecting peer={id}",
+                u64::from(stop_height - start_height) + 1
+            );
+            self.disconnect_by_id(id);
+            return None;
+        }
+        // Core: "Filter index for supported type not found", no disconnect.
+        self.filter_index.get().cloned().map(|idx| (stop_height, idx))
+    }
+
+    /// The half of Core's `BlockRequestAllowed` that admits a block off the
+    /// active chain: one this node validated, no more than
+    /// `STALE_RELAY_AGE_LIMIT` (30 days) older than the best header.
+    /// `BlockStatus::Valid` is written only by `connect_block` and survives
+    /// the reorg that takes the block off the active chain, as Core's
+    /// `BLOCK_VALID_SCRIPTS` does. Core also bounds the block's
+    /// work-equivalent age; that bound is not applied, so this admits a little
+    /// more than Core does.
+    #[cfg(feature = "block-filter-index")]
+    fn stale_block_request_allowed(&self, entry: &crate::storage::blockindex::BlockIndexEntry) -> bool {
+        const STALE_RELAY_AGE_LIMIT: i64 = 30 * 24 * 60 * 60;
+        if entry.status != crate::storage::blockindex::BlockStatus::Valid {
+            return false;
+        }
+        self.chain_state
+            .get_block_index(&self.chain_state.best_header_hash())
+            .is_some_and(|best| {
+                i64::from(best.header.time) - i64::from(entry.header.time) < STALE_RELAY_AGE_LIMIT
+            })
+    }
+
+    /// `getcfilters` handler per BIP 157, checked by
+    /// [`Self::prepare_block_filter_request`]. Replies with one `CFilter` per
+    /// height in the requested range (BIP 157 specifies per-height
+    /// responses, not a batched form).
     #[cfg(feature = "block-filter-index")]
     fn handle_get_cfilters(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFilters) {
         use crate::index::filter::lookups::MAX_GETCFILTERS_SIZE;
-        use node_filter_index::FILTER_TYPE_BASIC;
         let bitcoin::p2p::message_filter::GetCFilters {
             filter_type,
             start_height,
             stop_hash,
         } = req;
-        // Filter type guard.
-        if filter_type != FILTER_TYPE_BASIC {
-            return;
-        }
-        // Resolve stop_hash → stop_height via block_index.
-        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
-            return;
-        };
-        let stop_height = stop_entry.height;
-        // BIP 157: stop_height ≥ start_height, range < 1000.
-        if stop_height < start_height {
-            return;
-        }
-        if stop_height - start_height >= MAX_GETCFILTERS_SIZE {
-            return;
-        }
-        // Active-chain check: stop_hash must match the active chain at stop_height.
-        match self.chain_state.get_block_hash_by_height(stop_height) {
-            Some(h) if h == stop_hash => {}
-            _ => return,
-        }
-        let Some(idx) = self.filter_index.get() else {
+        let Some((stop_height, idx)) =
+            self.prepare_block_filter_request(id, filter_type, start_height, stop_hash, MAX_GETCFILTERS_SIZE)
+        else {
             return;
         };
         // Stream responses via an async task with backpressure. The
@@ -7806,7 +7914,6 @@ impl PeerManager {
             return;
         };
         let chain_state = self.chain_state.clone();
-        let idx = idx.clone();
         tokio::spawn(async move {
             for h in start_height..=stop_height {
                 let Some(block_hash) = chain_state.get_block_hash_by_height(h) else {
@@ -7832,7 +7939,8 @@ impl PeerManager {
         });
     }
 
-    /// `getcfheaders` handler per BIP 157.
+    /// `getcfheaders` handler per BIP 157, checked by
+    /// [`Self::prepare_block_filter_request`].
     /// Replies with a single `CFHeaders` carrying
     /// `previous_filter_header` plus per-height filter hashes (computed
     /// on the fly from the stored filter blob — see plan §"Filter-hash
@@ -7843,32 +7951,20 @@ impl PeerManager {
         use crate::index::filter::lookups::MAX_GETCFHEADERS_SIZE;
         use bitcoin::bip158::FilterHash;
         use bitcoin::hashes::Hash;
-        use node_filter_index::FILTER_TYPE_BASIC;
         let bitcoin::p2p::message_filter::GetCFHeaders {
             filter_type,
             start_height,
             stop_hash,
         } = req;
-        if filter_type != FILTER_TYPE_BASIC {
-            return;
-        }
-        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
-            return;
-        };
-        let stop_height = stop_entry.height;
-        if stop_height < start_height {
-            return;
-        }
         // Bitcoin Core / BIP 157 cap getcfheaders at 2000, not the 1000
         // that applies to getcfilters. Review 2026-05-04 M1.
-        if stop_height - start_height >= MAX_GETCFHEADERS_SIZE {
-            return;
-        }
-        match self.chain_state.get_block_hash_by_height(stop_height) {
-            Some(h) if h == stop_hash => {}
-            _ => return,
-        }
-        let Some(idx) = self.filter_index.get() else {
+        let Some((stop_height, idx)) = self.prepare_block_filter_request(
+            id,
+            filter_type,
+            start_height,
+            stop_hash,
+            MAX_GETCFHEADERS_SIZE,
+        ) else {
             return;
         };
         // previous_filter_header: header at start_height - 1, or all-zeros for height 0.
@@ -7902,27 +7998,19 @@ impl PeerManager {
 
     /// `getcfcheckpt` handler per BIP 157 — filter headers at every
     /// 1000-block boundary up to (and including) the highest 1000-block
-    /// boundary ≤ `stop_height`.
+    /// boundary ≤ `stop_height`. Checked by
+    /// [`Self::prepare_block_filter_request`] with no range limit, as Core
+    /// does.
     #[cfg(feature = "block-filter-index")]
     fn handle_get_cfcheckpt(&self, id: PeerId, req: bitcoin::p2p::message_filter::GetCFCheckpt) {
         use bitcoin::hashes::Hash;
-        use node_filter_index::FILTER_TYPE_BASIC;
         let bitcoin::p2p::message_filter::GetCFCheckpt {
             filter_type,
             stop_hash,
         } = req;
-        if filter_type != FILTER_TYPE_BASIC {
-            return;
-        }
-        let Some(stop_entry) = self.chain_state.get_block_index(&stop_hash) else {
-            return;
-        };
-        let stop_height = stop_entry.height;
-        match self.chain_state.get_block_hash_by_height(stop_height) {
-            Some(h) if h == stop_hash => {}
-            _ => return,
-        }
-        let Some(idx) = self.filter_index.get() else {
+        let Some((stop_height, idx)) =
+            self.prepare_block_filter_request(id, filter_type, 0, stop_hash, u32::MAX)
+        else {
             return;
         };
         let max_idx = stop_height / 1000;
@@ -8051,126 +8139,197 @@ impl PeerManager {
     /// Answer a `MSG_CMPCT_BLOCK` getdata with a `cmpctblock`, if the block
     /// is within [`compact::MAX_CMPCTBLOCK_DEPTH`] of the tip and we are not
     /// syncing (Core: `can_direct_fetch && pindex->nHeight >= tip->nHeight -
-    /// MAX_CMPCTBLOCK_DEPTH`). Returns false when the full block should be
-    /// sent instead.
-    fn serve_compact_block(&self, id: PeerId, hash: &bitcoin::BlockHash) -> bool {
+    /// MAX_CMPCTBLOCK_DEPTH`). `None` when the full block should be sent
+    /// instead; otherwise whether the `cmpctblock` was queued.
+    fn serve_compact_block(&self, id: PeerId, hash: &bitcoin::BlockHash) -> Option<bool> {
         if self.ibd.read().is_some() || self.is_ibd() {
-            return false;
+            return None;
         }
-        let Some(entry) = self.chain_state.get_block_index(hash) else {
-            return false;
-        };
+        let entry = self.chain_state.get_block_index(hash)?;
         if entry.height.saturating_add(compact::MAX_CMPCTBLOCK_DEPTH) < self.chain_state.tip_height() {
-            return false;
+            return None;
         }
         let compact = match self.cached_compact(hash) {
             Some(c) => c,
             None => {
-                let Some(block) = self.chain_state.get_block(hash) else {
-                    return false;
-                };
-                match self.compact_for(&block, entry.height, false) {
-                    Some(c) => c,
-                    None => return false,
-                }
+                let block = self.chain_state.get_block(hash)?;
+                self.compact_for(&block, entry.height, false)?
             }
         };
         let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
             compact_block: (*compact).clone(),
         });
-        if self.send_to_peer(id, msg) {
+        let queued = self.send_to_peer(id, msg);
+        if queued {
             self.compact_stats.sent_getdata.fetch_add(1, Ordering::Relaxed);
             self.note_peer_has_block(id, *hash);
         }
-        true
+        Some(queued)
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
+        // Core's `MAX_INV_SZ` (`net_processing.cpp` GETDATA), checked before
+        // anything in the request is looked at.
+        if inventory.len() > MAX_INV_PER_MSG {
+            self.add_ban_score(id, 100, &format!("getdata message size = {}", inventory.len()));
+            return;
+        }
         // Core's `ProcessMessage` line for every getdata.
         match inventory.as_slice() {
             [inv] => tracing::debug!("received getdata for: {} peer={id}", inv_to_string(inv)),
             invs => tracing::debug!("received getdata ({} invsz) peer={id}", invs.len()),
         }
+        let Some(sender) = self.peer_sender(id) else {
+            return;
+        };
+        // Queued behind anything still unserved and served from there:
+        // Core's `m_getdata_requests` and `ProcessGetData`.
+        sender.queue().push_getdata(inventory);
+        self.serve_getdata(id, &sender);
+    }
+
+    /// [`NetEvent::GetDataResume`]: the peer's queue has drained enough to
+    /// serve more of its `getdata` backlog.
+    fn resume_getdata(&self, id: PeerId) {
+        let Some(sender) = self.peer_sender(id) else {
+            return;
+        };
+        // Before looking at the queue: a write that drains it after this
+        // point asks again rather than finding a request already waiting.
+        sender.queue().resume_taken();
+        self.serve_getdata(id, &sender);
+    }
+
+    /// The sending end of a peer's queue, while the peer is connected.
+    fn peer_sender(&self, id: PeerId) -> Option<crate::net::send_queue::PeerSender> {
+        self.peers.read().get(&id).map(|h| h.msg_tx.clone())
+    }
+
+    /// Core's `ProcessGetData`: serve the peer's unserved `getdata` entries,
+    /// oldest first, until none are left or its queue is past the send
+    /// buffer (`fPauseSend`).
+    ///
+    /// The rest waits for the queue to drain. The peer's write loop asks for
+    /// more as it does ([`NetEvent::GetDataResume`]), and takes no other
+    /// message from the peer until the backlog is empty, which keeps the
+    /// answers in the order asked and the backlog to one request.
+    ///
+    /// satd served every entry at once, reading and deserializing each block
+    /// and queueing it with a `try_send` whose failure it ignored. One
+    /// request could hold a peer's whole queue of blocks in memory for as
+    /// long as the peer did not read them, and the blocks that did not fit
+    /// were read, dropped, and still charged to `-maxuploadtarget`.
+    fn serve_getdata(&self, id: PeerId, sender: &crate::net::send_queue::PeerSender) {
+        let queue = sender.queue();
         let mut not_found = Vec::new();
-        for inv in inventory {
-            match inv {
-                // `MSG_CMPCT_BLOCK` (BIP 152). A block within
-                // `MAX_CMPCTBLOCK_DEPTH` of the tip is answered with a
-                // `cmpctblock` (`serve_compact_block`). Anything deeper, or
-                // anything while we are still syncing, gets the full `block`,
-                // which BIP 152 permits and Core itself sends; Core accepts
-                // it against its in-flight compact request. Letting the
-                // request fall through to `_ => {}` instead would silently
-                // drop it, and a Core peer never re-requests.
-                Inventory::Block(hash)
-                | Inventory::WitnessBlock(hash)
-                | Inventory::CompactBlock(hash) => {
-                    if matches!(inv, Inventory::CompactBlock(_)) && self.serve_compact_block(id, &hash) {
-                        continue;
-                    }
-                    if let Some(block) = self.chain_state.get_block(&hash) {
-                        // -maxuploadtarget: decline historical blocks once
-                        // the rolling budget is spent (download/noban peers
-                        // and recent blocks are exempt).
-                        if !self.upload_permits_block(id, &block) {
-                            tracing::debug!(id, %hash, "maxuploadtarget reached; declining historical block");
-                            not_found.push(inv);
-                            continue;
-                        }
-                        self.record_upload(block.total_size() as u64);
-                        self.send_to_peer(id, NetworkMessage::Block(block));
-                    } else {
-                        not_found.push(inv);
-                    }
-                }
-                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    // Relay-quarantined txs are not served via `getdata`:
-                    // announce-suppression without serve-suppression would be
-                    // incoherent — a peer that learned the txid elsewhere must
-                    // not be able to pull it from us (design §6.1). Report it
-                    // as not-found, exactly as if we did not hold it.
-                    if let Some(entry) = self
-                        .mempool
-                        .get(&txid)
-                        .filter(|e| e.scope.assists_relay())
-                    {
-                        // The peer pulled this tx from us. If it's a pending
-                        // local broadcast, that's the primary proof it has
-                        // propagated — count the peer toward stopping
-                        // rebroadcast. Only if the Tx was actually enqueued:
-                        // a try_send drop (slow peer, full channel) means the
-                        // peer never received it, and retiring the tx on a
-                        // dropped send would defeat the exact failure mode
-                        // rebroadcast exists to cover.
-                        if self.send_to_peer(id, NetworkMessage::Tx(entry.tx)) {
-                            self.note_broadcast_witness(id, txid);
-                        }
-                    } else {
-                        not_found.push(inv);
-                    }
-                }
-                // BIP 339: the same, looked up by wtxid. A resident
-                // transaction with the same txid and another witness is not
-                // the one asked for, so the answer is `notfound`.
-                Inventory::WTx(wtxid) => {
-                    if let Some((txid, entry)) = self
-                        .mempool
-                        .get_by_wtxid(&wtxid)
-                        .filter(|(_, e)| e.scope.assists_relay())
-                    {
-                        if self.send_to_peer(id, NetworkMessage::Tx(entry.tx)) {
-                            self.note_broadcast_witness(id, txid);
-                        }
-                    } else {
-                        not_found.push(inv);
-                    }
-                }
-                _ => {}
+        while !sender.paused() {
+            let Some(inv) = queue.front_getdata() else {
+                break;
+            };
+            if !self.serve_getdata_entry(id, sender, inv, &mut not_found) {
+                // The queue filled after the check above, or the peer is
+                // gone. The entry stays first; the write loop asks again once
+                // there is room.
+                break;
             }
+            queue.pop_getdata();
         }
         if !not_found.is_empty() {
-            self.send_to_peer(id, NetworkMessage::NotFound(not_found));
+            let _ = sender.try_send(NetworkMessage::NotFound(not_found));
         }
+        if queue.getdata_backlog() == 0 {
+            queue.wake_reader();
+        }
+    }
+
+    /// Answer one `getdata` entry: queue what it asks for, or add it to the
+    /// `notfound`. False when nothing could be queued and the entry is still
+    /// to be served.
+    fn serve_getdata_entry(
+        &self,
+        id: PeerId,
+        sender: &crate::net::send_queue::PeerSender,
+        inv: Inventory,
+        not_found: &mut Vec<Inventory>,
+    ) -> bool {
+        match inv {
+            // `MSG_CMPCT_BLOCK` (BIP 152). A block within
+            // `MAX_CMPCTBLOCK_DEPTH` of the tip is answered with a
+            // `cmpctblock` (`serve_compact_block`). Anything deeper, or
+            // anything while we are still syncing, gets the full `block`,
+            // which BIP 152 permits and Core itself sends; Core accepts
+            // it against its in-flight compact request. Letting the
+            // request fall through to `_ => {}` instead would silently
+            // drop it, and a Core peer never re-requests.
+            Inventory::Block(hash)
+            | Inventory::WitnessBlock(hash)
+            | Inventory::CompactBlock(hash) => {
+                // A `cmpctblock` that could not be queued leaves the entry to
+                // be served again once the queue drains, as below.
+                if matches!(inv, Inventory::CompactBlock(_))
+                    && let Some(queued) = self.serve_compact_block(id, &hash)
+                {
+                    return queued;
+                }
+                let Some(block) = self.chain_state.get_block(&hash) else {
+                    not_found.push(inv);
+                    return true;
+                };
+                // -maxuploadtarget: decline historical blocks once
+                // the rolling budget is spent (download/noban peers
+                // and recent blocks are exempt).
+                if !self.upload_permits_block(id, &block) {
+                    tracing::debug!(id, %hash, "maxuploadtarget reached; declining historical block");
+                    not_found.push(inv);
+                    return true;
+                }
+                let size = block.total_size() as u64;
+                if sender.try_send(NetworkMessage::Block(block)).is_err() {
+                    return false;
+                }
+                // Charged for a block that was queued, not one that was read.
+                self.record_upload(size);
+            }
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                // Relay-quarantined txs are not served via `getdata`:
+                // announce-suppression without serve-suppression would be
+                // incoherent — a peer that learned the txid elsewhere must
+                // not be able to pull it from us (design §6.1). Report it
+                // as not-found, exactly as if we did not hold it.
+                let Some(entry) = self.mempool.get(&txid).filter(|e| e.scope.assists_relay()) else {
+                    not_found.push(inv);
+                    return true;
+                };
+                // The peer pulled this tx from us. If it's a pending
+                // local broadcast, that's the primary proof it has
+                // propagated — count the peer toward stopping
+                // rebroadcast. Only once the Tx is actually enqueued:
+                // retiring the tx on a send that did not happen would
+                // defeat the exact failure mode rebroadcast exists to cover.
+                if sender.try_send(NetworkMessage::Tx(entry.tx)).is_err() {
+                    return false;
+                }
+                self.note_broadcast_witness(id, txid);
+            }
+            // BIP 339: the same, looked up by wtxid. A resident
+            // transaction with the same txid and another witness is not
+            // the one asked for, so the answer is `notfound`.
+            Inventory::WTx(wtxid) => {
+                let Some((txid, entry)) =
+                    self.mempool.get_by_wtxid(&wtxid).filter(|(_, e)| e.scope.assists_relay())
+                else {
+                    not_found.push(inv);
+                    return true;
+                };
+                if sender.try_send(NetworkMessage::Tx(entry.tx)).is_err() {
+                    return false;
+                }
+                self.note_broadcast_witness(id, txid);
+            }
+            // An entry of a type that is not served is skipped, as in Core.
+            _ => {}
+        }
+        true
     }
 
     /// Accept the header a `cmpctblock` carries, the way a `headers` message
@@ -9276,7 +9435,7 @@ impl PeerManager {
         };
         let handle = PeerHandle {
             info,
-            msg_tx,
+            msg_tx: msg_tx.into(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
@@ -9646,13 +9805,16 @@ impl PeerManager {
         // the connection is torn down anyway.
         // Also the ping accounting the write loop needs below, so the map is
         // read once rather than again just before the loop starts.
-        let (ping_stats, peer_flow, disconnect_signal) = {
+        let (ping_stats, peer_flow, disconnect_signal, send_queue) = {
             let peers = self.peers.read();
             match peers.get(&id) {
-                Some(h) => {
-                    (Some(h.stats.clone()), Some(h.flow.clone()), Some(h.disconnect.clone()))
-                }
-                None => (None, None, None),
+                Some(h) => (
+                    Some(h.stats.clone()),
+                    Some(h.flow.clone()),
+                    Some(h.disconnect.clone()),
+                    Some(h.msg_tx.queue().clone()),
+                ),
+                None => (None, None, None, None),
             }
         };
         if let Some(stats) = &ping_stats {
@@ -9801,6 +9963,7 @@ impl PeerManager {
             peer_flow,
             Some(self.drain_now.clone()),
             disconnect_signal,
+            send_queue,
         )
         .await;
 
@@ -9855,6 +10018,14 @@ impl PeerManager {
     ///     terminate instead of leaving an untracked peer feeding events.
     ///     The earlier `Some(msg) = msg_rx.recv()` pattern silently
     ///     disabled the branch on close — review F2 (PRs #180-#184).
+    ///   - the disconnect signal, or a write that makes no progress for
+    ///     [`crate::net::send_queue::SEND_TIMEOUT`] → exit, even with the
+    ///     write unfinished (`send_watched`).
+    ///
+    /// Flow control, after Core's send buffer (`send_queue`): the bytes of
+    /// every message written are taken off the peer's queue count; while the
+    /// count is over the limit, or a `getdata` of the peer's is being served,
+    /// the peer's next message is left unread.
     #[allow(clippy::too_many_arguments)]
     async fn peer_write_loop(
         id: PeerId,
@@ -9866,6 +10037,7 @@ impl PeerManager {
         flow: Option<Arc<crate::net::flow::PeerFlow>>,
         drain_now: Option<Arc<tokio::sync::Notify>>,
         disconnect_signal: Option<Arc<tokio::sync::Notify>>,
+        send_queue: Option<Arc<crate::net::send_queue::SendQueue>>,
     ) -> Result<(), String> {
         // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
         // The first tick of a tokio interval fires immediately, which is also
@@ -9896,6 +10068,12 @@ impl PeerManager {
         tokio::pin!(disconnect_requested);
 
         loop {
+            // Core's `ProcessMessages` takes nothing more from a peer while a
+            // `getdata` of its is being served, or while its send buffer is
+            // full ("Don't bother if send buffer is too full to respond
+            // anyway"). The message stays in the peer's read queue, and the
+            // reader task stops reading the socket once that is full.
+            let reading_paused = send_queue.as_ref().is_some_and(|q| q.reading_paused());
             tokio::select! {
                 _ = &mut disconnect_requested => {
                     // Explicit teardown, as opposed to noticing `msg_rx`
@@ -9903,6 +10081,14 @@ impl PeerManager {
                     // and closes the socket.
                     return Err("disconnected by manager".to_string());
                 }
+                // Woken when the manager has served a `getdata`, to look
+                // again. The writes below re-check after every message.
+                _ = async {
+                    match &send_queue {
+                        Some(q) => q.reader_woken().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if reading_paused => {}
                 _ = ping_timer.tick() => {
                     // A peer that keeps talking but never answers a ping is
                     // dropped here. Returning takes the ordinary teardown
@@ -9949,13 +10135,17 @@ impl PeerManager {
                         // it must never go on the wire.
                         let nonce = rand::random::<u64>().max(1);
                         stats.ping_sent(nonce);
-                        writer
-                            .send(NetworkMessage::Ping(nonce))
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        Self::send_watched(
+                            id,
+                            writer,
+                            NetworkMessage::Ping(nonce),
+                            Some(stats),
+                            disconnect_requested.as_mut(),
+                        )
+                        .await?;
                     }
                 }
-                msg = read_rx.recv() => {
+                msg = read_rx.recv(), if !reading_paused => {
                     match msg {
                         // A pong is matched here, on the peer's own task,
                         // rather than forwarded to the manager loop.
@@ -10043,10 +10233,14 @@ impl PeerManager {
                                     );
                                 }
                             }
-                            writer
-                                .send(NetworkMessage::Pong(nonce))
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            Self::send_watched(
+                                id,
+                                writer,
+                                NetworkMessage::Pong(nonce),
+                                stats.as_ref(),
+                                disconnect_requested.as_mut(),
+                            )
+                            .await?;
                         }
                         Some(msg) => {
                             // Counted in here and out wherever the work ends
@@ -10056,10 +10250,22 @@ impl PeerManager {
                             if let Some(flow) = &flow {
                                 flow.queued();
                             }
+                            // Nothing more is read until the manager has
+                            // served this request (`reading_paused`), so it
+                            // is served now rather than at the manager's next
+                            // tick: a peer fetching blocks sends one `getdata`
+                            // after another.
+                            let getdata = matches!(msg, NetworkMessage::GetData(_));
+                            if let (true, Some(q)) = (getdata, &send_queue) {
+                                q.note_getdata_forwarded();
+                            }
                             event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
+                            if let (true, Some(wake)) = (getdata, &drain_now) {
+                                wake.notify_one();
+                            }
                         }
                         None => {
                             // Reader task ended (error or timeout)
@@ -10086,7 +10292,26 @@ impl PeerManager {
                             if let (NetworkMessage::Ping(nonce), Some(stats)) = (&msg, &stats) {
                                 stats.ping_sent(*nonce);
                             }
-                            writer.send(msg).await.map_err(|e| e.to_string())?;
+                            // What the sender counted the message at.
+                            let size = send_queue
+                                .as_ref()
+                                .map(|_| crate::net::send_queue::queued_size(&msg));
+                            Self::send_watched(id, writer, msg, stats.as_ref(), disconnect_requested.as_mut())
+                                .await?;
+                            if let (Some(q), Some(size)) = (&send_queue, size) {
+                                q.sent(size);
+                                // Back under the send buffer with `getdata`
+                                // entries waiting: ask the manager for more.
+                                if q.take_resume() {
+                                    event_tx
+                                        .send(NetEvent::GetDataResume { id })
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    if let Some(wake) = &drain_now {
+                                        wake.notify_one();
+                                    }
+                                }
+                            }
                         }
                         None => {
                             // Manager dropped our handle. Return so the
@@ -10097,6 +10322,63 @@ impl PeerManager {
                             // no longer in `self.peers`.
                             return Err("disconnected by manager".to_string());
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write one message to the peer, giving up if the manager drops the peer
+    /// or the socket takes no bytes for
+    /// [`crate::net::send_queue::SEND_TIMEOUT`].
+    ///
+    /// A peer that stops reading leaves a write parked for as long as it
+    /// likes, and the write loop looked at the disconnect signal and the ping
+    /// deadline only between writes. So `disconnectnode`, a ban and the ping
+    /// timeout could not reach such a peer, and its socket and everything
+    /// queued to it stayed. Core drops a peer that has taken no bytes for
+    /// `TIMEOUT_INTERVAL` (`InactivityCheck`, "socket sending timeout").
+    /// Progress is the bytes the socket takes, counted as it takes them, so a
+    /// slow reader is not mistaken for a stalled one. Without counters, which
+    /// only a loop whose peer handle was already gone when it started lacks,
+    /// progress cannot be seen and the deadline runs from the start of the
+    /// write.
+    async fn send_watched<F: std::future::Future<Output = ()>>(
+        id: PeerId,
+        writer: &mut ConnectionWriter,
+        msg: NetworkMessage,
+        stats: Option<&Arc<PeerStats>>,
+        mut disconnect: std::pin::Pin<&mut F>,
+    ) -> Result<(), String> {
+        use crate::net::send_queue::SEND_TIMEOUT;
+        /// How often a parked write is checked for progress.
+        const PROGRESS_CHECK: Duration = Duration::from_secs(10);
+
+        let send = writer.send(msg);
+        tokio::pin!(send);
+        // Most writes finish at once; only one that has to wait is watched.
+        tokio::select! {
+            biased;
+            res = &mut send => return res.map_err(|e| e.to_string()),
+            _ = std::future::ready(()) => {}
+        }
+        let mut check = tokio::time::interval(PROGRESS_CHECK);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent = stats.map(|s| s.bytes_sent());
+        let mut progress_at = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                res = &mut send => return res.map_err(|e| e.to_string()),
+                _ = disconnect.as_mut() => return Err("disconnected by manager".to_string()),
+                _ = check.tick() => {
+                    let now_sent = stats.map(|s| s.bytes_sent());
+                    if now_sent != sent {
+                        sent = now_sent;
+                        progress_at = tokio::time::Instant::now();
+                    } else if progress_at.elapsed() >= SEND_TIMEOUT {
+                        let secs = progress_at.elapsed().as_secs();
+                        tracing::debug!("socket sending timeout: {secs}s, disconnecting peer={id}");
+                        return Err(format!("socket sending timeout: no bytes taken in {secs}s"));
                     }
                 }
             }
@@ -10213,6 +10495,19 @@ impl PeerManager {
         // with a line naming it.
         let their_version = loop {
             match self.recv_handshake(id, conn, connected_at).await? {
+                // Core reads the user agent as `LIMITED_STRING(strSubVer,
+                // MAX_SUBVERSION_LENGTH)`. A longer one throws in
+                // deserialization: the `version` is dropped, and the peer is
+                // left without a handshake until a well-formed one arrives or
+                // the connect timeout ends it (`recv_handshake` applies it
+                // here too).
+                NetworkMessage::Version(v) if v.user_agent.len() > crate::MAX_SUBVERSION_LENGTH => {
+                    tracing::debug!(
+                        "ignoring version message with a {}-byte user agent (limit {}) from peer={id}",
+                        v.user_agent.len(),
+                        crate::MAX_SUBVERSION_LENGTH
+                    )
+                }
                 NetworkMessage::Version(v) => break v,
                 other => tracing::debug!(
                     "non-version message before version handshake. Message \"{}\" from peer={id}",
@@ -10944,7 +11239,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<NetworkMessage>(1);
         PeerHandle {
             info,
-            msg_tx: tx,
+            msg_tx: tx.into(),
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
@@ -11146,7 +11441,7 @@ mod tests {
         (
             PeerHandle {
                 info,
-                msg_tx: tx,
+                msg_tx: tx.into(),
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
@@ -13564,7 +13859,7 @@ mod tests {
             9,
             PeerHandle {
                 info,
-                msg_tx: tx,
+                msg_tx: tx.into(),
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
