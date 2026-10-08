@@ -15043,6 +15043,9 @@ mod tests {
         pm.peers
             .write()
             .insert(1, mk_handle(1, announcer, Direction::Inbound, PeerState::Connected));
+        // Two addresses from one peer: past the address rate limit's first
+        // token, so the peer has the `addr` permission.
+        pm.peers.write().get_mut(&1).unwrap().info.permissions.addr = true;
 
         let v1: SocketAddr = "198.51.100.1:8333".parse().unwrap();
         let v1_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
