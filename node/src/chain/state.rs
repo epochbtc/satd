@@ -7277,20 +7277,28 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // Structural + witness block validation.  If the block already has a
-        // `HeaderOnly` index entry (submitted via `submitheader`) and fails
-        // body validation, mark it — and every descendant in the index — as
-        // `Invalid` so that `getchaintips` reports the correct status.
-        // This matches Core's `InvalidBlockFound`.
+        // Structural + witness block validation: Core's `CheckBlock` plus the
+        // witness and weight rules of `ContextualCheckBlock`.
         //
-        // Except for mutation-class rejections, which Core deliberately
-        // excludes from that marking (CVE-2012-2459): the block hash does not
-        // commit to the data we just rejected, so the verdict may belong to a
-        // malleated copy of a block that is actually valid. Writing it down
-        // would bar the honest block — and, via the parent-status guard, its
-        // whole descendant chain — until an operator ran `reconsiderblock`.
+        // A failure here is not written down against the hash, with one
+        // exception. Core's `ProcessNewBlock` runs `CheckBlock` before
+        // `AcceptBlock` and returns on failure without marking anything
+        // (`validation.cpp`: "we will never mark a block as invalid if
+        // CheckBlock() fails"), so `bad-txnmrklroot`, `bad-txns-duplicate`,
+        // `bad-blk-length`, `bad-cb-missing`, `bad-cb-multiple` and
+        // `bad-blk-sigops` leave the index as it was. The witness rules are
+        // `BLOCK_MUTATED`, which `InvalidBlockFound` skips. That leaves
+        // `bad-blk-weight`, the one rule here that Core's `AcceptBlock`
+        // marks `BLOCK_FAILED_VALID`. `check_block` reaches it only after the
+        // merkle and witness checks have passed, so by then the hash commits
+        // to every byte that was weighed.
+        //
+        // Core marks it on the index entry `AcceptBlockHeader` made. Here that
+        // is the `HeaderOnly` row a header announcement left; a block with no
+        // row yet is refused unmarked, at the cost of re-running this check if
+        // it is sent again.
         if let Err(e) = validation::block::check_block(block, self.network, new_height) {
-            if !e.is_mutation_class()
+            if matches!(e, validation::ValidationError::OverweightBlock)
                 && self
                     .store
                     .get_block_index(&block_hash)
@@ -7373,6 +7381,39 @@ impl ChainState {
         // Check if this extends the current tip or is a side chain
         let current_tip = self.tip_hash();
         let new_chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
+
+        // A block that extends the tip and arrived without its header first
+        // (`submitblock`, a pushed `block` message) has no index entry yet.
+        // Core's `AcceptBlock` creates one in `AcceptBlockHeader` before the
+        // block can reach `ConnectTip`, so a block that then fails to connect
+        // is marked `BLOCK_FAILED_VALID` and a copy sent again stops at
+        // `duplicate-invalid`. Without an entry the mark after a failed
+        // connect below had nothing to land on: the block was forgotten, and
+        // every copy sent again was written to disk again and validated again
+        // in full.
+        //
+        // The entry is the `HeaderOnly` row a header announcement would have
+        // left. A connect writes the `Valid` entry over it and a verdict marks
+        // it `Invalid`, as on the headers-first path. Any other failure is
+        // damage to this node's own storage and leaves a known header whose
+        // block is not stored. Unlike an announced header, that one has not
+        // moved the best-header pointer, which moves here only after a
+        // successful connect: a restart seeds the pointer from the index, and
+        // a descendant header or another copy of the block reaches it.
+        if prev_hash == current_tip && self.store.get_block_index(&block_hash).is_none() {
+            let entry = BlockIndexEntry {
+                header: block.header,
+                height: new_height,
+                status: BlockStatus::HeaderOnly,
+                num_tx: 0,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: new_chainwork,
+            };
+            let mut batch = crate::storage::StoreBatch::default();
+            batch.block_index_puts.push((block_hash, entry));
+            self.write_chain_batch(batch)?;
+        }
 
         if prev_hash != current_tip {
             // Side chain block — store it first
@@ -9906,6 +9947,10 @@ impl ChainState {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+#[path = "state_blockaccept_tests.rs"]
+mod blockaccept_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
