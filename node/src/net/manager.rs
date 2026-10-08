@@ -414,9 +414,11 @@ pub enum NetEvent {
 }
 
 /// A block handed to the block processor: the peer it came from, that peer's
-/// counters, and the block.
+/// counters, the block, its in-flight guard, and whether this node asked for
+/// it. Only a block the node asked for may wait for a parent it does not
+/// know yet (see [`crate::net::orphan_blocks`]).
 type IncomingBlock =
-    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight);
+    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight, bool);
 
 /// BIP 152: at most this many peers are asked to announce blocks to us as
 /// `cmpctblock`s (high-bandwidth mode).
@@ -5346,6 +5348,15 @@ impl PeerManager {
         self.peers.read().get(&id).map(|h| h.flow.clone())
     }
 
+    /// Whether this node has asked any peer for `hash` recently enough to
+    /// still expect it: Core's `IsBlockRequested`.
+    fn block_is_requested(&self, hash: &bitcoin::BlockHash) -> bool {
+        self.in_flight_blocks
+            .read()
+            .values()
+            .any(|asked| asked.get(hash).is_some_and(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
+    }
+
     fn handle_block(
         &self,
         id: PeerId,
@@ -5355,6 +5366,10 @@ impl PeerManager {
         if self.reject_if_mutated(id, &block) {
             return;
         }
+        // Read before `note_block_arrived` clears the record. Core reads
+        // `IsBlockRequested` at the same point (`net_processing.cpp:4800`);
+        // here it decides whether the block may wait for an unknown parent.
+        let requested = self.block_is_requested(&block.block_hash());
         self.note_block_arrived(&block.block_hash());
         self.note_peer_has_block(id, block.block_hash());
         // A peer that pushes a block has it, so the same availability rule
@@ -5437,7 +5452,7 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight));
+        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight, requested));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -6027,15 +6042,14 @@ impl PeerManager {
         // Normal mode: process blocks from the channel.
         // Periodically check if the IBD scheduler was activated (header download completed
         // while we were in normal mode), and switch to the IBD connect loop if so.
-        // The in-flight guard rides along with the buffered block: a block
-        // waiting on a parent it has not seen is still work this peer sent
-        // that the node has not finished with, and a pong behind it must
-        // wait. Dropping the entry — connected, or evicted when the buffer
-        // fills — is what finally counts it out.
-        let mut block_buffer: HashMap<
-            bitcoin::BlockHash,
-            (bitcoin::Block, crate::net::flow::InFlight),
-        > = HashMap::new();
+        //
+        // A block this node asked for whose parent it does not know yet waits
+        // here, within the bounds `OrphanBlocks` enforces, and connects when
+        // the parent becomes the tip. Its in-flight guard is not kept with it:
+        // Core is done with such a block once it has refused it as
+        // `prev-blk-not-found`, so a pong behind it is answered then, and not
+        // after a parent that may never come.
+        let mut orphan_blocks = crate::net::orphan_blocks::OrphanBlocks::new();
         loop {
             // Shutdown: stop connecting. `join_connectors` is waiting for
             // this thread to exit before the shutdown flush.
@@ -6082,10 +6096,20 @@ impl PeerManager {
             // maintenance (and park peer tasks in `handle_block_ibd`) for
             // the duration.
             drop(ready);
+            orphan_blocks.expire(Instant::now());
 
-            // Drain all available blocks from the channel
-            while let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv() {
+            // Drain all available blocks from the channel. Each block's
+            // in-flight guard is counted out at the end of its iteration.
+            while let Ok((sender, sender_stats, block, _in_flight, requested)) = rx.try_recv() {
                 let hash = block.block_hash();
+                // A block whose parent has no index entry cannot connect yet,
+                // and `accept_block` would refuse it as `PrevBlockNotFound`.
+                // It skips that and the fee pass below, which looks up a coin
+                // per input.
+                if chain_state.get_block_index(&block.header.prev_blockhash).is_none() {
+                    Self::hold_for_parent(&mut orphan_blocks, sender, block, requested, network, &peer_manager);
+                    continue;
+                }
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
                 match chain_state.accept_block(&block) {
@@ -6137,11 +6161,11 @@ impl PeerManager {
                                 pm.block_became_tip(sender, &block, height);
                             }
                         }
-                        // Drain buffer
+                        // Connect the blocks that were waiting for this one.
                         loop {
                             let tip = chain_state.tip_hash();
-                            match block_buffer.remove(&tip) {
-                                Some((b, _in_flight)) => {
+                            match orphan_blocks.take_child_of(&tip) {
+                                Some(b) => {
                                     let b_fees = Self::compute_block_fee_rates(&b, &chain_state);
                                     match chain_state.accept_block(&b) {
                                         Ok(acc) => {
@@ -6159,7 +6183,10 @@ impl PeerManager {
                                             mempool.remove_for_block(&b, h);
                                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
                                         }
-                                        Err(_) => break,
+                                        // Another block waiting on the same
+                                        // parent may still connect. Each pass
+                                        // takes one block out, so this ends.
+                                        Err(_) => continue,
                                     }
                                 }
                                 None => break,
@@ -6167,7 +6194,7 @@ impl PeerManager {
                         }
                         let height = chain_state.tip_height();
                         if height / 1000 > last_log_height / 1000 {
-                            tracing::info!(height, buffered = block_buffer.len(), "IBD progress");
+                            tracing::info!(height, buffered = orphan_blocks.len(), "IBD progress");
                             last_log_height = height;
                         }
 
@@ -6187,11 +6214,14 @@ impl PeerManager {
                         }
                     }
                     Err(crate::chain::state::ChainError::Duplicate) => {}
-                    Err(crate::chain::state::ChainError::PrevBlockNotFound)
-                    | Err(crate::chain::state::ChainError::BadPrevBlock) => {
-                        if block_buffer.len() < 8192 {
-                            block_buffer.insert(block.header.prev_blockhash, (block, in_flight));
-                        }
+                    Err(crate::chain::state::ChainError::PrevBlockNotFound) => {
+                        Self::hold_for_parent(&mut orphan_blocks, sender, block, requested, network, &peer_manager);
+                    }
+                    // Core's `bad-prevblk`: nothing connects on a parent
+                    // marked invalid until `reconsiderblock` clears it, so
+                    // the block is not kept.
+                    Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                        tracing::debug!(%hash, "Block builds on a block marked invalid; not kept");
                     }
                     Err(e) => {
                         tracing::warn!(%hash, "Block rejected: {}", e);
@@ -6224,6 +6254,39 @@ impl PeerManager {
                 &orphanage,
                 &peer_manager,
             );
+        }
+    }
+
+    /// A block whose parent has no index entry. Core refuses it as
+    /// `prev-blk-not-found` (`validation.cpp:4216`) and keeps nothing. Here it
+    /// waits for its parent, within the bounds of
+    /// [`crate::net::orphan_blocks::OrphanBlocks`], only if this node asked
+    /// for it. Either way the sender is asked for headers, which is how the
+    /// node learns the parent, as Core does for headers that do not connect
+    /// (`HandleUnconnectingHeaders`) and satd does for a `cmpctblock` on an
+    /// unknown parent.
+    fn hold_for_parent(
+        orphan_blocks: &mut crate::net::orphan_blocks::OrphanBlocks,
+        sender: PeerId,
+        block: bitcoin::Block,
+        requested: bool,
+        network: Network,
+        peer_manager: &std::sync::Weak<PeerManager>,
+    ) {
+        let hash = block.block_hash();
+        if requested && orphan_blocks.insert(sender, block, network, Instant::now()) {
+            tracing::debug!(
+                %hash,
+                peer = sender,
+                waiting = orphan_blocks.len(),
+                bytes = orphan_blocks.bytes(),
+                "Block waits for its parent"
+            );
+        } else {
+            tracing::debug!(%hash, peer = sender, requested, "Dropped a block whose parent is unknown");
+        }
+        if let Some(pm) = peer_manager.upgrade() {
+            pm.maybe_send_getheaders(sender);
         }
     }
 
@@ -8613,6 +8676,9 @@ impl PeerManager {
                     self.peer_stats(id),
                     block,
                     crate::net::flow::InFlight::new(self.peer_flow(id)),
+                    // Its header connected before it was rebuilt, so it never
+                    // waits for a parent.
+                    false,
                 ));
             }
             compact::Reconstruction::Partial { txs, missing_indices, stats } => {
@@ -8751,6 +8817,9 @@ impl PeerManager {
                     self.peer_stats(id),
                     block,
                     crate::net::flow::InFlight::new(self.peer_flow(id)),
+                    // Its header connected before it was rebuilt, so it never
+                    // waits for a parent.
+                    false,
                 ));
             }
             Err(compact::CompleteError::Invalid) => {
@@ -10440,6 +10509,14 @@ fn historical_block_storable(
     }
     canonical_at_height == Some(block_hash)
 }
+
+#[cfg(test)]
+#[path = "manager_blockaccept_tests.rs"]
+mod blockaccept_tests;
+
+#[cfg(test)]
+#[path = "manager_orphanbuf_tests.rs"]
+mod orphanbuf_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///

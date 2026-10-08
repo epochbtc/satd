@@ -101,6 +101,13 @@ pub enum ConnectError {
     /// `-reindex-chainstate` rebuilds the series from genesis.
     #[error("cumulative transaction count missing for parent {parent}")]
     ChainTxGap { parent: BlockHash },
+    /// The median-time-past window for the block at `height` has no block
+    /// at `missing`: the height index or the block index lacks a row for an
+    /// ancestor this node connected. Local storage damage, not a verdict
+    /// about the block. A median over the rows that are left would gate BIP
+    /// 113 and BIP 68 time locks on the wrong value.
+    #[error("median-time-past window for height {height} has no block at height {missing}")]
+    MedianTimeWindowGap { height: u32, missing: u32 },
     /// The chain has more transactions than a 5-byte ordinal can name.
     /// Unreachable below ~1.1 trillion transactions; the variant exists
     /// so the encoder can never silently wrap two transactions onto one
@@ -137,6 +144,7 @@ impl ConnectError {
             Self::FilterIndexEmit(_) => false,
             Self::SpIndexEmit(_)
             | Self::ChainTxGap { .. }
+            | Self::MedianTimeWindowGap { .. }
             | Self::TxSeqOverflow
             | Self::Interrupted => false,
             e => !e.is_mutation_class(),
@@ -145,8 +153,9 @@ impl ConnectError {
 }
 
 /// Compute median time past (MTP) for a given height using the store directly.
-/// MTP is the median of the timestamps of the previous 11 blocks.
-pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> u32 {
+/// MTP is the median of the timestamps of the previous 11 blocks. See
+/// [`median_time_past_with_plan`].
+pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> Result<u32, ConnectError> {
     median_time_past_with_plan(store, None, height)
 }
 
@@ -160,28 +169,45 @@ pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> u32 {
 /// rewritten yet. MTP gates BIP113 locktimes and BIP68 time-based sequence
 /// locks, so resolving it against the wrong branch is a consensus decision made
 /// about a chain the node is not building.
+///
+/// The value is Core's `GetMedianTimePast` for the block at `height - 1`
+/// (`chain.h`): the median of that block's time and its ten ancestors'
+/// (back to genesis, if it has fewer). Every block in the window must
+/// resolve; a missing one is [`ConnectError::MedianTimeWindowGap`], never a
+/// median over fewer blocks. No block precedes genesis, so the window for height 0 is
+/// empty and the value is 0; nothing gates on it (BIP 113 starts at height 1,
+/// [`bip113_activation_height`]).
 pub(crate) fn median_time_past_with_plan(
     store: &dyn Store,
     plan: Option<&crate::chain::replay_plan::ReplayPlan>,
     height: u32,
-) -> u32 {
-    let start = height.saturating_sub(11);
-    let mut timestamps: Vec<u32> = Vec::new();
+) -> Result<u32, ConnectError> {
+    let start = height.saturating_sub(MEDIAN_TIME_SPAN);
+    let mut timestamps: Vec<u32> = Vec::with_capacity((height - start) as usize);
     for h in start..height {
         let hash = match plan {
             Some(p) => p.hash_at(h),
             None => store.get_block_hash_by_height(h),
         };
-        if let Some(hash) = hash
-            && let Some(entry) = store.get_block_index(&hash)
-        {
-            timestamps.push(entry.header.time);
-        }
+        let entry = hash
+            .and_then(|hash| store.get_block_index(&hash))
+            .ok_or(ConnectError::MedianTimeWindowGap { height, missing: h })?;
+        timestamps.push(entry.header.time);
     }
+    Ok(median_of(timestamps))
+}
+
+/// Core's `CBlockIndex::nMedianTimeSpan`.
+pub(crate) const MEDIAN_TIME_SPAN: u32 = 11;
+
+/// The median of a median-time-past window, as Core's `GetMedianTimePast`
+/// takes it: sorted, then the element at `len / 2`. 0 for the empty window,
+/// which only height 0 has.
+pub(crate) fn median_of(mut timestamps: Vec<u32>) -> u32 {
     if timestamps.is_empty() {
         return 0;
     }
-    timestamps.sort();
+    timestamps.sort_unstable();
     timestamps[timestamps.len() / 2]
 }
 
@@ -730,8 +756,16 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                             // Time-based: value * 512 seconds relative to input's MTP
                             // BIP 68: compare MTP at current height vs MTP at coin height
                             let required_seconds = (seq & mask) as u64 * 512;
-                            let mtp_coin =
-                                median_time_past_with_plan(store, *replay_plan, coin.height) as u64;
+                            // Core's `CalculateSequenceLocks`
+                            // (`consensus/tx_verify.cpp:74`) takes the MTP of
+                            // the coin block's parent,
+                            // `GetAncestor(max(nCoinHeight - 1, 0))`: the
+                            // window for height `max(coin.height, 1)`.
+                            let mtp_coin = median_time_past_with_plan(
+                                store,
+                                *replay_plan,
+                                coin.height.max(1),
+                            )? as u64;
                             let mtp_block = median_time_past as u64;
                             if mtp_block.saturating_sub(mtp_coin) < required_seconds {
                                 return Err(ConnectError::SequenceLockNotMet);
@@ -1166,6 +1200,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
 }
 
 #[cfg(test)]
+#[path = "connect_consharden_tests.rs"]
+mod consharden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::db::InMemoryStore;
@@ -1527,7 +1565,7 @@ mod tests {
     /// These fixtures build blocks with a placeholder `prev_blockhash`
     /// (or regtest genesis), so seeding the series is the fixture's job,
     /// exactly as seeding the parent's coins already is.
-    fn test_store() -> InMemoryStore {
+    pub(super) fn test_store() -> InMemoryStore {
         let store = InMemoryStore::new();
         let mut batch = StoreBatch::default();
         batch.chain_tx_puts.push((BlockHash::all_zeros(), 0));
@@ -1540,7 +1578,7 @@ mod tests {
     }
 
     /// Create an InMemoryStore pre-loaded with a single coin.
-    fn make_test_store_with_coin(coin_height: u32, coinbase: bool) -> (InMemoryStore, OutPoint, Coin) {
+    pub(super) fn make_test_store_with_coin(coin_height: u32, coinbase: bool) -> (InMemoryStore, OutPoint, Coin) {
         let store = test_store();
         let txid = bitcoin::Txid::from_raw_hash(
             bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
@@ -1566,7 +1604,7 @@ mod tests {
     /// The coinbase encodes `height` via BIP 34 and pays exactly `block_subsidy(Network::Regtest, height)`.
     /// The spending tx consumes `outpoint` (expected to hold 50_000_000 sats)
     /// and produces a single output of the same value (zero fee).
-    fn make_block_spending(
+    pub(super) fn make_block_spending(
         outpoint: OutPoint,
         height: u32,
         tx_version: i32,
@@ -1734,7 +1772,7 @@ mod tests {
         );
     }
 
-    fn default_pos() -> FlatFilePos {
+    pub(super) fn default_pos() -> FlatFilePos {
         FlatFilePos {
             file_number: 0,
             data_pos: 0,
