@@ -457,6 +457,71 @@ fn backfill_temp_key(op: &OutPoint) -> [u8; 36] {
 
 type DB = DBWithThreadMode<MultiThreaded>;
 
+/// One coin read from the coins column family.
+///
+/// `None` means the outpoint has no row: the coin was never created, or it
+/// has been spent. `connect_block` takes that as a verdict on a block that
+/// spends it (`bad-txns-inputs-missingorspent`), and `accept_block` and the
+/// reorg path record the block as invalid. A read that failed, or a row that
+/// does not decode, says nothing about the coin, so neither comes back as
+/// `None`: the node stops ([`stop_on_unreadable_coin`]).
+fn coin_from_read<V: AsRef<[u8]>, E: std::fmt::Display>(
+    read: Result<Option<V>, E>,
+    outpoint: &OutPoint,
+) -> Option<Coin> {
+    let row = match read {
+        Ok(row) => row?,
+        Err(e) => stop_on_unreadable_coin(outpoint, &e),
+    };
+    let row = row.as_ref();
+    match Coin::deserialize_compact(row) {
+        Some(coin) => Some(coin),
+        // A row in a layout this binary does not read is refused by the
+        // schema check at open, so one that gets here is damage.
+        None => stop_on_unreadable_coin(
+            outpoint,
+            &format!("the {}-byte row does not decode as a coin", row.len()),
+        ),
+    }
+}
+
+/// Stop the node on a coin the database could not read, as Bitcoin Core
+/// does.
+///
+/// Core reads its coins through `CCoinsViewErrorCatcher`, which logs
+/// "Error reading from database" and calls `std::abort()` on any read error
+/// (`coins.cpp:398-412`). Its reason: returning to the caller "would be
+/// interpreted as 'entry not found' (as opposed to unable to read data), and
+/// could lead to invalid interpretation". Here that interpretation is a
+/// verdict: a valid block that spends the coin would be refused and recorded
+/// as invalid, and the record outlives a restart.
+///
+/// `abort()`, as in Core, and as satd's other fail-stops do: no shutdown
+/// flush runs. The chainstate on disk is the one the last flush left, and
+/// the next start replays the blocks after it from the block files, as after
+/// any crash.
+fn stop_on_unreadable_coin(outpoint: &OutPoint, error: &dyn std::fmt::Display) -> ! {
+    tracing::error!(
+        %outpoint,
+        %error,
+        "Error reading from database, shutting down: a coin in the chainstate \
+         could not be read. Stopping without flushing. If this happens again \
+         after a restart, check the disk; -reindex-chainstate rebuilds the \
+         chainstate from the block files."
+    );
+    eprintln!(
+        "Error reading from database, shutting down: coin {outpoint}: {error}. \
+         If this happens again after a restart, check the disk; \
+         -reindex-chainstate rebuilds the chainstate from the block files."
+    );
+    // A test build panics instead, so a test can reach this without taking
+    // the harness down with it.
+    #[cfg(test)]
+    panic!("Error reading from database: coin {outpoint}: {error}");
+    #[cfg(not(test))]
+    std::process::abort()
+}
+
 /// Where the recent-height window stands. Held under
 /// [`RocksDbStore::recent_window`].
 enum RecentWindowState {
@@ -2414,23 +2479,16 @@ impl Store for RocksDbStore {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
-        let value = self.db.get_cf(&cf, key).ok()??;
-        let coin = Coin::deserialize_compact(&value);
-        if coin.is_none() {
-            tracing::error!(
-                "corrupt coin: failed to deserialize {} bytes for {}:{}",
-                value.len(),
-                outpoint.txid,
-                outpoint.vout
-            );
-        }
-        coin
+        coin_from_read(self.db.get_cf(&cf, key), outpoint)
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
-        matches!(self.db.get_pinned_cf(&cf, key), Ok(Some(_)))
+        match self.db.get_pinned_cf(&cf, key) {
+            Ok(row) => row.is_some(),
+            Err(e) => stop_on_unreadable_coin(outpoint, &e),
+        }
     }
 
     fn get_tip(&self) -> Option<BlockHash> {
@@ -2900,21 +2958,8 @@ impl Store for RocksDbStore {
         self.db
             .multi_get_cf(cf_keys)
             .into_iter()
-            .enumerate()
-            .map(|(i, result)| {
-                result.ok().flatten().and_then(|v| {
-                    let coin = Coin::deserialize_compact(&v);
-                    if coin.is_none() {
-                        tracing::error!(
-                            "corrupt coin: failed to deserialize {} bytes for {}:{}",
-                            v.len(),
-                            outpoints[i].txid,
-                            outpoints[i].vout
-                        );
-                    }
-                    coin
-                })
-            })
+            .zip(outpoints)
+            .map(|(read, outpoint)| coin_from_read(read, outpoint))
             .collect()
     }
 
@@ -3699,6 +3744,10 @@ impl Store for RocksDbStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "rocksdb_store_storefault_tests.rs"]
+mod storefault_tests;
 
 #[cfg(test)]
 mod tests {
