@@ -385,10 +385,12 @@ logged at `INFO`, not treated as damage.
 
 If RocksDB cannot read a coin from the chainstate (an I/O error or a checksum
 mismatch), or a coin's row does not decode, satd stops at once, as Bitcoin Core
-does. The log and stderr say `Error reading from database, shutting down`,
-with the outpoint and the error. satd does not carry on as if the coin were
-spent: that would refuse a valid block that spends it, and record the block as
-invalid across restarts.
+does. This holds wherever a coin is looked up: block connection, the mempool,
+`gettxout`, the Electrum and Esplora lookups, and the offline
+`satd-chainstate-audit` below. The log and stderr say `Error reading from
+database, shutting down`, with the outpoint and the error. satd does not carry
+on as if the coin were spent: that would refuse a valid block that spends it,
+and record the block as invalid across restarts.
 
 The stop is an `abort()` (the process ends with `SIGABRT`), so no shutdown
 flush runs. The next start replays the blocks after the last flush from the
@@ -426,7 +428,10 @@ Note also that it is not included in the release tarballs or the Docker image;
 build it from source (`cargo build --release --bin satd-chainstate-audit`).
 
 Exit status is `0` when consistent, `1` when it could not run, `2` when it found
-inconsistencies, so it scripts cleanly.
+inconsistencies, so it scripts cleanly. A coin the database cannot read stops
+the tool as it stops the node (see above): it prints `Error reading from
+database` with the outpoint and the RocksDB error, which names the damaged
+file, and ends with `SIGABRT` before any report.
 
 It diagnoses and does not repair. A missing coin is recoverable only by
 replaying the block that created it: `-reindex-chainstate`, or
