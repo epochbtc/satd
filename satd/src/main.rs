@@ -585,7 +585,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let registry = tracing_subscriber::registry().with(filter_layer);
+        // `request_dump_guard` keeps the RPC and WebSocket libraries' TRACE
+        // output, which prints request headers and parameters, out of the
+        // log whatever the filter above allows.
+        let registry = tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(config::request_dump_guard());
         // Only colorize when stdout is an actual terminal and the operator
         // hasn't opted out via NO_COLOR (https://no-color.org). Under journald
         // / a pipe, `is_terminal()` is false, so we don't leak ANSI escapes
