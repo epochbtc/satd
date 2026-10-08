@@ -1321,6 +1321,17 @@ pub trait PackageMember {
     fn txid(&self) -> Txid;
 }
 
+/// What an admission records from the outputs its transaction spends.
+/// Both admission paths build it with [`Mempool::spend_record`], so an
+/// entry carries the same sigop cost and prevout metadata however it got in.
+struct SpendRecord {
+    sigop_cost: u64,
+    prev_scripthashes: Vec<Scripthash>,
+    prev_amounts: Vec<u64>,
+    prev_scripts: Vec<ScriptBuf>,
+    sp_tweak: Option<TweakEntry>,
+}
+
 /// So the checks can be exercised against a plain transaction list.
 impl PackageMember for Transaction {
     fn tx(&self) -> &Transaction {
@@ -1415,6 +1426,64 @@ impl Mempool {
     /// [`crate::events::publisher::MempoolTweakSource`] for the firehose bridge.
     pub fn cached_sp_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
         self.inner.read().entries.get(txid).and_then(|e| e.sp_tweak.clone())
+    }
+
+    /// The [`SpendRecord`] for `tx`, whose inputs spend `prev_outputs` (input
+    /// order).
+    ///
+    /// The sigop cost is Bitcoin Core's `GetTransactionSigOpCost` with the
+    /// standard script flags, which include P2SH and WITNESS (Core's
+    /// `PreChecks`, src/validation.cpp): the number the block template budgets
+    /// by and getblocktemplate reports.
+    ///
+    /// `prev_outputs` is dropped after admission, so this is the one chance
+    /// to keep prevout data for mempool spend-side matching (exact script +
+    /// prefix bucket) without re-resolving prevouts in the (decoupled)
+    /// matcher. The scripthash is always kept; value and full script are gated
+    /// by `streamprevoutmeta` (see `PrevoutMetaLevel`) so operators pay only
+    /// for the matcher capabilities they want. Gate-cold the scripts are empty,
+    /// so the event payload is byte-identical to a node without silent
+    /// payments.
+    ///
+    /// Silent-payment tweak: while an SP scan-key watch (D7, Tier 2) OR a
+    /// `mempool_tweaks` firehose subscriber (Tier 1.5) is live, compute the
+    /// BIP 352 public tweak `T = input_hash · A` once here — the resolved
+    /// prevout `scriptPubKey`s (including in-mempool parents) are in hand and
+    /// cannot be reconstructed off the hot path. The ~73-byte result is cached
+    /// on the entry so the unconfirmed matcher never recomputes it and the
+    /// firehose bridge can read it by txid. Gate-cold this is `None` with no
+    /// EC work, so a node without silent payments is unchanged.
+    fn spend_record(
+        &self,
+        prevout_meta: PrevoutMetaLevel,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+    ) -> SpendRecord {
+        let sigop_cost = crate::validation::sigops::transaction_sigop_cost(
+            tx,
+            prev_outputs,
+            crate::validation::sigops::SigOpFlags::P2shWitness,
+        );
+        let prev_scripthashes: Vec<Scripthash> =
+            prev_outputs.iter().map(|o| scripthash_of(&o.script_pubkey)).collect();
+        let prev_amounts: Vec<u64> = if prevout_meta.retains_amount() {
+            prev_outputs.iter().map(|o| o.value.to_sat()).collect()
+        } else {
+            Vec::new()
+        };
+        let prev_scripts: Vec<ScriptBuf> = if prevout_meta.retains_script() {
+            prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
+            let spks: Vec<ScriptBuf> =
+                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
+            compute_tweak(tx, &spks)
+        } else {
+            None
+        };
+        SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak }
     }
 
     /// Whether the operator authorized emitting full prevout `scriptPubKey`s to
@@ -3000,56 +3069,9 @@ impl Mempool {
             inner.spends.insert(input.previous_output, txid);
         }
 
-        let prev_outputs_map: HashMap<OutPoint, TxOut> = tx
-            .input
-            .iter()
-            .zip(prev_outputs.iter())
-            .map(|(i, o)| (i.previous_output, o.clone()))
-            .collect();
-        let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
-
-        // Retain the spent prevout metadata (input order) for mempool
-        // spend-side matching (exact script + prefix bucket). `prev_outputs` is
-        // fully resolved above and dropped after this; capturing it now is the
-        // one chance to keep the data without re-resolving prevouts in the
-        // (decoupled) matcher. The scripthash is always kept; value and full
-        // script are gated by `streamprevoutmeta` (see `PrevoutMetaLevel`) so
-        // operators pay only for the matcher capabilities they want.
-        let prev_scripthashes: Vec<Scripthash> = prev_outputs
-            .iter()
-            .map(|o| scripthash_of(&o.script_pubkey))
-            .collect();
-        let prev_amounts: Vec<u64> = if cfg.prevout_meta.retains_amount() {
-            prev_outputs.iter().map(|o| o.value.to_sat()).collect()
-        } else {
-            Vec::new()
-        };
-        // Retain full prevout scripts only when the operator asked for them
-        // (`streamprevoutmeta=full`); gate-cold this is empty, so the event
-        // payload is byte-identical to a node without silent payments.
-        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() {
-            prev_outputs
-                .iter()
-                .map(|o| o.script_pubkey.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Silent-payment tweak: while an SP scan-key watch (D7, Tier 2) OR a
-        // `mempool_tweaks` firehose subscriber (Tier 1.5) is live, compute the
-        // BIP 352 public tweak `T = input_hash · A` once here — the resolved
-        // prevout `scriptPubKey`s (including in-mempool parents) are in hand and
-        // cannot be reconstructed off the hot path. The ~73-byte result is cached
-        // on the entry so the unconfirmed matcher never recomputes it and the
-        // firehose bridge can read it by txid. Gate-cold this is `None` with no
-        // EC work, so a node without silent payments is unchanged.
-        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
-            let spks: Vec<ScriptBuf> =
-                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
-            compute_tweak(&tx, &spks)
-        } else {
-            None
-        };
+        // Sigop cost and prevout metadata, the same for every admission path.
+        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
+            self.spend_record(cfg.prevout_meta, &tx, &prev_outputs);
 
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
@@ -5961,6 +5983,7 @@ impl Mempool {
 
         let weight = tx.weight().to_wu() as usize;
         let tx_size = bitcoin::consensus::serialize(&tx).len();
+        let prevout_meta = self.config.read().prevout_meta;
 
         // Take write lock
         let mut inner = self.inner.write();
@@ -6048,6 +6071,12 @@ impl Mempool {
 
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
 
+        // The same sigop cost and prevout metadata `accept_transaction`
+        // records. A zero cost here let the block template count this entry
+        // as free against the block sigop limit.
+        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
+            self.spend_record(prevout_meta, &tx, &prev_outputs);
+
         // Insert into mempool
         let scope = QuarantineScope::acting();
         inner.spends.extend(
@@ -6072,11 +6101,11 @@ impl Mempool {
                     .unwrap_or_default()
                     .as_secs(),
                 fee_delta: pending_delta,
-                sigop_cost: 0,
-                prev_scripthashes: Vec::new(),
-                prev_amounts: Vec::new(),
-                prev_scripts: Vec::new(),
-                sp_tweak: None,
+                sigop_cost,
+                prev_scripthashes,
+                prev_amounts,
+                prev_scripts,
+                sp_tweak,
                 scope,
                 source: TxSource::Rpc,
                 quarantine_rule: None,
@@ -6601,6 +6630,10 @@ impl Mempool {
         txid
     }
 }
+
+#[cfg(test)]
+#[path = "pool_sigops_tests.rs"]
+mod sigops_tests;
 
 #[cfg(test)]
 mod tests {

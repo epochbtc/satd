@@ -23,6 +23,11 @@ track Bitcoin Core v30.
 
 - **Resolution order.** `-conf=<path>` if given, else `<datadir>/bitcoin.conf`,
   else `<datadir>/satd.conf`. Flags override file values.
+- **Comments.** As in Core, `#` starts a comment anywhere on a line:
+  `txindex=1  # keep it` sets `txindex` to `1`. What is left of the line is
+  trimmed of spaces, tabs and line endings. An `rpcpassword` line that
+  contains a `#` is refused at load (`using # in rpcpassword can be ambiguous
+  and should be avoided`), as Core refuses it.
 - **Key disposition.** Each config-file key gets one of four treatments:
   1. **Honored.** satd implements it. This is the common case.
   2. **Skipped with a warning.** A recognized Core v30 option satd does not
@@ -120,7 +125,7 @@ startup error.
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). satd adds `stratum`, the Stratum server's per-miner lines (see [Verifying a miner](stratum.md#verifying-a-miner)). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
-| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
+| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. The JSON-RPC and WebSocket libraries' TRACE output (`jsonrpsee*`, `tungstenite*` targets), which prints request headers and call parameters, is never logged, whatever the level; their DEBUG output is. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
 | `maxshutdownsecs` | 30 | hot | satd | Graceful-shutdown budget (seconds), shared by the `shutdownnotify` hook (at most half of it), the wait for the block connector to stop (at most half of what is left) and the final flush. A connector still in a block at the end of its share costs the clean-shutdown marker but not the flush; a flush that overruns the budget force-exits without the marker. |
 

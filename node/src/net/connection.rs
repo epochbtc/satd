@@ -6,7 +6,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::net::stats::PeerStats;
@@ -225,8 +225,17 @@ pub struct V1Writer {
 
 /// Size of a P2P message header: 4 (magic) + 12 (command) + 4 (length) + 4 (checksum).
 const HEADER_SIZE: usize = 24;
-/// Maximum message payload size (32 MB).
-const MAX_PAYLOAD_SIZE: usize = 32 * 1024 * 1024;
+/// Maximum message payload size: Core's `MAX_PROTOCOL_MESSAGE_LENGTH`
+/// (`net.h`). A header announcing more ends the connection
+/// (`V1Transport::readHeader`); satd took up to 32 MiB.
+const MAX_PAYLOAD_SIZE: usize = 4_000_000;
+/// How far ahead of the payload bytes actually received the receive buffer
+/// is grown: Core's `V1Transport::readData` ("Allocate up to 256 KiB ahead,
+/// but never more than the total message size").
+const PAYLOAD_ALLOC_STEP: usize = 256 * 1024;
+/// Receive-buffer capacity kept for the next message. A buffer grown past it
+/// by a larger message is released once that message is decoded.
+const RECV_BUF_KEEP: usize = 64 * 1024;
 /// Maximum bytes to scan when resyncing to magic after stream misalignment.
 const MAX_RESYNC_BYTES: usize = 256 * 1024;
 
@@ -326,13 +335,37 @@ impl V1Writer {
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let raw = RawNetworkMessage::new(self.magic, msg);
         let bytes = serialize(&raw);
-        self.stream.write_all(&bytes).await?;
+        write_counted(&mut self.stream, &bytes, self.counters.as_ref()).await?;
         if let Some(c) = &self.counters {
-            c.record_sent(bytes.len());
             c.attribute_sent(raw.cmd(), bytes.len());
         }
         Ok(())
     }
+}
+
+/// Write `bytes` in full, counting each chunk as the socket takes it.
+///
+/// Core moves `nSendBytes` and `m_last_send` on every partial send
+/// (`SocketSendData`). Counting only whole messages made a large message that
+/// a peer reads slowly look like no progress at all, and the write loop's send
+/// timeout is measured against these counts.
+pub(crate) async fn write_counted<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+    counters: Option<&Arc<PeerStats>>,
+) -> io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let n = w.write(&bytes[written..]).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        written += n;
+        if let Some(c) = counters {
+            c.record_sent(n);
+        }
+    }
+    Ok(())
 }
 
 impl V1Reader {
@@ -383,10 +416,19 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
             ));
         }
 
-        // Read payload
-        let mut payload = vec![0u8; payload_len];
-        if payload_len > 0 {
-            stream.read_exact(&mut payload).await?;
+        // Read the payload into `buf`, behind the header, growing it as the
+        // bytes arrive and never more than PAYLOAD_ALLOC_STEP ahead of them
+        // (Core's `V1Transport::readData`). Sizing it from the header alone
+        // let a peer that announced a large payload and sent nothing hold
+        // that much memory per connection.
+        buf.clear();
+        buf.extend_from_slice(&header);
+        let frame_len = HEADER_SIZE + payload_len;
+        while buf.len() < frame_len {
+            let start = buf.len();
+            let end = frame_len.min(start + PAYLOAD_ALLOC_STEP);
+            buf.resize(end, 0);
+            stream.read_exact(&mut buf[start..end]).await?;
         }
 
         // Record on-wire bytes for this framed message (counted even if it
@@ -399,23 +441,16 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
             c.record_recv(wire_len);
         }
 
-        // Combine header + payload and deserialize
-        buf.clear();
-        buf.extend_from_slice(&header);
-        buf.extend_from_slice(&payload);
-
-        match deserialize::<RawNetworkMessage>(buf) {
+        let result = match deserialize::<RawNetworkMessage>(buf) {
+            Ok(raw) if *raw.magic() != magic => Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wrong network magic",
+            ))),
             Ok(raw) => {
-                if *raw.magic() != magic {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "wrong network magic",
-                    ));
-                }
                 if let Some(c) = counters {
                     c.attribute_recv(raw.cmd(), wire_len);
                 }
-                return Ok(raw.payload().clone());
+                Some(Ok(raw.into_payload()))
             }
             Err(_) if &header[4..16] == b"pong\0\0\0\0\0\0\0\0" && payload_len < 8 => {
                 // Too short to hold a nonce. Core still acts on it -- it
@@ -424,20 +459,29 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
                 if let Some(c) = counters {
                     c.attribute_recv("pong", wire_len);
                 }
-                return Ok(NetworkMessage::Unknown {
+                Some(Ok(NetworkMessage::Unknown {
                     command: bitcoin::p2p::message::CommandString::try_from_static("pong")
                         .expect("static command"),
-                    payload,
-                });
+                    payload: buf[HEADER_SIZE..].to_vec(),
+                }))
             }
             Err(_) => {
                 if let Some(c) = counters {
                     c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
                 }
-                let cmd = String::from_utf8_lossy(&header[4..16]);
-                tracing::debug!(cmd = %cmd.trim_end_matches('\0'), "Skipping unparseable message");
-                continue;
+                // The peer's own text: sanitized as Core's
+                // `SanitizeString(msg_type)`, so it cannot break a log line.
+                let cmd = crate::net::limits::sanitize_string(&String::from_utf8_lossy(&header[4..16]));
+                tracing::debug!(cmd = %cmd, "Skipping unparseable message");
+                None
             }
+        };
+        // Kept for the next message, but not at the size of a large one.
+        if buf.capacity() > RECV_BUF_KEEP {
+            *buf = Vec::new();
+        }
+        if let Some(result) = result {
+            return result;
         }
     }
 }
@@ -500,3 +544,7 @@ async fn resync_to_magic<R: AsyncReadExt + Unpin>(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "connection_bounds_tests.rs"]
+mod bounds_tests;

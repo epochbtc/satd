@@ -16,12 +16,11 @@
 //! buffers for the 32-byte txids; everything is constructed and consumed inside
 //! one stack frame, so no heap-resident view outlives the evaluation.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::hashes::{Hash, sha256};
-use bitcoin::{Network as BNetwork, OutPoint, Script, Transaction, TxIn, TxOut, Txid};
+use bitcoin::{Network as BNetwork, Script, Transaction, TxIn, TxOut, Txid};
 
 use satd_policy::{
     CompiledRuleset, Ctx, InputView, Network, OutputView, ScriptType, Source, TxView, Verdict,
@@ -326,14 +325,13 @@ fn with_view<R>(
         .collect();
 
     // sigop cost (`tx.sigops_cost`), computed against the resolved prevouts
-    // exactly as the entry accounting does at insert time.
-    let prev_map: HashMap<OutPoint, TxOut> = tx
-        .input
-        .iter()
-        .zip(prev_outputs.iter())
-        .map(|(i, o)| (i.previous_output, o.clone()))
-        .collect();
-    let sigops_cost = tx.total_sigop_cost(|op| prev_map.get(op).cloned()) as i128;
+    // exactly as the entry accounting does at insert time: Core's
+    // `GetTransactionSigOpCost` with the standard flags.
+    let sigops_cost = crate::validation::sigops::transaction_sigop_cost(
+        tx,
+        prev_outputs,
+        crate::validation::sigops::SigOpFlags::P2shWitness,
+    ) as i128;
 
     let mut inputs: Vec<InputView> = Vec::with_capacity(tx.input.len());
     for (idx, tin) in tx.input.iter().enumerate() {

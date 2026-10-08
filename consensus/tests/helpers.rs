@@ -51,6 +51,68 @@ pub fn parse_expected_error(name: &str) -> ScriptError {
     ScriptError::from_test_name(name).unwrap_or_else(|| panic!("Unknown error name: {name}"))
 }
 
+/// The scriptPubKey string Core's script_tests.json uses for a row that
+/// spends the taproot output built from the row's witness.
+#[allow(dead_code)]
+pub const TAPROOT_OUTPUT_MARKER: &str = "0x51 0x20 #TAPROOTOUTPUT#";
+
+/// A script_tests.json witness, with Core's taproot markers expanded.
+#[allow(dead_code)]
+pub struct WitnessRow {
+    pub stack: Vec<Vec<u8>>,
+    /// `OP_1 <output key>` for the one-leaf tree the row built, if any.
+    pub taproot_output: Option<Vec<u8>>,
+}
+
+/// Expand the witness items of a script_tests.json row (the amount already
+/// removed) the way Core's `script_json_test` does
+/// (src/test/script_tests.cpp:928-950):
+/// - `#SCRIPT# <asm>` is a script written in ASM, pushed as bytes;
+/// - `#CONTROLBLOCK#` adds the preceding item as a depth-0 tapscript leaf,
+///   finalizes the tree with key0's x-only key as the internal key, and
+///   pushes that leaf's control block;
+/// - anything else is hex.
+///
+/// key0 is the secret key 1 (`vchKey0`, src/test/script_tests.cpp:182).
+#[allow(dead_code)]
+pub fn parse_witness_row(items: &[serde_json::Value]) -> WitnessRow {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+    use bitcoin::ScriptBuf;
+
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut taproot_output = None;
+    for item in items {
+        let s = item.as_str().expect("witness item is a string");
+        if let Some(asm) = s.strip_prefix("#SCRIPT#") {
+            stack.push(parse_script(asm));
+        } else if s == "#CONTROLBLOCK#" {
+            let secp = Secp256k1::new();
+            let mut key0 = [0u8; 32];
+            key0[31] = 1;
+            let (internal, _) = SecretKey::from_slice(&key0)
+                .unwrap()
+                .x_only_public_key(&secp);
+            let leaf = ScriptBuf::from_bytes(stack.last().expect("#CONTROLBLOCK# follows a script").clone());
+            let info = TaprootBuilder::new()
+                .add_leaf(0, leaf.clone())
+                .unwrap()
+                .finalize(&secp, internal)
+                .unwrap();
+            let control = info
+                .control_block(&(leaf, LeafVersion::TapScript))
+                .expect("leaf is in the tree");
+            stack.push(control.serialize());
+            let mut spk = vec![0x51, 0x20];
+            spk.extend_from_slice(&info.output_key().to_x_only_public_key().serialize());
+            taproot_output = Some(spk);
+        } else {
+            stack.push(hex::decode(s).unwrap_or_else(|e| panic!("Bad witness hex '{s}': {e}")));
+        }
+    }
+    WitnessRow { stack, taproot_output }
+}
+
 /// Parse a human-readable script string from Bitcoin Core tests into raw bytes.
 ///
 /// Handles:

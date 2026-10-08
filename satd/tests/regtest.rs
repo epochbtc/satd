@@ -2168,9 +2168,12 @@ fn fill_mempool_past_the_block_sigop_limit(node: &TestNode) -> (usize, u64) {
 /// counts it. Every input in the fixture above spends a P2WPKH coinbase.
 fn template_tx_sigop_cost(tx: &bitcoin::Transaction) -> u64 {
     let p2wpkh = DeterministicWallet::from_secret([0x5c; 32]).address.script_pubkey();
-    tx.total_sigop_cost(|_| {
-        Some(bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh.clone() })
-    }) as u64
+    let prevout = bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh };
+    node::validation::sigops::transaction_sigop_cost(
+        tx,
+        &vec![prevout; tx.input.len()],
+        node::validation::sigops::SigOpFlags::P2shWitness,
+    )
 }
 
 /// A template must stay under the block sigop limit. `create_template`
@@ -15583,12 +15586,17 @@ mod cf_client {
             None
         }
 
-        /// Assert that no CFilter / CFHeaders / CFCheckpt arrives in the
-        /// window — the silent-drop contract from BIP 157.
-        pub fn assert_silent(&mut self, window: Duration) {
+        /// Assert that the node closes the connection within the window
+        /// without sending a CFilter / CFHeaders / CFCheckpt: Core's
+        /// `PrepareBlockFilterRequest` disconnects a peer whose request it
+        /// will not serve.
+        pub fn assert_disconnected(&mut self, window: Duration) {
             let deadline = Instant::now() + window;
-            while Instant::now() < deadline {
+            loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    panic!("assert_disconnected: still connected after {window:?}");
+                }
                 self.stream
                     .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
                     .unwrap();
@@ -15596,10 +15604,13 @@ mod cf_client {
                     Ok(NetworkMessage::CFilter(_))
                     | Ok(NetworkMessage::CFHeaders(_))
                     | Ok(NetworkMessage::CFCheckpt(_)) => {
-                        panic!("assert_silent: peer sent a filter response unexpectedly");
+                        panic!("assert_disconnected: peer sent a filter response unexpectedly");
                     }
                     Ok(_) => continue,
-                    Err(_) => break,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                        panic!("assert_disconnected: still connected after {window:?}");
+                    }
+                    Err(_) => return,
                 }
             }
         }
@@ -15854,13 +15865,14 @@ fn test_p2p_getcfcheckpt_thousand_block_intervals() {
 }
 
 #[test]
-fn test_p2p_silent_drop_when_peer_serve_disabled() {
+fn test_p2p_disconnect_when_peer_serve_disabled() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFHeaders;
 
-    // blockfilterindex=basic but peerblockfilters off: handlers must
-    // silent-drop and the version handshake must NOT advertise
-    // NODE_COMPACT_FILTERS.
+    // blockfilterindex=basic but peerblockfilters off: the version
+    // handshake must NOT advertise NODE_COMPACT_FILTERS, and a request for
+    // filters disconnects, as Core's does ("peer requested unsupported block
+    // filter type").
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
     let datadir = fresh_test_datadir("satd-p2p-silent-test");
@@ -15906,13 +15918,13 @@ fn test_p2p_silent_drop_when_peer_serve_disabled() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_invalid_filter_type() {
+fn test_p2p_disconnect_invalid_filter_type() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFilters;
 
@@ -15953,7 +15965,7 @@ fn test_p2p_silent_drop_invalid_filter_type() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -16085,7 +16097,7 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
         resp.filter_hashes.len()
     );
 
-    // 2001 headers must be silent-dropped (start=0, stop=2000 = 2001).
+    // 2001 headers disconnect, as in Core (start=0, stop=2000 = 2001).
     let stop_hex_genesis = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
         .unwrap()["result"]
@@ -16095,20 +16107,20 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
     let mut _consensus_g =
         <[u8; 32]>::try_from(hex::decode(&stop_hex_genesis).expect("hex").as_slice())
             .expect("32 bytes");
-    let _ = tip_hash; // suppress unused var warnings on the silent-drop path
+    let _ = tip_hash; // suppress unused var warnings on the refusal path
     client.send_get_cfheaders(GetCFHeaders {
         filter_type: 0,
         start_height: 0,
         stop_hash: stop_hash_2000,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
 
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_oversized_range() {
+fn test_p2p_disconnect_oversized_range() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFilters;
 
@@ -16147,13 +16159,13 @@ fn test_p2p_silent_drop_oversized_range() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_off_chain_stop_hash() {
+fn test_p2p_disconnect_unknown_stop_hash() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFHeaders;
 
@@ -16187,7 +16199,7 @@ fn test_p2p_silent_drop_off_chain_stop_hash() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
