@@ -561,6 +561,41 @@ impl Store for InMemoryStore {
         rows
     }
 
+    fn addr_rows_desc(
+        &self,
+        sh: &Scripthash,
+        below: Option<u64>,
+        min_txs: usize,
+    ) -> crate::storage::AddrRowsDesc {
+        use crate::storage::AddrRowKey;
+        let wanted = |txseq: u64| below.is_none_or(|b| txseq < b);
+        let mut rows: Vec<AddrRowKey> = self
+            .addr_funding
+            .read()
+            .iter()
+            .filter(|r| &r.scripthash == sh && wanted(r.txseq))
+            .map(|r| AddrRowKey {
+                txseq: r.txseq,
+                spending: false,
+                index: r.vout,
+            })
+            .collect();
+        rows.extend(
+            self.addr_spending
+                .read()
+                .iter()
+                .filter(|r| &r.scripthash == sh && wanted(r.txseq))
+                .map(|r| AddrRowKey {
+                    txseq: r.txseq,
+                    spending: true,
+                    index: r.vin,
+                }),
+        );
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        rows.dedup();
+        crate::storage::cut_addr_run(rows, min_txs)
+    }
+
     fn iter_addr_spending(&self, sh: &Scripthash) -> Vec<(AddrSpendingKey, OutPoint)> {
         // The on-disk shape, resolved and ordered exactly as the RocksDB
         // backend does. See `iter_addr_funding`.

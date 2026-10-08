@@ -164,6 +164,17 @@ impl SubscriptionRegistry {
             .collect()
     }
 
+    /// The scripthashes of `shs` with at least one live subscriber, in the
+    /// order given. One lookup each, so a mempool event that touches a few
+    /// scripthashes costs a few lookups however many are subscribed.
+    pub fn subscribed(&self, shs: &[Scripthash]) -> Vec<Scripthash> {
+        let channels = self.channels.lock();
+        shs.iter()
+            .filter(|sh| channels.get(*sh).is_some_and(|tx| tx.receiver_count() > 0))
+            .copied()
+            .collect()
+    }
+
     /// Send a status update to the channel for `sh`, if the
     /// recomputed `status_hash` differs from the last-seen value.
     ///
