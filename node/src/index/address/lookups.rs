@@ -288,6 +288,79 @@ impl AddressIndex for RocksAddressIndex {
         Ok(rows)
     }
 
+    fn confirmed_txs_newest_first(
+        &self,
+        sh: &Scripthash,
+        after: Option<bitcoin::Txid>,
+        limit: usize,
+    ) -> Result<Option<Vec<(u32, bitcoin::Txid)>>, IndexError> {
+        self.check_enabled()?;
+        // The rows are keyed by ordinal, which is chain order, so walking
+        // them backwards from the cursor reaches the page without touching
+        // the rest of the history. The page is in `(height, txid)` order,
+        // though, and a block's transactions sort by txid, not ordinal: the
+        // walk starts at the end of the cursor's block, and a block counts
+        // only once the walk has passed below it.
+        let (mut below, cursor) = match after {
+            None => (None, None),
+            Some(txid) => {
+                let Some(seq) = self.store.get_tx_seq(&txid) else {
+                    return Ok(None);
+                };
+                let Some((first, height)) = self.store.block_of_seq(seq) else {
+                    return Ok(None);
+                };
+                let Some(num_tx) = self
+                    .store
+                    .get_block_hash_by_height(height)
+                    .and_then(|h| self.store.get_block_index(&h))
+                    .map(|e| u64::from(e.num_tx))
+                else {
+                    return Ok(None);
+                };
+                (Some(first + num_tx), Some((height, txid)))
+            }
+        };
+        let page = limit.max(1);
+        // Distinct transactions in walk order: height never increases.
+        let mut walked: Vec<(u32, bitcoin::Txid)> = Vec::new();
+        loop {
+            let run = self.store.addr_rows_desc(sh, below, page.saturating_add(1));
+            let mut seqs: Vec<u64> = run.rows.iter().map(|r| r.txseq).collect();
+            seqs.dedup();
+            for (seq, resolved) in seqs
+                .iter()
+                .zip(crate::index::resolve::resolve_txseqs(self.store.as_ref(), &seqs))
+            {
+                match resolved {
+                    Some(r) => walked.push((r.height, r.txid)),
+                    None => tracing::error!(
+                        target: "storage",
+                        scripthash_prefix = %hex::encode(&sh[..8]),
+                        txseq = *seq,
+                        "address row references a transaction ordinal with no \
+                         reverse-map entry; skipping it. This is local index \
+                         corruption — rebuild with --reindex-chainstate."
+                    ),
+                }
+            }
+            below = run.next_below;
+            if below.is_none() || complete_rows_after(&walked, cursor) >= page {
+                break;
+            }
+        }
+        walked.sort_unstable_by(|a, b| b.cmp(a));
+        walked.dedup();
+        let start = match cursor {
+            None => 0,
+            Some(c) => match walked.iter().position(|r| *r == c) {
+                Some(i) => i + 1,
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(walked.into_iter().skip(start).take(limit).collect()))
+    }
+
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         self.utxos_limited(sh, usize::MAX)
     }
@@ -342,6 +415,27 @@ impl AddressIndex for RocksAddressIndex {
         self.subs.seed_status(sh, status_hash);
     }
 }
+
+/// How many of `walked` are settled and come after `cursor` in
+/// `(height, txid)` order. `walked` is in walk order, so its height never
+/// increases; every block above the lowest height reached is complete,
+/// and only those rows have their final place in the page.
+fn complete_rows_after(
+    walked: &[(u32, bitcoin::Txid)],
+    cursor: Option<(u32, bitcoin::Txid)>,
+) -> usize {
+    let Some(&(lowest, _)) = walked.last() else {
+        return 0;
+    };
+    walked
+        .iter()
+        .filter(|r| r.0 > lowest && cursor.is_none_or(|c| **r < c))
+        .count()
+}
+
+#[cfg(test)]
+#[path = "lookups_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 #[cfg(test)]
 mod tests {

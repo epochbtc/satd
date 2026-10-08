@@ -40,8 +40,8 @@ the address index for scripthash history (on by default) and
 | `--electrummtlsclientca=<path>` | none | PEM CA bundle to verify client certs when `--electrummtls=1`. |
 | `--electrummtlsclientallow=<subj>` | any CA-signed | Allowlist of accepted client-cert CN / DNS-SAN values. |
 | `--electrummaxconns=<n>` | `64` | Hard cap on simultaneously-open connections. |
-| `--electrummaxsubsperconn=<n>` | `1000` | Per-connection scripthash subscription cap. |
-| `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. |
+| `--electrummaxsubsperconn=<n>` | `1000` | Per-connection scripthash subscription cap. See [Subscription limits](#subscription-limits) for how it relates to the server-wide `--addrindexsubscriptions`. |
+| `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. A request still running after this long is answered with a `request timed out` error and its connection is closed. The handler's work cannot be interrupted, so the connection keeps its `--electrummaxconns` slot until that work ends. |
 | `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets such as Sparrow batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
@@ -49,7 +49,11 @@ the address index for scripthash history (on by default) and
 | `--electrumservername=<text>` | `satd-electrs-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs). |
 
 The server runs on satd's [isolated API runtime](api-scaling.md)
-(`--api-threads`), so Electrum load cannot starve block connection.
+(`--api-threads`), so Electrum load cannot starve block connection. Each
+request's handler runs on that runtime's blocking pool rather than on one of
+its workers: a request that reads a long history does not hold up other
+connections, Esplora, events gRPC or `/metrics`, and the request timeout
+answers on time.
 
 ## Supported methods
 
@@ -131,6 +135,34 @@ Two long-lived push subscriptions are supported, both counted against
   (spends an unconfirmed parent), then by txid as displayed. A client can
   therefore check an announced status by hashing the `get_history` answer
   as received.
+
+Status notifications are computed after every block for every subscribed
+scripthash, and after every mempool change for the subscribed scripthashes
+it touches, by reading each history from the index. That work runs on the
+blocking pool, never on a runtime worker, and block events that arrive while
+one pass is running share the next pass.
+
+### Subscription limits
+
+Two caps apply to `blockchain.scripthash.subscribe`:
+
+- `--electrummaxsubsperconn` (default `1000`) bounds one connection.
+- `--addrindexsubscriptions` (default `10000`) bounds the distinct
+  scripthashes subscribed across the whole server. Esplora's
+  `/address/:addr/sse` and `/scripthash/:hash/sse` streams count against it
+  too. Once it is full, every further subscribe of a new scripthash is
+  refused with `subscribe: subscription cap reached (N scripthashes)`,
+  whichever connection asks.
+
+With the defaults, 10 connections at their own cap fill the server-wide
+registry while 54 of the 64 connection slots are still free, and satd logs
+how many connections fill it at startup. For the per-connection cap to bind
+first, set `--addrindexsubscriptions` to at least
+`--electrummaxconns` × `--electrummaxsubsperconn` (64,000 with the defaults),
+plus room for the Esplora SSE streams you serve. Each subscribed scripthash
+costs a notification channel of a few kilobytes and a history read on every
+block, so size it to the wallets you serve. `--addrindexsubscriptions` can be
+changed with `SIGHUP`; lowering it does not drop existing subscriptions.
 
 `blockchain.tweaks.subscribe` also pushes notifications, but it is a bounded
 chunk rather than a standing subscription — it ends itself with

@@ -94,6 +94,37 @@ pub trait AddressIndex: Send + Sync {
         self.confirmed_distinct_history_limited(sh, limit)
     }
 
+    /// One page of `sh`'s distinct confirmed transactions, newest first:
+    /// height descending, then `Txid`'s order descending. With `after`, the
+    /// page starts just after that transaction; `Ok(None)` when `after` is
+    /// not in the confirmed history. At most `limit` rows.
+    ///
+    /// Esplora's `/txs/chain[/:last_seen_txid]` pages. The default reads the
+    /// whole history for every page, which makes walking an `N`-transaction
+    /// history `O(N²)`. The chainstate-backed index overrides it with a read
+    /// that starts at the cursor and stops once the page is complete.
+    fn confirmed_txs_newest_first(
+        &self,
+        sh: &Scripthash,
+        after: Option<bitcoin::Txid>,
+        limit: usize,
+    ) -> Result<Option<Vec<(u32, bitcoin::Txid)>>, IndexError> {
+        let distinct: std::collections::BTreeSet<(u32, bitcoin::Txid)> = self
+            .confirmed_history(sh)?
+            .iter()
+            .map(|e| (e.height(), e.txid()))
+            .collect();
+        let newest_first: Vec<(u32, bitcoin::Txid)> = distinct.into_iter().rev().collect();
+        let start = match after {
+            None => 0,
+            Some(cursor) => match newest_first.iter().position(|(_, t)| *t == cursor) {
+                Some(i) => i + 1,
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(newest_first.into_iter().skip(start).take(limit).collect()))
+    }
+
     /// Unconfirmed (mempool) entries for `sh`.
     fn mempool_history(&self, sh: &Scripthash) -> Vec<MempoolHistoryEntry>;
 

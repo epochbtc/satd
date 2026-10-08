@@ -39,8 +39,8 @@ Last verified against routes: 2026-05-05.
 | `--esplorauserpass=<user:pass>` | (none) | Static credentials, used only when `--esploraauth=userpass`. |
 | `--esploracookiefile=<path>` | (auto) | Override the cookie-file path when `--esploraauth=cookie`. The default is the same `.cookie` file the JSON-RPC server uses. |
 | `--esploracors=<origin>` | (none) | Repeat for multiple origins. Use `*` for any origin. |
-| `--esplorarequesttimeout=<seconds>` | `30` | Per-request timeout; also the TLS handshake budget and how long a keep-alive connection may sit idle between requests before it is closed. |
-| `--esploramaxconns=<n>` | `256` | Cap on concurrent in-flight requests. `0` disables the cap. Does not bound long-lived SSE streams; see [Live updates](#live-updates-server-sent-events). |
+| `--esplorarequesttimeout=<seconds>` | `30` | Per-request timeout, answered with 503; also the TLS handshake budget and how long a keep-alive connection may sit idle between requests before it is closed. |
+| `--esploramaxconns=<n>` | `256` | Cap on concurrent in-flight requests. `0` disables the cap. The address and scripthash routes do their reads on a blocking thread; a read still running after its request timed out keeps counting against this cap until it ends. Does not bound long-lived SSE streams; see [Live updates](#live-updates-server-sent-events). |
 | `--esplorasseconns=<n>` | same as `--esploramaxconns` | Hard cap on simultaneously open SSE streams (`/blocks/sse`, `/address/:addr/sse`, `/scripthash/:hash/sse`). Each open stream holds a permit until the client disconnects; over-cap connections receive 503. `0` disables the cap. |
 | `--esploramaxsockets=<n>` | `1024` | Hard cap on open sockets across both Esplora listeners, counted at accept, idle keep-alive connections included. Over the cap a socket is closed at accept. `--esploramaxconns` bounds requests in flight and never sees a socket that sends nothing; this does. `0` disables. A keep-alive connection idle for longer than `--esplorarequesttimeout` is closed. |
 
@@ -268,15 +268,19 @@ blockstream.info and mempool.space within these constraints:
 - **WebSocket** subscriptions are not implemented; SSE is the supported
   live-updates transport. Most consumers (BDK, the mempool.space SDK) accept
   SSE as a drop-in replacement.
-- **High-history scripts.** The address-history endpoints (`/address/:addr`,
-  `/address/:addr/txs/chain[/:cursor]`, `/address/:addr/utxo`, and the
-  scripthash variants) load the full confirmed-history row set for the
-  scripthash on every request and sort it in memory. For typical wallet-sized
-  scripts this takes under a millisecond. For high-activity scripts (exchange
-  hot wallets, mining pools, popular donation addresses) a request can cost
-  multi-MB allocations and sub-second latency. `--esploramaxconns` and
-  `--esplorarequesttimeout` bound the damage. For a public deployment that
-  serves such scripts, put the listener behind a per-IP rate limiter at the
-  reverse proxy. Cursor-paginated index reads are tracked as future work.
+- **High-history scripts.** `/address/:addr/txs/chain[/:cursor]` and the
+  confirmed part of `/address/:addr/txs` (with or without `?after_txid=`) read
+  the history from the cursor down and stop once the page is complete, so a
+  page costs about the same however long the history is. `/address/:addr`
+  (the stats) and `/address/:addr/utxo` still read the script's whole history
+  on every request. For high-activity scripts (exchange hot wallets, mining
+  pools, popular donation addresses) such a request can cost multi-MB
+  allocations and sub-second latency. Every address and scripthash route
+  runs its reads on a blocking thread rather than on the API runtime's
+  workers, so a slow read does not hold up other requests and
+  `--esplorarequesttimeout` answers 503 on time; reads still running after a
+  timeout count against `--esploramaxconns` until they end. For a public
+  deployment that serves such scripts, put the listener behind a per-IP rate
+  limiter at the reverse proxy.
 - **Address prefix search** (`/address-prefix/:prefix`) is not implemented; it
   would require a separate prefix index.
