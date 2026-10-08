@@ -180,8 +180,15 @@ fn addr_counts(node: &TestNode, port: u16) -> (u64, u64) {
     (p["addr_processed"].as_u64().unwrap(), p["addr_rate_limited"].as_u64().unwrap())
 }
 
+/// The addresses `addr_msg` announced that the address book holds (the
+/// book also holds the outbound peers the node connected to).
 fn book_size(node: &TestNode) -> usize {
-    node.rpc_ok("getnodeaddresses", vec![json!(0)]).as_array().unwrap().len()
+    node.rpc_ok("getnodeaddresses", vec![json!(0)])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["address"].as_str().is_some_and(|a| a.ends_with(".7.7")))
+        .count()
 }
 
 fn now_secs() -> u64 {
