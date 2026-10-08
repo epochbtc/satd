@@ -8076,38 +8076,32 @@ impl PeerManager {
     /// Answer a `MSG_CMPCT_BLOCK` getdata with a `cmpctblock`, if the block
     /// is within [`compact::MAX_CMPCTBLOCK_DEPTH`] of the tip and we are not
     /// syncing (Core: `can_direct_fetch && pindex->nHeight >= tip->nHeight -
-    /// MAX_CMPCTBLOCK_DEPTH`). Returns false when the full block should be
-    /// sent instead.
-    fn serve_compact_block(&self, id: PeerId, hash: &bitcoin::BlockHash) -> bool {
+    /// MAX_CMPCTBLOCK_DEPTH`). `None` when the full block should be sent
+    /// instead; otherwise whether the `cmpctblock` was queued.
+    fn serve_compact_block(&self, id: PeerId, hash: &bitcoin::BlockHash) -> Option<bool> {
         if self.ibd.read().is_some() || self.is_ibd() {
-            return false;
+            return None;
         }
-        let Some(entry) = self.chain_state.get_block_index(hash) else {
-            return false;
-        };
+        let entry = self.chain_state.get_block_index(hash)?;
         if entry.height.saturating_add(compact::MAX_CMPCTBLOCK_DEPTH) < self.chain_state.tip_height() {
-            return false;
+            return None;
         }
         let compact = match self.cached_compact(hash) {
             Some(c) => c,
             None => {
-                let Some(block) = self.chain_state.get_block(hash) else {
-                    return false;
-                };
-                match self.compact_for(&block, entry.height, false) {
-                    Some(c) => c,
-                    None => return false,
-                }
+                let block = self.chain_state.get_block(hash)?;
+                self.compact_for(&block, entry.height, false)?
             }
         };
         let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
             compact_block: (*compact).clone(),
         });
-        if self.send_to_peer(id, msg) {
+        let queued = self.send_to_peer(id, msg);
+        if queued {
             self.compact_stats.sent_getdata.fetch_add(1, Ordering::Relaxed);
             self.note_peer_has_block(id, *hash);
         }
-        true
+        Some(queued)
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
@@ -8207,8 +8201,12 @@ impl PeerManager {
             Inventory::Block(hash)
             | Inventory::WitnessBlock(hash)
             | Inventory::CompactBlock(hash) => {
-                if matches!(inv, Inventory::CompactBlock(_)) && self.serve_compact_block(id, &hash) {
-                    return true;
+                // A `cmpctblock` that could not be queued leaves the entry to
+                // be served again once the queue drains, as below.
+                if matches!(inv, Inventory::CompactBlock(_))
+                    && let Some(queued) = self.serve_compact_block(id, &hash)
+                {
+                    return queued;
                 }
                 let Some(block) = self.chain_state.get_block(&hash) else {
                     not_found.push(inv);
@@ -10272,7 +10270,10 @@ impl PeerManager {
     /// queued to it stayed. Core drops a peer that has taken no bytes for
     /// `TIMEOUT_INTERVAL` (`InactivityCheck`, "socket sending timeout").
     /// Progress is the bytes the socket takes, counted as it takes them, so a
-    /// slow reader is not mistaken for a stalled one.
+    /// slow reader is not mistaken for a stalled one. Without counters, which
+    /// only a loop whose peer handle was already gone when it started lacks,
+    /// progress cannot be seen and the deadline runs from the start of the
+    /// write.
     async fn send_watched<F: std::future::Future<Output = ()>>(
         id: PeerId,
         writer: &mut ConnectionWriter,
