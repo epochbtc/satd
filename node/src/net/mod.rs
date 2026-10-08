@@ -105,6 +105,16 @@ pub fn is_routable(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Bitcoin Core's `CNetAddr::IsLocal` (`netaddress.cpp`): IPv4 127.0.0.0/8
+/// or 0.0.0.0/8, or IPv6 `::1`. An IPv4-mapped IPv6 address is judged as the
+/// IPv4 address it carries, as Core's `CNetAddr` holds it.
+pub fn is_local(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => matches!(v4.octets()[0], 0 | 127),
+        std::net::IpAddr::V6(v6) => v6 == std::net::Ipv6Addr::LOCALHOST,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

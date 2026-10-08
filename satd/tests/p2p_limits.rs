@@ -171,8 +171,8 @@ fn an_inv_over_max_inv_sz_ends_the_connection() {
     let mut peer = Peer::connect(port);
     peer.send(NetworkMessage::Inv(vec![entry; 50_000]));
     assert!(peer.alive(), "50,000 entries are within the limit");
-    // Misbehaviour bans the address, and every peer here is 127.0.0.1, so
-    // the refusal goes last.
+    // Misbehaviour ends the connection (a peer on 127.0.0.1 is disconnected,
+    // not banned), so the refusal goes last.
     peer.send(NetworkMessage::Inv(vec![entry; 50_001]));
     assert!(peer.closed_within(Duration::from_secs(30)), "50,001 entries end the connection");
     node.stop();

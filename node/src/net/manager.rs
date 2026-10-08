@@ -42,6 +42,19 @@ const MAX_OUTBOUND_BLOCK_RELAY: usize = 2;
 /// since the connection was made.
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const BAN_THRESHOLD: u32 = 100;
+
+/// What becomes of a peer whose misbehaviour reached [`BAN_THRESHOLD`]; see
+/// [`PeerManager::misbehaviour_action`].
+#[derive(Debug)]
+enum MisbehaviourAction {
+    /// Neither disconnected nor punished. Names the kind of peer, as Core's
+    /// log line does.
+    Keep(&'static str),
+    /// Disconnected; its address is not banned.
+    Disconnect,
+    /// Disconnected, and this banned for `-bantime`.
+    Ban(crate::net::ban::BanTarget),
+}
 /// Keepalive cadence: how often each peer is sent a `ping` when none is
 /// outstanding. Bitcoin Core's `PING_INTERVAL` (net_processing.h).
 ///
@@ -513,6 +526,10 @@ fn log_received(id: PeerId, msg: &NetworkMessage) {
 #[cfg(test)]
 #[path = "manager_p2pbounds_tests.rs"]
 mod p2pbounds_tests;
+
+#[cfg(test)]
+#[path = "manager_peerpunish_tests.rs"]
+mod peerpunish_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -2947,6 +2964,7 @@ impl PeerManager {
             let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
             let mut info = PeerInfo::new(id, addr, Direction::Inbound);
             info.permissions = perms;
+            info.inbound_onion = inbound_onion;
             // `getpeerinfo`'s `addrbind`: which of our listeners this peer
             // reached us on. Distinct from `-bind` config, since a node may
             // listen on several addresses.
@@ -3666,51 +3684,96 @@ impl PeerManager {
         self.ban_list.read().is_banned(&addr.ip(), now)
     }
 
-    /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
-    /// is disconnected, removed, and its address is banned.
+    /// Add ban score to a peer. Once the score reaches [`BAN_THRESHOLD`] the
+    /// peer has misbehaved (Core's `Misbehaving`), and it is dealt with as
+    /// [`Self::misbehaviour_action`] says.
     fn add_ban_score(&self, id: PeerId, score: u32, reason: &str) {
         let mut peers = self.peers.write();
-        let (should_ban, ban_addr) = if let Some(handle) = peers.get_mut(&id) {
-            // NoBan peers (-whitelist/-whitebind) are never banned or
-            // disconnected for misbehavior.
-            if handle.info.permissions.noban {
-                tracing::debug!(id, addr = %handle.info.addr, reason, "Skipping ban score for noban peer");
+        let Some(handle) = peers.get_mut(&id) else {
+            return;
+        };
+        handle.info.ban_score = handle.info.ban_score.saturating_add(score);
+        if handle.info.ban_score < BAN_THRESHOLD {
+            tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
+            return;
+        }
+        let ban = match Self::misbehaviour_action(&handle.info) {
+            MisbehaviourAction::Keep(kind) => {
+                // Core clears `m_should_discourage` and does nothing else, so
+                // the next misbehaviour is logged again.
+                handle.info.ban_score = 0;
+                tracing::warn!(id, reason, "Not punishing {kind} peer {id}!");
                 return;
             }
-            handle.info.ban_score += score;
-            if handle.info.ban_score >= BAN_THRESHOLD {
-                tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                (true, Some(handle.info.addr.ip()))
-            } else {
-                tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
-                (false, None)
+            MisbehaviourAction::Disconnect => {
+                let kind = if handle.info.inbound_onion { "inbound onion" } else { "local" };
+                tracing::debug!(id, reason, "Warning: disconnecting but not banning {kind} peer {id}!");
+                None
             }
-        } else {
-            (false, None)
-        };
-        if should_ban {
-            // Signal, for the same reason `disconnect_by_id` does: dropping
-            // the handle closes the peer task's `msg_rx` only when the last
-            // sender goes, and a `getcfilters` stream task can hold a clone.
-            // Without the signal a banned peer stayed connected -- and kept
-            // feeding the node -- until that task drained.
-            if let Some(handle) = peers.remove(&id) {
-                handle.disconnect.notify_one();
-            }
-            if let Some(addr) = ban_addr {
-                drop(peers); // release peers lock before acquiring ban_list lock
-                let now = crate::time::now_secs();
-                let duration = self.ban_duration_secs.load(Ordering::Relaxed);
-                let target = crate::net::ban::BanTarget::Net(
-                    ipnet::IpNet::from(addr),
+            MisbehaviourAction::Ban(target) => {
+                tracing::warn!(
+                    id,
+                    addr = %handle.info.addr_string(),
+                    score = handle.info.ban_score,
+                    reason,
+                    "Banning peer"
                 );
-                // Best-effort: misbehaviour bans are fire-and-forget; if the
-                // entry already exists (e.g. repeated misbehaviour) the add
-                // fails silently.
-                let _ = self.ban_list.write().add(&target, now, now + duration);
-                self.flush_banlist();
+                Some(target)
             }
+        };
+        // Signal, for the same reason `disconnect_by_id` does: dropping
+        // the handle closes the peer task's `msg_rx` only when the last
+        // sender goes, and a `getcfilters` stream task can hold a clone.
+        // Without the signal a banned peer stayed connected -- and kept
+        // feeding the node -- until that task drained.
+        if let Some(handle) = peers.remove(&id) {
+            handle.disconnect.notify_one();
         }
+        if let Some(target) = ban {
+            drop(peers); // release peers lock before acquiring ban_list lock
+            let now = crate::time::now_secs();
+            let duration = self.ban_duration_secs.load(Ordering::Relaxed);
+            // Best-effort: misbehaviour bans are fire-and-forget; if the
+            // entry already exists (e.g. repeated misbehaviour) the add
+            // fails silently.
+            let _ = self.ban_list.write().add(&target, now, now + duration);
+            self.flush_banlist();
+        }
+    }
+
+    /// What Core's `MaybeDiscourageAndDisconnect` (`net_processing.cpp`) does
+    /// with a peer that has misbehaved, in this order:
+    /// - a `noban` peer is not punished;
+    /// - nor is a manual connection (`addnode`, `-addnode`, `-connect`);
+    /// - a peer on a local address is disconnected, but its address is not
+    ///   punished, "since that would discourage all peers on the same local
+    ///   address". Every inbound onion peer arrives from the address Tor
+    ///   dialled from, usually loopback, as does every local integration;
+    /// - anyone else is disconnected and its address punished. Core
+    ///   discourages it; satd bans it for `-bantime`.
+    ///
+    /// satd went straight to the last step for every peer but `noban` ones.
+    /// One misbehaving inbound onion peer banned 127.0.0.1, which refused
+    /// every onion peer and unwhitelisted local client until the ban expired,
+    /// across restarts, and a manual peer was banned and then skipped by the
+    /// redial loop.
+    fn misbehaviour_action(info: &PeerInfo) -> MisbehaviourAction {
+        if info.permissions.noban {
+            return MisbehaviourAction::Keep("noban");
+        }
+        if info.conn_type == ConnType::Manual {
+            return MisbehaviourAction::Keep("manually connected");
+        }
+        // An outbound onion peer's `addr` is the `0.0.0.0` placeholder all
+        // onion peers share. Core's address for it is the onion host, which
+        // is not a local one, and is what it punishes.
+        if let Some(host) = &info.onion_host {
+            return MisbehaviourAction::Ban(crate::net::ban::BanTarget::Onion(host.clone()));
+        }
+        if crate::net::is_local(info.addr.ip()) {
+            return MisbehaviourAction::Disconnect;
+        }
+        MisbehaviourAction::Ban(crate::net::ban::BanTarget::Net(ipnet::IpNet::from(info.addr.ip())))
     }
 
     /// Run the main event loop. Returns when shutdown signal is received.
