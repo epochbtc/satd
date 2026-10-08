@@ -3749,7 +3749,9 @@ impl PeerManager {
     /// - a peer on a local address is disconnected, but its address is not
     ///   punished, "since that would discourage all peers on the same local
     ///   address". Every inbound onion peer arrives from the address Tor
-    ///   dialled from, usually loopback, as does every local integration;
+    ///   dialled from, usually loopback, as does every local integration.
+    ///   satd treats an inbound onion peer this way whatever that address
+    ///   is (see below);
     /// - anyone else is disconnected and its address punished. Core
     ///   discourages it; satd bans it for `-bantime`.
     ///
@@ -3771,7 +3773,14 @@ impl PeerManager {
         if let Some(host) = &info.onion_host {
             return MisbehaviourAction::Ban(crate::net::ban::BanTarget::Onion(host.clone()));
         }
-        if crate::net::is_local(info.addr.ip()) {
+        // Core tests the address alone (`pnode.addr.IsLocal()`), and names
+        // an inbound onion peer only in its log line: Tor on this host dials
+        // from loopback. With Tor on another host (`-bind=<lan address>=onion`)
+        // every onion peer arrives from that host's address. Core discourages
+        // it, and still admits it while inbound slots are free; satd's ban
+        // would refuse every onion peer for `-bantime`. So an inbound onion
+        // peer is disconnected without a ban wherever Tor dials from.
+        if crate::net::is_local(info.addr.ip()) || info.inbound_onion {
             return MisbehaviourAction::Disconnect;
         }
         MisbehaviourAction::Ban(crate::net::ban::BanTarget::Net(ipnet::IpNet::from(info.addr.ip())))

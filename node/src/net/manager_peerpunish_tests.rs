@@ -124,6 +124,14 @@ fn misbehaviour_follows_cores_ladder() {
             Outcome::Disconnected,
         ),
         ("an inbound onion peer", onion(peer(1, "127.0.0.1:50000", Direction::Inbound)), Outcome::Disconnected),
+        // Tor on another host (`-bind=<lan address>:<port>=onion`): the
+        // address is the Tor host's, shared by every onion peer, so it is not
+        // banned either. See `misbehaviour_action`.
+        (
+            "an inbound onion peer forwarded from another host",
+            onion(peer(1, "192.168.1.20:50000", Direction::Inbound)),
+            Outcome::Disconnected,
+        ),
         ("an outbound peer on loopback", peer(1, "127.0.0.1:8333", Direction::Outbound), Outcome::Disconnected),
     ];
     for (case, info, expected) in cases {
