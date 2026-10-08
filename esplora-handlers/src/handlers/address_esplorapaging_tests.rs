@@ -39,6 +39,20 @@ fn after_txid_in_the_mempool_continues_after_it() {
     );
 }
 
+/// Between a block connecting and the mempool dropping its transactions, a
+/// transaction can be in both lists. The confirmed history is where it ends
+/// up, so the cursor continues there, after it, instead of restarting the
+/// confirmed history from its newest entry (the cursor itself).
+#[test]
+fn after_txid_in_both_lists_resolves_to_the_confirmed_one() {
+    let mempool = [txid(1), txid(10)];
+    let confirmed = [txid(10), txid(11)];
+    assert_eq!(
+        locate_after_txid(&mempool, &confirmed, &txid(10)),
+        Some(AfterTxid::Confirmed(1))
+    );
+}
+
 #[test]
 fn after_txid_outside_the_history_is_422_after_txid_not_found() {
     assert_eq!(locate_after_txid(&[txid(1)], &[txid(10)], &txid(99)), None);
@@ -66,15 +80,38 @@ fn after_txid_query_parses_or_is_a_bad_request() {
 #[test]
 fn mempool_rows_sort_in_admission_order_then_by_txid() {
     let mut rows = vec![
-        (300u64, txid(1), ()),
-        (200, txid(9), ()),
-        (100, txid(3), ()),
-        (200, txid(2), ()),
+        (300u64, txid(1)),
+        (200, txid(9)),
+        (100, txid(3)),
+        (200, txid(2)),
     ];
     sort_in_admission_order(&mut rows);
-    let order: Vec<(u64, Txid)> = rows.into_iter().map(|(t, id, ())| (t, id)).collect();
     assert_eq!(
-        order,
+        rows,
         vec![(100, txid(3)), (200, txid(2)), (200, txid(9)), (300, txid(1))]
+    );
+}
+
+/// A transaction both lists hold (a block just connected, the mempool has
+/// not dropped it yet) is listed once, as confirmed.
+#[test]
+fn mempool_rows_already_confirmed_are_listed_only_as_confirmed() {
+    let confirmed = [
+        ConfirmedTxRef {
+            txid: txid(10),
+            height: 7,
+        },
+        ConfirmedTxRef {
+            txid: txid(11),
+            height: 6,
+        },
+    ];
+    assert_eq!(
+        without_confirmed(vec![txid(1), txid(10), txid(2)], &confirmed),
+        vec![txid(1), txid(2)]
+    );
+    assert_eq!(
+        without_confirmed(vec![txid(1), txid(2)], &[]),
+        vec![txid(1), txid(2)]
     );
 }

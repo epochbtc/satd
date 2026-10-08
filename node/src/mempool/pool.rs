@@ -13,6 +13,10 @@ use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
 use node_sp_index::{compute_tweak, TweakEntry};
 
+#[cfg(test)]
+#[path = "pool_esplorapaging_tests.rs"]
+mod esplorapaging_tests;
+
 /// Capacity of the broadcast channel carrying [`MempoolEvent`]s.
 ///
 /// This is not a queue depth. `broadcast::send` never blocks and never
@@ -3379,6 +3383,18 @@ impl Mempool {
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().entries.get(txid).cloned()
+    }
+
+    /// The admission time (`MempoolEntry::time`) of each of `txids` that is
+    /// in the pool, under one read lock and without cloning any transaction.
+    /// A txid not in the pool is left out. Lets a reader order a large set of
+    /// entries and then fetch only the few it serves.
+    pub fn admission_times(&self, txids: &[Txid]) -> Vec<(Txid, u64)> {
+        let inner = self.inner.read();
+        txids
+            .iter()
+            .filter_map(|txid| inner.entries.get(txid).map(|entry| (*txid, entry.time)))
+            .collect()
     }
 
     /// Get a transaction, and its txid, by wtxid: the id a BIP 339 peer
