@@ -398,7 +398,7 @@ impl ElectrumServer {
 ///   dispatch, write response.
 async fn handle_connection<S>(
     stream: S,
-    mut dispatch: BoxedDispatch,
+    dispatch: BoxedDispatch,
     mut notify_rx: mpsc::Receiver<String>,
     config: Arc<ElectrumConfig>,
     mut shutdown: watch::Receiver<bool>,
@@ -411,6 +411,8 @@ where
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let request_timeout = config.request_timeout;
     let max_batch = config.max_batch_requests;
+    // Out only while a request runs on the blocking pool.
+    let mut dispatch = Some(dispatch);
 
     loop {
         tokio::select! {
@@ -451,17 +453,63 @@ where
                 // `select!` cancelling the read arm mid-line. Now that the line
                 // has been copied out, and only now, reset it for the next one.
                 buf.clear();
-                let response = match tokio::time::timeout(
-                    request_timeout,
-                    async { process_request(&mut dispatch, &line, max_batch) },
-                ).await {
-                    Ok(resp) => resp,
+                // The handlers are synchronous (RocksDB and flat-file
+                // reads), so the request runs on the blocking pool, not on
+                // this task: on the task it held an API-runtime worker for
+                // as long as it took, and the timeout around it could never
+                // fire because the dispatch finished on its first poll.
+                let mut owned = dispatch.take().expect("the dispatch comes back after every request");
+                let mut job = tokio::task::spawn_blocking(move || {
+                    let resp = process_request(&mut owned, &line, max_batch);
+                    (owned, resp)
+                });
+                let response = match tokio::time::timeout(request_timeout, &mut job).await {
+                    Ok(Ok((owned, resp))) => {
+                        dispatch = Some(owned);
+                        resp
+                    }
+                    Ok(Err(e)) => {
+                        // A panicking handler takes the connection's state
+                        // (its subscriptions) with it.
+                        tracing::warn!(
+                            target = "electrum::server",
+                            error = %e,
+                            "request handler failed — closing connection",
+                        );
+                        return Ok(());
+                    }
                     Err(_elapsed) => {
                         let err = JsonRpcError::bad_request(format!(
                             "request timed out after {}s", request_timeout.as_secs()
                         ));
                         let resp = Response::error(Value::Null, err);
-                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                        let resp_json = serde_json::to_string(&resp).unwrap_or_default();
+                        tracing::warn!(
+                            target = "electrum::server",
+                            timeout_secs = request_timeout.as_secs(),
+                            "request timed out — closing connection",
+                        );
+                        // The work cannot be interrupted and the connection's
+                        // state is inside it, so answer, close the stream, and
+                        // keep this task (and its connection slot) until the
+                        // work ends. A client that reconnects after every
+                        // timeout therefore cannot run more handlers at once
+                        // than `--electrummaxconns`.
+                        let _ = tokio::time::timeout(request_timeout, async {
+                            write_line(&mut write_half, &resp_json).await?;
+                            write_half.shutdown().await.map_err(FramingError::from)
+                        })
+                        .await;
+                        loop {
+                            tokio::select! {
+                                _ = &mut job => return Ok(()),
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
                     }
                 };
                 if let Some(resp_json) = response {
@@ -559,6 +607,10 @@ async fn reject_overflow(mut stream: TcpStream) -> io::Result<()> {
     }
     stream.shutdown().await
 }
+
+#[cfg(test)]
+#[path = "server_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 #[cfg(test)]
 mod tests {

@@ -21,6 +21,9 @@ use std::time::Duration;
 
 use p2p::RawPeer;
 
+#[path = "compact_blocks/unknown_parent.rs"]
+mod unknown_parent;
+
 mod p2p {
     use bitcoin::consensus::{deserialize, serialize};
     use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};

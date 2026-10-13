@@ -9,6 +9,7 @@ pub mod flow;
 pub mod ibd;
 pub mod limits;
 pub mod manager;
+pub mod orphan_blocks;
 pub mod peer;
 pub mod permissions;
 pub mod proxy;

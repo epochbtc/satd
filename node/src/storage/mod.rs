@@ -554,6 +554,54 @@ pub struct HeightHashScanStats {
     pub skipped_bad_value: u64,
 }
 
+/// One address-index row of a scripthash as it is keyed on disk: the
+/// transaction's ordinal plus the output (funding row) or input (spending
+/// row) index. Read by [`Store::addr_rows_desc`]; nothing outside the
+/// storage layer and the address index sees an ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AddrRowKey {
+    pub txseq: u64,
+    /// `true` for an `addr_spending` row, `false` for `addr_funding`.
+    pub spending: bool,
+    /// The vout of a funding row, the vin of a spending row.
+    pub index: u32,
+}
+
+/// A run of a scripthash's address rows, newest first. See
+/// [`Store::addr_rows_desc`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddrRowsDesc {
+    /// Rows in descending ordinal order. Every row of each ordinal in the
+    /// run is present: a run never ends between two rows of one
+    /// transaction.
+    pub rows: Vec<AddrRowKey>,
+    /// Where the next run starts, to pass back as `below`: the lowest
+    /// ordinal in this run. `None` when the run reached the oldest row.
+    pub next_below: Option<u64>,
+}
+
+/// Cut `rows`, already in descending order and free of duplicates, into
+/// one [`AddrRowsDesc`] run: the rows of the first `min_txs` ordinals (at
+/// least one), and `next_below` set when rows were left over.
+pub(crate) fn cut_addr_run(mut rows: Vec<AddrRowKey>, min_txs: usize) -> AddrRowsDesc {
+    let mut seen = 0usize;
+    let mut last: Option<u64> = None;
+    let mut end = rows.len();
+    for (i, row) in rows.iter().enumerate() {
+        if last != Some(row.txseq) {
+            if seen >= min_txs.max(1) {
+                end = i;
+                break;
+            }
+            seen += 1;
+            last = Some(row.txseq);
+        }
+    }
+    let next_below = (end < rows.len()).then(|| rows[end - 1].txseq);
+    rows.truncate(end);
+    AddrRowsDesc { rows, next_below }
+}
+
 /// Abstract storage backend for block index, UTXO set, and metadata.
 pub trait Store: Send + Sync {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry>;
@@ -907,6 +955,47 @@ pub trait Store: Send + Sync {
         let mut v = self.iter_addr_spending(sh);
         v.truncate(limit);
         v
+    }
+
+    /// `sh`'s `addr_funding` and `addr_spending` rows with an ordinal below
+    /// `below` (all of them for `None`), newest first, without resolving
+    /// them: the read a newest-first history page needs, which can then
+    /// resolve only the transactions it shows.
+    ///
+    /// The run holds the rows of at least `min_txs` distinct ordinals, or
+    /// every remaining row when fewer are left, and never stops between two
+    /// rows of one ordinal. A caller continues with
+    /// [`AddrRowsDesc::next_below`] until it is `None`.
+    ///
+    /// The default reads the whole resolved history and maps it back to
+    /// ordinals: correct for any backend, bounded by nothing. The RocksDB
+    /// backend and the `CoinCache` over it seek instead.
+    fn addr_rows_desc(&self, sh: &Scripthash, below: Option<u64>, min_txs: usize) -> AddrRowsDesc {
+        let _ = min_txs;
+        let funding = self.iter_addr_funding(sh).into_iter().filter_map(|(k, _)| {
+            self.get_tx_seq(&k.txid).map(|txseq| AddrRowKey {
+                txseq,
+                spending: false,
+                index: k.vout,
+            })
+        });
+        let spending = self.iter_addr_spending(sh).into_iter().filter_map(|(k, _)| {
+            self.get_tx_seq(&k.txid).map(|txseq| AddrRowKey {
+                txseq,
+                spending: true,
+                index: k.vin,
+            })
+        });
+        let mut rows: Vec<AddrRowKey> = funding
+            .chain(spending)
+            .filter(|r| below.is_none_or(|b| r.txseq < b))
+            .collect();
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        rows.dedup();
+        AddrRowsDesc {
+            rows,
+            next_below: None,
+        }
     }
 
     /// Look up the input that spent `outpoint` on the active chain.

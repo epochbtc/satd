@@ -18,6 +18,7 @@
 //!   accept SSE.
 
 pub mod auth;
+pub mod blocking;
 pub mod config;
 pub mod encode;
 pub mod error;
@@ -26,6 +27,7 @@ pub mod router;
 pub mod serve;
 pub mod state;
 
+pub use blocking::work_permits_for;
 pub use config::{EsploraAuth, EsploraConfig};
 pub use error::EsploraError;
 pub use router::{RouterBuildError, build_router};

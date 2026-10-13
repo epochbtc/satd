@@ -2045,6 +2045,81 @@ impl Store for CoinCache {
         all
     }
 
+    fn addr_rows_desc(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        below: Option<u64>,
+        min_txs: usize,
+    ) -> crate::storage::AddrRowsDesc {
+        use crate::storage::{AddrRowKey, AddrRowsDesc};
+        // The not-yet-flushed rows of `sh`, keyed as on disk, so the merge
+        // below is the one the flush will make: the inner rows plus the
+        // pending puts, less the pending removes (a put and a remove of one
+        // key end up removed, as in `iter_addr_funding_limited`).
+        let wanted = |txseq: u64| below.is_none_or(|b| txseq < b);
+        let (removes, puts) = {
+            let pending = self.pending_batch.lock();
+            let removes: std::collections::HashSet<AddrRowKey> = pending
+                .addr_funding_removes
+                .iter()
+                .filter(|k| &k.scripthash == sh)
+                .map(|k| AddrRowKey {
+                    txseq: k.txseq,
+                    spending: false,
+                    index: k.vout,
+                })
+                .chain(
+                    pending
+                        .addr_spending_removes
+                        .iter()
+                        .filter(|k| &k.scripthash == sh)
+                        .map(|k| AddrRowKey {
+                            txseq: k.txseq,
+                            spending: true,
+                            index: k.vin,
+                        }),
+                )
+                .collect();
+            let puts: Vec<AddrRowKey> = pending
+                .addr_funding_puts
+                .iter()
+                .filter(|r| &r.scripthash == sh && wanted(r.txseq))
+                .map(|r| AddrRowKey {
+                    txseq: r.txseq,
+                    spending: false,
+                    index: r.vout,
+                })
+                .chain(
+                    pending
+                        .addr_spending_puts
+                        .iter()
+                        .filter(|r| &r.scripthash == sh && wanted(r.txseq))
+                        .map(|r| AddrRowKey {
+                            txseq: r.txseq,
+                            spending: true,
+                            index: r.vin,
+                        }),
+                )
+                .collect();
+            (removes, puts)
+        };
+        let inner = self.inner.addr_rows_desc(sh, below, min_txs);
+        // The inner run covers every ordinal down to its lowest one. A
+        // pending row below that belongs to the next run, which reads the
+        // inner rows it has to be merged with.
+        let floor = inner.next_below.unwrap_or(0);
+        let rows: std::collections::BTreeSet<AddrRowKey> = inner
+            .rows
+            .into_iter()
+            .chain(puts.into_iter().filter(|r| r.txseq >= floor))
+            .filter(|r| !removes.contains(r))
+            .collect();
+        AddrRowsDesc {
+            rows: rows.into_iter().rev().collect(),
+            next_below: inner.next_below,
+        }
+    }
+
     fn create_backfill_temp_cf(&self) -> Result<(), StoreError> {
         self.inner.create_backfill_temp_cf()
     }
@@ -2388,6 +2463,10 @@ fn resolve_spending_ref_via(
         height: resolved.height,
     })
 }
+
+#[cfg(test)]
+#[path = "coin_cache_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 #[cfg(test)]
 mod tests {
