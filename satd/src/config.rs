@@ -292,7 +292,7 @@ impl std::str::FromStr for EsploraAuthMode {
 /// don't allow `:` in the username because Core's rpcauth.py forbids it
 /// too (Basic-auth header is `user:pass`, so a `:` in the user breaks
 /// the decode).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcAuthEntry {
     pub username: String,
     /// The salt EXACTLY as written in the config line. Core's
@@ -303,6 +303,16 @@ pub struct RpcAuthEntry {
     pub salt: String,
     /// The expected HMAC-SHA256 tag, hex-decoded to 32 raw bytes.
     pub hash: Vec<u8>,
+}
+
+/// The salt and the tag together let anyone holding them test password
+/// guesses offline, so `Debug` shows the user only.
+impl std::fmt::Debug for RpcAuthEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcAuthEntry")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RpcAuthEntry {
@@ -408,7 +418,10 @@ pub struct ProfileDefaults {
 }
 
 /// Resolved node configuration after merging CLI args, config file, and defaults.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand (see the impl below): the struct holds RPC, Tor,
+/// Esplora and webhook secrets.
+#[derive(Clone)]
 pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
@@ -1423,6 +1436,19 @@ pub struct Config {
     /// up, so logging from inside the resolver would silently disappear
     /// (round-3 M2). Consumed once by `take_pending_notes`.
     pub pending_notes: Vec<ConfigNote>,
+}
+
+/// `Config` holds `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`
+/// and `reorgwebhooksecret`, so a derived `Debug` would print them wherever a
+/// config reached a `{:?}` or a panic message. This one names the network
+/// and the data directory and nothing else.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("network", &self.network)
+            .field("datadir", &self.datadir)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A deferred operator-facing note emitted during config load. Its
@@ -8077,6 +8103,13 @@ pub fn filter_unsupported_core_cli_args(
     Ok((kept, warnings))
 }
 
+/// Trim a `bitcoin.conf` line, key or value the way Bitcoin Core does
+/// (`TrimString(str, " \t\r\n")` in src/common/config.cpp): spaces, tabs,
+/// CRs and LFs only, not every Unicode whitespace character.
+fn trim_conf_whitespace(s: &str) -> &str {
+    s.trim_matches([' ', '\t', '\r', '\n'])
+}
+
 /// Parsed bitcoin.conf file.
 #[derive(Debug, Default)]
 pub struct ConfigFile {
@@ -8106,8 +8139,15 @@ impl ConfigFile {
 
         for (idx, line) in content.lines().enumerate() {
             let line_no = idx + 1;
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            // Bitcoin Core's GetConfigOptions (src/common/config.cpp): a `#`
+            // anywhere on a line starts a comment, and what is left is
+            // trimmed of spaces, tabs, CRs and LFs.
+            let (line, used_hash) = match line.find('#') {
+                Some(pos) => (&line[..pos], true),
+                None => (line, false),
+            };
+            let trimmed = trim_conf_whitespace(line);
+            if trimmed.is_empty() {
                 continue;
             }
 
@@ -8120,12 +8160,22 @@ impl ConfigFile {
 
             // Key=value or bare key
             let (key, value) = if let Some(eq_pos) = trimmed.find('=') {
-                let k = trimmed[..eq_pos].trim().to_string();
-                let v = trimmed[eq_pos + 1..].trim().to_string();
+                let k = trim_conf_whitespace(&trimmed[..eq_pos]).to_string();
+                let v = trim_conf_whitespace(&trimmed[eq_pos + 1..]).to_string();
                 (k, v)
             } else {
                 (trimmed.to_string(), "1".to_string())
             };
+
+            // Core refuses a `#` on an rpcpassword line rather than guess
+            // whether it starts a comment or belongs to the password. Its
+            // check is a substring match on the key, as here.
+            if used_hash && key.contains("rpcpassword") {
+                return Err(format!(
+                    "Error reading configuration file: parse error on line {line_no}, using # \
+                     in rpcpassword can be ambiguous and should be avoided"
+                ));
+            }
 
             // Accept Bitcoin Core's hyphenated `reindex-chainstate` config
             // spelling — Core's own conf-file key is hyphenated, so a
@@ -8899,6 +8949,39 @@ pub fn build_env_filter(config: &Config) -> tracing_subscriber::EnvFilter {
     env_filter
 }
 
+/// Target prefixes of dependency crates whose TRACE output prints raw
+/// requests. jsonrpsee-server logs each HTTP request with its headers,
+/// `Authorization` included, before satd's auth layer has run
+/// (jsonrpsee-server 0.26 `src/server.rs:1026`), and jsonrpsee-core logs call
+/// parameters, raw request bodies and responses (`src/server/rpc_module.rs:310,
+/// 356, 409`). tungstenite logs every WebSocket frame with its payload
+/// (`src/protocol/frame/mod.rs:228, 257`). Bitcoin Core logs no credentials
+/// and no RPC parameters at any level.
+const REQUEST_DUMP_TARGET_PREFIXES: [&str; 2] = ["jsonrpsee", "tungstenite"];
+
+/// Whether `meta` is TRACE output from one of [`REQUEST_DUMP_TARGET_PREFIXES`].
+fn is_request_dump(meta: &tracing::Metadata<'_>) -> bool {
+    *meta.level() == tracing::Level::TRACE
+        && REQUEST_DUMP_TARGET_PREFIXES
+            .iter()
+            .any(|prefix| meta.target().starts_with(prefix))
+}
+
+/// A global filter layer that drops [`is_request_dump`] spans and events. Their
+/// DEBUG and higher output still follows the [`build_env_filter`] filter.
+///
+/// It is a separate layer rather than an `EnvFilter` directive because
+/// `EnvFilter` lets the most specific directive win: a `RUST_LOG` naming a
+/// longer target, such as `jsonrpsee_core::server=trace`, would override a
+/// `jsonrpsee_core=debug` cap. No `-loglevel`, `-debug`, `logging` call or
+/// `RUST_LOG` value can turn this layer off.
+pub fn request_dump_guard<S: tracing::Subscriber>() -> impl tracing_subscriber::Layer<S> {
+    tracing_subscriber::filter::FilterFn::new(|meta: &tracing::Metadata<'_>| !is_request_dump(meta))
+        // Allows any level itself, so the EnvFilter's hint still sets the
+        // global maximum level.
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE)
+}
+
 /// Normalize a Bitcoin Core `-loglevel` severity to a `tracing` level.
 /// Core accepts `trace|debug|info|warning|error`; `tracing` spells the
 /// warning level `warn`. Returns `None` for an unrecognized level.
@@ -9315,6 +9398,10 @@ fn check_money_range(rate: u64, raw: &str) -> Result<u64, String> {
     }
     Ok(rate)
 }
+
+#[cfg(test)]
+#[path = "config_localharden_tests.rs"]
+mod localharden_tests;
 
 #[cfg(test)]
 mod tests {

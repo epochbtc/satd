@@ -2,6 +2,7 @@ pub mod block;
 pub mod pow;
 pub mod script;
 pub mod signet;
+pub mod sigops;
 pub mod tx;
 pub mod versionbits;
 

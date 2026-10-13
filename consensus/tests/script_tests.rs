@@ -11,7 +11,9 @@ use consensus::error::ScriptError;
 use consensus::flags;
 use consensus::sighash::TxSignatureChecker;
 use consensus::verify::verify_script;
-use helpers::{parse_expected_error, parse_flags, parse_script};
+use helpers::{
+    parse_expected_error, parse_flags, parse_script, parse_witness_row, TAPROOT_OUTPUT_MARKER,
+};
 use serde_json::Value;
 
 /// Build a crediting transaction that pays `value` to `script_pubkey`.
@@ -79,6 +81,7 @@ fn test_script_vectors() {
     let mut failed = 0;
     let mut skipped = 0;
     let mut total = 0;
+    let mut taproot_rows = 0;
 
     for test in &tests {
         if test.is_string() {
@@ -88,6 +91,7 @@ fn test_script_vectors() {
         let arr = test.as_array().unwrap();
 
         total += 1;
+        let mut taproot_output: Option<Vec<u8>> = None;
 
         // Parse witness format vs standard format
         let (witness_items, script_sig_str, script_pubkey_str, flags_str, expected_error_str, n_value) =
@@ -98,12 +102,6 @@ fn test_script_vectors() {
                 }
                 let wit_arr = arr[0].as_array().unwrap();
                 let script_pubkey_str = arr[2].as_str().unwrap();
-
-                // Skip auto-generated taproot tests
-                if script_pubkey_str.contains("#TAPROOTOUTPUT#") {
-                    skipped += 1;
-                    continue;
-                }
 
                 // Last element of witness array is the amount
                 let amount = if let Some(v) = wit_arr.last() {
@@ -116,31 +114,13 @@ fn test_script_vectors() {
                     0
                 };
 
-                // All elements except the last are witness stack items (hex)
-                // Skip tests using #SCRIPT# or #CONTROLBLOCK# syntax
-                let mut has_special = false;
-                let wit: Vec<Vec<u8>> = wit_arr[..wit_arr.len() - 1]
-                    .iter()
-                    .map(|v| {
-                        let s = v.as_str().unwrap();
-                        if s.starts_with('#') {
-                            has_special = true;
-                            Vec::new()
-                        } else {
-                            hex::decode(s).unwrap_or_else(|e| {
-                                panic!("Bad witness hex '{s}': {e}");
-                            })
-                        }
-                    })
-                    .collect();
-
-                if has_special {
-                    skipped += 1;
-                    continue;
-                }
+                // All elements except the last are witness stack items: hex,
+                // or Core's #SCRIPT# / #CONTROLBLOCK# taproot markers.
+                let row = parse_witness_row(&wit_arr[..wit_arr.len() - 1]);
+                taproot_output = row.taproot_output;
 
                 (
-                    wit,
+                    row.stack,
                     arr[1].as_str().unwrap(),
                     script_pubkey_str,
                     arr[3].as_str().unwrap(),
@@ -177,7 +157,14 @@ fn test_script_vectors() {
         }
 
         let script_sig = parse_script(script_sig_str);
-        let script_pubkey = parse_script(script_pubkey_str);
+        // Core auto-generates the taproot output for this marker
+        // (src/test/script_tests.cpp:966-970).
+        let script_pubkey = if script_pubkey_str == TAPROOT_OUTPUT_MARKER {
+            taproot_rows += 1;
+            taproot_output.take().expect("no tapscript leaf to build the output from")
+        } else {
+            parse_script(script_pubkey_str)
+        };
 
         // Build synthetic transactions (same as Bitcoin Core's test harness)
         let credit_tx = build_crediting_tx(&script_pubkey, n_value);
@@ -223,12 +210,15 @@ fn test_script_vectors() {
     }
 
     eprintln!(
-        "\nScript tests: {passed} passed, {failed} failed, {skipped} skipped out of {total} total"
+        "\nScript tests: {passed} passed, {failed} failed, {skipped} skipped out of {total} total \
+         ({taproot_rows} taproot rows)"
     );
     assert_eq!(
         failed, 0,
         "{failed} script tests failed (see output above)"
     );
+    // The five tapscript rows of Core's file run, not skip.
+    assert_eq!(taproot_rows, 5, "taproot rows run");
 }
 
 /// Smoke test: verify_script with 1+2=3

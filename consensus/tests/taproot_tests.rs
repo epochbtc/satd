@@ -1,6 +1,7 @@
 //! Taproot tests: BIP341 wallet vectors (key-path spending with real signed tx)
-//! and hand-crafted tapscript tests replacing the auto-generated ones from
-//! Bitcoin Core's script_tests.json.
+//! and hand-crafted tapscript tests. The taproot rows of Bitcoin Core's
+//! script_tests.json run in script_tests.rs, and Core's taproot script assets
+//! in script_assets_tests.rs.
 
 mod helpers;
 

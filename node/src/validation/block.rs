@@ -67,11 +67,6 @@ pub fn check_block(
     network: Network,
     height: u32,
 ) -> Result<(), ValidationError> {
-    // Block must have at least one transaction
-    if block.txdata.is_empty() {
-        return Err(ValidationError::EmptyBlock);
-    }
-
     // Check merkle root. Core runs `CheckMerkleRoot` FIRST, ahead of the size
     // limits and the coinbase-position tests (`validation.cpp`, `CheckBlock`),
     // because "all potential-corruption validation must be done before we do
@@ -79,16 +74,17 @@ pub fn check_block(
     // a header must not get the header marked invalid. A block that is both
     // oversized and merkle-broken therefore answers `bad-txnmrklroot`, not
     // `bad-blk-length`.
-    let computed = block.compute_merkle_root();
-    match computed {
-        Some(root) => {
-            if root != block.header.merkle_root {
-                return Err(ValidationError::BadMerkleRoot);
-            }
-        }
-        None => {
-            return Err(ValidationError::EmptyBlock);
-        }
+    //
+    // That includes a block with no transactions at all. Core's
+    // `ComputeMerkleRoot` returns all-zero for an empty list, so an empty body
+    // sent for a real header is `bad-txnmrklroot` (`BLOCK_MUTATED`): it says
+    // nothing about the block the header names. Only an empty body under an
+    // all-zero merkle root reaches the size limits below.
+    let computed = block
+        .compute_merkle_root()
+        .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
+    if computed != block.header.merkle_root {
+        return Err(ValidationError::BadMerkleRoot);
     }
 
     // CVE-2012-2459: reject a merkle-mutated block. A tx list that duplicates a
@@ -99,6 +95,12 @@ pub fn check_block(
     // right stage, rather than later in connect_block as a double-spend.
     if merkle_tree_mutated(block) {
         return Err(ValidationError::BadTxDuplicate);
+    }
+
+    // Core's size-limits test opens with `block.vtx.empty()`, under the same
+    // `bad-blk-length` reason.
+    if block.txdata.is_empty() {
+        return Err(ValidationError::EmptyBlock);
     }
 
     // Size limits, split exactly as Core splits them (#548):
@@ -136,17 +138,12 @@ pub fn check_block(
     // p2sh sigops", but it is a hard ceiling a block cannot talk its way out
     // of, and it fires ahead of `bad-txns-inputs-missingorspent`.
     // `connect_block` still applies the full accurate count.
-    let mut legacy_sigops: usize = 0;
+    let mut legacy_sigops: u64 = 0;
     for tx in &block.txdata {
-        for input in &tx.input {
-            legacy_sigops = legacy_sigops.saturating_add(input.script_sig.count_sigops_legacy());
-        }
-        for output in &tx.output {
-            legacy_sigops =
-                legacy_sigops.saturating_add(output.script_pubkey.count_sigops_legacy());
-        }
+        legacy_sigops =
+            legacy_sigops.saturating_add(crate::validation::sigops::legacy_sigop_count(tx));
     }
-    if legacy_sigops.saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_SIGOPS_COST {
+    if legacy_sigops.saturating_mul(WITNESS_SCALE_FACTOR as u64) > MAX_BLOCK_SIGOPS_COST as u64 {
         return Err(ValidationError::BadBlockSigops);
     }
 
@@ -536,11 +533,39 @@ mod tests {
         assert!(check_block(&genesis, Network::Regtest, 0).is_ok());
     }
 
+    /// Core's `feature_block.py` b46: no transactions under an all-zero merkle
+    /// root reaches the size limits and is `bad-blk-length`.
     #[test]
     fn test_empty_block_rejected() {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         block.txdata.clear();
-        assert!(matches!(check_block(&block, Network::Regtest, 0), Err(ValidationError::EmptyBlock)));
+        block.header.merkle_root = bitcoin::TxMerkleNode::all_zeros();
+        let err = check_block(&block, Network::Regtest, 0).unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyBlock), "{err:?}");
+        assert_eq!(err.to_string(), "bad-blk-length");
+        assert!(!err.is_mutation_class());
+    }
+
+    /// An empty body sent for a real header: Core's `CheckMerkleRoot` runs
+    /// first and compares the header against the all-zero root of an empty
+    /// list, so the answer is `bad-txnmrklroot` (`BLOCK_MUTATED`), not
+    /// `bad-blk-length`. The difference decides whether the header's hash may
+    /// be marked invalid for it.
+    ///
+    /// Perturbation: move the `txdata.is_empty()` test back above the merkle
+    /// comparison and this returns `EmptyBlock`.
+    #[test]
+    fn an_empty_body_under_a_real_merkle_root_is_a_merkle_mismatch() {
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata.clear();
+        let err = check_block(&block, Network::Regtest, 0).unwrap_err();
+        assert!(matches!(err, ValidationError::BadMerkleRoot), "{err:?}");
+        assert_eq!(err.to_string(), "bad-txnmrklroot");
+        assert!(err.is_mutation_class());
+        assert!(
+            is_block_mutated(&block, true),
+            "the P2P gate and check_block must agree on this body"
+        );
     }
 
     #[test]

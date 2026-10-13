@@ -148,20 +148,21 @@ impl TorController {
         // control port is trusted" model (same as Bitcoin Core): the bytes are
         // only fed into the HMAC, never sent or logged, and the SERVERHASH check
         // below fails unless the port already knows the file — i.e. it is the
-        // real Tor. No confidentiality leak results.
-        let cookie = std::fs::read(cookie_path).map_err(|e| {
-            format!(
-                "Tor SAFECOOKIE: cannot read cookie file {}: {} (run satd as a user that can read \
-                 it, or set CookieAuthFileGroupReadable 1 in torrc)",
-                cookie_path, e
-            )
-        })?;
+        // real Tor. No confidentiality leak results. The read itself is
+        // bounded (see `read_cookie_file`), so a path such as /dev/zero or a
+        // FIFO cannot exhaust memory or stall startup.
+        let cookie = read_cookie_file(cookie_path)?;
         if cookie.len() != COOKIE_LEN {
+            // At most COOKIE_LEN + 1 bytes were read, so a longer read means
+            // "longer than the cookie", not its exact size.
+            let size = if cookie.len() > COOKIE_LEN {
+                format!("more than {COOKIE_LEN}")
+            } else {
+                cookie.len().to_string()
+            };
             return Err(format!(
                 "Tor SAFECOOKIE: cookie file {} is {} bytes, expected {}",
-                cookie_path,
-                cookie.len(),
-                COOKIE_LEN
+                cookie_path, size, COOKIE_LEN
             ));
         }
 
@@ -355,6 +356,51 @@ impl TorController {
             Err(format!("Tor {} failed: {}", what, reply.join(" / ")))
         }
     }
+}
+
+/// Open the SAFECOOKIE cookie file the control port named and read at most
+/// `COOKIE_LEN + 1` bytes of it.
+///
+/// Bitcoin Core reads the cookie with `ReadBinaryFile(cookiefile,
+/// TOR_COOKIE_SIZE)` (`torcontrol.cpp`), which never reads more than 32 bytes.
+/// The path comes from the control port, so nothing guarantees it names a
+/// small regular file: a read of `/dev/zero` to end of file never ends, and
+/// opening a FIFO for reading waits for a writer. The file is opened
+/// non-blocking and must be a regular file. One byte past the cookie length is
+/// read so that a longer file is refused by the caller's length check instead
+/// of being truncated to a cookie.
+fn read_cookie_file(cookie_path: &str) -> Result<Vec<u8>, String> {
+    let unreadable = |e: std::io::Error| {
+        format!(
+            "Tor SAFECOOKIE: cannot read cookie file {}: {} (run satd as a user that can read \
+             it, or set CookieAuthFileGroupReadable 1 in torrc)",
+            cookie_path, e
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(cookie_path).map_err(unreadable)?;
+    let metadata = file.metadata().map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Tor SAFECOOKIE: cookie file {} is not a regular file",
+            cookie_path
+        ));
+    }
+    read_cookie_bytes(file).map_err(unreadable)
+}
+
+/// Read at most `COOKIE_LEN + 1` bytes from `reader`.
+fn read_cookie_bytes(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut cookie = Vec::with_capacity(COOKIE_LEN + 1);
+    reader.take(COOKIE_LEN as u64 + 1).read_to_end(&mut cookie)?;
+    Ok(cookie)
 }
 
 /// HMAC-SHA256(key, msg).
@@ -583,5 +629,181 @@ mod tests {
             sent.is_empty(),
             "client leaked a proof to an unverified server"
         );
+    }
+
+    /// A control port that offers SAFECOOKIE and names `cookie_path` as the
+    /// cookie file, then waits for the client's next line. Returns that line
+    /// (empty if the client hung up without sending one).
+    async fn fake_tor_naming_cookie(listener: TcpListener, cookie_path: String) -> String {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(stream);
+        let mut reader = BufReader::new(rh);
+        let mut l = String::new();
+        reader.read_line(&mut l).await.unwrap();
+        assert!(l.starts_with("PROTOCOLINFO"), "got: {l}");
+        wh.write_all(
+            format!(
+                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=SAFECOOKIE COOKIEFILE=\"{cookie_path}\"\r\n250 OK\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut next = String::new();
+        let _ = reader.read_line(&mut next).await;
+        next
+    }
+
+    /// Connect to a fake control port naming `cookie_path` and authenticate,
+    /// in a task of its own so the caller can time it out.
+    fn spawn_authenticate(addr: String) -> tokio::task::JoinHandle<Result<(), String>> {
+        tokio::spawn(async move {
+            let mut ctrl = TorController::connect(&addr).await?;
+            ctrl.authenticate(None).await
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safecookie_refuses_a_fifo_cookie_path() {
+        // Opening a FIFO for reading waits for a writer. The cookie path comes
+        // from the control port, so naming a FIFO must not stall startup: the
+        // file has to be refused as not a regular file, promptly.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("cookie.fifo");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        // The client runs on a runtime of its own in its own thread: if it
+        // blocks in open(2), this thread's timeout still fires.
+        let cookie_path = fifo.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                let server = tokio::spawn(fake_tor_naming_cookie(listener, cookie_path));
+                let auth = async {
+                    let mut ctrl = TorController::connect(&addr).await?;
+                    ctrl.authenticate(None).await
+                }
+                .await;
+                (auth, server.await.unwrap())
+            });
+            let _ = tx.send(outcome);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok((auth, next)) => {
+                client.join().unwrap();
+                let err = auth.unwrap_err();
+                assert!(err.contains("not a regular file"), "got: {err}");
+                assert!(
+                    !next.starts_with("AUTHCHALLENGE"),
+                    "client went on to AUTHCHALLENGE with a refused cookie: {next}"
+                );
+            }
+            Err(_) => {
+                // Release the reader blocked in open(2) so its thread ends,
+                // then fail. O_NONBLOCK: never wait here for a reader.
+                use std::os::unix::fs::OpenOptionsExt;
+                drop(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo),
+                );
+                let _ = client.join();
+                panic!("authenticate blocked on a FIFO named as the Tor cookie file");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safecookie_refuses_a_device_cookie_path() {
+        // A character device such as /dev/zero never reaches end of file, so a
+        // read to EOF would not end. It is not a regular file, so it is refused
+        // before any read.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_naming_cookie(listener, "/dev/zero".to_string()));
+        let auth = spawn_authenticate(addr);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), auth)
+            .await
+            .expect("authenticate did not return for a /dev/zero cookie path")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+    }
+
+    #[tokio::test]
+    async fn safecookie_refuses_a_cookie_file_longer_than_32_bytes() {
+        // Tor writes exactly 32 bytes. A longer file is refused rather than
+        // truncated to its first 32 bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.authcookie");
+        std::fs::write(&path, [7u8; 64]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_naming_cookie(
+            listener,
+            path.to_str().unwrap().to_string(),
+        ));
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), spawn_authenticate(addr))
+            .await
+            .expect("authenticate timed out")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("is more than 32 bytes"), "got: {err}");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+    }
+
+    /// A reader with `len` bytes available that counts how many it served.
+    struct CountingReader {
+        remaining: usize,
+        served: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(0xab);
+            self.remaining -= n;
+            self.served.set(self.served.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn cookie_read_stops_one_byte_past_the_cookie_length() {
+        let served = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = CountingReader {
+            remaining: 1 << 20,
+            served: served.clone(),
+        };
+        let cookie = read_cookie_bytes(reader).unwrap();
+        assert_eq!(cookie.len(), COOKIE_LEN + 1);
+        assert!(
+            served.get() <= COOKIE_LEN + 1,
+            "read {} bytes from a 1 MiB source; the cookie read must stop at {}",
+            served.get(),
+            COOKIE_LEN + 1
+        );
+
+        // An exact 32-byte source reads as the cookie.
+        let served = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = CountingReader {
+            remaining: COOKIE_LEN,
+            served,
+        };
+        assert_eq!(read_cookie_bytes(reader).unwrap().len(), COOKIE_LEN);
     }
 }
