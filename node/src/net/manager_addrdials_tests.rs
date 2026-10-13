@@ -571,3 +571,34 @@ async fn a_banned_onion_host_is_neither_learned_nor_dialled_automatically() {
     assert!(!listed(&later), "a banned onion host is not learned");
     assert!(listed(&host('e')), "an open one is");
 }
+
+/// `setban <host>.onion` disconnects a connected peer at that onion host, as
+/// Core's `setban` disconnects the peers the ban covers. satd matched a ban
+/// against peers' IP addresses only, and an onion peer's is the `0.0.0.0`
+/// placeholder, so the peer stayed.
+#[test]
+fn setban_of_an_onion_host_disconnects_that_peer_only() {
+    let (pm, _dir) = mk_pm();
+    let placeholder = SocketAddr::from(([0, 0, 0, 0], 8333));
+    let host = |c: char| format!("{}.onion", c.to_string().repeat(56));
+    for (id, h) in [(1, host('a')), (2, host('b'))] {
+        let mut info = peer(id, placeholder, Direction::Outbound);
+        info.onion_host = Some(h);
+        add_peer(&pm, info);
+    }
+    add_peer(&pm, peer(3, SocketAddr::from(([198, 51, 100, 3], 8333)), Direction::Outbound));
+    let now = crate::time::now_secs();
+    pm.set_ban_subnet(&crate::net::ban::BanTarget::Onion(host('a')), true, now, now + 3600).unwrap();
+    let ids: std::collections::BTreeSet<PeerId> = pm.peers.read().keys().copied().collect();
+    assert_eq!(ids, [2, 3].into_iter().collect(), "only the banned onion peer is disconnected");
+
+    // A ban of an IP range does not reach onion peers through their placeholder.
+    pm.set_ban_subnet(
+        &crate::net::ban::BanTarget::Net("0.0.0.0/8".parse().unwrap()),
+        true,
+        now,
+        now + 3600,
+    )
+    .unwrap();
+    assert!(pm.peers.read().contains_key(&2), "the other onion peer stays");
+}

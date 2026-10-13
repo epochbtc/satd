@@ -3671,14 +3671,25 @@ impl PeerManager {
             .already_banned(target, is_subnet, crate::time::now_secs())
     }
 
-    /// Disconnect every peer whose IP falls within `target`.
+    /// Disconnect every peer `target` covers: an onion peer by its onion
+    /// host, any other by its IP. An onion peer's IP is the `0.0.0.0`
+    /// placeholder they all share, so matching it said nothing about the
+    /// peer: `setban <host>.onion` left that peer connected.
     fn disconnect_banned_peers(&self, target: &crate::net::ban::BanTarget) {
         let ids_to_disconnect: Vec<u64> = {
             let peers = self.peers.read();
             peers
                 .iter()
                 .filter_map(|(id, handle)| {
-                    if target.contains_addr(&handle.info.addr.ip()) {
+                    let covered = match (target, handle.info.onion_host.as_deref()) {
+                        (crate::net::ban::BanTarget::Onion(host), Some(peer_host)) => host == peer_host,
+                        (crate::net::ban::BanTarget::Onion(_), None) => false,
+                        (crate::net::ban::BanTarget::Net(_), Some(_)) => false,
+                        (crate::net::ban::BanTarget::Net(_), None) => {
+                            target.contains_addr(&handle.info.addr.ip())
+                        }
+                    };
+                    if covered {
                         Some(*id)
                     } else {
                         None
