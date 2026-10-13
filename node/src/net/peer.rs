@@ -276,6 +276,11 @@ pub struct PeerInfo {
     /// dedup, getpeerinfo, and addrman can distinguish onion peers. `None`
     /// for clearnet and inbound peers.
     pub onion_host: Option<String>,
+    /// The peer came in on the listener a Tor hidden service forwards to
+    /// (`-bind=…=onion`): Core's `CNode::m_inbound_onion`. Its socket address
+    /// is the one Tor dialled from, usually loopback, and says nothing about
+    /// the peer.
+    pub inbound_onion: bool,
     /// The local socket address this connection is bound to
     /// (`getsockname()`), behind `getpeerinfo`'s `addrbind`. `None` until the
     /// socket exists, and for onion peers, whose local end belongs to the
@@ -330,6 +335,7 @@ impl PeerInfo {
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
+            inbound_onion: false,
             conn_type: match direction {
                 Direction::Inbound => ConnType::Inbound,
                 Direction::Outbound => ConnType::OutboundFullRelay,
@@ -422,9 +428,10 @@ impl PeerInfo {
             .as_secs();
 
         let addr_str = self.addr_string();
-        // Derive the peer's network from its address.
-        let network = if let Some(ref onion) = self.onion_host {
-            let _ = onion; // suppress unused
+        // Derive the peer's network from its address. A peer that came in on
+        // the onion listener is on the onion network whatever address Tor
+        // dialled from: Core's `ConnectedThroughNetwork` (`net.cpp`).
+        let network = if self.onion_host.is_some() || self.inbound_onion {
             "onion"
         } else if !crate::net::is_routable(self.addr.ip()) {
             "not_publicly_routable"
