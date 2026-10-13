@@ -451,6 +451,13 @@ impl LearnedAddrs {
         true
     }
 
+    /// Drop `addr` from the list.
+    fn remove(&mut self, addr: &SocketAddr) {
+        if self.members.remove(addr) {
+            self.order.retain(|a| a != addr);
+        }
+    }
+
     #[cfg(test)]
     fn contains(&self, addr: &SocketAddr) -> bool {
         self.members.contains(addr)
@@ -1938,9 +1945,15 @@ impl PeerManager {
                 tracing::debug!(%addr, "Ignoring a gossiped address the address book does not take");
                 return;
             }
-            if !book.add_from(addr, now_unix_secs(), services, source) && !book.contains(&addr) {
+            let (inserted, evicted) = book.add_from_replacing(addr, now_unix_secs(), services, source);
+            if !inserted && !book.contains(&addr) {
                 tracing::debug!(%addr, "Not dialling a gossiped address the address book has no room for");
                 return;
+            }
+            // A full book makes room by dropping a terrible entry; it
+            // leaves the dial list with it.
+            if let Some(gone) = evicted {
+                self.learned_addrs.write().remove(&gone);
             }
         }
         self.push_learned(addr);
@@ -4155,6 +4168,11 @@ impl PeerManager {
             };
             if let Err(e) = &result {
                 tracing::debug!(%target, "Reconnect failed: {e}");
+                // What makes an address terrible, and so replaceable once
+                // the book is full (Core's `Attempt`).
+                if let PeerAddr::Socket(sa) = &target {
+                    pm.addrman.write().mark_attempt(*sa);
+                }
             }
             let connected = result.is_ok();
             let update = |state: &mut ReconnectState| {

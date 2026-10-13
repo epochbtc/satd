@@ -602,3 +602,52 @@ fn setban_of_an_onion_host_disconnects_that_peer_only() {
     .unwrap();
     assert!(pm.peers.read().contains_key(&2), "the other onion peer stays");
 }
+
+/// A full address book makes room for a new address by dropping a terrible
+/// entry (tried three times, never reached), as Core's does, and the dropped
+/// address leaves the dial list. satd's book refused every new address once
+/// full, for good. With nothing terrible to drop it still refuses.
+#[test]
+fn a_full_book_replaces_a_terrible_entry() {
+    let (pm, _dir) = mk_pm();
+    let source = IpAddr::from([198, 51, 100, 1]);
+    let full = crate::net::addrman::MAX_ENTRIES;
+    // 64 per /16, across enough groups to fill the book.
+    let addr_at = |i: usize| SocketAddr::from(([11 + (i / 64 / 256) as u8, ((i / 64) % 256) as u8, 1, (i % 64) as u8 + 1], 8333));
+    for i in 0..full {
+        pm.add_learned_addr_from(addr_at(i), 9, source);
+    }
+    assert_eq!(pm.addrman.read().len(), full, "fixture: the book is full");
+
+    let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
+    pm.add_learned_addr_from(fresh, 9, source);
+    assert!(!pm.addrman.read().contains(&fresh), "nothing terrible: refused");
+
+    let stale = addr_at(0);
+    for _ in 0..3 {
+        pm.addrman.write().mark_attempt(stale);
+    }
+    pm.add_learned_addr_from(fresh, 9, source);
+    assert!(pm.addrman.read().contains(&fresh), "the new address takes the terrible one's place");
+    assert!(!pm.addrman.read().contains(&stale));
+    assert_eq!(pm.addrman.read().len(), full);
+    assert!(pm.learned_addrs.read().contains(&fresh), "and is dialled");
+    assert!(!pm.learned_addrs.read().contains(&stale), "the dropped one is not");
+}
+
+/// A failed redial counts as an attempt in the address book: what makes an
+/// unreachable address terrible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_redial_counts_as_an_attempt() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    pm.add_learned_addr_from(addr, 9, IpAddr::from([198, 51, 100, 1]));
+    pm.reconnect_tick();
+    wait_for(&pm, || pm.reconnect_backoff.read().contains_key(&addr), "the dial fails").await;
+    settle(&pm).await;
+    let attempts = pm.addrman.read().iter().find(|e| e.addr == addr).map(|e| e.attempts);
+    assert_eq!(attempts, Some(1));
+}
