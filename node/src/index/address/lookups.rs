@@ -85,12 +85,17 @@ impl RocksAddressIndex {
         self.subs.clone()
     }
 
-    fn check_enabled(&self) -> Result<(), IndexError> {
-        if self.cfg.enabled {
-            Ok(())
-        } else {
-            Err(IndexError::Disabled)
+    /// Whether confirmed history can be served: the index is enabled AND
+    /// no address backfill is mid-run (see
+    /// [`crate::index::address::backfill::serving_allowed`]).
+    fn check_serving(&self) -> Result<(), IndexError> {
+        if !self.cfg.enabled {
+            return Err(IndexError::Disabled);
         }
+        if !crate::index::address::backfill::serving_allowed(self.store.as_ref()) {
+            return Err(IndexError::Incomplete);
+        }
+        Ok(())
     }
 }
 
@@ -104,7 +109,7 @@ impl AddressIndex for RocksAddressIndex {
         sh: &Scripthash,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows.
@@ -176,7 +181,7 @@ impl AddressIndex for RocksAddressIndex {
     }
 
     fn balance(&self, sh: &Scripthash) -> Result<(u64, i64), IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Confirmed balance = sum of live UTXOs. We walk the funding
         // rows for `sh` and ask the coins CF whether each outpoint is
@@ -229,7 +234,7 @@ impl AddressIndex for RocksAddressIndex {
         // the scan window would re-introduce the silent-truncation
         // bug. Tighter bounding would need a streaming Store API,
         // which is queued as a separate cleanup.
-        self.check_enabled()?;
+        self.check_serving()?;
 
         let funding = self.store.iter_addr_funding(sh);
         let spending = self.store.iter_addr_spending(sh);
@@ -294,7 +299,7 @@ impl AddressIndex for RocksAddressIndex {
         after: Option<bitcoin::Txid>,
         limit: usize,
     ) -> Result<Option<Vec<(u32, bitcoin::Txid)>>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
         // The rows are keyed by ordinal, which is chain order, so walking
         // them backwards from the cursor reaches the page without touching
         // the rest of the history. The page is in `(height, txid)` order,
@@ -366,7 +371,7 @@ impl AddressIndex for RocksAddressIndex {
     }
 
     fn utxos_limited(&self, sh: &Scripthash, limit: usize) -> Result<Vec<Utxo>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Same iteration shape as `balance`: walk funding rows, keep
         // those whose outpoint is still in the coins CF. Returns in

@@ -2817,6 +2817,22 @@ impl ChainState {
         (accepted, None)
     }
 
+    /// Run `f` under `accept_lock`, so no block connects or disconnects
+    /// while it runs. For the index backfills: their "is my anchor still on
+    /// the active chain" check and the row write it guards must not straddle
+    /// a reorg, or a row for a block the reorg just disconnected lands after
+    /// the disconnect removed it.
+    ///
+    /// `f` must not take `accept_lock` again (it is not reentrant) or call
+    /// anything that does (`accept_block`, `invalidate_block`, ...). Store
+    /// reads, `write_batch` and `flush` are fine: `accept_lock` comes before
+    /// every lock the coin cache takes, which is the order the chain
+    /// mutators already use.
+    pub(crate) fn with_accept_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _accept = self.accept_lock.lock();
+        f()
+    }
+
     /// Hold the accept lock, for tests that prove a read path never takes it.
     #[cfg(test)]
     pub(crate) fn hold_accept_lock_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {

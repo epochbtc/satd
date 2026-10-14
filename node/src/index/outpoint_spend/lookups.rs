@@ -28,6 +28,10 @@ impl SpendIndex for RocksSpendIndex {
         if !self.cfg.enabled {
             return Err(node_index::IndexError::Disabled);
         }
+        // The address backfill writes these rows too (its second pass).
+        if !crate::index::address::backfill::serving_allowed(self.store.as_ref()) {
+            return Err(node_index::IndexError::Incomplete);
+        }
         let result = self
             .store
             .lookup_spend(outpoint)
@@ -55,6 +59,10 @@ impl SpendIndex for RocksSpendIndex {
     ) -> Result<Vec<(u32, SpendingRef)>, node_index::IndexError> {
         if !self.cfg.enabled {
             return Err(node_index::IndexError::Disabled);
+        }
+        // The address backfill writes these rows too (its second pass).
+        if !crate::index::address::backfill::serving_allowed(self.store.as_ref()) {
+            return Err(node_index::IndexError::Incomplete);
         }
         // Same completeness contract as `spend_of`, applied to the whole
         // transaction: an empty result on an index that is not known

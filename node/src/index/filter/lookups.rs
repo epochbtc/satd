@@ -44,6 +44,24 @@ impl RocksFilterIndex {
     pub fn new(store: Arc<dyn Store>, config: node_filter_index::FilterIndexConfig) -> Self {
         Self { store, config }
     }
+
+    /// Whether the stored filters can be served: the index is complete AND
+    /// no backfill is mid-run.
+    ///
+    /// The marker alone is not enough. It is set once and stays set while a
+    /// later `backfillindex blockfilter` runs over the same index, and a run
+    /// that stops part-way (a reorg, a cancel, an error) leaves it set too.
+    /// The silent-payment index applies the same rule (see its
+    /// `is_complete`). `is_complete` also drives the `NODE_COMPACT_FILTERS`
+    /// service bit, so the bit follows this as well.
+    fn serving(&self) -> bool {
+        use node_filter_index::cursor::BackfillState;
+        self.store.block_filter_index_complete()
+            && matches!(
+                self.store.read_filter_backfill_cursor().state,
+                BackfillState::Idle | BackfillState::Completed
+            )
+    }
 }
 
 impl FilterIndex for RocksFilterIndex {
@@ -54,7 +72,7 @@ impl FilterIndex for RocksFilterIndex {
         if filter_type != FILTER_TYPE_BASIC {
             return Err(IndexError::NotFound(height));
         }
-        if !self.store.block_filter_index_complete() {
+        if !self.serving() {
             return Err(IndexError::Incomplete);
         }
         self.store
@@ -69,7 +87,7 @@ impl FilterIndex for RocksFilterIndex {
         if filter_type != FILTER_TYPE_BASIC {
             return Err(IndexError::NotFound(height));
         }
-        if !self.store.block_filter_index_complete() {
+        if !self.serving() {
             return Err(IndexError::Incomplete);
         }
         self.store
@@ -103,7 +121,7 @@ impl FilterIndex for RocksFilterIndex {
                 stop_height,
             });
         }
-        if !self.store.block_filter_index_complete() {
+        if !self.serving() {
             return Err(IndexError::Incomplete);
         }
         let mut out = Vec::with_capacity((stop_height - start_height + 1) as usize);
@@ -128,7 +146,7 @@ impl FilterIndex for RocksFilterIndex {
         if filter_type != FILTER_TYPE_BASIC {
             return Err(IndexError::NotFound(stop_height));
         }
-        if !self.store.block_filter_index_complete() {
+        if !self.serving() {
             return Err(IndexError::Incomplete);
         }
         // BIP 157: filter headers at every 1000-block boundary up to
@@ -156,7 +174,7 @@ impl FilterIndex for RocksFilterIndex {
     }
 
     fn is_complete(&self) -> bool {
-        self.config.enabled && self.store.block_filter_index_complete()
+        self.config.enabled && self.serving()
     }
 }
 

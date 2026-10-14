@@ -42,6 +42,12 @@
 //! - Disjoint height prefixes → no key collisions; an exact-key
 //!   duplicate via reorg-disconnect→reconnect at h ≤ snapshot is
 //!   caught by the per-batch reorg check above and aborts the run.
+//! - Each batch's anchor check and its write run together under the
+//!   chain's `accept_lock`, which every reorg holds for its whole length,
+//!   so a write never lands for a block a reorg has just disconnected.
+//! - After a reorg aborts a run, `cleanup_stale_rows_after_reorg` removes
+//!   only rows no active block owns; the live path already replaced the
+//!   rest.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +98,66 @@ impl ActiveChainSnapshot {
 
     fn anchor_hash(&self) -> BlockHash {
         self.hashes[self.snapshot_height() as usize]
+    }
+}
+
+/// The address-index keys the live connect path wrote for a run of active
+/// blocks, derived the way `connect_block` derives them.
+#[derive(Default)]
+struct LiveKeys {
+    funding: std::collections::HashSet<AddrFundingKeyV3>,
+    spending: std::collections::HashSet<AddrSpendingKeyV3>,
+    spent: std::collections::HashSet<(u64, u32)>,
+}
+
+impl LiveKeys {
+    /// Keys of the active blocks at heights `from..` (`live_hashes` is the
+    /// active chain by height). `None` when a block, its undo data or its
+    /// ordinal base cannot be read.
+    fn collect(chain: &ChainState, live_hashes: &[BlockHash], from: u32) -> Option<Self> {
+        let store = chain.store_ref();
+        let mut keys = Self::default();
+        for &hash in live_hashes.iter().skip(from as usize) {
+            let block = chain.get_block(&hash)?;
+            let undo = store.get_undo(&hash)?;
+            let first_txseq = store.get_cumulative_tx_count(&block.header.prev_blockhash)?;
+            let mut undo_cursor = 0usize;
+            for (tx_idx, tx) in block.txdata.iter().enumerate() {
+                let txseq = first_txseq + tx_idx as u64;
+                for (vout, output) in tx.output.iter().enumerate() {
+                    // As `connect_block`: unspendable outputs are not indexed.
+                    if crate::chain::connect::is_unspendable(&output.script_pubkey) {
+                        continue;
+                    }
+                    keys.funding.insert(AddrFundingKeyV3 {
+                        scripthash: scripthash_of(&output.script_pubkey),
+                        txseq,
+                        vout: vout as u32,
+                    });
+                }
+                if tx.is_coinbase() {
+                    continue;
+                }
+                for (vin, input) in tx.input.iter().enumerate() {
+                    let coin = undo.spent_coins.get(undo_cursor)?;
+                    undo_cursor += 1;
+                    keys.spending.insert(AddrSpendingKeyV3 {
+                        scripthash: scripthash_of(&coin.script_pubkey),
+                        txseq,
+                        vin: vin as u32,
+                    });
+                    let funding_txseq = if coin.txseq != node_index::TXSEQ_UNKNOWN {
+                        Some(coin.txseq)
+                    } else {
+                        store.get_tx_seq(&input.previous_output.txid)
+                    };
+                    if let Some(funding_txseq) = funding_txseq {
+                        keys.spent.insert((funding_txseq, input.previous_output.vout));
+                    }
+                }
+            }
+        }
+        Some(keys)
     }
 }
 
@@ -290,6 +356,26 @@ impl BackfillRunner {
         Ok(())
     }
 
+    /// Write `batch` only if `anchor` is still the active block at
+    /// `anchor_height`, checking and writing under `accept_lock`. A reorg
+    /// holds that lock for its whole length, so it cannot land between the
+    /// check and the write: rows are never written for a block a reorg has
+    /// just disconnected (whose rows the disconnect has already removed).
+    fn write_if_anchor_active(
+        &self,
+        anchor_height: u32,
+        anchor: BlockHash,
+        batch: StoreBatch,
+    ) -> Result<(), BackfillError> {
+        self.chain.with_accept_lock(|| {
+            self.verify_anchor_active(anchor_height, anchor)?;
+            self.chain
+                .store_ref()
+                .write_batch_mode(batch, WriteMode::Normal)?;
+            Ok(())
+        })
+    }
+
     /// Walk the OLD snapshot (rebuilt from `cursor.snapshot_tip_hash`)
     /// for the heights backfill has already touched, find divergences
     /// against the live active chain, and emit row removes for any
@@ -297,7 +383,25 @@ impl BackfillRunner {
     /// before persisting `Failed` after a `ReorgInvalidated` error.
     /// Bounded work: reads only divergent blocks (typically <10 for a
     /// normal reorg).
+    ///
+    /// It never removes a key the active chain owns. A replacement block on
+    /// the same parent numbers its transactions from the same ordinal, so a
+    /// transaction re-mined at the same position, or any output paying the
+    /// same script at the same position, has exactly the key the displaced
+    /// block's row had; by now the reorg's disconnect has removed the
+    /// displaced rows and its connect has written the replacement's under
+    /// those keys. What is left to remove is what only a backfill wrote and
+    /// no live block owns (for example the rows pass 1 writes for
+    /// unspendable outputs, which the live path does not index). Runs under
+    /// `accept_lock` so the active chain cannot move while it decides.
     pub fn cleanup_stale_rows_after_reorg(
+        chain: &ChainState,
+        handle: &BackfillHandle,
+    ) -> Result<(), BackfillError> {
+        chain.with_accept_lock(|| Self::cleanup_stale_rows_locked(chain, handle))
+    }
+
+    fn cleanup_stale_rows_locked(
         chain: &ChainState,
         handle: &BackfillHandle,
     ) -> Result<(), BackfillError> {
@@ -367,6 +471,30 @@ impl BackfillRunner {
         };
         let spending_high = if cur.pass >= 2 { cur.cursor_height } else { 0 };
 
+        // The keys the active chain owns from the first divergent height up:
+        // exactly the rows the live connect path wrote for those blocks.
+        let first_divergent = (1..=funding_high).find(|h| {
+            live_hashes.get(*h as usize) != Some(&old_snapshot.hashes[*h as usize])
+        });
+        let live = match first_divergent {
+            None => LiveKeys::default(),
+            Some(d) => match LiveKeys::collect(chain, &live_hashes, d) {
+                Some(keys) => keys,
+                None => {
+                    // Without them a remove could hit a live row. Leaving a
+                    // stale row is the lesser harm: the run is marked
+                    // Failed, the indexes stop serving, and the next
+                    // backfill rewrites what it covers.
+                    tracing::warn!(
+                        from_height = d,
+                        "addr-index reorg cleanup: cannot read the active chain's blocks \
+                         above the fork; removing nothing"
+                    );
+                    return Ok(());
+                }
+            },
+        };
+
         let mut total_funding_removes = 0u64;
         let mut total_spending_removes = 0u64;
 
@@ -425,11 +553,15 @@ impl BackfillRunner {
             for (tx_idx, tx) in old_block.txdata.iter().enumerate() {
                 let txseq = old_first_txseq + tx_idx as u64;
                 for (vout, output) in tx.output.iter().enumerate() {
-                    batch.addr_funding_removes.push(AddrFundingKeyV3 {
+                    let key = AddrFundingKeyV3 {
                         scripthash: scripthash_of(&output.script_pubkey),
                         txseq,
                         vout: vout as u32,
-                    });
+                    };
+                    if live.funding.contains(&key) {
+                        continue;
+                    }
+                    batch.addr_funding_removes.push(key);
                     total_funding_removes += 1;
                 }
                 if h <= spending_high && !tx.is_coinbase() {
@@ -454,13 +586,18 @@ impl BackfillRunner {
                             Ok(Some(v)) => v,
                             Ok(None) | Err(_) => continue,
                         };
-                        batch.spent_removes.push((funding_txseq, prev.vout));
-                        total_spending_removes += 1;
-                        batch.addr_spending_removes.push(AddrSpendingKeyV3 {
+                        if !live.spent.contains(&(funding_txseq, prev.vout)) {
+                            batch.spent_removes.push((funding_txseq, prev.vout));
+                        }
+                        let key = AddrSpendingKeyV3 {
                             scripthash: sh,
                             txseq,
                             vin: vin as u32,
-                        });
+                        };
+                        if !live.spending.contains(&key) {
+                            batch.addr_spending_removes.push(key);
+                            total_spending_removes += 1;
+                        }
                     }
                 }
             }
@@ -598,9 +735,7 @@ impl BackfillRunner {
             // Force WriteMode::Normal so cursor + row + temp-CF
             // advances are durable even when the chain is in BulkLoad
             // (WAL-disabled) mode for IBD. See review finding #8.
-            self.chain
-                .store_ref()
-                .write_batch_mode(batch, WriteMode::Normal)?;
+            self.write_if_anchor_active(snapshot_height, anchor, batch)?;
 
             let mut cur = self.handle.cursor();
             cur.cursor_height = h;
@@ -702,9 +837,7 @@ impl BackfillRunner {
                 started_at_unix,
                 snapshot_tip_hash: [0u8; 32],
             });
-            self.chain
-                .store_ref()
-                .write_batch_mode(batch, WriteMode::Normal)?;
+            self.write_if_anchor_active(snapshot_height, anchor, batch)?;
 
             let mut cur = self.handle.cursor();
             cur.cursor_height = h;
