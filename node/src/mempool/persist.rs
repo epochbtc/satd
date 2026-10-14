@@ -59,7 +59,13 @@ pub struct LoadStats {
 /// torn file that breaks the next startup. Returns the number of
 /// transactions written.
 pub fn dump_mempool(mempool: &Mempool, net_datadir: &Path) -> std::io::Result<usize> {
-    let entries = mempool.get_all_entries();
+    // Parents before children, as Core writes its file (`DumpMempool` takes
+    // `infoAll()`, which is in topological order), so a reload that admits
+    // records in file order never meets a child before its parent.
+    let mut entries = mempool.get_all_entries();
+    entries.sort_by_key(|(txid, e)| (e.time, *txid));
+    let order = parent_first_order(entries.iter().map(|(_, e)| &e.tx));
+    let entries = permute(entries, &order);
     let unbroadcast: std::collections::HashSet<bitcoin::Txid> =
         mempool.unbroadcast_txids().into_iter().collect();
 
@@ -160,10 +166,16 @@ pub fn load_mempool(
         tracing::warn!(%note, "persisted mempool body was truncated/corrupt; loaded the valid prefix");
     }
 
-    // Re-admit oldest-first so a parent that entered before its child is
-    // accepted first; a child whose parent fails still just gets skipped.
+    // Re-admit oldest-first, but never a child before a parent that is in
+    // the same file. `time` has one-second resolution, so a parent and its
+    // child often tie, and a file written by an older satd is in no
+    // particular order; the dependency pass puts every in-file parent ahead
+    // of its children whatever the times say. A child whose parent fails
+    // still just gets skipped.
     let mut records = parsed.records;
     records.sort_by_key(|r| r.time);
+    let order = parent_first_order(records.iter().map(|r| &r.tx));
+    let records = permute(records, &order);
 
     // Core's `LoadMempool` (src/node/mempool_persist.cpp): the delta first,
     // so a transaction that met the floor only through
@@ -199,6 +211,60 @@ pub fn load_mempool(
         }
     }
     Ok(stats)
+}
+
+/// A stable topological order of `txs`: indices into the input, every
+/// transaction after each of its parents that is also in the input, and
+/// otherwise in input order. One depth-first pass over the spend edges, so
+/// linear in the number of inputs. A duplicate txid links its children to
+/// the first copy; a cycle cannot occur between real transactions (a txid
+/// commits to its inputs) and would just be broken where it was entered.
+fn parent_first_order<'a>(txs: impl Iterator<Item = &'a bitcoin::Transaction>) -> Vec<usize> {
+    let txs: Vec<&bitcoin::Transaction> = txs.collect();
+    let mut index: std::collections::HashMap<bitcoin::Txid, usize> =
+        std::collections::HashMap::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        index.entry(tx.compute_txid()).or_insert(i);
+    }
+
+    const UNSEEN: u8 = 0;
+    const OPEN: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state = vec![UNSEEN; txs.len()];
+    let mut order = Vec::with_capacity(txs.len());
+    // (transaction, next input to look at)
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for root in 0..txs.len() {
+        if state[root] != UNSEEN {
+            continue;
+        }
+        state[root] = OPEN;
+        stack.push((root, 0));
+        while let Some((node, next)) = stack.last_mut() {
+            let node = *node;
+            if let Some(input) = txs[node].input.get(*next) {
+                *next += 1;
+                if let Some(&parent) = index.get(&input.previous_output.txid)
+                    && state[parent] == UNSEEN
+                {
+                    state[parent] = OPEN;
+                    stack.push((parent, 0));
+                }
+            } else {
+                state[node] = DONE;
+                order.push(node);
+                stack.pop();
+            }
+        }
+    }
+    order
+}
+
+/// `items` rearranged so that position `k` holds the item at `order[k]`.
+/// `order` must be a permutation of `0..items.len()`.
+fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order.iter().filter_map(|&i| slots[i].take()).collect()
 }
 
 struct Record {
@@ -329,6 +395,10 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
+#[path = "persist_reload_order_tests.rs"]
+mod reload_order_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chain::state::{AssumeValid, ChainState};
@@ -371,7 +441,7 @@ mod tests {
         .unwrap()
     }
 
-    fn dummy_tx(nonce: u8) -> bitcoin::Transaction {
+    pub(super) fn dummy_tx(nonce: u8) -> bitcoin::Transaction {
         bitcoin::Transaction {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
@@ -395,7 +465,7 @@ mod tests {
 
     /// Frame records exactly as `dump_mempool` does (current version), for
     /// load-side tests.
-    fn frame(records: &[(u64, i64, bitcoin::Transaction)]) -> Vec<u8> {
+    pub(super) fn frame(records: &[(u64, i64, bitcoin::Transaction)]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -516,7 +586,7 @@ mod tests {
 
     /// A regtest chain holding one coin per `tag`, and an empty pool under
     /// `min_fee_rate`.
-    fn funded(tags: &[u8], min_fee_rate: u64) -> (ChainState, Mempool, std::path::PathBuf) {
+    pub(super) fn funded(tags: &[u8], min_fee_rate: u64) -> (ChainState, Mempool, std::path::PathBuf) {
         let coins: Vec<(OutPoint, crate::storage::coinview::Coin)> = tags
             .iter()
             .map(|t| {
@@ -553,14 +623,14 @@ mod tests {
         }
     }
 
-    fn p2wpkh(tag: u8) -> ScriptBuf {
+    pub(super) fn p2wpkh(tag: u8) -> ScriptBuf {
         let mut spk = vec![0x00, 0x14];
         spk.extend_from_slice(&[tag; 20]);
         ScriptBuf::from_bytes(spk)
     }
 
     /// A standard spend of the coin `funded` made for `tag`, paying `fee`.
-    fn funded_spend(tag: u8, fee: u64) -> bitcoin::Transaction {
+    pub(super) fn funded_spend(tag: u8, fee: u64) -> bitcoin::Transaction {
         let mut tx = dummy_tx(tag);
         tx.input[0].previous_output = funded_prev(tag);
         tx.output[0] = TxOut { value: Amount::from_sat(100_000 - fee), script_pubkey: p2wpkh(tag) };
