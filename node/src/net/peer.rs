@@ -263,6 +263,9 @@ pub struct PeerInfo {
     /// lazily, on the first addr-related message the peer sends, so a peer
     /// that never participates in addr relay is never counted as doing so.
     pub addr_relay_enabled: bool,
+    /// The rate limit on the addresses this peer announces, and its
+    /// `getpeerinfo` counters: Core's address token bucket.
+    pub addr_rate: crate::net::addr_rate::AddrTokenBucket,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
     pub fee_filter: u64,
     pub conn_time: SystemTime,
@@ -330,6 +333,7 @@ impl PeerInfo {
             wants_addrv2: false,
             wtxid_relay: false,
             addr_relay_enabled: false,
+            addr_rate: crate::net::addr_rate::AddrTokenBucket::new(crate::time::now_micros()),
             fee_filter: 0,
             conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),
             permissions: crate::net::permissions::NetPermissions::NONE,
@@ -503,8 +507,8 @@ impl PeerInfo {
             // permissions granted", not "not implemented", which is the
             // opposite claim for a `-whitelist`ed peer.
             "permissions": self.permissions.to_strings(),
-            "addr_processed": 0,
-            "addr_rate_limited": 0,
+            "addr_processed": self.addr_rate.processed,
+            "addr_rate_limited": self.addr_rate.rate_limited,
             // Core withholds address relay from block-relay-only peers --
             // that is the whole point of the connection type. For everyone
             // else this is latched by `SetupAddressRelay`, not derived from

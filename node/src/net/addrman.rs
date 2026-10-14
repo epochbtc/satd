@@ -38,7 +38,7 @@ use std::path::Path;
 
 /// Hard cap on total stored addresses (new + tried). Keeps `peers.dat`
 /// and memory bounded; well above what a single node needs to bootstrap.
-const MAX_ENTRIES: usize = 16_384;
+pub const MAX_ENTRIES: usize = 16_384;
 /// Per-network-group cap in the *new* table (eclipse resistance: stop one
 /// `/16`/ASN from flooding the book with addresses).
 const MAX_NEW_PER_GROUP: usize = 64;
@@ -90,6 +90,29 @@ pub struct AddrEntry {
     /// persisted: it depends on the active `group_fn` (`-asmap`), so it is
     /// recomputed on load.
     group: Vec<u8>,
+}
+
+/// Core's `ADDRMAN_HORIZON`: an address not seen for this long is terrible.
+const ADDRMAN_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
+/// Core's `ADDRMAN_RETRIES`: failed attempts, with no success ever, that
+/// make an address terrible.
+const ADDRMAN_RETRIES: u32 = 3;
+/// Core's `ADDRMAN_MAX_FAILURES` within `ADDRMAN_MIN_FAIL` (7 days).
+const ADDRMAN_MAX_FAILURES: u32 = 10;
+const ADDRMAN_MIN_FAIL_SECS: u64 = 7 * 24 * 60 * 60;
+
+impl AddrEntry {
+    /// Core's `AddrInfo::IsTerrible`, without its one-minute grace after an
+    /// attempt (satd does not record when it last tried): seen in the
+    /// future, not seen for 30 days, tried three times and never reached,
+    /// or ten failures with no success in a week.
+    pub fn is_terrible(&self, now: u64) -> bool {
+        self.last_seen > now + 10 * 60
+            || now.saturating_sub(self.last_seen) > ADDRMAN_HORIZON_SECS
+            || (self.last_success == 0 && self.attempts >= ADDRMAN_RETRIES)
+            || (now.saturating_sub(self.last_success) > ADDRMAN_MIN_FAIL_SECS
+                && self.attempts >= ADDRMAN_MAX_FAILURES)
+    }
 }
 
 /// Network group key used for bucketing. IPv4 → the `/16`; IPv6 → the
@@ -251,19 +274,62 @@ impl AddrMan {
     /// of the peer that announced it. A refresh of a known address updates
     /// its last-seen time only, as before.
     pub fn add_from(&mut self, addr: SocketAddr, now: u64, services: u64, source: IpAddr) -> bool {
+        self.add_from_replacing(addr, now, services, source).0
+    }
+
+    /// [`add_from`](Self::add_from), and when the book or the address's
+    /// network group is full, make room for the new address by dropping one
+    /// entry (of that group and new, when the group is full; new before
+    /// tried otherwise) that is terrible
+    /// ([`AddrEntry::is_terrible`]), as Core's address manager replaces
+    /// terrible entries. Returns whether `addr` was inserted, and the
+    /// address dropped for it.
+    ///
+    /// Without this a full book refused every address it did not already
+    /// hold, for good: nothing ever left it.
+    pub fn add_from_replacing(
+        &mut self,
+        addr: SocketAddr,
+        now: u64,
+        services: u64,
+        source: IpAddr,
+    ) -> (bool, Option<SocketAddr>) {
         if !self.admits(&addr) {
-            return false;
+            return (false, None);
         }
         if let Some(e) = self.entries.get_mut(&addr) {
             e.last_seen = now;
-            return false;
-        }
-        if self.entries.len() >= MAX_ENTRIES {
-            return false;
+            return (false, None);
         }
         let group = self.group_of(&addr);
+        let mut evicted = None;
         if self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP {
-            return false;
+            // The group is full: make room in it, or refuse.
+            let Some(victim) = self
+                .entries
+                .values()
+                .find(|e| !e.tried && e.group == group && e.is_terrible(now))
+                .map(|e| e.addr)
+            else {
+                return (false, None);
+            };
+            self.entries.remove(&victim);
+            evicted = Some(victim);
+        } else if self.entries.len() >= MAX_ENTRIES {
+            // A terrible new entry first, then a terrible tried one: Core
+            // keeps the two tables apart, so a full tried table never shuts
+            // new addresses out there; one shared cap must not either.
+            let terrible = |tried: bool| {
+                self.entries
+                    .values()
+                    .find(|e| e.tried == tried && e.is_terrible(now))
+                    .map(|e| e.addr)
+            };
+            let Some(victim) = terrible(false).or_else(|| terrible(true)) else {
+                return (false, None);
+            };
+            self.entries.remove(&victim);
+            evicted = Some(victim);
         }
         self.entries.insert(
             addr,
@@ -278,7 +344,7 @@ impl AddrMan {
                 group,
             },
         );
-        true
+        (true, evicted)
     }
 
     /// Promote an address to the *tried* table after a successful connect.
@@ -315,6 +381,11 @@ impl AddrMan {
         entry.last_success = now;
         entry.last_seen = now;
         entry.attempts = 0;
+    }
+
+    /// Whether the book holds `addr`, in either table.
+    pub fn contains(&self, addr: &SocketAddr) -> bool {
+        self.entries.contains_key(addr)
     }
 
     /// Record a failed connection attempt.
