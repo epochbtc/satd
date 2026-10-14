@@ -4388,9 +4388,7 @@ impl PeerManager {
             return None;
         }
         let last = worst.last_block_announcement;
-        let Some(handle) = self.peers.write().remove(&id) else {
-            return None;
-        };
+        let handle = self.peers.write().remove(&id)?;
         // Signal, as `disconnect_by_id` does, so the socket closes now.
         handle.disconnect.notify_one();
         drop(handle);
