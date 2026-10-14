@@ -2531,12 +2531,30 @@ impl ChainState {
     /// the same reason — a reader must not see the pointer ahead of its rows.
     fn commit_accepted_headers(
         &self,
-        mut batch: crate::storage::StoreBatch,
+        batch: crate::storage::StoreBatch,
         batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
         best_in_batch: Option<(BlockHash, [u8; 32])>,
         max_height: u32,
     ) -> Result<(), StoreError> {
         let _accept_guard = self.accept_lock.lock();
+        self.commit_accepted_headers_locked(batch, batch_index, best_in_batch, max_height)
+    }
+
+    /// [`Self::commit_accepted_headers`] for a caller that already holds
+    /// `accept_lock`: `accept_block`, which indexes a stored block's header
+    /// the way Core's `AcceptBlock` does through `AcceptBlockHeader`.
+    fn commit_accepted_headers_locked(
+        &self,
+        mut batch: crate::storage::StoreBatch,
+        batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
+        best_in_batch: Option<(BlockHash, [u8; 32])>,
+        max_height: u32,
+    ) -> Result<(), StoreError> {
+        // Stands in for `AssertLockHeld`, as in `recalculate_best_header`.
+        debug_assert!(
+            self.accept_lock.try_lock().is_none(),
+            "commit_accepted_headers_locked must run under accept_lock"
+        );
         let tip_height = self.tip_height();
         // Crash-resume repair rows staged by the caller: never at or below
         // the tip, whatever the tip was when they were staged.
@@ -7466,9 +7484,25 @@ impl ChainState {
                 data_pos: flat_pos.data_pos,
                 chainwork: new_chainwork,
             };
+            // Core's `AcceptBlock` indexes the header first
+            // (`AcceptBlockHeader`, validation.cpp:4307), and
+            // `BlockManager::AddToBlockIndex` raises `m_best_header` to any
+            // entry with more work (node/blockstorage.cpp:249). A block that
+            // arrived without its header announced (`submitblock` before its
+            // parent's data) must do the same here: the stored-tail drain
+            // follows the best-header chain, so a block left off it was never
+            // connected once its parent was, and `headers` under-reported it
+            // (#922). Committed through the header path so the height rows
+            // above the tip follow the new best header.
             let mut batch = crate::storage::StoreBatch::default();
             batch.block_index_puts.push((block_hash, entry.clone()));
-            self.write_chain_batch(batch)?;
+            let batch_index = std::collections::HashMap::from([(block_hash, entry.clone())]);
+            self.commit_accepted_headers_locked(
+                batch,
+                &batch_index,
+                Some((block_hash, new_chainwork)),
+                new_height,
+            )?;
             // Core's `ReceivedBlockTransactions`: fix this block's place in
             // the arrival order before anything can consult the tie-break.
             let newly_connectable = self.note_block_data_arrived(block_hash, &entry);
@@ -10021,6 +10055,10 @@ impl ChainState {
 #[cfg(test)]
 #[path = "state_blockaccept_tests.rs"]
 mod blockaccept_tests;
+
+#[cfg(test)]
+#[path = "state_sbparent_tests.rs"]
+mod sbparent_tests;
 
 #[cfg(test)]
 #[path = "state_hdrsync_tests.rs"]
@@ -17032,9 +17070,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #856 for a branch the best header does not describe: B4 reached the
-    /// node as a block and never as a header, so only the blocks parked behind
-    /// B2 know the branch is complete when B2 arrives.
+    /// #856 for a branch the best header does not describe: the best header
+    /// is A5, on a chain whose blocks have not arrived, so only the blocks
+    /// parked behind B2 know the B branch is complete when B2 arrives. B4
+    /// reached the node as a block; storing it indexes its header (#922), but
+    /// it has less work than A5 and does not become the best header.
     ///
     /// Perturbation: drop the `newly_connectable` candidates from
     /// `activation_target` and the tip stays on A3.
@@ -17048,17 +17088,21 @@ pub(crate) mod tests {
         let a2_hash = cs.accept_block(&a2).unwrap().hash();
         let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
         let a3_hash = cs.accept_block(&a3).unwrap().hash();
+        let a4 = build_test_block(a3_hash, 4, 1_300_000_004);
+        let a5 = build_test_block(a4.block_hash(), 5, 1_300_000_005);
+        cs.accept_header(&a4.header).unwrap();
+        cs.accept_header(&a5.header).unwrap();
         let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
         let b3 = build_test_block(b2.block_hash(), 3, 1_300_000_013);
         let b4 = build_test_block(b3.block_hash(), 4, 1_300_000_014);
-        // B3 has no more work than A3, so the best header stays A3.
         cs.accept_header(&b2.header).unwrap();
         cs.accept_header(&b3.header).unwrap();
-        assert_eq!(cs.best_header_hash(), a3_hash);
+        assert_eq!(cs.best_header_hash(), a5.block_hash());
 
         for b in [&b4, &b3] {
             assert!(matches!(cs.accept_block(b), Ok(BlockAcceptance::Stored(_))));
         }
+        assert_eq!(cs.best_header_hash(), a5.block_hash());
         assert_eq!(cs.tip_hash(), a3_hash);
         cs.accept_block(&b2).unwrap();
         assert_eq!(cs.tip_hash(), b4.block_hash());
