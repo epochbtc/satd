@@ -29,15 +29,17 @@ fn indexes_with_cursor(
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap())
         as Arc<dyn Store>;
-    let mut batch = StoreBatch::default();
-    batch.backfill_cursor_advance = Some(BackfillCursorWrite {
-        state,
-        pass: 2,
-        cursor_height: 50,
-        snapshot_height: 100,
-        started_at_unix: 1,
-        snapshot_tip_hash: [9u8; 32],
-    });
+    let batch = StoreBatch {
+        backfill_cursor_advance: Some(BackfillCursorWrite {
+            state,
+            pass: 2,
+            cursor_height: 50,
+            snapshot_height: 100,
+            started_at_unix: 1,
+            snapshot_tip_hash: [9u8; 32],
+        }),
+        ..Default::default()
+    };
     store.write_batch(batch).unwrap();
     assert_eq!(store.read_backfill_cursor().state, state);
     assert!(store.address_index_complete());
