@@ -279,7 +279,8 @@ impl AddrMan {
 
     /// [`add_from`](Self::add_from), and when the book or the address's
     /// network group is full, make room for the new address by dropping one
-    /// *new* entry (of that group, when the group is full) that is terrible
+    /// entry (of that group and new, when the group is full; new before
+    /// tried otherwise) that is terrible
     /// ([`AddrEntry::is_terrible`]), as Core's address manager replaces
     /// terrible entries. Returns whether `addr` was inserted, and the
     /// address dropped for it.
@@ -315,12 +316,16 @@ impl AddrMan {
             self.entries.remove(&victim);
             evicted = Some(victim);
         } else if self.entries.len() >= MAX_ENTRIES {
-            let Some(victim) = self
-                .entries
-                .values()
-                .find(|e| !e.tried && e.is_terrible(now))
-                .map(|e| e.addr)
-            else {
+            // A terrible new entry first, then a terrible tried one: Core
+            // keeps the two tables apart, so a full tried table never shuts
+            // new addresses out there; one shared cap must not either.
+            let terrible = |tried: bool| {
+                self.entries
+                    .values()
+                    .find(|e| e.tried == tried && e.is_terrible(now))
+                    .map(|e| e.addr)
+            };
+            let Some(victim) = terrible(false).or_else(|| terrible(true)) else {
                 return (false, None);
             };
             self.entries.remove(&victim);

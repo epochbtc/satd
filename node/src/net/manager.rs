@@ -4185,10 +4185,15 @@ impl PeerManager {
             match &target {
                 // Not for an address that left both lists while the dial ran
                 // (the address book replaced it): its state would never go.
-                PeerAddr::Socket(sa)
-                    if !pm.learned_addrs.read().contains(sa) && !pm.manual_addrs.read().contains(sa) => {}
+                // Checked with the backoff map locked, so a replacement that
+                // removes the address's state either sees this entry (and
+                // removes it after) or has already taken the address off the
+                // list (and this adds nothing).
                 PeerAddr::Socket(sa) => {
-                    update(pm.reconnect_backoff.write().entry(*sa).or_insert_with(ReconnectState::new))
+                    let mut backoff = pm.reconnect_backoff.write();
+                    if pm.learned_addrs.read().contains(sa) || pm.manual_addrs.read().contains(sa) {
+                        update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
+                    }
                 }
                 PeerAddr::Onion { .. } => update(
                     pm.onion_reconnect_backoff

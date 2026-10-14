@@ -679,3 +679,26 @@ fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
     assert!(!pm.learned_addrs.read().contains(&stale));
     assert!(!pm.reconnect_backoff.read().contains_key(&stale), "its backoff is dropped");
 }
+
+/// A book full of tried addresses, all unseen for over 30 days, still makes
+/// room for a new one: Core keeps its tried table apart from its new one, so
+/// tried entries never shut new addresses out.
+#[test]
+fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
+    let (pm, _dir) = mk_pm();
+    let full = crate::net::addrman::MAX_ENTRIES;
+    let long_ago = crate::time::now_secs() - 31 * 24 * 60 * 60;
+    {
+        let mut book = pm.addrman.write();
+        for i in 0..full {
+            let a = SocketAddr::from(([11 + (i / 65536) as u8, ((i / 256) % 256) as u8, (i % 256) as u8, 1], 8333));
+            book.mark_good(a, long_ago);
+        }
+        assert_eq!(book.len(), full, "fixture: the book is full of tried entries");
+    }
+    let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
+    pm.add_learned_addr_from(fresh, 9, IpAddr::from([198, 51, 100, 1]));
+    assert!(pm.addrman.read().contains(&fresh));
+    assert!(pm.learned_addrs.read().contains(&fresh));
+    assert_eq!(pm.addrman.read().len(), full);
+}
