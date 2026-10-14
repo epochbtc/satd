@@ -2465,20 +2465,17 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // PoW validation
-        validation::pow::check_proof_of_work(header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(header, self.network)?;
 
-        // Difficulty check. `get_ancestor` (by height) seeds retarget boundaries;
-        // the testnet min-difficulty walk-back uses `get_by_hash` (parent
-        // pointers) so it is immune to height→hash index gaps.
+        // Difficulty check. The retarget seed and the testnet min-difficulty
+        // walk-back follow parent pointers, so they stay on this header's own
+        // branch and are immune to height→hash index gaps.
         validation::pow::check_difficulty(
             header,
             &parent,
             self.network,
-            |h| {
-                let hash = self.store.get_block_hash_by_height(h)?;
-                self.store.get_block_index(&hash)
-            },
             |h| self.store.get_block_index(h),
         )?;
 
@@ -2707,12 +2704,10 @@ impl ChainState {
         headers: &[bitcoin::block::Header],
     ) -> (u32, Option<ChainError>) {
         let mut batch = crate::storage::StoreBatch::default();
-        // Entries staged in this batch, by hash and by height, so consecutive
-        // headers resolve their parent and their retarget ancestors before
-        // anything is committed.
+        // Entries staged in this batch, by hash, so consecutive headers
+        // resolve their parent and their retarget ancestors before anything
+        // is committed.
         let mut batch_index: std::collections::HashMap<BlockHash, BlockIndexEntry> =
-            std::collections::HashMap::new();
-        let mut staged_by_height: std::collections::HashMap<u32, BlockHash> =
             std::collections::HashMap::new();
         let mut accepted = 0u32;
         let mut max_height = 0u32;
@@ -2756,8 +2751,9 @@ impl ChainState {
 
             let new_height = parent.height + 1;
 
-            // PoW validation
-            if let Err(e) = validation::pow::check_proof_of_work(header) {
+            // PoW validation, against the network's limit as well as the
+            // header's own claim (Core's `CheckProofOfWork` with `powLimit`).
+            if let Err(e) = validation::pow::check_proof_of_work_bounded(header, self.network) {
                 return (accepted, Some(e.into()));
             }
 
@@ -2767,21 +2763,10 @@ impl ChainState {
                 &parent,
                 self.network,
                 |h| {
-                    // Retarget seed by height: check batch first for recently
-                    // accepted headers, then store.
-                    staged_by_height
-                        .get(&h)
-                        .and_then(|hash| batch_index.get(hash).cloned())
-                        .or_else(|| {
-                            let hash = self.store.get_block_hash_by_height(h)?;
-                            self.store.get_block_index(&hash)
-                        })
-                },
-                |h| {
-                    // Min-difficulty walk-back by parent hash: in-batch headers
-                    // (this batch's predecessors) first, then the store. Using
-                    // parent pointers — not the height index — makes the walk
-                    // immune to height→hash gaps.
+                    // Ancestors by parent hash (retarget seed and testnet
+                    // walk-back): in-batch headers (this batch's predecessors)
+                    // first, then the store. Parent pointers, not the height
+                    // index, keep both on this header's own branch.
                     batch_index
                         .get(h)
                         .cloned()
@@ -2810,7 +2795,6 @@ impl ChainState {
             // Staged for the in-batch retarget lookup only. Which heights get a
             // height->hash row is decided once, from the best-header chain, in
             // `commit_accepted_headers`.
-            staged_by_height.insert(new_height, hash);
             accepted += 1;
             max_height = max_height.max(new_height);
             if best_in_batch
@@ -4718,8 +4702,9 @@ impl ChainState {
         // Structural + witness block validation
         validation::block::check_block(block, self.network, new_height)?;
 
-        // PoW validation
-        validation::pow::check_proof_of_work(&block.header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
 
         // Difficulty check
         let store_ref = &*self.store;
@@ -4727,10 +4712,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         )?;
 
@@ -7137,10 +7118,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         ) {
             return Ok(Some(e.to_string()));
@@ -7309,8 +7286,9 @@ impl ChainState {
             return Err(e.into());
         }
 
-        // PoW validation
-        validation::pow::check_proof_of_work(&block.header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
 
         // Difficulty check
         let store_ref = &*self.store;
@@ -7318,10 +7296,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         )?;
 
@@ -9951,6 +9925,10 @@ impl ChainState {
 #[cfg(test)]
 #[path = "state_blockaccept_tests.rs"]
 mod blockaccept_tests;
+
+#[cfg(test)]
+#[path = "state_hdrsync_tests.rs"]
+mod hdrsync_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
