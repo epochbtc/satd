@@ -36,6 +36,10 @@ pub struct RocksAddressIndex {
     /// Subscription registry. Populated lazily so test harnesses
     /// without a tokio runtime can construct a working trait impl.
     subs: Arc<SubscriptionRegistry>,
+    /// Set when a status recompute was refused because a backfill was
+    /// mid-run. The notifier recomputes every subscription once serving
+    /// resumes, so a change that arrived meanwhile is still pushed.
+    status_recompute_owed: std::sync::atomic::AtomicBool,
 }
 
 impl RocksAddressIndex {
@@ -49,6 +53,7 @@ impl RocksAddressIndex {
             cfg,
             mempool: Arc::new(RwLock::new(MempoolAddrIndex::new())),
             subs,
+            status_recompute_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -69,6 +74,7 @@ impl RocksAddressIndex {
             cfg,
             mempool,
             subs,
+            status_recompute_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -83,6 +89,21 @@ impl RocksAddressIndex {
     /// hold receivers for.
     pub fn subscription_registry(&self) -> Arc<SubscriptionRegistry> {
         self.subs.clone()
+    }
+
+    /// Record that a status recompute was refused by the serving gate.
+    pub(crate) fn note_status_recompute_owed(&self) {
+        self.status_recompute_owed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// If a recompute is owed and the index serves again, clear the debt
+    /// and return true: the caller recomputes every subscription.
+    pub(crate) fn take_status_recompute_owed(&self) -> bool {
+        self.check_serving().is_ok()
+            && self
+                .status_recompute_owed
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Whether confirmed history can be served: the index is enabled AND
