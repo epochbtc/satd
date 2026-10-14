@@ -179,3 +179,30 @@ fn full_batch_of_known_headers_still_asks_for_the_next() {
         "a batch under 2000 headers ends the exchange"
     );
 }
+
+/// On the height rows the branch locator is the ordinary one. Off them it
+/// starts with the branch's own blocks, spaced as Core spaces them, and
+/// still ends at genesis.
+#[test]
+fn branch_locator_follows_the_branch_then_the_rows() {
+    let (pm, _dir) = mk_pm();
+    let cs = &pm.chain_state;
+    let rows = header_chain(300, 1_500_000_000);
+    let side = header_chain(200, 1_600_000_000);
+    assert_eq!(cs.accept_headers(&rows).0, 300);
+    assert_eq!(cs.accept_headers(&side).0, 200);
+
+    let tip = rows.last().unwrap().block_hash();
+    assert_eq!(sync::build_locator_for_branch(cs, tip).unwrap(), sync::build_locator(cs));
+
+    let locator = sync::build_locator_for_branch(cs, side.last().unwrap().block_hash()).unwrap();
+    let height_of = |h: &bitcoin::BlockHash| side.iter().position(|s| s.block_hash() == *h).map(|i| i as u32 + 1);
+    let heights: Vec<u32> = locator.iter().filter_map(height_of).collect();
+    assert_eq!(heights[..11], [200, 199, 198, 197, 196, 195, 194, 193, 192, 191, 189]);
+    assert_eq!(heights.len(), locator.len() - 1, "every entry but genesis is on the branch");
+    assert_eq!(
+        *locator.last().unwrap(),
+        bitcoin::constants::genesis_block(Network::Regtest).block_hash()
+    );
+    assert!(sync::build_locator_for_branch(cs, bitcoin::BlockHash::all_zeros()).is_none());
+}
