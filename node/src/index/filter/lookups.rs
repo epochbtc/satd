@@ -169,6 +169,10 @@ pub fn filter_hash(filter_bytes: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[path = "lookups_indexgate_tests.rs"]
+mod indexgate_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::db::InMemoryStore;

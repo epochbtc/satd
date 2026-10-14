@@ -840,3 +840,6 @@ fn debug_delay_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+#[path = "runner_indexgate_tests.rs"]
+mod indexgate_tests;

@@ -2469,6 +2469,10 @@ fn resolve_spending_ref_via(
 mod electrumbounds_tests;
 
 #[cfg(test)]
+#[path = "coin_cache_indexgate_tests.rs"]
+mod indexgate_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::blockindex::{BlockIndexEntry, BlockStatus, work_for_bits};
     use super::super::db::InMemoryStore;

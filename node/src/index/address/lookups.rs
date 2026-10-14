@@ -434,6 +434,10 @@ fn complete_rows_after(
 }
 
 #[cfg(test)]
+#[path = "lookups_indexgate_tests.rs"]
+mod indexgate_tests;
+
+#[cfg(test)]
 #[path = "lookups_electrumbounds_tests.rs"]
 mod electrumbounds_tests;
 
