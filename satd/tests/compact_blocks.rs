@@ -684,12 +684,12 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     let (b, compact) = partial_block(&node, 3, 5);
     let hash = b.block_hash();
     // Only three peers can be high-bandwidth, so the four take the other road
-    // past the unsolicited-push gate: the node asks each of them for the
-    // block after the header is announced -- the announcer for a
-    // `cmpctblock`, the others in full once the tip-following sweep reaches
-    // them.
-    peers[0].send(NetworkMessage::Headers(vec![b.header]));
+    // past the unsolicited-push gate: each announces the block by `inv`
+    // before the node knows its header, and the node asks each of them for
+    // it. (The tip-following sweep asks one peer per block, so it would not
+    // ask all four.)
     for (i, p) in peers.iter_mut().enumerate() {
+        p.send(NetworkMessage::Inv(vec![Inventory::Block(hash)]));
         assert!(
             p.recv_until(is_block_request_for(hash), test_timeout(20)).is_some(),
             "the node must request the block from peer {i}"
