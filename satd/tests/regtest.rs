@@ -11603,10 +11603,37 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
         last_err
     );
 
-    // Verify no stale rows remain. After Failed-cleanup:
+    // While the run is Failed the address index does not serve: a run that
+    // stopped part-way leaves no guarantee about the rows it touched.
+    let refused = node_a
+        .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_b)])
+        .expect("rpc");
+    assert!(
+        !refused["error"].is_null(),
+        "address history must be refused while the backfill is Failed: {}",
+        refused
+    );
+
+    // After Failed: a fresh backfillindex starts a new run (lenient).
+    let r2 = node_a
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
+        .expect("rpc");
+    assert_eq!(
+        r2["result"]["started"].as_bool(),
+        Some(true),
+        "fresh backfill after Failed should start (lenient): {}",
+        r2
+    );
+    poll_backfill_state(&node_a, &["completed"], Duration::from_secs(60));
+
+    // Verify no stale rows remain, now that the index serves again. A
+    // re-run rewrites the rows of the active chain but never removes a
+    // key, so a stale A row left by the failed run would still be here
+    // (resolving to the B transaction that reuses its ordinal):
     //  - addr_a should be empty (its blocks were disconnected by
     //    reorg AND backfill's stale rows for A were cleaned up).
-    //  - addr_b should have B's 3 live-indexed rows.
+    //  - addr_b should have B's 3 live-indexed rows (the cleanup did not
+    //    remove the rows the live path wrote under the same ordinals).
     let history_a = node_a
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr_a)])
         .expect("rpc");
@@ -11637,18 +11664,6 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
             entry
         );
     }
-
-    // After Failed: a fresh backfillindex starts a new run (lenient).
-    let r2 = node_a
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
-    assert_eq!(
-        r2["result"]["started"].as_bool(),
-        Some(true),
-        "fresh backfill after Failed should start (lenient): {}",
-        r2
-    );
-    poll_backfill_state(&node_a, &["completed"], Duration::from_secs(60));
 
     node_a.stop();
 }

@@ -36,6 +36,12 @@
 //! - Disjoint height prefixes → no key collisions; an exact-key
 //!   duplicate via reorg-disconnect→reconnect at h ≤ snapshot is
 //!   caught by the per-batch reorg check above and aborts the run.
+//! - Each batch's anchor check and its write run together under the
+//!   chain's `accept_lock`, which every reorg holds for its whole length,
+//!   so a write never lands for a block a reorg has just disconnected.
+//! - After a reorg aborts a run, `cleanup_stale_rows_after_reorg` removes
+//!   only rows no active block owns; the live path already replaced the
+//!   rest.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -165,7 +171,7 @@ impl BackfillRunner {
     /// in one or two iterations.
     fn run_tail_catchup(&self, snapshot_height: u32) -> Result<(), BackfillError> {
         let mut cursor = snapshot_height;
-        loop {
+        'walk: loop {
             self.check_pause_loop()?;
             let (tip_hash, tip_height) = self.chain.tip_snapshot();
             if tip_height <= cursor {
@@ -237,18 +243,29 @@ impl BackfillRunner {
                     }
                 }
                 let mut batch = StoreBatch::default();
+                let mut next_header = prev_header;
                 if let Some((row, header_row)) =
                     build_filter_row_pair(&self.cfg, h, &block, &prev_map, &prev_header).map_err(
                         |e| BackfillError::Chain(format!("tail catch-up emit at {h}: {e}")),
                     )?
                 {
-                    prev_header = header_row.header;
+                    next_header = header_row.header;
                     batch.filter_puts.push(row);
                     batch.filter_header_puts.push(header_row);
                 }
-                self.chain
-                    .store_ref()
-                    .write_batch_mode(batch, WriteMode::Normal)?;
+                match self.write_if_anchor_active(h, hash, batch) {
+                    Ok(()) => prev_header = next_header,
+                    // A reorg replaced this block since the walk started.
+                    // Every row below `h` was written while its block was
+                    // active; where the reorg replaced one, the live path
+                    // rewrote it chained off the rows below. Walk again
+                    // from the new tip, keeping that progress.
+                    Err(BackfillError::ReorgInvalidated { .. }) => {
+                        cursor = h - 1;
+                        continue 'walk;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             tracing::info!(
                 from = cursor + 1,
@@ -345,12 +362,46 @@ impl BackfillRunner {
         Ok(())
     }
 
+    /// Write `batch` only if `anchor` is still the active block at
+    /// `anchor_height`, checking and writing under `accept_lock`. A reorg
+    /// holds that lock for its whole length, so it cannot land between the
+    /// check and the write: a row is never written for a block a reorg has
+    /// just disconnected (whose rows the disconnect has already removed).
+    fn write_if_anchor_active(
+        &self,
+        anchor_height: u32,
+        anchor: BlockHash,
+        batch: StoreBatch,
+    ) -> Result<(), BackfillError> {
+        self.chain.with_accept_lock(|| {
+            self.verify_anchor_active(anchor_height, anchor)?;
+            self.chain
+                .store_ref()
+                .write_batch_mode(batch, WriteMode::Normal)?;
+            Ok(())
+        })
+    }
+
     /// Walk the OLD snapshot for the heights backfill has already
     /// touched, find divergences against the live active chain, and
     /// emit `filter_removes` for any OLD blocks no longer active.
     /// Bounded work: reads only divergent blocks (typically <10 for a
     /// normal reorg). Mirrors the address-index `cleanup_stale_rows_after_reorg`.
+    ///
+    /// Filter rows are keyed by height, so at a divergent height the active
+    /// chain still has a block, the row there is the live path's: the
+    /// reorg's disconnect removed the displaced block's row and its connect
+    /// wrote the replacement's. Only heights above the live tip, where no
+    /// active block owns the key, are removed. Runs under `accept_lock` so
+    /// the active chain cannot move while it decides.
     pub fn cleanup_stale_rows_after_reorg(
+        chain: &ChainState,
+        handle: &BackfillHandle,
+    ) -> Result<(), BackfillError> {
+        chain.with_accept_lock(|| Self::cleanup_stale_rows_locked(chain, handle))
+    }
+
+    fn cleanup_stale_rows_locked(
         chain: &ChainState,
         handle: &BackfillHandle,
     ) -> Result<(), BackfillError> {
@@ -407,6 +458,10 @@ impl BackfillRunner {
             let old_hash = old_hashes[h as usize];
             let live_hash = live_hashes.get(h as usize).copied();
             if live_hash == Some(old_hash) {
+                continue;
+            }
+            if live_hash.is_some() {
+                // An active block holds this height; the row is its.
                 continue;
             }
             let mut batch = StoreBatch::default();
@@ -483,9 +538,7 @@ impl BackfillRunner {
                 started_at_unix,
                 snapshot_tip_hash,
             });
-            self.chain
-                .store_ref()
-                .write_batch_mode(batch, WriteMode::Normal)?;
+            self.write_if_anchor_active(snapshot_height, anchor, batch)?;
             let mut cur = self.handle.cursor();
             cur.cursor_height = 0;
             self.handle.set_cursor(cur);
@@ -560,9 +613,7 @@ impl BackfillRunner {
                 // anchor recorded by start() is preserved.
                 snapshot_tip_hash: [0u8; 32],
             });
-            self.chain
-                .store_ref()
-                .write_batch_mode(batch, WriteMode::Normal)?;
+            self.write_if_anchor_active(snapshot_height, anchor, batch)?;
 
             let mut cur = self.handle.cursor();
             cur.cursor_height = h;
@@ -656,3 +707,6 @@ fn debug_delay_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+#[path = "runner_indexgate_tests.rs"]
+mod indexgate_tests;
