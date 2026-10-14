@@ -66,3 +66,6 @@ pub mod warmup;
 pub mod whitelist;
 pub mod server;
 pub mod util;
+
+#[cfg(test)]
+mod rpcparity_tests;

@@ -1397,6 +1397,7 @@ pub async fn start(
         indexes::get_block_filter(
             &ctx.chain_state,
             ctx.filter_index.as_ref(),
+            ctx.blockfilterindex_enabled,
             &block_hash,
             filter_type.as_deref(),
         )
@@ -1536,11 +1537,8 @@ pub async fn start(
         let mut args = Args::new(&params);
         let hex_block: String = args.required("hexdata")?;
         args.check()?;
-        Ok::<_, ErrorObjectOwned>(mining::submit_block(
-            &ctx.chain_state,
-            &ctx.mempool,
-            &hex_block,
-        ))
+        mining::submit_block(&ctx.chain_state, &ctx.mempool, &hex_block)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("generatetoaddress", |params, ctx, _extensions| {
@@ -1739,7 +1737,8 @@ pub async fn start(
         let height: i64 = args.optional_or("height", -1)?;
         args.check()?;
         mining::get_network_hash_ps(&ctx.chain_state, nblocks, height)
-            .map(|hps| serde_json::json!(hps))
+            // A double, printed as Core's `UniValue::setFloat` prints it.
+            .map(crate::rpc::util::univalue_double)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -4708,7 +4707,9 @@ async fn spawn_tls_surface(
                 // sidesteps the HRTB-inference quirk that bites if you
                 // return `async move { ... }` directly.
                 let svc = tower::service_fn(
-                    move |req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                    move |mut req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                        // See the plain accept loop: the peer, for the auth log.
+                        req.extensions_mut().insert(crate::rpc::auth::RpcPeerAddr(peer));
                         let mut rpc_svc = rpc_svc.clone();
                         Box::pin(async move {
                             tower::Service::<
@@ -5019,7 +5020,10 @@ pub async fn spawn_plain_surface(
             // spawn site sees a `Send + 'static` future (sidesteps the
             // HRTB-inference quirk the TLS path documents).
             let svc = tower::service_fn(
-                move |req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                move |mut req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
+                    // The auth layer names the peer when it logs a failed
+                    // credential, as Core does.
+                    req.extensions_mut().insert(crate::rpc::auth::RpcPeerAddr(peer));
                     let mut rpc_svc = rpc_svc.clone();
                     Box::pin(async move {
                         tower::Service::<
