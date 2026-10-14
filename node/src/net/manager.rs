@@ -7469,6 +7469,27 @@ impl PeerManager {
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
+                    // The block failed a consensus rule. The connect marked it
+                    // and its descendants invalid and moved the header tip off
+                    // them. This scheduler's target is on that branch, and
+                    // staying would park the connector on the marked block as
+                    // one with no usable data. Core's `ActivateBestChain` stops at the failed
+                    // block and waits for a better chain. Hand off to the
+                    // steady-state path, which follows the recalculated header
+                    // tip; `maybe_start_ibd` starts a new scheduler if that tip
+                    // is far enough ahead.
+                    Err(crate::chain::state::ChainError::Connect(ref ce))
+                        if ce.is_verdict_on_block() =>
+                    {
+                        tracing::error!(
+                            height = next_height, %hash,
+                            "IBD: block failed validation and is marked invalid ({ce}); \
+                             leaving IBD to follow the best valid header chain"
+                        );
+                        chain_state.warnings().clear("connect.retry");
+                        *ibd.write() = None;
+                        break;
+                    }
                     // `Duplicate` deliberately falls through to the generic
                     // error arm rather than retrying immediately. It means the
                     // block offered at tip+1 is one this chainstate already
@@ -11466,6 +11487,10 @@ mod blockaccept_tests;
 #[cfg(test)]
 #[path = "manager_orphanbuf_tests.rs"]
 mod orphanbuf_tests;
+
+#[cfg(test)]
+#[path = "manager_chainsel_tests.rs"]
+mod chainsel_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
