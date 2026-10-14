@@ -212,7 +212,9 @@ fn the_prefetch_connect_marks_a_stored_block_that_fails_to_connect() {
 /// A connector failure that reports this node's storage is not a verdict:
 /// with a hole in the median-time-past window the stored block stays
 /// `DataStored`, the header tip stays on it, and it connects once the hole is
-/// repaired.
+/// repaired. (The window is read before `connect_block` runs, so this pins
+/// the connect paths' order; the filter is pinned by
+/// `only_a_verdict_from_connect_marks_a_stored_block`.)
 #[test]
 fn a_storage_gap_in_the_connector_does_not_mark_the_block() {
     let (cs, dir) = make_chain_state();
@@ -242,5 +244,37 @@ fn a_storage_gap_in_the_connector_does_not_mark_the_block() {
     cs.connect_stored_block(&next.block_hash()).expect("connects once the window is whole");
     assert_eq!(cs.tip_hash(), next.block_hash());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The filter itself: of the two errors `connect_block` can return for a
+/// stored block, only the verdict is written down. A missing `chain_tx` row
+/// for the parent reports this node's storage and leaves the block
+/// `DataStored`; a missing input marks it.
+///
+/// Fails if the filter is dropped: the storage error marked the block.
+#[test]
+fn only_a_verdict_from_connect_marks_a_stored_block() {
+    let (cs, dir) = make_chain_state();
+    let a = connect_chain(&cs, 3);
+    let tip = a[2].block_hash();
+    let next = build_test_block(tip, 4, BASE + 600 * 4);
+    announce_and_store(&cs, &next);
+    let guard = cs.accept_lock.lock();
+
+    cs.mark_stored_block_failure(&next.block_hash(), &connect::ConnectError::ChainTxGap { parent: tip });
+    assert_eq!(status(&cs, &next.block_hash()), Some(BlockStatus::DataStored));
+    assert_eq!(cs.best_header_hash(), next.block_hash());
+
+    cs.mark_stored_block_failure(
+        &next.block_hash(),
+        &connect::ConnectError::MissingOrSpentInput {
+            outpoint: OutPoint { txid: bitcoin::Txid::from_byte_array([0xc6; 32]), vout: 0 },
+        },
+    );
+    assert_eq!(status(&cs, &next.block_hash()), Some(BlockStatus::Invalid));
+    assert_eq!(cs.best_header_hash(), tip);
+
+    drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
