@@ -651,3 +651,31 @@ async fn a_failed_redial_counts_as_an_attempt() {
     let attempts = pm.addrman.read().iter().find(|e| e.addr == addr).map(|e| e.attempts);
     assert_eq!(attempts, Some(1));
 }
+
+/// The same within a network group: a full group (64 new addresses) makes
+/// room by dropping a terrible entry of that group, and the dropped
+/// address's reconnect backoff goes with it.
+#[test]
+fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
+    let (pm, _dir) = mk_pm();
+    let source = IpAddr::from([198, 51, 100, 1]);
+    let in_group = |i: u8| SocketAddr::from(([44, 1, 0, i + 1], 8333));
+    for i in 0..64 {
+        pm.add_learned_addr_from(in_group(i), 9, source);
+    }
+    let fresh = in_group(100);
+    pm.add_learned_addr_from(fresh, 9, source);
+    assert!(!pm.addrman.read().contains(&fresh), "nothing terrible: refused");
+
+    let stale = in_group(0);
+    for _ in 0..3 {
+        pm.addrman.write().mark_attempt(stale);
+    }
+    pm.reconnect_backoff.write().insert(stale, ReconnectState::new());
+    pm.add_learned_addr_from(fresh, 9, source);
+    assert!(pm.addrman.read().contains(&fresh));
+    assert!(!pm.addrman.read().contains(&stale));
+    assert!(pm.learned_addrs.read().contains(&fresh));
+    assert!(!pm.learned_addrs.read().contains(&stale));
+    assert!(!pm.reconnect_backoff.read().contains_key(&stale), "its backoff is dropped");
+}

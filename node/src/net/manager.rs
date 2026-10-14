@@ -458,7 +458,6 @@ impl LearnedAddrs {
         }
     }
 
-    #[cfg(test)]
     fn contains(&self, addr: &SocketAddr) -> bool {
         self.members.contains(addr)
     }
@@ -1954,6 +1953,7 @@ impl PeerManager {
             // leaves the dial list with it.
             if let Some(gone) = evicted {
                 self.learned_addrs.write().remove(&gone);
+                self.reconnect_backoff.write().remove(&gone);
             }
         }
         self.push_learned(addr);
@@ -4183,6 +4183,10 @@ impl PeerManager {
                 }
             };
             match &target {
+                // Not for an address that left both lists while the dial ran
+                // (the address book replaced it): its state would never go.
+                PeerAddr::Socket(sa)
+                    if !pm.learned_addrs.read().contains(sa) && !pm.manual_addrs.read().contains(sa) => {}
                 PeerAddr::Socket(sa) => {
                     update(pm.reconnect_backoff.write().entry(*sa).or_insert_with(ReconnectState::new))
                 }

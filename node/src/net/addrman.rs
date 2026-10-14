@@ -277,8 +277,9 @@ impl AddrMan {
         self.add_from_replacing(addr, now, services, source).0
     }
 
-    /// [`add_from`](Self::add_from), and when the book is full, make room
-    /// for the new address by dropping one *new* entry that is terrible
+    /// [`add_from`](Self::add_from), and when the book or the address's
+    /// network group is full, make room for the new address by dropping one
+    /// *new* entry (of that group, when the group is full) that is terrible
     /// ([`AddrEntry::is_terrible`]), as Core's address manager replaces
     /// terrible entries. Returns whether `addr` was inserted, and the
     /// address dropped for it.
@@ -300,11 +301,20 @@ impl AddrMan {
             return (false, None);
         }
         let group = self.group_of(&addr);
-        if self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP {
-            return (false, None);
-        }
         let mut evicted = None;
-        if self.entries.len() >= MAX_ENTRIES {
+        if self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP {
+            // The group is full: make room in it, or refuse.
+            let Some(victim) = self
+                .entries
+                .values()
+                .find(|e| !e.tried && e.group == group && e.is_terrible(now))
+                .map(|e| e.addr)
+            else {
+                return (false, None);
+            };
+            self.entries.remove(&victim);
+            evicted = Some(victim);
+        } else if self.entries.len() >= MAX_ENTRIES {
             let Some(victim) = self
                 .entries
                 .values()
