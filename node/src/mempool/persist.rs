@@ -48,6 +48,9 @@ pub struct LoadStats {
     /// Entries skipped (no longer valid against the current chainstate,
     /// or a decode error on a single record).
     pub skipped: usize,
+    /// Entries not offered at all because they entered the pool longer
+    /// than `-mempoolexpiry` ago.
+    pub expired: usize,
 }
 
 /// Serialize the current mempool to `<net_datadir>/mempool.dat`.
@@ -162,24 +165,29 @@ pub fn load_mempool(
     let mut records = parsed.records;
     records.sort_by_key(|r| r.time);
 
+    // Core's `LoadMempool` (src/node/mempool_persist.cpp): the delta first,
+    // so a transaction that met the floor only through
+    // `prioritisetransaction` still does, then `AcceptToMemoryPool` with the
+    // persisted time, for a record that has not expired yet.
+    let expiry_secs = mempool.policy().expiry_secs;
+    let now = crate::time::now_secs();
     let mut stats = LoadStats::default();
     for rec in records {
         let fee_delta = rec.fee_delta;
         let unbroadcast = rec.flags & FLAG_UNBROADCAST != 0;
-        match mempool.accept_transaction(
-            rec.tx,
-            chain_state,
-            script_verifier,
-            crate::mempool::pool::TxSource::Reload,
-            // mempool.dat reload re-enters and quarantines normally; never refused.
-            false,
-        ) {
+        if fee_delta != 0 {
+            let txid = rec.tx.compute_txid();
+            if let Err(e) = mempool.prioritise_transaction(&txid, fee_delta) {
+                tracing::debug!(%txid, err = %e, "persisted fee_delta not applied");
+            }
+        }
+        // Core keeps a record only when `nTime > now - expiry`.
+        if rec.time <= now.saturating_sub(expiry_secs) {
+            stats.expired += 1;
+            continue;
+        }
+        match mempool.accept_persisted_transaction(rec.tx, chain_state, script_verifier, rec.time) {
             Ok(txid) => {
-                if fee_delta != 0
-                    && let Err(e) = mempool.prioritise_transaction(&txid, fee_delta)
-                {
-                    tracing::debug!(%txid, err = %e, "persisted fee_delta not applied");
-                }
                 if unbroadcast {
                     // Resume durable rebroadcast across the restart — the tx
                     // had not yet been confirmed propagated when we shut down.
@@ -449,9 +457,11 @@ mod tests {
     fn load_decodes_records_but_skips_unfunded() {
         // A well-formed file with two txs whose inputs don't exist in the
         // (empty) UTXO set: both decode (proving the framing parses) and
-        // both are skipped by re-validation.
+        // both are skipped by re-validation. Recent times, so that expiry
+        // is not what skips them.
         let dir = temp_datadir("decode");
-        let buf = frame(&[(100, 0, dummy_tx(1)), (200, 500, dummy_tx(2))]);
+        let now = crate::time::now_secs();
+        let buf = frame(&[(now - 200, 0, dummy_tx(1)), (now - 100, 500, dummy_tx(2))]);
         std::fs::write(dir.join("mempool.dat"), &buf).unwrap();
 
         let cs = empty_chainstate(&dir);
@@ -501,6 +511,121 @@ mod tests {
         let mp = Mempool::new(300_000_000, 1000);
         let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
         assert_eq!(stats, LoadStats::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A regtest chain holding one coin per `tag`, and an empty pool under
+    /// `min_fee_rate`.
+    fn funded(tags: &[u8], min_fee_rate: u64) -> (ChainState, Mempool, std::path::PathBuf) {
+        let coins: Vec<(OutPoint, crate::storage::coinview::Coin)> = tags
+            .iter()
+            .map(|t| {
+                (
+                    funded_prev(*t),
+                    crate::storage::coinview::Coin {
+                        amount: 100_000,
+                        script_pubkey: p2wpkh(0x11),
+                        height: 1,
+                        coinbase: false,
+                        txseq: node_index::TXSEQ_UNKNOWN,
+                    },
+                )
+            })
+            .collect();
+        let (cs, mp, dir) = crate::mining::template::tests::make_funded_template_env_with(
+            &coins,
+            Box::new(NoopVerifier),
+        );
+        mp.reload_policy(crate::mempool::pool::MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate,
+            ..Default::default()
+        });
+        (cs, mp, dir)
+    }
+
+    fn funded_prev(tag: u8) -> OutPoint {
+        OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [tag; 32],
+            )),
+            vout: 0,
+        }
+    }
+
+    fn p2wpkh(tag: u8) -> ScriptBuf {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[tag; 20]);
+        ScriptBuf::from_bytes(spk)
+    }
+
+    /// A standard spend of the coin `funded` made for `tag`, paying `fee`.
+    fn funded_spend(tag: u8, fee: u64) -> bitcoin::Transaction {
+        let mut tx = dummy_tx(tag);
+        tx.input[0].previous_output = funded_prev(tag);
+        tx.output[0] = TxOut { value: Amount::from_sat(100_000 - fee), script_pubkey: p2wpkh(tag) };
+        tx
+    }
+
+    #[test]
+    fn load_keeps_each_records_entry_time() {
+        // Core's `LoadMempool` hands the persisted `nTime` to
+        // `AcceptToMemoryPool`, so the entry time — and the expiry clock —
+        // carry over a restart.
+        let (cs, mp, dir) = funded(&[1], 0);
+        let then = crate::time::now_secs() - 3_600;
+        let tx = funded_spend(1, 1_000);
+        let txid = tx.compute_txid();
+        std::fs::write(dir.join("mempool.dat"), frame(&[(then, 0, tx)])).unwrap();
+
+        let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(mp.get(&txid).expect("re-admitted").time, then);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_a_record_past_expiry() {
+        // Core keeps a record only when `nTime > now - expiry`.
+        let (cs, mp, dir) = funded(&[1, 2], 0);
+        let expiry = mp.policy().expiry_secs;
+        let now = crate::time::now_secs();
+        let old = funded_spend(1, 1_000);
+        let fresh = funded_spend(2, 1_000);
+        let (old_txid, fresh_txid) = (old.compute_txid(), fresh.compute_txid());
+        std::fs::write(
+            dir.join("mempool.dat"),
+            frame(&[(now - expiry - 60, 0, old), (now - 60, 0, fresh)]),
+        )
+        .unwrap();
+
+        let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
+        assert_eq!((stats.accepted, stats.skipped, stats.expired), (1, 0, 1));
+        assert!(mp.get(&old_txid).is_none(), "an expired record must not re-enter");
+        assert!(mp.get(&fresh_txid).is_some(), "a fresh record does");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_applies_the_delta_before_admission() {
+        // A transaction that met the relay floor only through
+        // `prioritisetransaction`: Core applies the persisted delta first,
+        // so it is re-admitted, with the delta counted once.
+        let (cs, mp, dir) = funded(&[1, 2], 1_000);
+        let now = crate::time::now_secs();
+        let lifted = funded_spend(1, 0);
+        let plain = funded_spend(2, 0);
+        let (lifted_txid, plain_txid) = (lifted.compute_txid(), plain.compute_txid());
+        std::fs::write(
+            dir.join("mempool.dat"),
+            frame(&[(now - 60, 10_000, lifted), (now - 60, 0, plain)]),
+        )
+        .unwrap();
+
+        let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(mp.get(&lifted_txid).expect("re-admitted").fee_delta, 10_000);
+        assert!(mp.get(&plain_txid).is_none(), "without the delta the floor still refuses it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -106,6 +106,21 @@ pub fn format_amount(sats: u64, unit: AmountUnit) -> Value {
     }
 }
 
+/// [`format_amount`] for a signed amount, formatted as Core's
+/// `ValueFromAmount` formats a negative one (`-0.00001000`). A modified fee
+/// can be negative after `prioritisetransaction`.
+pub fn format_signed_amount(sats: i64, unit: AmountUnit) -> Value {
+    match unit {
+        AmountUnit::Btc if sats < 0 => Value::Number(
+            format!("-{}", btc_fixed_8dp(sats.unsigned_abs()))
+                .parse()
+                .expect("a negated fixed 8-decimal literal is a valid JSON number"),
+        ),
+        AmountUnit::Btc => btc_fixed_8dp(sats as u64),
+        AmountUnit::Sats => Value::Number(serde_json::Number::from(sats)),
+    }
+}
+
 /// Annotate an already-built response object with `_units` **only** when
 /// the active unit differs from the Core-compatible default (`Btc`). That
 /// way default responses remain byte-identical to Bitcoin Core; clients
