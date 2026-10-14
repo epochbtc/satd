@@ -70,6 +70,12 @@ fn now_unix_secs() -> u64 {
     crate::time::now_secs()
 }
 
+/// The modified fee as Core keeps it (`CTxMemPoolEntry::m_modified_fee`):
+/// signed and unclamped, for the RPC rollups that report it.
+fn signed_modified_fee(base_fee: u64, delta: i64) -> i64 {
+    (base_fee as i64).saturating_add(delta)
+}
+
 /// Format a satoshi amount as a BTC string the way Core's `FormatMoney` does:
 /// 8 decimal digits, trailing zeros stripped but keeping at least 2 decimals.
 /// Compute the modified fee: base fee adjusted by `prioritisetransaction`
@@ -733,7 +739,9 @@ pub struct MempoolSummaryEntry {
     pub time: u64,
     pub ancestorcount: usize,
     pub ancestorsize: usize,
-    pub ancestorfees: u64,
+    /// Signed: a `prioritisetransaction` delta can make a modified fee
+    /// negative.
+    pub ancestorfees: i64,
     pub descendantcount: usize,
 }
 
@@ -757,7 +765,7 @@ struct SummaryRollup {
     time: u64,
     ancestorcount: usize,
     ancestorsize: usize,
-    ancestorfees: u64,
+    ancestorfees: i64,
 }
 
 struct MempoolInner {
@@ -3808,13 +3816,39 @@ impl Mempool {
     /// transaction has the txid. This is the mempool half of Core's
     /// `CCoinsViewMemPool::GetCoin`, which `gettxout` reads; a quarantined
     /// transaction is invisible here, as on every standard surface (§6.1).
-    pub fn acting_output(&self, outpoint: &OutPoint) -> Option<Option<TxOut>> {
+    ///
+    /// Alongside the output it returns every outpoint outside the pool that
+    /// the transaction and its in-pool ancestors spend. The pool trails the
+    /// chain: a block is committed before `remove_for_block` takes what it
+    /// confirmed or conflicted. While those outpoints are all coins at a
+    /// given tip, the transaction is still unconfirmed and valid there;
+    /// once one is gone, the pool's answer is stale for that tip.
+    pub fn acting_output(&self, outpoint: &OutPoint) -> Option<(Option<TxOut>, Vec<OutPoint>)> {
         let inner = self.inner.read();
         let entry = inner.entries.get(&outpoint.txid)?;
         if !entry.scope.is_acting() {
             return None;
         }
-        Some(entry.tx.output.get(outpoint.vout as usize).cloned())
+        let output = entry.tx.output.get(outpoint.vout as usize).cloned();
+        let mut confirmed_inputs = Vec::new();
+        let mut seen: HashSet<Txid> = HashSet::from([outpoint.txid]);
+        let mut walk = vec![outpoint.txid];
+        while let Some(txid) = walk.pop() {
+            let Some(e) = inner.entries.get(&txid) else {
+                continue;
+            };
+            for input in &e.tx.input {
+                let parent = input.previous_output.txid;
+                if inner.entries.contains_key(&parent) {
+                    if seen.insert(parent) {
+                        walk.push(parent);
+                    }
+                } else {
+                    confirmed_inputs.push(input.previous_output);
+                }
+            }
+        }
+        Some((output, confirmed_inputs))
     }
 
     /// Like [`spending_tx`](Self::spending_tx) but only reports a spender in the
@@ -4041,8 +4075,8 @@ impl Mempool {
         inner: &MempoolInner,
         relatives: &HashSet<Txid>,
         self_vsize: usize,
-        self_fee: u64,
-    ) -> (usize, usize, u64) {
+        self_fee: i64,
+    ) -> (usize, usize, i64) {
         let mut count = 0usize;
         let mut vsize = self_vsize;
         let mut fees = self_fee;
@@ -4052,7 +4086,7 @@ impl Mempool {
             {
                 count += 1;
                 vsize += Self::entry_vsize(e);
-                fees += modified_fee(e.fee, e.fee_delta);
+                fees = fees.saturating_add(signed_modified_fee(e.fee, e.fee_delta));
             }
         }
         (count, vsize, fees)
@@ -4766,7 +4800,7 @@ impl Mempool {
                 &inner,
                 &relatives,
                 vsize,
-                modified_fee(entry.fee, entry.fee_delta),
+                signed_modified_fee(entry.fee, entry.fee_delta),
             );
 
             rollups.push(SummaryRollup {
@@ -4782,13 +4816,13 @@ impl Mempool {
         }
 
         // Ancestor feerate, descending. Compared as a cross-multiplied
-        // fraction in u128 rather than an f64 division: exact, total, and
+        // fraction in i128 rather than an f64 division: exact, total, and
         // free of the NaN tiebreak an `f64` comparator would need. A zero
         // `ancestorsize` cannot occur (it includes the subject's own vsize)
         // but sorts as zero feerate if it ever did.
         rollups.sort_unstable_by(|a, b| {
-            let lhs = a.ancestorfees as u128 * b.ancestorsize as u128;
-            let rhs = b.ancestorfees as u128 * a.ancestorsize as u128;
+            let lhs = a.ancestorfees as i128 * b.ancestorsize as i128;
+            let rhs = b.ancestorfees as i128 * a.ancestorsize as i128;
             rhs.cmp(&lhs).then_with(|| a.vsize.cmp(&b.vsize))
         });
         rollups.truncate(top_n);
@@ -4846,7 +4880,9 @@ impl Mempool {
         let vsize = Self::entry_vsize(entry);
         let entry_fee = entry.fee;
         let entry_fee_delta = entry.fee_delta;
-        let entry_modified_fee = modified_fee(entry_fee, entry_fee_delta);
+        // Signed, as Core's `GetModifiedFee`: a negative delta can take it
+        // below zero, and the rollups must carry that, not a clamped zero.
+        let entry_modified_fee = signed_modified_fee(entry_fee, entry_fee_delta);
         let entry_weight = entry.weight;
         let entry_time = entry.time;
         let entry_height = entry.height;
@@ -4888,12 +4924,11 @@ impl Mempool {
             .map(Self::entry_vsize)
             .sum::<usize>()
             + vsize;
-        let ancestor_fees: u64 = ancestors
+        let ancestor_fees: i64 = ancestors
             .iter()
             .filter_map(|a| inner.entries.get(a))
-            .map(|e| modified_fee(e.fee, e.fee_delta))
-            .sum::<u64>()
-            + entry_modified_fee;
+            .map(|e| signed_modified_fee(e.fee, e.fee_delta))
+            .fold(entry_modified_fee, i64::saturating_add);
 
         let descendant_count = descendants.len() + 1; // includes self
         let descendant_size: usize = descendants
@@ -4902,12 +4937,11 @@ impl Mempool {
             .map(Self::entry_vsize)
             .sum::<usize>()
             + vsize;
-        let descendant_fees: u64 = descendants
+        let descendant_fees: i64 = descendants
             .iter()
             .filter_map(|d| inner.entries.get(d))
-            .map(|e| modified_fee(e.fee, e.fee_delta))
-            .sum::<u64>()
-            + entry_modified_fee;
+            .map(|e| signed_modified_fee(e.fee, e.fee_delta))
+            .fold(entry_modified_fee, i64::saturating_add);
 
         // Core's `entryToJSON`: `depends` names the in-mempool transactions
         // this one spends from directly, once each, in string order (a
@@ -4936,12 +4970,13 @@ impl Mempool {
         // binary-floating-point rounding `btc_fixed_8dp` exists to avoid.
         let unit = crate::rpc::amounts::default_unit();
         let amount = |sats: u64| crate::rpc::amounts::format_amount(sats, unit);
+        let signed_amount = |sats: i64| crate::rpc::amounts::format_signed_amount(sats, unit);
         let mut out = serde_json::json!({
             "fees": {
                 "base": amount(entry_fee),
-                "modified": amount(entry_modified_fee),
-                "ancestor": amount(ancestor_fees),
-                "descendant": amount(descendant_fees),
+                "modified": signed_amount(entry_modified_fee),
+                "ancestor": signed_amount(ancestor_fees),
+                "descendant": signed_amount(descendant_fees),
             },
             "vsize": vsize,
             "weight": entry_weight,

@@ -836,31 +836,12 @@ pub fn get_tx_out_view(
     let outpoint = bitcoin::OutPoint { txid, vout };
 
     let unit = default_unit();
-    if let Some(mempool) = mempool {
-        // Core: `if (!mempool.isSpent(out)) coin = view.GetCoin(out);`
-        if mempool.spending_tx_acting(&outpoint).is_some() {
-            return Ok(Value::Null);
-        }
-        // A pool transaction with this txid answers for every one of its
-        // outputs, as `CCoinsViewMemPool::GetCoin` checks the pool first.
-        if let Some(output) = mempool.acting_output(&outpoint) {
-            let Some(output) = output else {
-                return Ok(Value::Null);
-            };
-            let (tip_hash, _) = chain_state.tip_snapshot();
-            let mut response = json!({
-                "bestblock": tip_hash.to_string(),
-                "confirmations": 0,
-                "value": format_amount(output.value.to_sat(), unit),
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                },
-                "coinbase": false,
-            });
-            annotate_units(&mut response, unit);
-            return Ok(response);
-        }
+
+    // What the reply rests on, read in one chain snapshot (see below).
+    enum Found {
+        Spent,
+        Pool(Option<bitcoin::TxOut>),
+        Chain(Option<crate::storage::coinview::Coin>),
     }
 
     // `bestblock` is not decoration: it names the chain state the unspent
@@ -877,9 +858,30 @@ pub fn get_tx_out_view(
     // watches the mutation counter instead, which is bumped for the whole of
     // that window, so it covers both the wide case (a connect that lands
     // between the samples) and the narrow one.
-    let Some((tip_hash, tip_height, coin)) = chain_state.coherent_read(|| {
+    //
+    // The mempool reads go inside the same snapshot, as Core reads the pool
+    // and the coins under one lock (`CCoinsViewMemPool`). The pool trails the
+    // chain by the time `remove_for_block` takes to run, so a pool
+    // transaction counts only while every coin it rests on is still a coin
+    // at this tip; otherwise the block at the tip has confirmed or conflicted
+    // it, and the chain answers.
+    let Some((tip_hash, tip_height, found)) = chain_state.coherent_read(|| {
         let (tip_hash, tip_height) = chain_state.tip_snapshot();
-        (tip_hash, tip_height, chain_state.get_coin(&outpoint))
+        if let Some(mempool) = mempool {
+            // Core: `if (!mempool.isSpent(out)) coin = view.GetCoin(out);`
+            if mempool.spending_tx_acting(&outpoint).is_some() {
+                return (tip_hash, tip_height, Found::Spent);
+            }
+            // A pool transaction with this txid answers for every one of
+            // its outputs, as `CCoinsViewMemPool::GetCoin` checks the pool
+            // first.
+            if let Some((output, rests_on)) = mempool.acting_output(&outpoint)
+                && rests_on.iter().all(|op| chain_state.has_coin(op))
+            {
+                return (tip_hash, tip_height, Found::Pool(output));
+            }
+        }
+        (tip_hash, tip_height, Found::Chain(chain_state.get_coin(&outpoint)))
     }) else {
         // -32603 (internal error), NOT -5: -5 is what a permanently absent
         // key returns, and a client that special-cases it would misread a
@@ -889,6 +891,25 @@ pub fn get_tx_out_view(
             -32603,
             "chain is advancing faster than gettxout can answer consistently; retry".to_string(),
         ));
+    };
+
+    let coin = match found {
+        Found::Spent | Found::Pool(None) => return Ok(Value::Null),
+        Found::Pool(Some(output)) => {
+            let mut response = json!({
+                "bestblock": tip_hash.to_string(),
+                "confirmations": 0,
+                "value": format_amount(output.value.to_sat(), unit),
+                "scriptPubKey": {
+                    "asm": format!("{}", output.script_pubkey),
+                    "hex": hex::encode(output.script_pubkey.as_bytes()),
+                },
+                "coinbase": false,
+            });
+            annotate_units(&mut response, unit);
+            return Ok(response);
+        }
+        Found::Chain(coin) => coin,
     };
 
     // Bitcoin Core returns JSON `null` for a missing or spent outpoint — not an

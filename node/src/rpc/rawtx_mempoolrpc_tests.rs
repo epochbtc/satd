@@ -150,6 +150,43 @@ fn gettxout_does_not_see_a_quarantined_transaction() {
 }
 
 #[test]
+fn gettxout_trusts_the_pool_only_while_the_coins_it_spends_remain() {
+    // A block is committed before `remove_for_block` updates the pool, so
+    // for a moment the pool still holds what the tip has confirmed. The
+    // reply must describe the tip it names.
+    let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
+    let tx = spend(prev(1), &[(COIN_VALUE - 1_000, 2)]);
+    let out = OutPoint { txid: tx.compute_txid(), vout: 0 };
+    let txid = admit(&mp, &cs, tx.clone()).to_string();
+    assert_eq!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["confirmations"], 0);
+
+    // The tip confirms the transaction; the pool has not caught up.
+    let mut batch = crate::storage::StoreBatch::default();
+    batch.coin_removes.push((prev(1), COIN_VALUE, 1));
+    batch.coin_puts.push((out, Coin { amount: COIN_VALUE - 1_000, height: 0, ..coin(0) }));
+    cs.store_ref().write_batch(batch).unwrap();
+    assert!(mp.get(&tx.compute_txid()).is_some(), "the pool still holds it");
+    let confirmed = get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap();
+    assert_eq!(confirmed["confirmations"], 1, "the chain answers: {confirmed}");
+
+    // The tip also spends that output.
+    let mut batch = crate::storage::StoreBatch::default();
+    batch.coin_removes.push((out, COIN_VALUE - 1_000, 0));
+    cs.store_ref().write_batch(batch).unwrap();
+    assert!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap().is_null());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_negative_amount_formats_as_core_does() {
+    use crate::rpc::amounts::{AmountUnit, format_signed_amount};
+    assert_eq!(format_signed_amount(-1_000, AmountUnit::Btc).to_string(), "-0.00001000");
+    assert_eq!(format_signed_amount(-250_000_000, AmountUnit::Btc).to_string(), "-2.50000000");
+    assert_eq!(format_signed_amount(1_000, AmountUnit::Btc).to_string(), "0.00001000");
+    assert_eq!(format_signed_amount(-1_000, AmountUnit::Sats).to_string(), "-1000");
+}
+
+#[test]
 fn preflight_finds_a_confirmed_transaction_in_the_utxo_set() {
     // Core answers -27 when one of the transaction's outputs is a coin,
     // which needs no txindex.

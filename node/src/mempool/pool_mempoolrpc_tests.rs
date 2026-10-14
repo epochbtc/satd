@@ -197,6 +197,30 @@ fn entry_fee_rollups_use_modified_fees() {
 }
 
 #[test]
+fn entry_fee_rollups_carry_a_negative_modified_fee() {
+    // Core's modified fee is signed (`CTxMemPoolEntry::m_modified_fee`) and
+    // its rollups add it as is (`CalculateAncestorData`).
+    let (cs, mp, dir) = env(&[1]);
+    let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2);
+    let child = spend(&[out0(&parent)], COIN_VALUE - 1_000, 2_000, 3);
+    let p = admit(&mp, &cs, parent);
+    let c = admit(&mp, &cs, child);
+    mp.prioritise_transaction(&p, -2_000).expect("prioritised");
+
+    let pv = entry_json(&mp, &p);
+    assert_eq!(pv["fees"]["modified"].to_string(), "-0.00001000", "{pv}");
+    assert_eq!(pv["fees"]["descendant"].to_string(), "0.00001000", "{pv}");
+    assert_eq!(pv["descendantfees"].as_i64(), Some(1_000), "{pv}");
+    let cv = entry_json(&mp, &c);
+    assert_eq!(cv["fees"]["ancestor"].to_string(), "0.00001000", "{cv}");
+    assert_eq!(cv["ancestorfees"].as_i64(), Some(1_000), "{cv}");
+    let summary = mp.summary(10);
+    let row = summary.top.iter().find(|r| r.txid == c.to_string()).expect("child row");
+    assert_eq!(row.ancestorfees, 1_000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn info_usage_grows_with_the_pool() {
     let (cs, mp, dir) = env(&[1, 2]);
     assert_eq!(mp.info().usage, 0);
