@@ -331,6 +331,7 @@ fn eviction_cost_follows_what_it_evicts() {
                 weight: 4 * size,
                 fee_rate: policy::fee_rate_sat_per_kvb(fee, 4 * size as u64),
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
