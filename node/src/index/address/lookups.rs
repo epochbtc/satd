@@ -36,6 +36,10 @@ pub struct RocksAddressIndex {
     /// Subscription registry. Populated lazily so test harnesses
     /// without a tokio runtime can construct a working trait impl.
     subs: Arc<SubscriptionRegistry>,
+    /// Set when a status recompute was refused because a backfill was
+    /// mid-run. The notifier recomputes every subscription once serving
+    /// resumes, so a change that arrived meanwhile is still pushed.
+    status_recompute_owed: std::sync::atomic::AtomicBool,
 }
 
 impl RocksAddressIndex {
@@ -49,6 +53,7 @@ impl RocksAddressIndex {
             cfg,
             mempool: Arc::new(RwLock::new(MempoolAddrIndex::new())),
             subs,
+            status_recompute_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -69,6 +74,7 @@ impl RocksAddressIndex {
             cfg,
             mempool,
             subs,
+            status_recompute_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -85,12 +91,32 @@ impl RocksAddressIndex {
         self.subs.clone()
     }
 
-    fn check_enabled(&self) -> Result<(), IndexError> {
-        if self.cfg.enabled {
-            Ok(())
-        } else {
-            Err(IndexError::Disabled)
+    /// Record that a status recompute was refused by the serving gate.
+    pub(crate) fn note_status_recompute_owed(&self) {
+        self.status_recompute_owed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// If a recompute is owed and the index serves again, clear the debt
+    /// and return true: the caller recomputes every subscription.
+    pub(crate) fn take_status_recompute_owed(&self) -> bool {
+        self.check_serving().is_ok()
+            && self
+                .status_recompute_owed
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Whether confirmed history can be served: the index is enabled AND
+    /// no address backfill is mid-run (see
+    /// [`crate::index::address::backfill::serving_allowed`]).
+    fn check_serving(&self) -> Result<(), IndexError> {
+        if !self.cfg.enabled {
+            return Err(IndexError::Disabled);
         }
+        if !crate::index::address::backfill::serving_allowed(self.store.as_ref()) {
+            return Err(IndexError::Incomplete);
+        }
+        Ok(())
     }
 }
 
@@ -104,7 +130,7 @@ impl AddressIndex for RocksAddressIndex {
         sh: &Scripthash,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows.
@@ -176,7 +202,7 @@ impl AddressIndex for RocksAddressIndex {
     }
 
     fn balance(&self, sh: &Scripthash) -> Result<(u64, i64), IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Confirmed balance = sum of live UTXOs. We walk the funding
         // rows for `sh` and ask the coins CF whether each outpoint is
@@ -229,7 +255,7 @@ impl AddressIndex for RocksAddressIndex {
         // the scan window would re-introduce the silent-truncation
         // bug. Tighter bounding would need a streaming Store API,
         // which is queued as a separate cleanup.
-        self.check_enabled()?;
+        self.check_serving()?;
 
         let funding = self.store.iter_addr_funding(sh);
         let spending = self.store.iter_addr_spending(sh);
@@ -294,7 +320,7 @@ impl AddressIndex for RocksAddressIndex {
         after: Option<bitcoin::Txid>,
         limit: usize,
     ) -> Result<Option<Vec<(u32, bitcoin::Txid)>>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
         // The rows are keyed by ordinal, which is chain order, so walking
         // them backwards from the cursor reaches the page without touching
         // the rest of the history. The page is in `(height, txid)` order,
@@ -366,7 +392,7 @@ impl AddressIndex for RocksAddressIndex {
     }
 
     fn utxos_limited(&self, sh: &Scripthash, limit: usize) -> Result<Vec<Utxo>, IndexError> {
-        self.check_enabled()?;
+        self.check_serving()?;
 
         // Same iteration shape as `balance`: walk funding rows, keep
         // those whose outpoint is still in the coins CF. Returns in
@@ -432,6 +458,10 @@ fn complete_rows_after(
         .filter(|r| r.0 > lowest && cursor.is_none_or(|c| **r < c))
         .count()
 }
+
+#[cfg(test)]
+#[path = "lookups_indexgate_tests.rs"]
+mod indexgate_tests;
 
 #[cfg(test)]
 #[path = "lookups_electrumbounds_tests.rs"]
