@@ -136,6 +136,9 @@ fn reorg_cleanup_keeps_the_rows_the_active_chain_owns() {
     // funding row for A102's OP_RETURN output (the live path does not index
     // unspendable outputs), and the pass-1 lookup row pass 2 used for S.
     let store = cs.store_ref();
+    // The live rows are on disk before the backfill's, as they would be
+    // for any block older than one flush window.
+    store.flush().unwrap();
     let sh_empty = scripthash_of(&ScriptBuf::new());
     let sh_op_return = scripthash_of(&op_return_script());
     let a102_first_txseq = store
@@ -242,6 +245,7 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
     let dir = tempfile::tempdir().unwrap();
     let cs = Arc::new(chain(dir.path(), false));
     let blocks = connect_chain(&cs, 5);
+    cs.store_ref().flush().unwrap();
     let sh_empty = scripthash_of(&ScriptBuf::new());
     assert!(funding_heights(&cs, &sh_empty).is_empty(), "the live path writes no rows here");
 
@@ -271,6 +275,7 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
     let written_while_held = funding_heights(&cs, &sh_empty);
     drop(held);
     walk.join().unwrap().expect("the backfill completes");
+    cs.store_ref().flush().unwrap();
 
     assert!(
         written_while_held.is_empty(),
