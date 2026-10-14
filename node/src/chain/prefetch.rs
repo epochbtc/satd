@@ -131,8 +131,16 @@ pub fn prefetch_block(
         return None;
     }
 
-    // 5. Compute MTP (read-only store lookups)
-    let mtp = crate::chain::connect::median_time_past_with_plan(store, plan, height);
+    // 5. Compute MTP (read-only store lookups). A window with a missing block
+    //    goes to the direct-read path too, which fails the connect with
+    //    `MedianTimeWindowGap`.
+    let mtp = match crate::chain::connect::median_time_past_with_plan(store, plan, height) {
+        Ok(mtp) => mtp,
+        Err(e) => {
+            tracing::debug!(height, block = %hash, error = %e, "prefetch: deferring to the direct read");
+            return None;
+        }
+    };
 
     // 6. Context-free work: txids + check_transaction
     let mut txids = Vec::with_capacity(block.txdata.len());

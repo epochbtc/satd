@@ -16,7 +16,7 @@
 //! commitment), and time.
 
 use bitcoin::blockdata::opcodes::all::OP_RETURN;
-use bitcoin::blockdata::script::{Builder, Instruction};
+use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::Magic;
@@ -99,39 +99,103 @@ fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
 /// [`SIGNET_HEADER`] and which carries data beyond the header). On the
 /// first match, return `(rebuilt_script, solution)` where `solution` is
 /// the bytes after the header and `rebuilt_script` is the script with
-/// that push truncated to just the header — exactly Core's
-/// `FetchAndClearCommitmentSection`. Returns `None` if no signet push is
-/// present (Core allows this, e.g. an `OP_TRUE` trivial challenge).
+/// that push truncated to just the header. Returns `None` if no signet push
+/// is present (Core allows this, e.g. an `OP_TRUE` trivial challenge).
+///
+/// A port of Core's `FetchAndClearCommitmentSection` (`signet.cpp:32-57`),
+/// byte for byte, because the rebuilt script feeds the merkle root the
+/// solution signs:
+/// - every op is read with Core's `GetScriptOp` ([`get_script_op`]), and the
+///   scan stops at the first op that does not parse. Ops already read are
+///   kept, so a signet section found before that point is still used and the
+///   unparseable tail is dropped from the rebuilt script.
+/// - a push with data is written back as `CScript << data` writes it: the
+///   shortest length prefix (`AppendDataSize`), whatever prefix it had.
+/// - an op with no data is written back as its one opcode byte
+///   (`CScript << opcode`). That includes a zero-length `OP_PUSHDATA1/2/4`,
+///   which becomes the bare `0x4c`, `0x4d` or `0x4e`, not `OP_0`.
 fn fetch_and_clear_signet_section(script: &ScriptBuf) -> Option<(ScriptBuf, Vec<u8>)> {
-    let mut builder = Builder::new();
+    let bytes = script.as_bytes();
+    let mut replacement: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut solution: Option<Vec<u8>> = None;
 
-    for instr in script.instructions() {
-        // A malformed script can't carry a valid solution.
-        let instr = instr.ok()?;
-        match instr {
-            Instruction::Op(op) => {
-                builder = builder.push_opcode(op);
-            }
-            Instruction::PushBytes(push) => {
-                let bytes = push.as_bytes();
-                if solution.is_none()
-                    && bytes.len() > SIGNET_HEADER.len()
-                    && bytes[..SIGNET_HEADER.len()] == SIGNET_HEADER
-                {
-                    solution = Some(bytes[SIGNET_HEADER.len()..].to_vec());
-                    // Keep only the header in the rebuilt script.
-                    builder = builder.push_slice(SIGNET_HEADER);
-                } else {
-                    // push.as_bytes() is a valid pushable slice.
-                    let pb: &bitcoin::script::PushBytes = push;
-                    builder = builder.push_slice(pb);
-                }
-            }
+    let mut pc = 0;
+    while let Some((opcode, pushdata)) = get_script_op(bytes, &mut pc) {
+        if pushdata.is_empty() {
+            replacement.push(opcode);
+            continue;
         }
+        let mut pushdata = pushdata;
+        if solution.is_none()
+            && pushdata.len() > SIGNET_HEADER.len()
+            && pushdata[..SIGNET_HEADER.len()] == SIGNET_HEADER
+        {
+            solution = Some(pushdata[SIGNET_HEADER.len()..].to_vec());
+            // Keep only the header in the rebuilt script.
+            pushdata = &pushdata[..SIGNET_HEADER.len()];
+        }
+        append_push(&mut replacement, pushdata);
     }
 
-    solution.map(|s| (builder.into_script(), s))
+    solution.map(|s| (ScriptBuf::from_bytes(replacement), s))
+}
+
+/// Core's `GetScriptOp` (`script/script.cpp:312-362`): read the op at `*pc`,
+/// advance `*pc` past it, and return the opcode with its push data (empty
+/// for an op that pushes nothing). `None` at the end of the script, or when
+/// a push's length prefix or data runs past the end.
+fn get_script_op<'a>(script: &'a [u8], pc: &mut usize) -> Option<(u8, &'a [u8])> {
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+    const OP_PUSHDATA4: u8 = 0x4e;
+
+    let opcode = *script.get(*pc)?;
+    let mut at = *pc + 1;
+    let size = match opcode {
+        0..OP_PUSHDATA1 => usize::from(opcode),
+        OP_PUSHDATA1 => {
+            let n = *script.get(at)?;
+            at += 1;
+            usize::from(n)
+        }
+        OP_PUSHDATA2 => {
+            let n = script.get(at..at + 2)?;
+            at += 2;
+            usize::from(u16::from_le_bytes([n[0], n[1]]))
+        }
+        OP_PUSHDATA4 => {
+            let n = script.get(at..at + 4)?;
+            at += 4;
+            usize::try_from(u32::from_le_bytes([n[0], n[1], n[2], n[3]])).ok()?
+        }
+        _ => {
+            *pc = at;
+            return Some((opcode, &[]));
+        }
+    };
+    let data = script.get(at..at.checked_add(size)?)?;
+    *pc = at + size;
+    Some((opcode, data))
+}
+
+/// Core's `CScript << data` for a non-empty push: `AppendDataSize`
+/// (`script/script.h:407-425`), the shortest length prefix, then the bytes.
+fn append_push(out: &mut Vec<u8>, data: &[u8]) {
+    const OP_PUSHDATA1: usize = 0x4c;
+    let len = data.len();
+    if len < OP_PUSHDATA1 {
+        out.push(len as u8);
+    } else if len <= 0xff {
+        out.push(0x4c);
+        out.push(len as u8);
+    } else if len <= 0xffff {
+        out.push(0x4d);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else {
+        out.push(0x4e);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    }
+    out.extend_from_slice(data);
 }
 
 /// Double-SHA256 merkle root over `txids` (Bitcoin's odd-node-duplicates
@@ -356,6 +420,7 @@ mod tests {
     }
 
     use bitcoin::blockdata::opcodes::all::OP_PUSHNUM_1;
+    use bitcoin::blockdata::script::Instruction;
     use bitcoin::script::PushBytes;
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
     use bitcoin::{block, BlockHash, CompactTarget, TxMerkleNode};
@@ -634,3 +699,7 @@ mod tests {
         assert!(matches!(ins[1], Instruction::PushBytes(b) if b.len() == 72));
     }
 }
+
+#[cfg(test)]
+#[path = "signet_consharden_tests.rs"]
+mod consharden_tests;
