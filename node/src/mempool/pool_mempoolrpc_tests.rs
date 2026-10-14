@@ -359,3 +359,42 @@ fn expiry_pass_skips_the_walk_until_something_can_have_expired() {
     assert!(!mp.inner.read().entries.may_hold_older_than(cutoff));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn prioritising_a_transaction_not_in_the_pool_keeps_the_expiry_floor() {
+    // A `mempool.dat` reload prioritises each record before admitting it.
+    // That edit cannot move any entry's time, so it must not make the next
+    // admission walk the pool.
+    let (cs, mp, dir) = env(&[1]);
+    admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 1_000, 2));
+    let cutoff = crate::time::now_secs().saturating_sub(mp.config.read().expiry_secs);
+    assert!(!mp.inner.read().entries.may_hold_older_than(cutoff));
+
+    let absent = spend(&[prev(9)], COIN_VALUE, 1_000, 3).compute_txid();
+    mp.prioritise_transaction(&absent, 5_000).expect("stored for later");
+    assert!(!mp.inner.read().entries.may_hold_older_than(cutoff));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn acting_view_reads_spend_and_creation_together() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2);
+    let child = spend(&[out0(&parent)], COIN_VALUE - 1_000, 1_000, 3);
+    let child_out = TxOut { value: Amount::from_sat(COIN_VALUE - 2_000), script_pubkey: p2wpkh(3) };
+    admit(&mp, &cs, parent.clone());
+    admit(&mp, &cs, child.clone());
+
+    assert_eq!(mp.acting_view_of(&out0(&parent)), ActingOutpointView::Spent);
+    assert_eq!(
+        mp.acting_view_of(&out0(&child)),
+        ActingOutpointView::Created { output: Some(child_out), rests_on: vec![prev(1)] }
+    );
+    assert_eq!(
+        mp.acting_view_of(&OutPoint { txid: child.compute_txid(), vout: 1 }),
+        ActingOutpointView::Created { output: None, rests_on: vec![prev(1)] }
+    );
+    assert_eq!(mp.acting_view_of(&prev(1)), ActingOutpointView::Spent);
+    assert_eq!(mp.acting_view_of(&prev(7)), ActingOutpointView::NotInPool);
+    let _ = std::fs::remove_dir_all(&dir);
+}

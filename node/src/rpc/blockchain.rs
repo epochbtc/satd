@@ -868,17 +868,18 @@ pub fn get_tx_out_view(
     let Some((tip_hash, tip_height, found)) = chain_state.coherent_read(|| {
         let (tip_hash, tip_height) = chain_state.tip_snapshot();
         if let Some(mempool) = mempool {
-            // Core: `if (!mempool.isSpent(out)) coin = view.GetCoin(out);`
-            if mempool.spending_tx_acting(&outpoint).is_some() {
-                return (tip_hash, tip_height, Found::Spent);
-            }
-            // A pool transaction with this txid answers for every one of
-            // its outputs, as `CCoinsViewMemPool::GetCoin` checks the pool
-            // first.
-            if let Some((output, rests_on)) = mempool.acting_output(&outpoint)
-                && rests_on.iter().all(|op| chain_state.has_coin(op))
-            {
-                return (tip_hash, tip_height, Found::Pool(output));
+            use crate::mempool::pool::ActingOutpointView;
+            // Core: `if (!mempool.isSpent(out)) coin = view.GetCoin(out);`,
+            // and a pool transaction with this txid answers for every one
+            // of its outputs. One pool read answers both.
+            match mempool.acting_view_of(&outpoint) {
+                ActingOutpointView::Spent => return (tip_hash, tip_height, Found::Spent),
+                ActingOutpointView::Created { output, rests_on }
+                    if rests_on.iter().all(|op| chain_state.has_coin(op)) =>
+                {
+                    return (tip_hash, tip_height, Found::Pool(output));
+                }
+                ActingOutpointView::Created { .. } | ActingOutpointView::NotInPool => {}
             }
         }
         (tip_hash, tip_height, Found::Chain(chain_state.get_coin(&outpoint)))

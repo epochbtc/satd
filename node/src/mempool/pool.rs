@@ -511,6 +511,23 @@ impl crate::events::publisher::MempoolTweakSource for Mempool {
     }
 }
 
+/// What the acting class says about one outpoint: see
+/// [`Mempool::acting_view_of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActingOutpointView {
+    /// An acting transaction spends it.
+    Spent,
+    /// An acting transaction has its txid. `output` is `None` when that
+    /// transaction has no such output. `rests_on` lists every outpoint
+    /// outside the pool that the transaction and its in-pool ancestors
+    /// spend. The pool trails the chain (a block is committed before
+    /// `remove_for_block` takes what it confirmed or conflicted), so the
+    /// answer holds at a tip only while each of these is a coin there.
+    Created { output: Option<TxOut>, rests_on: Vec<OutPoint> },
+    /// No acting transaction spends or creates it.
+    NotInPool,
+}
+
 /// Statistics about the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolInfo {
@@ -928,9 +945,15 @@ impl EntryMap {
 
     /// The entry's bookkeeping fields, for update in place. Its `tx` must not
     /// change: the wtxid index is keyed on it.
+    ///
+    /// A hit resets the time floor, since the caller may move `time`. A miss
+    /// leaves it alone: `prioritisetransaction` for a transaction not yet in
+    /// the pool (every prioritised record of a `mempool.dat` reload) must not
+    /// cost the next admission a walk over the pool.
     fn get_mut(&mut self, txid: &Txid) -> Option<&mut MempoolEntry> {
+        let entry = self.by_txid.get_mut(txid)?;
         self.time_floor = 0;
-        self.by_txid.get_mut(txid)
+        Some(entry)
     }
 
     /// Whether an entry may have entered before `cutoff`, i.e. whether the
@@ -3810,27 +3833,22 @@ impl Mempool {
         Some((spending_txid, vin))
     }
 
-    /// The output `outpoint` names, when an acting-class transaction in the
-    /// pool has `outpoint.txid`: `Some(Some(output))`, or `Some(None)` when
-    /// that transaction has no output `outpoint.vout`. `None` when no acting
-    /// transaction has the txid. This is the mempool half of Core's
-    /// `CCoinsViewMemPool::GetCoin`, which `gettxout` reads; a quarantined
-    /// transaction is invisible here, as on every standard surface (§6.1).
-    ///
-    /// Alongside the output it returns every outpoint outside the pool that
-    /// the transaction and its in-pool ancestors spend. The pool trails the
-    /// chain: a block is committed before `remove_for_block` takes what it
-    /// confirmed or conflicted. While those outpoints are all coins at a
-    /// given tip, the transaction is still unconfirmed and valid there;
-    /// once one is gone, the pool's answer is stale for that tip.
-    pub fn acting_output(&self, outpoint: &OutPoint) -> Option<(Option<TxOut>, Vec<OutPoint>)> {
+    /// What the acting class says about `outpoint`, read under one lock:
+    /// the mempool half of Core's `CCoinsViewMemPool`, which `gettxout`
+    /// reads. A quarantined transaction is invisible here, as on every
+    /// standard surface (§6.1).
+    pub fn acting_view_of(&self, outpoint: &OutPoint) -> ActingOutpointView {
         let inner = self.inner.read();
-        let entry = inner.entries.get(&outpoint.txid)?;
-        if !entry.scope.is_acting() {
-            return None;
+        if let Some(spender) = inner.spends.get(outpoint)
+            && inner.entries.get(spender).is_some_and(|e| e.scope.is_acting())
+        {
+            return ActingOutpointView::Spent;
         }
+        let Some(entry) = inner.entries.get(&outpoint.txid).filter(|e| e.scope.is_acting()) else {
+            return ActingOutpointView::NotInPool;
+        };
         let output = entry.tx.output.get(outpoint.vout as usize).cloned();
-        let mut confirmed_inputs = Vec::new();
+        let mut rests_on = Vec::new();
         let mut seen: HashSet<Txid> = HashSet::from([outpoint.txid]);
         let mut walk = vec![outpoint.txid];
         while let Some(txid) = walk.pop() {
@@ -3844,11 +3862,11 @@ impl Mempool {
                         walk.push(parent);
                     }
                 } else {
-                    confirmed_inputs.push(input.previous_output);
+                    rests_on.push(input.previous_output);
                 }
             }
         }
-        Some((output, confirmed_inputs))
+        ActingOutpointView::Created { output, rests_on }
     }
 
     /// Like [`spending_tx`](Self::spending_tx) but only reports a spender in the
