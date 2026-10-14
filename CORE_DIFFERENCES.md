@@ -662,13 +662,13 @@ silently returning an empty or wrong answer.
 
   | Method | Argument | Why it is refused |
   |---|---|---|
-  | `submitpackage` | `maxfeerate`, `maxburnamount` | not applied to a package; `sendrawtransaction` does enforce both |
   | `utxoupdatepsbt` | `descriptors` | satd fills in UTXOs only; an empty list is a faithful no-op and is accepted |
   | `converttopsbt` | `iswitness` | satd's decoder auto-detects, which is Core's behaviour when the argument is omitted |
 
-  A fee or burn limit is the caller's own safety check, so silently accepting
-  one that is never enforced is the failure mode worth avoiding: the caller
-  would get no protection and no warning.
+  Silently accepting an argument that is never acted on is the failure mode
+  worth avoiding: the caller would get an answer to another question and no
+  warning. (`submitpackage` applies its `maxfeerate` and `maxburnamount`, as
+  `sendrawtransaction` does.)
 
 - **`estimaterawfee`** — Core's fee estimator keeps three horizons of decaying
   bucket statistics; satd's keeps a rolling sample of recent block feerates.
@@ -739,10 +739,24 @@ silently returning an empty or wrong answer.
   committing funds is worse than an absent one.
 
 - **`savemempool`** — Core refuses with `-1 The mempool was not loaded yet`
-  when `CTxMemPool::GetLoadTried()` is false. satd attempts the load
-  unconditionally at startup and has no such flag, so the precondition has
-  nothing to read and the call proceeds. The failure message is Core's
-  verbatim; the OS error goes to the log rather than into the RPC reply.
+  when `CTxMemPool::GetLoadTried()` is false. satd keeps that flag and
+  reports it as `getmempoolinfo.loaded`, but `savemempool` does not consult
+  it, so a call made while the startup load is still running proceeds. The
+  failure message is Core's verbatim; the OS error goes to the log rather
+  than into the RPC reply.
+
+- **Mempool size and descendant limits** — Core measures `-maxmempool`
+  against the pool's memory use (`DynamicMemoryUsage`); satd measures it
+  against the serialized size of the transactions it holds. At the same
+  setting satd keeps more transactions than Core, uses more memory than the
+  figure, and starts evicting (and raising `mempoolminfee`) later.
+  `getmempoolinfo.usage` is satd's estimate of the memory its entries occupy,
+  added up from what each entry holds rather than measured from the
+  allocator, so it is a lower bound. `-limitclustercount` caps a
+  transaction's unconfirmed *ancestors*: one with more than that many in the
+  mempool is refused as `too-large-cluster`. Descendants are not counted, so
+  a transaction can gain any number of children, where Core bounds
+  descendants too (v30's `-limitdescendantcount`, v31's cluster limit).
 
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes

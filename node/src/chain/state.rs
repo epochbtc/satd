@@ -974,6 +974,14 @@ impl ChainState {
         //      are mode 644 satd:satd. Without this branch a validation
         //      node sharing `blocks/` with a primary can never
         //      `-reindex-chainstate`.
+        //
+        // A full `-reindex` keeps no block index, so the store is empty, but
+        // the block files still hold genesis as the first record of
+        // `blk00000.dat`, where satd and Core both write it (#931). Index it
+        // there: appending a second copy wrote to a block file, possibly one
+        // of Core's, on an operation that otherwise only reads them. Only a
+        // datadir whose files do not begin with genesis (a new one, a pruned
+        // one) gets it written.
         tracing::info!("Initializing chain with genesis block");
 
         let flat_pos = if let Some(entry) = store.get_block_index(&genesis_hash) {
@@ -986,6 +994,11 @@ impl ChainState {
                 file_number: entry.file_number,
                 data_pos: entry.data_pos,
             }
+        } else if let Some(pos) = genesis_record_on_disk(&mut flat_files, &genesis) {
+            tracing::info!(
+                "Genesis is the first record of blk00000.dat; indexing it there"
+            );
+            pos
         } else {
             let block_data = serialize(&genesis);
             let pos = flat_files
@@ -2452,20 +2465,17 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // PoW validation
-        validation::pow::check_proof_of_work(header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(header, self.network)?;
 
-        // Difficulty check. `get_ancestor` (by height) seeds retarget boundaries;
-        // the testnet min-difficulty walk-back uses `get_by_hash` (parent
-        // pointers) so it is immune to height→hash index gaps.
+        // Difficulty check. The retarget seed and the testnet min-difficulty
+        // walk-back follow parent pointers, so they stay on this header's own
+        // branch and are immune to height→hash index gaps.
         validation::pow::check_difficulty(
             header,
             &parent,
             self.network,
-            |h| {
-                let hash = self.store.get_block_hash_by_height(h)?;
-                self.store.get_block_index(&hash)
-            },
             |h| self.store.get_block_index(h),
         )?;
 
@@ -2694,12 +2704,10 @@ impl ChainState {
         headers: &[bitcoin::block::Header],
     ) -> (u32, Option<ChainError>) {
         let mut batch = crate::storage::StoreBatch::default();
-        // Entries staged in this batch, by hash and by height, so consecutive
-        // headers resolve their parent and their retarget ancestors before
-        // anything is committed.
+        // Entries staged in this batch, by hash, so consecutive headers
+        // resolve their parent and their retarget ancestors before anything
+        // is committed.
         let mut batch_index: std::collections::HashMap<BlockHash, BlockIndexEntry> =
-            std::collections::HashMap::new();
-        let mut staged_by_height: std::collections::HashMap<u32, BlockHash> =
             std::collections::HashMap::new();
         let mut accepted = 0u32;
         let mut max_height = 0u32;
@@ -2743,8 +2751,9 @@ impl ChainState {
 
             let new_height = parent.height + 1;
 
-            // PoW validation
-            if let Err(e) = validation::pow::check_proof_of_work(header) {
+            // PoW validation, against the network's limit as well as the
+            // header's own claim (Core's `CheckProofOfWork` with `powLimit`).
+            if let Err(e) = validation::pow::check_proof_of_work_bounded(header, self.network) {
                 return (accepted, Some(e.into()));
             }
 
@@ -2754,21 +2763,10 @@ impl ChainState {
                 &parent,
                 self.network,
                 |h| {
-                    // Retarget seed by height: check batch first for recently
-                    // accepted headers, then store.
-                    staged_by_height
-                        .get(&h)
-                        .and_then(|hash| batch_index.get(hash).cloned())
-                        .or_else(|| {
-                            let hash = self.store.get_block_hash_by_height(h)?;
-                            self.store.get_block_index(&hash)
-                        })
-                },
-                |h| {
-                    // Min-difficulty walk-back by parent hash: in-batch headers
-                    // (this batch's predecessors) first, then the store. Using
-                    // parent pointers — not the height index — makes the walk
-                    // immune to height→hash gaps.
+                    // Ancestors by parent hash (retarget seed and testnet
+                    // walk-back): in-batch headers (this batch's predecessors)
+                    // first, then the store. Parent pointers, not the height
+                    // index, keep both on this header's own branch.
                     batch_index
                         .get(h)
                         .cloned()
@@ -2797,7 +2795,6 @@ impl ChainState {
             // Staged for the in-batch retarget lookup only. Which heights get a
             // height->hash row is decided once, from the best-header chain, in
             // `commit_accepted_headers`.
-            staged_by_height.insert(new_height, hash);
             accepted += 1;
             max_height = max_height.max(new_height);
             if best_in_batch
@@ -4717,8 +4714,9 @@ impl ChainState {
         // Structural + witness block validation
         validation::block::check_block(block, self.network, new_height)?;
 
-        // PoW validation
-        validation::pow::check_proof_of_work(&block.header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
 
         // Difficulty check
         let store_ref = &*self.store;
@@ -4726,10 +4724,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         )?;
 
@@ -6370,11 +6364,11 @@ impl ChainState {
         if let Some(required) = short_of {
             // Where the stored chain picks up again past the hole, if it does:
             // blocks whose parent is nowhere in the files. The gap alone is
-            // not enough, because it can be gone by now. `ChainState::new`
-            // appended genesis to the empty database's block files before
-            // this scan, and when genesis does not fit in the file below a
-            // gap it rolls over into the missing file's number, so the scan
-            // reads past the hole.
+            // not enough, because it can be gone by now. When the block files
+            // do not begin with genesis, `ChainState::new` appended it to the
+            // empty database's block files before this scan, and when genesis
+            // does not fit in the file below a gap it rolls over into the
+            // missing file's number, so the scan reads past the hole.
             let mut orphaned = 0usize;
             let mut first_orphan_file: Option<u32> = None;
             for (hash, record) in &header_by_hash {
@@ -7136,10 +7130,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         ) {
             return Ok(Some(e.to_string()));
@@ -7310,8 +7300,9 @@ impl ChainState {
             return Err(e.into());
         }
 
-        // PoW validation
-        validation::pow::check_proof_of_work(&block.header)?;
+        // PoW validation, bounded by the network's limit (Core's
+        // `CheckProofOfWork` with `powLimit`).
+        validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
 
         // Difficulty check
         let store_ref = &*self.store;
@@ -7319,10 +7310,6 @@ impl ChainState {
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         )?;
 
@@ -9956,6 +9943,10 @@ impl ChainState {
 mod blockaccept_tests;
 
 #[cfg(test)]
+#[path = "state_hdrsync_tests.rs"]
+mod hdrsync_tests;
+
+#[cfg(test)]
 #[path = "state_consharden_tests.rs"]
 mod consharden_tests;
 
@@ -10248,6 +10239,19 @@ pub(crate) fn network_magic(network: Network) -> [u8; 4] {
         Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
         Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
     }
+}
+
+/// Where `genesis` sits when it is the first record of `blk00000.dat`, as a
+/// fresh satd or Core datadir writes it: the record's payload must be the
+/// genesis block byte for byte. `None` when the file is missing, unreadable,
+/// or begins with anything else.
+fn genesis_record_on_disk(flat_files: &mut FlatFileManager, genesis: &Block) -> Option<FlatFilePos> {
+    let pos = FlatFilePos {
+        file_number: 0,
+        data_pos: 0,
+    };
+    let payload = flat_files.read_block(&pos).ok()?;
+    (payload == serialize(genesis)).then_some(pos)
 }
 
 #[cfg(test)]
@@ -20802,6 +20806,116 @@ pub(crate) mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every `blk*.dat` under `blocks`, by name, with its bytes.
+    fn blk_file_bytes(blocks: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(blocks)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("blk") && n.ends_with(".dat"))
+            .map(|n| {
+                let bytes = std::fs::read(blocks.join(&n)).unwrap();
+                (n, bytes)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// #931: a full `-reindex` opens an empty store over block files that
+    /// already begin with genesis. Genesis is indexed where it is, so the
+    /// reindex leaves the block files, which may be Core's, as it found them.
+    ///
+    /// Perturbation: drop the `genesis_record_on_disk` branch from
+    /// `ChainState::new` and the last file grows by a second genesis record.
+    #[test]
+    fn a_full_reindex_leaves_the_block_files_as_it_found_them() {
+        let (cs, dir) = make_chain_state();
+        let hashes = build_chain(&cs, 6, 1_702_100_000);
+        cs.flat_files.lock().sync_all().unwrap();
+        let before = blk_file_bytes(&dir.join("blocks"));
+
+        let re = reindexing_chain_state_over(&dir);
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let entry = re.store.get_block_index(&genesis).expect("genesis is indexed");
+        assert_eq!((entry.file_number, entry.data_pos), (0, 0));
+        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+
+        assert_eq!(end, FlatFileReindexEnd::Finished);
+        assert_eq!(re.tip_hash(), hashes[5]);
+        assert!(
+            blk_file_bytes(&dir.join("blocks")) == before,
+            "the reindex wrote to the block files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #931: genesis is reused only where `blk00000.dat` begins with it, read
+    /// through the blocks directory's `xor.dat` key as Core 28+ writes one. A
+    /// first record that is anything else gets genesis appended, as a new
+    /// datadir does.
+    #[test]
+    fn genesis_is_reused_only_where_blk00000_begins_with_it() {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let magic = network_magic(Network::Regtest);
+        let open = |blocks: &std::path::Path| {
+            ChainState::new(
+                Box::new(InMemoryStore::new()),
+                FlatFileManager::new(blocks).unwrap(),
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap()
+        };
+        for key in [[0u8; 8], [0x8f, 0x1a, 0x00, 0xc4, 0x5e, 0x21, 0xd0, 0x77]] {
+            for genesis_first in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let blocks = dir.path().join("blocks");
+                std::fs::create_dir_all(&blocks).unwrap();
+                std::fs::write(blocks.join("xor.dat"), key).unwrap();
+                {
+                    let mut files = FlatFileManager::new(&blocks).unwrap();
+                    let first = if genesis_first {
+                        serialize(&genesis)
+                    } else {
+                        b"a record that is not genesis".to_vec()
+                    };
+                    files.write_block(&first, magic, 0).unwrap();
+                    files.sync_all().unwrap();
+                }
+                let before = blk_file_bytes(&blocks);
+
+                let cs = open(&blocks);
+                let entry = cs.store.get_block_index(&genesis.block_hash()).unwrap();
+                let at = (entry.file_number, entry.data_pos);
+                let after = blk_file_bytes(&blocks);
+                let stored = cs.flat_files.lock().read_block(&FlatFilePos {
+                    file_number: entry.file_number,
+                    data_pos: entry.data_pos,
+                });
+
+                assert_eq!(stored.unwrap(), serialize(&genesis), "key {key:?}");
+                if genesis_first {
+                    assert_eq!(at, (0, 0), "key {key:?}");
+                    assert!(after == before, "key {key:?}: genesis was written again");
+                } else {
+                    assert_ne!(at, (0, 0), "key {key:?}");
+                    assert_eq!(
+                        after[0].1.len(),
+                        before[0].1.len() + 8 + serialize(&genesis).len(),
+                        "key {key:?}: genesis is appended after the other record"
+                    );
+                }
+            }
+        }
     }
 
     /// #906: a fresh reindex refuses a chainstate that is not empty. Its

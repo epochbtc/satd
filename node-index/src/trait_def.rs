@@ -74,6 +74,57 @@ pub trait AddressIndex: Send + Sync {
         Ok(out)
     }
 
+    /// Distinct confirmed transactions of `sh` in chain order: ascending
+    /// height, then position in the block. That is the order the Electrum
+    /// protocol lists a history in and hashes its status over (see
+    /// [`crate::history`]).
+    ///
+    /// At most `limit` rows. A caller enforcing a cap passes `cap + 1` and
+    /// treats a longer answer as too large; a truncated answer can hold
+    /// only part of its last block.
+    ///
+    /// The default has no in-block position to go on and keeps
+    /// [`confirmed_distinct_history_limited`](Self::confirmed_distinct_history_limited)'s
+    /// `(height, txid)` order. The chainstate-backed index overrides it.
+    fn confirmed_txs_in_chain_order(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Result<Vec<(u32, bitcoin::Txid)>, IndexError> {
+        self.confirmed_distinct_history_limited(sh, limit)
+    }
+
+    /// One page of `sh`'s distinct confirmed transactions, newest first:
+    /// height descending, then `Txid`'s order descending. With `after`, the
+    /// page starts just after that transaction; `Ok(None)` when `after` is
+    /// not in the confirmed history. At most `limit` rows.
+    ///
+    /// Esplora's `/txs/chain[/:last_seen_txid]` pages. The default reads the
+    /// whole history for every page, which makes walking an `N`-transaction
+    /// history `O(N²)`. The chainstate-backed index overrides it with a read
+    /// that starts at the cursor and stops once the page is complete.
+    fn confirmed_txs_newest_first(
+        &self,
+        sh: &Scripthash,
+        after: Option<bitcoin::Txid>,
+        limit: usize,
+    ) -> Result<Option<Vec<(u32, bitcoin::Txid)>>, IndexError> {
+        let distinct: std::collections::BTreeSet<(u32, bitcoin::Txid)> = self
+            .confirmed_history(sh)?
+            .iter()
+            .map(|e| (e.height(), e.txid()))
+            .collect();
+        let newest_first: Vec<(u32, bitcoin::Txid)> = distinct.into_iter().rev().collect();
+        let start = match after {
+            None => 0,
+            Some(cursor) => match newest_first.iter().position(|(_, t)| *t == cursor) {
+                Some(i) => i + 1,
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(newest_first.into_iter().skip(start).take(limit).collect()))
+    }
+
     /// Unconfirmed (mempool) entries for `sh`.
     fn mempool_history(&self, sh: &Scripthash) -> Vec<MempoolHistoryEntry>;
 
@@ -107,4 +158,12 @@ pub trait AddressIndex: Send + Sync {
         &self,
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError>;
+
+    /// Record the status a new subscriber to `sh` was just answered with, so
+    /// the next recompute that finds the status unchanged does not push it
+    /// again. Call it right after the [`subscribe`](Self::subscribe) that
+    /// gave the caller its receiver, with a status computed after that
+    /// subscribe. See [`SubscriptionRegistry::seed_status`](crate::SubscriptionRegistry::seed_status).
+    /// Default: nothing to record.
+    fn seed_status(&self, _sh: Scripthash, _status_hash: [u8; 32]) {}
 }

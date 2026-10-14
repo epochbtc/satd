@@ -34,4 +34,10 @@ pub struct EsploraState {
     /// that layer only bounds request *handling*, not the lifetime of
     /// long-lived streaming bodies (review M2).
     pub sse_semaphore: Arc<Semaphore>,
+    /// Permits for handler work run on the blocking pool (see
+    /// [`crate::blocking`]). A permit is held until the work ends, even
+    /// after its request has timed out. Sized from
+    /// `EsploraConfig::max_concurrency` by [`crate::work_permits_for`];
+    /// `None` when that cap is disabled.
+    pub work_permits: Option<Arc<Semaphore>>,
 }

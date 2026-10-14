@@ -69,7 +69,7 @@ data with Bitcoin Core requires a patched fork such as Bitcoin Knots:
 | `--datacarriersize=<bytes>` | `83` | The maximum permitted size of an `OP_RETURN` script. Anything larger is rejected as non-standard. |
 | `--dustrelayfee=<sat/kvB>` | `3000` | The threshold used to calculate dust. Raising it forces transactions that create tiny, unspendable UTXOs to pay higher fees. |
 | `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects non-standard bare multisig setups, a construction often used for data storage. |
-| `--limitclustercount=<N>` | `64` | Do not accept a transaction directly or indirectly connected to `N` or more other unconfirmed transactions. This is the limit that gates admission; `64` is also the maximum, so the option can only lower it. Exceeding it is rejected as `too-large-cluster`. |
+| `--limitclustercount=<N>` | `64` | Do not accept a transaction with more than `N` unconfirmed ancestors in the mempool; it is rejected as `too-large-cluster`. This is the limit that gates admission; `64` is also the maximum, so the option can only lower it. satd counts ancestors only: unlike Bitcoin Core, which also bounds descendants, it does not limit how many transactions descend from one. |
 | `--limitancestorcount=<N>` | `25` | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `--limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `--limitdescendantcount=<N>` | `25` | Maximum unconfirmed descendant count. Deprecated alongside `--limitancestorcount`, and likewise no longer gates admission. |
 
@@ -94,7 +94,9 @@ sat-cli -datadir=/path/to/datadir getblockcount
   `rpccookiefile` come from the command line first, then the active chain's
   section (`[main]`, `[test]`, `[testnet4]`, `[signet]`, `[regtest]`), then
   the top level of the file; the first value in a scope wins. A top-level
-  `rpcport` applies on every chain, as it does for satd itself.
+  `rpcport` applies on every chain, as it does for satd itself. The file is
+  read with satd's rules: `#` starts a comment anywhere on a line, and an
+  `rpcpassword` line holding a `#` is an error.
 - **Which credentials.** A non-empty `rpcpassword` from either source means
   user/password authentication, with `rpcuser` looked up the same way;
   otherwise the cookie file, whose relative path is under the chain's data
@@ -143,7 +145,7 @@ changed. Their values are redacted in the log, never printed.
 | `rpcextendederrors`, `rpcdefaultunits` | Switches the RPC error-payload shape and the default amount unit. |
 | `maxconnections`, `maxinboundperip` | New limits govern subsequent connections. Existing peers above a lowered cap are not dropped. |
 | `bantime` | New ban duration applies to bans created after the change. |
-| `minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier`, `datacarriersize`, `mempoolfullrbf`, `limitclustercount`, `limitancestorcount`, `limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig` | Mempool and relay policy is swapped atomically and governs subsequent transaction admissions. Already-admitted entries are not re-evaluated. |
+| `minrelaytxfee`, `maxmempool`, `dustrelayfee`, `datacarrier`, `datacarriersize`, `mempoolfullrbf`, `limitclustercount`, `limitancestorcount`, `limitdescendantcount`, `mempoolexpiry`, `permitbaremultisig` | Mempool and relay policy is swapped atomically and governs subsequent transaction admissions. Already-admitted entries are not re-evaluated, except that a lower `maxmempool` evicts the lowest-feerate entries at once, down to the new size. |
 | `connect`, `addnode`, `seednode` | Newly added peers are registered as at startup and dialed immediately; existing connections are untouched. A new `addnode` entry is an added node, listed by `getaddednodeinfo` and removable with `addnode remove`, and a new `addnode` or `connect` host name that does not resolve yet is kept and looked up again on every reconnect tick. Removing an entry does not disconnect that peer (use `disconnectnode`) or remove the added node (use `addnode remove`), matching Core's `-addnode`. The exclusivity of `-connect` (connect only to these peers, with automatic outbound and DNS seeding suppressed) is a startup-time decision and is not re-evaluated on reload. Adding `-connect` live dials the new peer but does not put a running node into connect-only mode; restart for that. |
 | `peerblockfilters` | Turns `NODE_COMPACT_FILTERS` advertisement on or off for new handshakes, still gated on a complete `blockfilterindex`. |
 | `addrindexsubscriptions` | New address-index subscription cap, applied to subsequent subscriptions. Lowering it does not evict existing subscribers. |

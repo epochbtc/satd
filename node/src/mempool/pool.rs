@@ -13,6 +13,10 @@ use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
 use node_sp_index::{compute_tweak, TweakEntry};
 
+#[cfg(test)]
+#[path = "pool_esplorapaging_tests.rs"]
+mod esplorapaging_tests;
+
 /// Capacity of the broadcast channel carrying [`MempoolEvent`]s.
 ///
 /// This is not a queue depth. `broadcast::send` never blocks and never
@@ -64,6 +68,12 @@ const INFECTIOUS_RULE: &str = "(infectious: quarantined ancestor)";
 /// policy-load timestamps; the hot paths inline their own `now`.
 fn now_unix_secs() -> u64 {
     crate::time::now_secs()
+}
+
+/// The modified fee as Core keeps it (`CTxMemPoolEntry::m_modified_fee`):
+/// signed and unclamped, for the RPC rollups that report it.
+fn signed_modified_fee(base_fee: u64, delta: i64) -> i64 {
+    (base_fee as i64).saturating_add(delta)
 }
 
 /// Format a satoshi amount as a BTC string the way Core's `FormatMoney` does:
@@ -436,6 +446,10 @@ pub struct MempoolEntry {
     pub weight: usize,
     pub fee_rate: u64,
     pub time: u64,
+    /// Chain tip height when the transaction entered the pool: Core's
+    /// `CTxMemPoolEntry::entryHeight`, which `getmempoolentry` reports as
+    /// `height`.
+    pub height: u32,
     /// Miner-adjustable fee delta (satoshis) from `prioritisetransaction`.
     pub fee_delta: i64,
     /// BIP 141 witness-aware sigop cost of this tx. Computed at admission
@@ -497,11 +511,40 @@ impl crate::events::publisher::MempoolTweakSource for Mempool {
     }
 }
 
+/// What the acting class says about one outpoint: see
+/// [`Mempool::acting_view_of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActingOutpointView {
+    /// An acting transaction spends it.
+    Spent,
+    /// An acting transaction has its txid. `output` is `None` when that
+    /// transaction has no such output. `rests_on` lists every outpoint
+    /// outside the pool that the transaction and its in-pool ancestors
+    /// spend. The pool trails the chain (a block is committed before
+    /// `remove_for_block` takes what it confirmed or conflicted), so the
+    /// answer holds at a tip only while each of these is a coin there.
+    Created { output: Option<TxOut>, rests_on: Vec<OutPoint> },
+    /// No acting transaction spends or creates it.
+    NotInPool,
+}
+
 /// Statistics about the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolInfo {
     pub size: usize,
+    /// Serialized bytes of the acting class: what `-maxmempool` is measured
+    /// against, and what `satd_mempool_bytes` exports.
     pub bytes: usize,
+    /// Sum of the acting entries' virtual sizes: Core's `GetTotalTxSize`,
+    /// which `getmempoolinfo` reports as `bytes`.
+    pub vsize: usize,
+    /// Sum of the acting entries' base fees, in satoshis, ignoring
+    /// `prioritisetransaction` deltas: Core's `GetTotalFee`
+    /// (`getmempoolinfo.total_fee`).
+    pub total_fee: u64,
+    /// Estimated heap memory the acting entries occupy
+    /// (`getmempoolinfo.usage`); see `Mempool::estimated_memory_usage`.
+    pub usage: usize,
     pub max_size: usize,
     pub min_fee_rate: u64,
     /// Core's `mempoolminfee`: the larger of the rolling minimum and the
@@ -713,7 +756,9 @@ pub struct MempoolSummaryEntry {
     pub time: u64,
     pub ancestorcount: usize,
     pub ancestorsize: usize,
-    pub ancestorfees: u64,
+    /// Signed: a `prioritisetransaction` delta can make a modified fee
+    /// negative.
+    pub ancestorfees: i64,
     pub descendantcount: usize,
 }
 
@@ -722,7 +767,7 @@ pub struct MempoolSummaryEntry {
 pub struct MempoolSummary {
     /// Acting-class transaction count, as `getmempoolinfo.size` reports it.
     pub size: usize,
-    /// Acting-class serialized bytes, as `getmempoolinfo.bytes` reports it.
+    /// Acting-class virtual size, as `getmempoolinfo.bytes` reports it.
     pub bytes: usize,
     pub vsize_histogram: Vec<MempoolVsizeBucket>,
     pub top: Vec<MempoolSummaryEntry>,
@@ -737,7 +782,7 @@ struct SummaryRollup {
     time: u64,
     ancestorcount: usize,
     ancestorsize: usize,
-    ancestorfees: u64,
+    ancestorfees: i64,
 }
 
 struct MempoolInner {
@@ -860,6 +905,13 @@ impl RollingMinFee {
 struct EntryMap {
     by_txid: FxHashMap<Txid, MempoolEntry>,
     by_wtxid: FxHashMap<Wtxid, Txid>,
+    /// No entry's `time` is below this. Insertion lowers it, an in-place edit
+    /// resets it to 0 (the edit may have moved a `time`), and only the expiry
+    /// pass raises it, to the exact minimum it has just seen. It lets that
+    /// pass skip the whole-pool walk while nothing can have expired: Core
+    /// walks its entry-time index from the oldest (`CTxMemPool::Expire`), so
+    /// an admission does not cost a pass over the pool.
+    time_floor: u64,
 }
 
 impl EntryMap {
@@ -867,6 +919,7 @@ impl EntryMap {
     /// witness gives up its wtxid.
     fn insert(&mut self, txid: Txid, entry: MempoolEntry) -> Option<MempoolEntry> {
         let wtxid = entry.tx.compute_wtxid();
+        self.time_floor = self.time_floor.min(entry.time);
         let old = self.by_txid.insert(txid, entry);
         if let Some(old) = &old {
             self.unindex(txid, old);
@@ -892,8 +945,27 @@ impl EntryMap {
 
     /// The entry's bookkeeping fields, for update in place. Its `tx` must not
     /// change: the wtxid index is keyed on it.
+    ///
+    /// A hit resets the time floor, since the caller may move `time`. A miss
+    /// leaves it alone: `prioritisetransaction` for a transaction not yet in
+    /// the pool (every prioritised record of a `mempool.dat` reload) must not
+    /// cost the next admission a walk over the pool.
     fn get_mut(&mut self, txid: &Txid) -> Option<&mut MempoolEntry> {
-        self.by_txid.get_mut(txid)
+        let entry = self.by_txid.get_mut(txid)?;
+        self.time_floor = 0;
+        Some(entry)
+    }
+
+    /// Whether an entry may have entered before `cutoff`, i.e. whether the
+    /// expiry pass has anything to look for.
+    fn may_hold_older_than(&self, cutoff: u64) -> bool {
+        !self.by_txid.is_empty() && self.time_floor < cutoff
+    }
+
+    /// Raise the time floor to the oldest entry's time, after a walk that saw
+    /// every entry.
+    fn set_time_floor(&mut self, oldest: u64) {
+        self.time_floor = oldest;
     }
 
     /// The txid of the resident transaction whose wtxid is `wtxid`.
@@ -1108,6 +1180,10 @@ pub struct Mempool {
     /// entirely in the ~always case where nothing is pending — a relay
     /// node would otherwise pay a write-lock acquisition per inv item.
     unbroadcast_len: std::sync::atomic::AtomicUsize,
+    /// Core's `m_load_tried`: whether the startup attempt to load
+    /// `mempool.dat` has finished, whatever it found. `getmempoolinfo` reports
+    /// it as `loaded`.
+    load_tried: std::sync::atomic::AtomicBool,
     /// Mempool/relay policy. Behind a `RwLock` so SIGHUP config reload can swap
     /// it live (`reload_policy`); `accept_transaction` snapshots it once at
     /// entry so a transaction is judged against a single policy version.
@@ -1317,6 +1393,17 @@ pub trait PackageMember {
     fn txid(&self) -> Txid;
 }
 
+/// What an admission records from the outputs its transaction spends.
+/// Both admission paths build it with [`Mempool::spend_record`], so an
+/// entry carries the same sigop cost and prevout metadata however it got in.
+struct SpendRecord {
+    sigop_cost: u64,
+    prev_scripthashes: Vec<Scripthash>,
+    prev_amounts: Vec<u64>,
+    prev_scripts: Vec<ScriptBuf>,
+    sp_tweak: Option<TweakEntry>,
+}
+
 /// So the checks can be exercised against a plain transaction list.
 impl PackageMember for Transaction {
     fn tx(&self) -> &Transaction {
@@ -1349,6 +1436,7 @@ impl Mempool {
                 rolling: Mutex::new(RollingMinFee::default()),
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
+            load_tried: std::sync::atomic::AtomicBool::new(false),
             config: RwLock::new(config),
             policy: arc_swap::ArcSwapOption::empty(),
             policy_sha: Mutex::new(None),
@@ -1411,6 +1499,64 @@ impl Mempool {
     /// [`crate::events::publisher::MempoolTweakSource`] for the firehose bridge.
     pub fn cached_sp_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
         self.inner.read().entries.get(txid).and_then(|e| e.sp_tweak.clone())
+    }
+
+    /// The [`SpendRecord`] for `tx`, whose inputs spend `prev_outputs` (input
+    /// order).
+    ///
+    /// The sigop cost is Bitcoin Core's `GetTransactionSigOpCost` with the
+    /// standard script flags, which include P2SH and WITNESS (Core's
+    /// `PreChecks`, src/validation.cpp): the number the block template budgets
+    /// by and getblocktemplate reports.
+    ///
+    /// `prev_outputs` is dropped after admission, so this is the one chance
+    /// to keep prevout data for mempool spend-side matching (exact script +
+    /// prefix bucket) without re-resolving prevouts in the (decoupled)
+    /// matcher. The scripthash is always kept; value and full script are gated
+    /// by `streamprevoutmeta` (see `PrevoutMetaLevel`) so operators pay only
+    /// for the matcher capabilities they want. Gate-cold the scripts are empty,
+    /// so the event payload is byte-identical to a node without silent
+    /// payments.
+    ///
+    /// Silent-payment tweak: while an SP scan-key watch (D7, Tier 2) OR a
+    /// `mempool_tweaks` firehose subscriber (Tier 1.5) is live, compute the
+    /// BIP 352 public tweak `T = input_hash · A` once here — the resolved
+    /// prevout `scriptPubKey`s (including in-mempool parents) are in hand and
+    /// cannot be reconstructed off the hot path. The ~73-byte result is cached
+    /// on the entry so the unconfirmed matcher never recomputes it and the
+    /// firehose bridge can read it by txid. Gate-cold this is `None` with no
+    /// EC work, so a node without silent payments is unchanged.
+    fn spend_record(
+        &self,
+        prevout_meta: PrevoutMetaLevel,
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+    ) -> SpendRecord {
+        let sigop_cost = crate::validation::sigops::transaction_sigop_cost(
+            tx,
+            prev_outputs,
+            crate::validation::sigops::SigOpFlags::P2shWitness,
+        );
+        let prev_scripthashes: Vec<Scripthash> =
+            prev_outputs.iter().map(|o| scripthash_of(&o.script_pubkey)).collect();
+        let prev_amounts: Vec<u64> = if prevout_meta.retains_amount() {
+            prev_outputs.iter().map(|o| o.value.to_sat()).collect()
+        } else {
+            Vec::new()
+        };
+        let prev_scripts: Vec<ScriptBuf> = if prevout_meta.retains_script() {
+            prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
+            let spks: Vec<ScriptBuf> =
+                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
+            compute_tweak(tx, &spks)
+        } else {
+            None
+        };
+        SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak }
     }
 
     /// Whether the operator authorized emitting full prevout `scriptPubKey`s to
@@ -1491,6 +1637,17 @@ impl Mempool {
         }
     }
 
+    /// `LeaveEvicted` for each evicted entry that was acting. A held entry
+    /// never emitted an `Enter`, so a `Leave` for it would be a phantom that
+    /// leaks a withheld txid (§10).
+    fn emit_evicted(&self, evicted: &[(Txid, QuarantineScope)], reason: EvictReason) {
+        for (txid, scope) in evicted {
+            if scope.is_acting() {
+                self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason });
+            }
+        }
+    }
+
     /// Emit a quarantine-class event on the separate channel (§10). Best-effort,
     /// no-op when no sender is wired.
     fn emit_quarantine(&self, event: QuarantineEvent) {
@@ -1561,9 +1718,31 @@ impl Mempool {
 
     /// Swap in a new mempool/relay policy live (SIGHUP config reload). Takes
     /// effect on the next `accept_transaction` call; already-admitted entries
-    /// are not re-evaluated.
+    /// are not re-evaluated, except that a lower size limit trims the pool to
+    /// it at once.
     pub fn reload_policy(&self, new: MempoolConfig) {
+        let (max_size_bytes, quarantine_max_bytes, incremental_relay_fee) =
+            (new.max_size_bytes, new.quarantine_max_bytes, new.incremental_relay_fee);
         *self.config.write() = new;
+
+        // Core never leaves the pool over `-maxmempool`: every admission ends
+        // in `LimitMempoolSize` → `TrimToSize` (src/validation.cpp). Left over a
+        // lowered limit, the pool refused every admission until it drained.
+        let none = HashSet::new();
+        let (acting, held) = {
+            let mut inner = self.inner.write();
+            let over = inner.acting_bytes().saturating_sub(max_size_bytes);
+            let acting =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, false, incremental_relay_fee, &none);
+            let over = inner.quarantine_bytes.saturating_sub(quarantine_max_bytes);
+            let held =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, true, incremental_relay_fee, &none);
+            self.sync_unbroadcast_len(&inner);
+            (acting, held)
+        };
+        // Reported as admission reports them: only what was acting.
+        self.emit_evicted(&acting, EvictReason::FullPool);
+        self.emit_evicted(&held, EvictReason::Policy);
     }
 
     /// Load (or replace) the transaction-filtering ruleset from a file. Returns
@@ -2429,11 +2608,42 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
-        let accepted =
-            self.accept_transaction_unexpired(tx, chain_state, script_verifier, source, allow_quarantined)?;
+        let accepted = self.accept_transaction_unexpired(
+            tx,
+            chain_state,
+            script_verifier,
+            source,
+            allow_quarantined,
+            None,
+        )?;
         // Core expires the pool after every acceptance (`LimitMempoolSize` in
         // `MemPoolAccept::Finalize`), so `-mempoolexpiry` is enforced at the
         // moment the pool changes, not up to a timer tick later.
+        self.remove_expired();
+        Ok(accepted)
+    }
+
+    /// [`accept_transaction`](Self::accept_transaction) for a transaction
+    /// read back from `mempool.dat`, which keeps the time it first entered.
+    /// Core's `LoadMempool` passes the persisted `nTime` to
+    /// `AcceptToMemoryPool`, so `getmempoolentry.time` and the
+    /// `-mempoolexpiry` clock carry over a restart.
+    pub(crate) fn accept_persisted_transaction(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        time: u64,
+    ) -> Result<Txid, MempoolError> {
+        let accepted = self.accept_transaction_unexpired(
+            tx,
+            chain_state,
+            script_verifier,
+            TxSource::Reload,
+            // mempool.dat reload re-enters and quarantines normally; never refused.
+            false,
+            Some(time),
+        )?;
         self.remove_expired();
         Ok(accepted)
     }
@@ -2445,6 +2655,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         source: TxSource,
         allow_quarantined: bool,
+        entry_time: Option<u64>,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
@@ -2920,21 +3131,54 @@ impl Mempool {
         } else {
             EvictReason::FullPool
         };
-        let mut evicted_full_pool: Vec<Txid> = Vec::new();
-        if class_bytes + tx_size > class_budget {
-            // Only evict if the new tx outbids the cheapest entry *in its own class*.
-            let min_class_fee_rate = inner
+        let needs_room = class_bytes + tx_size > class_budget;
+        if needs_room {
+            // Only evict if the new tx outbids the cheapest entry *in its own
+            // class* that it may evict. Its own in-pool ancestors stay (see the
+            // eviction below), so they are not that bar.
+            let Some(min_class_fee_rate) = inner
                 .entries
-                .values()
-                .filter(|e| e.scope.is_quarantined() == quarantined)
-                .map(|e| e.fee_rate)
+                .iter()
+                .filter(|(t, e)| e.scope.is_quarantined() == quarantined && !ancestors.contains(*t))
+                .map(|(_, e)| e.fee_rate)
                 .min()
-                .unwrap_or(0);
+            else {
+                return Err(MempoolError::MempoolFull);
+            };
             if fee_rate <= min_class_fee_rate {
                 return Err(MempoolError::MempoolFull);
             }
-            // Evict enough lowest-fee-rate entries *of this class* to make room.
-            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size, quarantined, cfg.incremental_relay_fee);
+        }
+
+        // Script verification (all inputs at once for taproot), before
+        // anything leaves the pool to make room. Core runs PolicyScriptChecks
+        // and ConsensusScriptChecks before it adds the transaction and trims
+        // the pool (src/validation.cpp, AcceptSingleTransactionInternal), so a
+        // transaction whose scripts fail changes nothing.
+        // Use tip_height + 1 since the tx will be mined in the next block
+        if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
+            // Naming the script error can mean running the second engine over
+            // the input. Nothing has changed in the pool, so release it first.
+            drop(inner);
+            let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
+            return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
+        }
+
+        let mut evicted_full_pool: Vec<(Txid, QuarantineScope)> = Vec::new();
+        if needs_room {
+            // Evict lowest-fee-rate entries *of this class* until the pool,
+            // with this transaction in it, is back within its limit: Core's
+            // `TrimToSize` (src/txmempool.cpp). Freeing only this transaction's
+            // size left a pool that was already over (a lowered `-maxmempool`)
+            // over, and refused everything. Never this transaction's own
+            // ancestors.
+            evicted_full_pool = Self::evict_lowest_fee_entries_except(
+                &mut inner,
+                class_bytes + tx_size - class_budget,
+                quarantined,
+                cfg.incremental_relay_fee,
+                &ancestors,
+            );
             self.sync_unbroadcast_len(&inner);
             // If still not enough room after eviction, reject.
             let class_bytes_after = if quarantined {
@@ -2943,17 +3187,12 @@ impl Mempool {
                 inner.acting_bytes()
             };
             if class_bytes_after + tx_size > class_budget {
+                drop(inner);
+                // The evicted entries are gone whether or not this one gets in.
+                self.emit_evicted(&evicted_full_pool, evict_reason);
                 return Err(MempoolError::MempoolFull);
             }
         }
-
-        // Script verification (all inputs at once for taproot)
-        // Use tip_height + 1 since the tx will be mined in the next block
-        script_verifier
-            .verify_transaction(&tx, &prev_outputs, tip_height + 1)
-            .map_err(|e| {
-                MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx))
-            })?;
 
         // RBF: remove conflicted transactions before inserting replacement.
         // Collect replaced txids so we can emit LeaveReplaced events after the
@@ -2990,62 +3229,15 @@ impl Mempool {
         self.sync_unbroadcast_len(&inner);
 
         // Insert
-        let now = crate::time::now_secs();
+        let now = entry_time.unwrap_or_else(crate::time::now_secs);
 
         for input in &tx.input {
             inner.spends.insert(input.previous_output, txid);
         }
 
-        let prev_outputs_map: HashMap<OutPoint, TxOut> = tx
-            .input
-            .iter()
-            .zip(prev_outputs.iter())
-            .map(|(i, o)| (i.previous_output, o.clone()))
-            .collect();
-        let sigop_cost = tx.total_sigop_cost(|op| prev_outputs_map.get(op).cloned()) as u64;
-
-        // Retain the spent prevout metadata (input order) for mempool
-        // spend-side matching (exact script + prefix bucket). `prev_outputs` is
-        // fully resolved above and dropped after this; capturing it now is the
-        // one chance to keep the data without re-resolving prevouts in the
-        // (decoupled) matcher. The scripthash is always kept; value and full
-        // script are gated by `streamprevoutmeta` (see `PrevoutMetaLevel`) so
-        // operators pay only for the matcher capabilities they want.
-        let prev_scripthashes: Vec<Scripthash> = prev_outputs
-            .iter()
-            .map(|o| scripthash_of(&o.script_pubkey))
-            .collect();
-        let prev_amounts: Vec<u64> = if cfg.prevout_meta.retains_amount() {
-            prev_outputs.iter().map(|o| o.value.to_sat()).collect()
-        } else {
-            Vec::new()
-        };
-        // Retain full prevout scripts only when the operator asked for them
-        // (`streamprevoutmeta=full`); gate-cold this is empty, so the event
-        // payload is byte-identical to a node without silent payments.
-        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() {
-            prev_outputs
-                .iter()
-                .map(|o| o.script_pubkey.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // Silent-payment tweak: while an SP scan-key watch (D7, Tier 2) OR a
-        // `mempool_tweaks` firehose subscriber (Tier 1.5) is live, compute the
-        // BIP 352 public tweak `T = input_hash · A` once here — the resolved
-        // prevout `scriptPubKey`s (including in-mempool parents) are in hand and
-        // cannot be reconstructed off the hot path. The ~73-byte result is cached
-        // on the entry so the unconfirmed matcher never recomputes it and the
-        // firehose bridge can read it by txid. Gate-cold this is `None` with no
-        // EC work, so a node without silent payments is unchanged.
-        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
-            let spks: Vec<ScriptBuf> =
-                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
-            compute_tweak(&tx, &spks)
-        } else {
-            None
-        };
+        // Sigop cost and prevout metadata, the same for every admission path.
+        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
+            self.spend_record(cfg.prevout_meta, &tx, &prev_outputs);
 
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
@@ -3059,6 +3251,9 @@ impl Mempool {
                 weight,
                 fee_rate,
                 time: now,
+                // Core's `entryHeight`: the tip when the transaction entered
+                // (`PreChecks`, `m_active_chainstate.m_chain.Height()`).
+                height: tip_height,
                 fee_delta: preset_delta,
                 sigop_cost,
                 prev_scripthashes,
@@ -3082,19 +3277,10 @@ impl Mempool {
         // are best-effort but keeping the lock duration tight is the rule.
         drop(inner);
 
-        // `evicted_full_pool` is always drawn from the incoming tx's own class
-        // (`evict_lowest_fee_entries` filters to `quarantined`). Acting-class
-        // evictions go on the standard stream as before; quarantine-class
-        // evictions never emitted an `Enter`, so a `LeaveEvicted` for them would
-        // be a phantom Leave leaking a withheld txid (§10) — suppress it.
-        if !quarantined {
-            for evicted_txid in &evicted_full_pool {
-                self.emit(MempoolEvent::LeaveEvicted {
-                    txid: *evicted_txid,
-                    reason: evict_reason,
-                });
-            }
-        }
+        // Acting-class evictions go on the standard stream as before;
+        // quarantine-class ones never emitted an `Enter`, so a `LeaveEvicted`
+        // for them would be a phantom Leave leaking a withheld txid (§10).
+        self.emit_evicted(&evicted_full_pool, evict_reason);
         for conflict_txid in &replaced {
             self.emit(MempoolEvent::LeaveReplaced {
                 txid: *conflict_txid,
@@ -3173,32 +3359,52 @@ impl Mempool {
                 }
 
                 // Also remove any mempool txs whose inputs are now
-                // double-spent by the block. The chain — not policy —
+                // double-spent by the block, and everything that descends
+                // from them: Core's `removeConflicts` removes each conflict
+                // with `removeRecursive`, since a descendant spends an output
+                // that no longer exists anywhere. The chain — not policy —
                 // retired these, surfaced as
                 // `LeaveEvicted { BlockConflict }` so operators don't
                 // read them as mempool pressure.
                 if !tx.is_coinbase() {
                     for input in &tx.input {
-                        if let Some(conflict_txid) =
-                            inner.spends.remove(&input.previous_output)
-                            && let Some(conflict_entry) = inner.entries.remove(&conflict_txid)
-                        {
-                            let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
-                            inner.account_remove(conflict_entry.scope, sz);
-                            for ci in &conflict_entry.tx.input {
+                        let Some(conflict_txid) = inner.spends.get(&input.previous_output).copied()
+                        else {
+                            continue;
+                        };
+                        // Core clears the direct conflict's prioritisation
+                        // (`removeConflicts` → `ClearPrioritisation`), not its
+                        // descendants'.
+                        inner.fee_deltas.remove(&conflict_txid);
+                        let mut doomed = vec![conflict_txid];
+                        let mut children: Vec<Txid> = Vec::new();
+                        while let Some(doomed_txid) = doomed.pop() {
+                            Self::collect_children(&inner, &doomed_txid, &mut children);
+                            doomed.append(&mut children);
+                            let Some(doomed_entry) = inner.entries.remove(&doomed_txid) else {
+                                continue;
+                            };
+                            let sz = bitcoin::consensus::serialize(&doomed_entry.tx).len();
+                            inner.account_remove(doomed_entry.scope, sz);
+                            for ci in &doomed_entry.tx.input {
                                 inner.spends.remove(&ci.previous_output);
                             }
-                            inner.unbroadcast.remove(&conflict_txid);
+                            inner.unbroadcast.remove(&doomed_txid);
                             // Acting-class only on the standard stream (§10): a
                             // quarantined conflict never emitted an `Enter`, so a
                             // block-conflict `LeaveEvicted` for it would be a
                             // phantom Leave leaking a withheld txid.
-                            if conflict_entry.scope.is_acting() {
-                                evicted_conflicts.push(conflict_txid);
+                            if doomed_entry.scope.is_acting() {
+                                evicted_conflicts.push(doomed_txid);
                             }
                         }
                     }
                 }
+
+                // Core's `removeForBlock` clears every block transaction's
+                // prioritisation, resident or not: the delta has done its
+                // job, and a transaction reorged back in must not get it again.
+                inner.fee_deltas.remove(&txid);
             }
             self.sync_unbroadcast_len(&inner);
         }
@@ -3379,6 +3585,18 @@ impl Mempool {
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().entries.get(txid).cloned()
+    }
+
+    /// The admission time (`MempoolEntry::time`) of each of `txids` that is
+    /// in the pool, under one read lock and without cloning any transaction.
+    /// A txid not in the pool is left out. Lets a reader order a large set of
+    /// entries and then fetch only the few it serves.
+    pub fn admission_times(&self, txids: &[Txid]) -> Vec<(Txid, u64)> {
+        let inner = self.inner.read();
+        txids
+            .iter()
+            .filter_map(|txid| inner.entries.get(txid).map(|entry| (*txid, entry.time)))
+            .collect()
     }
 
     /// Get a transaction, and its txid, by wtxid: the id a BIP 339 peer
@@ -3615,6 +3833,42 @@ impl Mempool {
         Some((spending_txid, vin))
     }
 
+    /// What the acting class says about `outpoint`, read under one lock:
+    /// the mempool half of Core's `CCoinsViewMemPool`, which `gettxout`
+    /// reads. A quarantined transaction is invisible here, as on every
+    /// standard surface (§6.1).
+    pub fn acting_view_of(&self, outpoint: &OutPoint) -> ActingOutpointView {
+        let inner = self.inner.read();
+        if let Some(spender) = inner.spends.get(outpoint)
+            && inner.entries.get(spender).is_some_and(|e| e.scope.is_acting())
+        {
+            return ActingOutpointView::Spent;
+        }
+        let Some(entry) = inner.entries.get(&outpoint.txid).filter(|e| e.scope.is_acting()) else {
+            return ActingOutpointView::NotInPool;
+        };
+        let output = entry.tx.output.get(outpoint.vout as usize).cloned();
+        let mut rests_on = Vec::new();
+        let mut seen: HashSet<Txid> = HashSet::from([outpoint.txid]);
+        let mut walk = vec![outpoint.txid];
+        while let Some(txid) = walk.pop() {
+            let Some(e) = inner.entries.get(&txid) else {
+                continue;
+            };
+            for input in &e.tx.input {
+                let parent = input.previous_output.txid;
+                if inner.entries.contains_key(&parent) {
+                    if seen.insert(parent) {
+                        walk.push(parent);
+                    }
+                } else {
+                    rests_on.push(input.previous_output);
+                }
+            }
+        }
+        ActingOutpointView::Created { output, rests_on }
+    }
+
     /// Like [`spending_tx`](Self::spending_tx) but only reports a spender in the
     /// *acting* class (design §6.1): a relay-quarantined spender must stay
     /// invisible on standard read surfaces, exactly as it is absent from
@@ -3650,15 +3904,25 @@ impl Mempool {
         // so a concurrent `reload_policy` (config.write) can never form a lock
         // cycle with the mempool lock.
         let expiry_secs = self.config.read().expiry_secs;
+        // An entry has expired when it entered before this.
+        let cutoff = now.saturating_sub(expiry_secs);
         let mut expired_txids: Vec<Txid> = Vec::new();
         {
             let mut inner = self.inner.write();
-            let mut expired: Vec<Txid> = inner
-                .entries
-                .iter()
-                .filter(|(_, entry)| now.saturating_sub(entry.time) > expiry_secs)
-                .map(|(txid, _)| *txid)
-                .collect();
+            if !inner.entries.may_hold_older_than(cutoff) {
+                return 0;
+            }
+            let mut oldest_kept = u64::MAX;
+            let mut expired: Vec<Txid> = Vec::new();
+            for (txid, entry) in inner.entries.iter() {
+                if entry.time < cutoff {
+                    expired.push(*txid);
+                } else {
+                    oldest_kept = oldest_kept.min(entry.time);
+                }
+            }
+            // Every entry left is one of those kept above, or none at all.
+            inner.entries.set_time_floor(oldest_kept);
             // An expired transaction takes its descendants with it, as Core's
             // `CTxMemPool::Expire` does: a child left behind spends an output
             // the pool no longer has, and a block template would include it.
@@ -3777,9 +4041,51 @@ impl Mempool {
         }
     }
 
+    /// An entry's virtual size as Core reports it (`GetVirtualTransactionSize`,
+    /// src/policy/policy.cpp): its weight divided by four, rounded up.
+    fn entry_vsize(entry: &MempoolEntry) -> usize {
+        policy::weight_to_vsize(entry.weight as u64) as usize
+    }
+
+    /// Estimated heap memory one entry occupies, for `getmempoolinfo.usage`.
+    ///
+    /// Core reports `DynamicMemoryUsage`, which its allocator-aware
+    /// `memusage` helpers add up exactly. satd has no such accounting, so
+    /// this counts what the entry holds: the entry itself and its slot in
+    /// the txid and wtxid maps, each input and output with its script and
+    /// witness bytes, the retained prevout metadata, and one `spends` slot
+    /// per input. It ignores allocator rounding and spare capacity, so it
+    /// is a lower bound, but it moves with the pool the way Core's number
+    /// does.
+    fn estimated_memory_usage(entry: &MempoolEntry) -> usize {
+        use std::mem::size_of;
+        let tx = &entry.tx;
+        let inputs: usize = tx
+            .input
+            .iter()
+            .map(|i| {
+                size_of::<bitcoin::TxIn>()
+                    + i.script_sig.len()
+                    + i.witness.size()
+                    + size_of::<(OutPoint, Txid)>()
+            })
+            .sum();
+        let outputs: usize =
+            tx.output.iter().map(|o| size_of::<TxOut>() + o.script_pubkey.len()).sum();
+        let prevouts = entry.prev_scripthashes.len() * size_of::<Scripthash>()
+            + entry.prev_amounts.len() * size_of::<u64>()
+            + entry
+                .prev_scripts
+                .iter()
+                .map(|s| size_of::<ScriptBuf>() + s.len())
+                .sum::<usize>();
+        size_of::<(Txid, MempoolEntry)>() + size_of::<(Wtxid, Txid)>() + inputs + outputs + prevouts
+    }
+
     /// Acting-class rollup over a relative set: `(count, vsize, fees)`, where
     /// `vsize` and `fees` include the subject transaction itself and `count`
-    /// does not. Quarantined relatives are excluded from all three (design
+    /// does not. `fees` are modified fees, as Core's `CalculateAncestorData`
+    /// sums them. Quarantined relatives are excluded from all three (design
     /// §6.1): the standard surface must never leak the quarantine class.
     ///
     /// Assumes the caller already holds the inner lock.
@@ -3787,8 +4093,8 @@ impl Mempool {
         inner: &MempoolInner,
         relatives: &HashSet<Txid>,
         self_vsize: usize,
-        self_fee: u64,
-    ) -> (usize, usize, u64) {
+        self_fee: i64,
+    ) -> (usize, usize, i64) {
         let mut count = 0usize;
         let mut vsize = self_vsize;
         let mut fees = self_fee;
@@ -3797,8 +4103,8 @@ impl Mempool {
                 && e.scope.is_acting()
             {
                 count += 1;
-                vsize += e.weight / 4;
-                fees += e.fee;
+                vsize += Self::entry_vsize(e);
+                fees = fees.saturating_add(signed_modified_fee(e.fee, e.fee_delta));
             }
         }
         (count, vsize, fees)
@@ -4496,18 +4802,24 @@ impl Mempool {
         let mut queue: Vec<Txid> = Vec::new();
         let mut buf: Vec<Txid> = Vec::new();
         let mut size = 0usize;
+        let mut bytes = 0usize;
 
         for (txid, entry) in inner.entries.iter() {
             if !entry.scope.is_acting() {
                 continue;
             }
             size += 1;
-            let vsize = entry.weight / 4;
+            let vsize = Self::entry_vsize(entry);
+            bytes += vsize;
             counts[Self::vsize_bucket(vsize as u64)] += 1;
 
             Self::collect_ancestors(&inner, txid, &mut relatives, &mut queue);
-            let (ancestorcount, ancestorsize, ancestorfees) =
-                Self::acting_rollup(&inner, &relatives, vsize, entry.fee);
+            let (ancestorcount, ancestorsize, ancestorfees) = Self::acting_rollup(
+                &inner,
+                &relatives,
+                vsize,
+                signed_modified_fee(entry.fee, entry.fee_delta),
+            );
 
             rollups.push(SummaryRollup {
                 txid: *txid,
@@ -4522,13 +4834,13 @@ impl Mempool {
         }
 
         // Ancestor feerate, descending. Compared as a cross-multiplied
-        // fraction in u128 rather than an f64 division: exact, total, and
+        // fraction in i128 rather than an f64 division: exact, total, and
         // free of the NaN tiebreak an `f64` comparator would need. A zero
         // `ancestorsize` cannot occur (it includes the subject's own vsize)
         // but sorts as zero feerate if it ever did.
         rollups.sort_unstable_by(|a, b| {
-            let lhs = a.ancestorfees as u128 * b.ancestorsize as u128;
-            let rhs = b.ancestorfees as u128 * a.ancestorsize as u128;
+            let lhs = a.ancestorfees as i128 * b.ancestorsize as i128;
+            let rhs = b.ancestorfees as i128 * a.ancestorsize as i128;
             rhs.cmp(&lhs).then_with(|| a.vsize.cmp(&b.vsize))
         });
         rollups.truncate(top_n);
@@ -4566,7 +4878,7 @@ impl Mempool {
 
         MempoolSummary {
             size,
-            bytes: inner.acting_bytes(),
+            bytes,
             vsize_histogram,
             top,
         }
@@ -4582,11 +4894,16 @@ impl Mempool {
         if !entry.scope.is_acting() {
             return None;
         }
-        let vsize = entry.weight / 4;
+        // Core's `GetVirtualTransactionSize`: weight / 4, rounded up.
+        let vsize = Self::entry_vsize(entry);
         let entry_fee = entry.fee;
         let entry_fee_delta = entry.fee_delta;
+        // Signed, as Core's `GetModifiedFee`: a negative delta can take it
+        // below zero, and the rollups must carry that, not a clamped zero.
+        let entry_modified_fee = signed_modified_fee(entry_fee, entry_fee_delta);
         let entry_weight = entry.weight;
         let entry_time = entry.time;
+        let entry_height = entry.height;
         let entry_wtxid = entry.tx.compute_wtxid();
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
         let is_unbroadcast = inner.unbroadcast.contains_key(txid);
@@ -4616,37 +4933,53 @@ impl Mempool {
             .filter(|c| inner.entries.get(c).is_some_and(|e| e.scope.is_acting()))
             .collect();
 
+        // Core's `CalculateAncestorData` / `CalculateDescendantData`: each
+        // relative's vsize and *modified* fee, the transaction's own included.
         let ancestor_count = ancestors.len();
         let ancestor_size: usize = ancestors
             .iter()
             .filter_map(|a| inner.entries.get(a))
-            .map(|e| e.weight / 4)
+            .map(Self::entry_vsize)
             .sum::<usize>()
             + vsize;
-        let ancestor_fees: u64 = ancestors
+        let ancestor_fees: i64 = ancestors
             .iter()
             .filter_map(|a| inner.entries.get(a))
-            .map(|e| e.fee)
-            .sum::<u64>()
-            + entry_fee;
+            .map(|e| signed_modified_fee(e.fee, e.fee_delta))
+            .fold(entry_modified_fee, i64::saturating_add);
 
         let descendant_count = descendants.len() + 1; // includes self
         let descendant_size: usize = descendants
             .iter()
             .filter_map(|d| inner.entries.get(d))
-            .map(|e| e.weight / 4)
+            .map(Self::entry_vsize)
             .sum::<usize>()
             + vsize;
-        let descendant_fees: u64 = descendants
+        let descendant_fees: i64 = descendants
             .iter()
             .filter_map(|d| inner.entries.get(d))
-            .map(|e| e.fee)
-            .sum::<u64>()
-            + entry_fee;
+            .map(|e| signed_modified_fee(e.fee, e.fee_delta))
+            .fold(entry_modified_fee, i64::saturating_add);
 
-        let bip125_replaceable = entry_tx_inputs
+        // Core's `entryToJSON`: `depends` names the in-mempool transactions
+        // this one spends from directly, once each, in string order (a
+        // `std::set<std::string>`), not every ancestor.
+        let depends: std::collections::BTreeSet<String> = entry_tx_inputs
             .iter()
-            .any(|i| i.sequence.0 < 0xffff_fffe);
+            .map(|i| i.previous_output.txid)
+            .filter(|parent| ancestors.contains(parent))
+            .map(|parent| parent.to_string())
+            .collect();
+
+        // Core's `IsRBFOptIn` (src/policy/rbf.cpp): the transaction signals
+        // BIP 125 itself, or one of its in-mempool ancestors does.
+        let signals_rbf =
+            |inputs: &[bitcoin::TxIn]| inputs.iter().any(|i| i.sequence.0 < 0xffff_fffe);
+        let bip125_replaceable = signals_rbf(&entry_tx_inputs)
+            || ancestors
+                .iter()
+                .filter_map(|a| inner.entries.get(a))
+                .any(|e| signals_rbf(&e.tx.input));
 
         // Every amount goes through `format_amount`, like every other RPC
         // surface: raw `f64` division here meant `getrawmempool verbose` and
@@ -4655,25 +4988,26 @@ impl Mempool {
         // binary-floating-point rounding `btc_fixed_8dp` exists to avoid.
         let unit = crate::rpc::amounts::default_unit();
         let amount = |sats: u64| crate::rpc::amounts::format_amount(sats, unit);
+        let signed_amount = |sats: i64| crate::rpc::amounts::format_signed_amount(sats, unit);
         let mut out = serde_json::json!({
             "fees": {
                 "base": amount(entry_fee),
-                "modified": amount(modified_fee(entry_fee, entry_fee_delta)),
-                "ancestor": amount(ancestor_fees),
-                "descendant": amount(descendant_fees),
+                "modified": signed_amount(entry_modified_fee),
+                "ancestor": signed_amount(ancestor_fees),
+                "descendant": signed_amount(descendant_fees),
             },
             "vsize": vsize,
             "weight": entry_weight,
             "fee": amount(entry_fee),
             "time": entry_time,
-            "height": 0, // would need chain height at time of entry
+            "height": entry_height,
             "descendantcount": descendant_count,
             "descendantsize": descendant_size,
             "descendantfees": descendant_fees,
             "ancestorcount": ancestor_count + 1,
             "ancestorsize": ancestor_size,
             "ancestorfees": ancestor_fees,
-            "depends": ancestors.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "depends": depends.into_iter().collect::<Vec<_>>(),
             "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
             "unbroadcast": is_unbroadcast,
@@ -5945,6 +6279,7 @@ impl Mempool {
 
         let weight = tx.weight().to_wu() as usize;
         let tx_size = bitcoin::consensus::serialize(&tx).len();
+        let prevout_meta = self.config.read().prevout_meta;
 
         // Take write lock
         let mut inner = self.inner.write();
@@ -6023,14 +6358,21 @@ impl Mempool {
 
         // Skip fee rate check — this is the bypass.
 
-        // Script verification
-        script_verifier
-            .verify_transaction(&tx, &prev_outputs, tip_height + 1)
-            .map_err(|e| {
-                MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx))
-            })?;
+        // Script verification; the failure is named once the pool is released,
+        // as in `accept_transaction`.
+        if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
+            drop(inner);
+            let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
+            return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
+        }
 
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+
+        // The same sigop cost and prevout metadata `accept_transaction`
+        // records. A zero cost here let the block template count this entry
+        // as free against the block sigop limit.
+        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
+            self.spend_record(prevout_meta, &tx, &prev_outputs);
 
         // Insert into mempool
         let scope = QuarantineScope::acting();
@@ -6055,12 +6397,13 @@ impl Mempool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                height: tip_height,
                 fee_delta: pending_delta,
-                sigop_cost: 0,
-                prev_scripthashes: Vec::new(),
-                prev_amounts: Vec::new(),
-                prev_scripts: Vec::new(),
-                sp_tweak: None,
+                sigop_cost,
+                prev_scripthashes,
+                prev_amounts,
+                prev_scripts,
+                sp_tweak,
                 scope,
                 source: TxSource::Rpc,
                 quarantine_rule: None,
@@ -6086,7 +6429,43 @@ impl Mempool {
         want_quarantined: bool,
         incremental_relay_fee: u64,
     ) -> Vec<Txid> {
-        // Sort *this class's* entries by fee rate ascending; the other class is
+        Self::evict_lowest_fee_entries_except(
+            inner,
+            bytes_needed,
+            want_quarantined,
+            incremental_relay_fee,
+            &HashSet::new(),
+        )
+        .into_iter()
+        .map(|(txid, _)| txid)
+        .collect()
+    }
+
+    /// [`evict_lowest_fee_entries`](Self::evict_lowest_fee_entries), never
+    /// choosing an entry in `keep`. Admission passes the incoming
+    /// transaction's in-pool ancestors: evicting one would leave that
+    /// transaction spending an output nothing provides. An ancestor set is
+    /// closed under "parent of", so no kept entry descends from an evicted one
+    /// either.
+    ///
+    /// The cost follows what is evicted, not the size of the pool: one pass
+    /// builds a heap of the class, each eviction pops it, and descendants come
+    /// from the `spends` index.
+    ///
+    /// Each evicted txid comes with the scope it had: a held descendant of an
+    /// evicted acting entry goes with it, but never emitted an `Enter`, so it
+    /// gets no `LeaveEvicted` (§10).
+    fn evict_lowest_fee_entries_except(
+        inner: &mut MempoolInner,
+        bytes_needed: usize,
+        want_quarantined: bool,
+        incremental_relay_fee: u64,
+        keep: &HashSet<Txid>,
+    ) -> Vec<(Txid, QuarantineScope)> {
+        if bytes_needed == 0 {
+            return Vec::new();
+        }
+        // *This class's* entries, lowest fee rate first; the other class is
         // never an eviction candidate (its own budget governs it).
         //
         // On the *modified* fee rate. `entry.fee_rate` is the rate as of
@@ -6095,55 +6474,49 @@ impl Mempool {
         // delta did not exist — which defeats the point of the RPC. Core
         // evicts on the modified feerate (`CTxMemPool::TrimToSize` sorts by
         // descendant-modified feerate).
-        let mut by_fee_rate: Vec<(Txid, u64)> = inner
+        let mut by_fee_rate: std::collections::BinaryHeap<std::cmp::Reverse<(u64, Txid)>> = inner
             .entries
             .iter()
-            .filter(|(_, entry)| entry.scope.is_quarantined() == want_quarantined)
+            .filter(|(txid, entry)| {
+                entry.scope.is_quarantined() == want_quarantined && !keep.contains(*txid)
+            })
             .map(|(txid, entry)| {
-                (
-                    *txid,
+                std::cmp::Reverse((
                     policy::fee_rate_sat_per_kvb(
                         modified_fee(entry.fee, entry.fee_delta),
                         entry.weight as u64,
                     ),
-                )
+                    *txid,
+                ))
             })
             .collect();
-        by_fee_rate.sort_by_key(|(_, rate)| *rate);
 
         let mut freed = 0usize;
         let mut to_remove: Vec<Txid> = Vec::new();
+        // What `to_remove` holds, for membership tests.
+        let mut removing: HashSet<Txid> = HashSet::new();
+        let mut children: Vec<Txid> = Vec::new();
 
-        for (txid, _) in &by_fee_rate {
-            if freed >= bytes_needed {
+        while freed < bytes_needed {
+            let Some(std::cmp::Reverse((_, txid))) = by_fee_rate.pop() else {
                 break;
-            }
-            if to_remove.contains(txid) {
+            };
+            if !removing.insert(txid) {
                 continue;
             }
             let package_start = to_remove.len();
-            to_remove.push(*txid);
-            if let Some(entry) = inner.entries.get(txid) {
+            to_remove.push(txid);
+            if let Some(entry) = inner.entries.get(&txid) {
                 freed += bitcoin::consensus::serialize(&entry.tx).len();
             }
             // Also collect descendants of the evicted entry
-            let mut desc_queue = vec![*txid];
+            let mut desc_queue = vec![txid];
             while let Some(current) = desc_queue.pop() {
-                let current_txid_for_search = current;
-                let children: Vec<Txid> = inner
-                    .entries
-                    .iter()
-                    .filter(|(child_txid, child_entry)| {
-                        !to_remove.contains(child_txid)
-                            && child_entry
-                                .tx
-                                .input
-                                .iter()
-                                .any(|i| i.previous_output.txid == current_txid_for_search)
-                    })
-                    .map(|(child_txid, _)| *child_txid)
-                    .collect();
-                for child in children {
+                Self::collect_children(inner, &current, &mut children);
+                for child in children.drain(..) {
+                    if !removing.insert(child) {
+                        continue;
+                    }
                     if let Some(child_entry) = inner.entries.get(&child) {
                         // A cross-class descendant (e.g. a quarantined child of an
                         // evicted acting parent) must still be removed for graph
@@ -6175,6 +6548,7 @@ impl Mempool {
             }
         }
 
+        let mut evicted = Vec::with_capacity(to_remove.len());
         for txid in &to_remove {
             if let Some(entry) = inner.entries.remove(txid) {
                 let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
@@ -6184,13 +6558,14 @@ impl Mempool {
                 }
                 inner.unbroadcast.remove(txid);
                 tracing::debug!(%txid, fee_rate = entry.fee_rate, "Evicted low-fee tx from mempool");
+                evicted.push((*txid, entry.scope));
             }
         }
 
-        if !to_remove.is_empty() {
-            tracing::info!(evicted = to_remove.len(), "Mempool eviction complete");
+        if !evicted.is_empty() {
+            tracing::info!(evicted = evicted.len(), "Mempool eviction complete");
         }
-        to_remove
+        evicted
     }
 
     /// Keep the lock-free `unbroadcast_len` mirror coherent with the map.
@@ -6297,6 +6672,18 @@ impl Mempool {
         count
     }
 
+    /// Record that the startup load of `mempool.dat` has finished (Core's
+    /// `SetLoadTried`, which runs whether or not `-persistmempool` is on and
+    /// whether or not the file loaded).
+    pub fn set_load_tried(&self, tried: bool) {
+        self.load_tried.store(tried, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the startup load of `mempool.dat` has finished.
+    pub fn load_tried(&self) -> bool {
+        self.load_tried.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Whether `txid` is a pending-broadcast local tx still in the mempool.
     pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
         let inner = self.inner.read();
@@ -6335,11 +6722,19 @@ impl Mempool {
         // so `getmempoolinfo` is byte-identical to a node whose relay policy
         // refused the quarantined transactions. Until a policy is loaded every
         // entry is acting, so this equals the physical pool and is unchanged.
-        let size = inner
-            .entries
-            .values()
-            .filter(|e| e.scope.is_acting())
-            .count();
+        // Core's `GetTotalTxSize` (virtual sizes), `GetTotalFee` (base fees)
+        // and `DynamicMemoryUsage` (an estimate here; see
+        // `estimated_memory_usage`), over the same acting class.
+        let mut size = 0usize;
+        let mut vsize = 0usize;
+        let mut total_fee = 0u64;
+        let mut usage = 0usize;
+        for entry in inner.entries.values().filter(|e| e.scope.is_acting()) {
+            size += 1;
+            vsize += Self::entry_vsize(entry);
+            total_fee = total_fee.saturating_add(entry.fee);
+            usage += Self::estimated_memory_usage(entry);
+        }
         // Count only acting unbroadcast entries still resident (read-only belt —
         // the removal paths prune inline). A quarantined-relay entry is never
         // announced, so it never belongs to the broadcast-confirmation set.
@@ -6363,6 +6758,9 @@ impl Mempool {
         MempoolInfo {
             size,
             bytes: inner.acting_bytes(),
+            vsize,
+            total_fee,
+            usage,
             max_size,
             min_fee_rate,
             mempool_min_fee: rolling_min.max(min_fee_rate),
@@ -6385,6 +6783,11 @@ impl Mempool {
     #[cfg(test)]
     pub(crate) fn insert_entry_for_test(&self, txid: Txid, tx: Transaction, fee_rate: u64) {
         let mut inner = self.inner.write();
+        // Every admission indexes the entry's spends, and eviction finds
+        // descendants through them.
+        for input in &tx.input {
+            inner.spends.insert(input.previous_output, txid);
+        }
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -6393,6 +6796,7 @@ impl Mempool {
                 weight: 4,
                 fee_rate,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -6434,6 +6838,7 @@ impl Mempool {
                 weight: 4,
                 fee_rate,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -6490,6 +6895,7 @@ impl Mempool {
                 weight,
                 fee_rate,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -6535,6 +6941,7 @@ impl Mempool {
                 weight: 4,
                 fee_rate,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -6562,6 +6969,11 @@ impl Mempool {
         let txid = tx.compute_txid();
         let tx_size = bitcoin::consensus::serialize(&tx).len();
         let mut inner = self.inner.write();
+        // Every admission indexes the entry's spends, and eviction finds
+        // descendants through them.
+        for input in &tx.input {
+            inner.spends.insert(input.previous_output, txid);
+        }
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -6570,6 +6982,7 @@ impl Mempool {
                 weight: 4,
                 fee_rate: 0,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -6585,6 +6998,18 @@ impl Mempool {
         txid
     }
 }
+
+#[cfg(test)]
+#[path = "pool_sigops_tests.rs"]
+mod sigops_tests;
+
+#[cfg(test)]
+#[path = "pool_fullpool_tests.rs"]
+mod fullpool_tests;
+
+#[cfg(test)]
+#[path = "pool_mempoolrpc_tests.rs"]
+mod mempoolrpc_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6769,6 +7194,7 @@ mod tests {
                 weight: 400,
                 fee_rate: 25, // very low fee rate
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -8017,6 +8443,7 @@ mod tests {
                     weight: 400,
                     fee_rate: 1_250,
                     time: 0,
+                    height: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -8149,6 +8576,7 @@ mod tests {
                     weight: 400,
                     fee_rate: 10_000,
                     time: 0,
+                    height: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -8171,6 +8599,7 @@ mod tests {
                     weight: 400,
                     fee_rate: 20_000,
                     time: 0,
+                    height: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -8269,6 +8698,7 @@ mod tests {
                     weight: 400,
                     fee_rate: 0,
                     time: crate::time::now_secs(), // unexpired: acceptance runs expiry
+                    height: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -8374,6 +8804,7 @@ mod tests {
                         weight: 400,
                         fee_rate: 0,
                         time: crate::time::now_secs(), // unexpired: acceptance runs expiry
+                        height: 0,
                         fee_delta: 0,
                         sigop_cost: 0,
                         prev_scripthashes: Vec::new(),
@@ -8510,6 +8941,7 @@ mod tests {
                         weight: 400,
                         fee_rate: 0,
                         time: crate::time::now_secs(), // unexpired: acceptance runs expiry
+                        height: 0,
                         fee_delta: 0,
                         sigop_cost: 0,
                         prev_scripthashes: Vec::new(),
@@ -8753,6 +9185,11 @@ mod tests {
             let txid = tx.compute_txid();
             let tx_size = bitcoin::consensus::serialize(&tx).len();
             let mut inner = mp.inner.write();
+            // Index the spends as every admission does: eviction finds a
+            // descendant through them.
+            for i in &tx.input {
+                inner.spends.insert(i.previous_output, txid);
+            }
             inner.entries.insert(
                 txid,
                 MempoolEntry {
@@ -8761,6 +9198,7 @@ mod tests {
                     weight: 4,
                     fee_rate,
                     time: 0,
+                    height: 0,
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -9659,6 +10097,7 @@ mod tests {
             weight: 4,
             fee_rate: 0,
             time: 0,
+            height: 0,
             fee_delta: 0,
             sigop_cost: 0,
             prev_scripthashes: Vec::new(),
@@ -10443,6 +10882,7 @@ mod tests {
                 weight: 400,
                 fee_rate: 2_500,
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),
@@ -10836,6 +11276,7 @@ mod tests {
                 weight: 400,
                 fee_rate: policy::fee_rate_sat_per_kvb(1_000, 400),
                 time: 0,
+                height: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
                 prev_scripthashes: Vec::new(),

@@ -2,15 +2,31 @@ use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
 use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
+use crate::rpc::util::univalue_double;
+use crate::storage::blockindex::BlockStatus;
 use crate::validation::pow::RETARGET_INTERVAL;
 use serde_json::{json, Value};
 
-/// Handle the `submitblock` RPC call.
-pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str) -> Value {
-    let block_bytes = match hex::decode(hex_block) {
-        Ok(b) => b,
-        Err(_) => return Value::String("Block decode failed".to_string()),
-    };
+/// Core's `RPC_DESERIALIZATION_ERROR`.
+const RPC_DESERIALIZATION_ERROR: i32 = -22;
+/// Core's `RPC_VERIFY_ERROR`.
+const RPC_VERIFY_ERROR: i32 = -25;
+
+/// Handle the `submitblock` RPC call, as Core's `submitblock`
+/// (src/rpc/mining.cpp) answers it.
+///
+/// Hex that does not decode into a block is an RPC error, -22 "Block decode
+/// failed". Otherwise the answer is BIP 22's: `null` when the block joined the
+/// active chain, a reject reason, `"duplicate"`, `"duplicate-invalid"` or
+/// `"inconclusive"`. A failure of this node rather than a verdict on the block
+/// is -25 (see [`rejection_answer`]).
+pub fn submit_block(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    hex_block: &str,
+) -> Result<Value, (i32, String)> {
+    let decode_failed = || (RPC_DESERIALIZATION_ERROR, "Block decode failed".to_string());
+    let block_bytes = hex::decode(hex_block).map_err(|_| decode_failed())?;
 
     // Use a cursor-based decode that tolerates trailing bytes, matching
     // Core's CBlock::Unserialize (which reads exactly one block and
@@ -18,23 +34,27 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
     // and rejects trailing bytes — a problem for the functional test
     // `interface_http.py`, which sends a 4 MB garbage payload that
     // still starts with a decodable (all-zeros) header + 0 txs.
-    let block: bitcoin::Block = {
+    let mut block: bitcoin::Block = {
         use bitcoin::consensus::Decodable;
         let mut cursor = std::io::Cursor::new(&block_bytes);
-        match bitcoin::Block::consensus_decode(&mut cursor) {
-            Ok(b) => b,
-            Err(_) => return Value::String("Block decode failed".to_string()),
-        }
+        bitcoin::Block::consensus_decode(&mut cursor).map_err(|_| decode_failed())?
     };
+
+    // Core runs `UpdateUncommittedBlockStructures` whenever the parent is in
+    // the block index, before the block is processed.
+    if let Some(parent) = chain_state.get_block_index(&block.header.prev_blockhash) {
+        fill_witness_reserved_value(&mut block, chain_state.network, parent.height + 1);
+    }
 
     // Check PoW before looking up the parent, matching Core's
     // `CheckBlockHeader` → `AcceptBlock` flow. If the header fails PoW,
     // Core returns "high-hash" without ever searching the block index
     // for the parent.
     if let Err(e) = crate::validation::pow::check_proof_of_work(&block.header) {
-        return Value::String(e.to_string());
+        return Ok(Value::String(e.to_string()));
     }
 
+    let block_hash = block.block_hash();
     match chain_state.accept_block(&block) {
         Ok(acceptance) => {
             // Only a block that joined the active chain confirms anything.
@@ -54,12 +74,88 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
             // connect (e.g. side chain, future block). Tests rely on the
             // distinction.
             if acceptance.connected() {
-                Value::Null
+                Ok(Value::Null)
             } else {
-                Value::String("inconclusive".to_string())
+                Ok(Value::String("inconclusive".to_string()))
             }
         }
-        Err(e) => Value::String(e.to_string()),
+        Err(e) => rejection_answer(chain_state, &block_hash, e),
+    }
+}
+
+/// Core's `UpdateUncommittedBlockStructures` (src/validation.cpp): when the
+/// coinbase has a BIP 141 commitment output, segwit is active at the block's
+/// height, and no coinbase input carries witness data, the coinbase input gets
+/// the 32-byte zero witness reserved value. Pool software working from
+/// `getblocktemplate` often submits the coinbase without it, and the block
+/// then fails `bad-witness-nonce-size`.
+///
+/// Nothing in the block hash covers the coinbase witness, so this changes
+/// neither the header nor the merkle root.
+fn fill_witness_reserved_value(block: &mut bitcoin::Block, network: bitcoin::Network, height: u32) {
+    use crate::validation::block::{has_witness_commitment_output, segwit_active_at};
+    if !has_witness_commitment_output(block) || !segwit_active_at(network, height) {
+        return;
+    }
+    let Some(coinbase) = block.txdata.first_mut() else {
+        return;
+    };
+    if coinbase.input.iter().any(|input| !input.witness.is_empty()) {
+        return;
+    }
+    // Core writes `vin[0]` unconditionally; a coinbase with no input fails
+    // `CheckBlock` regardless.
+    if let Some(input) = coinbase.input.first_mut() {
+        input.witness = bitcoin::Witness::from_slice(&[[0u8; 32]]);
+    }
+}
+
+/// `submitblock`'s answer for a block `accept_block` refused, as Core's
+/// `submitblock` and `BIP22ValidationResult` give it.
+///
+/// - A block already in the index: `"duplicate-invalid"` when its entry is
+///   marked invalid (Core's `AcceptBlockHeader` on `BLOCK_FAILED_VALID`), and
+///   `"duplicate"` otherwise. The entry's own status decides, not the path in
+///   `accept_block` that noticed the duplicate, so the answer does not depend
+///   on when that path marks a block.
+/// - A failure of this node (storage, block files, a snapshot load, an
+///   interrupted connect): Core's `state.IsError()`, thrown as -25 with the
+///   error text.
+/// - Every other error is a verdict on the block, and its text is the reject
+///   reason.
+pub(crate) fn rejection_answer(
+    chain_state: &ChainState,
+    hash: &bitcoin::BlockHash,
+    e: crate::chain::state::ChainError,
+) -> Result<Value, (i32, String)> {
+    use crate::chain::state::ChainError as E;
+    match e {
+        E::Duplicate => {
+            let invalid = chain_state
+                .get_block_index(hash)
+                .is_some_and(|entry| entry.status == BlockStatus::Invalid);
+            let answer = if invalid { "duplicate-invalid" } else { "duplicate" };
+            Ok(Value::String(answer.to_string()))
+        }
+        E::DecodeFailed => Err((RPC_DESERIALIZATION_ERROR, e.to_string())),
+        e if is_verdict(&e) => Ok(Value::String(e.to_string())),
+        e => Err((RPC_VERIFY_ERROR, e.to_string())),
+    }
+}
+
+/// Whether `e` judges the block (a reject reason) rather than reporting a
+/// fault of this node. Anything not listed here is a node failure.
+fn is_verdict(e: &crate::chain::state::ChainError) -> bool {
+    use crate::chain::state::ChainError as E;
+    match e {
+        E::PrevBlockNotFound
+        | E::BadPrevBlock
+        | E::CheckpointMismatch(_)
+        | E::Validation(_) => true,
+        // A mutation-class failure is a verdict on these bytes, not one
+        // `accept_block` may record against the hash: still a reject reason.
+        E::Connect(c) => c.is_verdict_on_block() || c.is_mutation_class(),
+        _ => false,
     }
 }
 
@@ -234,14 +330,13 @@ fn next_block_info(chain_state: &ChainState, tip: &crate::storage::blockindex::B
         chain_state.network,
         tip,
         time,
-        |h| chain_state.get_block_index(&chain_state.get_block_hash_by_height(h)?),
         |hash| chain_state.get_block_index(hash),
     )
     .unwrap_or(tip.header.bits);
     json!({
         "height": tip.height + 1,
         "bits": crate::rpc::blockchain::bits_hex(bits),
-        "difficulty": target_to_difficulty(bits),
+        "difficulty": univalue_double(target_to_difficulty(bits)),
         "target": crate::rpc::blockchain::target_hex(bits),
     })
 }
@@ -269,8 +364,9 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
 
     let mut out = json!({
         "blocks": tip_height,
-        "difficulty": difficulty,
-        "networkhashps": hashps,
+        // Doubles in Core's `%.16g` form (`UniValue::setFloat`).
+        "difficulty": univalue_double(difficulty),
+        "networkhashps": univalue_double(hashps),
         "pooledtx": pooledtx,
         // Core's `blockmintxfee`, BTC/kvB.
         "blockmintxfee": crate::rpc::amounts::format_feerate_sat_per_kvb(
@@ -356,7 +452,7 @@ pub fn get_network_hash_ps(
     }
 
     let mut lookup = if nblocks == -1 {
-        i64::from(pb.height % RETARGET_INTERVAL + 1)
+        i64::from(pb.height % difficulty_adjustment_interval(chain_state.network) + 1)
     } else {
         nblocks
     };
@@ -383,6 +479,18 @@ pub fn get_network_hash_ps(
 
     let work = u256_to_f64(&sub_u256(&pb.chainwork, &pb0.chainwork));
     Ok(work / f64::from(max_time - min_time))
+}
+
+/// Core's `DifficultyAdjustmentInterval()`: `nPowTargetTimespan /
+/// nPowTargetSpacing`. Two weeks of ten-minute blocks (2016) everywhere but
+/// regtest, whose timespan is one day (144, `chainparams.cpp`). Regtest never
+/// retargets, but `getnetworkhashps -1` still measures its window in these
+/// units.
+fn difficulty_adjustment_interval(network: bitcoin::Network) -> u32 {
+    match network {
+        bitcoin::Network::Regtest => 144,
+        _ => RETARGET_INTERVAL,
+    }
 }
 
 /// Handle `getblocktemplate` in proposal mode (BIP 22/23).

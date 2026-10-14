@@ -287,15 +287,11 @@ impl BackgroundChainState {
         // `ChainState::accept_block` (minus side-chain/reorg handling,
         // which cannot occur on this linear in-order replay).
         validation::block::check_block(block, self.network, new_height)?;
-        validation::pow::check_proof_of_work(&block.header)?;
+        validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
         validation::pow::check_difficulty(
             &block.header,
             &parent,
             self.network,
-            |h| {
-                let hash = store_ref.get_block_hash_by_height(h)?;
-                store_ref.get_block_index(&hash)
-            },
             |h| store_ref.get_block_index(h),
         )?;
         // MTP walks the candidate's own parent pointers (see `check_timestamp`).

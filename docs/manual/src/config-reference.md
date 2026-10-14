@@ -23,6 +23,11 @@ track Bitcoin Core v30.
 
 - **Resolution order.** `-conf=<path>` if given, else `<datadir>/bitcoin.conf`,
   else `<datadir>/satd.conf`. Flags override file values.
+- **Comments.** As in Core, `#` starts a comment anywhere on a line:
+  `txindex=1  # keep it` sets `txindex` to `1`. What is left of the line is
+  trimmed of spaces, tabs and line endings. An `rpcpassword` line that
+  contains a `#` is refused at load (`using # in rpcpassword can be ambiguous
+  and should be avoided`), as Core refuses it.
 - **Key disposition.** Each config-file key gets one of four treatments:
   1. **Honored.** satd implements it. This is the common case.
   2. **Skipped with a warning.** A recognized Core v30 option satd does not
@@ -44,8 +49,8 @@ track Bitcoin Core v30.
 
 > **Note.** Compatibility is pinned to Bitcoin Core v30, a frozen and
 > verifiable surface. Keys Core adds in v31 or later (for example
-> `limitclustercount`, `limitclustersize`, `privatebroadcast`,
-> `txospenderindex`) are not recognized and are rejected as typos until the
+> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are not
+> recognized and are rejected as typos until the
 > pin is bumped. Keys Core removed at or before v30 (for example `upnp`,
 > `maxorphantx`) are likewise not honored. A `bitcoin.conf` migrated from a
 > newer Core that contains a v31+ key stops satd at startup with an "unknown
@@ -120,7 +125,7 @@ startup error.
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). satd adds `stratum`, the Stratum server's per-miner lines (see [Verifying a miner](stratum.md#verifying-a-miner)). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
-| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
+| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. The JSON-RPC and WebSocket libraries' TRACE output (`jsonrpsee*`, `tungstenite*` targets), which prints request headers and call parameters, is never logged, whatever the level; their DEBUG output is. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
 | `maxshutdownsecs` | 30 | hot | satd | Graceful-shutdown budget (seconds), shared by the `shutdownnotify` hook (at most half of it), the wait for the block connector to stop (at most half of what is left) and the final flush. A connector still in a block at the end of its share costs the clean-shutdown marker but not the flush; a flush that overruns the budget force-exits without the marker. |
 
@@ -184,7 +189,7 @@ startup error.
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
 | `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy hardening). |
 | `externalip` | none | hot | core | External address to advertise to peers (repeatable). |
-| `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). `[<perms>@]<subnet>`. **Inbound only unless the permission list carries `out`**, as in Core; an `out` entry applies only to *manual* outbound connections (`connect`, `addnode`, and `seednode`, which satd keeps as a manual connection), never to automatic ones such as the peers the node finds through gossip, `peers.dat` or a DNS seed. `@<subnet>` with an empty list matches the range and grants nothing. A peer arriving over the Tor hidden service is never matched against this — it reaches the node on a loopback socket Tor forwards to, so matching would grant an anonymous remote peer whatever you granted your own machine. |
+| `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). `[<perms>@]<subnet>`. **Inbound only unless the permission list carries `out`**, as in Core; an `out` entry applies only to *manual* outbound connections (`connect`, `addnode`, and `seednode`, which satd keeps as a manual connection), never to automatic ones such as the peers the node finds through gossip, `peers.dat` or a DNS seed. `@<subnet>` with an empty list matches the range and grants nothing. A peer arriving over the Tor hidden service is never matched against this — it reaches the node on a loopback socket Tor forwards to, so matching would grant an anonymous remote peer whatever you granted your own machine. The `addr` permission exempts a peer from Core's address rate limit: otherwise the node takes one address from a peer's `addr`/`addrv2` messages to start and one more every 10 seconds (a thousand more after it sends the peer `getaddr`), and `getpeerinfo` reports the rest as `addr_rate_limited`. |
 | `whitelistrelay` | on | hot | core | Grant `relay` to whitelisted peers with default permissions (relay their txes even under `-blocksonly`). Entries with an explicit `perms@` prefix are unaffected. |
 | `whitelistforcerelay` | off | hot | core | Grant `forcerelay` to whitelisted peers with default permissions. Entries with an explicit `perms@` prefix are unaffected. |
 | `whitebind` | none | restart | core | Bind an extra permissioned P2P listener (repeatable). |
@@ -192,10 +197,10 @@ startup error.
 | `port` | network default | restart | core | P2P listen port. |
 | `bind` | `0.0.0.0` | restart | core | Bind P2P to this address; **repeatable**. Accepts `addr`, `addr:port`, and `addr[:port]=onion`. An entry with a port uses it; a bare address takes `port`, and a bare `=onion` entry takes `port` + 1 (as in Core). IPv6 literals may be plain (`::1`) or bracketed. Any explicit `bind` replaces the default listener. Cannot be combined with `listen=0`. |
 | `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). An entry with no port takes the network's default P2P port. Any `connect` stops the node dialling addresses it learns from gossip and soft-sets `listen=0` (see `listen`); `connect=0` — and the command-line negation `-noconnect` — is Core's spelling for "open no outbound connections at all"; a literal `connect=0` mixed with a peer address is refused, since Core keeps the peer and satd will not dial the `0`. Connect-only *exclusivity* is a startup decision (restart to change). |
-| `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding, and does not affect `listen`). An entry with no port takes the network's default P2P port. |
+| `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding, and does not affect `listen`). An entry with no port takes the network's default P2P port. As in Core, added nodes are counted apart from the automatic outbound peers and `maxconnections`: at most 8 are connected at a time, and one that is not connected is dialled again at most a minute later, however many automatic peers the node has. A ban does not stop the dial; it does stop automatic dials to that address. |
 | `uacomment` | none | restart | core | Append a comment to the advertised user agent (**repeatable**; command-line and config-file values accumulate, command line first). Renders as `/satd:<version>(c1; c2)/`. A comment may contain only alphanumerics and `` .,;-_?@`` — the user agent's own delimiters `/`, `:`, `(` and `)` are refused — and the whole user agent may not exceed 256 bytes. Either violation is a startup error, as in Core. |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
-| `maxconnections` | 125 | hot | core | Maximum total connections. `0` (or any value ≤ 0) soft-sets `listen=0`, as in Core — see `listen`. That half is a startup decision: changing `maxconnections` over SIGHUP applies the new cap but does not start or stop the listener. |
+| `maxconnections` | 125 | hot | core | Maximum total connections. Manual connections (`connect`, `addnode`, `seednode`, `addnode onetry`) do not count against the automatic outbound peers, as in Core. `0` (or any value ≤ 0) soft-sets `listen=0`, as in Core — see `listen`. That half is a startup decision: changing `maxconnections` over SIGHUP applies the new cap but does not start or stop the listener. |
 | `maxinboundperip` | 3 | hot | satd | Max simultaneous inbound peers from one source IP (Core-style flood guard; no Core flag). |
 | `cmpctblockprefill` | false | restart | satd | Announce a new block as a `cmpctblock` with the transactions this node lacked when it arrived prefilled, so a peer that lacks them too rebuilds the block without a `getblocktxn` round trip. Bitcoin Core's proposed design (#35558, not yet merged in Core); off until measurement says otherwise. |
 | `cmpctblockprefillbytes` | 8192 | restart | satd | Transaction bytes a `cmpctblockprefill` announcement may carry beyond the coinbase. Transactions nobody relayed to this node go first, then replaced or policy-refused ones; one that does not fit is skipped. `0` prefills nothing. |
@@ -252,7 +257,7 @@ startup error.
 |---|---|---|---|---|
 | `txindex` | off | restart | core | Maintain a full transaction index. |
 | `addressindex` | on | restart | satd | Maintain an address-history index (backs native Electrum/Esplora). |
-| `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions. |
+| `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
@@ -264,12 +269,12 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains the flag. |
-| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB. |
+| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB, measured by the serialized size of the transactions held. Bitcoin Core measures its memory use instead, so at the same setting satd holds more transactions than Core and uses more memory than the figure. |
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |
 | `datacarriersize` | 83 bytes | hot | core | Maximum `OP_RETURN` size in bytes (`0` = reject all). |
-| `limitclustercount` | 64 | hot | core | Do not accept a transaction directly or indirectly connected to this many or more other unconfirmed transactions. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. Exceeding the limit is rejected as `too-large-cluster`. |
+| `limitclustercount` | 64 | hot | core | Do not accept a transaction with more than this many unconfirmed ancestors in the mempool; it is rejected as `too-large-cluster`. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. satd counts ancestors only: unlike Bitcoin Core, which also bounds descendants, it does not limit how many transactions descend from one. |
 | `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. Deprecated alongside `limitancestorcount`, and likewise no longer gates admission. |
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
@@ -321,7 +326,7 @@ startup error.
 | `electrummtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
 | `electrummaxconns` | 64 | restart | satd | Hard cap on simultaneously-open Electrum connections. |
 | `electrummaxsubsperconn` | 1000 | restart | satd | Per-connection scripthash subscription cap. |
-| `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). |
+| `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). Past it the client gets a `request timed out` error and the connection is closed; the connection keeps its slot until the handler's work ends. |
 | `electrummaxbatchrequests` | 100 | restart | satd | Max requests per JSON-RPC batch line. Wallets (Sparrow) batch their whole gap-limit window of subscribes at scan time. |
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |

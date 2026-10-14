@@ -607,7 +607,9 @@ fn blocktxn_with_wrong_count_is_penalised() {
         transactions: BlockTransactions { block_hash: hash, transactions: vec![b.txdata[1].clone()] },
     }));
     assert!(peer.wait_closed(Duration::from_secs(15)), "a mismatched blocktxn must disconnect the peer");
-    poll_until(|| banned_count(&node) == 1, test_timeout(10), "and ban it");
+    // The peer is on 127.0.0.1: Core disconnects a local peer without
+    // punishing its address, which every local peer shares.
+    assert_eq!(banned_count(&node), 0, "a local peer's address is not banned");
 }
 
 fn getblocktxn(hash: BlockHash, indexes: Vec<u64>) -> NetworkMessage {
@@ -665,7 +667,8 @@ fn getblocktxn_out_of_range_index_is_penalised() {
     // holds only its coinbase.
     peer.send(getblocktxn(best_hash(&node), vec![5]));
     assert!(peer.wait_closed(Duration::from_secs(15)), "an out-of-range getblocktxn must disconnect");
-    poll_until(|| banned_count(&node) == 1, test_timeout(10), "and ban the peer");
+    // As above: a local peer is disconnected, its address not banned.
+    assert_eq!(banned_count(&node), 0, "a local peer's address is not banned");
 }
 
 /// Core allows at most three peers to hold a partial reconstruction of the
@@ -681,12 +684,12 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     let (b, compact) = partial_block(&node, 3, 5);
     let hash = b.block_hash();
     // Only three peers can be high-bandwidth, so the four take the other road
-    // past the unsolicited-push gate: the node asks each of them for the
-    // block after the header is announced -- the announcer for a
-    // `cmpctblock`, the others in full once the tip-following sweep reaches
-    // them.
-    peers[0].send(NetworkMessage::Headers(vec![b.header]));
+    // past the unsolicited-push gate: each announces the block by `inv`
+    // before the node knows its header, and the node asks each of them for
+    // it. (The tip-following sweep asks one peer per block, so it would not
+    // ask all four.)
     for (i, p) in peers.iter_mut().enumerate() {
+        p.send(NetworkMessage::Inv(vec![Inventory::Block(hash)]));
         assert!(
             p.recv_until(is_block_request_for(hash), test_timeout(20)).is_some(),
             "the node must request the block from peer {i}"
