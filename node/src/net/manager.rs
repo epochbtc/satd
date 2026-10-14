@@ -4106,6 +4106,19 @@ impl PeerManager {
         }
     }
 
+    /// Dial learned addresses now, as one automatic pass of the reconnect
+    /// loop does, without waiting for the loop's next pass: for the seed
+    /// addresses learned at startup. They go through the same choice as
+    /// every other automatic dial (the outbound target and one peer per
+    /// network group), as Core adds a seed's answers to its address book
+    /// and leaves the dialling to `ThreadOpenConnections`. Nothing while
+    /// networking is paused.
+    pub fn dial_learned_peers(self: &Arc<Self>) {
+        if self.is_network_active() {
+            self.dial_automatic_peers(Instant::now());
+        }
+    }
+
     /// The automatic half of [`Self::reconnect_tick`]: learned addresses,
     /// then onion peers learned from `addrv2` gossip, one dial each until the
     /// automatic outbound target is reached, the dials in flight counted

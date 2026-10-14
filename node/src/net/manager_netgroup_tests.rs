@@ -365,3 +365,36 @@ fn a_new_header_stamps_the_announcement_and_protects_four_peers() {
     let protected: Vec<PeerId> = (100..106).filter(|id| info(*id).chain_sync_protect).collect();
     assert_eq!(protected, vec![100, 101, 102, 103], "the first four");
 }
+
+/// Seed addresses learned at startup are dialled by the automatic dial pass
+/// (`dial_learned_peers`), which applies the outbound target and the group
+/// rule, rather than one task each that bypassed both: here a seed on
+/// loopback is dialled and becomes an outbound full-relay peer, and with
+/// networking paused nothing is dialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeds_are_dialled_by_the_automatic_pass() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed = listener.local_addr().unwrap();
+    pm.add_learned_peer_addr(&PeerAddr::Socket(seed));
+
+    pm.set_network_active(false);
+    pm.dial_learned_peers();
+    assert_eq!(pm.dials_in_flight.lock().automatic, 0, "nothing while networking is paused");
+
+    pm.set_network_active(true);
+    pm.dial_learned_peers();
+    let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+    assert!(accepted.is_ok(), "the seed is dialled");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let conn_type = pm.peers.read().values().find(|h| h.info.addr == seed).map(|h| h.info.conn_type);
+        if conn_type.is_some() {
+            assert_eq!(conn_type, Some(ConnType::OutboundFullRelay));
+            break;
+        }
+        assert!(Instant::now() < deadline, "the seed peer appears");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

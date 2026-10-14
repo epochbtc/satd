@@ -4487,15 +4487,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // one `manual` for good -- granted the outgoing `-whitelist`, exempt
         // from the service check at the handshake, and redialled even after
         // a reload turned on `-connect`.
+        //
+        // They are dialled by the automatic dial pass, not one task each, so
+        // the outbound target and the one-peer-per-network-group rule hold
+        // for them as for every other automatic connection.
         for addr in seed_addrs.into_iter().take(max_dns_outbound) {
             peer_manager.add_learned_peer_addr(&addr);
-            let pm = peer_manager.clone();
-            tokio::spawn(async move {
-                if let Err(e) = pm.connect_peer_addr_automatic(&addr).await {
-                    tracing::warn!(%addr, "Seed peer connection failed: {}", e);
-                }
-            });
         }
+        peer_manager.dial_learned_peers();
     }
 
     // -fixedseeds: last-resort fallback to satd's compiled-in fixed seed
@@ -4513,13 +4512,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // Learned, as the DNS seeds' answers are above.
             for addr in fixed {
                 peer_manager.add_learned_peer_addr(&addr);
-                let pm = peer_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr_automatic(&addr).await {
-                        tracing::warn!(%addr, "Fixed seed connection failed: {}", e);
-                    }
-                });
             }
+            peer_manager.dial_learned_peers();
         }
     }
 
