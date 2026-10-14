@@ -34,6 +34,7 @@ item below is (or will be) written up in full in the in-development
 - satd stops, as Core does, when it cannot read a coin from the chainstate, instead of treating the coin as spent and recording a valid block as invalid (#945).
 - Header sync continues from the last header a peer sent, so a node on a competing best-header branch keeps syncing; the retarget start is found on the block's own branch, and targets above the proof-of-work limit are refused (#954).
 - A block that fails to connect from storage is marked invalid instead of being retried by the IBD connector; the `headers` tip leaves the failed branch, and a chain with more work below it is activated at once (#957).
+- A block passed to `submitblock` before its parent's block is now indexed as a header, as Core indexes it: it becomes the best header (`headers` counts it) and connects as soon as its parent does, where it stayed unconnected until another block arrived (#922).
 - IBD no longer stalls with a full `-maxahead` window; re-sent blocks do not count against it, local write failures do not penalize the sender, and block downloads go only to peers that advertise block service (#953).
 - A block that arrives before its parent is kept only if it was requested and within fixed bounds (4 per peer, 32 MB in all, 5 minutes) (#941).
 - Core's P2P message size and count limits apply, block replies are queued about 1 MB per peer, a peer that takes no data for 20 minutes is disconnected, user agents are capped at 256 bytes and sanitized, and refused BIP 157 requests disconnect (#939).
