@@ -1045,40 +1045,41 @@ fn map_sp_backfill_err(e: silent_payments::BackfillError) -> (i32, String) {
 /// RPC. Returns `{filter: hex, header: hex}` for the basic filter at
 /// the block.
 ///
-/// Errors:
-/// - `RPC_INVALID_ADDRESS_OR_KEY` (-5) when the block hash is unknown.
-/// - `RPC_INVALID_PARAMETER` (-8) when `filtertype` is not `"basic"`.
-/// - `RPC_MISC_ERROR` (-1) when the index is disabled or not synced.
+/// Refusals come in Core's order and with Core's codes
+/// (src/rpc/blockchain.cpp, asserted by `rpc_getblockfilter.py`):
+/// - `RPC_INVALID_PARAMETER` (-8) for a malformed block hash (`ParseHashV`);
+/// - `RPC_INVALID_ADDRESS_OR_KEY` (-5) "Unknown filtertype" for any type but
+///   `"basic"`;
+/// - `RPC_MISC_ERROR` (-1) "Index is not enabled for filtertype basic" when
+///   the index is off, whether or not the block is known;
+/// - `RPC_INVALID_ADDRESS_OR_KEY` (-5) "Block not found" for an unknown hash;
+/// - then the filter lookup's own errors.
 #[cfg(feature = "block-filter-index")]
 pub fn get_block_filter(
     chain: &Arc<ChainState>,
     filter_index: Option<&Arc<dyn node_filter_index::FilterIndex>>,
+    index_enabled: bool,
     block_hash_hex: &str,
     filter_type_str: Option<&str>,
 ) -> Result<Value, (i32, String)> {
     use bitcoin::BlockHash;
-    use bitcoin::hashes::{Hash, hex::FromHex};
     use node_filter_index::FILTER_TYPE_BASIC;
+
+    let block_hash: BlockHash = crate::rpc::util::parse_hash_v(block_hash_hex, "blockhash")?;
 
     let filter_type = match filter_type_str {
         None | Some("basic") => FILTER_TYPE_BASIC,
-        Some(other) => return Err((-8, format!("unknown filter type '{other}'"))),
+        Some(_) => return Err((-5, "Unknown filtertype".to_string())),
     };
 
-    let raw = <[u8; 32]>::from_hex(block_hash_hex)
-        .map_err(|e| (-5, format!("blockhash must be hex of length 64: {e}")))?;
-    // Bitcoin block hashes are display-reversed; the wire-format we
-    // deserialize from the user's hex IS the consensus byte order.
-    // `BlockHash::from_byte_array` takes consensus bytes — but the
-    // user typed the display form. Reverse it.
-    let mut consensus = raw;
-    consensus.reverse();
-    let block_hash =
-        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(consensus));
+    let idx = match filter_index {
+        Some(idx) if index_enabled => idx,
+        _ => return Err(index_not_enabled()),
+    };
 
     let entry = chain
         .get_block_index(&block_hash)
-        .ok_or_else(|| (-5, "block not found".to_string()))?;
+        .ok_or_else(|| (-5, "Block not found".to_string()))?;
     let height = entry.height;
 
     // Active-chain check (review 2026-05-04 H2): the filter index is
@@ -1095,13 +1096,6 @@ pub fn get_block_filter(
             ));
         }
     }
-
-    let idx = filter_index.ok_or_else(|| {
-        (
-            -1,
-            "block filter index not initialized in this build".to_string(),
-        )
-    })?;
 
     let filter_bytes = idx
         .filter_at(filter_type, height)
@@ -1141,11 +1135,18 @@ pub fn get_block_filter(
     }))
 }
 
+/// Core's refusal when no index runs for the requested filter type. `basic`
+/// is the only type, and the only name that gets this far.
+#[cfg(feature = "block-filter-index")]
+fn index_not_enabled() -> (i32, String) {
+    (-1, "Index is not enabled for filtertype basic".to_string())
+}
+
 #[cfg(feature = "block-filter-index")]
 fn map_filter_index_err(e: node_filter_index::IndexError) -> (i32, String) {
     use node_filter_index::IndexError;
     match e {
-        IndexError::Disabled => (-1, "block filter index is disabled".to_string()),
+        IndexError::Disabled => index_not_enabled(),
         IndexError::Incomplete => (-1, "block filter index is not synced".to_string()),
         IndexError::NotFound(h) => (-5, format!("filter not found at height {h}")),
         IndexError::InvalidRange { .. } => (-8, "invalid filter range".to_string()),

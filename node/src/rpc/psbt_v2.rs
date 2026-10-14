@@ -226,7 +226,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
     }
 
     out["fee"] = match fee(&view) {
-        Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+        Some(fee) => format_amount(fee.to_sat(), default_unit()),
         None => Value::Null,
     };
     Ok(out)
@@ -427,7 +427,7 @@ pub fn analyze(raw: &RawPsbt, chain_state: Option<&ChainState>) -> Result<Value,
         Err(_) => Value::Null,
     };
     out["fee"] = match fee(&view) {
-        Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+        Some(fee) => format_amount(fee.to_sat(), default_unit()),
         None => Value::Null,
     };
     if view.has_sp_outputs() {

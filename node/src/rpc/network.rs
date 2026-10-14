@@ -117,11 +117,6 @@ pub fn get_block_from_peer(
 
 
 /// Build the `getnetworkinfo` response with live connection data.
-/// Core reports both fee floors in BTC/kvB, at eight decimal places.
-fn sat_per_kvb_to_btc(sat_per_kvb: u64) -> f64 {
-    sat_per_kvb as f64 / 100_000_000.0
-}
-
 pub fn get_network_info(
     peer_manager: &PeerManager,
     min_relay_fee_sat_per_kvb: u64,
@@ -162,7 +157,8 @@ pub fn get_network_info(
         })
         .collect();
 
-    json!({
+    let unit = crate::rpc::amounts::default_unit();
+    let mut response = json!({
         // Advertises Bitcoin Core wire-protocol vintage (Core v28).
         // Distinct from `subversion`, which carries satd's own
         // implementation version. Clients use `version` to gate
@@ -218,8 +214,17 @@ pub fn get_network_info(
         // times high before an operator set anything -- and `getmempoolinfo`
         // reported the real values all along, so one node answered two
         // different numbers for the same knob.
-        "relayfee": sat_per_kvb_to_btc(min_relay_fee_sat_per_kvb),
-        "incrementalfee": sat_per_kvb_to_btc(incremental_relay_fee_sat_per_kvb),
+        //
+        // Both are amounts: Core prints them with `ValueFromAmount`, eight
+        // decimal places (`0.00000100`, not the `1e-6` an f64 printed).
+        "relayfee": crate::rpc::amounts::format_feerate_sat_per_kvb(
+            min_relay_fee_sat_per_kvb,
+            unit,
+        ),
+        "incrementalfee": crate::rpc::amounts::format_feerate_sat_per_kvb(
+            incremental_relay_fee_sat_per_kvb,
+            unit,
+        ),
         "localaddresses": local_addresses,
         // The node's real warnings, the same set `getblockchaininfo` reports.
         // This was `""` unconditionally, so a node warning about an unknown
@@ -229,7 +234,9 @@ pub fn get_network_info(
             v if v.is_empty() => Value::String(String::new()),
             v => Value::Array(v.into_iter().map(Value::String).collect()),
         }
-    })
+    });
+    crate::rpc::amounts::annotate_units(&mut response, unit);
+    response
 }
 
 #[cfg(test)]

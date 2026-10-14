@@ -464,7 +464,7 @@ fn decode_psbt_v0(psbt: &Psbt) -> Result<Value, (i32, String)> {
         // PSBT still reported no fee — the number a signer most wants before
         // committing.
         "fee": match psbt_fee(psbt) {
-            Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+            Some(fee) => format_amount(fee.to_sat(), default_unit()),
             None => Value::Null,
         },
     }))
@@ -616,7 +616,7 @@ fn analyze_psbt_v0(psbt: &Psbt) -> Result<Value, (i32, String)> {
         // along with `estimated_vsize`'s own inaccuracy.
         "estimated_feerate": Value::Null,
         "fee": match fee {
-            Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+            Some(fee) => format_amount(fee.to_sat(), default_unit()),
             None => Value::Null,
         },
         "next": next,
@@ -976,7 +976,8 @@ mod tests {
         let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned.clone()).unwrap();
         psbt.inputs[0].non_witness_utxo = Some(funding.clone());
         let out = analyze(&psbt);
-        assert_eq!(out["fee"], json!(0.01), "{out}");
+        // `ValueFromAmount`: eight decimal places, as Core prints it.
+        assert_eq!(out["fee"].to_string(), "0.01000000", "{out}");
 
         // A `witness_utxo` disagreeing with a correct `non_witness_utxo` must
         // not be the one read: Core takes the non_witness_utxo.
@@ -987,7 +988,7 @@ mod tests {
             script_pubkey: ScriptBuf::new(),
         });
         let out = analyze(&psbt);
-        assert_eq!(out["fee"], json!(0.01), "the non_witness_utxo wins: {out}");
+        assert_eq!(out["fee"].to_string(), "0.01000000", "the non_witness_utxo wins: {out}");
 
         // A non_witness_utxo that is not the transaction being spent: Core
         // returns false from GetInputUTXO and omits the fee entirely.

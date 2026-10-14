@@ -98,6 +98,59 @@ pub fn parse_hash_v<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, (i32
     Err((-8, format!("{name} must be hexadecimal string (not '{s}')")))
 }
 
+/// A double as Bitcoin Core prints one in an RPC answer.
+///
+/// `UniValue::setFloat` (src/univalue/lib/univalue.cpp) writes
+/// `std::ostringstream << std::setprecision(16) << val`, which is C's
+/// `%.16g`: 16 significant digits, trailing zeros dropped, and scientific
+/// notation when the decimal exponent is below -4 or at least 16 (`1e-05`,
+/// `1e+16`). serde_json prints the shortest string that round-trips instead,
+/// which takes 17 digits for most difficulties (`4.6565423739069247e-10`
+/// where Core prints `4.656542373906925e-10`) and writes `1.0` and `0.0`
+/// where Core writes `1` and `0`.
+///
+/// The literal survives serialization because the workspace enables
+/// serde_json's `arbitrary_precision`. NaN and the infinities are not JSON
+/// numbers; they become `null`, as `json!` makes them.
+pub fn univalue_double(v: f64) -> Value {
+    if !v.is_finite() {
+        return Value::Null;
+    }
+    Value::Number(
+        format_g16(v)
+            .parse()
+            .expect("a %.16g rendering is always a valid JSON number"),
+    )
+}
+
+/// C's `%.16g` for a finite `v`.
+fn format_g16(v: f64) -> String {
+    const PRECISION: i32 = 16;
+    fn trim(s: &str) -> &str {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            s
+        }
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    // `%e` at precision P-1 fixes the decimal exponent X after rounding.
+    // `%g` then prints `%e` when X < -4 or X >= P, and otherwise `%f` with
+    // P-1-X decimals. Rust's `{:.N}` and `{:.Ne}` round exactly, as glibc
+    // does, so both halves agree with Core digit for digit.
+    let sci = format!("{:.*e}", (PRECISION - 1) as usize, v);
+    let (mantissa, exp) = sci.split_once('e').expect("`{:e}` always has an exponent");
+    let exp: i32 = exp.parse().expect("`{:e}` writes an integer exponent");
+    if !(-4..PRECISION).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exp.abs())
+    } else {
+        trim(&format!("{:.*}", (PRECISION - 1 - exp) as usize, v)).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

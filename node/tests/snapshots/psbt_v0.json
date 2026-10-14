@@ -19,7 +19,7 @@
     "ok": {
       "estimated_feerate": null,
       "estimated_vsize": 82,
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -35,7 +35,7 @@
     "ok": {
       "estimated_feerate": null,
       "estimated_vsize": 82,
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -51,7 +51,7 @@
     "ok": {
       "estimated_feerate": null,
       "estimated_vsize": 82,
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -67,7 +67,7 @@
     "ok": {
       "estimated_feerate": null,
       "estimated_vsize": 82,
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -145,7 +145,7 @@
   },
   "decodepsbt/finalized": {
     "ok": {
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "final_scriptwitness": [
@@ -189,7 +189,7 @@
   },
   "decodepsbt/signed": {
     "ok": {
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -223,7 +223,7 @@
   },
   "decodepsbt/updated": {
     "ok": {
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
@@ -251,7 +251,7 @@
   },
   "decodepsbt/with-unknowns": {
     "ok": {
-      "fee": 0.0001,
+      "fee": 0.00010000,
       "inputs": [
         {
           "has_utxo": true,
