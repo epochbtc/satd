@@ -16,7 +16,7 @@
 
 use bitcoin::{Transaction, Txid};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::mempool::policy::MAX_STANDARD_TX_WEIGHT;
@@ -81,6 +81,8 @@ pub struct OrphanEntry {
     pub added_at: Instant,
     pub missing_parents: HashSet<Txid>,
     pub bytes: usize,
+    /// Its key in the orphanage's arrival-order queue.
+    seq: u64,
 }
 
 struct OrphanageInner {
@@ -88,10 +90,13 @@ struct OrphanageInner {
     by_parent: HashMap<Txid, HashSet<Txid>>,
     by_peer: HashMap<PeerId, HashSet<Txid>>,
     total_bytes: usize,
-    // Insertion-order queue for FIFO eviction. Entries may refer to
-    // txids that have already been removed (via explicit remove or
-    // per-peer eviction); eviction skips stale entries at the front.
-    order: VecDeque<Txid>,
+    /// The live orphans in arrival order, for FIFO eviction, keyed by an
+    /// arrival sequence number as Core's orphanage keys its announcements
+    /// (`m_entry_sequence`, src/node/txorphanage.cpp). Every removal takes
+    /// its orphan's key out, so this holds exactly the orphans in `by_txid`.
+    order: BTreeMap<u64, Txid>,
+    /// The next arrival's key in `order`.
+    next_seq: u64,
 }
 
 pub struct TxOrphanage {
@@ -107,7 +112,8 @@ impl TxOrphanage {
                 by_parent: HashMap::new(),
                 by_peer: HashMap::new(),
                 total_bytes: 0,
-                order: VecDeque::new(),
+                order: BTreeMap::new(),
+                next_seq: 0,
             }),
             config,
         }
@@ -178,23 +184,26 @@ impl TxOrphanage {
 
         // Global cap: evict oldest (FIFO) until we have room.
         while inner.by_txid.len() >= self.config.max_count {
-            if let Some(victim) = Self::pop_oldest(&mut inner) {
+            if let Some(victim) = Self::oldest(&inner) {
                 Self::remove_locked(&mut inner, &victim);
             } else {
                 break;
             }
         }
 
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
         let entry = OrphanEntry {
             tx,
             from_peer,
             added_at,
             missing_parents: missing_parents.clone(),
             bytes,
+            seq,
         };
         inner.by_txid.insert(txid, entry);
         inner.total_bytes += bytes;
-        inner.order.push_back(txid);
+        inner.order.insert(seq, txid);
         for parent in &missing_parents {
             inner.by_parent.entry(*parent).or_default().insert(txid);
         }
@@ -238,8 +247,7 @@ impl TxOrphanage {
                 inner.by_peer.remove(&entry.from_peer);
             }
         }
-        // We don't eagerly strip `order` — stale entries are skipped at
-        // eviction time. This keeps remove() O(1).
+        inner.order.remove(&entry.seq);
         Some(entry)
     }
 
@@ -276,28 +284,26 @@ impl TxOrphanage {
         self.inner.lock().by_txid.contains_key(txid)
     }
 
-    fn pop_oldest(inner: &mut OrphanageInner) -> Option<Txid> {
-        while let Some(txid) = inner.order.pop_front() {
-            if inner.by_txid.contains_key(&txid) {
-                return Some(txid);
-            }
-            // Stale order entry (already removed via some other path).
-        }
-        None
+    fn oldest(inner: &OrphanageInner) -> Option<Txid> {
+        inner.order.first_key_value().map(|(_, txid)| *txid)
     }
 
+    /// The peer's oldest orphan: a scan of that peer's own orphans, at most
+    /// `config.max_per_peer` of them.
     fn oldest_for_peer(inner: &OrphanageInner, peer: PeerId) -> Option<Txid> {
-        let peer_set = inner.by_peer.get(&peer)?;
-        // Linear scan of order queue, picking the first that still
-        // belongs to this peer. Bounded by config.max_count.
-        for txid in &inner.order {
-            if peer_set.contains(txid) {
-                return Some(*txid);
-            }
-        }
-        None
+        inner
+            .by_peer
+            .get(&peer)?
+            .iter()
+            .filter_map(|txid| inner.by_txid.get(txid).map(|e| (e.seq, *txid)))
+            .min()
+            .map(|(_, txid)| txid)
     }
 }
+
+#[cfg(test)]
+#[path = "orphanage_order_tests.rs"]
+mod order_tests;
 
 #[cfg(test)]
 mod tests {
