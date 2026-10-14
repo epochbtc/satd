@@ -4259,21 +4259,30 @@ impl PeerManager {
     /// time and sees each in its node list before the next choice; satd's
     /// dials run in parallel and can outlast a pass, so they count from the
     /// moment they start.
+    ///
+    /// The dials in flight are read first and their lock held while the
+    /// peers are read. A dial registers its peer (`spawn_peer`) before it
+    /// leaves `pending_connections`, and leaving needs that lock, so every
+    /// dial is seen in one list or the other. Two separate reads could miss
+    /// one that completed between them. The order, `pending_connections`
+    /// then `peers`, is the one `connect_outbound_inner` takes them in.
     fn outbound_netgroups(&self) -> HashSet<Vec<u8>> {
-        let mut ips: Vec<IpAddr> = self
-            .peers
-            .read()
-            .values()
-            .filter(|h| {
-                matches!(
-                    h.info.conn_type,
-                    ConnType::Manual | ConnType::OutboundFullRelay | ConnType::BlockRelay
-                ) && h.info.state != PeerState::Disconnected
-                    && h.info.onion_host.is_none()
-            })
-            .map(|h| h.info.addr.ip())
-            .collect();
-        ips.extend(self.pending_connections.read().iter().map(|a| a.ip()));
+        let ips: Vec<IpAddr> = {
+            let pending = self.pending_connections.read();
+            let peers = self.peers.read();
+            peers
+                .values()
+                .filter(|h| {
+                    matches!(
+                        h.info.conn_type,
+                        ConnType::Manual | ConnType::OutboundFullRelay | ConnType::BlockRelay
+                    ) && h.info.state != PeerState::Disconnected
+                        && h.info.onion_host.is_none()
+                })
+                .map(|h| h.info.addr.ip())
+                .chain(pending.iter().map(|a| a.ip()))
+                .collect()
+        };
         ips.into_iter().filter_map(|ip| self.outbound_netgroup(ip)).collect()
     }
 
