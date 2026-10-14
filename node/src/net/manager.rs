@@ -5106,6 +5106,13 @@ impl PeerManager {
                 if block_hashes.is_empty() {
                     tracing::debug!(id, count = inventory.len(), "Peer sent notfound (non-block)");
                 } else {
+                    // A tip-following request it cannot answer no longer
+                    // holds the block back from the sweep's next pass.
+                    if let Some(asked) = self.in_flight_blocks.write().get_mut(&id) {
+                        for h in &block_hashes {
+                            asked.remove(h);
+                        }
+                    }
                     // The background download's heights too, so the next
                     // pass asks a different peer instead of waiting out
                     // the stale timeout.
@@ -9586,6 +9593,11 @@ impl PeerManager {
     /// [`SWEEP_BLOCKS_PER_PEER`] per peer per pass; the rest wait for the
     /// next. Core keeps one request per block (`mapBlocksInFlight`); the
     /// sweep used to send every missing block to every peer on each pass.
+    ///
+    /// A block goes to a peer known to have it, as Core downloads from a peer
+    /// only up to its `pindexBestKnownBlock` and from a limited peer only
+    /// within [`LIMITED_PEER_BLOCK_DEPTH`] of it (`net_processing.cpp:1533`).
+    /// When no peer qualifies (heights not yet known), any peer is asked.
     fn sweep_missing_blocks(&self, peers: &[PeerId]) {
         if peers.is_empty() {
             return;
@@ -9594,6 +9606,25 @@ impl PeerManager {
         if missing.is_empty() {
             return;
         }
+        // Each peer's best known height and whether it is limited.
+        let reach: Vec<(i64, bool)> = {
+            let handles = self.peers.read();
+            peers
+                .iter()
+                .map(|id| {
+                    handles.get(id).map_or((-1, false), |h| {
+                        let height = (h.info.best_height as i64)
+                            .max(h.info.best_known_height.map_or(-1, i64::from));
+                        (height, h.info.is_limited())
+                    })
+                })
+                .collect()
+        };
+        let can_serve = |i: usize, height: Option<u32>| {
+            let Some(height) = height.map(i64::from) else { return true };
+            let (best, limited) = reach[i];
+            best >= height && !(limited && best - height >= i64::from(LIMITED_PEER_BLOCK_DEPTH))
+        };
         // Who has been asked for each block in full, and the newest ask.
         let mut asked: HashMap<bitcoin::BlockHash, (Duration, Vec<PeerId>)> = HashMap::new();
         for (peer, requests) in self.in_flight_blocks.read().iter() {
@@ -9615,13 +9646,17 @@ impl PeerManager {
                 Some((_, who)) => who,
                 None => &[],
             };
+            let height = self.chain_state.get_block_index(&hash).map(|e| e.height);
+            let any_has_it = (0..peers.len()).any(|i| can_serve(i, height));
             let pick = |fresh_only: bool| {
                 (0..peers.len()).map(|k| (next + k) % peers.len()).find(|&i| {
-                    given[i].len() < SWEEP_BLOCKS_PER_PEER && !(fresh_only && before.contains(&peers[i]))
+                    given[i].len() < SWEEP_BLOCKS_PER_PEER
+                        && !(fresh_only && before.contains(&peers[i]))
+                        && (!any_has_it || can_serve(i, height))
                 })
             };
             let Some(i) = pick(true).or_else(|| pick(false)) else {
-                break;
+                continue;
             };
             given[i].push(hash);
             next = i + 1;

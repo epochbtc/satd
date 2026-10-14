@@ -234,3 +234,32 @@ fn notfound_releases_a_background_height() {
     assert!(!pm.bg_downloader.read().is_in_flight(1), "notfound from the peer asked releases it");
     assert!(pm.bg_downloader.read().is_in_flight(2));
 }
+
+/// The sweep asks for a block only a peer known to have it: not one whose
+/// best block is lower, and not a limited peer for a block deeper than it
+/// keeps. A `notfound` frees the block for the next pass.
+#[test]
+fn the_sweep_asks_a_peer_that_has_the_block() {
+    let (pm, _dir) = mk_pm();
+    let chain = blocks(300);
+    for b in &chain {
+        pm.chain_state.accept_header(&b.header).unwrap();
+    }
+    let mut behind = add_peer(&pm, 1, ServiceFlags::NETWORK, 0);
+    let mut limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED, 300);
+    let mut full = add_peer(&pm, 3, ServiceFlags::NETWORK, 300);
+    pm.sweep_missing_blocks(&[1, 2, 3]);
+    assert!(blocks_asked(&drain(&mut behind)).is_empty(), "a peer without the blocks was asked");
+    // The limited peer keeps blocks 15..=300 (within 286 of its tip).
+    let deep: Vec<bitcoin::BlockHash> = chain[..14].iter().map(|b| b.block_hash()).collect();
+    let from_limited = blocks_asked(&drain(&mut limited));
+    assert!(!from_limited.is_empty(), "the limited peer is asked for the blocks it keeps");
+    assert!(from_limited.iter().all(|h| !deep.contains(h)), "a limited peer was asked for deep blocks");
+    let asked = blocks_asked(&drain(&mut full));
+    assert!(asked.contains(&chain[0].block_hash()), "the peer that has them was not asked: {asked:?}");
+
+    // It answers notfound: the next pass may ask again at once.
+    pm.handle_message(3, NetworkMessage::NotFound(vec![Inventory::WitnessBlock(chain[0].block_hash())]), InFlight::adopt(None));
+    pm.sweep_missing_blocks(&[1, 2, 3]);
+    assert!(blocks_asked(&drain(&mut full)).contains(&chain[0].block_hash()));
+}
