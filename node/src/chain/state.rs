@@ -410,7 +410,9 @@ pub struct ChainState {
     /// has changed since.
     blocks_indexed: AtomicU64,
     /// `(tip, best header, blocks_indexed)` as the last
-    /// [`Self::activate_best_stored_chain`] attempt found them.
+    /// [`Self::activate_best_stored_chain`] attempt found them. Cleared by
+    /// [`Self::mark_subtree_invalid`]: a mark changes what that attempt would
+    /// find without changing any part of the key.
     last_activation_attempt: Mutex<Option<(BlockHash, BlockHash, u64)>>,
     /// Reorgs rolled back by [`Self::abort_reorg`] since startup.
     reorg_aborts: AtomicU64,
@@ -2905,8 +2907,11 @@ impl ChainState {
     /// active tip anyway, so an undershoot can never report `headers` below
     /// `blocks`.
     ///
-    /// The scan is O(index), as Core's is. It runs only on the two operator
-    /// RPCs that can change a branch's validity, never on a P2P path.
+    /// The scan is O(index), as Core's is. It runs from the two operator
+    /// RPCs that can change a branch's validity, and from
+    /// [`Self::mark_subtree_invalid`] when a failed connect marks a branch the
+    /// header tip is on (Core's `InvalidChainFound`), which happens at most
+    /// once per marked block.
     ///
     /// **Caller must hold `accept_lock`**, which is Core's `AssertLockHeld(
     /// cs_main)` on `RecalculateBestHeader`. Both halves of the header tip
@@ -4422,7 +4427,8 @@ impl ChainState {
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
             interrupt: None,
-        })?;
+        })
+        .inspect_err(|e| self.mark_stored_block_failure(&pre.hash, e))?;
 
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
@@ -5043,6 +5049,35 @@ impl ChainState {
         })
     }
 
+    /// Record a failed connect of a stored block against it, as `accept_block`
+    /// does for the block it connects: Core's `InvalidBlockFound`, which
+    /// `ConnectTip` reaches whichever way the block arrived.
+    ///
+    /// Only a verdict on the block is recorded
+    /// ([`connect::ConnectError::is_verdict_on_block`]). The stored bytes are
+    /// the block the hash names: `store_block` ran `check_block` on them, so
+    /// the merkle and witness commitments hold, and both connect paths check
+    /// the record's hash against the entry before connecting it. A failure
+    /// that reports this node's own storage, such as a gap in the
+    /// median-time-past window, says nothing about the block and leaves it
+    /// `DataStored` for the next attempt.
+    ///
+    /// Unmarked, the connectors retried the block for as long as it stayed on
+    /// the header chain: the IBD connector thirty times and then again from a
+    /// fresh scheduler, the stored-tail drain on every wakeup. Marked, both
+    /// pass it over, and the header tip moves off it.
+    ///
+    /// Caller holds `accept_lock`.
+    fn mark_stored_block_failure(&self, hash: &BlockHash, e: &connect::ConnectError) {
+        if !e.is_verdict_on_block() {
+            return;
+        }
+        tracing::warn!(block = %hash, reason = %e, "stored block failed to connect; marking it invalid");
+        if let Err(mark_err) = self.mark_subtree_invalid(*hash) {
+            tracing::warn!(block = %hash, error = %mark_err, "could not mark the failed block invalid");
+        }
+    }
+
     /// Connect an already-stored block (DataStored) to the chain tip.
     /// The block's parent must be the current chain tip.
     ///
@@ -5213,7 +5248,8 @@ impl ChainState {
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
             interrupt: None,
-        })?;
+        })
+        .inspect_err(|e| self.mark_stored_block_failure(hash, e))?;
 
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
@@ -8876,11 +8912,31 @@ impl ChainState {
 
     /// Mark `root` and all of its descendants `Invalid` (Core's
     /// FAILED_VALID + FAILED_CHILD). `Pruned` descendants are left alone.
+    ///
+    /// The rest is Core's `InvalidChainFound` (`validation.cpp`):
+    ///
+    /// - When the header tip is in the marked subtree, the header tip is
+    ///   recalculated (`RecalculateBestHeader`). Left alone, it keeps naming
+    ///   the dead branch: `headers` in `getblockchaininfo`, the IBD target and
+    ///   `best_header_stored_prefix` all keep aiming at a chain this node will
+    ///   not connect, until a better header arrives.
+    /// - The [`Self::activate_best_stored_chain`] attempt key is cleared. When
+    ///   the failed reorg was that function's own, none of the key's parts
+    ///   change, so without this the stored prefix below the marked block,
+    ///   which can still out-work the tip, would not be tried until another
+    ///   block or header arrived. Core's `ActivateBestChain` moves on to the
+    ///   next candidate straight away.
+    ///
+    /// **Caller must hold `accept_lock`** (`recalculate_best_header` asserts
+    /// it), as Core holds `cs_main` here.
     fn mark_subtree_invalid(&self, root: BlockHash) -> Result<(), ChainError> {
         let children = self.block_index_children()?;
         let mut batch = crate::storage::StoreBatch::default();
+        let best_header = self.best_header_hash();
+        let mut best_header_marked = false;
         let mut stack = vec![root];
         while let Some(h) = stack.pop() {
+            best_header_marked |= h == best_header;
             if let Some(mut e) = self.store.get_block_index(&h)
                 && e.status != BlockStatus::Invalid
                 && e.status != BlockStatus::Pruned
@@ -8896,6 +8952,13 @@ impl ChainState {
         // write is never HeaderOnly, so the dominance filter never drops it).
         if !batch.block_index_puts.is_empty() {
             self.write_chain_batch(batch)?;
+        }
+        *self.last_activation_attempt.lock() = None;
+        // Core: `m_best_header->GetAncestor(pindexNew->nHeight) == pindexNew`.
+        // The walk above visits every descendant of `root`, so the header tip
+        // descends from it exactly when the walk met it.
+        if best_header_marked {
+            self.recalculate_best_header();
         }
         Ok(())
     }
@@ -9298,7 +9361,8 @@ impl ChainState {
     /// it block by block with the bookkeeping a reorg does not do.
     ///
     /// Keyed on the tip, the best header and a count of indexed blocks, so an
-    /// attempt that failed is not repeated until one of them changes. The
+    /// attempt that failed is not repeated until one of them changes, or until
+    /// a block is marked invalid (`mark_subtree_invalid` clears the key). The
     /// caller polls this on every connector wakeup, and while nothing has
     /// changed it reads two index entries and returns.
     pub fn activate_best_stored_chain(&self) -> Result<Option<BlockHash>, ChainError> {
@@ -9949,6 +10013,10 @@ mod hdrsync_tests;
 #[cfg(test)]
 #[path = "state_consharden_tests.rs"]
 mod consharden_tests;
+
+#[cfg(test)]
+#[path = "state_chainsel_tests.rs"]
+mod chainsel_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
@@ -13327,7 +13395,10 @@ pub(crate) mod tests {
         // Simulate a crash mid-`invalidate_block`: the subtree was marked
         // Invalid but the re-activation never ran, so the durable tip still
         // points at the (now Invalid) block.
-        cs.mark_subtree_invalid(tip3).unwrap();
+        {
+            let _accept_guard = cs.accept_lock.lock();
+            cs.mark_subtree_invalid(tip3).unwrap();
+        }
         assert_eq!(cs.tip_hash(), tip3, "tip unchanged by marking alone");
         assert_eq!(
             cs.get_block_index(&tip3).unwrap().status,
