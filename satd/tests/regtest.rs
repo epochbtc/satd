@@ -25392,7 +25392,9 @@ fn an_address_that_names_no_host_is_neither_learned_nor_dialled() {
     use serde_json::json;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    let node = TestNode::start(&["--v2transport=0"]);
+    // `addr`: the gossiper's addresses are not rate limited (Core's
+    // address token bucket), so all six entries are looked at.
+    let node = TestNode::start(&["--v2transport=0", "--whitelist=addr@127.0.0.1"]);
     // Where a dial to `0.0.0.0:<port>` lands.
     let local = Inbound::bind();
     let port = local.addr.port();
@@ -25545,6 +25547,8 @@ fn off_regtest_a_gossiped_private_address_is_neither_learned_nor_dialled() {
             "--dnsseed=0",
             "--fixedseeds=0",
             &format!("--addnode={}", named.addr),
+            // Both announced addresses are looked at, past the rate limit.
+            "--whitelist=addr@127.0.0.1",
         ],
     );
     let stream = gossip::take_dial(&named, Magic::SIGNET);
