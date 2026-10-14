@@ -190,6 +190,14 @@ const UNREADABLE_REFETCH_INTERVAL: Duration = Duration::from_secs(10);
 /// refreshes the stamp; an entry this old belongs to a request nobody is
 /// making any more.
 const BLOCK_IN_FLIGHT_TTL: Duration = Duration::from_secs(120);
+/// How long the tip-following sweep leaves a block it asked one peer for
+/// before asking again. Core asks one peer per block (`mapBlocksInFlight`)
+/// and moves on only when that request fails; the sweep asked every peer
+/// for every missing block on each pass, every few seconds.
+const SWEEP_REREQUEST_AFTER: Duration = Duration::from_secs(30);
+/// Most blocks the tip-following sweep asks of one peer in a pass, Core's
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER`.
+const SWEEP_BLOCKS_PER_PEER: usize = 16;
 /// How long a compact block being reconstructed suppresses an ordinary fetch
 /// of the same block. Core marks a block it is reconstructing as in flight
 /// and does not download it twice; satd's tip-following sweep would otherwise
@@ -333,10 +341,15 @@ const BG_CATCHUP_WINDOW: u32 = 1024;
 /// A background-range `getdata` older than this is assumed lost and
 /// becomes eligible for re-request on the next download pass.
 const BG_CATCHUP_STALE_SECS: u64 = 30;
-/// Cap on the number of fresh background-range `getdata` heights issued
-/// per peer per download pass, so the catch-up downloader does not flood
-/// a single peer.
-const BG_CATCHUP_PER_PEER_PER_PASS: usize = 16;
+/// Most background-range heights outstanding to one peer at a time, as
+/// Core caps `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16, `net_processing.cpp`).
+/// A peer that has not answered gets no more until it does or its requests
+/// time out.
+const BG_CATCHUP_PER_PEER: usize = 16;
+/// Core serves a NODE_NETWORK_LIMITED peer's blocks only this far below its
+/// tip: `NODE_NETWORK_LIMITED_MIN_BLOCKS` (288) less Core's two-block margin
+/// (`net_processing.cpp:154`, `:1533`).
+const LIMITED_PEER_BLOCK_DEPTH: u32 = 288 - 2;
 /// Flush the background coin cache to disk every N connected blocks so a
 /// crash resumes from a recent private tip instead of redoing the whole
 /// genesis→snapshot validation.
@@ -638,6 +651,10 @@ mod peerpunish_tests;
 #[cfg(test)]
 #[path = "manager_addrdials_tests.rs"]
 mod addrdials_tests;
+
+#[cfg(test)]
+#[path = "manager_ibdwindow_tests.rs"]
+mod ibdwindow_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -4558,14 +4575,14 @@ impl PeerManager {
                         let peers = self.peers.read();
                         peers.iter()
                             .filter(|(_, h)| {
-                                h.info.state == PeerState::Connected && h.info.serves_blocks()
+                                h.info.state == PeerState::Connected
+                                    && h.info.serves_blocks()
+                                    && h.info.advertises_blocks()
                             })
                             .map(|(id, _)| *id)
                             .collect()
                     };
-                    for pid in &peer_ids {
-                        self.request_missing_blocks(*pid);
-                    }
+                    self.sweep_missing_blocks(&peer_ids);
                 }
             }
 
@@ -5089,6 +5106,19 @@ impl PeerManager {
                 if block_hashes.is_empty() {
                     tracing::debug!(id, count = inventory.len(), "Peer sent notfound (non-block)");
                 } else {
+                    // The background download's heights too, so the next
+                    // pass asks a different peer instead of waiting out
+                    // the stale timeout.
+                    if self.bg_downloader.read().in_flight_len() > 0 {
+                        let mut dl = self.bg_downloader.write();
+                        for h in &block_hashes {
+                            if let Some(entry) = self.chain_state.get_block_index(h)
+                                && dl.note_not_found(entry.height, id)
+                            {
+                                tracing::debug!(id, height = entry.height, "background download: notfound, released");
+                            }
+                        }
+                    }
                     let mut released_heights: Vec<u32> = Vec::new();
                     {
                         let mut ibd = self.ibd.write();
@@ -5614,9 +5644,19 @@ impl PeerManager {
             if !handle.info.serves_blocks() {
                 return;
             }
+            // Nor does Core download from a peer that advertises neither
+            // NODE_NETWORK nor NODE_NETWORK_LIMITED (`CanServeBlocks`), such
+            // as a light client: it cannot serve what it is asked for.
+            if !handle.info.advertises_blocks() {
+                return;
+            }
             // What the peer claimed at connect, or has announced since.
-            (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from))
+            (
+                (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from)),
+                handle.info.is_limited(),
+            )
         };
+        let (peer_height, limited) = peer_height;
         // i32::saturating_sub avoids underflow for early-IBD targets.
         if peer_height < (target_height as i64).saturating_sub(1000) {
             // Peer is not synced enough to be a useful IBD source. Skip.
@@ -5629,10 +5669,19 @@ impl PeerManager {
         let Ok(max_height) = u32::try_from(peer_height) else { return };
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
-            scheduler.register_peer(peer_id);
             if max_height <= scheduler.connect_cursor() {
                 return;
             }
+            // A pruned (NODE_NETWORK_LIMITED) peer keeps only its recent
+            // blocks. Core asks it for a block only within
+            // [`LIMITED_PEER_BLOCK_DEPTH`] of its tip (`net_processing.cpp:1533`)
+            // and not at all during IBD (`:6164`). The scheduler can hand out
+            // any height above the cursor, so use such a peer only when every
+            // one of those is that recent.
+            if limited && max_height - scheduler.connect_cursor() >= LIMITED_PEER_BLOCK_DEPTH {
+                return;
+            }
+            scheduler.register_peer(peer_id);
             let hashes = scheduler.assign_blocks_up_to(peer_id, max_height);
             if !hashes.is_empty() {
                 drop(ibd);
@@ -6093,9 +6142,12 @@ impl PeerManager {
                 // Don't penalize the peer; the block may become valid later.
                 tracing::debug!(%hash, "IBD block store: parent unknown, skipping");
             }
-            Err(e) => {
+            Err(e) if Self::store_error_is_the_blocks(&e) => {
                 tracing::debug!(%hash, "IBD block store failed: {}", e);
                 self.add_ban_score(id, 10, &format!("block rejected: {}", e));
+            }
+            Err(e) => {
+                tracing::warn!(%hash, id, "IBD block could not be stored: {}", e);
             }
         }
     }
@@ -6121,14 +6173,30 @@ impl PeerManager {
             | Err(crate::chain::state::ChainError::BadPrevBlock) => {
                 tracing::debug!(%hash, "bg catch-up block store: parent unknown, skipping");
             }
-            Err(e) => {
+            Err(e) if Self::store_error_is_the_blocks(&e) => {
                 tracing::debug!(%hash, "bg catch-up block store failed: {}", e);
                 // Smaller penalty than forward IBD: a malformed historical
                 // block is suspicious but the catch-up download is best-
                 // effort and will re-request from another peer.
                 self.add_ban_score(id, 5, &format!("bg block rejected: {}", e));
             }
+            Err(e) => {
+                tracing::warn!(%hash, id, "bg catch-up block could not be stored: {}", e);
+            }
         }
+    }
+
+    /// Whether a `store_block` failure was the block's own fault: it failed a
+    /// check, or contradicts a checkpoint. Everything else (a block-file or
+    /// database write, a snapshot load in progress) is this node's, and Core
+    /// never charges the sender for it: a failed write ends in `FatalError`
+    /// (`validation.cpp`, `AcceptBlock`), not in `Misbehaving`.
+    fn store_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
+        matches!(
+            e,
+            crate::chain::state::ChainError::Validation(_)
+                | crate::chain::state::ChainError::CheckpointMismatch(_)
+        )
     }
 
     /// A block's data was stored — clear it from the background download
@@ -6191,46 +6259,29 @@ impl PeerManager {
             return;
         }
 
+        // Core downloads historical blocks only from a peer that keeps them
+        // all: NODE_NETWORK, not a limited one (`net_processing.cpp:6176`).
         let peer_ids: Vec<PeerId> = {
             let peers = self.peers.read();
-            peers
+            let mut ids: Vec<PeerId> = peers
                 .iter()
-                .filter(|(_, h)| h.info.state == PeerState::Connected)
+                .filter(|(_, h)| {
+                    h.info.state == PeerState::Connected
+                        && h.info.serves_blocks()
+                        && h.info.advertises_blocks()
+                        && !h.info.is_limited()
+                })
                 .map(|(id, _)| *id)
-                .collect()
+                .collect();
+            ids.sort_unstable();
+            ids
         };
         if peer_ids.is_empty() {
             return;
         }
 
-        // Round-robin the needed heights across peers, capping how many we
-        // assign to any one peer this pass.
-        let mut assignments: HashMap<PeerId, Vec<bitcoin::BlockHash>> = HashMap::new();
-        {
-            let mut dl = self.bg_downloader.write();
-            let mut next_peer = 0usize;
-            let mut per_peer: HashMap<PeerId, usize> = HashMap::new();
-            for (h, hash) in needed {
-                // Find a peer under the per-pass cap.
-                let mut placed = false;
-                for _ in 0..peer_ids.len() {
-                    let pid = peer_ids[next_peer % peer_ids.len()];
-                    next_peer += 1;
-                    let count = per_peer.entry(pid).or_insert(0);
-                    if *count < BG_CATCHUP_PER_PEER_PER_PASS {
-                        *count += 1;
-                        dl.mark_in_flight(h, pid, now);
-                        assignments.entry(pid).or_default().push(hash);
-                        placed = true;
-                        break;
-                    }
-                }
-                if !placed {
-                    // Every peer is at the per-pass cap; defer the rest.
-                    break;
-                }
-            }
-        }
+        let assignments =
+            self.bg_downloader.write().assign(&needed, &peer_ids, BG_CATCHUP_PER_PEER, now);
         for (pid, hashes) in assignments {
             for chunk in hashes.chunks(128) {
                 self.send_to_peer(pid, sync::make_getdata_blocks(chunk));
@@ -9528,6 +9579,58 @@ impl PeerManager {
         self.request_full_blocks(id, &to_request);
     }
 
+    /// The tip-following sweep: ask `peers` for the blocks the best header
+    /// chain lacks, each block of one peer. A block asked of anyone (in full)
+    /// less than [`SWEEP_REREQUEST_AFTER`] ago is left alone; an older one
+    /// goes to a peer not asked before when there is one. At most
+    /// [`SWEEP_BLOCKS_PER_PEER`] per peer per pass; the rest wait for the
+    /// next. Core keeps one request per block (`mapBlocksInFlight`); the
+    /// sweep used to send every missing block to every peer on each pass.
+    fn sweep_missing_blocks(&self, peers: &[PeerId]) {
+        if peers.is_empty() {
+            return;
+        }
+        let missing = self.missing_blocks_to_fetch();
+        if missing.is_empty() {
+            return;
+        }
+        // Who has been asked for each block in full, and the newest ask.
+        let mut asked: HashMap<bitcoin::BlockHash, (Duration, Vec<PeerId>)> = HashMap::new();
+        for (peer, requests) in self.in_flight_blocks.read().iter() {
+            for (hash, r) in requests {
+                let age = r.at.elapsed();
+                if r.compact || age >= BLOCK_IN_FLIGHT_TTL {
+                    continue;
+                }
+                let entry = asked.entry(*hash).or_insert((age, Vec::new()));
+                entry.0 = entry.0.min(age);
+                entry.1.push(*peer);
+            }
+        }
+        let mut given: Vec<Vec<bitcoin::BlockHash>> = vec![Vec::new(); peers.len()];
+        let mut next = 0usize;
+        for hash in missing {
+            let before: &[PeerId] = match asked.get(&hash) {
+                Some((age, _)) if *age < SWEEP_REREQUEST_AFTER => continue,
+                Some((_, who)) => who,
+                None => &[],
+            };
+            let pick = |fresh_only: bool| {
+                (0..peers.len()).map(|k| (next + k) % peers.len()).find(|&i| {
+                    given[i].len() < SWEEP_BLOCKS_PER_PEER && !(fresh_only && before.contains(&peers[i]))
+                })
+            };
+            let Some(i) = pick(true).or_else(|| pick(false)) else {
+                break;
+            };
+            given[i].push(hash);
+            next = i + 1;
+        }
+        for (peer, hashes) in peers.iter().zip(given) {
+            self.request_full_blocks(*peer, &hashes);
+        }
+    }
+
     /// Fetch what a `headers` message from `id`, ending at `last`, left
     /// missing: Bitcoin Core's `HeadersDirectFetchBlocks` (v31.1
     /// `net_processing.cpp:2844`), on satd's tip-following fetch.
@@ -9680,7 +9783,7 @@ impl PeerManager {
     /// on its way in compactly from this moment, so the tip-following sweep
     /// holds off for [`COMPACT_RECONSTRUCT_SUPPRESSION`], as it does for a
     /// reconstruction; if nothing usable comes by then, the sweep fetches it
-    /// in full from every peer.
+    /// in full.
     fn note_compact_requested(&self, id: PeerId, hash: bitcoin::BlockHash) {
         self.record_block_requests(id, &[hash], true);
         self.compact_in_progress.write().insert(hash, Instant::now());

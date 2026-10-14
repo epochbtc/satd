@@ -248,14 +248,20 @@ impl IbdScheduler {
         // This prevents stalls where random blocks are downloaded far ahead but the
         // connect thread is blocked waiting for the next sequential block.
         // 256 blocks ensures the near-cursor region is well-covered across multiple peers.
+        //
+        // The zone is exempt from `max_ahead`. The window counts heights that
+        // are downloaded but not yet connected, and those only drain as the
+        // cursor advances; if the window is full while the height the
+        // connector needs next is not in flight (released from a peer that
+        // did not deliver it, or after a restart with a smaller window), a
+        // gated zone would never hand that height out again and the download
+        // would stop for good. Core's window is measured from the last common
+        // block, so the blocks just above it are always inside
+        // (`nWindowEnd`, `net_processing.cpp:1436-1441`). The overshoot is
+        // bounded by the zone's 256 heights.
         let priority_end = (self.connect_cursor + 256).min(self.target_height).min(max_height);
         for h in (self.connect_cursor + 1)..=priority_end {
             if hashes.len() >= budget {
-                break;
-            }
-            let total_ahead =
-                self.downloaded.len() as u32 + self.in_flight.len() as u32 + hashes.len() as u32;
-            if total_ahead >= self.max_ahead {
                 break;
             }
             if self.downloaded.contains(&h) || self.in_flight.contains_key(&h) {
@@ -292,7 +298,9 @@ impl IbdScheduler {
                 None => break,
             };
 
-            if self.downloaded.contains(&height) {
+            // Already connected: a released height can sit in the pool while
+            // its block arrives late and is connected from disk.
+            if height <= self.connect_cursor || self.downloaded.contains(&height) {
                 continue;
             }
             if self.in_flight.contains_key(&height) {
@@ -340,35 +348,46 @@ impl IbdScheduler {
     /// good: the very wedge the best-header rows exist to prevent, reached
     /// through the delivery door instead of the index.
     ///
+    /// Only a height that is in flight counts, and only one above the connect
+    /// cursor is recorded as downloaded. `downloaded` drains only as the
+    /// cursor passes it, so an already-connected height recorded there would
+    /// stay in the window for the rest of the download. The peer's activity
+    /// clock and failure count move only for a block that was asked of that
+    /// peer, as Core clears `m_stalling_since` only when a requested block
+    /// arrives (`RemoveBlockRequest`, `net_processing.cpp:1199-1230`); a block nobody
+    /// asked it for says nothing about the heights it still owes.
+    ///
     /// Returns `true` if the peer has capacity for more work.
     pub fn block_received(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) -> bool {
-        let wanted = self.height_to_hash.get(&height) == Some(&hash);
-        if wanted {
+        let holder = if self.height_to_hash.get(&height) == Some(&hash) {
+            self.in_flight.get(&height).copied()
+        } else {
+            None
+        };
+        if let Some(holder) = holder {
             // Clear the height from whichever peer actually holds it. After a
             // re-key and reassignment that need not be the peer delivering it,
             // and leaving the holder's slot occupied would leak its capacity.
-            if let Some(holder) = self.in_flight.remove(&height)
-                && holder != peer_id
-                && let Some(slots) = self.peer_slots.get_mut(&holder)
-            {
+            self.in_flight.remove(&height);
+            self.in_flight_at.remove(&height);
+            if let Some(slots) = self.peer_slots.get_mut(&holder) {
                 slots.assigned.retain(|&h| h != height);
             }
-            self.in_flight_at.remove(&height);
-            self.downloaded.insert(height);
+            if height > self.connect_cursor {
+                self.downloaded.insert(height);
+            }
             // Drop any cooldown entries for this height.
             self.height_peer_cooldown.remove(&height);
         }
 
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
-            // The peer proved it is alive and delivering, whether or not the
-            // block is still one we want.
-            if wanted {
-                slots.assigned.retain(|&h| h != height);
+            if holder == Some(peer_id) {
+                // The peer delivered what it was asked for: it is alive.
+                slots.blocks_received += 1;
+                slots.last_activity = Instant::now();
+                slots.consecutive_failures = 0;
+                slots.last_failure_at = None;
             }
-            slots.blocks_received += 1;
-            slots.last_activity = Instant::now();
-            slots.consecutive_failures = 0;
-            slots.last_failure_at = None;
             return (slots.assigned.len() as u32) < self.per_peer_limit / 2;
         }
         false
@@ -820,6 +839,10 @@ impl IbdScheduler {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "ibd_ibdwindow_tests.rs"]
+mod ibdwindow_tests;
 
 #[cfg(test)]
 mod tests {
