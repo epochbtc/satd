@@ -27,6 +27,26 @@ item below is (or will be) written up in full in the in-development
 - A full `-reindex` no longer appends a second copy of the genesis block to the last block file. It indexes the genesis record `blk00000.dat` begins with, so the reindex writes nothing to the block files, which on a switch from Bitcoin Core are Core's (#931).
 - StartOS package: the service log now shows satd's INFO lines (sync progress, a reindex's phases, the steps of a shutdown). StartOS starts every service with `RUST_LOG=warn`, which satd honors, so the log carried warnings only.
 - `getrawaddrman` could report an address in a bucket Core's formulas would never give it. When two addresses derived the same slot, the second moved to the next free slot of the whole table, which from a bucket's last position is the next bucket's first. It now moves within its own bucket, as Core keeps every address in the bucket its formula gives; only a full bucket spills over.
+- Signature operations are counted exactly as Bitcoin Core counts them, for the block sigop limit, mempool policy and block templates; the old counter scored an `OP_CHECKMULTISIG` after another signature opcode in P2SH and P2WSH scripts lower than Core. Parents admitted by `submitpackage` without a fee check carry their real sigop cost (#937).
+- The Rust script engine treats 0x80, 0x81 and 0x83–0x86 as `OP_SUCCESSx` in tapscript, as Core does, instead of failing the leaf (`-consensus=rust`, `cpp-shadow`, `satd-chainstate-repair`) (#933).
+- A block body that fails the context-free block checks no longer marks the block invalid, and an empty body is checked against the header's merkle root first (#936).
+- On signet the signed coinbase commitment is rebuilt exactly as Core does; a missing block in a median-time-past window stops connecting with a storage error; malformed `nBits` count as zero work (#948).
+- satd stops, as Core does, when it cannot read a coin from the chainstate, instead of treating the coin as spent and recording a valid block as invalid (#945).
+- Header sync continues from the last header a peer sent, so a node on a competing best-header branch keeps syncing; the retarget start is found on the block's own branch, and targets above the proof-of-work limit are refused (#954).
+- A block that fails to connect from storage is marked invalid instead of being retried by the IBD connector; the `headers` tip leaves the failed branch, and a chain with more work below it is activated at once (#957).
+- IBD no longer stalls with a full `-maxahead` window; re-sent blocks do not count against it, local write failures do not penalize the sender, and block downloads go only to peers that advertise block service (#953).
+- A block that arrives before its parent is kept only if it was requested and within fixed bounds (4 per peer, 32 MB in all, 5 minutes) (#941).
+- Core's P2P message size and count limits apply, block replies are queued about 1 MB per peer, a peer that takes no data for 20 minutes is disconnected, user agents are capped at 256 bytes and sanitized, and refused BIP 157 requests disconnect (#939).
+- `noban` and manual peers are never punished for misbehaviour; local and onion-inbound peers are disconnected but not banned, so 127.0.0.1 is no longer banned; `getpeerinfo` reports onion-inbound peers as `onion` (#944).
+- Address announcements are rate-limited per peer as in Core (`addr_processed`, `addr_rate_limited` in `getpeerinfo`); dials in flight count against the outbound limit; manual connections sit outside it; `setban` of an onion host disconnects it (#952).
+- A full mempool checks an incoming transaction's scripts before evicting for it and never evicts its parent; eviction scales with what it removes; lowering `maxmempool` on reload trims at once (#942).
+- `getmempoolentry`, `getrawmempool`, `getmempoolinfo`, `gettxout` and `sendrawtransaction` answer as Core does; a restart keeps entry times and loads a large mempool in linear time (#946).
+- RPC numbers use Core's formatting (16 significant digits, 8-decimal fee amounts); `submitblock` answers `duplicate-invalid` and throws -22/-25; `getblockfilter` uses Core's errors; a failed RPC password is answered after 250 ms (#955).
+- Electrum scripthash status hashes the history in `get_history` order, which stops Electrum desktop reconnecting in a loop on addresses with pending transactions (#938).
+- Esplora honours `?after_txid=` paging, answers 404/400 for out-of-range or misaligned block-txs pages, drops empty `witness` arrays, and `/fee-estimates` omits targets with no estimate (#943).
+- Long Electrum and Esplora address-history reads run off the API runtime's workers, and `--electrumrequesttimeout` and `--esplorarequesttimeout` take effect (#947).
+- The address, spend and filter indexes do not serve during or after an unfinished `backfillindex`; a reorg during a backfill no longer deletes live rows; reads during a flush wait for it (#958).
+- `bitcoin.conf` treats `#` anywhere as a comment start and refuses an `rpcpassword` containing `#`, as Core does; trace logs no longer include RPC headers or parameters; the Tor control cookie read is bounded (#940).
 
 ## Releases
 
