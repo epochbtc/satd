@@ -21,9 +21,19 @@ fn best_known_height(chain_state: &ChainState) -> u32 {
 /// A block locator starting at `tip_height`.
 fn build_locator_from(chain_state: &ChainState, tip_height: u32) -> Vec<BlockHash> {
     let mut locator = Vec::new();
-    let mut step = 1u32;
-    let mut height = tip_height as i64;
+    extend_locator_from_rows(chain_state, &mut locator, 1, tip_height as i64);
+    locator
+}
 
+/// Continue `locator` down the height rows from `height`, spacing entries as
+/// [`build_locator`] does (`step` is the current spacing), and end it with
+/// genesis.
+fn extend_locator_from_rows(
+    chain_state: &ChainState,
+    locator: &mut Vec<BlockHash>,
+    mut step: u32,
+    mut height: i64,
+) {
     while height >= 0 {
         if let Some(hash) = chain_state.get_block_hash_by_height(height as u32) {
             locator.push(hash);
@@ -39,8 +49,72 @@ fn build_locator_from(chain_state: &ChainState, tip_height: u32) -> Vec<BlockHas
         && locator.last() != Some(&hash) {
             locator.push(hash);
         }
+}
 
-    locator
+/// How many parent links [`build_locator_for_branch`] follows before it
+/// falls back to the height rows. The first locator entries are the ones a
+/// peer on that branch matches; the cap bounds the index reads one locator
+/// can cost when the branch is long and not on the height rows.
+const BRANCH_LOCATOR_MAX_WALK: u32 = 4096;
+
+/// A block locator that starts at `start` and follows `start`'s own branch
+/// (Core's `GetLocator(pindex)`), not the node's height rows.
+///
+/// Once the branch reaches a block the height rows also hold, the rest of the
+/// locator comes from the rows, which below that point are the same chain.
+/// `None` if `start` is not in the block index.
+pub fn build_locator_for_branch(chain_state: &ChainState, start: BlockHash) -> Option<Vec<BlockHash>> {
+    let mut entry = chain_state.get_block_index(&start)?;
+    let mut hash = start;
+    let mut locator = Vec::new();
+    let mut step = 1u32;
+    let mut walked = 0u32;
+    loop {
+        if chain_state.get_block_hash_by_height(entry.height) == Some(hash) {
+            extend_locator_from_rows(chain_state, &mut locator, step, entry.height as i64);
+            return Some(locator);
+        }
+        locator.push(hash);
+        if locator.len() >= 10 {
+            step = step.saturating_mul(2);
+        }
+        let Some(target) = entry.height.checked_sub(step) else {
+            // Below the first spaced entry: only genesis is left.
+            extend_locator_from_rows(chain_state, &mut locator, step, -1);
+            return Some(locator);
+        };
+        while entry.height > target {
+            if walked >= BRANCH_LOCATOR_MAX_WALK {
+                extend_locator_from_rows(chain_state, &mut locator, step, target as i64);
+                return Some(locator);
+            }
+            hash = entry.header.prev_blockhash;
+            match chain_state.get_block_index(&hash) {
+                Some(parent) if parent.height + 1 == entry.height => entry = parent,
+                _ => {
+                    extend_locator_from_rows(chain_state, &mut locator, step, target as i64);
+                    return Some(locator);
+                }
+            }
+            walked += 1;
+        }
+    }
+}
+
+/// The `getheaders` that follows a full `headers` batch: it continues from
+/// the last header the peer sent, as Core's `ProcessHeadersMessage` does
+/// (`MaybeSendGetHeaders(pfrom, GetLocator(pindexLast))`). A locator from the
+/// node's own height rows would not do: when those rows are on a competing
+/// branch with more work than the peer's chain has shown so far, the peer
+/// matches only the fork point and sends the same headers again.
+pub fn make_getheaders_after(chain_state: &ChainState, last: BlockHash) -> NetworkMessage {
+    match build_locator_for_branch(chain_state, last) {
+        Some(locator) => NetworkMessage::GetHeaders(GetHeadersMessage::new(
+            locator,
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32])),
+        )),
+        None => make_getheaders(chain_state),
+    }
 }
 
 /// Create a GetHeaders message using the current chain state.

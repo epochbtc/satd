@@ -12220,11 +12220,11 @@ fn test_esplora_block_txids_and_paging() {
     node.stop();
 }
 
-/// `/block/:hash/txs/:start_index` returns an empty array for an
-/// in-range-but-past-end offset, and tolerates `usize::MAX` without
-/// panicking. (Review H5.)
+/// `/block/:hash/txs/:start_index` answers 404 `start index out of range`
+/// for an offset at or past the end of the block, as upstream Esplora does,
+/// and tolerates `usize::MAX` without panicking. (Review H5.)
 #[test]
-fn test_esplora_block_txs_pagination_past_end_returns_empty() {
+fn test_esplora_block_txs_pagination_past_end_is_404() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
@@ -12236,17 +12236,21 @@ fn test_esplora_block_txs_pagination_past_end_returns_empty() {
         .trim()
         .to_string();
 
-    // Offset == len → empty array, not 404 / panic.
+    // Offset == len → 404 `start index out of range`, not an empty page.
     let r = esplora_get(esplora_port, &format!("/block/{}/txs/1", tip));
-    assert_eq!(r.status(), 200);
-    let arr: Vec<serde_json::Value> = r.json().unwrap();
-    assert!(arr.is_empty());
+    assert_eq!(r.status(), 404);
+    assert_eq!(r.text().unwrap(), "start index out of range");
 
-    // usize::MAX must be saturated, not overflow-panic.
+    // usize::MAX must not overflow-panic.
     let r2 = esplora_get(esplora_port, &format!("/block/{}/txs/{}", tip, usize::MAX));
-    assert_eq!(r2.status(), 200);
-    let arr2: Vec<serde_json::Value> = r2.json().unwrap();
-    assert!(arr2.is_empty());
+    assert_eq!(r2.status(), 404);
+    assert_eq!(r2.text().unwrap(), "start index out of range");
+
+    // The first page itself is still served.
+    let r3 = esplora_get(esplora_port, &format!("/block/{}/txs/0", tip));
+    assert_eq!(r3.status(), 200);
+    let arr3: Vec<serde_json::Value> = r3.json().unwrap();
+    assert_eq!(arr3.len(), 1);
 
     node.stop();
 }
@@ -14105,27 +14109,20 @@ fn test_esplora_mempool_with_tx_reports_summary_txids_and_recent() {
     node.stop();
 }
 
-/// `GET /fee-estimates` returns a complete map keyed by every standard
-/// confirmation target — entries default to 1.0 sat/vB when the node
-/// lacks confirmed-block fee samples (regtest mempool is normally empty).
+/// `GET /fee-estimates` leaves out every target the node has no estimate
+/// for. A fresh regtest node has an empty mempool and no confirmed-block fee
+/// samples, so there is no estimate at all and the answer is `{}`, as
+/// upstream Esplora answers when bitcoind cannot estimate any target. It
+/// used to report the 1 sat/vB floor for every target.
 #[test]
-fn test_esplora_fee_estimates_returns_complete_map() {
+fn test_esplora_fee_estimates_empty_without_a_fee_signal() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let r = esplora_get(esplora_port, "/fee-estimates");
     assert_eq!(r.status(), 200);
     let body: serde_json::Value = r.json().unwrap();
-    let obj = body.as_object().unwrap();
-    // Standard targets: 1..25 + 144, 504, 1008.
-    for t in [1u32, 2, 3, 6, 10, 25, 144, 504, 1008] {
-        let v = obj
-            .get(&t.to_string())
-            .unwrap_or_else(|| panic!("missing target {t}"));
-        let f = v.as_f64().expect("feerate is a number");
-        // Floor is 1.0 sat/vB so consumers always have a usable value.
-        assert!(f >= 1.0, "target {} feerate {} below 1.0 floor", t, f);
-    }
+    assert_eq!(body, serde_json::json!({}), "no target has an estimate");
     node.stop();
 }
 
@@ -15589,12 +15586,17 @@ mod cf_client {
             None
         }
 
-        /// Assert that no CFilter / CFHeaders / CFCheckpt arrives in the
-        /// window — the silent-drop contract from BIP 157.
-        pub fn assert_silent(&mut self, window: Duration) {
+        /// Assert that the node closes the connection within the window
+        /// without sending a CFilter / CFHeaders / CFCheckpt: Core's
+        /// `PrepareBlockFilterRequest` disconnects a peer whose request it
+        /// will not serve.
+        pub fn assert_disconnected(&mut self, window: Duration) {
             let deadline = Instant::now() + window;
-            while Instant::now() < deadline {
+            loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    panic!("assert_disconnected: still connected after {window:?}");
+                }
                 self.stream
                     .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
                     .unwrap();
@@ -15602,10 +15604,13 @@ mod cf_client {
                     Ok(NetworkMessage::CFilter(_))
                     | Ok(NetworkMessage::CFHeaders(_))
                     | Ok(NetworkMessage::CFCheckpt(_)) => {
-                        panic!("assert_silent: peer sent a filter response unexpectedly");
+                        panic!("assert_disconnected: peer sent a filter response unexpectedly");
                     }
                     Ok(_) => continue,
-                    Err(_) => break,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                        panic!("assert_disconnected: still connected after {window:?}");
+                    }
+                    Err(_) => return,
                 }
             }
         }
@@ -15860,13 +15865,14 @@ fn test_p2p_getcfcheckpt_thousand_block_intervals() {
 }
 
 #[test]
-fn test_p2p_silent_drop_when_peer_serve_disabled() {
+fn test_p2p_disconnect_when_peer_serve_disabled() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFHeaders;
 
-    // blockfilterindex=basic but peerblockfilters off: handlers must
-    // silent-drop and the version handshake must NOT advertise
-    // NODE_COMPACT_FILTERS.
+    // blockfilterindex=basic but peerblockfilters off: the version
+    // handshake must NOT advertise NODE_COMPACT_FILTERS, and a request for
+    // filters disconnects, as Core's does ("peer requested unsupported block
+    // filter type").
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
     let datadir = fresh_test_datadir("satd-p2p-silent-test");
@@ -15912,13 +15918,13 @@ fn test_p2p_silent_drop_when_peer_serve_disabled() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_invalid_filter_type() {
+fn test_p2p_disconnect_invalid_filter_type() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFilters;
 
@@ -15959,7 +15965,7 @@ fn test_p2p_silent_drop_invalid_filter_type() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -16091,7 +16097,7 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
         resp.filter_hashes.len()
     );
 
-    // 2001 headers must be silent-dropped (start=0, stop=2000 = 2001).
+    // 2001 headers disconnect, as in Core (start=0, stop=2000 = 2001).
     let stop_hex_genesis = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
         .unwrap()["result"]
@@ -16101,20 +16107,20 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
     let mut _consensus_g =
         <[u8; 32]>::try_from(hex::decode(&stop_hex_genesis).expect("hex").as_slice())
             .expect("32 bytes");
-    let _ = tip_hash; // suppress unused var warnings on the silent-drop path
+    let _ = tip_hash; // suppress unused var warnings on the refusal path
     client.send_get_cfheaders(GetCFHeaders {
         filter_type: 0,
         start_height: 0,
         stop_hash: stop_hash_2000,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
 
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_oversized_range() {
+fn test_p2p_disconnect_oversized_range() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFilters;
 
@@ -16153,13 +16159,13 @@ fn test_p2p_silent_drop_oversized_range() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
 #[test]
-fn test_p2p_silent_drop_off_chain_stop_hash() {
+fn test_p2p_disconnect_unknown_stop_hash() {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_filter::GetCFHeaders;
 
@@ -16193,7 +16199,7 @@ fn test_p2p_silent_drop_off_chain_stop_hash() {
         start_height: 0,
         stop_hash,
     });
-    client.assert_silent(Duration::from_secs(2));
+    client.assert_disconnected(Duration::from_secs(10));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -25386,7 +25392,9 @@ fn an_address_that_names_no_host_is_neither_learned_nor_dialled() {
     use serde_json::json;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    let node = TestNode::start(&["--v2transport=0"]);
+    // `addr`: the gossiper's addresses are not rate limited (Core's
+    // address token bucket), so all six entries are looked at.
+    let node = TestNode::start(&["--v2transport=0", "--whitelist=addr@127.0.0.1"]);
     // Where a dial to `0.0.0.0:<port>` lands.
     let local = Inbound::bind();
     let port = local.addr.port();
@@ -25539,6 +25547,8 @@ fn off_regtest_a_gossiped_private_address_is_neither_learned_nor_dialled() {
             "--dnsseed=0",
             "--fixedseeds=0",
             &format!("--addnode={}", named.addr),
+            // Both announced addresses are looked at, past the rate limit.
+            "--whitelist=addr@127.0.0.1",
         ],
     );
     let stream = gossip::take_dial(&named, Magic::SIGNET);

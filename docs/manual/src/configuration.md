@@ -94,7 +94,9 @@ sat-cli -datadir=/path/to/datadir getblockcount
   `rpccookiefile` come from the command line first, then the active chain's
   section (`[main]`, `[test]`, `[testnet4]`, `[signet]`, `[regtest]`), then
   the top level of the file; the first value in a scope wins. A top-level
-  `rpcport` applies on every chain, as it does for satd itself.
+  `rpcport` applies on every chain, as it does for satd itself. The file is
+  read with satd's rules: `#` starts a comment anywhere on a line, and an
+  `rpcpassword` line holding a `#` is an error.
 - **Which credentials.** A non-empty `rpcpassword` from either source means
   user/password authentication, with `rpcuser` looked up the same way;
   otherwise the cookie file, whose relative path is under the chain's data

@@ -103,14 +103,21 @@ pub struct ConfFile {
 }
 
 impl ConfFile {
-    pub fn parse(content: &str) -> Self {
+    /// Parse the file as bitcoin-cli does, with Bitcoin Core's
+    /// GetConfigOptions (src/common/config.cpp): a `#` anywhere on a line
+    /// starts a comment, what is left is trimmed of spaces, tabs, CRs and
+    /// LFs, and an `rpcpassword` line holding a `#` is an error.
+    pub fn parse(content: &str) -> Result<Self, String> {
+        let trim = |s: &str| s.trim_matches([' ', '\t', '\r', '\n']).to_string();
         let mut file = ConfFile::default();
         let mut section: Option<String> = None;
-        for line in content.lines() {
-            // Whole-line comments only, as the daemon parses them: a `#`
-            // later on a line is part of the value (a password may hold one).
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        for (idx, line) in content.lines().enumerate() {
+            let (line, used_hash) = match line.find('#') {
+                Some(pos) => (&line[..pos], true),
+                None => (line, false),
+            };
+            let line = trim(line);
+            if line.is_empty() {
                 continue;
             }
             if line.starts_with('[') && line.ends_with(']') {
@@ -118,25 +125,34 @@ impl ConfFile {
                 continue;
             }
             let (key, value) = match line.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => (line, "1"),
+                Some((k, v)) => (trim(k), trim(v)),
+                None => (line.clone(), "1".to_string()),
             };
+            if used_hash && key.contains("rpcpassword") {
+                return Err(format!(
+                    "parse error on line {}, using # in rpcpassword can be ambiguous and \
+                     should be avoided",
+                    idx + 1
+                ));
+            }
             let map = match &section {
                 Some(s) => file.sections.entry(s.clone()).or_default(),
                 None => &mut file.global,
             };
-            map.entry(key.to_string()).or_default().push(value.to_string());
+            map.entry(key).or_default().push(value);
         }
-        file
+        Ok(file)
     }
 
     /// Read `path`. A missing file is not an error (`Ok(None)`); an
-    /// unreadable one is, when the caller named it with `-conf`.
-    pub fn read(path: &Path) -> std::io::Result<Option<Self>> {
+    /// unreadable or unparseable one is.
+    pub fn read(path: &Path) -> Result<Option<Self>, String> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Self::parse(&s))),
+            Ok(s) => Self::parse(&s).map(Some).map_err(|e| {
+                format!("Error reading configuration file {}: {e}", path.display())
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         }
     }
 
@@ -344,7 +360,7 @@ mod tests {
     use super::*;
 
     fn resolve_str(cli: &CliConn, body: &str) -> Result<Conn, String> {
-        let conf = ConfFile::parse(body);
+        let conf = ConfFile::parse(body)?;
         resolve(cli, Some(&conf), Path::new("/d"), PathBuf::from("/d/bitcoin.conf"))
     }
 
@@ -489,10 +505,34 @@ mod tests {
 
     #[test]
     fn comments_and_bare_keys() {
-        let body = "# a comment\nregtest\nrpcport=9\nrpcpassword=a#b\n";
+        let body = "# a comment\nregtest\nrpcport=9\nrpcpassword=ab\n";
         let c = resolve_str(&CliConn::default(), body).unwrap();
         assert_eq!((c.chain, c.port), (Chain::Regtest, 9));
-        assert_eq!(c.creds, Creds::UserPass(String::new(), "a#b".into()));
+        assert_eq!(c.creds, Creds::UserPass(String::new(), "ab".into()));
+    }
+
+    /// bitcoin-cli reads the file with Bitcoin Core's GetConfigOptions
+    /// (src/common/config.cpp): a `#` anywhere starts a comment, and the rest
+    /// is trimmed of spaces, tabs, CRs and LFs.
+    #[test]
+    fn an_inline_comment_is_not_part_of_the_value() {
+        let body = "regtest=1 # lab node\n[regtest] # this chain\nrpcport=19000\t# port\n\
+                    rpcuser=u #user\nrpcpassword=p\n";
+        let c = resolve_str(&CliConn::default(), body).unwrap();
+        assert_eq!((c.chain, c.port), (Chain::Regtest, 19000));
+        assert_eq!(c.creds, Creds::UserPass("u".into(), "p".into()));
+    }
+
+    /// Core refuses an `rpcpassword` line holding a `#`, as the daemon does.
+    #[test]
+    fn a_hash_on_an_rpcpassword_line_is_refused() {
+        for body in ["rpcpassword=a#b\n", "rpcuser=u\n[main]\nrpcpassword=p # old\n"] {
+            let err = resolve_str(&CliConn::default(), body).unwrap_err();
+            assert!(
+                err.contains("using # in rpcpassword can be ambiguous and should be avoided"),
+                "{body:?}: {err}"
+            );
+        }
     }
 
     #[test]
