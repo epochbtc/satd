@@ -4,7 +4,8 @@
 //! once under `/scripthash/:hash` for parallel access):
 //!
 //! - `GET /address/:addr`                            → chain + mempool stats
-//! - `GET /address/:addr/txs`                        → up to 50 mempool txs + first 25 confirmed
+//! - `GET /address/:addr/txs[?after_txid=<txid>]`    → up to 50 mempool txs + first 25 confirmed,
+//!   or the history after `after_txid`
 //! - `GET /address/:addr/txs/chain[/:last_seen_txid]` → 25 confirmed per page (newest first)
 //! - `GET /address/:addr/txs/mempool`                → up to 50 mempool txs (no paging)
 //! - `GET /address/:addr/utxo`                       → live UTXOs with status
@@ -21,16 +22,21 @@
 //! handlers still surface a 503 if either turns out disabled at request
 //! time so an operator running a degraded configuration sees a clear
 //! signal rather than partial data.
+//!
+//! Every handler does its index and store reads on the blocking pool
+//! ([`crate::blocking`]): a busy script's history is a long synchronous
+//! read, and the request timeout could not answer before it ended.
 
 use std::collections::{BTreeSet, HashMap};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Network, OutPoint, Txid};
 use node_index::{HistoryEntry, Scripthash, scripthash_of};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::blocking::off_worker;
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::tx::{TxJson, TxStatusJson, build_confirmed_tx_json};
 use crate::state::EsploraState;
@@ -64,6 +70,14 @@ pub struct AddressInfoJson {
     pub mempool_stats: AddressStatsJson,
 }
 
+/// Query string of `/address/:addr/txs` and `/scripthash/:hash/txs`.
+#[derive(Debug, Default, Deserialize)]
+pub struct TxsQuery {
+    /// mempool.space's paging cursor: continue the history after this
+    /// transaction (see `build_combined_txs`).
+    pub after_txid: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct UtxoJson {
     pub txid: String,
@@ -79,15 +93,17 @@ pub async fn address_info(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_address_info(&state, &addr, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &addr, &sh)).await?))
 }
 
 pub async fn address_txs_combined(
     State(state): State<EsploraState>,
     Path(addr): Path<String>,
+    Query(query): Query<TxsQuery>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_combined_txs(&state, &sh)?))
+    let after_txid = parse_after_txid(&query)?;
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
 }
 
 pub async fn address_txs_chain(
@@ -95,7 +111,7 @@ pub async fn address_txs_chain(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_chain_txs(&state, &sh, None)?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
 }
 
 pub async fn address_txs_chain_paged(
@@ -104,7 +120,7 @@ pub async fn address_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(build_chain_txs(&state, &sh, Some(last_seen))?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
 }
 
 pub async fn address_txs_mempool(
@@ -112,7 +128,7 @@ pub async fn address_txs_mempool(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_mempool_txs(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
 }
 
 pub async fn address_utxo(
@@ -120,7 +136,7 @@ pub async fn address_utxo(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(build_utxos(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
 }
 
 // ── Scripthash handlers (parallel set) ─────────────────────────────
@@ -130,15 +146,17 @@ pub async fn scripthash_info(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_address_info(&state, &hash, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &hash, &sh)).await?))
 }
 
 pub async fn scripthash_txs_combined(
     State(state): State<EsploraState>,
     Path(hash): Path<String>,
+    Query(query): Query<TxsQuery>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_combined_txs(&state, &sh)?))
+    let after_txid = parse_after_txid(&query)?;
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
 }
 
 pub async fn scripthash_txs_chain(
@@ -146,7 +164,7 @@ pub async fn scripthash_txs_chain(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_chain_txs(&state, &sh, None)?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
 }
 
 pub async fn scripthash_txs_chain_paged(
@@ -155,7 +173,7 @@ pub async fn scripthash_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(build_chain_txs(&state, &sh, Some(last_seen))?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
 }
 
 pub async fn scripthash_txs_mempool(
@@ -163,7 +181,7 @@ pub async fn scripthash_txs_mempool(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_mempool_txs(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
 }
 
 pub async fn scripthash_utxo(
@@ -171,8 +189,12 @@ pub async fn scripthash_utxo(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(build_utxos(&state, &sh)?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
 }
+
+#[cfg(test)]
+#[path = "address_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 // ── Parsing ────────────────────────────────────────────────────────
 
@@ -205,6 +227,20 @@ fn parse_scripthash(s: &str) -> EsploraResult<Scripthash> {
 fn parse_txid(s: &str) -> EsploraResult<Txid> {
     s.parse::<Txid>()
         .map_err(|e| EsploraError::BadRequest(format!("bad txid: {e}")))
+}
+
+/// `?after_txid=`: absent or empty is no cursor (the first page); anything
+/// else must be a txid, or the request is a 400 like a malformed
+/// `/txs/chain/:last_seen_txid`.
+fn parse_after_txid(query: &TxsQuery) -> EsploraResult<Option<Txid>> {
+    match query.after_txid.as_deref() {
+        None | Some("") => Ok(None),
+        Some(s) => parse_txid(s).map(Some),
+    }
+}
+
+fn after_txid_not_found() -> EsploraError {
+    EsploraError::Unprocessable("after_txid not found".to_string())
 }
 
 // ── Stats / info ───────────────────────────────────────────────────
@@ -295,6 +331,10 @@ fn compute_chain_stats_from_history(history: &[HistoryEntry]) -> AddressStatsJso
         spent_txo_sum,
     }
 }
+
+#[cfg(test)]
+#[path = "address_esplorapaging_tests.rs"]
+mod esplorapaging_tests;
 
 #[cfg(test)]
 mod tests {
@@ -442,37 +482,161 @@ fn build_mempool_stats(state: &EsploraState, sh: &Scripthash) -> AddressStatsJso
 
 // ── Tx pagination ──────────────────────────────────────────────────
 
-/// One distinct confirmed tx touching `sh`, ordered by (height, txid).
-#[derive(Debug, Clone, Copy)]
-struct ConfirmedTxRef {
-    txid: Txid,
-    height: u32,
+/// One page of the script's distinct confirmed transactions, newest first,
+/// starting after `after`; `None` when `after` is not in the confirmed
+/// history. The index reads the page from the cursor down rather than the
+/// whole history (`AddressIndex::confirmed_txs_newest_first`), so walking a
+/// long history page by page costs each request its page, not the history.
+fn confirmed_page(
+    state: &EsploraState,
+    sh: &Scripthash,
+    after: Option<Txid>,
+) -> EsploraResult<Option<Vec<(u32, Txid)>>> {
+    Ok(state
+        .address_index
+        .confirmed_txs_newest_first(sh, after, CONFIRMED_TXS_PAGE)?)
 }
 
-/// Walk the confirmed history once and reduce to the set of distinct
-/// (height, txid) pairs. Returned ascending by `(height, txid)`; callers
-/// reverse for newest-first display.
-fn distinct_confirmed_txs(history: &[HistoryEntry]) -> Vec<ConfirmedTxRef> {
-    let mut seen: BTreeSet<(u32, Txid)> = BTreeSet::new();
-    for entry in history {
-        seen.insert((entry.height(), entry.txid()));
+/// Whether `txid` is in the script's confirmed history. An empty page after
+/// it exists exactly when it is; for a transaction that is not confirmed the
+/// index answers from one ordinal lookup.
+fn in_confirmed_history(
+    state: &EsploraState,
+    sh: &Scripthash,
+    txid: &Txid,
+) -> EsploraResult<bool> {
+    Ok(state
+        .address_index
+        .confirmed_txs_newest_first(sh, Some(*txid), 0)?
+        .is_some())
+}
+
+/// The script's mempool txids in the order this node admitted them (oldest
+/// first), ties broken by txid. Upstream Esplora keeps a script's mempool
+/// history in insertion order and lists it that way. A fixed order is also
+/// what lets an `after_txid` cursor that names a mempool transaction
+/// continue where the previous page stopped: a transaction admitted later
+/// lands after every one already listed. Rows whose transaction has already
+/// left the mempool are dropped.
+///
+/// Only admission times are read here, with no transaction cloned; the
+/// caller fetches the at most 50 transactions it serves.
+fn mempool_txids_in_admission_order(state: &EsploraState, sh: &Scripthash) -> Vec<Txid> {
+    let txids: Vec<Txid> = state
+        .address_index
+        .mempool_history(sh)
+        .into_iter()
+        .map(|e| e.txid)
+        .collect();
+    let mut rows: Vec<(u64, Txid)> = state
+        .mempool
+        .admission_times(&txids)
+        .into_iter()
+        .map(|(txid, time)| (time, txid))
+        .collect();
+    sort_in_admission_order(&mut rows);
+    rows.into_iter().map(|(_, txid)| txid).collect()
+}
+
+/// Admission time ascending, then txid, so the order is total.
+fn sort_in_admission_order(rows: &mut [(u64, Txid)]) {
+    rows.sort_unstable();
+}
+
+/// Drop from the mempool list every transaction the confirmed history
+/// already holds (`is_confirmed`). Between a block connecting and the
+/// mempool dropping its transactions both lists can hold one; it is listed
+/// once, as confirmed, as Blockstream's electrs does (`rest.rs`
+/// `prepare_history`).
+fn without_confirmed(
+    mempool: Vec<Txid>,
+    mut is_confirmed: impl FnMut(&Txid) -> EsploraResult<bool>,
+) -> EsploraResult<Vec<Txid>> {
+    let mut out = Vec::with_capacity(mempool.len());
+    for txid in mempool {
+        if !is_confirmed(&txid)? {
+            out.push(txid);
+        }
     }
-    seen.into_iter()
-        .map(|(height, txid)| ConfirmedTxRef { txid, height })
-        .collect()
+    Ok(out)
+}
+
+/// Where an `after_txid` cursor continues the combined `/txs` history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterTxid {
+    /// The cursor is one of the script's mempool transactions: continue with
+    /// the mempool transactions from this index, then the confirmed history
+    /// from its start.
+    Mempool(usize),
+    /// The cursor is confirmed: this is the confirmed page after it.
+    Confirmed(Vec<(u32, Txid)>),
+}
+
+/// Find `cursor` in the script's confirmed history (`confirmed_after` reads
+/// the page after it, `None` when it is not there) or else in its mempool
+/// list (in `/txs` order). The confirmed history is searched first: a
+/// transaction in both has confirmed, and continuing in the mempool list
+/// would restart the confirmed history at its newest entry, the cursor
+/// itself. `None` when it is in neither, which `/txs` answers with 422
+/// `after_txid not found`.
+fn locate_after_txid(
+    mempool: &[Txid],
+    cursor: &Txid,
+    confirmed_after: impl FnOnce(&Txid) -> EsploraResult<Option<Vec<(u32, Txid)>>>,
+) -> EsploraResult<Option<AfterTxid>> {
+    if let Some(page) = confirmed_after(cursor)? {
+        return Ok(Some(AfterTxid::Confirmed(page)));
+    }
+    Ok(mempool
+        .iter()
+        .position(|t| t == cursor)
+        .map(|i| AfterTxid::Mempool(i + 1)))
 }
 
 /// `/address/:addr/txs` and `/scripthash/:hash/txs` — combined: up to 50
-/// mempool txs (newest first by mempool-touched order, which is the
-/// HashSet iteration order — Esplora's contract is "up to 50", not a
-/// strict ordering, but we prefer a stable order for clients). Followed
-/// by the first 25 confirmed (newest first).
+/// mempool txs (admission order, see `mempool_txids_in_admission_order`)
+/// followed by the first 25 confirmed (newest first).
+///
+/// `after_txid` (`?after_txid=`, mempool.space's "load more" cursor)
+/// continues after a transaction of an earlier page, as mempool.space's
+/// electrs does (`rest.rs`, the `address/:addr/txs` route): after a confirmed
+/// transaction come the next 25 confirmed, the same page
+/// `/txs/chain/:last_seen_txid` returns; after a mempool transaction come the
+/// mempool transactions that follow it, then the first 25 confirmed. A cursor
+/// that is in neither list is 422 `after_txid not found`. Ignoring the cursor
+/// would hand a client paging this way its first page again on every request.
 fn build_combined_txs(
     state: &EsploraState,
     sh: &Scripthash,
+    after_txid: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
-    let mut out = build_mempool_txs(state, sh)?;
-    out.extend(build_chain_txs(state, sh, None)?);
+    // Mempool first, then the confirmed history: a transaction that
+    // confirms between the two reads is still in at least one of them.
+    let mempool = mempool_txids_in_admission_order(state, sh);
+    let mempool = without_confirmed(mempool, |txid| in_confirmed_history(state, sh, txid))?;
+    let mempool_from = match after_txid {
+        None => 0,
+        Some(cursor) => {
+            match locate_after_txid(&mempool, &cursor, |c| confirmed_page(state, sh, Some(*c)))? {
+                Some(AfterTxid::Mempool(i)) => i,
+                Some(AfterTxid::Confirmed(page)) => return render_confirmed_txs(state, &page),
+                None => return Err(after_txid_not_found()),
+            }
+        }
+    };
+    let end = mempool_from
+        .saturating_add(MEMPOOL_TXS_LIMIT)
+        .min(mempool.len());
+    // The confirmed page is read after the membership checks above, so a
+    // transaction that confirmed in between is on it: drop it from the
+    // mempool part too, so it is listed once, as confirmed.
+    let page = confirmed_page(state, sh, None)?.unwrap_or_default();
+    let on_page: std::collections::HashSet<Txid> = page.iter().map(|(_, t)| *t).collect();
+    let served = without_confirmed(mempool[mempool_from..end].to_vec(), |t| {
+        Ok(on_page.contains(t))
+    })?;
+    let mut out = render_mempool_txs(state, &served)?;
+    out.extend(render_confirmed_txs(state, &page)?);
     Ok(out)
 }
 
@@ -488,55 +652,49 @@ fn build_chain_txs(
     sh: &Scripthash,
     last_seen: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
-    let history = state.address_index.confirmed_history(sh)?;
-    let mut txs = distinct_confirmed_txs(&history);
-    txs.reverse(); // newest first
+    match confirmed_page(state, sh, last_seen)? {
+        Some(page) => render_confirmed_txs(state, &page),
+        None => Ok(Vec::new()),
+    }
+}
 
-    let start = match last_seen {
-        None => 0,
-        Some(tx) => match txs.iter().position(|t| t.txid == tx) {
-            Some(p) => p + 1,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let end = start
-        .saturating_add(CONFIRMED_TXS_PAGE)
-        .min(txs.len());
-
-    let page = &txs[start..end];
+/// Render confirmed `(height, txid)` transactions in full Esplora shape.
+fn render_confirmed_txs(
+    state: &EsploraState,
+    page: &[(u32, Txid)],
+) -> EsploraResult<Vec<TxJson>> {
     let mut out = Vec::with_capacity(page.len());
-    for t in page {
+    for (height, txid) in page {
         // Render full Esplora-shape tx JSON. Requires txindex (to find
         // the containing block); if disabled, surface as 503 — see
         // module-level note. The reconciliation in `satd/src/config.rs`
         // auto-enables txindex when esplora is on, so this is a defense
         // against operator overrides that won't normally fire.
-        let json = build_confirmed_tx_json(state, &t.txid, t.height)?;
+        let json = build_confirmed_tx_json(state, txid, *height)?;
         out.push(json);
     }
     Ok(out)
 }
 
-/// `/address/:addr/txs/mempool` — up to 50 mempool txs, no paging. The
-/// upstream contract doesn't pin a specific ordering; we return the
-/// HashSet iteration order trimmed to the cap. Clients that need
-/// strict ordering should call `/txs/chain` after a confirmation.
+/// `/address/:addr/txs/mempool` — up to 50 mempool txs, no paging, in the
+/// order this node admitted them (see `mempool_txids_in_admission_order`).
 fn build_mempool_txs(
     state: &EsploraState,
     sh: &Scripthash,
 ) -> EsploraResult<Vec<TxJson>> {
-    let mut entries = state.address_index.mempool_history(sh);
-    if entries.len() > MEMPOOL_TXS_LIMIT {
-        entries.truncate(MEMPOOL_TXS_LIMIT);
-    }
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        if let Some(entry) = state.mempool.get(&e.txid) {
-            // Mempool tx → no ConfirmedLocation; rendered with
-            // `confirmed: false`. We re-use the lower-level builder
-            // exposed by tx.rs.
-            let json = crate::handlers::tx::build_mempool_tx_json(state, &entry.tx)?;
-            out.push(json);
+    let mut txids = mempool_txids_in_admission_order(state, sh);
+    txids.truncate(MEMPOOL_TXS_LIMIT);
+    render_mempool_txs(state, &txids)
+}
+
+/// Render mempool transactions: no ConfirmedLocation, so each comes out
+/// with `confirmed: false`. Only these are fetched (cloned) from the pool;
+/// one that left it since its txid was listed is skipped.
+fn render_mempool_txs(state: &EsploraState, txids: &[Txid]) -> EsploraResult<Vec<TxJson>> {
+    let mut out = Vec::with_capacity(txids.len());
+    for txid in txids {
+        if let Some(entry) = state.mempool.get(txid) {
+            out.push(crate::handlers::tx::build_mempool_tx_json(state, &entry.tx)?);
         }
     }
     Ok(out)

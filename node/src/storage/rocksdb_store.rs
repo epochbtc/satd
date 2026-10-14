@@ -335,6 +335,42 @@ pub(crate) fn resolve_funding_rows_for(
     out
 }
 
+/// The address row under a reverse cursor of `addr_funding_v3` or
+/// `addr_spending_v3`, or `None` once the cursor has left `prefix` or the
+/// family. A read error ends the walk the same way, and is logged.
+fn addr_row_at(
+    it: &rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
+    prefix: &[u8],
+    spending: bool,
+) -> Option<crate::storage::AddrRowKey> {
+    if !it.valid() {
+        if let Err(e) = it.status() {
+            tracing::error!(
+                target: "storage",
+                error = %e,
+                "address-history reverse scan failed; the history page ends here"
+            );
+        }
+        return None;
+    }
+    let key = it.key()?;
+    if key.len() != crate::index::address::KEY_LEN_V3 || &key[..prefix.len()] != prefix {
+        return None;
+    }
+    let (txseq, index) = if spending {
+        let p = crate::index::address::decode_spending_key_v3(key)?;
+        (p.txseq, p.vin)
+    } else {
+        let p = crate::index::address::decode_funding_key_v3(key)?;
+        (p.txseq, p.vout)
+    };
+    Some(crate::storage::AddrRowKey {
+        txseq,
+        spending,
+        index,
+    })
+}
+
 /// Resolve raw v3 spending rows into the public `(AddrSpendingKey,
 /// prev_outpoint)` shape and put them in the documented
 /// `(height, txid, vin)` order.
@@ -456,6 +492,71 @@ fn backfill_temp_key(op: &OutPoint) -> [u8; 36] {
 }
 
 type DB = DBWithThreadMode<MultiThreaded>;
+
+/// One coin read from the coins column family.
+///
+/// `None` means the outpoint has no row: the coin was never created, or it
+/// has been spent. `connect_block` takes that as a verdict on a block that
+/// spends it (`bad-txns-inputs-missingorspent`), and `accept_block` and the
+/// reorg path record the block as invalid. A read that failed, or a row that
+/// does not decode, says nothing about the coin, so neither comes back as
+/// `None`: the node stops ([`stop_on_unreadable_coin`]).
+fn coin_from_read<V: AsRef<[u8]>, E: std::fmt::Display>(
+    read: Result<Option<V>, E>,
+    outpoint: &OutPoint,
+) -> Option<Coin> {
+    let row = match read {
+        Ok(row) => row?,
+        Err(e) => stop_on_unreadable_coin(outpoint, &e),
+    };
+    let row = row.as_ref();
+    match Coin::deserialize_compact(row) {
+        Some(coin) => Some(coin),
+        // A row in a layout this binary does not read is refused by the
+        // schema check at open, so one that gets here is damage.
+        None => stop_on_unreadable_coin(
+            outpoint,
+            &format!("the {}-byte row does not decode as a coin", row.len()),
+        ),
+    }
+}
+
+/// Stop the node on a coin the database could not read, as Bitcoin Core
+/// does.
+///
+/// Core reads its coins through `CCoinsViewErrorCatcher`, which logs
+/// "Error reading from database" and calls `std::abort()` on any read error
+/// (`coins.cpp:398-412`). Its reason: returning to the caller "would be
+/// interpreted as 'entry not found' (as opposed to unable to read data), and
+/// could lead to invalid interpretation". Here that interpretation is a
+/// verdict: a valid block that spends the coin would be refused and recorded
+/// as invalid, and the record outlives a restart.
+///
+/// `abort()`, as in Core, and as satd's other fail-stops do: no shutdown
+/// flush runs. The chainstate on disk is the one the last flush left, and
+/// the next start replays the blocks after it from the block files, as after
+/// any crash.
+fn stop_on_unreadable_coin(outpoint: &OutPoint, error: &dyn std::fmt::Display) -> ! {
+    tracing::error!(
+        %outpoint,
+        %error,
+        "Error reading from database, shutting down: a coin in the chainstate \
+         could not be read. Stopping without flushing. If this happens again \
+         after a restart, check the disk; -reindex-chainstate rebuilds the \
+         chainstate from the block files."
+    );
+    eprintln!(
+        "Error reading from database, shutting down: coin {outpoint}: {error}. \
+         If this happens again after a restart, check the disk; \
+         -reindex-chainstate rebuilds the chainstate from the block files."
+    );
+    // A test build panics instead, so a test can reach this without taking
+    // the harness down with it.
+    #[cfg(test)]
+    panic!("Error reading from database: coin {outpoint}: {error}");
+    #[cfg(not(test))]
+    std::process::abort()
+}
 
 /// Where the recent-height window stands. Held under
 /// [`RocksDbStore::recent_window`].
@@ -2414,23 +2515,16 @@ impl Store for RocksDbStore {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
-        let value = self.db.get_cf(&cf, key).ok()??;
-        let coin = Coin::deserialize_compact(&value);
-        if coin.is_none() {
-            tracing::error!(
-                "corrupt coin: failed to deserialize {} bytes for {}:{}",
-                value.len(),
-                outpoint.txid,
-                outpoint.vout
-            );
-        }
-        coin
+        coin_from_read(self.db.get_cf(&cf, key), outpoint)
     }
 
     fn has_coin(&self, outpoint: &OutPoint) -> bool {
         let cf = self.cf(CF_COINS);
         let key = outpoint_to_key(outpoint);
-        matches!(self.db.get_pinned_cf(&cf, key), Ok(Some(_)))
+        match self.db.get_pinned_cf(&cf, key) {
+            Ok(row) => row.is_some(),
+            Err(e) => stop_on_unreadable_coin(outpoint, &e),
+        }
     }
 
     fn get_tip(&self) -> Option<BlockHash> {
@@ -2900,21 +2994,8 @@ impl Store for RocksDbStore {
         self.db
             .multi_get_cf(cf_keys)
             .into_iter()
-            .enumerate()
-            .map(|(i, result)| {
-                result.ok().flatten().and_then(|v| {
-                    let coin = Coin::deserialize_compact(&v);
-                    if coin.is_none() {
-                        tracing::error!(
-                            "corrupt coin: failed to deserialize {} bytes for {}:{}",
-                            v.len(),
-                            outpoints[i].txid,
-                            outpoints[i].vout
-                        );
-                    }
-                    coin
-                })
-            })
+            .zip(outpoints)
+            .map(|(read, outpoint)| coin_from_read(read, outpoint))
             .collect()
     }
 
@@ -3079,6 +3160,80 @@ impl Store for RocksDbStore {
             raw.push((payload.txseq, payload.vin, funding_txseq, funding_vout));
         }
         resolve_spending_rows_for(self, sh, raw)
+    }
+
+    fn addr_rows_desc(
+        &self,
+        sh: &crate::index::address::Scripthash,
+        below: Option<u64>,
+        min_txs: usize,
+    ) -> crate::storage::AddrRowsDesc {
+        use crate::storage::{AddrRowKey, AddrRowsDesc};
+        use node_index::{KEY_LEN_V3, SCRIPTHASH_PREFIX_LEN, TXSEQ_LEN, TXSEQ_MAX};
+
+        let top = match below {
+            Some(0) => return AddrRowsDesc::default(),
+            Some(b) => (b - 1).min(TXSEQ_MAX),
+            None => TXSEQ_MAX,
+        };
+        let prefix = &sh[..SCRIPTHASH_PREFIX_LEN];
+        // The largest key an ordinal of `top` or less can have: the
+        // prefix, `top`, and an all-ones output index.
+        let mut target = [0xFFu8; KEY_LEN_V3];
+        target[..SCRIPTHASH_PREFIX_LEN].copy_from_slice(prefix);
+        target[SCRIPTHASH_PREFIX_LEN..SCRIPTHASH_PREFIX_LEN + TXSEQ_LEN]
+            .copy_from_slice(&node_index::encode_txseq(TxSeq(top)));
+
+        // Both families carry a 16-byte prefix extractor. The walk runs in
+        // total order rather than relying on prefix-mode seek semantics
+        // for a reverse scan, and checks the prefix on every key itself.
+        let funding_cf = self.cf(CF_ADDR_FUNDING_V3);
+        let spending_cf = self.cf(CF_ADDR_SPENDING_V3);
+        let reverse_from = |cf: &Arc<BoundColumnFamily<'_>>| {
+            let mut opts = rocksdb::ReadOptions::default();
+            opts.set_total_order_seek(true);
+            let mut it = self.db.raw_iterator_cf_opt(cf, opts);
+            it.seek_for_prev(target);
+            it
+        };
+        let mut cursors = [
+            (reverse_from(&funding_cf), false),
+            (reverse_from(&spending_cf), true),
+        ];
+
+        // Merge the two families newest first, stopping at the first
+        // ordinal past `min_txs` so no transaction's rows are split.
+        let mut rows: Vec<AddrRowKey> = Vec::new();
+        let mut seen = 0usize;
+        let mut last: Option<u64> = None;
+        loop {
+            let mut next: Option<(usize, AddrRowKey)> = None;
+            for (i, (it, spending)) in cursors.iter().enumerate() {
+                if let Some(row) = addr_row_at(it, prefix, *spending)
+                    && next.is_none_or(|(_, newest)| row > newest)
+                {
+                    next = Some((i, row));
+                }
+            }
+            let Some((i, row)) = next else {
+                return AddrRowsDesc {
+                    rows,
+                    next_below: None,
+                };
+            };
+            if last != Some(row.txseq) {
+                if seen >= min_txs.max(1) {
+                    return AddrRowsDesc {
+                        rows,
+                        next_below: last,
+                    };
+                }
+                seen += 1;
+                last = Some(row.txseq);
+            }
+            rows.push(row);
+            cursors[i].0.prev();
+        }
     }
 
     fn spent_complete(&self) -> bool {
@@ -3699,6 +3854,14 @@ impl Store for RocksDbStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "rocksdb_store_storefault_tests.rs"]
+mod storefault_tests;
+
+#[cfg(test)]
+#[path = "rocksdb_store_electrumbounds_tests.rs"]
+mod electrumbounds_tests;
 
 #[cfg(test)]
 mod tests {

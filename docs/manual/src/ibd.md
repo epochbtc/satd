@@ -17,7 +17,11 @@ pipeline that keeps the network, the disk, and the CPU busy at the same time.
 - **Parallel block download.** satd fetches blocks from many peers at once, the
   way BitTorrent downloads pieces from a swarm. Download throughput scales with
   aggregate peer bandwidth instead of one peer's round-trip time. `-maxahead`
-  bounds how far ahead of the connect tip downloaded blocks may be staged.
+  bounds how far ahead of the connect tip downloaded blocks may be staged. The
+  256 blocks just above the connect tip are always fetched, even with the
+  window full, so the block the connector needs next is never held back by it.
+  As in Bitcoin Core, blocks are asked only of peers that advertise
+  `NODE_NETWORK`, or `NODE_NETWORK_LIMITED` for blocks within 286 of their tip.
 - **Background prefetch workers.** `-prefetchworkers` threads pre-read blocks
   from the flat files without holding the chainstate lock. They deserialize
   each block, compute txids, run the context-free transaction validation, and
@@ -381,6 +385,23 @@ On an AssumeUTXO node the history below the snapshot base is legitimately
 unvalidated until the background chainstate reaches it. That is recognised and
 logged at `INFO`, not treated as damage.
 
+### A coin the database cannot read
+
+If RocksDB cannot read a coin from the chainstate (an I/O error or a checksum
+mismatch), or a coin's row does not decode, satd stops at once, as Bitcoin Core
+does. This holds wherever a coin is looked up: block connection, the mempool,
+`gettxout`, the Electrum and Esplora lookups, and the offline
+`satd-chainstate-audit` below. The log and stderr say `Error reading from
+database, shutting down`, with the outpoint and the error. satd does not carry
+on as if the coin were spent: that would refuse a valid block that spends it,
+and record the block as invalid across restarts.
+
+The stop is an `abort()` (the process ends with `SIGABRT`), so no shutdown
+flush runs. The next start replays the blocks after the last flush from the
+block files, as after any crash. If the error comes back after a restart, the
+disk or the datadir is damaged: check the disk, then rebuild the UTXO set with
+`-reindex-chainstate`, or audit a copy of the datadir first (below).
+
 ### Auditing a suspect datadir offline
 
 `satd-chainstate-audit` answers the question the startup checks cannot afford
@@ -411,7 +432,10 @@ Note also that it is not included in the release tarballs or the Docker image;
 build it from source (`cargo build --release --bin satd-chainstate-audit`).
 
 Exit status is `0` when consistent, `1` when it could not run, `2` when it found
-inconsistencies, so it scripts cleanly.
+inconsistencies, so it scripts cleanly. A coin the database cannot read stops
+the tool as it stops the node (see above): it prints `Error reading from
+database` with the outpoint and the RocksDB error, which names the damaged
+file, and ends with `SIGABRT` before any report.
 
 It diagnoses and does not repair. A missing coin is recoverable only by
 replaying the block that created it: `-reindex-chainstate`, or

@@ -69,10 +69,20 @@ impl LogReloadHandle {
 /// [`SharedWebhook`] so a SIGHUP reload can change the URL/secret — or turn the
 /// webhook on/off — without restarting the dispatcher task. `None` means "no
 /// webhook configured"; the dispatcher then drains and drops records.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebhookTarget {
     pub url: String,
     pub secret: Option<String>,
+}
+
+/// `secret` is the webhook's HMAC key; `Debug` says only whether one is set.
+impl std::fmt::Debug for WebhookTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookTarget")
+            .field("url", &self.url)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Shared, reloadable reorg-webhook target. The dispatcher (spawned once at

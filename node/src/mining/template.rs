@@ -293,8 +293,8 @@ fn assemble_template(
     // `check_difficulty` compares a received block against, so a template is
     // valid at a retarget boundary. On testnet3/testnet4 the answer depends on
     // the timestamp (the 20-minute minimum-difficulty rule), which is why it
-    // is computed after `cur_time` is fixed. The height index is the active
-    // chain, and the tip is on it, so its rows are this template's ancestors.
+    // is computed after `cur_time` is fixed. Ancestors are found through the
+    // tip's parent links.
     //
     // A failure means an ancestor the node should hold is missing. Reusing
     // the tip's bits keeps the template well-formed; the block it yields is
@@ -303,7 +303,6 @@ fn assemble_template(
         chain_state.network,
         &tip_entry,
         cur_time,
-        |h| chain_state.get_block_index(&chain_state.get_block_hash_by_height(h)?),
         |hash| chain_state.get_block_index(hash),
     )
     .unwrap_or_else(|e| {

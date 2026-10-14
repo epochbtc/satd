@@ -263,6 +263,9 @@ pub struct PeerInfo {
     /// lazily, on the first addr-related message the peer sends, so a peer
     /// that never participates in addr relay is never counted as doing so.
     pub addr_relay_enabled: bool,
+    /// The rate limit on the addresses this peer announces, and its
+    /// `getpeerinfo` counters: Core's address token bucket.
+    pub addr_rate: crate::net::addr_rate::AddrTokenBucket,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
     pub fee_filter: u64,
     pub conn_time: SystemTime,
@@ -276,6 +279,11 @@ pub struct PeerInfo {
     /// dedup, getpeerinfo, and addrman can distinguish onion peers. `None`
     /// for clearnet and inbound peers.
     pub onion_host: Option<String>,
+    /// The peer came in on the listener a Tor hidden service forwards to
+    /// (`-bind=…=onion`): Core's `CNode::m_inbound_onion`. Its socket address
+    /// is the one Tor dialled from, usually loopback, and says nothing about
+    /// the peer.
+    pub inbound_onion: bool,
     /// The local socket address this connection is bound to
     /// (`getsockname()`), behind `getpeerinfo`'s `addrbind`. `None` until the
     /// socket exists, and for onion peers, whose local end belongs to the
@@ -325,11 +333,13 @@ impl PeerInfo {
             wants_addrv2: false,
             wtxid_relay: false,
             addr_relay_enabled: false,
+            addr_rate: crate::net::addr_rate::AddrTokenBucket::new(crate::time::now_micros()),
             fee_filter: 0,
             conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
+            inbound_onion: false,
             conn_type: match direction {
                 Direction::Inbound => ConnType::Inbound,
                 Direction::Outbound => ConnType::OutboundFullRelay,
@@ -338,9 +348,13 @@ impl PeerInfo {
     }
 
     /// Update peer info after receiving their version message.
-    pub fn set_version(&mut self, version: VersionMessage) {
+    pub fn set_version(&mut self, mut version: VersionMessage) {
         self.services = version.services;
         self.best_height = version.start_height;
+        // Core keeps the user agent only as `SanitizeString(strSubVer)`
+        // (`cleanSubVer`): it is logged and reported in `getpeerinfo.subver`,
+        // and the raw string can carry line breaks and escape sequences.
+        version.user_agent = crate::net::limits::sanitize_string(&version.user_agent);
         self.user_agent = version.user_agent.clone();
         // The peer's own `fRelay` is kept on the stored `version` message;
         // `relays_txs()` is the answer to "do *we* relay to them", which
@@ -354,6 +368,20 @@ impl PeerInfo {
     /// collect addresses and dropped straight afterwards.
     pub fn serves_blocks(&self) -> bool {
         self.conn_type != ConnType::AddrFetch
+    }
+
+    /// Whether the peer's services say it can serve blocks at all: Core's
+    /// `CanServeBlocks` (`net_processing.cpp:1152-1155`), NODE_NETWORK or
+    /// NODE_NETWORK_LIMITED. A light client sets neither.
+    pub fn advertises_blocks(&self) -> bool {
+        self.services.has(ServiceFlags::NETWORK) || self.services.has(ServiceFlags::NETWORK_LIMITED)
+    }
+
+    /// Whether the peer serves only recent blocks: Core's `IsLimitedPeer`
+    /// (`net_processing.cpp:1159-1163`), NODE_NETWORK_LIMITED without
+    /// NODE_NETWORK.
+    pub fn is_limited(&self) -> bool {
+        !self.services.has(ServiceFlags::NETWORK) && self.services.has(ServiceFlags::NETWORK_LIMITED)
     }
 
     /// Whether this peer participates in tx relay — the BIP 37 `fRelay`
@@ -418,9 +446,10 @@ impl PeerInfo {
             .as_secs();
 
         let addr_str = self.addr_string();
-        // Derive the peer's network from its address.
-        let network = if let Some(ref onion) = self.onion_host {
-            let _ = onion; // suppress unused
+        // Derive the peer's network from its address. A peer that came in on
+        // the onion listener is on the onion network whatever address Tor
+        // dialled from: Core's `ConnectedThroughNetwork` (`net.cpp`).
+        let network = if self.onion_host.is_some() || self.inbound_onion {
             "onion"
         } else if !crate::net::is_routable(self.addr.ip()) {
             "not_publicly_routable"
@@ -492,8 +521,8 @@ impl PeerInfo {
             // permissions granted", not "not implemented", which is the
             // opposite claim for a `-whitelist`ed peer.
             "permissions": self.permissions.to_strings(),
-            "addr_processed": 0,
-            "addr_rate_limited": 0,
+            "addr_processed": self.addr_rate.processed,
+            "addr_rate_limited": self.addr_rate.rate_limited,
             // Core withholds address relay from block-relay-only peers --
             // that is the whole point of the connection type. For everyone
             // else this is latched by `SetupAddressRelay`, not derived from

@@ -293,6 +293,18 @@ fn case_accept_genesis() -> Satd {
 }
 
 fn case_empty_block() -> Satd {
+    // feature_block.py b46: `vtx = []` with `hashMerkleRoot = 0`. The empty
+    // list's merkle root is all-zero, so the header matches it and the block
+    // reaches the size limits. Against any other root it is `bad-txnmrklroot`.
+    let mut b = bitcoin::constants::genesis_block(Network::Regtest);
+    b.txdata.clear();
+    b.header.merkle_root = TxMerkleNode::all_zeros();
+    cb(&b)
+}
+
+fn case_empty_block_under_real_merkle_root() -> Satd {
+    // The same empty body sent for a real header: Core's `CheckMerkleRoot`
+    // runs before the size limits, so this is `bad-txnmrklroot`.
     let mut b = bitcoin::constants::genesis_block(Network::Regtest);
     b.txdata.clear();
     cb(&b)
@@ -592,7 +604,7 @@ fn case_bad_diffbits() -> Satd {
     let prev = block_index_entry(0, BASE_TIME, REGTEST_POWLIMIT_BITS);
     let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
     header.bits = CompactTarget::from_consensus(0x1d00_ffff); // wrong for regtest
-    check_difficulty(&header, &prev, Network::Regtest, |_| None, |_| None).map_err(|e| e.to_string())
+    check_difficulty(&header, &prev, Network::Regtest, |_| None).map_err(|e| e.to_string())
 }
 
 fn case_time_too_old_mtp() -> Satd {
@@ -720,6 +732,7 @@ fn cases() -> Vec<Case> {
         // context-free block structure
         Case { name: "accept_genesis", core: Accept, expect: Match, run: case_accept_genesis },
         Case { name: "empty_block", core: Reject("bad-blk-length"), expect: Match, run: case_empty_block },
+        Case { name: "empty_block_under_real_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_empty_block_under_real_merkle_root },
         Case { name: "first_tx_not_coinbase", core: Reject("bad-cb-missing"), expect: Match, run: case_first_tx_not_coinbase },
         Case { name: "multiple_coinbase", core: Reject("bad-cb-multiple"), expect: Match, run: case_multiple_coinbase },
         Case { name: "bad_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_bad_merkle_root },

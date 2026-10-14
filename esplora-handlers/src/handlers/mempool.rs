@@ -10,7 +10,8 @@
 //! Wire shapes match upstream Esplora: `/mempool`'s `fee_histogram` is
 //! an array of `[feerate_sat_vb, vsize]` pairs, descending by feerate;
 //! `/fee-estimates` is an object whose keys are target strings and
-//! values are floating-point sat/vB. `/` is a small JSON envelope
+//! values are floating-point sat/vB, listing only the targets the node
+//! has an estimate for. `/` is a small JSON envelope
 //! (chain tip + mempool count) that mirrors blockstream.info's root.
 
 use std::collections::HashMap;
@@ -23,9 +24,10 @@ use serde_json::Value;
 use crate::error::EsploraResult;
 use crate::state::EsploraState;
 
-/// Confirmation targets exposed by `/fee-estimates`. Matches upstream
-/// Esplora; downstream consumers (BDK, mempool.space SDK) iterate this
-/// exact set so adding/removing keys is a wire-level break.
+/// Confirmation targets `/fee-estimates` answers for. Matches upstream
+/// Esplora. A target without an estimate is left out of the answer, as
+/// upstream leaves out a target bitcoind cannot estimate; adding a target
+/// to this set is still a wire-level change.
 const FEE_TARGETS: &[u32] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 144,
     504, 1008,
@@ -183,14 +185,36 @@ pub async fn fee_estimates(
         node::mempool::estimate::EstimateMode::Blend,
         floor_sat_per_kvb,
     );
+    Ok(Json(Value::Object(fee_estimates_map(&sf))))
+}
+
+/// The `/fee-estimates` object: target → sat/vB, for every target the node
+/// has an estimate for.
+///
+/// In blend mode a `Confidence::Low` target is exactly one with no estimate:
+/// the mempool simulation had nothing at that depth and there is no
+/// confirmed-block fee history, so `resolve_target` fell back to the relay
+/// floor. That is the state of a node in IBD or just started, and reporting
+/// the floor there tells a wallet the relay minimum will do for every target
+/// when the node knows nothing. Upstream Esplora leaves out a target
+/// bitcoind cannot estimate (`estimatesmartfee` errors) and answers `{}`
+/// when it can estimate none; satd does the same. Without fee history the
+/// floored targets are the deepest ones, so the monotone clamp never
+/// carried a floor into a target that is kept.
+fn fee_estimates_map(
+    sf: &node::mempool::estimate::SmartFees,
+) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::with_capacity(sf.targets.len());
     for tf in &sf.targets {
+        if tf.confidence == node::mempool::estimate::Confidence::Low {
+            continue;
+        }
         out.insert(
             tf.target.to_string(),
             Value::from(tf.feerate_sat_per_kvb as f64 / 1000.0),
         );
     }
-    Ok(Json(Value::Object(out)))
+    out
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -234,6 +258,10 @@ fn build_fee_histogram(tx_rates: &[(f64, u64)]) -> Vec<(f64, u64)> {
     out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
+
+#[cfg(test)]
+#[path = "mempool_esplorapaging_tests.rs"]
+mod esplorapaging_tests;
 
 #[cfg(test)]
 mod tests {
