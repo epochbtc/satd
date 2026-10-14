@@ -27,8 +27,13 @@ pub struct BlockIndexEntry {
 
 /// Compute the work represented by a single block with the given target bits.
 /// Returns 2^256 / (target + 1) as a big-endian [u8; 32].
+///
+/// Core's `GetBitsProof` (`chain.cpp:121-134`): no work at all for bits that
+/// encode a negative, overflowing or zero target.
 pub fn work_for_bits(bits: CompactTarget) -> [u8; 32] {
-    let target = target_from_compact(bits);
+    let Some(target) = target_with_work(bits) else {
+        return [0u8; 32];
+    };
 
     // work = (2^256 - target - 1) / (target + 1) + 1
     // which equals floor(2^256 / (target + 1))
@@ -42,7 +47,42 @@ pub fn work_for_bits(bits: CompactTarget) -> [u8; 32] {
     div_2_256_by(&target_plus_one)
 }
 
-/// Add two big-endian U256 values.
+/// The target `bits` encodes, decoded as Core's `arith_uint256::SetCompact`
+/// (`arith_uint256.cpp:176-194`) decodes it, or `None` where `GetBitsProof`
+/// counts no work: a negative target, an overflowing one, or zero.
+///
+/// For every exponent up to 32 with a positive mantissa (every target a
+/// header can meet) this is [`target_from_compact`]'s value; they part only
+/// on encodings no header's proof of work meets.
+fn target_with_work(bits: CompactTarget) -> Option<[u8; 32]> {
+    let compact = bits.to_consensus();
+    let size = compact >> 24;
+    let mut word = compact & 0x007f_ffff;
+    let mut target = [0u8; 32];
+    if size <= 3 {
+        word >>= 8 * (3 - size);
+        target[28..].copy_from_slice(&word.to_be_bytes());
+    } else {
+        // `word << 8 * (size - 3)`, keeping the low 256 bits: byte `i` of the
+        // big-endian word lands at big-endian position `31 - (size - i)`.
+        for (i, byte) in word.to_be_bytes().into_iter().enumerate() {
+            if let Some(pos) = (31 + i).checked_sub(size as usize) {
+                target[pos] = byte;
+            }
+        }
+    }
+    let negative = word != 0 && compact & 0x0080_0000 != 0;
+    let overflow =
+        word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+    (!negative && !overflow && target != [0u8; 32]).then_some(target)
+}
+
+/// Add two big-endian U256 values, saturating at 2^256 - 1.
+///
+/// Chainwork is a sum of these, and a sum that wrapped would rank the chain
+/// with the most work below every other. Core's `arith_uint256` wraps, but its
+/// sums cannot get near 2^256: no block's proof of work meets a target small
+/// enough to be worth that much. Saturating keeps the order if one ever did.
 pub fn add_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut result = [0u8; 32];
     let mut carry: u16 = 0;
@@ -50,6 +90,9 @@ pub fn add_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         let sum = a[i] as u16 + b[i] as u16 + carry;
         result[i] = sum as u8;
         carry = sum >> 8;
+    }
+    if carry != 0 {
+        return [0xff; 32];
     }
     result
 }
@@ -388,6 +431,10 @@ mod header_serde {
 }
 
 #[cfg(test)]
+#[path = "blockindex_consharden_tests.rs"]
+mod consharden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -462,8 +509,11 @@ mod tests {
         let mut b = [0u8; 32];
         b[31] = 0x01;
         let result = add_u256(&a, &b);
-        // All-0xFF + 1 should wrap to all-0x00 (overflow wraps)
-        assert_eq!(result, [0u8; 32]);
+        // All-0xFF + 1 saturates: a chainwork sum never wraps below its parts.
+        assert_eq!(result, [0xFFu8; 32]);
+        let mut half = [0u8; 32];
+        half[0] = 0x80;
+        assert_eq!(add_u256(&half, &half), [0xFFu8; 32]);
     }
 
     #[test]
