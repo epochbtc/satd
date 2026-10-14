@@ -15,10 +15,15 @@
 //! sequential requests above the background connect cursor is sufficient.
 //! Robustness against a peer that accepts a `getdata` but never delivers
 //! comes from a stale-request timeout that returns the height to the
-//! request pool on the next pass.
+//! request pool on the next pass, and from releasing a height the peer
+//! answers with `notfound`. Each peer has at most a fixed number of heights
+//! outstanding, as Core caps `MAX_BLOCKS_IN_TRANSIT_PER_PEER`, and a released
+//! height goes to a different peer when there is one.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use bitcoin::BlockHash;
 
 use crate::net::peer::PeerId;
 
@@ -37,6 +42,13 @@ pub struct BgDownloader {
     /// A request older than this is assumed lost and becomes eligible for
     /// re-request (to a possibly different peer) on the next pass.
     stale_after: Duration,
+    /// The peer a released height was last asked of (timed out or answered
+    /// `notfound`). The next pass gives the height to someone else when it
+    /// can, rather than back to the peer that did not deliver it.
+    released_from: HashMap<u32, PeerId>,
+    /// Where the next pass starts its round-robin over the peer list, so the
+    /// lowest needed height does not go to the same peer every pass.
+    next_start: usize,
 }
 
 impl BgDownloader {
@@ -45,12 +57,28 @@ impl BgDownloader {
             in_flight: HashMap::new(),
             window: window.max(1),
             stale_after,
+            released_from: HashMap::new(),
+            next_start: 0,
         }
     }
 
     /// A height's data was stored — it no longer needs requesting.
     pub fn note_stored(&mut self, height: u32) {
         self.in_flight.remove(&height);
+        self.released_from.remove(&height);
+    }
+
+    /// `peer` answered `notfound` for `height`. Release it if it was asked of
+    /// that peer, so another peer can be asked on the next pass. Returns
+    /// whether it was released.
+    pub fn note_not_found(&mut self, height: u32, peer: PeerId) -> bool {
+        if self.in_flight.get(&height).is_some_and(|(p, _)| *p == peer) {
+            self.in_flight.remove(&height);
+            self.released_from.insert(height, peer);
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop every in-flight request assigned to a departed peer so the
@@ -58,19 +86,32 @@ impl BgDownloader {
     /// stale timeout.
     pub fn note_peer_gone(&mut self, peer: PeerId) {
         self.in_flight.retain(|_, (p, _)| *p != peer);
+        self.released_from.retain(|_, p| *p != peer);
     }
 
     /// Forget all outstanding requests (handoff completed / background
     /// detached — the tracker is about to go idle).
     pub fn reset(&mut self) {
         self.in_flight.clear();
+        self.released_from.clear();
     }
 
     /// Drop requests older than `stale_after` so they re-enter the pool.
     pub fn release_stale(&mut self, now: Instant) {
         let stale = self.stale_after;
-        self.in_flight
-            .retain(|_, (_, at)| now.duration_since(*at) < stale);
+        let released_from = &mut self.released_from;
+        self.in_flight.retain(|&h, (p, at)| {
+            let keep = now.duration_since(*at) < stale;
+            if !keep {
+                released_from.insert(h, *p);
+            }
+            keep
+        });
+    }
+
+    /// How many heights are outstanding to `peer`.
+    pub fn outstanding(&self, peer: PeerId) -> usize {
+        self.in_flight.values().filter(|(p, _)| *p == peer).count()
     }
 
     pub fn in_flight_len(&self) -> usize {
@@ -104,7 +145,55 @@ impl BgDownloader {
     pub fn mark_in_flight(&mut self, height: u32, peer: PeerId, now: Instant) {
         self.in_flight.insert(height, (peer, now));
     }
+
+    /// Share `needed` (ascending, none in flight) out over `peers`, at most
+    /// `per_peer` outstanding to each, and record every request. Round-robin
+    /// from a start that moves on each pass; a released height skips the
+    /// peer it was released from unless that peer is the only one. Heights
+    /// that find no peer with room wait for the next pass. Returns the hashes
+    /// to ask of each peer.
+    pub fn assign(
+        &mut self,
+        needed: &[(u32, BlockHash)],
+        peers: &[PeerId],
+        per_peer: usize,
+        now: Instant,
+    ) -> Vec<(PeerId, Vec<BlockHash>)> {
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let mut room: Vec<usize> = peers
+            .iter()
+            .map(|p| per_peer.saturating_sub(self.outstanding(*p)))
+            .collect();
+        let mut out: Vec<Vec<BlockHash>> = vec![Vec::new(); peers.len()];
+        let mut next = self.next_start % peers.len();
+        self.next_start = self.next_start.wrapping_add(1);
+        for &(height, hash) in needed {
+            let avoid = if peers.len() > 1 { self.released_from.get(&height).copied() } else { None };
+            let Some(i) = (0..peers.len())
+                .map(|k| (next + k) % peers.len())
+                .find(|&i| room[i] > 0 && Some(peers[i]) != avoid)
+            else {
+                continue;
+            };
+            room[i] -= 1;
+            out[i].push(hash);
+            self.in_flight.insert(height, (peers[i], now));
+            next = i + 1;
+        }
+        peers
+            .iter()
+            .copied()
+            .zip(out)
+            .filter(|(_, hashes)| !hashes.is_empty())
+            .collect()
+    }
 }
+
+#[cfg(test)]
+#[path = "bg_catchup_ibdwindow_tests.rs"]
+mod ibdwindow_tests;
 
 #[cfg(test)]
 mod tests {

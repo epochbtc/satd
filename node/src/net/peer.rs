@@ -370,6 +370,20 @@ impl PeerInfo {
         self.conn_type != ConnType::AddrFetch
     }
 
+    /// Whether the peer's services say it can serve blocks at all: Core's
+    /// `CanServeBlocks` (`net_processing.cpp:1152-1155`), NODE_NETWORK or
+    /// NODE_NETWORK_LIMITED. A light client sets neither.
+    pub fn advertises_blocks(&self) -> bool {
+        self.services.has(ServiceFlags::NETWORK) || self.services.has(ServiceFlags::NETWORK_LIMITED)
+    }
+
+    /// Whether the peer serves only recent blocks: Core's `IsLimitedPeer`
+    /// (`net_processing.cpp:1159-1163`), NODE_NETWORK_LIMITED without
+    /// NODE_NETWORK.
+    pub fn is_limited(&self) -> bool {
+        !self.services.has(ServiceFlags::NETWORK) && self.services.has(ServiceFlags::NETWORK_LIMITED)
+    }
+
     /// Whether this peer participates in tx relay — the BIP 37 `fRelay`
     /// flag from its version message. A peer that set `relay = false`
     /// (e.g. Bitcoin Core under `-blocksonly`, or a block-relay-only

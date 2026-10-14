@@ -17,7 +17,11 @@ pipeline that keeps the network, the disk, and the CPU busy at the same time.
 - **Parallel block download.** satd fetches blocks from many peers at once, the
   way BitTorrent downloads pieces from a swarm. Download throughput scales with
   aggregate peer bandwidth instead of one peer's round-trip time. `-maxahead`
-  bounds how far ahead of the connect tip downloaded blocks may be staged.
+  bounds how far ahead of the connect tip downloaded blocks may be staged. The
+  256 blocks just above the connect tip are always fetched, even with the
+  window full, so the block the connector needs next is never held back by it.
+  As in Bitcoin Core, blocks are asked only of peers that advertise
+  `NODE_NETWORK`, or `NODE_NETWORK_LIMITED` for blocks within 286 of their tip.
 - **Background prefetch workers.** `-prefetchworkers` threads pre-read blocks
   from the flat files without holding the chainstate lock. They deserialize
   each block, compute txids, run the context-free transaction validation, and
