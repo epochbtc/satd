@@ -93,6 +93,22 @@ struct BackfillInner {
     stint: Arc<StintMeter>,
 }
 
+/// Whether the address and spend indexes may serve, given the persisted
+/// address-backfill cursor: only while no backfill is mid-run (Idle or
+/// Completed).
+///
+/// Electrum and Esplora check the "complete" marker once, when they bind.
+/// A `backfillindex address` started afterwards runs while they keep
+/// serving, and a run that stops part-way (a reorg, a cancel, an error)
+/// leaves the marker set. The silent-payment index applies the same rule to
+/// its own cursor.
+pub fn serving_allowed(store: &dyn Store) -> bool {
+    matches!(
+        store.read_backfill_cursor().state,
+        BackfillState::Idle | BackfillState::Completed
+    )
+}
+
 impl BackfillHandle {
     pub fn new(initial: BackfillCursor) -> Self {
         // Initialize the in-memory pause flag from the persisted state

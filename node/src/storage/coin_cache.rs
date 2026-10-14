@@ -451,12 +451,31 @@ impl CoinCache {
     ///   touch the backing store (Core PR #17487 insight).
     /// - **Move semantics**: flushed coins are moved (not cloned) to the clean LRU,
     ///   avoiding the allocation burst that caused glibc malloc fragmentation.
+    ///
+    /// The pending batch stays locked from the moment it is taken until the
+    /// backing-store write returns (and, on failure, until its rows are back
+    /// in it). Every overlay read (`get_tx_seq`, `txids_of_seqs`, the
+    /// address, spend, filter, tweak and height overlays) looks at the
+    /// pending batch first and then falls through to the backing store. If
+    /// the lock were released after the take, a read in that window would
+    /// find the newest blocks' rows in neither place. Holding it makes such
+    /// a read wait for the write instead. The cost is that overlay reads,
+    /// and writes that buffer into the pending batch, wait for one RocksDB
+    /// batch write while a flush is in progress.
+    ///
+    /// Lock order, which every other site agrees with: `flush_guard` (taken
+    /// by the caller) → `dirty` → `pending_batch` → `pending_tip`. `dirty`
+    /// and `pending_tip` are released before the backing-store write; only
+    /// `pending_batch` is held across it. Nothing else holds `dirty` or
+    /// `pending_tip` while waiting for `pending_batch`, and the backing
+    /// store never calls back into this cache. On failure the pending rows
+    /// are put back and the lock released *before* `dirty` and
+    /// `pending_tip` are taken again, so the failure path does not invert
+    /// the order either.
     fn flush_inner(&self) -> Result<(), StoreError> {
         let mut dirty = self.dirty.write();
-        let mut batch = {
-            let mut pending = self.pending_batch.lock();
-            std::mem::take(&mut *pending)
-        };
+        let mut pending = self.pending_batch.lock();
+        let mut batch = std::mem::take(&mut *pending);
 
         // Pre-allocate batch vectors based on dirty map size
         batch.coin_puts.reserve(dirty.len());
@@ -564,7 +583,9 @@ impl CoinCache {
             );
             if let Err((returned, e)) = self.inner.write_batch_recoverable(batch, mode) {
                 match returned {
-                    Some(batch) => self.restore_after_failed_flush(*batch, &rowless_removes),
+                    Some(batch) => {
+                        self.restore_after_failed_flush(*batch, &rowless_removes, pending)
+                    }
                     // The inner store cannot say what it applied, so replaying
                     // could double-apply. Nothing to do but say so: the delta
                     // is gone and the caller's error is the only signal.
@@ -580,6 +601,8 @@ impl CoinCache {
                 return Err(e);
             }
         }
+        // The rows are in the backing store now; readers may look again.
+        drop(pending);
 
         // Move flushed coins to clean LRU (cache warming) — unless a batch
         // was absorbed while the inner write ran. The drained coins were
@@ -606,10 +629,12 @@ impl CoinCache {
     /// Put back what [`Self::flush_inner`] drained to build a batch the
     /// backing store then refused to write.
     ///
-    /// `flush_inner` empties the dirty map, takes the buffered non-coin rows
-    /// and the pending tip, and zeroes the counters *before* the inner write,
-    /// so that readers are not held behind a multi-second RocksDB call. That
-    /// is fine when the write succeeds and silent data loss when it does not:
+    /// `flush_inner` empties the dirty map, takes the pending tip, and zeroes
+    /// the counters *before* the inner write, so that coin readers are not
+    /// held behind a multi-second RocksDB call (the buffered non-coin rows
+    /// stay locked until the write returns; `pending` is that lock, still
+    /// held). That is fine when the write succeeds and silent data loss when
+    /// it does not:
     /// a transient ENOSPC or I/O error would discard an entire flush window's
     /// UTXO delta — the shape of #567 with no reorg involved.
     ///
@@ -645,6 +670,7 @@ impl CoinCache {
         &self,
         mut batch: StoreBatch,
         rowless_removes: &std::collections::HashSet<OutPoint>,
+        mut pending: parking_lot::MutexGuard<'_, StoreBatch>,
     ) {
         let coin_puts = std::mem::take(&mut batch.coin_puts);
         let coin_removes = std::mem::take(&mut batch.coin_removes);
@@ -654,6 +680,18 @@ impl CoinCache {
                 .map(|(outpoint, amount, height)| (outpoint, (amount, height)))
                 .collect();
         let tip = batch.tip.take();
+
+        // Non-coin rows go back into the pending batch first, while the
+        // flush's lock on it is still held, so no reader sees them missing.
+        // They go *underneath* anything buffered since the drain (nothing
+        // can have been while the lock was held, but the merge order keeps
+        // a newer write winning regardless). The lock is then released
+        // before `dirty` is taken: `flush_inner` takes `dirty` first, and
+        // the failure path must not take them in the other order.
+        let newer = std::mem::take(&mut *pending);
+        batch.merge(newer);
+        *pending = batch;
+        drop(pending);
 
         // `dirty_count` mirrors the map's population, so only ops actually
         // inserted may count — an entry re-dirtied since the drain was
@@ -711,13 +749,6 @@ impl CoinCache {
                 *pending = Some(tip);
             }
         }
-
-        // Non-coin rows go back into the pending batch *underneath* anything
-        // buffered since the drain, so a newer write still wins.
-        let mut pending = self.pending_batch.lock();
-        let newer = std::mem::take(&mut *pending);
-        batch.merge(newer);
-        *pending = batch;
 
         tracing::error!(
             restored_coins = restored,
@@ -891,7 +922,10 @@ impl CoinCache {
         // reorg's rollback, and flagging it would turn a safe discard into a
         // spurious process fail-stop.
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
-        if coin_dirty > 0 || batch.tip.is_some() {
+        // A batch that moves the tip is a block connect or disconnect, and
+        // belongs to whatever reorg is in flight even when it moves no coins.
+        let moves_tip = batch.tip.is_some();
+        if coin_dirty > 0 || moves_tip {
             self.note_mutation();
         }
         // Honor the caller's explicit mode for the inner-store call.
@@ -1151,39 +1185,36 @@ impl CoinCache {
                 }
             };
 
-        // A batch with no coins goes straight to the backing store, bypassing
-        // both the flush-exclusion and `discard_uncommitted`. That looks
-        // alarming next to the reorg atomicity `discard_uncommitted` promises,
-        // so it is worth writing down why it is not a hole.
+        // A batch with no coins and no tip goes straight to the backing store,
+        // bypassing both the flush-exclusion and `discard_uncommitted`. That
+        // looks alarming next to the reorg atomicity `discard_uncommitted`
+        // promises, so it is worth writing down why it is not a hole.
         //
         // The routing is per batch, not global. Everything a reorg writes
-        // tentatively — every disconnect, every reconnect — carries coins, so
-        // `coin_dirty > 0` and it is buffered and therefore discardable. What
-        // takes this branch is writes that are not part of the reorg's
-        // tentative state and must not be rolled back with it: `store_block`
-        // recording an arriving block, `accept_header(s)`, `mark_subtree_invalid`
-        // stamping an invalidation. Those are durable facts about blocks, not
-        // about which chain is active, and a reorg aborting should not undo
-        // them.
+        // tentatively — every disconnect, every reconnect — moves the tip, so
+        // it is buffered and therefore discardable. What takes this branch is
+        // writes that are not part of the reorg's tentative state and must not
+        // be rolled back with it: `store_block` recording an arriving block,
+        // `accept_header(s)`, `mark_subtree_invalid` stamping an invalidation,
+        // an index backfill. Those are durable facts about blocks, not about
+        // which chain is active, and a reorg aborting should not undo them.
         //
         // The one thing to preserve when touching this: nothing that a failed
-        // reorg must be able to retract may reach here. The `coin_dirty == 0`
-        // test is what enforces that, and it is *nearly* — not entirely —
-        // implied by "connection and disconnection always move coins".
+        // reorg must be able to retract may reach here.
         //
-        // The exception is a block whose every output is unspendable and which
-        // spends nothing: `connect_block` and `disconnect_block` both skip
-        // unspendable outputs, so such a block yields empty `coin_puts` and
-        // empty `coin_removes`. A coinbase-only block whose sole output is an
-        // OP_RETURN is exactly that, and it is a block a miner can produce (or
-        // a fork-feeder can craft). Its index writes would then pass straight
-        // through and survive a reorg abort that should have retracted them —
-        // the height-row pollution shape of #322/#564. It is a narrow case and
-        // no such block is known on mainnet, but the invariant is not airtight
-        // and this comment should not claim it is. Routing on "a reorg is in
-        // flight" rather than on `coin_dirty` would close it properly.
+        // Routing on coins alone was not enough. A block whose every output is
+        // unspendable and which spends nothing (a coinbase-only block whose
+        // sole output is an OP_RETURN) yields empty `coin_puts` and empty
+        // `coin_removes`, because `connect_block` and `disconnect_block` both
+        // skip unspendable outputs. Its rows then went straight to the backing
+        // store: they survived a reorg abort that should have retracted them,
+        // and in a reorg that succeeded, the disconnect's still-pending
+        // removes for the same height (`height_hash_removes`, `filter_removes`,
+        // `sp_tweak_removes`) hid them from reads and deleted them at the next
+        // flush, so the next block's filter header chained off zeros. Such a
+        // batch always carries the tip, so the tip routes it here instead.
         if has_non_coin {
-            if coin_dirty == 0 {
+            if coin_dirty == 0 && !moves_tip {
                 let pass_through = StoreBatch {
                     block_index_puts: batch.block_index_puts,
                     coin_puts: Vec::new(),
@@ -2467,6 +2498,10 @@ fn resolve_spending_ref_via(
 #[cfg(test)]
 #[path = "coin_cache_electrumbounds_tests.rs"]
 mod electrumbounds_tests;
+
+#[cfg(test)]
+#[path = "coin_cache_indexgate_tests.rs"]
+mod indexgate_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4696,7 +4731,7 @@ mod tests {
         spend.coin_removes.push((y, 7_000, 2));
         cache.write_batch(spend).unwrap();
         let gauge_before = cache.dirty_count();
-        cache.restore_after_failed_flush(drained, &std::collections::HashSet::new());
+        cache.restore_after_failed_flush(drained, &std::collections::HashSet::new(), cache.pending_batch.lock());
 
         assert!(
             cache.get_coin(&y).is_none(),
@@ -4750,7 +4785,7 @@ mod tests {
         older.height_hash_puts.push((2, hash_a));
         older.height_hash_removes.push(3);
         older.tip = Some(tip_old);
-        cache.restore_after_failed_flush(older, &std::collections::HashSet::new());
+        cache.restore_after_failed_flush(older, &std::collections::HashSet::new(), cache.pending_batch.lock());
 
         // Newer values win immediately...
         assert_eq!(cache.get_block_hash_by_height(2), Some(hash_b));

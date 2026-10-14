@@ -40,6 +40,11 @@ use node_index::{MempoolTxFacts, history_rows, history_status_hash};
 /// Cheap (O(channels)) and runs alongside the chain-event loop.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the notifier checks whether a status recompute refused during
+/// an address backfill can now run. The check is two atomic loads and a
+/// metadata read.
+const OWED_RECOMPUTE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Spawn the chain-driven status-update notifier. Listens on
 /// `ChainEvent::BlockConnected` / `BlockDisconnected` and recomputes
 /// status hashes only for scripthashes with active subscribers.
@@ -58,6 +63,8 @@ pub async fn notifier_task(
     let mut prune_ticker = tokio::time::interval(PRUNE_INTERVAL);
     // Skip the initial fire so first-event latency stays clean.
     prune_ticker.tick().await;
+    let mut owed_ticker = tokio::time::interval(OWED_RECOMPUTE_INTERVAL);
+    owed_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -68,6 +75,27 @@ pub async fn notifier_task(
             }
             _ = prune_ticker.tick() => {
                 registry.prune_empty();
+            }
+            _ = owed_ticker.tick() => {
+                // Recomputes refused while an address backfill ran (chain
+                // or mempool triggered) are made up once it has finished.
+                if index.take_status_recompute_owed() {
+                    let mut pass = std::pin::pin!(recompute_all_active_off_thread(
+                        index.clone(),
+                        registry.clone(),
+                        mempool.clone(),
+                    ));
+                    loop {
+                        tokio::select! {
+                            _ = &mut pass => break,
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             chain_event = chain_rx.recv() => {
                 match chain_event {
@@ -191,9 +219,15 @@ fn recompute_one(
     // pushed status by hashing that response as it arrived. Building the
     // rows through the same helper as the Electrum handlers keeps the two
     // from drifting apart.
-    let Ok(rows) = history_rows(index, sh, usize::MAX, |txid| mempool_facts(mempool, txid))
-    else {
-        return;
+    let rows = match history_rows(index, sh, usize::MAX, |txid| mempool_facts(mempool, txid)) {
+        Ok(rows) => rows,
+        // A backfill is mid-run. Whatever changed is pushed when serving
+        // resumes (`notifier_task` checks every `OWED_RECOMPUTE_INTERVAL`).
+        Err(crate::index::address::IndexError::Incomplete) => {
+            index.note_status_recompute_owed();
+            return;
+        }
+        Err(_) => return,
     };
     registry.maybe_notify(*sh, history_status_hash(&rows));
 }
@@ -225,3 +259,7 @@ mod electrumstatus_tests;
 #[cfg(test)]
 #[path = "notifier_electrumbounds_tests.rs"]
 mod electrumbounds_tests;
+
+#[cfg(test)]
+#[path = "notifier_indexgate_tests.rs"]
+mod indexgate_tests;
