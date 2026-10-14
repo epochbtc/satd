@@ -656,6 +656,10 @@ mod addrdials_tests;
 #[path = "manager_ibdwindow_tests.rs"]
 mod ibdwindow_tests;
 
+#[cfg(test)]
+#[path = "manager_hdrsync_tests.rs"]
+mod hdrsync_tests;
+
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
 fn tx_announcement(wtxid_relay: bool, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid) -> Inventory {
@@ -5395,6 +5399,19 @@ impl PeerManager {
         // Whatever the batch did to the rows above the tip, the scheduler
         // must hear about it before its next assignment.
         self.apply_header_row_changes();
+        // A full batch: the peer may have more. Ask it to continue from the
+        // last header it sent, already known or not (Core's
+        // `ProcessHeadersMessage`: `MaybeSendGetHeaders(pfrom,
+        // GetLocator(pindexLast))` whenever `nCount == MAX_HEADERS_RESULTS`).
+        // A locator from our own height rows would bring a peer whose chain
+        // forks below them back to the fork point, and to the same batch.
+        let batch_connected = matches!(err, None | Some(crate::chain::state::ChainError::Duplicate));
+        if batch_connected
+            && headers.len() >= 2000
+            && let Some(last) = headers.last()
+        {
+            self.send_to_peer(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
+        }
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
         if let Some(last) = headers.last() {
@@ -5445,9 +5462,8 @@ impl PeerManager {
 
             tracing::debug!(id, accepted, headers_tip = htip, "Headers accepted");
 
-            // Request more headers if peer sent a full batch
+            // Peer sent a full batch: the getheaders to it went out above.
             if headers.len() >= 2000 {
-                self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
                 // During header download, request from other peers too for redundancy
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read();

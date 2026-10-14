@@ -234,7 +234,6 @@ fn next_block_info(chain_state: &ChainState, tip: &crate::storage::blockindex::B
         chain_state.network,
         tip,
         time,
-        |h| chain_state.get_block_index(&chain_state.get_block_hash_by_height(h)?),
         |hash| chain_state.get_block_index(hash),
     )
     .unwrap_or(tip.header.bits);
