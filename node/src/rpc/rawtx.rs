@@ -90,7 +90,7 @@ pub fn get_raw_transaction(
     // returns this error both when a blockhash is explicitly supplied and
     // when the txindex would otherwise resolve it.
     if is_genesis_coinbase(chain_state, &txid) {
-        return Err((-5, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved; to get its block, use the getblock RPC".to_string()));
+        return Err((-5, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved".to_string()));
     }
 
     // Search mempool first (unless blockhash is specified). Bitcoin

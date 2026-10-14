@@ -42,6 +42,13 @@ credential is tried first, so existing Core tooling is not affected. A
 operator Basic credential. A matching cookie, userpass, or `rpcauth`
 credential always resolves to the full-capability operator.
 
+A request whose credential does not authenticate is answered `401` after a
+250 ms pause and logged at warn level as
+`ThreadRPCServer incorrect password attempt from <ip>:<port>`, as in Core. A
+request with no `Authorization` header gets its `401` at once and is not
+logged. The warning is limited to 60 lines a minute per listener; the first
+line of the next minute carries a `suppressed` count of what it left out.
+
 ## Per-user method allowlists (`rpcwhitelist`)
 
 satd implements Bitcoin Core's `-rpcwhitelist` and `-rpcwhitelistdefault`

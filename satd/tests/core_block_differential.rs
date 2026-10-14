@@ -203,6 +203,11 @@ fn satd_submit_block(node: &TestNode, hex: &str) -> Outcome {
     let resp = node
         .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
         .expect("satd submitblock RPC");
+    // An RPC error (decode failure, -25 node failure) is not an accept; the
+    // Core adapter reports its own the same way.
+    if !resp["error"].is_null() {
+        return Outcome::Reject(format!("rpc-error: {}", resp["error"]));
+    }
     match &resp["result"] {
         serde_json::Value::Null => Outcome::Accept,
         serde_json::Value::String(s) => Outcome::Reject(s.clone()),

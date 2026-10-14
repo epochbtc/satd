@@ -262,6 +262,16 @@ pub struct HttpCharged;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcUser(pub Arc<str>);
 
+/// The address of the peer a request came from. The RPC listeners' accept
+/// loops put it on every request, since jsonrpsee does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpcPeerAddr(pub std::net::SocketAddr);
+
+/// How long a request whose credential does not authenticate waits before its
+/// `401`: Core's `UninterruptibleSleep(250ms)` in `HTTPReq_JSONRPC`
+/// (src/httprpc.cpp), there to slow a password search down.
+pub const FAILED_AUTH_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Tower middleware layer for HTTP auth. Authenticates a request and stashes the
 /// resolved [`satd_auth::Principal`] in the request extensions (for the RPC-layer
 /// capability filter and method handlers).
@@ -275,11 +285,23 @@ pub struct RpcUser(pub Arc<str>);
 pub struct AuthLayer {
     auth: Arc<RpcAuth>,
     bearer: Option<Arc<satd_auth::TokenStore>>,
+    /// Budget for the failed-credential warning, one per listener surface.
+    failed_auth_log: Arc<crate::warn_budget::WarnBudget>,
 }
 
 impl AuthLayer {
     pub fn new(auth: Arc<RpcAuth>, bearer: Option<Arc<satd_auth::TokenStore>>) -> Self {
-        Self { auth, bearer }
+        Self {
+            auth,
+            bearer,
+            // Core logs every attempt. A budget keeps a flood from filling
+            // the disk; the first line of the next minute counts what it
+            // left out.
+            failed_auth_log: Arc::new(crate::warn_budget::WarnBudget::new(
+                60,
+                std::time::Duration::from_secs(60),
+            )),
+        }
     }
 }
 
@@ -291,6 +313,7 @@ impl<S> tower::Layer<S> for AuthLayer {
             inner,
             auth: self.auth.clone(),
             bearer: self.bearer.clone(),
+            failed_auth_log: self.failed_auth_log.clone(),
         }
     }
 }
@@ -302,6 +325,7 @@ pub struct AuthMiddleware<S> {
     inner: S,
     auth: Arc<RpcAuth>,
     bearer: Option<Arc<satd_auth::TokenStore>>,
+    failed_auth_log: Arc<crate::warn_budget::WarnBudget>,
 }
 
 impl<S, B> tower::Service<hyper::Request<B>> for AuthMiddleware<S>
@@ -330,6 +354,7 @@ where
     fn call(&mut self, mut req: hyper::Request<B>) -> Self::Future {
         let auth = self.auth.clone();
         let bearer = self.bearer.clone();
+        let failed_auth_log = self.failed_auth_log.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -397,6 +422,29 @@ where
                     inner.call(req).await
                 }
                 None => {
+                    // Core (`HTTPReq_JSONRPC`, src/httprpc.cpp): a request with
+                    // no Authorization header gets its 401 at once. One whose
+                    // credential does not authenticate is logged with the
+                    // peer's address and answered after 250 ms. The pause is
+                    // an async sleep, so it holds this request and not a
+                    // runtime worker.
+                    if header.is_some() {
+                        let peer = req
+                            .extensions()
+                            .get::<RpcPeerAddr>()
+                            .map_or_else(|| "an unknown address".to_string(), |p| p.0.to_string());
+                        if let Some(suppressed) = failed_auth_log.tick() {
+                            if suppressed == 0 {
+                                tracing::warn!("ThreadRPCServer incorrect password attempt from {peer}");
+                            } else {
+                                tracing::warn!(
+                                    suppressed,
+                                    "ThreadRPCServer incorrect password attempt from {peer}"
+                                );
+                            }
+                        }
+                        tokio::time::sleep(FAILED_AUTH_DELAY).await;
+                    }
                     let response = hyper::Response::builder()
                         .status(401)
                         .header("WWW-Authenticate", "Basic realm=\"jsonrpc\"")

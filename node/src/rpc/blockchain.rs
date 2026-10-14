@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
+use crate::rpc::util::univalue_double;
 use crate::storage::{RecentHeightWindow, Store};
 use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
 
@@ -175,10 +176,11 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
         "bestblockhash": tip_hash.to_string(),
         "bits": bits_hex(bits),
         "target": target_hex(bits),
-        "difficulty": difficulty,
+        // Doubles in Core's `%.16g` form (`UniValue::setFloat`).
+        "difficulty": univalue_double(difficulty),
         "time": time,
         "mediantime": mediantime,
-        "verificationprogress": chain_state.verification_progress(&tip_hash),
+        "verificationprogress": univalue_double(chain_state.verification_progress(&tip_hash)),
         "initialblockdownload": is_ibd,
         "chainwork": format!("{:0>64}", chainwork),
         // Core's is `blk*.dat` + `rev*.dat`; satd keeps undo data in
@@ -487,8 +489,8 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
             chainstates.push(with_tip_cache(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
-                "difficulty": difficulty,
-                "verificationprogress": verificationprogress,
+                "difficulty": univalue_double(difficulty),
+                "verificationprogress": univalue_double(verificationprogress),
                 "coins_db_cache_bytes": coins_db_cache_bytes,
                 "snapshot_blockhash": bg.snapshot_hash().to_string(),
                 "validated": false,
@@ -504,8 +506,8 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
             chainstates.push(with_tip_cache(json!({
                 "blocks": bg_height,
                 "bestblockhash": bg.tip_hash().to_string(),
-                "difficulty": bg_difficulty,
-                "verificationprogress": bg_progress,
+                "difficulty": univalue_double(bg_difficulty),
+                "verificationprogress": univalue_double(bg_progress),
                 "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
             })));
@@ -515,8 +517,8 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
             chainstates.push(with_tip_cache(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
-                "difficulty": difficulty,
-                "verificationprogress": verificationprogress,
+                "difficulty": univalue_double(difficulty),
+                "verificationprogress": univalue_double(verificationprogress),
                 "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
             })));
@@ -729,7 +731,7 @@ pub fn get_block(
         "nonce": entry.header.nonce,
         "bits": bits_hex(entry.header.bits),
         "target": target_hex(entry.header.bits),
-        "difficulty": difficulty,
+        "difficulty": univalue_double(difficulty),
         "chainwork": format!("{:0>64}", chainwork_hex),
         "nTx": entry.num_tx,
         "size": block_size,
@@ -792,7 +794,7 @@ pub fn get_block_header(
         "nonce": entry.header.nonce,
         "bits": bits_hex(entry.header.bits),
         "target": target_hex(entry.header.bits),
-        "difficulty": difficulty,
+        "difficulty": univalue_double(difficulty),
         "chainwork": format!("{:0>64}", chainwork_hex),
         "nTx": entry.num_tx,
     });
@@ -1114,9 +1116,9 @@ fn height_hist_to_age_buckets(
 pub fn get_difficulty(chain_state: &ChainState) -> Value {
     let tip_hash = chain_state.tip_hash();
     if let Some(entry) = chain_state.get_block_index(&tip_hash) {
-        json!(target_to_difficulty(entry.header.bits))
+        univalue_double(target_to_difficulty(entry.header.bits))
     } else {
-        json!(0.0)
+        univalue_double(0.0)
     }
 }
 

@@ -1412,17 +1412,15 @@ fn test_getblockheader() {
 fn test_submitblock_invalid() {
     let mut node = TestNode::start(&[]);
 
-    // Submit garbage hex
-    let response = node
-        .rpc_call_with_params("submitblock", vec![serde_json::json!("deadbeef")])
-        .unwrap();
-    assert_eq!(response["result"], "Block decode failed");
-
-    // Submit invalid hex
-    let response = node
-        .rpc_call_with_params("submitblock", vec![serde_json::json!("not-hex!")])
-        .unwrap();
-    assert_eq!(response["result"], "Block decode failed");
+    // Core throws RPC_DESERIALIZATION_ERROR for hex that is not a block
+    // (src/rpc/mining.cpp), rather than returning a BIP 22 reason.
+    for hex in ["deadbeef", "not-hex!"] {
+        let response = node
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .unwrap();
+        assert_eq!(response["error"]["code"], -22, "{hex}: {response}");
+        assert_eq!(response["error"]["message"], "Block decode failed", "{hex}: {response}");
+    }
 
     node.stop();
 }
@@ -5624,10 +5622,12 @@ fn test_getblockfilter_errors_when_index_disabled() {
         "getblockfilter should error when index is disabled, got: {:?}",
         response
     );
-    let msg = response["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("disabled") || msg.contains("not synced"),
-        "expected disabled/not-synced message, got: {msg}"
+    // Core's code and text (src/rpc/blockchain.cpp, asserted by
+    // `rpc_getblockfilter.py`).
+    assert_eq!(response["error"]["code"], -1, "{response}");
+    assert_eq!(
+        response["error"]["message"], "Index is not enabled for filtertype basic",
+        "{response}"
     );
 
     node.stop();
@@ -17942,14 +17942,16 @@ fn getnetworkhashps_takes_core_s_signed_arguments() {
 
     // Genesis has no window to measure.
     let genesis = call(vec![serde_json::json!(100), serde_json::json!(0)]);
-    assert_eq!(genesis["result"], serde_json::json!(0.0), "{genesis}");
+    // Core's `GetNetworkHashPS` returns a bare `0` here.
+    assert_eq!(genesis["result"].to_string(), "0", "{genesis}");
 
     // `-1` is "since the last difficulty change": Core's window is
-    // `height % 2016 + 1`. Asking for that window by number must give the
-    // identical answer.
+    // `height % DifficultyAdjustmentInterval() + 1`, and the interval is 144
+    // on regtest. Asking for that window by number must give the identical
+    // answer.
     let height = node.rpc_call("getblockcount").unwrap()["result"].as_i64().unwrap();
     let since_change = call(vec![serde_json::json!(-1)]);
-    let by_number = call(vec![serde_json::json!(height % 2016 + 1)]);
+    let by_number = call(vec![serde_json::json!(height % 144 + 1)]);
     assert!(since_change["error"].is_null(), "{since_change}");
     assert_eq!(since_change["result"], by_number["result"]);
 
