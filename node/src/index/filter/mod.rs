@@ -13,6 +13,8 @@ pub mod backfill;
 #[cfg(feature = "block-filter-index")]
 pub mod emit;
 #[cfg(feature = "block-filter-index")]
+pub mod header_chain;
+#[cfg(feature = "block-filter-index")]
 pub mod lookups;
 #[cfg(feature = "block-filter-index")]
 pub mod runner;
@@ -23,6 +25,8 @@ pub use backfill::{
 };
 #[cfg(feature = "block-filter-index")]
 pub use emit::{build_filter_row_pair, filter_remove_key};
+#[cfg(feature = "block-filter-index")]
+pub use header_chain::{HeaderChainCheck, check_filter_header_chain};
 #[cfg(feature = "block-filter-index")]
 pub use lookups::{MAX_FILTER_RANGE, RocksFilterIndex, filter_hash};
 #[cfg(feature = "block-filter-index")]

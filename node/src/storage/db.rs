@@ -50,6 +50,8 @@ pub struct InMemoryStore {
     #[cfg(feature = "block-filter-index")]
     filter_complete: parking_lot::RwLock<bool>,
     #[cfg(feature = "block-filter-index")]
+    filter_header_chain_checked: parking_lot::RwLock<bool>,
+    #[cfg(feature = "block-filter-index")]
     filter_backfill_cursor: parking_lot::RwLock<node_filter_index::cursor::BackfillCursor>,
     #[cfg(feature = "block-filter-index")]
     filter_backfill_last_error: parking_lot::RwLock<Option<String>>,
@@ -106,6 +108,10 @@ impl InMemoryStore {
             // `mark_block_filter_index_complete`.
             #[cfg(feature = "block-filter-index")]
             filter_complete: parking_lot::RwLock::new(true),
+            // Unset, like a datadir an older release wrote, so tests can
+            // drive the one-time header chain check.
+            #[cfg(feature = "block-filter-index")]
+            filter_header_chain_checked: parking_lot::RwLock::new(false),
             #[cfg(feature = "block-filter-index")]
             filter_backfill_cursor: parking_lot::RwLock::new(
                 node_filter_index::cursor::BackfillCursor::idle(),
@@ -778,6 +784,17 @@ impl Store for InMemoryStore {
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
         *self.filter_complete.write() = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        *self.filter_header_chain_checked.read()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        *self.filter_header_chain_checked.write() = true;
         Ok(())
     }
 
