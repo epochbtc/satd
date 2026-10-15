@@ -292,6 +292,15 @@ pub struct PeerInfo {
     /// How this connection came about. Drives `getpeerinfo`'s
     /// `connection_type`, the `fRelay` flag we send, and address relay.
     pub conn_type: ConnType,
+    /// Node-clock seconds when this peer last announced a header with more
+    /// work than our tip; 0 = never. Core's
+    /// `CNodeState::m_last_block_announcement`, the order in which surplus
+    /// outbound peers are disconnected (`EvictExtraOutboundPeers`).
+    pub last_block_announcement: u64,
+    /// One of the first few outbound full-relay peers to show a chain with
+    /// at least our tip's work: Core's `m_chain_sync.m_protect`. Such a peer
+    /// is never disconnected as a surplus outbound peer.
+    pub chain_sync_protect: bool,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -344,6 +353,27 @@ impl PeerInfo {
                 Direction::Inbound => ConnType::Inbound,
                 Direction::Outbound => ConnType::OutboundFullRelay,
             },
+            last_block_announcement: 0,
+            chain_sync_protect: false,
+        }
+    }
+
+    /// The peer's network as `getpeerinfo` names it, derived from its
+    /// address. A peer that came in on the onion listener is on the onion
+    /// network whatever address Tor dialled from: Core's
+    /// `ConnectedThroughNetwork` (`net.cpp`).
+    pub fn network(&self) -> &'static str {
+        if self.onion_host.is_some() || self.inbound_onion {
+            "onion"
+        } else if !crate::net::is_routable(self.addr.ip()) {
+            "not_publicly_routable"
+        } else {
+            // An IPv4-mapped IPv6 address is the IPv4 peer it carries, as
+            // Core's `CNetAddr` unwraps it.
+            match self.addr.ip().to_canonical() {
+                std::net::IpAddr::V4(_) => "ipv4",
+                std::net::IpAddr::V6(_) => "ipv6",
+            }
         }
     }
 
@@ -446,21 +476,7 @@ impl PeerInfo {
             .as_secs();
 
         let addr_str = self.addr_string();
-        // Derive the peer's network from its address. A peer that came in on
-        // the onion listener is on the onion network whatever address Tor
-        // dialled from: Core's `ConnectedThroughNetwork` (`net.cpp`).
-        let network = if self.onion_host.is_some() || self.inbound_onion {
-            "onion"
-        } else if !crate::net::is_routable(self.addr.ip()) {
-            "not_publicly_routable"
-        } else {
-            // An IPv4-mapped IPv6 address is the IPv4 peer it carries, as
-            // Core's `CNetAddr` unwraps it.
-            match self.addr.ip().to_canonical() {
-                std::net::IpAddr::V4(_) => "ipv4",
-                std::net::IpAddr::V6(_) => "ipv6",
-            }
-        };
+        let network = self.network();
 
         // Build the services-name list matching Core's format.
         let svc_u64 = self.services.to_u64();
