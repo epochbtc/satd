@@ -12,7 +12,7 @@
 # ghcr.io/epochbtc/satd for anything else.
 #
 # Warnet only renders image tags of the form X.Y[.Z][-suffix]; tag builds of
-# this image `<satd version>-warnet<N>` (for example 0.6.0-warnet0).
+# this image `<satd version>-warnet<N>` (for example 0.6.1-warnet0).
 ARG SATD_IMAGE=ghcr.io/epochbtc/satd:latest
 FROM ${SATD_IMAGE}
 
