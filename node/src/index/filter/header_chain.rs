@@ -2,7 +2,7 @@
 //!
 //! Before 0.6.1, a filter backfill's rows could lose to the live connect
 //! path's still-pending rows for the same heights (see
-//! `CoinCache::drop_pending_filter_rows_superseded_by`). Those live rows
+//! `CoinCache::write_pass_through`). Those live rows
 //! chained their header off the all-zero fallback, so from the first such
 //! height on, every stored filter header differed from the BIP 157 chain,
 //! even though every stored *filter* was correct: a filter depends only on
