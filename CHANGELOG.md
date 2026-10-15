@@ -49,6 +49,7 @@ item below is (or will be) written up in full in the in-development
 - Esplora honours `?after_txid=` paging, answers 404/400 for out-of-range or misaligned block-txs pages, drops empty `witness` arrays, and `/fee-estimates` omits targets with no estimate (#943).
 - Long Electrum and Esplora address-history reads run off the API runtime's workers, and `--electrumrequesttimeout` and `--esplorarequesttimeout` take effect (#947).
 - The address, spend and filter indexes do not serve during or after an unfinished `backfillindex`; a reorg during a backfill no longer deletes live rows; reads during a flush wait for it (#958).
+- A `backfillindex blockfilter` run no longer leaves a broken BIP 157 filter header chain. Rows the live connect path had not yet flushed for the same heights replaced the backfill's at the next flush, so `getblockfilter`, `getcfheaders` and `getcfcheckpt` served headers chained off zeros from that height on. On first start, 0.6.1 checks the stored header chain once on any datadir a filter backfill has written and rewrites the headers that differ.
 - `bitcoin.conf` treats `#` anywhere as a comment start and refuses an `rpcpassword` containing `#`, as Core does; trace logs no longer include RPC headers or parameters; the Tor control cookie read is bounded (#940).
 
 ## Releases
