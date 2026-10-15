@@ -60,14 +60,16 @@ fn headers(cs: &ChainState) -> Vec<Option<[u8; 32]>> {
 }
 
 fn set_cursor(cs: &ChainState, state: BackfillState) {
-    let mut batch = StoreBatch::default();
-    batch.filter_backfill_cursor_advance = Some(FilterBackfillCursorWrite {
-        state,
-        cursor_height: 3,
-        snapshot_height: 3,
-        started_at_unix: 1,
-        snapshot_tip_hash: [7u8; 32],
-    });
+    let batch = StoreBatch {
+        filter_backfill_cursor_advance: Some(FilterBackfillCursorWrite {
+            state,
+            cursor_height: 3,
+            snapshot_height: 3,
+            started_at_unix: 1,
+            snapshot_tip_hash: [7u8; 32],
+        }),
+        ..Default::default()
+    };
     cs.store_ref().write_batch(batch).unwrap();
 }
 
