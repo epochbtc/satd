@@ -110,6 +110,16 @@ const MANUAL_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The longest an automatic dial candidate waits between two dials.
 const AUTOMATIC_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+/// Core's `MINIMUM_CONNECT_TIME` (`net_processing.cpp`): a surplus outbound
+/// peer is disconnected only after it has been connected this long, to give
+/// it time to announce something.
+const MINIMUM_CONNECT_TIME_SECS: u64 = 30;
+
+/// Core's `MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT`
+/// (`net_processing.cpp`): how many outbound full-relay peers that showed a
+/// chain with at least our tip's work are kept whatever else happens.
+const MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT: usize = 4;
+
 /// Cap on the automatic dial list. Only an address the address book holds
 /// gets on it (seeds aside), so this is the book's own size.
 const MAX_LEARNED_ADDRS: usize = crate::net::addrman::MAX_ENTRIES;
@@ -651,6 +661,10 @@ mod peerpunish_tests;
 #[cfg(test)]
 #[path = "manager_addrdials_tests.rs"]
 mod addrdials_tests;
+
+#[cfg(test)]
+#[path = "manager_netgroup_tests.rs"]
+mod netgroup_tests;
 
 #[cfg(test)]
 #[path = "manager_ibdwindow_tests.rs"]
@@ -4052,6 +4066,7 @@ impl PeerManager {
             self.flush_banlist();
         }
         self.redial_manual_peers(now);
+        self.evict_extra_outbound_peer();
         self.dial_automatic_peers(now);
     }
 
@@ -4091,6 +4106,19 @@ impl PeerManager {
         }
     }
 
+    /// Dial learned addresses now, as one automatic pass of the reconnect
+    /// loop does, without waiting for the loop's next pass: for the seed
+    /// addresses learned at startup. They go through the same choice as
+    /// every other automatic dial (the outbound target and one peer per
+    /// network group), as Core adds a seed's answers to its address book
+    /// and leaves the dialling to `ThreadOpenConnections`. Nothing while
+    /// networking is paused.
+    pub fn dial_learned_peers(self: &Arc<Self>) {
+        if self.is_network_active() {
+            self.dial_automatic_peers(Instant::now());
+        }
+    }
+
     /// The automatic half of [`Self::reconnect_tick`]: learned addresses,
     /// then onion peers learned from `addrv2` gossip, one dial each until the
     /// automatic outbound target is reached, the dials in flight counted
@@ -4100,23 +4128,8 @@ impl PeerManager {
     /// skips a banned address for an automatic connection; satd checked
     /// the bans of clearnet addresses only.
     fn dial_automatic_peers(self: &Arc<Self>, now: Instant) {
-        // An address the operator also named is offered by the manual half,
-        // and `spawn_peer` makes it the manual connection it is: Core makes
-        // no automatic connection to an added node (`AddedNodesContain`,
-        // v31.1 `src/net.cpp:2883`).
-        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
-        for addr in learned {
-            if self.is_manual_target(&PeerAddr::Socket(addr)) || !self.may_dial(&addr) {
-                continue;
-            }
-            let target = PeerAddr::Socket(addr);
-            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
-                continue;
-            }
-            match self.reserve_dial(DialBudget::Automatic) {
-                Ok(slot) => self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF),
-                Err(_) => return,
-            }
+        for (addr, slot) in self.reserve_automatic_dials(now) {
+            self.spawn_redial(PeerAddr::Socket(addr), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
         }
 
         // `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up
@@ -4171,6 +4184,241 @@ impl PeerManager {
                         .is_none_or(|state| now >= state.next_attempt)
             }
         }
+    }
+
+    /// The learned addresses the automatic half of the reconnect loop dials
+    /// this pass, each with the place it took in the automatic budget, in
+    /// the order of the dial list. Stops when the budget is spent.
+    ///
+    /// An address the operator also named is offered by the manual half,
+    /// and `spawn_peer` makes it the manual connection it is: Core makes no
+    /// automatic connection to an added node (`AddedNodesContain`, v31.1
+    /// `src/net.cpp:2883`).
+    fn reserve_automatic_dials(self: &Arc<Self>, now: Instant) -> Vec<(SocketAddr, DialSlot)> {
+        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        let mut groups = self.outbound_netgroups();
+        let mut dials = Vec::new();
+        for addr in learned {
+            if self.is_manual_target(&PeerAddr::Socket(addr)) || !self.may_dial(&addr) {
+                continue;
+            }
+            let target = PeerAddr::Socket(addr);
+            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
+                continue;
+            }
+            // One automatic outbound peer per network group, as Core
+            // requires (v31.1 `src/net.cpp:2829`): a candidate in a group
+            // the node already has an outbound peer in, or is dialling, is
+            // skipped. satd walked the list in order, and addresses learned
+            // together often sit in one group, so several slots could go to
+            // one /16.
+            let group = self.outbound_netgroup(addr.ip());
+            if group.as_ref().is_some_and(|g| groups.contains(g)) {
+                continue;
+            }
+            match self.reserve_dial(DialBudget::Automatic) {
+                Ok(slot) => {
+                    // The dials of one pass run in parallel, so the group is
+                    // taken now, not when the peer connects.
+                    if let Some(group) = group {
+                        groups.insert(group);
+                    }
+                    dials.push((addr, slot));
+                }
+                Err(_) => break,
+            }
+        }
+        dials
+    }
+
+    /// The network group the one-per-group outbound rule keys `ip` on: the
+    /// address book's group (the /16 for IPv4, the /32 for IPv6, the ASN
+    /// under `-asmap`). `None` for an address the rule leaves alone.
+    ///
+    /// That is every address that is not publicly routable. Core would put
+    /// all of them in one group (`NetGroupManager::GetGroup`: "all local
+    /// addresses belong to the same group", likewise the other unroutable
+    /// ones), but its address book never holds one (`AddrManImpl::AddSingle`
+    /// refuses `!IsRoutable()`), so Core never dials one automatically at
+    /// all. satd's book refuses them too, except on regtest, where it takes
+    /// them so that local nodes can find each other; there they are left out
+    /// of the rule, which would otherwise allow one automatic peer on
+    /// loopback or a private network. Onion peers have no address of their
+    /// own (the unspecified placeholder) and are left out with them, as Core
+    /// exempts Tor, I2P and CJDNS (`src/net.cpp:2677`).
+    fn outbound_netgroup(&self, ip: IpAddr) -> Option<Vec<u8>> {
+        crate::net::is_routable(ip).then(|| self.addrman.read().group_key(ip))
+    }
+
+    /// The network groups the node already holds an outbound connection in,
+    /// for the automatic dial pass: every manual, outbound full-relay and
+    /// block-relay-only peer, connected or in the handshake, as Core collects
+    /// `outbound_ipv46_peer_netgroups` (v31.1 `src/net.cpp:2654-2690`), plus
+    /// every dial still in flight. Inbound peers, feelers and addr-fetch
+    /// connections do not count, as in Core. Core opens one connection at a
+    /// time and sees each in its node list before the next choice; satd's
+    /// dials run in parallel and can outlast a pass, so they count from the
+    /// moment they start.
+    ///
+    /// The dials in flight are read first and their lock held while the
+    /// peers are read. A dial registers its peer (`spawn_peer`) before it
+    /// leaves `pending_connections`, and leaving needs that lock, so every
+    /// dial is seen in one list or the other. Two separate reads could miss
+    /// one that completed between them. The order, `pending_connections`
+    /// then `peers`, is the one `connect_outbound_inner` takes them in.
+    fn outbound_netgroups(&self) -> HashSet<Vec<u8>> {
+        let ips: Vec<IpAddr> = {
+            let pending = self.pending_connections.read();
+            let peers = self.peers.read();
+            peers
+                .values()
+                .filter(|h| {
+                    matches!(
+                        h.info.conn_type,
+                        ConnType::Manual | ConnType::OutboundFullRelay | ConnType::BlockRelay
+                    ) && h.info.state != PeerState::Disconnected
+                        && h.info.onion_host.is_none()
+                })
+                .map(|h| h.info.addr.ip())
+                .chain(pending.iter().map(|a| a.ip()))
+                .collect()
+        };
+        ips.into_iter().filter_map(|ip| self.outbound_netgroup(ip)).collect()
+    }
+
+    /// Disconnect one surplus outbound full-relay peer, if there are more
+    /// than the automatic target: Core's `EvictExtraOutboundPeers` (v31.1
+    /// `src/net_processing.cpp:5264`). Returns the peer disconnected.
+    ///
+    /// satd raises its full-relay target from 8 to 64 during initial block
+    /// download and had nothing to bring the count back down, so a node kept
+    /// the connections it reached until those peers dropped them. Core
+    /// targets 8 whatever its sync state and goes above it only for the extra
+    /// peer it tries on a stale tip, which this function removes there.
+    ///
+    /// One peer per call, as in Core, so a node leaving IBD sheds its surplus
+    /// over several reconnect ticks instead of all at once. The peer is the
+    /// one that least recently announced a block with more work than our
+    /// tip, the newer connection on a tie. Never one of:
+    /// - a manual or block-relay-only connection (only full-relay peers are
+    ///   candidates);
+    /// - a peer protected by the chain-sync rule (`chain_sync_protect`);
+    /// - the only manual or full-relay connection on its network.
+    ///
+    /// When some candidates share a network group with another outbound
+    /// peer, one of those goes first. Core needs no such step, since its dial
+    /// rule keeps every outbound peer in a group of its own; surplus peers
+    /// satd connected during IBD can share one.
+    ///
+    /// If the chosen peer has been connected for less than
+    /// [`MINIMUM_CONNECT_TIME_SECS`] or has blocks in flight, nothing is
+    /// disconnected this time, as in Core.
+    fn evict_extra_outbound_peer(&self) -> Option<PeerId> {
+        struct Outbound {
+            id: PeerId,
+            ip: IpAddr,
+            conn_type: ConnType,
+            connected: bool,
+            network: &'static str,
+            last_block_announcement: u64,
+            protected: bool,
+            conn_secs: u64,
+        }
+        let target = self.automatic_outbound_target();
+        // A snapshot, so the address book is not read with `peers` held.
+        let outbound: Vec<Outbound> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| {
+                matches!(
+                    h.info.conn_type,
+                    ConnType::Manual | ConnType::OutboundFullRelay | ConnType::BlockRelay
+                ) && h.info.state != PeerState::Disconnected
+            })
+            .map(|h| Outbound {
+                id: h.info.id,
+                ip: h.info.addr.ip(),
+                conn_type: h.info.conn_type,
+                connected: h.info.state == PeerState::Connected,
+                network: h.info.network(),
+                last_block_announcement: h.info.last_block_announcement,
+                protected: h.info.chain_sync_protect,
+                conn_secs: h
+                    .info
+                    .conn_time
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            })
+            .collect();
+        // Core's `GetExtraFullOutboundCount`: full-relay peers past the
+        // handshake.
+        let full_relay = outbound
+            .iter()
+            .filter(|p| p.conn_type == ConnType::OutboundFullRelay && p.connected)
+            .count();
+        if full_relay <= target {
+            return None;
+        }
+        // Core's `MultipleManualOrFullOutboundConns`, per network.
+        let mut per_network: HashMap<&'static str, usize> = HashMap::new();
+        for p in outbound.iter().filter(|p| p.conn_type != ConnType::BlockRelay) {
+            *per_network.entry(p.network).or_default() += 1;
+        }
+        let groups: Vec<Option<Vec<u8>>> = outbound
+            .iter()
+            .map(|p| if p.network == "onion" { None } else { self.outbound_netgroup(p.ip) })
+            .collect();
+        let shares_group = |i: usize| {
+            groups[i]
+                .as_ref()
+                .is_some_and(|g| groups.iter().filter(|o| o.as_ref() == Some(g)).count() > 1)
+        };
+        let candidates: Vec<usize> = (0..outbound.len())
+            .filter(|&i| {
+                let p = &outbound[i];
+                p.conn_type == ConnType::OutboundFullRelay
+                    && p.connected
+                    && !p.protected
+                    && per_network.get(p.network).copied().unwrap_or(0) > 1
+            })
+            .collect();
+        let duplicates: Vec<usize> = candidates.iter().copied().filter(|&i| shares_group(i)).collect();
+        let pool = if duplicates.is_empty() { &candidates } else { &duplicates };
+        let worst = pool
+            .iter()
+            .map(|&i| &outbound[i])
+            .min_by(|a, b| {
+                a.last_block_announcement
+                    .cmp(&b.last_block_announcement)
+                    .then(b.id.cmp(&a.id))
+            })?;
+        let id = worst.id;
+
+        let now = crate::time::now_secs();
+        let blocks_in_flight = self
+            .in_flight_blocks
+            .read()
+            .get(&id)
+            .is_some_and(|asked| asked.values().any(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
+            || self.ibd.read().as_ref().is_some_and(|s| s.peer_inflight_count(id) > 0);
+        if now.saturating_sub(worst.conn_secs) <= MINIMUM_CONNECT_TIME_SECS || blocks_in_flight {
+            tracing::debug!(
+                "keeping outbound peer={id} chosen for eviction (connect time: {}, blocks in flight: {blocks_in_flight})",
+                worst.conn_secs
+            );
+            return None;
+        }
+        let last = worst.last_block_announcement;
+        let handle = self.peers.write().remove(&id)?;
+        // Signal, as `disconnect_by_id` does, so the socket closes now.
+        handle.disconnect.notify_one();
+        drop(handle);
+        tracing::debug!(
+            "disconnecting extra outbound peer={id} (last block announcement received at time {last})"
+        );
+        self.handle_peer_disconnected(id);
+        Some(id)
     }
 
     /// Dial `target` for the reconnect loop in a task of its own, holding the
@@ -5416,6 +5664,7 @@ impl PeerManager {
         // header it sent, already known or not.
         if let Some(last) = headers.last() {
             self.note_block_availability(id, &last.block_hash());
+            self.note_header_announcement(id, &last.block_hash(), accepted > 0);
         }
         if let Some(e) = err {
             match e {
@@ -5596,6 +5845,51 @@ impl PeerManager {
         if let Some(entry) = self.chain_state.get_block_index(hash) {
             self.note_peer_height(id, entry.height);
             self.maybe_send_sendheaders(id, &entry);
+        }
+    }
+
+    /// The part of Core's `UpdatePeerStateForReceivedHeaders` (v31.1
+    /// `src/net_processing.cpp:2907`) the surplus-outbound trim
+    /// ([`Self::evict_extra_outbound_peer`]) reads, for a `headers` message or
+    /// the header of a `cmpctblock` whose last header is `last`:
+    /// - a new header with more work than our tip stamps the peer's
+    ///   `last_block_announcement`;
+    /// - an outbound full-relay peer whose chain has at least our tip's work
+    ///   is protected (`chain_sync_protect`), while fewer than
+    ///   [`MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT`] peers are.
+    ///
+    /// Core compares the peer's best known block; satd keeps that only as a
+    /// height, so the header just received stands in for it. That header
+    /// has no more work than the best known block, so a peer protected here
+    /// would be protected by Core too.
+    fn note_header_announcement(&self, id: PeerId, last: &bitcoin::BlockHash, received_new_header: bool) {
+        let Some(entry) = self.chain_state.get_block_index(last) else {
+            return;
+        };
+        let Some(tip) = self.chain_state.get_block_index(&self.chain_state.tip_hash()) else {
+            return;
+        };
+        let cmp = crate::chain::state::compare_u256(&entry.chainwork, &tip.chainwork);
+        let announced = received_new_header && cmp > 0;
+        let may_protect = cmp >= 0;
+        if !announced && !may_protect {
+            return;
+        }
+        let mut peers = self.peers.write();
+        let protected = peers.values().filter(|h| h.info.chain_sync_protect).count();
+        let Some(handle) = peers.get_mut(&id) else {
+            return;
+        };
+        if announced {
+            handle.info.last_block_announcement = crate::time::now_secs();
+        }
+        if may_protect
+            && handle.info.conn_type == ConnType::OutboundFullRelay
+            && !handle.info.chain_sync_protect
+            && protected < MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT
+        {
+            handle.info.chain_sync_protect = true;
+            tracing::debug!("Protecting outbound peer={id} from eviction");
         }
     }
 
@@ -8944,13 +9238,14 @@ impl PeerManager {
             self.maybe_send_getheaders(id);
             return None;
         }
-        match self.chain_state.accept_header(header) {
+        let new_header = match self.chain_state.accept_header(header) {
             Ok(_) => {
                 self.apply_header_row_changes();
                 let htip = self.chain_state.headers_tip_height() as u64;
                 self.headers_tip.store(htip, Ordering::Relaxed);
+                true
             }
-            Err(crate::chain::state::ChainError::Duplicate) => {}
+            Err(crate::chain::state::ChainError::Duplicate) => false,
             Err(crate::chain::state::ChainError::PrevBlockNotFound) => {
                 self.maybe_send_getheaders(id);
                 return None;
@@ -8959,13 +9254,14 @@ impl PeerManager {
                 tracing::debug!(id, %hash, error = %e, "ignoring cmpctblock with an invalid header");
                 return None;
             }
-        }
+        };
         // A high-bandwidth peer announces with `cmpctblock` instead of
         // `headers` (BIP 152), so this is the only place the announcement is
         // seen. Without it the peer stays pinned at whatever height its last
         // `headers` message left it at and the scheduler stops asking it for
         // anything.
         self.note_block_availability(id, &hash);
+        self.note_header_announcement(id, &hash, new_header);
         self.chain_state.get_block_index(&hash)
     }
 
