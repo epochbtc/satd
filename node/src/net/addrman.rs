@@ -253,6 +253,14 @@ impl AddrMan {
         (self.group_fn)(addr.ip())
     }
 
+    /// The network group of `ip` under the active group function (the /16
+    /// or /32, or the ASN under `-asmap`): Core's `NetGroupManager::GetGroup`,
+    /// which the outbound dial rule uses as well as the bucketing. An
+    /// IPv4-mapped IPv6 address is grouped as the IPv4 address it carries.
+    pub fn group_key(&self, ip: IpAddr) -> Vec<u8> {
+        (self.group_fn)(ip.to_canonical())
+    }
+
     fn new_count_in_group(&self, group: &[u8]) -> usize {
         // Uses the cached `e.group` rather than re-running `group_fn`, so
         // this stays a cheap byte-slice comparison even under `-asmap`.
