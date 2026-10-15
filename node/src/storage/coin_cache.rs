@@ -1275,6 +1275,15 @@ impl CoinCache {
                         .block_index_puts
                         .retain(|(h, _)| !superseded.contains(h));
                 }
+                // Same for filter rows. The filter backfill writes here, and
+                // the live connect path may still hold a pending row for the
+                // same height whose header chained off the all-zero fallback
+                // (the rows below it did not exist yet). Left in place, that
+                // row shadowed the backfill's in reads and the next flush
+                // wrote it back over the backfill's, breaking the BIP 157
+                // header chain from that height on.
+                #[cfg(feature = "block-filter-index")]
+                self.drop_pending_filter_rows_superseded_by(&pass_through);
                 self.inner.write_batch_recoverable(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
@@ -1337,6 +1346,40 @@ enum PendingTxLoc {
 }
 
 impl CoinCache {
+    /// Drop the pending filter rows a pass-through batch supersedes, before
+    /// that batch is written to the backing store. The pass-through write is
+    /// the newer one for every key it carries, so the rule is
+    /// last-writer-wins by `(filter_type, height)`, as `StoreBatch::merge`
+    /// applies between pending batches: a filter put replaces a pending
+    /// filter put, a header put a pending header put, a put cancels a
+    /// pending remove, and a remove drops both pending puts.
+    #[cfg(feature = "block-filter-index")]
+    fn drop_pending_filter_rows_superseded_by(&self, pass_through: &StoreBatch) {
+        use node_filter_index::FilterKey;
+        use std::collections::HashSet;
+        if pass_through.filter_puts.is_empty()
+            && pass_through.filter_header_puts.is_empty()
+            && pass_through.filter_removes.is_empty()
+        {
+            return;
+        }
+        let filter_puts: HashSet<FilterKey> =
+            pass_through.filter_puts.iter().map(|r| r.key).collect();
+        let header_puts: HashSet<FilterKey> =
+            pass_through.filter_header_puts.iter().map(|r| r.key).collect();
+        let removes: HashSet<FilterKey> = pass_through.filter_removes.iter().copied().collect();
+        let mut pending = self.pending_batch.lock();
+        pending
+            .filter_puts
+            .retain(|r| !filter_puts.contains(&r.key) && !removes.contains(&r.key));
+        pending
+            .filter_header_puts
+            .retain(|r| !header_puts.contains(&r.key) && !removes.contains(&r.key));
+        pending
+            .filter_removes
+            .retain(|k| !filter_puts.contains(k) && !header_puts.contains(k));
+    }
+
     fn pending_tx_loc(&self, txid: &Txid) -> PendingTxLoc {
         let pending = self.pending_batch.lock();
         if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
@@ -2282,6 +2325,16 @@ impl Store for CoinCache {
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
         self.inner.mark_block_filter_index_complete()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        self.inner.filter_header_chain_checked()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        self.inner.mark_filter_header_chain_checked()
     }
 
     // BIP 352 SP-index forwarders. Always compiled (the SP index follows
