@@ -710,3 +710,7 @@ fn debug_delay_ms() -> u64 {
 #[cfg(test)]
 #[path = "runner_indexgate_tests.rs"]
 mod indexgate_tests;
+
+#[cfg(test)]
+#[path = "runner_filtertail_tests.rs"]
+mod filtertail_tests;

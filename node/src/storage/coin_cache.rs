@@ -1275,7 +1275,7 @@ impl CoinCache {
                         .block_index_puts
                         .retain(|(h, _)| !superseded.contains(h));
                 }
-                self.inner.write_batch_recoverable(pass_through, mode)?;
+                self.write_pass_through(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
                 pending.block_index_puts.extend(batch.block_index_puts);
@@ -1337,6 +1337,59 @@ enum PendingTxLoc {
 }
 
 impl CoinCache {
+    /// Write a pass-through batch to the backing store, then drop the
+    /// pending filter rows it supersedes.
+    ///
+    /// The filter backfill and the header chain check write here, while the
+    /// live connect path may still hold a pending row for the same height
+    /// whose header chained off the all-zero fallback (the rows below it did
+    /// not exist yet). Left in place, that row shadowed the newer one in
+    /// reads and the next flush wrote it back over it, breaking the BIP 157
+    /// header chain from that height on.
+    ///
+    /// The rule is last-writer-wins by `(filter_type, height)`, as
+    /// `StoreBatch::merge` applies between pending batches: a filter put
+    /// replaces a pending filter put, a header put a pending header put, a
+    /// put cancels a pending remove, and a remove drops both pending puts.
+    ///
+    /// `pending` is held across the write, as `flush_inner` holds it, and
+    /// rows are dropped only once the write succeeded: a failed write leaves
+    /// pending as it was, and no reader or flush sees the rows in neither
+    /// place.
+    fn write_pass_through(
+        &self,
+        pass_through: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        #[cfg(feature = "block-filter-index")]
+        if !pass_through.filter_puts.is_empty()
+            || !pass_through.filter_header_puts.is_empty()
+            || !pass_through.filter_removes.is_empty()
+        {
+            use node_filter_index::FilterKey;
+            use std::collections::HashSet;
+            let filter_puts: HashSet<FilterKey> =
+                pass_through.filter_puts.iter().map(|r| r.key).collect();
+            let header_puts: HashSet<FilterKey> =
+                pass_through.filter_header_puts.iter().map(|r| r.key).collect();
+            let removes: HashSet<FilterKey> =
+                pass_through.filter_removes.iter().copied().collect();
+            let mut pending = self.pending_batch.lock();
+            self.inner.write_batch_recoverable(pass_through, mode)?;
+            pending
+                .filter_puts
+                .retain(|r| !filter_puts.contains(&r.key) && !removes.contains(&r.key));
+            pending
+                .filter_header_puts
+                .retain(|r| !header_puts.contains(&r.key) && !removes.contains(&r.key));
+            pending
+                .filter_removes
+                .retain(|k| !filter_puts.contains(k) && !header_puts.contains(k));
+            return Ok(());
+        }
+        self.inner.write_batch_recoverable(pass_through, mode)
+    }
+
     fn pending_tx_loc(&self, txid: &Txid) -> PendingTxLoc {
         let pending = self.pending_batch.lock();
         if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
@@ -2284,6 +2337,16 @@ impl Store for CoinCache {
         self.inner.mark_block_filter_index_complete()
     }
 
+    #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        self.inner.filter_header_chain_checked()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        self.inner.mark_filter_header_chain_checked()
+    }
+
     // BIP 352 SP-index forwarders. Always compiled (the SP index follows
     // the address-index model). Without these, the trait defaults
     // (`silent_payment_index_complete` → true, `read_sp_backfill_cursor`
@@ -2502,6 +2565,10 @@ mod electrumbounds_tests;
 #[cfg(test)]
 #[path = "coin_cache_indexgate_tests.rs"]
 mod indexgate_tests;
+
+#[cfg(all(test, feature = "block-filter-index"))]
+#[path = "coin_cache_filtertail_tests.rs"]
+mod filtertail_tests;
 
 #[cfg(test)]
 mod tests {

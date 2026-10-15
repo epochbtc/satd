@@ -229,6 +229,12 @@ const BLOCK_FILTER_INDEX_COMPLETE_KEY: &[u8] = b"block_filter_index.complete";
 /// Updated by `connect_block` only; reorg-disconnect doesn't roll it
 /// back (the active chain's tip is the read-time oracle, the
 /// persisted value is just an upper bound).
+/// Set once the one-time filter header chain check has run on this
+/// datadir (`index::filter::check_filter_header_chain`). Additive, not a
+/// schema step: a binary that does not know it leaves it alone, and one
+/// that does runs the check while it is missing.
+#[cfg(feature = "block-filter-index")]
+const BLOCK_FILTER_HEADER_CHAIN_CHECKED_KEY: &[u8] = b"block_filter_index.header_chain_checked";
 #[cfg(feature = "block-filter-index")]
 const BLOCK_FILTER_INDEX_TIP_HEIGHT_KEY: &[u8] = b"block_filter_index.tip_height";
 // v2: compact varint coins. v3: storage-format cleanup — v1 undo
@@ -3328,6 +3334,28 @@ impl Store for RocksDbStore {
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
         self.write_block_filter_index_complete(true)
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        let Some(cf) = self.db.cf_handle(CF_METADATA) else {
+            return false;
+        };
+        matches!(
+            self.db.get_cf(&cf, BLOCK_FILTER_HEADER_CHAIN_CHECKED_KEY),
+            Ok(Some(v)) if v.first().is_some_and(|b| *b != 0)
+        )
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, BLOCK_FILTER_HEADER_CHAIN_CHECKED_KEY, [1u8])
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {

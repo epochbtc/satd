@@ -488,6 +488,14 @@ impl Store for ControllableStore {
         self.inner.mark_block_filter_index_complete()
     }
     #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        self.inner.filter_header_chain_checked()
+    }
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        self.inner.mark_filter_header_chain_checked()
+    }
+    #[cfg(feature = "block-filter-index")]
     fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
         self.inner.read_filter_backfill_cursor()
     }
