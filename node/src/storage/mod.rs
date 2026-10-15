@@ -1200,6 +1200,22 @@ pub trait Store: Send + Sync {
         ))
     }
 
+    /// True once the stored BIP 157 filter header chain has been checked
+    /// (and repaired where needed) by `check_filter_header_chain`, the
+    /// one-time pass that fixes datadirs a pre-0.6.1 filter backfill left
+    /// with headers chained off zeros. Default: `true`, so a backend without
+    /// the marker never runs the pass.
+    #[cfg(feature = "block-filter-index")]
+    fn filter_header_chain_checked(&self) -> bool {
+        true
+    }
+
+    /// Persist that the filter header chain check has run.
+    #[cfg(feature = "block-filter-index")]
+    fn mark_filter_header_chain_checked(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Read the persisted backfill cursor from metadata. Default: idle.
     fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
         crate::index::address::cursor::BackfillCursor::idle()

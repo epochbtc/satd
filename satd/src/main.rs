@@ -5515,6 +5515,28 @@ async fn filter_backfill_supervisor(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     resume_on_start: bool,
 ) {
+    // One-time repair of a filter header chain a pre-0.6.1 backfill left
+    // broken. Runs before any resumed or newly requested backfill, so the
+    // two never walk at once; a no-op once the datadir has been checked.
+    {
+        let chain = chain.clone();
+        let cfg = cfg.clone();
+        let shutdown = shutdown.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            node::index::filter::check_filter_header_chain(&chain, &cfg, &shutdown)
+        })
+        .await;
+        match checked {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "filter index: header chain check failed");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "filter index: header chain check task panicked");
+            }
+        }
+    }
+
     if resume_on_start {
         tracing::info!("filter-index backfill: auto-resuming from persisted cursor");
         spawn_filter_runner(handle.clone(), chain.clone(), cfg.clone(), shutdown.clone()).await;
