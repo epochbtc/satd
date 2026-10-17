@@ -95,35 +95,103 @@ fn is_p2pk(spk: &Script) -> bool {
         && valid_pubkey_size(&b[1..b.len() - 1])
 }
 
-/// Core's `MatchMultisig`: `OP_m`, then keys of valid size, then `OP_n`
-/// with `n` the number of keys and `m <= n`, then `OP_CHECKMULTISIG` and
-/// nothing after it. Any push form carries a key, as Core's `GetOp` reads
-/// them. rust-bitcoin's `is_multisig` does not check the keys.
-fn match_multisig(spk: &Script) -> bool {
-    use bitcoin::script::Instruction;
-    let small = |op: bitcoin::opcodes::Opcode| match op.to_u8() {
-        n @ 0x51..=0x60 => Some(n - 0x50),
-        _ => None,
-    };
-    let mut it = spk.instructions();
-    let Some(Ok(Instruction::Op(op))) = it.next() else { return false };
-    let Some(required) = small(op) else { return false };
-    let mut keys = 0u8;
-    let n = loop {
-        match it.next() {
-            Some(Ok(Instruction::PushBytes(p))) if valid_pubkey_size(p.as_bytes()) => keys += 1,
-            Some(Ok(Instruction::Op(op))) => match small(op) {
-                Some(n) => break n,
-                None => return false,
-            },
-            _ => return false,
+/// One operation of a script, as Core's `CScript::GetOp` reads it: the
+/// opcode, the data it pushes, and the offset after it. `None` past the end
+/// or on a push that runs off it.
+fn get_op(script: &[u8], pc: usize) -> Option<(u8, &[u8], usize)> {
+    let &op = script.get(pc)?;
+    let mut pc = pc + 1;
+    let len = match op {
+        0x01..=0x4b => usize::from(op),
+        0x4c => {
+            let n = usize::from(*script.get(pc)?);
+            pc += 1;
+            n
         }
+        0x4d => {
+            let n = usize::from(u16::from_le_bytes(script.get(pc..pc + 2)?.try_into().ok()?));
+            pc += 2;
+            n
+        }
+        0x4e => {
+            let n = u32::from_le_bytes(script.get(pc..pc + 4)?.try_into().ok()?) as usize;
+            pc += 4;
+            n
+        }
+        _ => 0,
     };
-    if keys != n || n < required {
+    let data = script.get(pc..pc.checked_add(len)?)?;
+    Some((op, data, pc + len))
+}
+
+/// Core's `CheckMinimalPush`: `data` pushed with the shortest opcode.
+fn is_minimal_push(op: u8, data: &[u8]) -> bool {
+    match data.len() {
+        0 => op == 0x00,
+        1 if (1..=16).contains(&data[0]) => false,
+        1 if data[0] == 0x81 => false,
+        n if n <= 75 => usize::from(op) == n,
+        n if n <= 255 => op == 0x4c,
+        n if n <= 65_535 => op == 0x4d,
+        _ => true,
+    }
+}
+
+/// Core's `GetScriptNumber`: `OP_1`..`OP_16`, or a minimally pushed,
+/// minimally encoded number, in `min..=max`.
+fn script_number(op: u8, data: &[u8], min: i64, max: i64) -> Option<i64> {
+    let n = match op {
+        0x51..=0x60 => i64::from(op - 0x50),
+        0x01..=0x4e => {
+            if !is_minimal_push(op, data) || data.len() > 4 {
+                return None;
+            }
+            // `CScriptNum(data, fRequireMinimal = true)`.
+            if let Some(&last) = data.last()
+                && last & 0x7f == 0
+                && (data.len() <= 1 || data[data.len() - 2] & 0x80 == 0)
+            {
+                return None;
+            }
+            let mut v: i64 = 0;
+            for (i, &b) in data.iter().enumerate() {
+                v |= i64::from(b) << (8 * i);
+            }
+            match data.last() {
+                Some(&last) if last & 0x80 != 0 => -(v & !(0x80i64 << (8 * (data.len() - 1)))),
+                _ => v,
+            }
+        }
+        _ => return None,
+    };
+    (min..=max).contains(&n).then_some(n)
+}
+
+/// Core's `MAX_PUBKEYS_PER_MULTISIG`.
+const MAX_PUBKEYS_PER_MULTISIG: i64 = 20;
+
+/// Core's `MatchMultisig`: a count of required signatures, then keys of
+/// valid size, then the count of keys, then `OP_CHECKMULTISIG` and nothing
+/// after it. Each count is `OP_n` or a minimal push (so up to 20 keys), and
+/// any push form carries a key, as Core's `GetOp` reads them.
+/// rust-bitcoin's `is_multisig` does not check the keys, and stops at 16.
+fn match_multisig(spk: &Script) -> bool {
+    let b = spk.as_bytes();
+    if b.last() != Some(&0xae) {
         return false;
     }
-    matches!(it.next(), Some(Ok(Instruction::Op(op))) if op == bitcoin::opcodes::all::OP_CHECKMULTISIG)
-        && it.next().is_none()
+    let Some((op, data, mut pc)) = get_op(b, 0) else { return false };
+    let Some(required) = script_number(op, data, 1, MAX_PUBKEYS_PER_MULTISIG) else { return false };
+    let mut keys = 0i64;
+    let (op, data) = loop {
+        let Some((op, data, next)) = get_op(b, pc) else { return false };
+        pc = next;
+        if !valid_pubkey_size(data) {
+            break (op, data);
+        }
+        keys += 1;
+    };
+    script_number(op, data, required, MAX_PUBKEYS_PER_MULTISIG) == Some(keys) && pc + 1 == b.len()
 }
 
 /// The stack a scriptSig leaves, run with no flags and a checker that fails

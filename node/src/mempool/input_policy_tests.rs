@@ -80,6 +80,40 @@ fn the_spent_output_types_core_solves_are_standard_inputs() {
     }
 }
 
+/// Core's `MatchMultisig` reads each count with `GetScriptNumber`: `OP_n`,
+/// or a minimal push up to 20 keys. A 1-of-17 output is a multisig Core
+/// solves; a non-minimal count, a count past 20, or a key count that does
+/// not match is not.
+#[test]
+fn multisig_counts_up_to_twenty_are_core_multisig() {
+    let multisig = |m: &[u8], keys: usize, n: &[u8]| {
+        let mut v = m.to_vec();
+        for _ in 0..keys {
+            v.extend([0x21, 0x02]);
+            v.extend([5; 32]);
+        }
+        v.extend(n);
+        v.push(0xae);
+        ScriptBuf::from_bytes(v)
+    };
+    let spends = |spk: ScriptBuf| {
+        validate_inputs_standardness(&tx(vec![(ScriptBuf::new(), Witness::new())]), &[out(spk)])
+    };
+    assert_eq!(spends(multisig(&[0x51], 17, &[0x01, 0x11])), Ok(()), "1-of-17");
+    assert_eq!(spends(multisig(&[0x01, 0x11], 20, &[0x01, 0x14])), Ok(()), "17-of-20");
+    assert_eq!(spends(multisig(&[0x51], 16, &[0x60])), Ok(()), "1-of-16");
+    for (bad, why) in [
+        (multisig(&[0x51], 21, &[0x01, 0x15]), "21 keys"),
+        (multisig(&[0x51], 16, &[0x01, 0x10]), "16 pushed, not OP_16"),
+        (multisig(&[0x51], 17, &[0x02, 0x11, 0x00]), "17 non-minimally encoded"),
+        (multisig(&[0x51], 17, &[0x01, 0x12]), "18 keys claimed, 17 given"),
+        (multisig(&[0x01, 0x12], 17, &[0x01, 0x11]), "18 required of 17"),
+        (multisig(&[0x00], 1, &[0x51]), "0 required"),
+    ] {
+        assert_eq!(spends(bad), Err("input 0 script unknown".to_string()), "{why}");
+    }
+}
+
 #[test]
 fn an_unknown_spent_script_is_nonstandard() {
     let t = tx(vec![(ScriptBuf::new(), Witness::new()), (ScriptBuf::new(), Witness::new())]);
