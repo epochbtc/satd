@@ -690,6 +690,10 @@ pub struct Config {
     /// before the node trusts it as the best header for `-assumevalid` and
     /// header announcements. `None` keeps the network's default.
     pub minimumchainwork: Option<[u8; 32]>,
+    /// Core's `-bytespersigop` (default 20): the vbytes each unit of sigop
+    /// cost counts as when the mempool prices a transaction
+    /// (`GetSigOpsAdjustedWeight`). Startup only, as in Core.
+    pub bytespersigop: u32,
     /// Core's `-peertimeout`, seconds: how long a new connection has to
     /// finish its handshake before the inactivity check drops it. Default 60.
     pub peertimeout: i64,
@@ -3126,6 +3130,19 @@ impl Config {
             None => None,
         };
 
+        let bytespersigop = match cli
+            .policy_size_args
+            .bytespersigop
+            .clone()
+            .or_else(|| file_get("bytespersigop").map(|v| v.trim().to_string()))
+        {
+            Some(v) => v
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("invalid bytespersigop {v:?}: expected a non-negative integer"))?,
+            None => node::mempool::policy::DEFAULT_BYTES_PER_SIGOP,
+        };
+
         let peertimeout = match cli.peertimeout {
             Some(v) => v,
             None => match file_get("peertimeout") {
@@ -4155,6 +4172,7 @@ impl Config {
             mempoolexpiry,
             maxtipage,
             minimumchainwork,
+            bytespersigop,
             peertimeout,
             persistmempool: cli
                 .persistmempool
@@ -5974,6 +5992,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub chain_work_args: ChainWorkArgs,
 
+    /// `-bytespersigop`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
+    #[command(flatten)]
+    pub policy_size_args: PolicySizeArgs,
+
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
@@ -7372,6 +7395,52 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
     }
 }
 
+/// Bitcoin Core's `-bytespersigop` (see [`CliArgs::policy_size_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct PolicySizeArgs {
+    pub bytespersigop: Option<String>,
+}
+
+/// Help text is Core's own (v31.1 `src/init.cpp`).
+const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
+    "bytespersigop",
+    "N",
+    StratumArgKind::Text,
+    "Equivalent bytes per sigop in transactions for relay and mining (default: 20)",
+)];
+
+impl clap::Args for PolicySizeArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in POLICY_SIZE_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for PolicySizeArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { bytespersigop: m.remove_one("bytespersigop") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// Bitcoin Core's `-minimumchainwork` (see [`CliArgs::chain_work_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChainWorkArgs {
@@ -8128,6 +8197,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mempoolexpiry",
         "maxtipage",
         "minimumchainwork",
+        "bytespersigop",
         "peertimeout",
         "cjdnsreachable",
         "persistmempool",
@@ -8932,6 +9002,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mempoolexpiry",
     "maxtipage",
     "minimumchainwork",
+    "bytespersigop",
     "peertimeout",
     "cjdnsreachable",
     "persistmempool",
@@ -9857,6 +9928,10 @@ mod minchainwork_tests;
 #[cfg(test)]
 #[path = "config_onlynet_tests.rs"]
 mod onlynet_tests;
+
+#[cfg(test)]
+#[path = "config_bytespersigop_tests.rs"]
+mod bytespersigop_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11446,6 +11521,7 @@ testactivationheight=bip34@2
             signetchallenge: Vec::new(),
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
+            policy_size_args: PolicySizeArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -11764,6 +11840,7 @@ testactivationheight=bip34@2
             signetchallenge: Vec::new(),
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
+            policy_size_args: PolicySizeArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),

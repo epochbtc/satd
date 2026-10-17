@@ -200,12 +200,12 @@ fn ancestor_aggregate(
         return (0, 0);
     };
     let mut fee = effective_fee(root);
-    let mut weight = root.weight as u64;
+    let mut weight = root.adjusted_weight();
     let anc = ancestor_set(txid, entries, anc_memo);
     for a in &anc {
         if let Some(e) = entries.get(a) {
             fee = fee.saturating_add(effective_fee(e));
-            weight = weight.saturating_add(e.weight as u64);
+            weight = weight.saturating_add(e.adjusted_weight());
         }
     }
     (fee, weight)
@@ -272,7 +272,7 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
         for t in &group {
             if let Some(e) = remaining.get(t) {
                 group_fee = group_fee.saturating_add(effective_fee(e));
-                group_weight = group_weight.saturating_add(e.weight as u64);
+                group_weight = group_weight.saturating_add(e.adjusted_weight());
                 group_sigops = group_sigops.saturating_add(e.sigop_cost);
             }
         }
@@ -373,7 +373,7 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
     let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
     for entry in entries.values() {
         let rate =
-            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.weight as u64);
+            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.adjusted_weight());
         // Drop into the highest bucket whose boundary is ≤ rate.
         let mut idx: Option<usize> = None;
         for (i, b) in bounds_kvb.iter().enumerate() {
@@ -384,7 +384,7 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
             }
         }
         if let Some(i) = idx {
-            weights[i] = weights[i].saturating_add(entry.weight as u64);
+            weights[i] = weights[i].saturating_add(entry.adjusted_weight());
         }
     }
     bounds_kvb
@@ -408,7 +408,7 @@ pub fn estimate_from_mempool(
     n_blocks: usize,
 ) -> MempoolEstimate {
     let entries: HashMap<Txid, MempoolEntry> = snapshot.into_iter().collect();
-    let mempool_weight: u64 = entries.values().map(|e| e.weight as u64).sum();
+    let mempool_weight: u64 = entries.values().map(|e| e.adjusted_weight()).sum();
     let histogram = build_histogram(&entries);
 
     let mut remaining = entries;

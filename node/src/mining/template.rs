@@ -627,7 +627,10 @@ fn select_transactions(
         let e = &entries[i].1;
         Package {
             fee: (e.fee as i64).saturating_add(e.fee_delta).max(0) as u64,
-            weight: e.weight as u64,
+            // Core's adjusted weight ranks the package and is what the block
+            // limit test adds (`TestChunkBlockLimits`); the block's running
+            // total below adds each transaction's own weight, as Core's does.
+            weight: e.adjusted_weight(),
             sigops: e.sigop_cost,
         }
     };

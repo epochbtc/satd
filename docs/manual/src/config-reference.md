@@ -284,6 +284,7 @@ startup error.
 | `rebroadcastinterval` | 0 (auto) | hot | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers take it (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time; the pending set is persisted in `mempool.dat` so it also survives restarts. A SIGHUP interval change applies after the in-flight sleep completes. |
 | `broadcastconfirmpeers` | 1 | hot | satd | Distinct peer IPs that must take a locally-broadcast tx before it counts as propagated and rebroadcast stops. A peer takes a tx by fetching it via `getdata` (the primary signal) or announcing it back via `inv`. Counted per IP, not per connection, so a reconnecting host is one witness. Raising it demands wider observed propagation before retries stop. |
 | `permitbaremultisig` | on | hot | core | Allow bare multisig outputs. |
+| `bytespersigop` | 20 | restart | core | Vbytes charged per unit of sigop cost when the mempool and block template price a transaction: its size is the larger of its vsize and its sigop cost times this. |
 | `acceptnonstdtxn` | off | hot | core | Relay and accept non-standard transactions (bypass the standardness relay checks: oversize, dust, OP_RETURN/datacarrier, non-standard scripts). Consensus rules are never relaxed. Intended for test/dev networks. |
 
 ## Esplora
@@ -550,7 +551,7 @@ warning names the satd equivalent where one exists. This covers the long tail:
 | `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the option has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
 | `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
-| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
+| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)
 

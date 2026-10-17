@@ -1962,6 +1962,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         if config.network == bitcoin::Network::Regtest { config.blockversion } else { None },
     );
 
+    // Core's `nBytesPerSigOp`, process-wide, before anything is priced.
+    node::mempool::policy::set_bytes_per_sigop(config.bytespersigop);
     let mempool = Arc::new(Mempool::with_config(reload::mempool_config_from(&config)));
 
     // Transaction-filtering policy ruleset (opt-in via `policyfile`). Compiled

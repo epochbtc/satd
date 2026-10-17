@@ -85,6 +85,34 @@ pub fn weight_to_vsize(weight: u64) -> u64 {
     weight.div_ceil(4)
 }
 
+/// Core's `DEFAULT_BYTES_PER_SIGOP`: the vbytes `-bytespersigop` charges a
+/// transaction for each unit of sigop cost.
+pub const DEFAULT_BYTES_PER_SIGOP: u32 = 20;
+
+static BYTES_PER_SIGOP: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_BYTES_PER_SIGOP);
+
+/// Set `-bytespersigop` (Core's `nBytesPerSigOp`, a process-wide setting
+/// read at startup). Call before the mempool admits anything.
+pub fn set_bytes_per_sigop(bytes: u32) {
+    BYTES_PER_SIGOP.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `-bytespersigop` in force.
+pub fn bytes_per_sigop() -> u32 {
+    BYTES_PER_SIGOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Core's `GetSigOpsAdjustedWeight`: a transaction's weight, or its sigop
+/// cost times `-bytespersigop` when that is more. Every feerate and size the
+/// mempool and the block template work with is this, so a transaction dense
+/// in signature checks pays for the block space its sigops take: a block
+/// can hold 80000 sigop cost and 4M weight. Only the block's own weight
+/// limit and the RPCs' `weight` read the transaction's weight itself.
+pub fn sigops_adjusted_weight(weight: u64, sigop_cost: u64) -> u64 {
+    weight.max(sigop_cost.saturating_mul(u64::from(bytes_per_sigop())))
+}
+
 /// Fee rate in sat/kvB (sat per 1000 *virtual* bytes), matching Bitcoin Core's
 /// `CFeeRate`. Fee rates throughout satd are sat/kvB and MUST be derived from
 /// virtual size, not raw weight: weight ≈ 4× vsize, so dividing a fee by weight

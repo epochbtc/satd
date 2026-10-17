@@ -538,6 +538,15 @@ pub struct MempoolEntry {
     pub quarantine_rule: Option<String>,
 }
 
+impl MempoolEntry {
+    /// Core's `GetAdjustedWeight`: [`policy::sigops_adjusted_weight`] of
+    /// this entry. `weight` is the transaction's own weight; this is the
+    /// size every feerate and pool size uses.
+    pub fn adjusted_weight(&self) -> u64 {
+        policy::sigops_adjusted_weight(self.weight as u64, self.sigop_cost)
+    }
+}
+
 impl crate::events::publisher::MempoolTweakSource for Mempool {
     fn cached_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
         self.cached_sp_tweak(txid)
@@ -1434,7 +1443,9 @@ impl AcceptedMember {
         entry: &MempoolEntry,
         admission: Admission,
     ) -> Self {
-        let weight = entry.weight as u64;
+        // The sigop-adjusted weight: `submitpackage` reports Core's
+        // `GetTxSize` as `vsize`, and the subpackage feerate is over it.
+        let weight = entry.adjusted_weight();
         Self {
             wtxid,
             txid,
@@ -2147,7 +2158,7 @@ impl Mempool {
                 relay: e.scope.relay,
                 template: e.scope.template,
                 time: e.time,
-                vsize: policy::weight_to_vsize(e.weight as u64),
+                vsize: policy::weight_to_vsize(e.adjusted_weight()),
                 fee: e.fee,
                 fee_rate: e.fee_rate,
             })
@@ -2188,7 +2199,7 @@ impl Mempool {
             relay: e.scope.relay,
             template: e.scope.template,
             time: e.time,
-            vsize: policy::weight_to_vsize(e.weight as u64),
+            vsize: policy::weight_to_vsize(e.adjusted_weight()),
             weight: e.weight as u64,
             fee: e.fee,
             fee_rate: e.fee_rate,
@@ -2481,7 +2492,7 @@ impl Mempool {
                     std_enter.push(StdEnter {
                         txid: *txid,
                         fee: e.fee,
-                        vsize: policy::weight_to_vsize(e.weight as u64),
+                        vsize: policy::weight_to_vsize(e.adjusted_weight()),
                         fee_rate: e.fee_rate,
                         time: e.time,
                         raw_tx: self.raw_tx_for_event(&e.tx),
@@ -2604,14 +2615,18 @@ impl Mempool {
         Ok(())
     }
 
-    /// Core's `MAX_STANDARD_TX_SIGOPS_COST` (16000), on the cost Core's
-    /// `GetTransactionSigOpCost` gives under the standard flags.
-    fn check_sigop_cost(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), MempoolError> {
-        let cost = crate::validation::sigops::transaction_sigop_cost(
+    /// The sigop cost Core's `GetTransactionSigOpCost` gives under the
+    /// standard flags.
+    fn sigop_cost_of(tx: &Transaction, prev_outputs: &[TxOut]) -> u64 {
+        crate::validation::sigops::transaction_sigop_cost(
             tx,
             prev_outputs,
             crate::validation::sigops::SigOpFlags::P2shWitness,
-        );
+        )
+    }
+
+    /// Core's `MAX_STANDARD_TX_SIGOPS_COST` (16000).
+    fn check_sigop_cost(cost: u64) -> Result<(), MempoolError> {
         if cost > super::input_policy::MAX_STANDARD_TX_SIGOPS_COST {
             return Err(MempoolError::TooManySigops(cost));
         }
@@ -3035,6 +3050,12 @@ impl Mempool {
         // CPFP: build full ancestor set (transitive) and enforce limits
         Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
+        // Core's sigop-adjusted weight (`-bytespersigop`): the size every
+        // feerate from here on charges. The cap on the cost itself comes
+        // later, where Core checks it.
+        let sigop_cost = Self::sigop_cost_of(&tx, &prev_outputs);
+        let adj_weight = policy::sigops_adjusted_weight(weight as u64, sigop_cost);
+
         // RBF: every replacement rule, shared with `test_accept` so the two
         // cannot answer differently. See `rbf_check`.
         if !conflicts.is_empty() {
@@ -3049,7 +3070,7 @@ impl Mempool {
                 &cfg,
                 &tx,
                 &txid,
-                weight as u64,
+                adj_weight,
                 new_fee,
                 &conflicts,
                 &ancestors,
@@ -3101,7 +3122,7 @@ impl Mempool {
         // Core's `MAX_STANDARD_TX_SIGOPS_COST`, after `PreCheckEphemeralTx`.
         // Not gated on `require_standard`: `-acceptnonstdtxn` does not lift
         // it, and no `allow` rule forgives it.
-        Self::check_sigop_cost(&tx, &prev_outputs)?;
+        Self::check_sigop_cost(sigop_cost)?;
 
         // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
         //
@@ -3112,7 +3133,7 @@ impl Mempool {
         // `testmempoolaccept` and `sendrawtransaction` disagreed about a
         // prioritised transaction — one of #660's bullets.
         let effective_fee = modified_fee(fee, fee_delta);
-        let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight as u64);
+        let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, adj_weight);
         // Core's `CheckFeeRate`: the rolling minimum a full pool raised comes
         // first, then the static relay floor.
         let acting_bytes = inner.acting_bytes();
@@ -3122,14 +3143,14 @@ impl Mempool {
             cfg.max_size_bytes,
             cfg.incremental_relay_fee,
         );
-        let required = policy::fee_for_rate(min_fee, weight as u64);
+        let required = policy::fee_for_rate(min_fee, adj_weight);
         if required > 0 && effective_fee < required {
             return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
         }
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(
                 effective_fee,
-                policy::fee_for_rate(cfg.min_fee_rate, weight as u64),
+                policy::fee_for_rate(cfg.min_fee_rate, adj_weight),
             ));
         }
 
@@ -3418,8 +3439,7 @@ impl Mempool {
         let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
             self.spend_record(cfg.prevout_meta, &tx, &prev_outputs);
 
-        let entry_weight_u64 = weight as u64;
-        let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
+        let vsize_u64 = policy::weight_to_vsize(adj_weight);
         // Apply any pre-set `prioritisetransaction` delta for this txid.
         let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         // A quarantined admission emits no `Enter`, so it needs no copy.
@@ -4237,7 +4257,7 @@ impl Mempool {
     /// An entry's virtual size as Core reports it (`GetVirtualTransactionSize`,
     /// src/policy/policy.cpp): its weight divided by four, rounded up.
     fn entry_vsize(entry: &MempoolEntry) -> usize {
-        policy::weight_to_vsize(entry.weight as u64) as usize
+        policy::weight_to_vsize(entry.adjusted_weight()) as usize
     }
 
     /// Estimated heap memory one entry occupies, for `getmempoolinfo.usage`.
@@ -4654,7 +4674,7 @@ impl Mempool {
                 }
                 standalone_ancestors.push(FeeFrac::new(
                     modified_fee(ue.fee, ue.fee_delta) as i64,
-                    vsize_of(ue.weight as u64),
+                    vsize_of(ue.adjusted_weight()),
                 ));
             }
         }
@@ -4668,7 +4688,7 @@ impl Mempool {
                     && let Some(ae) = inner.entries.get(anc_txid)
                 {
                     anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
-                    anc_weight_total += ae.weight as u64;
+                    anc_weight_total += ae.adjusted_weight();
                 }
             }
             let ancestor_feerate =
@@ -4678,7 +4698,7 @@ impl Mempool {
                 if let Some(ce) = inner.entries.get(conflict_txid) {
                     let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
                         modified_fee(ce.fee, ce.fee_delta),
-                        ce.weight as u64,
+                        ce.adjusted_weight(),
                     );
                     if effective_feerate <= conflict_mod_feerate {
                         return Err(MempoolError::DoesNotImproveFeerateDiagram(
@@ -4711,13 +4731,13 @@ impl Mempool {
                     .map(|pe| {
                         FeeFrac::new(
                             modified_fee(pe.fee, pe.fee_delta) as i64,
-                            vsize_of(pe.weight as u64),
+                            vsize_of(pe.adjusted_weight()),
                         )
                     });
                 Some(crate::mempool::feefrac::EvictedTx {
                     individual: FeeFrac::new(
                         modified_fee(entry.fee, entry.fee_delta) as i64,
-                        vsize_of(entry.weight as u64),
+                        vsize_of(entry.adjusted_weight()),
                     ),
                     parent,
                     has_descendant,
@@ -4747,7 +4767,7 @@ impl Mempool {
                 if let Some(pe) = inner.entries.get(&p) {
                     new_chunks.push(FeeFrac::new(
                         modified_fee(pe.fee, pe.fee_delta) as i64,
-                        vsize_of(pe.weight as u64),
+                        vsize_of(pe.adjusted_weight()),
                     ));
                 }
             }
@@ -4770,7 +4790,7 @@ impl Mempool {
             .iter()
             .filter(|anc| !all_evicted.contains(*anc))
             .filter_map(|anc| inner.entries.get(anc))
-            .map(|ae| FeeFrac::new(modified_fee(ae.fee, ae.fee_delta) as i64, vsize_of(ae.weight as u64)))
+            .map(|ae| FeeFrac::new(modified_fee(ae.fee, ae.fee_delta) as i64, vsize_of(ae.adjusted_weight())))
             .collect();
         parents.sort_by(|a, b| feerate_compare(*a, *b));
         let mut chunk = individual;
@@ -5342,6 +5362,10 @@ impl Mempool {
         // `sendrawtransaction`.
         Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
+        // Core's sigop-adjusted weight, as on admission.
+        let sigop_cost = Self::sigop_cost_of(tx, &prev_outputs);
+        let weight_u64 = policy::sigops_adjusted_weight(weight as u64, sigop_cost);
+
         // RBF: the same `rbf_check` `accept_transaction` runs, so
         // `testmempoolaccept` and `sendrawtransaction` cannot disagree.
         if !conflicts.is_empty() {
@@ -5352,7 +5376,7 @@ impl Mempool {
                 &cfg,
                 tx,
                 &txid,
-                weight as u64,
+                weight_u64,
                 new_fee,
                 &conflicts,
                 &ancestors,
@@ -5363,7 +5387,7 @@ impl Mempool {
         // `prioritisetransaction` delta counts toward the min-relay gate, so
         // `testmempoolaccept` answers what `sendrawtransaction` would do.
         // `inner` and `cfg` are already held above — do not re-acquire them.
-        let weight_u64 = weight as u64;
+        // `vsize` is Core's `GetTxSize`, the sigop-adjusted one.
         let vsize = policy::weight_to_vsize(weight_u64) as usize;
         let priority_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
 
@@ -5376,7 +5400,7 @@ impl Mempool {
             Self::check_spend_standardness(tx, &prev_outputs)?;
             Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
         }
-        Self::check_sigop_cost(tx, &prev_outputs)?;
+        Self::check_sigop_cost(sigop_cost)?;
 
         let effective_fee = modified_fee(fee, priority_delta);
         let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight_u64);
@@ -5528,31 +5552,27 @@ impl Mempool {
         tx: &Transaction,
         chain_state: &ChainState,
         pkg_tx_map: &HashMap<Txid, &Transaction>,
-    ) -> Option<u64> {
-        let mut sum_in: u64 = 0;
+    ) -> Option<(u64, u64)> {
+        let mut prev_outputs = Vec::with_capacity(tx.input.len());
         for input in &tx.input {
-            let value = if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                coin.amount
+            let prev = if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                TxOut { value: bitcoin::Amount::from_sat(coin.amount), script_pubkey: coin.script_pubkey }
             } else if let Some(parent) = pkg_tx_map.get(&input.previous_output.txid) {
-                parent
-                    .output
-                    .get(input.previous_output.vout as usize)?
-                    .value
-                    .to_sat()
+                parent.output.get(input.previous_output.vout as usize)?.clone()
             } else {
                 let inner = self.inner.read();
                 let entry = inner.entries.get(&input.previous_output.txid)?;
-                entry
-                    .tx
-                    .output
-                    .get(input.previous_output.vout as usize)?
-                    .value
-                    .to_sat()
+                entry.tx.output.get(input.previous_output.vout as usize)?.clone()
             };
-            sum_in = sum_in.saturating_add(value);
+            prev_outputs.push(prev);
         }
+        let sum_in: u64 = prev_outputs.iter().map(|o| o.value.to_sat()).fold(0, u64::saturating_add);
         let sum_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        Some(sum_in.saturating_sub(sum_out))
+        let adj_weight = policy::sigops_adjusted_weight(
+            tx.weight().to_wu(),
+            Self::sigop_cost_of(tx, &prev_outputs),
+        );
+        Some((sum_in.saturating_sub(sum_out), adj_weight))
     }
 
     /// Core's `PreCheckEphemeralTx` (`src/policy/ephemeral_policy.cpp`).
@@ -5698,15 +5718,14 @@ impl Mempool {
                 }
                 // Unknowable fee (an input resolves nowhere) — acceptance will
                 // refuse it for that instead, and with a better reason.
-                let Some(base_fee) = self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
+                let Some((base_fee, adj_weight)) = self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
                 else {
                     continue;
                 };
                 let delta = self.inner.read().fee_deltas.get(&ptx.txid).copied().unwrap_or(0);
-                let rate = policy::fee_rate_sat_per_kvb(
-                    modified_fee(base_fee, delta),
-                    ptx.tx.weight().to_wu(),
-                );
+                // Core's `CFeeRate(ws.m_modified_fees, ws.m_vsize)`: the
+                // sigop-adjusted size.
+                let rate = policy::fee_rate_sat_per_kvb(modified_fee(base_fee, delta), adj_weight);
                 if rate > limit {
                     over_maxfeerate.insert(ptx.txid);
                     tx_results.insert(
@@ -6392,7 +6411,7 @@ impl Mempool {
         Some(MempoolEvent::Enter {
             txid: *txid,
             fee: entry.fee,
-            vsize: policy::weight_to_vsize(entry.weight as u64),
+            vsize: policy::weight_to_vsize(entry.adjusted_weight()),
             fee_rate_sat_per_kvb: entry.fee_rate,
             time: entry.time,
             mempool_sequence,
@@ -6619,7 +6638,8 @@ impl Mempool {
             Self::check_standardness(&tx, &cfg, weight)?;
             Self::check_spend_standardness(&tx, &prev_outputs)?;
         }
-        Self::check_sigop_cost(&tx, &prev_outputs)?;
+        let sigop_cost = Self::sigop_cost_of(&tx, &prev_outputs);
+        Self::check_sigop_cost(sigop_cost)?;
 
         // Script verification, consensus then policy, as in
         // `accept_transaction`; a consensus failure is named once the pool is
@@ -6633,7 +6653,7 @@ impl Mempool {
             return Err(MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(&tx)));
         }
 
-        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+        let fee_rate = policy::fee_rate_sat_per_kvb(fee, policy::sigops_adjusted_weight(weight as u64, sigop_cost));
 
         // The same sigop cost and prevout metadata `accept_transaction`
         // records. A zero cost here let the block template count this entry
@@ -6753,7 +6773,7 @@ impl Mempool {
                 std::cmp::Reverse((
                     policy::fee_rate_sat_per_kvb(
                         modified_fee(entry.fee, entry.fee_delta),
-                        entry.weight as u64,
+                        entry.adjusted_weight(),
                     ),
                     *txid,
                 ))
@@ -6810,7 +6830,7 @@ impl Mempool {
                     .iter()
                     .filter_map(|t| inner.entries.get(t))
                     .fold((0u64, 0u64), |(f, w), e| {
-                        (f + modified_fee(e.fee, e.fee_delta), w + e.weight as u64)
+                        (f + modified_fee(e.fee, e.fee_delta), w + e.adjusted_weight())
                     });
                 let removed = policy::fee_rate_sat_per_kvb(fees, weight) + incremental_relay_fee;
                 inner.rolling.lock().package_removed(removed);
@@ -7275,6 +7295,10 @@ mod sigops_tests;
 #[cfg(test)]
 #[path = "pool_policy_tests.rs"]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "pool_sigopsize_tests.rs"]
+mod sigopsize_tests;
 
 #[cfg(test)]
 #[path = "pool_fullpool_tests.rs"]
