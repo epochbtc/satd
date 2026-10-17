@@ -2146,6 +2146,18 @@ impl PeerManager {
         self.addrman.read().is_empty()
     }
 
+    /// Whether the address book holds an address on a reachable network
+    /// (`-onlynet`). The seeding decisions read this rather than
+    /// [`Self::addrman_is_empty`]: a book of addresses the node will never
+    /// dial, such as a clearnet `peers.dat` on a node restarted with
+    /// `-onlynet=onion`, is no reason to skip the seeds. Core adds its fixed
+    /// seeds for each reachable network its address book has nothing on
+    /// (`ThreadOpenConnections`, `src/net.cpp`).
+    pub fn addrman_has_reachable(&self) -> bool {
+        let reachable = *self.reachable.read();
+        self.addrman.read().iter().any(|e| reachable.contains_socket(&e.addr))
+    }
+
     /// A copy of every address-book entry, for `getnodeaddresses`.
     pub fn addrman_snapshot(&self) -> Vec<crate::net::addrman::AddrEntry> {
         self.addrman.read().iter().cloned().collect()
