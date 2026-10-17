@@ -36,6 +36,9 @@ item below is (or will be) written up in full in the in-development
   finality, coinbase height and `CheckTransaction` before a block is written,
   as in Core's `AcceptBlockHeader` and `AcceptBlock`; they were checked only
   for blocks arriving outside initial block download, or only at connect.
+- A node that caught up through its parallel block download never announced
+  the tip it reached, so a peer that does not poll for headers, as Core does
+  not, stayed behind until the next block; the tip is now announced.
 
 ## Releases
 
