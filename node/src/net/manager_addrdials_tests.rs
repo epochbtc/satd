@@ -702,3 +702,36 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
     assert!(pm.learned_addrs.read().contains(&fresh));
     assert_eq!(pm.addrman.read().len(), full);
 }
+
+/// Under `-onlynet`, an automatic dial and a gossiped address both need a
+/// reachable network (Core's `g_reachable_nets`); a manual peer does not.
+/// Perturbation: drop the reachability test from `may_dial` and the IPv6
+/// address is dialable; drop it from `add_learned_addr_from` and it is
+/// learned.
+#[test]
+fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
+    use crate::net::reachable::ReachableNets;
+    let (pm, _dir) = mk_pm();
+    pm.set_reachable(ReachableNets { ipv4: true, ipv6: false, onion: false, cjdns: false, cjdns_flip: false });
+    let source = IpAddr::from([198, 51, 100, 1]);
+    let v4 = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let v6: SocketAddr = "[2001:4860::7]:8333".parse().unwrap();
+
+    pm.add_learned_addr_from(v4, 9, source);
+    pm.add_learned_addr_from(v6, 9, source);
+    assert!(pm.learned_addrs.read().contains(&v4));
+    assert!(!pm.learned_addrs.read().contains(&v6), "an unreachable network's address is not kept");
+    assert!(!pm.addrman.read().contains(&v6));
+
+    assert!(pm.may_dial(&v4));
+    assert!(!pm.may_dial(&v6), "no automatic dial to an unreachable network");
+    pm.manual_addrs.write().insert(v6);
+    assert!(pm.may_dial(&v6), "-onlynet does not affect manual connections");
+
+    // Seeds go through the same gate, and onion candidates need onion.
+    let v6b: SocketAddr = "[2001:4860::8]:8333".parse().unwrap();
+    pm.add_learned_peer_addr(&PeerAddr::Socket(v6b));
+    assert!(!pm.learned_addrs.read().contains(&v6b));
+    pm.add_learned_peer_addr(&PeerAddr::Onion { host: "a".repeat(56) + ".onion", port: 8333 });
+    assert!(pm.connect_peer_addrs.read().is_empty(), "onion is not reachable");
+}

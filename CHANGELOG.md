@@ -31,6 +31,10 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- `-onlynet` restricts automatic outbound connections and kept addresses, with
+  Core's startup refusals; `-proxy` soft-sets `-listen=0`; `-proxy=0` and
+  `-onion=0` are read as Core reads them. **A node with `-proxy` and no explicit
+  `-listen` stops listening.**
 
 ## Releases
 
