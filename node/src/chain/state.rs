@@ -2731,7 +2731,9 @@ impl ChainState {
     }
 
     /// Accept a batch of headers in a single write transaction.
-    /// Returns (accepted_count, last_error). Stops on non-Duplicate errors.
+    /// Returns (accepted_count, error). Stops at the first header refused for
+    /// anything but being known already; the `accepted_count` headers before
+    /// it are committed.
     pub fn accept_headers(
         &self,
         headers: &[bitcoin::block::Header],
@@ -2746,6 +2748,11 @@ impl ChainState {
         let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
         let now = unix_now_secs();
+        // The first header refused. The headers before it in the batch are
+        // still committed, as Core's `ProcessNewBlockHeaders` keeps each
+        // header it accepted before the one that failed: a batch whose last
+        // header is ahead of our clock must not lose the rest.
+        let mut refused: Option<ChainError> = None;
 
         for header in headers {
             let hash = header.block_hash();
@@ -2780,7 +2787,10 @@ impl ChainState {
 
             let parent = match parent {
                 Some(p) => p,
-                None => return (accepted, Some(ChainError::BadPrevBlock)),
+                None => {
+                    refused = Some(ChainError::BadPrevBlock);
+                    break;
+                }
             };
 
             let new_height = parent.height + 1;
@@ -2788,7 +2798,8 @@ impl ChainState {
             // PoW validation, against the network's limit as well as the
             // header's own claim (Core's `CheckProofOfWork` with `powLimit`).
             if let Err(e) = validation::pow::check_proof_of_work_bounded(header, self.network) {
-                return (accepted, Some(e.into()));
+                refused = Some(e.into());
+                break;
             }
 
             // Difficulty check
@@ -2807,7 +2818,8 @@ impl ChainState {
                         .or_else(|| self.store.get_block_index(h))
                 },
             ) {
-                return (accepted, Some(e.into()));
+                refused = Some(e.into());
+                break;
             }
 
             // Time and version, as in `accept_header`. The MTP walk resolves
@@ -2826,7 +2838,8 @@ impl ChainState {
                         .or_else(|| self.store.get_block_index(h))
                 },
             ) {
-                return (accepted, Some(e.into()));
+                refused = Some(e.into());
+                break;
             }
 
             let chainwork = crate::storage::blockindex::add_u256(
@@ -2865,7 +2878,7 @@ impl ChainState {
             return (0, Some(e.into()));
         }
 
-        (accepted, None)
+        (accepted, refused)
     }
 
     /// Run `f` under `accept_lock`, so no block connects or disconnects

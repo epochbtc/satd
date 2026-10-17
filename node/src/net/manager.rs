@@ -6521,8 +6521,15 @@ impl PeerManager {
     /// The `Connect` errors `store_block` can return come from the
     /// transaction rules it checks before writing (`bad-txns-nonfinal`,
     /// `bad-cb-height`, `CheckTransaction`), all verdicts on the block.
+    ///
+    /// `time-too-new` is not: a block ahead of our clock may be fine by the
+    /// sender's, and becomes acceptable with time. Core's
+    /// `MaybePunishNodeForBlock` charges nothing for `BLOCK_TIME_FUTURE`.
     fn store_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
         match e {
+            crate::chain::state::ChainError::Validation(
+                crate::validation::ValidationError::TimeTooNew,
+            ) => false,
             crate::chain::state::ChainError::Validation(_)
             | crate::chain::state::ChainError::CheckpointMismatch(_) => true,
             crate::chain::state::ChainError::Connect(ce) => ce.is_verdict_on_block(),

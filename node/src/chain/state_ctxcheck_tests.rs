@@ -119,6 +119,34 @@ fn accept_headers_judges_time_against_the_batchs_own_ancestors() {
     let err = err.expect("the third is time-too-old");
     assert!(is_validation(&err, validation::ValidationError::TimeTooOld), "got {err:?}");
     assert!(cs.get_block_index(&h3.block_hash()).is_none());
+    // The two accepted before it are committed, not dropped with the batch.
+    // Perturbation: return on the refusal without committing, and this fails.
+    for h in [&h1, &h2] {
+        assert_eq!(
+            cs.get_block_index(&h.block_hash()).map(|e| e.status),
+            Some(BlockStatus::HeaderOnly),
+            "a header accepted before the refused one must be indexed"
+        );
+    }
+    assert_eq!(cs.best_header_hash(), h2.block_hash());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch whose last header is ahead of the clock keeps the rest: an honest
+/// peer whose clock runs fast must not stop header sync at its last batch.
+#[test]
+fn accept_headers_keeps_the_prefix_of_a_batch_ending_ahead_of_the_clock() {
+    let (cs, dir) = make_chain_state();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let h1 = build_test_block(genesis, 1, BASE + 600);
+    let ahead = crate::time::now_secs() as u32 + 2 * 60 * 60 + 60;
+    let h2 = build_test_block(h1.block_hash(), 2, ahead);
+    let (accepted, err) = cs.accept_headers(&[h1.header, h2.header]);
+    assert_eq!(accepted, 1);
+    assert!(err.is_some_and(|e| is_validation(&e, validation::ValidationError::TimeTooNew)));
+    assert!(cs.get_block_index(&h1.block_hash()).is_some(), "h1 must be committed");
+    assert!(cs.get_block_index(&h2.block_hash()).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
