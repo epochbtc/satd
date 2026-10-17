@@ -31,6 +31,8 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- A coin or undo record with a ten-byte varint that does not fit in 64 bits is
+  now refused as corrupt instead of decoding to a truncated value (#975).
 
 ## Releases
 
