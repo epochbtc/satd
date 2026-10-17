@@ -265,9 +265,11 @@ blockstream.info and mempool.space within these constraints:
   `/tx/:txid/outspends` return exactly the objects they did before,
   `txid` and `status` fields included. Nothing on the Esplora wire
   carries an ordinal.
-- **WebSocket** subscriptions are not implemented; SSE is the supported
-  live-updates transport. Most consumers (BDK, the mempool.space SDK) accept
-  SSE as a drop-in replacement.
+- **WebSocket** subscriptions are not implemented; SSE is satd's
+  live-updates transport. BDK's Esplora client polls over HTTP and needs
+  neither. Clients built on the mempool.space WebSocket (`/api/v1/ws`), such
+  as the mempool.space JS client's live updates, need adapting to SSE: it is
+  not a drop-in replacement for them.
 - **High-history scripts.** `/address/:addr/txs/chain[/:cursor]` and the
   confirmed part of `/address/:addr/txs` (with or without `?after_txid=`) read
   the history from the cursor down and stop once the page is complete, so a

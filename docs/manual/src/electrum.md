@@ -118,8 +118,10 @@ exactly as in the Electrum protocol.
 
 ## Subscriptions
 
-Two long-lived push subscriptions are supported, both counted against
-`--electrummaxsubsperconn`:
+Two long-lived push subscriptions are supported. Only
+`blockchain.scripthash.subscribe` is counted against
+`--electrummaxsubsperconn`; `blockchain.headers.subscribe` is one per
+connection whatever the cap:
 
 - `blockchain.headers.subscribe`: a `blockchain.headers.subscribe`
   notification on every new tip.
