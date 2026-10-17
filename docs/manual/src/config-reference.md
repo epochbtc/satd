@@ -212,7 +212,7 @@ startup error.
 | `fixedseeds` | true | restart | core | Allow the compiled-in fixed-seed fallback. |
 | `bantime` | 86400 | hot | core | Ban duration in seconds. |
 | `timeout` | 5000 ms | hot | core | P2P connection timeout in milliseconds (accepts `5s`/`5000ms`). |
-| `onlynet` | all | restart | core | Make automatic outbound connections only to these networks (repeatable): `ipv4`, `ipv6`, `onion`, `cjdns`, `i2p`. Gossiped addresses on other networks are not kept. Inbound and manual connections (`connect`, `addnode`, `seednode`) are not affected. Refused at startup as in Core: an unknown name; `onion` with none of `proxy`, `onion` or `listenonion`, or with `onion=0`; `cjdns` without `cjdnsreachable`; `i2p` (satd has no I2P transport). |
+| `onlynet` | all | restart | core | Make automatic outbound connections only to these networks (repeatable): `ipv4`, `ipv6`, `onion`, `cjdns`, `i2p`. Gossiped addresses on other networks are not kept. Inbound and manual connections (`connect`, `addnode`, `seednode`) are not affected. Refused at startup as in Core: an unknown name; `onion` with neither `proxy` nor `onion` (Core also takes `listenonion`; satd cannot reach Tor through it), or with `onion=0`; `cjdns` without `cjdnsreachable`; `i2p` (satd has no I2P transport). |
 | `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
 | `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). Without it satd runs the default signet and verifies every block against its challenge. |
 

@@ -923,6 +923,8 @@ pub struct PeerManager {
     /// addresses are kept from (Core's `g_reachable_nets`, from `-onlynet`).
     /// See [`crate::net::reachable`].
     reachable: RwLock<crate::net::reachable::ReachableNets>,
+    /// `-onion=0`: no `.onion` connection at all, manual ones included.
+    onion_disabled: std::sync::atomic::AtomicBool,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
     /// `addnode add` (the address a name resolved to), and `-seednode`. The
     /// reconnect loop dials them whatever `automatic_outbound` says, and a
@@ -1301,6 +1303,7 @@ impl PeerManager {
             learned_addrs: RwLock::new(LearnedAddrs::default()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             reachable: RwLock::new(Default::default()),
+            onion_disabled: std::sync::atomic::AtomicBool::new(false),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
@@ -2066,6 +2069,11 @@ impl PeerManager {
     fn may_dial(&self, addr: &SocketAddr) -> bool {
         (self.automatic_outbound.load(Ordering::Relaxed) && self.reachable.read().contains_socket(addr))
             || self.manual_addrs.read().contains(addr)
+    }
+
+    /// `-onion=0`: refuse every `.onion` dial. Called once at startup.
+    pub fn set_onion_disabled(&self, disabled: bool) {
+        self.onion_disabled.store(disabled, Ordering::Relaxed);
     }
 
     /// Set the reachable networks (`-onlynet`). Called once at startup.
@@ -10609,6 +10617,11 @@ impl PeerManager {
     /// Dial a .onion outbound peer through the configured SOCKS5 proxy,
     /// bounded by Core's `-timeout`.
     async fn dial_onion(&self, host: &str, port: u16) -> Result<TcpStream, String> {
+        // `-onion=0` leaves Core with no proxy for `NET_ONION`, so even a
+        // manual `.onion` peer is not dialled through `-proxy`.
+        if self.onion_disabled.load(Ordering::Relaxed) {
+            return Err(".onion connections are disabled (-onion=0)".to_string());
+        }
         let proxy_addr = self
             .onion_proxy
             .as_deref()

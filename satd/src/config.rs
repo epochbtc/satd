@@ -1034,6 +1034,9 @@ pub struct Config {
     /// The networks automatic outbound connections may use, resolved from
     /// `-onlynet` (Core's `g_reachable_nets`).
     pub reachable: node::net::reachable::ReachableNets,
+    /// `-onion=0` (`-noonion`): never connect to `.onion`, not even a
+    /// manual peer through `-proxy`, as in Core (no `NET_ONION` proxy).
+    pub noonion: bool,
     // Mining
     /// `-blockmaxweight`: the cap on a block template's weight, the coinbase
     /// reserve included. Never above `MAX_BLOCK_WEIGHT` (refused at load).
@@ -2711,8 +2714,13 @@ impl Config {
         // `InitParameterInteraction`). A `-bind` / `-whitebind` soft-set
         // `-listen=1` first, and a soft-set never overrides a value already
         // set, so a bind still wins, as in Core.
+        // Logging is not up yet; these join `pending_notes` below.
+        let mut net_notes: Vec<ConfigNote> = Vec::new();
         if !listen_explicit && !binds_requested && proxy.is_some() && listen {
-            tracing::info!("parameter interaction: -proxy set -> setting -listen=0");
+            net_notes.push(ConfigNote {
+                level: NoteLevel::Info,
+                message: "parameter interaction: -proxy set -> setting -listen=0".to_string(),
+            });
             listen = false;
         }
 
@@ -2763,7 +2771,11 @@ impl Config {
             }
             Some(v) => v,
             None if !reachable.clearnet() => {
-                tracing::info!("parameter interaction: -onlynet excludes IPv4 and IPv6 -> setting -dnsseed=0");
+                net_notes.push(ConfigNote {
+                    level: NoteLevel::Info,
+                    message: "parameter interaction: -onlynet excludes IPv4 and IPv6 -> setting -dnsseed=0"
+                        .to_string(),
+                });
                 false
             }
             None => true,
@@ -3893,6 +3905,7 @@ impl Config {
         // --log-format selects the formatter), so direct
         // `tracing::warn!` calls would silently drop on the floor.
         let mut pending_notes: Vec<ConfigNote> = std::mem::take(&mut include_notes);
+        pending_notes.append(&mut net_notes);
         // Resolved in a helper, to keep this function's debug-build stack
         // frame from growing.
         let zmq = resolve_zmq_pub(cli.zmq_pub_args, config_file.as_ref(), section, &file_get)?;
@@ -4330,6 +4343,7 @@ impl Config {
             listenonion,
             onlynet: onlynet_raw,
             reachable,
+            noonion,
             blockmaxweight,
             blockmintxfee,
             blockversion: cli
@@ -7931,6 +7945,16 @@ fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::Re
                  the Tor network is not provided: none of -proxy, -onion or -listenonion is given"
                 .to_string());
         }
+        // Core accepts `-listenonion` alone, because its Tor controller takes
+        // Tor's SOCKS port from the control connection and makes onion
+        // reachable later. satd's does not, so the node would have no
+        // outbound transport at all; refuse it instead (CORE_DIFFERENCES.md).
+        if nets.onion && !onion_proxy {
+            return Err("Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching \
+                 the Tor network is not provided: neither -proxy nor -onion is given (satd does not take \
+                 the proxy from the Tor control port, so -listenonion alone cannot reach Tor)"
+                .to_string());
+        }
         if i2p {
             return Err("Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
                 .to_string());
@@ -7939,8 +7963,9 @@ fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::Re
     if !i.cjdnsreachable_set {
         nets.cjdns = false;
     }
-    // Core removes onion when there is no onion proxy and no -listenonion.
-    if !onion_proxy && !i.listenonion {
+    // Without an onion proxy onion is not reachable (Core removes it, and
+    // satd cannot add it back later from the Tor control port).
+    if !onion_proxy {
         nets.onion = false;
     }
     Ok(nets)

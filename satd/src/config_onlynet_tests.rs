@@ -56,10 +56,27 @@ fn onlynet_onion_without_a_tor_proxy_is_refused() {
              is explicitly forbidden: -onion=0"
         )
     );
-    // Any of the three is enough.
+    // A proxy for Tor is enough.
     assert!(load("onlynet=onion\nproxy=127.0.0.1:9050\n", &[]).is_ok());
     assert!(load("onlynet=onion\nonion=127.0.0.1:9050\n", &[]).is_ok());
-    assert!(load("onlynet=onion\nlistenonion=1\n", &[]).is_ok());
+    // Core also accepts -listenonion alone, taking Tor's SOCKS port from the
+    // control connection later. satd cannot, so it refuses rather than start
+    // with no outbound transport. Perturbation: drop that check and this
+    // loads.
+    let err = load("onlynet=onion\nlistenonion=1\n", &[]).expect_err("no outbound transport");
+    assert!(err.contains("satd does not take the proxy from the Tor control port"), "{err}");
+}
+
+/// `-onion=0` keeps `.onion` out of reach even with `-proxy` (Core has no
+/// `NET_ONION` proxy then), and is carried to the dialer.
+#[test]
+fn onion_zero_makes_onion_unreachable_whatever_the_proxy() {
+    let c = load("proxy=127.0.0.1:9050\nonion=0\n", &[]).unwrap();
+    assert!(c.noonion);
+    assert!(!c.reachable.onion);
+    assert_eq!(c.onion, None);
+    let c = load("proxy=127.0.0.1:9050\n", &[]).unwrap();
+    assert!(!c.noonion && c.reachable.onion);
 }
 
 #[test]
