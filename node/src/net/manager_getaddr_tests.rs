@@ -181,3 +181,23 @@ fn externals_are_advertised_to_outbound_peers_on_their_family() {
     let _o = add_peer(&pm, onion);
     assert!(pm.self_advertise_externals(2).is_none(), "nothing clearnet to an onion peer");
 }
+
+/// A block-relay-only link carries no address traffic, so neither our
+/// `-externalip` addresses nor our onion go out on one (Core's
+/// `SetupAddressRelay`).
+#[test]
+fn nothing_is_self_advertised_to_a_block_relay_only_peer() {
+    let (pm, _dir) = mk_pm();
+    pm.external_addrs.write().push(SocketAddr::from(([203, 0, 113, 50], 8333)));
+    *pm.advertised_onion.write() = Some(PeerAddr::Onion { host: "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion".to_string(), port: 8333 });
+    let mut full = peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound);
+    full.wants_addrv2 = true;
+    let _f = add_peer(&pm, full);
+    let mut blocks_only = peer(2, SocketAddr::from(([198, 51, 100, 8], 8333)), Direction::Outbound);
+    blocks_only.wants_addrv2 = true;
+    blocks_only.conn_type = ConnType::BlockRelay;
+    let _b = add_peer(&pm, blocks_only);
+    assert!(pm.self_advertise_externals(1).is_some() && pm.self_advertise_addrv2(1).is_some());
+    assert!(pm.self_advertise_externals(2).is_none(), "no -externalip on a block-relay-only link");
+    assert!(pm.self_advertise_addrv2(2).is_none(), "no onion on a block-relay-only link");
+}
