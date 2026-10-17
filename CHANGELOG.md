@@ -31,6 +31,11 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- Header timestamps (median time past, two hours ahead) and minimum block
+  versions are checked on every header and block-store path, and transaction
+  finality, coinbase height and `CheckTransaction` before a block is written,
+  as in Core's `AcceptBlockHeader` and `AcceptBlock`; they were checked only
+  for blocks arriving outside initial block download, or only at connect.
 
 ## Releases
 

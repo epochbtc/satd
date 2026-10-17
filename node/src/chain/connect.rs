@@ -296,6 +296,162 @@ pub fn check_block_version(
     Ok(())
 }
 
+/// The header rules of Core's `ContextualCheckBlockHeader` that need only
+/// the block's height and its parent's median time past: `time-too-old` and
+/// `bad-version(0x…)`. `median_time_past` is the MTP of the block's parent
+/// (the value [`get_median_time_past`] returns for `height`).
+///
+/// Header acceptance and both block-store paths apply these before a block is
+/// indexed, through [`check_header_context`]. `connect_block` repeats them, so
+/// that every connect path enforces them: a block indexed by a reindex scan,
+/// or by a satd from before header acceptance applied them, would otherwise
+/// connect without them.
+pub(crate) fn check_header_time_and_version(
+    header: &bitcoin::block::Header,
+    height: u32,
+    median_time_past: u32,
+    network: Network,
+) -> Result<(), crate::validation::ValidationError> {
+    if header.time <= median_time_past {
+        return Err(crate::validation::ValidationError::TimeTooOld);
+    }
+    check_block_version(header, height, network)
+}
+
+/// Core's `ContextualCheckBlockHeader` beyond the difficulty bits, for a
+/// header at `height` whose parent is `parent`: `time-too-old` against the
+/// parent's MTP, `time-too-new` against `now`, and `bad-version(0x…)`.
+///
+/// `get_by_hash` resolves the parent's ancestors by hash, so the MTP is the
+/// header's own branch's (see [`crate::validation::pow::median_time_past_of`]).
+/// Callers check the difficulty bits first, as Core does. Returns the
+/// parent's MTP, which the block-store paths go on to use for finality.
+pub(crate) fn check_header_context<G>(
+    header: &bitcoin::block::Header,
+    parent: &BlockIndexEntry,
+    height: u32,
+    network: Network,
+    now: u64,
+    get_by_hash: G,
+) -> Result<u32, crate::validation::ValidationError>
+where
+    G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
+{
+    let mtp = crate::validation::pow::median_time_past_of(parent, get_by_hash);
+    check_header_time_and_version(header, height, mtp, network)
+        .and_then(|()| crate::validation::pow::check_future_timestamp(header, now))
+        .inspect_err(|e| {
+            // Core logs every refusal here with this line, and its
+            // functional tests (`feature_dersig`, `feature_cltv`) read it to
+            // tell a block refused for its header from one refused for its
+            // content.
+            tracing::debug!(
+                "AcceptBlockHeader: Consensus::ContextualCheckBlockHeader: {}, {e}",
+                header.block_hash()
+            );
+        })?;
+    Ok(mtp)
+}
+
+/// The time a block's transactions' locktimes are measured against (Core's
+/// `nLockTimeCutoff` in `ContextualCheckBlock`): the parent's median time
+/// past once BIP 113 is active, the block's own timestamp before.
+pub(crate) fn lock_time_cutoff(
+    height: u32,
+    median_time_past: u32,
+    block_time: u32,
+    network: Network,
+) -> u32 {
+    if height >= bip113_activation_height(network) {
+        median_time_past
+    } else {
+        block_time
+    }
+}
+
+/// The per-transaction rules a block's transactions must meet before any of
+/// their inputs are looked at: Core's `CheckTransaction` (from `CheckBlock`),
+/// and from `ContextualCheckBlock` finality (`bad-txns-nonfinal`) and the
+/// BIP 34 coinbase height (`bad-cb-height`).
+///
+/// `connect_block` runs this for each transaction as it connects it, and
+/// [`check_block_context`] runs it for the whole block before the block is
+/// written.
+pub(crate) fn check_transaction_context(
+    tx: &Transaction,
+    height: u32,
+    lock_time_cutoff: u32,
+    network: Network,
+) -> Result<(), ConnectError> {
+    // Context-free transaction checks
+    check_transaction(tx)?;
+
+    // Finality (Core: `ContextualCheckBlock` → `IsFinalTx`). Applies to
+    // every transaction in the block — the coinbase included; Core's
+    // loop runs over all of `block.vtx`, and a coinbase with an
+    // unsatisfied locktime and a non-final sequence is a consensus
+    // reject (`bad-txns-nonfinal`). A transaction is final iff its
+    // locktime is zero, its locktime is *strictly* below the cutoff —
+    // the block's own height for height locktimes; MTP (or, before
+    // BIP 113 activation, the block's timestamp) for time locktimes —
+    // or every input's sequence is SEQUENCE_FINAL, which disables
+    // locktime entirely. Both inequalities are strict in Core
+    // (`nLockTime < nBlockHeight` / `< nBlockTime`): a locktime equal
+    // to the cutoff is NOT final.
+    let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
+    if !is_final {
+        let locktime = tx.lock_time.to_consensus_u32();
+        if locktime > 0 {
+            if locktime < 500_000_000 {
+                // Height-based locktime: final only strictly below the
+                // connecting height.
+                if locktime >= height {
+                    return Err(ConnectError::LocktimeNotFinal);
+                }
+            } else if locktime >= lock_time_cutoff {
+                // Time-based locktime
+                return Err(ConnectError::LocktimeNotFinal);
+            }
+        }
+    }
+
+    // BIP 34: the coinbase scriptSig starts with exactly
+    // `CScript() << nHeight`, Core's minimal encoding. Core compares the
+    // bytes, not the decoded number, so a non-minimal push of the right
+    // height is `bad-cb-height` too.
+    if tx.is_coinbase()
+        && height >= bip34_activation_height(network)
+        && !tx.input[0]
+            .script_sig
+            .as_bytes()
+            .starts_with(&crate::validation::block::bip34_height_prefix(height))
+    {
+        return Err(ConnectError::BadCoinbaseHeight);
+    }
+    Ok(())
+}
+
+/// [`check_transaction_context`] for every transaction of `block` at
+/// `height`, whose parent's median time past is `median_time_past`.
+///
+/// This is the part of Core's `CheckBlock` and `ContextualCheckBlock` that
+/// `validation::block::check_block` leaves out, and Core runs all of it in
+/// `AcceptBlock` before `WriteBlock`. The block-store paths run it before
+/// writing, so a block that breaks these rules is refused with Core's reason
+/// rather than written to disk and judged only if it is ever connected.
+pub(crate) fn check_block_context(
+    block: &Block,
+    height: u32,
+    median_time_past: u32,
+    network: Network,
+) -> Result<(), ConnectError> {
+    let cutoff = lock_time_cutoff(height, median_time_past, block.header.time, network);
+    block
+        .txdata
+        .iter()
+        .try_for_each(|tx| check_transaction_context(tx, height, cutoff, network))
+}
+
 /// Whether BIP 30 (no overwriting an unspent transaction) must be enforced
 /// for a block at `height`.
 ///
@@ -477,6 +633,13 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
 
+    // `time-too-old` and `bad-version`, for every connect path; see
+    // `check_header_time_and_version`. Genesis has no parent to compare with.
+    if !is_genesis {
+        check_header_time_and_version(&block.header, height, median_time_past, network)?;
+    }
+    let lock_time_cutoff = lock_time_cutoff(height, median_time_past, block.header.time, network);
+
     // The chain-order ordinal this block's first transaction takes.
     // Read here, before the transaction loop, because every index row
     // the loop emits is keyed on `first_txseq + tx_idx`.
@@ -629,58 +792,8 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         // spends it makes — is keyed on it.
         let txseq = first_txseq + tx_idx as u64;
 
-        // Context-free transaction checks
-        check_transaction(tx)?;
-
-        // Finality (Core: `ContextualCheckBlock` → `IsFinalTx`). Applies to
-        // every transaction in the block — the coinbase included; Core's
-        // loop runs over all of `block.vtx`, and a coinbase with an
-        // unsatisfied locktime and a non-final sequence is a consensus
-        // reject (`bad-txns-nonfinal`). A transaction is final iff its
-        // locktime is zero, its locktime is *strictly* below the cutoff —
-        // the block's own height for height locktimes; MTP (or, before
-        // BIP 113 activation, the block's timestamp) for time locktimes —
-        // or every input's sequence is SEQUENCE_FINAL, which disables
-        // locktime entirely. Both inequalities are strict in Core
-        // (`nLockTime < nBlockHeight` / `< nBlockTime`): a locktime equal
-        // to the cutoff is NOT final.
-        let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
-        if !is_final {
-            let locktime = tx.lock_time.to_consensus_u32();
-            if locktime > 0 {
-                if locktime < 500_000_000 {
-                    // Height-based locktime: final only strictly below the
-                    // connecting height.
-                    if locktime >= height {
-                        return Err(ConnectError::LocktimeNotFinal);
-                    }
-                } else {
-                    // Time-based locktime
-                    let time_threshold = if height >= bip113_activation_height(network) {
-                        median_time_past
-                    } else {
-                        block.header.time
-                    };
-                    if locktime >= time_threshold {
-                        return Err(ConnectError::LocktimeNotFinal);
-                    }
-                }
-            }
-        }
-
-        // BIP 34: the coinbase scriptSig starts with exactly
-        // `CScript() << nHeight`, Core's minimal encoding. Core compares the
-        // bytes, not the decoded number, so a non-minimal push of the right
-        // height is `bad-cb-height` too.
-        if is_coinbase
-            && height >= bip34_activation_height(network)
-            && !tx.input[0]
-                .script_sig
-                .as_bytes()
-                .starts_with(&crate::validation::block::bip34_height_prefix(height))
-        {
-            return Err(ConnectError::BadCoinbaseHeight);
-        }
+        // `CheckTransaction`, finality and the BIP 34 coinbase height.
+        check_transaction_context(tx, height, lock_time_cutoff, network)?;
 
         // Spend inputs (skip for coinbase which has no real inputs)
         let mut sum_inputs: u64 = 0;
@@ -2751,7 +2864,9 @@ mod tests {
         // does not.
         let seq = (1u32 << 22) | 8;
         let mtp_block = base_time + 7000;
-        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        let mut block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        // Above the parent's MTP, or the block is `time-too-old`.
+        block.header.time = mtp_block + 1;
         let plan = crate::chain::replay_plan::ReplayPlan::from_hashes(honest);
 
         let address_index = Default::default();
@@ -2845,7 +2960,7 @@ mod tests {
 
         // Time-based BIP68 sequence: bit 22 set, 1 unit (512 seconds)
         let seq = (1u32 << 22) | 1; // time-based, 1 unit = 512s
-        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        let mut block = make_block_spending(outpoint, block_height, 2, seq, 0);
 
         // The connect_block receives MTP for the block (median_time_past param).
         // But BIP68 internally calls get_median_time_past(store, coin.height) for the coin MTP.
@@ -2853,6 +2968,8 @@ mod tests {
         // MTP at block_height=20: timestamps[9..20] = base+900..base+1900
         // sorted = [base+900, base+1000, ..., base+1900], median = timestamps[5] = base+1400
         let mtp_block = base_time + 1400;
+        // Above the parent's MTP, or the block is `time-too-old`.
+        block.header.time = mtp_block + 1;
 
         let result = connect_block(&ConnectParams {
             replay_plan: None,
@@ -2921,7 +3038,9 @@ mod tests {
         let mtp_block = base_time + 50;
 
         let seq = (1u32 << 22) | 1; // time-based, 1 unit = 512s
-        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        let mut block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        // Above the parent's MTP, or the block is `time-too-old`.
+        block.header.time = mtp_block + 1;
 
         let result = connect_block(&ConnectParams {
             replay_plan: None,

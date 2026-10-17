@@ -123,7 +123,9 @@ fn a_replay_plan_that_does_not_reach_the_window_is_an_error() {
 /// one-unit (512 s) BIP 68 time lock, against `store`.
 fn connect_time_locked_spend(store: &InMemoryStore, outpoint: OutPoint, block_mtp: u32) -> Result<StoreBatch, ConnectError> {
     const BLOCK_HEIGHT: u32 = 40;
-    let block = make_block_spending(outpoint, BLOCK_HEIGHT, 2, (1 << 22) | 1, 0);
+    let mut block = make_block_spending(outpoint, BLOCK_HEIGHT, 2, (1 << 22) | 1, 0);
+    // Above the parent's MTP, or the block is `time-too-old`.
+    block.header.time = block_mtp + 1;
     let address_index = Default::default();
     let sp_index = Default::default();
     #[cfg(feature = "block-filter-index")]

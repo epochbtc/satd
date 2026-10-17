@@ -396,6 +396,20 @@ pub fn check_timestamp<G>(
 where
     G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
 {
+    if header.time <= median_time_past_of(prev, get_by_hash) {
+        return Err(ValidationError::TimeTooOld);
+    }
+    Ok(())
+}
+
+/// Core's `GetMedianTimePast` for `prev`: the median of its timestamp and its
+/// ten nearest ancestors' (fewer near genesis, or where `get_by_hash` has no
+/// entry for an ancestor), found by walking parent pointers. See [`check_timestamp`] for why the walk
+/// must not use the height index.
+pub fn median_time_past_of<G>(prev: &BlockIndexEntry, get_by_hash: G) -> u32
+where
+    G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
+{
     const MEDIAN_TIME_SPAN: usize = 11;
 
     let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_SPAN);
@@ -407,19 +421,8 @@ where
         }
         current = get_by_hash(&entry.header.prev_blockhash);
     }
-
-    if timestamps.is_empty() {
-        return Ok(());
-    }
-
     timestamps.sort_unstable();
-    let median = timestamps[timestamps.len() / 2];
-
-    if header.time <= median {
-        return Err(ValidationError::TimeTooOld);
-    }
-
-    Ok(())
+    timestamps[timestamps.len() / 2]
 }
 
 /// Reject a header whose timestamp is more than `MAX_FUTURE_BLOCK_TIME`

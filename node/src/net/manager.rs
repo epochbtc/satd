@@ -5694,6 +5694,15 @@ impl PeerManager {
                     // node with no block source and its sync stopped dead.
                     self.maybe_send_getheaders(id);
                 }
+                // A header more than two hours ahead of our clock may be
+                // fine by the peer's. Core's `MaybePunishNodeForBlock` charges
+                // nothing for `BLOCK_TIME_FUTURE`; the header is simply not
+                // accepted yet.
+                crate::chain::state::ChainError::Validation(
+                    crate::validation::ValidationError::TimeTooNew,
+                ) => {
+                    tracing::debug!(id, "Header rejected: time-too-new");
+                }
                 other => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
                 }
@@ -6508,12 +6517,24 @@ impl PeerManager {
     /// database write, a snapshot load in progress) is this node's, and Core
     /// never charges the sender for it: a failed write ends in `FatalError`
     /// (`validation.cpp`, `AcceptBlock`), not in `Misbehaving`.
+    ///
+    /// The `Connect` errors `store_block` can return come from the
+    /// transaction rules it checks before writing (`bad-txns-nonfinal`,
+    /// `bad-cb-height`, `CheckTransaction`), all verdicts on the block.
+    ///
+    /// `time-too-new` is not: a block ahead of our clock may be fine by the
+    /// sender's, and becomes acceptable with time. Core's
+    /// `MaybePunishNodeForBlock` charges nothing for `BLOCK_TIME_FUTURE`.
     fn store_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
-        matches!(
-            e,
+        match e {
+            crate::chain::state::ChainError::Validation(
+                crate::validation::ValidationError::TimeTooNew,
+            ) => false,
             crate::chain::state::ChainError::Validation(_)
-                | crate::chain::state::ChainError::CheckpointMismatch(_)
-        )
+            | crate::chain::state::ChainError::CheckpointMismatch(_) => true,
+            crate::chain::state::ChainError::Connect(ce) => ce.is_verdict_on_block(),
+            _ => false,
+        }
     }
 
     /// A block's data was stored — clear it from the background download

@@ -267,3 +267,29 @@ async fn a_peer_accepted_on_the_onion_listener_is_marked_inbound_onion() {
         assert_eq!(marked, vec![inbound_onion], "accepted with inbound_onion = {inbound_onion}");
     }
 }
+
+/// A stored block refused as `time-too-new` is not the sender's fault (Core's
+/// `MaybePunishNodeForBlock` charges nothing for `BLOCK_TIME_FUTURE`); the
+/// other refusals `store_block` returns are. Perturbation: drop the
+/// `TimeTooNew` arm and the first assertion fails.
+#[test]
+fn a_block_ahead_of_the_clock_is_not_charged_to_its_sender() {
+    use crate::chain::connect::ConnectError;
+    use crate::chain::state::ChainError;
+    use crate::validation::ValidationError;
+    assert!(!PeerManager::store_error_is_the_blocks(&ChainError::Validation(
+        ValidationError::TimeTooNew
+    )));
+    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Validation(
+        ValidationError::TimeTooOld
+    )));
+    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Connect(
+        ConnectError::LocktimeNotFinal
+    )));
+    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Connect(
+        ConnectError::BadCoinbaseHeight
+    )));
+    assert!(!PeerManager::store_error_is_the_blocks(&ChainError::Connect(
+        ConnectError::Interrupted
+    )));
+}
