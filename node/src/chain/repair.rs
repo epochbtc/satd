@@ -438,13 +438,15 @@ mod tests {
         }
     }
 
-    fn seal(prev_blockhash: BlockHash, txdata: Vec<Transaction>) -> Block {
+    /// A block at `height`, ten minutes after its parent, so every block's
+    /// time is above its parent's median time past.
+    fn seal(prev_blockhash: BlockHash, height: u32, txdata: Vec<Transaction>) -> Block {
         let mut block = Block {
             header: Header {
                 version: bitcoin::block::Version::from_consensus(0x2000_0000),
                 prev_blockhash,
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-                time: 1_700_000_000,
+                time: 1_700_000_000 + 600 * height,
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
@@ -474,7 +476,7 @@ mod tests {
     /// (block1, block2_hash, seeded_outpoint).
     fn populate_holed_store(store: &dyn Store) -> (Block, BlockHash, OutPoint) {
         // Genesis, fully connected and counted.
-        let genesis = seal(BlockHash::all_zeros(), vec![make_coinbase(0, 0)]);
+        let genesis = seal(BlockHash::all_zeros(), 0, vec![make_coinbase(0, 0)]);
         let genesis_hash = genesis.block_hash();
         let mut batch = StoreBatch::default();
         batch.block_index_puts.push((genesis_hash, index_entry(&genesis, 0, BlockStatus::Valid)));
@@ -536,7 +538,7 @@ mod tests {
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
-        let block1 = seal(genesis_hash, vec![make_coinbase(1, 0), spend, chained]);
+        let block1 = seal(genesis_hash, 1, vec![make_coinbase(1, 0), spend, chained]);
         let block1_hash = block1.block_hash();
         let mut batch = StoreBatch::default();
         batch
@@ -553,7 +555,7 @@ mod tests {
         // closed on a missing parent count (that is the fix). What the
         // repair tool faces is a datadir an older binary left behind, so
         // the fixture has to lay those bytes down directly.
-        let block2 = seal(block1_hash, vec![make_coinbase(2, 0)]);
+        let block2 = seal(block1_hash, 2, vec![make_coinbase(2, 0)]);
         let block2_hash = block2.block_hash();
         let cb2_txid = block2.txdata[0].compute_txid();
         let mut batch2 = StoreBatch::default();

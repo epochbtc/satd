@@ -2481,6 +2481,19 @@ impl ChainState {
             |h| self.store.get_block_index(h),
         )?;
 
+        // The rest of Core's `ContextualCheckBlockHeader`: time-too-old,
+        // time-too-new and bad-version. Core applies them in
+        // `AcceptBlockHeader`, so no header that breaks them is indexed; a
+        // block can then never be fetched or connected on such a header.
+        connect::check_header_context(
+            header,
+            &parent,
+            new_height,
+            self.network,
+            unix_now_secs(),
+            |h| self.store.get_block_index(h),
+        )?;
+
         // Store as header-only
         let chainwork =
             crate::storage::blockindex::add_u256(&parent.chainwork, &crate::storage::blockindex::work_for_bits(header.bits));
@@ -2732,6 +2745,7 @@ impl ChainState {
         let mut accepted = 0u32;
         let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
+        let now = unix_now_secs();
 
         for header in headers {
             let hash = header.block_hash();
@@ -2787,6 +2801,25 @@ impl ChainState {
                     // walk-back): in-batch headers (this batch's predecessors)
                     // first, then the store. Parent pointers, not the height
                     // index, keep both on this header's own branch.
+                    batch_index
+                        .get(h)
+                        .cloned()
+                        .or_else(|| self.store.get_block_index(h))
+                },
+            ) {
+                return (accepted, Some(e.into()));
+            }
+
+            // Time and version, as in `accept_header`. The MTP walk resolves
+            // ancestors the same way the difficulty check does: this batch's
+            // predecessors first, then the store.
+            if let Err(e) = connect::check_header_context(
+                header,
+                &parent,
+                new_height,
+                self.network,
+                now,
+                |h| {
                     batch_index
                         .get(h)
                         .cloned()
@@ -4713,6 +4746,62 @@ impl ChainState {
         }
     }
 
+    /// Core's `CheckTransaction` for every transaction, and the finality and
+    /// BIP 34 coinbase-height rules of `ContextualCheckBlock`, for a block
+    /// about to be written ([`connect::check_block_context`]). Core runs both
+    /// in `AcceptBlock` before `WriteBlock`, so a block that breaks them is
+    /// never stored; `connect_block` checks them again when it connects.
+    ///
+    /// A finality or coinbase-height failure is recorded against the block,
+    /// as Core's `AcceptBlock` records a `ContextualCheckBlock` failure
+    /// (`BLOCK_FAILED_VALID`): the merkle root `check_block` has verified
+    /// commits to every byte those rules read, so the verdict is on the block
+    /// the hash names. As for `bad-blk-weight` in `accept_block`, the mark
+    /// lands only on an index row a header announcement left. A
+    /// `CheckTransaction` failure is part of Core's `CheckBlock`, which never
+    /// marks, and is not recorded either.
+    ///
+    /// `holds_accept_lock` says whether the caller holds `accept_lock`, which
+    /// the mark needs.
+    fn check_block_context_before_write(
+        &self,
+        block: &Block,
+        block_hash: &BlockHash,
+        height: u32,
+        median_time_past: u32,
+        holds_accept_lock: bool,
+    ) -> Result<(), ChainError> {
+        let Err(e) = connect::check_block_context(block, height, median_time_past, self.network)
+        else {
+            return Ok(());
+        };
+        if matches!(
+            e,
+            connect::ConnectError::LocktimeNotFinal | connect::ConnectError::BadCoinbaseHeight
+        ) {
+            let mark = || {
+                if self
+                    .store
+                    .get_block_index(block_hash)
+                    .is_some_and(|ex| ex.status == BlockStatus::HeaderOnly)
+                    && let Err(mark_err) = self.mark_subtree_invalid(*block_hash)
+                {
+                    tracing::warn!(
+                        block = %block_hash, error = %mark_err,
+                        "could not mark the refused block invalid"
+                    );
+                }
+            };
+            if holds_accept_lock {
+                mark();
+            } else {
+                let _accept_guard = self.accept_lock.lock();
+                mark();
+            }
+        }
+        Err(e.into())
+    }
+
     /// Store block data to disk without connecting it to the chain.
     /// Used during parallel IBD: blocks arrive out of order and are stored
     /// immediately, then connected sequentially later.
@@ -4767,6 +4856,18 @@ impl ChainState {
             |h| store_ref.get_block_index(h),
         )?;
 
+        // Time and version (Core's `ContextualCheckBlockHeader`). A block
+        // whose header was accepted has passed these already; one stored
+        // without its header announced first has not.
+        let mtp = connect::check_header_context(
+            &block.header,
+            &parent,
+            new_height,
+            self.network,
+            unix_now_secs(),
+            |h| store_ref.get_block_index(h),
+        )?;
+
         // Signet block-solution check (BIP 325): every signet, default or custom.
         self.check_signet_solution(block)?;
 
@@ -4776,6 +4877,10 @@ impl ChainState {
         {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
+
+        // The transaction rules Core checks in `AcceptBlock` before
+        // `WriteBlock`; see `check_block_context_before_write`.
+        self.check_block_context_before_write(block, &block_hash, new_height, mtp, false)?;
 
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
@@ -7430,6 +7535,12 @@ impl ChainState {
             hook(block, new_height);
         }
 
+        // The transaction rules Core checks in `AcceptBlock` before
+        // `WriteBlock`. Without them a side-chain block that breaks them was
+        // written and answered `inconclusive`.
+        let mtp = validation::pow::median_time_past_of(&parent, |h| store_ref.get_block_index(h));
+        self.check_block_context_before_write(block, &block_hash, new_height, mtp, true)?;
+
         // ---- Connect-time validation passed. Write the block data. ----
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
@@ -10071,6 +10182,10 @@ mod consharden_tests;
 #[cfg(test)]
 #[path = "state_chainsel_tests.rs"]
 mod chainsel_tests;
+
+#[cfg(test)]
+#[path = "state_ctxcheck_tests.rs"]
+mod ctxcheck_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
@@ -17733,7 +17848,20 @@ pub(crate) mod tests {
             vout: 7,
         };
         let b23 = build_test_block_timelocked(b_parent, 23, b_times[2], bogus, lock_time);
-        b_parent = cs.accept_block(&b23).expect("store B23 as a side block").hash();
+        // Sent on its own, B23 is refused before it is written, as Core's
+        // `AcceptBlock` refuses it in `ContextualCheckBlock`, and judged
+        // against its own branch's MTP there too.
+        let refused = cs.accept_block(&b23).expect_err("B23 is non-final on its own branch");
+        assert!(
+            refused.to_string().contains("nonfinal"),
+            "refused before the write for its locktime: {refused}"
+        );
+        assert!(cs.get_block_index(&b23.block_hash()).is_none(), "B23 must not be indexed");
+
+        // Index it anyway, as a reindex scan or an older satd could have, so
+        // the reorg path's own MTP is still the thing under test below.
+        store_block_without_connecting(&cs, &b23, 23);
+        b_parent = b23.block_hash();
 
         // B24 gives B more work than A and triggers the reorg, which reconnects
         // B21, B22 and then B23 — where the MTP under test is read.
