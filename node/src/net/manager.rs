@@ -6576,6 +6576,48 @@ impl PeerManager {
         }
     }
 
+    /// Charge for `block`, sent by `sender`, which `accept_block` refused
+    /// with `e`, a verdict ([`Self::block_error_is_the_blocks`]).
+    ///
+    /// The block that failed is not always this one. A block that makes a
+    /// stored side branch the best chain triggers a reorg, which reconnects
+    /// the branch's stored blocks first, and one of those can be the one that
+    /// fails. `mark_subtree_invalid` marks the failing block and everything
+    /// under it, and this block's parent was not marked before the call
+    /// (`accept_block` refuses a child of a marked block as `bad-prevblk`),
+    /// so a marked parent means an ancestor failed. The topmost newly marked
+    /// ancestor is the failing block, and its sender, if recorded when it was
+    /// stored, is charged instead. Otherwise this block failed, and `sender`
+    /// is charged unless the block was rebuilt from a compact block.
+    fn charge_refused_block(
+        &self,
+        block: &bitcoin::Block,
+        sender: PeerId,
+        via_compact: bool,
+        e: &crate::chain::state::ChainError,
+    ) {
+        use crate::storage::blockindex::BlockStatus;
+        let hash = block.block_hash();
+        let invalid = |h: &bitcoin::BlockHash| {
+            self.chain_state.get_block_index(h).is_some_and(|x| x.status == BlockStatus::Invalid)
+        };
+        let mut failed = block.header.prev_blockhash;
+        if !invalid(&failed) {
+            if !via_compact {
+                self.block_sources.lock().take(&hash);
+                self.add_ban_score(sender, BAN_THRESHOLD, &format!("invalid block {hash}: {e}"));
+            }
+            return;
+        }
+        while let Some(parent) = self.chain_state.get_block_index(&failed).map(|x| x.header.prev_blockhash)
+            && invalid(&parent)
+        {
+            failed = parent;
+        }
+        tracing::debug!(%hash, %failed, "refused block's ancestor failed; charging the ancestor's sender");
+        self.punish_block_source(&failed, &e.to_string());
+    }
+
     /// Forget the sender of a block that connected.
     fn forget_block_source(&self, hash: &bitcoin::BlockHash) {
         self.block_sources.lock().take(hash);
@@ -7101,6 +7143,17 @@ impl PeerManager {
                         if let Some(stats) = &sender_stats {
                             stats.record_block();
                         }
+                        // A block stored but not connected is judged only if
+                        // a later reorg reaches it; remember who sent it. A
+                        // block rebuilt from a compact block is not
+                        // recorded, so it is never charged (see
+                        // `IncomingBlock`).
+                        if matches!(acceptance, crate::chain::state::BlockAcceptance::Stored(_))
+                            && !via_compact
+                            && let Some(pm) = peer_manager.upgrade()
+                        {
+                            pm.block_sources.lock().record(hash, sender);
+                        }
                         chain_state.bump_connect_heartbeat();
                         // A successful steady-state connect disproves "the
                         // connector cannot make progress" no matter which
@@ -7202,12 +7255,12 @@ impl PeerManager {
                     Err(e) => {
                         tracing::warn!(%hash, peer = sender, "Block rejected: {}", e);
                         // Core's `MaybePunishNodeForBlock` for a block that
-                        // fails validation (#544).
-                        if !via_compact
-                            && Self::block_error_is_the_blocks(&e)
+                        // fails validation (#544), charged to whoever sent
+                        // the block that failed.
+                        if Self::block_error_is_the_blocks(&e)
                             && let Some(pm) = peer_manager.upgrade()
                         {
-                            pm.add_ban_score(sender, BAN_THRESHOLD, &format!("invalid block {hash}: {e}"));
+                            pm.charge_refused_block(&block, sender, via_compact, &e);
                         }
                     }
                 }
