@@ -31,6 +31,9 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- `getblocktemplate` transactions carry Core's `hash` (wtxid) and `depends`
+  fields; gateways that require them (such as OCEAN's DATUM gateway) refused
+  every non-empty template (#982).
 
 ## Releases
 
