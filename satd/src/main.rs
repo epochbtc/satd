@@ -4439,6 +4439,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // `-connect` (any form) means: dial these and nothing else. Recorded on
     // the manager so gossiped addresses are learned but never dialled.
     peer_manager.set_automatic_outbound(config.automatic_outbound);
+    peer_manager.set_reachable(config.reachable);
 
     // Connect to configured peers (and register for auto-reconnect).
     //

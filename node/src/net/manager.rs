@@ -922,6 +922,10 @@ pub struct PeerManager {
     learned_addrs: RwLock<LearnedAddrs>,
     /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
     automatic_outbound: std::sync::atomic::AtomicBool,
+    /// The networks automatic outbound connections may use, and gossiped
+    /// addresses are kept from (Core's `g_reachable_nets`, from `-onlynet`).
+    /// See [`crate::net::reachable`].
+    reachable: RwLock<crate::net::reachable::ReachableNets>,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
     /// `addnode add` (the address a name resolved to), and `-seednode`. The
     /// reconnect loop dials them whatever `automatic_outbound` says, and a
@@ -1303,6 +1307,7 @@ impl PeerManager {
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
             learned_addrs: RwLock::new(LearnedAddrs::default()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
+            reachable: RwLock::new(Default::default()),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
@@ -1981,6 +1986,13 @@ impl PeerManager {
         // address on the dial list, past the bounds the book keeps. An
         // address the book already holds is pushed again; the list holds
         // each address once.
+        // Core keeps only addresses on a reachable network (`vAddrOk` in
+        // `ProcessMessage`, `g_reachable_nets.Contains`): under `-onlynet` a
+        // node does not fill its book with addresses it will never dial.
+        if !self.reachable.read().contains_socket(&addr) {
+            tracing::debug!(%addr, "Ignoring a gossiped address on a network -onlynet leaves out");
+            return;
+        }
         {
             let mut book = self.addrman.write();
             if !book.admits(&addr) {
@@ -2011,7 +2023,7 @@ impl PeerManager {
     pub fn add_learned_peer_addr(&self, addr: &PeerAddr) {
         match addr {
             PeerAddr::Socket(sa) => {
-                if self.addrman.read().admits(sa) {
+                if self.reachable.read().contains_socket(sa) && self.addrman.read().admits(sa) {
                     self.push_learned(*sa);
                 }
             }
@@ -2054,9 +2066,19 @@ impl PeerManager {
     /// Explicit operator lists are unaffected: `-connect=<addr>`, `-addnode`
     /// and `-seednode` all register in `manual_addrs`, and Core dials those
     /// under `-connect` too.
+    ///
+    /// An automatic dial also needs `addr`'s network to be reachable
+    /// (`-onlynet`, Core's `g_reachable_nets` check in
+    /// `ThreadOpenConnections`). A manual one does not: `-onlynet` does not
+    /// affect manual connections.
     fn may_dial(&self, addr: &SocketAddr) -> bool {
-        self.automatic_outbound.load(Ordering::Relaxed)
+        (self.automatic_outbound.load(Ordering::Relaxed) && self.reachable.read().contains_socket(addr))
             || self.manual_addrs.read().contains(addr)
+    }
+
+    /// Set the reachable networks (`-onlynet`). Called once at startup.
+    pub fn set_reachable(&self, nets: crate::net::reachable::ReachableNets) {
+        *self.reachable.write() = nets;
     }
 
     /// Record a `.onion` peer learned from `addrv2` gossip so the reconnect
@@ -2069,7 +2091,7 @@ impl PeerManager {
         // Under `-connect` the node dials only the peers it was told to; see
         // `may_dial`. Onion candidates are in-memory only, so refusing them
         // here is enough to keep them off the dial list.
-        if !self.automatic_outbound.load(Ordering::Relaxed) {
+        if !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
             return;
         }
         if self.is_onion_connected(&host) {
@@ -4151,8 +4173,9 @@ impl PeerManager {
             self.dials_in_flight.lock().automatic,
         );
         for target in onion.into_iter().filter(|a| !self.is_manual_target(a)) {
-            // Under `-connect`, only the peers the operator named.
-            if budget == 0 || !self.automatic_outbound.load(Ordering::Relaxed) {
+            // Under `-connect`, only the peers the operator named; with an
+            // `-onlynet` that leaves out onion, none.
+            if budget == 0 || !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
                 break;
             }
             if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
