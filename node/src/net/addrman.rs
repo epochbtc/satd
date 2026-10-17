@@ -404,6 +404,24 @@ impl AddrMan {
     }
 
     /// Pick an address to dial, biased ~50/50 between tried and new.
+    /// Core's `AddrMan::GetAddr` for a `getaddr` reply: a random sample of
+    /// at most `max_pct`% of the book, and at most `max_addresses`, with
+    /// terrible entries skipped. As in Core the count is taken over the
+    /// whole book before the terrible ones are left out.
+    pub fn get_addr(&self, max_addresses: usize, max_pct: usize, now: u64) -> Vec<AddrEntry> {
+        use rand::seq::SliceRandom as _;
+        let mut all: Vec<&AddrEntry> = self.iter().collect();
+        let mut wanted = all.len();
+        if max_pct != 0 {
+            wanted = max_pct * wanted / 100;
+        }
+        if max_addresses != 0 {
+            wanted = wanted.min(max_addresses);
+        }
+        all.shuffle(&mut rand::thread_rng());
+        all.into_iter().filter(|e| !e.is_terrible(now)).take(wanted).cloned().collect()
+    }
+
     pub fn select(&self) -> Option<SocketAddr> {
         let (tried, new): (Vec<&AddrEntry>, Vec<&AddrEntry>) =
             self.entries.values().partition(|e| e.tried);

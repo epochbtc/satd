@@ -31,6 +31,9 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- `getaddr` is answered only for inbound peers, once per connection, from a
+  cached sample of the address book per listening socket, as in Core; satd
+  sent every peer its live connection list and its own addresses.
 
 ## Releases
 
