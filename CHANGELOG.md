@@ -45,6 +45,9 @@ item below is (or will be) written up in full in the in-development
   misbehaviour (disconnected and banned; `noban` and manual peers kept, local
   ones only disconnected), including for a block judged only when the
   initial-block-download connector reaches it (#544).
+- A node that caught up through its parallel block download never announced
+  the tip it reached, so a peer that does not poll for headers, as Core does
+  not, stayed behind until the next block; the tip is now announced.
 
 ## Releases
 
