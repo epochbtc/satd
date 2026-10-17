@@ -50,6 +50,9 @@ item below is (or will be) written up in full in the in-development
   not, stayed behind until the next block; the tip is now announced.
 - A coin or undo record with a ten-byte varint that does not fit in 64 bits is
   now refused as corrupt instead of decoding to a truncated value (#975).
+- BIP 30's buried-BIP 34 skip now needs Core's BIP 34 block at that height
+  and ends at height 1,983,702, as in Core; testnet3, past that height, checks
+  BIP 30 on every block again.
 
 ## Releases
 
