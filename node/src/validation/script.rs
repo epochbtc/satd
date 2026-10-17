@@ -395,6 +395,18 @@ impl ScriptVerifier for ConsensusVerifier {
         prev_outputs: &[TxOut],
         height: u32,
     ) -> Result<(), ScriptError> {
+        // One spent output per input, as the Rust engine requires
+        // (`ErrSpentOutputsMismatch`) and Core's `PrecomputedTransactionData`
+        // assumes. The loop below stops at the shorter of the two, so a short
+        // or empty `prev_outputs` would verify only the inputs it covers and
+        // pass the rest unchecked. No caller passes one today.
+        if prev_outputs.len() != tx.input.len() {
+            return Err(ScriptError::VerifyFailed {
+                input: 0,
+                reason: "spent outputs count mismatch".to_string(),
+            });
+        }
+
         let tx_bytes = bitcoin::consensus::serialize(tx);
 
         let flags = script_verify_flags(self.network, height);
@@ -780,6 +792,38 @@ mod naming_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cpp engine refuses a `prev_outputs` that does not have one entry
+    /// per input, as the Rust engine does. It used to verify only the inputs
+    /// the slice covered, so an empty one passed every input unchecked.
+    /// Perturbation: drop the length check and the empty and short cases pass.
+    #[test]
+    fn the_cpp_engine_needs_one_spent_output_per_input() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        let input = |vout| TxIn {
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![input(0), input(1)],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+        };
+        let spent = TxOut { value: Amount::from_sat(5000), script_pubkey: op_true };
+        let cpp = ConsensusVerifier::new(Network::Regtest);
+        assert!(
+            cpp.verify_transaction(&tx, &[spent.clone(), spent.clone()], 200).is_ok(),
+            "one spent output per input: anyone-can-spend inputs verify"
+        );
+        assert!(cpp.verify_transaction(&tx, std::slice::from_ref(&spent), 200).is_err(), "one short");
+        assert!(cpp.verify_transaction(&tx, &[], 200).is_err(), "none at all");
+        assert!(cpp.verify_transaction(&tx, &[spent.clone(), spent.clone(), spent], 200).is_err(), "one extra");
+    }
 
     // PrimaryEngine identifies the authoritative engine so prefetch can
     // match it. Regression: ShadowVerifier must report its *inner* primary,
