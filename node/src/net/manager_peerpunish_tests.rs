@@ -293,3 +293,46 @@ fn a_block_ahead_of_the_clock_is_not_charged_to_its_sender() {
         ConnectError::Interrupted
     )));
 }
+
+/// The sender of a stored block that fails when the connector reaches it is
+/// charged for it, as Core's `BlockChecked` charges `mapBlockSource` (#544).
+/// A block that connected is forgotten, so a later failure of the same hash
+/// (it cannot happen, but a stale entry would) charges no one.
+#[test]
+fn the_source_of_a_block_that_fails_to_connect_is_charged() {
+    use bitcoin::hashes::Hash as _;
+    let (pm, _dir) = mk_pm();
+    let _rx = add_peer(&pm, peer(1, "10.62.0.1:50000", Direction::Inbound));
+    let _rx2 = add_peer(&pm, peer(2, "10.62.0.2:50000", Direction::Inbound));
+    let bad = bitcoin::BlockHash::from_byte_array([1; 32]);
+    let good = bitcoin::BlockHash::from_byte_array([2; 32]);
+    pm.block_sources.lock().record(bad, 1);
+    pm.block_sources.lock().record(good, 2);
+
+    pm.forget_block_source(&good);
+    pm.punish_block_source(&good, "bad-txns-inputs-missingorspent");
+    assert!(pm.peers.read().contains_key(&2), "a connected block's sender is not charged");
+
+    pm.punish_block_source(&bad, "block-script-verify-flag-failed");
+    assert_eq!(outcome(&pm, 1), Outcome::Banned);
+}
+
+/// Which refusals in the block processor charge the sender: Core's
+/// `MaybePunishNodeForBlock`. Verdicts on the block's contents and header
+/// rules do; a block ahead of the clock, a mutation (charged before the
+/// block reaches the processor), and this node's own storage faults do not.
+#[test]
+fn block_processor_refusals_charge_the_sender_as_core_does() {
+    use crate::chain::connect::ConnectError;
+    use crate::chain::state::ChainError;
+    use crate::validation::ValidationError;
+    let charged = |e: ChainError| PeerManager::block_error_is_the_blocks(&e);
+    assert!(charged(ChainError::Connect(ConnectError::LocktimeNotFinal)));
+    assert!(charged(ChainError::Connect(ConnectError::BadCoinbaseHeight)));
+    assert!(charged(ChainError::Validation(ValidationError::TimeTooOld)));
+    assert!(charged(ChainError::CheckpointMismatch(10)));
+    assert!(!charged(ChainError::Validation(ValidationError::TimeTooNew)));
+    assert!(!charged(ChainError::Validation(ValidationError::BadMerkleRoot)));
+    assert!(!charged(ChainError::Connect(ConnectError::Interrupted)));
+    assert!(!charged(ChainError::FlatFile("disk".into())));
+}
