@@ -4537,7 +4537,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     let dns_seeding = config.automatic_outbound
         && config.dns
         && config.dnsseed
-        && (config.forcednsseed || peer_manager.addrman_is_empty());
+        && (config.forcednsseed || !peer_manager.addrman_has_reachable());
     // Core's `ThreadDNSAddressSeed` line when seeding is off (`-dnsseed=0`,
     // or `-connect`, which defaults it off).
     if !config.dnsseed || !config.automatic_outbound {
@@ -4568,12 +4568,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     }
 
     // -fixedseeds: last-resort fallback to satd's compiled-in fixed seed
-    // list when DNS seeding did not run (disabled), the address book is
-    // empty, and there are no explicit -connect peers. -fixedseeds=0
-    // forbids it.
+    // list when DNS seeding did not run (disabled), the address book has no
+    // address on a reachable network, and there are no explicit -connect
+    // peers. -fixedseeds=0 forbids it.
     if config.fixedseeds
         && config.automatic_outbound
-        && peer_manager.addrman_is_empty()
+        && !peer_manager.addrman_has_reachable()
         && !dns_seeding
     {
         let fixed = node::net::dns::fixed_seeds_for_network(config.network);

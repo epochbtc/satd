@@ -746,3 +746,20 @@ async fn onion_zero_refuses_even_a_manual_onion_dial() {
     let err = pm.dial_onion(&("a".repeat(56) + ".onion"), 8333).await.expect_err("disabled");
     assert!(err.contains("-onion=0"), "{err}");
 }
+
+/// A clearnet address book is no reason to skip seeding on a node whose
+/// `-onlynet` leaves clearnet out: `addrman_has_reachable` counts only
+/// addresses on reachable networks. Perturbation: answer with
+/// `!addrman_is_empty()` and the onion-only case reports a reachable book.
+#[test]
+fn an_address_book_of_unreachable_addresses_does_not_count() {
+    use crate::net::reachable::ReachableNets;
+    let (pm, _dir) = mk_pm();
+    let v4 = SocketAddr::from(([44, 1, 2, 3], 8333));
+    pm.add_learned_addr_from(v4, 9, IpAddr::from([198, 51, 100, 1]));
+    assert!(!pm.addrman_is_empty());
+    assert!(pm.addrman_has_reachable());
+    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
+    assert!(!pm.addrman_is_empty(), "the clearnet entry is still in the book");
+    assert!(!pm.addrman_has_reachable(), "but it is not on a reachable network");
+}
