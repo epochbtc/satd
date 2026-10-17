@@ -1876,7 +1876,7 @@ impl PeerManager {
     fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
         let (peer_v4, wants_v2, onion) = {
             let peers = self.peers.read();
-            let h = peers.get(&id)?;
+            let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
             let v4 = match h.info.addr.ip() {
                 IpAddr::V4(_) => true,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
@@ -1918,7 +1918,9 @@ impl PeerManager {
     /// stored host; it was validated when the onion was registered, so this is
     /// infallible in practice.
     fn self_advertise_addrv2(&self, id: PeerId) -> Option<bitcoin::p2p::address::AddrV2Message> {
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2) {
+        // A block-relay-only link carries no address traffic (Core's
+        // `SetupAddressRelay`); our onion on one would link the two.
+        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2 && h.info.relays_addrs()) {
             return None;
         }
         let onion = self.advertised_onion.read().clone()?;
@@ -11168,10 +11170,12 @@ impl PeerManager {
         // relay it onward, which is the actual propagation seed; without it a
         // listenonion node is reachable only by peers handed the address out of
         // band.
-        // Our `-externalip` addresses, to an outbound peer on the same IP
-        // family: Core pushes its local address for the peer's network
+        //
+        // Before it, our `-externalip` addresses, to an outbound peer on the
+        // same IP family: Core pushes its local address for the peer's network
         // (`GetLocalAddrForPeer`) when it opens an outbound connection.
         // They used to ride in every `getaddr` reply instead, to any peer.
+        // Neither goes to a block-relay-only peer.
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
             && let Some(msg) = self.self_advertise_externals(id)
