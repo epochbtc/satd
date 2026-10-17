@@ -148,7 +148,7 @@ unauthenticated HTTP endpoints on that port (default bind 127.0.0.1):
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | The process is alive and the event loop responds. Cheap. |
-| `GET /readyz` | The tip is within six blocks of the best headers tip seen from peers, and the block connector is making progress. 503 otherwise — for the whole of a sync, and whenever the connector has persistently failed. |
+| `GET /readyz` | The tip is within six blocks of the best headers tip seen from peers, the block connector is making progress, and neither the `tip_stall` nor the `peer_floor` health detector is raised. 503 otherwise — for the whole of a sync, whenever the connector has persistently failed, when no block has connected for `-alerttipstallseconds`, and when the node has had fewer than `-alertpeerfloor` peers for the detector's window. Setting either threshold to `0` leaves `/readyz` out of it. |
 | `GET /metrics` | Prometheus exposition format. |
 
 The two are not interchangeable, and the difference matters most where it
