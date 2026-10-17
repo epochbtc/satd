@@ -183,7 +183,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `listen` | on (see note) | restart | core | Accept P2P connections. The default is *soft*, as in Core: a node given any `connect` (including `connect=0` / `-noconnect`), or `maxconnections` ≤ 0, does not accept inbound either, since a node pinned to specific peers has not asked to be reachable. `bind` or `whitebind` raises it back, and an explicit `listen` — flag or config file — beats both. Because the value is derived, changing a *hot* key that feeds it (`connect`, `maxconnections`) over SIGHUP logs a `listen` restart-required notice; the running listener is not started or stopped until a restart. A `listen` that is off in turn soft-sets `listenonion` off, as in Core, so a pinned node does not publish a hidden service; an explicit `listenonion` beats that. satd does not implement Core's third soft-set, where a `proxy` also lowers `listen` — a Tor-proxied satd is still reachable on clearnet unless you set `listen=0`. |
+| `listen` | on (see note) | restart | core | Accept P2P connections. The default is *soft*, as in Core: a node given any `connect` (including `connect=0` / `-noconnect`), or `maxconnections` ≤ 0, does not accept inbound either, since a node pinned to specific peers has not asked to be reachable. `bind` or `whitebind` raises it back, and an explicit `listen` — flag or config file — beats both. Because the value is derived, changing a *hot* key that feeds it (`connect`, `maxconnections`) over SIGHUP logs a `listen` restart-required notice; the running listener is not started or stopped until a restart. A `listen` that is off in turn soft-sets `listenonion` off, as in Core, so a pinned node does not publish a hidden service; an explicit `listenonion` beats that. A `proxy` also lowers `listen`, as in Core ("to protect privacy, do not listen by default if a default proxy server is specified"); set `listen=1` to accept inbound with a proxy. |
 | `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); change it at runtime with the `setnetworkactive` RPC. |
 | `blocksonly` | false | hot | core | Suppress P2P transaction relay; locally-submitted txs still relayed. |
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
@@ -207,12 +207,12 @@ startup error.
 | `blockreconstructionextratxn` | 100 | restart | core | Recently seen transactions that are not in the mempool — replaced, or refused by policy — kept so a compact block that includes one still reconstructs without a round trip. `0` keeps none. |
 | `maxuploadtarget` | 0 (unlimited) | hot | core | Soft cap (bytes/24h) on historical block upload. |
 | `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. With `dns=0` those options accept only literal IP addresses and `.onion` targets; a hostname is refused. |
-| `dnsseed` | true | restart | core | Query DNS seeds for peer addresses (requires `dns`). |
+| `dnsseed` | true | restart | core | Query DNS seeds for peer addresses (requires `dns`). Off by default when `onlynet` leaves out both IPv4 and IPv6; `dnsseed=1` with such an `onlynet` is refused at startup, as in Core. |
 | `forcednsseed` | false | restart | core | Always query DNS seeds even with a populated address book. |
 | `fixedseeds` | true | restart | core | Allow the compiled-in fixed-seed fallback. |
 | `bantime` | 86400 | hot | core | Ban duration in seconds. |
 | `timeout` | 5000 ms | hot | core | P2P connection timeout in milliseconds (accepts `5s`/`5000ms`). |
-| `onlynet` | all | restart | core | Restrict to network types: `ipv4`, `ipv6`, `onion`. |
+| `onlynet` | all | restart | core | Make automatic outbound connections only to these networks (repeatable): `ipv4`, `ipv6`, `onion`, `cjdns`, `i2p`. Gossiped addresses on other networks are not kept. Inbound and manual connections (`connect`, `addnode`, `seednode`) are not affected. Refused at startup as in Core: an unknown name; `onion` with neither `proxy` nor `onion` (Core also takes `listenonion`; satd cannot reach Tor through it), or with `onion=0`; `cjdns` without `cjdnsreachable`; `i2p` (satd has no I2P transport). |
 | `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
 | `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). Without it satd runs the default signet and verifies every block against its challenge. |
 
@@ -232,9 +232,9 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections. A **hostname** in `-addnode`/`-seednode`/`-connect` is refused while this is set, rather than resolved by the local resolver — that lookup would leak the peer names the proxy is there to hide. Use a literal IP or a `.onion` address. |
+| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections; `proxy=0` is none. Lowers `listen` by default (see `listen`). A **hostname** in `-addnode`/`-seednode`/`-connect` is refused while this is set, rather than resolved by the local resolver — that lookup would leak the peer names the proxy is there to hide. Use a literal IP or a `.onion` address. |
 | `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are not negotiated. Set `=0` to opt out. |
-| `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. |
+| `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. `onion=0` (`-noonion`) never reaches `.onion`, even through `proxy`. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
 | `torpassword` | none | restart | core | Tor control port password (for a `HashedControlPassword` setup). Leave unset to use SAFECOOKIE cookie auth. |
 | `listenonion` | off (on if `torcontrol` set) | restart | core | Create a Tor v3 hidden service via the control port. Soft-set off when `listen` is off, as in Core; state it explicitly to keep the service on a non-listening node. Gets its own P2P listener on `127.0.0.1:<port+1>` unless a `bind=<addr>:<port>=onion` entry names one, matching Core's `onion_binds`; peers arriving there are exempt from `whitelist` matching. |

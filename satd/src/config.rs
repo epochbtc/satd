@@ -1029,8 +1029,14 @@ pub struct Config {
     /// default rule (off, unless `-torcontrol` is set). The control
     /// port address is `torcontrol`, defaulting to `127.0.0.1:9051`.
     pub listenonion: bool,
-    #[allow(dead_code)]
+    /// `-onlynet` as given, for `getconfig`-style dumps and the reload diff.
     pub onlynet: Vec<String>,
+    /// The networks automatic outbound connections may use, resolved from
+    /// `-onlynet` (Core's `g_reachable_nets`).
+    pub reachable: node::net::reachable::ReachableNets,
+    /// `-onion=0` (`-noonion`): never connect to `.onion`, not even a
+    /// manual peer through `-proxy`, as in Core (no `NET_ONION` proxy).
+    pub noonion: bool,
     // Mining
     /// `-blockmaxweight`: the cap on a block template's weight, the coinbase
     /// reserve included. Never above `MAX_BLOCK_WEIGHT` (refused at load).
@@ -1896,10 +1902,12 @@ impl Config {
         // here, the thing Core does to the RPC allowlist: with it set, an
         // address in fc00::/8 is a CJDNS address rather than RFC4193, and
         // Core refuses an RFC4193 subnet (L bit clear) in `-rpcallowip`.
-        let cjdnsreachable = cli
+        let cjdnsreachable_setting = cli
             .cjdnsreachable
-            .or_else(|| file_get("cjdnsreachable").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
+            .or_else(|| file_get("cjdnsreachable").and_then(|v| parse_bool(&v)));
+        // Core's `IsArgSet("-cjdnsreachable")`, for `-onlynet=cjdns` below.
+        let cjdnsreachable_set = cjdnsreachable_setting.is_some();
+        let cjdnsreachable = cjdnsreachable_setting.unwrap_or(false);
         for entry in &rpcallowip_raw {
             let parsed = IpAllowEntry::parse(entry)?;
             if cjdnsreachable && parsed.is_cjdns_range() {
@@ -2257,6 +2265,22 @@ impl Config {
         // default, never overriding a stated value.
         let listenonion_explicit = listenonion_setting.is_some();
         let mut listenonion = listenonion_setting.unwrap_or_else(|| torcontrol.is_some());
+
+        // Core reads `-proxy=0` and an empty `-proxy` as no proxy, and
+        // `-onion=0` (`-noonion`) as "never reach .onion", which also refuses
+        // `-onlynet=onion` (`AppInitMain`, `src/init.cpp`). satd used the
+        // value as an address either way.
+        let proxy = cli
+            .proxy
+            .clone()
+            .or_else(|| file_get("proxy"))
+            .filter(|p| !p.is_empty() && p != "0");
+        let onion_raw = cli.onion.clone().or_else(|| file_get("onion"));
+        let noonion = onion_raw.as_deref() == Some("0");
+        let onion = onion_raw.filter(|o| !o.is_empty() && o != "0");
+        let dnsseed_setting = cli
+            .dnsseed
+            .or_else(|| file_get("dnsseed").and_then(|v| parse_bool(&v)));
 
         let rpc_tls_bind = cli.rpctlsbind.or_else(|| file_get("rpctlsbind"));
         let rpc_tls_cert = cli
@@ -2663,11 +2687,8 @@ impl Config {
         // hold the default up, never contradict the operator.
         //
         // Core has a third listen-lowering rule in the same function -- a
-        // `-proxy` also soft-sets `-listen=0`, and `-listen=0` in turn
-        // soft-sets `-listenonion=0` and `-discover=0`. satd implements
-        // neither; a Tor-proxied satd is still reachable on clearnet by
-        // default where Core is not. That is a pre-existing privacy gap, not
-        // one this rule introduces, and it is tracked separately.
+        // `-proxy` also soft-sets `-listen=0` -- applied just below, and
+        // `-listen=0` in turn soft-sets `-listenonion=0` (further down).
         // Hoisted out of the struct literal: the interaction below reads it,
         // and Core's own condition is `-connect OR maxconnections <= 0`.
         // Parsed through `i64` so a negative value lands on Core's `<= 0`
@@ -2688,6 +2709,20 @@ impl Config {
         {
             listen = false;
         }
+        // `-proxy` soft-sets `-listen=0`, "to protect privacy, do not listen
+        // by default if a default proxy server is specified" (Core's
+        // `InitParameterInteraction`). A `-bind` / `-whitebind` soft-set
+        // `-listen=1` first, and a soft-set never overrides a value already
+        // set, so a bind still wins, as in Core.
+        // Logging is not up yet; these join `pending_notes` below.
+        let mut net_notes: Vec<ConfigNote> = Vec::new();
+        if !listen_explicit && !binds_requested && proxy.is_some() && listen {
+            net_notes.push(ConfigNote {
+                level: NoteLevel::Info,
+                message: "parameter interaction: -proxy set -> setting -listen=0".to_string(),
+            });
+            listen = false;
+        }
 
         // Core's `-listen=0` in turn soft-sets `-listenonion=0`
         // (`InitParameterInteraction`, `src/init.cpp`), and it has to: a
@@ -2706,6 +2741,45 @@ impl Config {
         if !listen && !listenonion_explicit {
             listenonion = false;
         }
+
+        // `-onlynet`, as Core's `AppInitMain` resolves it into
+        // `g_reachable_nets`, with its startup refusals.
+        let onlynet_raw = {
+            let mut nets = cli.onlynet.clone();
+            if nets.is_empty() {
+                nets = file_get_all("onlynet");
+            }
+            nets
+        };
+        let reachable = resolve_reachable(&ReachableInputs {
+            onlynet: &onlynet_raw,
+            cjdnsreachable_set,
+            cjdnsreachable,
+            proxy: proxy.is_some(),
+            onion: onion.is_some(),
+            noonion,
+            listenonion,
+        })?;
+        // DNS seeds answer with IPv4/IPv6 only. Core soft-sets `-dnsseed=0`
+        // when `-onlynet` excludes both, and refuses an explicit
+        // `-dnsseed=1` (`InitParameterInteraction`, `AppInitMain`).
+        let dnsseed = match dnsseed_setting {
+            Some(true) if !reachable.clearnet() => {
+                return Err("Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet \
+                     forbids connections to IPv4/IPv6"
+                    .to_string());
+            }
+            Some(v) => v,
+            None if !reachable.clearnet() => {
+                net_notes.push(ConfigNote {
+                    level: NoteLevel::Info,
+                    message: "parameter interaction: -onlynet excludes IPv4 and IPv6 -> setting -dnsseed=0"
+                        .to_string(),
+                });
+                false
+            }
+            None => true,
+        };
 
         // Computed here rather than inline in the struct below, because the
         // default reads `connect`, which the struct literal has already moved
@@ -3831,6 +3905,7 @@ impl Config {
         // --log-format selects the formatter), so direct
         // `tracing::warn!` calls would silently drop on the floor.
         let mut pending_notes: Vec<ConfigNote> = std::mem::take(&mut include_notes);
+        pending_notes.append(&mut net_notes);
         // Resolved in a helper, to keep this function's debug-build stack
         // frame from growing.
         let zmq = resolve_zmq_pub(cli.zmq_pub_args, config_file.as_ref(), section, &file_get)?;
@@ -4236,10 +4311,7 @@ impl Config {
                 .dns
                 .or_else(|| file_get("dns").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
-            dnsseed: cli
-                .dnsseed
-                .or_else(|| file_get("dnsseed").and_then(|v| parse_bool(&v)))
-                .unwrap_or(true),
+            dnsseed,
             forcednsseed: cli
                 .forcednsseed
                 .or_else(|| file_get("forcednsseed").and_then(|v| parse_bool(&v)))
@@ -4260,22 +4332,18 @@ impl Config {
                 .broadcastconfirmpeers
                 .or_else(|| file_get("broadcastconfirmpeers").and_then(|v| v.parse().ok()))
                 .unwrap_or(1),
-            proxy: cli.proxy.or_else(|| file_get("proxy")),
+            proxy,
             proxyrandomize: cli
                 .proxyrandomize
                 .or_else(|| file_get("proxyrandomize").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
-            onion: cli.onion.or_else(|| file_get("onion")),
+            onion,
             torcontrol,
             torpassword: cli.torpassword.or_else(|| file_get("torpassword")),
             listenonion,
-            onlynet: {
-                let mut nets = cli.onlynet;
-                if nets.is_empty() {
-                    nets = file_get_all("onlynet");
-                }
-                nets
-            },
+            onlynet: onlynet_raw,
+            reachable,
+            noonion,
             blockmaxweight,
             blockmintxfee,
             blockversion: cli
@@ -7828,6 +7896,81 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
 /// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
+/// What [`resolve_reachable`] reads.
+struct ReachableInputs<'a> {
+    onlynet: &'a [String],
+    cjdnsreachable_set: bool,
+    cjdnsreachable: bool,
+    proxy: bool,
+    onion: bool,
+    noonion: bool,
+    listenonion: bool,
+}
+
+/// Core's `g_reachable_nets` from `-onlynet` and the proxies
+/// (`AppInitMain`, `src/init.cpp`), with Core's refusals and their
+/// messages. satd has no I2P or CJDNS transport, so it never dials either
+/// automatically; `-onlynet=i2p` is refused as Core refuses it without
+/// `-i2psam`, which satd does not implement.
+fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::ReachableNets, String> {
+    use node::net::reachable::{Network, ReachableNets, parse_network};
+    // An onion proxy is `-onion`, or `-proxy` unless `-onion=0`.
+    let onion_proxy = i.onion || (i.proxy && !i.noonion);
+    let mut nets = ReachableNets { cjdns_flip: i.cjdnsreachable, ..ReachableNets::default() };
+    if !i.onlynet.is_empty() {
+        nets = ReachableNets { ipv4: false, ipv6: false, onion: false, cjdns: false, cjdns_flip: i.cjdnsreachable };
+        let mut i2p = false;
+        for name in i.onlynet {
+            match parse_network(name) {
+                Some(Network::Ipv4) => nets.ipv4 = true,
+                Some(Network::Ipv6) => nets.ipv6 = true,
+                Some(Network::Onion) => nets.onion = true,
+                Some(Network::Cjdns) => nets.cjdns = true,
+                Some(Network::I2p) => i2p = true,
+                None => return Err(format!("Unknown network specified in -onlynet: '{name}'")),
+            }
+        }
+        if nets.cjdns && !i.cjdnsreachable_set {
+            return Err("Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is \
+                 not provided"
+                .to_string());
+        }
+        if nets.onion && i.noonion {
+            return Err("Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching \
+                 the Tor network is explicitly forbidden: -onion=0"
+                .to_string());
+        }
+        if nets.onion && !onion_proxy && !i.listenonion {
+            return Err("Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching \
+                 the Tor network is not provided: none of -proxy, -onion or -listenonion is given"
+                .to_string());
+        }
+        // Core accepts `-listenonion` alone, because its Tor controller takes
+        // Tor's SOCKS port from the control connection and makes onion
+        // reachable later. satd's does not, so the node would have no
+        // outbound transport at all; refuse it instead (CORE_DIFFERENCES.md).
+        if nets.onion && !onion_proxy {
+            return Err("Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching \
+                 the Tor network is not provided: neither -proxy nor -onion is given (satd does not take \
+                 the proxy from the Tor control port, so -listenonion alone cannot reach Tor)"
+                .to_string());
+        }
+        if i2p {
+            return Err("Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
+                .to_string());
+        }
+    }
+    if !i.cjdnsreachable_set {
+        nets.cjdns = false;
+    }
+    // Without an onion proxy onion is not reachable (Core removes it, and
+    // satd cannot add it back later from the Tor control port).
+    if !onion_proxy {
+        nets.onion = false;
+    }
+    Ok(nets)
+}
+
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     // Translate index-control aliases first so the rest of the
     // pipeline sees the canonical `--addressindex` form.
@@ -9622,6 +9765,10 @@ fn check_money_range(rate: u64, raw: &str) -> Result<u64, String> {
 #[cfg(test)]
 #[path = "config_localharden_tests.rs"]
 mod localharden_tests;
+
+#[cfg(test)]
+#[path = "config_onlynet_tests.rs"]
+mod onlynet_tests;
 
 #[cfg(test)]
 mod tests {
