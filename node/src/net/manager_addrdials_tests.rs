@@ -735,3 +735,14 @@ fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
     pm.add_learned_peer_addr(&PeerAddr::Onion { host: "a".repeat(56) + ".onion", port: 8333 });
     assert!(pm.connect_peer_addrs.read().is_empty(), "onion is not reachable");
 }
+
+/// `-onion=0` refuses every `.onion` dial, a manual peer's included, before
+/// any proxy is chosen (Core has no `NET_ONION` proxy). Perturbation: drop
+/// the check and the dial fails on the missing proxy instead.
+#[tokio::test]
+async fn onion_zero_refuses_even_a_manual_onion_dial() {
+    let (pm, _dir) = mk_pm();
+    pm.set_onion_disabled(true);
+    let err = pm.dial_onion(&("a".repeat(56) + ".onion"), 8333).await.expect_err("disabled");
+    assert!(err.contains("-onion=0"), "{err}");
+}

@@ -870,6 +870,16 @@ silently returning an empty or wrong answer.
   and the connections are refused). Name one explicitly with
   `-bind=<addr>:<port>=onion` to choose the port.
 
+- **`-onlynet` networks and Tor bootstrap** — satd has IPv4, IPv6 and onion
+  transports only. `-onlynet=i2p` is refused at startup as Core refuses it
+  without `-i2psam`, and a CJDNS network is never dialled automatically.
+  Core's Tor controller takes Tor's SOCKS port from the control connection,
+  so Core accepts `-onlynet=onion` with `-listenonion` and no `-proxy`; satd's
+  does not, and refuses that combination instead of starting with no
+  outbound transport. With `-proxy` set, satd's built-in bootstrap seeds are
+  `.onion` addresses only (no DNS through the proxy), so a proxied node
+  whose `-onlynet` leaves out onion needs `-seednode` or `-addnode`; satd
+  warns at startup. Core would fetch its DNS seeds through the proxy.
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
   argument descriptions. Two things follow from that, both deliberate:

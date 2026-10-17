@@ -4440,6 +4440,23 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // the manager so gossiped addresses are learned but never dialled.
     peer_manager.set_automatic_outbound(config.automatic_outbound);
     peer_manager.set_reachable(config.reachable);
+    peer_manager.set_onion_disabled(config.noonion);
+    // satd's proxied bootstrap seeds are .onion only (no DNS through the
+    // proxy), so a proxied node whose -onlynet leaves out onion has no
+    // built-in way to find peers; Core would fetch the DNS seeds through
+    // the proxy instead.
+    if config.proxy.is_some()
+        && !config.reachable.onion
+        && config.automatic_outbound
+        && config.seednode.is_empty()
+        && config.addnode.is_empty()
+    {
+        tracing::warn!(
+            "-proxy is set and -onlynet leaves out onion: satd's proxied bootstrap seeds are .onion \
+             addresses, so this node has no built-in way to find peers. Add -seednode or -addnode \
+             peers on a network -onlynet allows."
+        );
+    }
 
     // Connect to configured peers (and register for auto-reconnect).
     //
