@@ -44,8 +44,8 @@ note = "measured 2026-09-16 with -prune=1 implemented: gets past startup and now
 [[test]]
 file = "feature_assumevalid.py"
 status = "skip"
-reason = "core-log"
-note = "measured 2026-09-15: L146 assert_debug_log 'Enabling script verification at block #1 (<hash>): assumevalid=0 (always verify).'; satd does not log the assumevalid decision"
+reason = "feature-missing"
+note = "measured 2026-10-17 with the #544 fix merged in: nodes 0-2 pass (the assumevalid decision and its log lines match); fails at L212: node3 is in IBD with a best-header chain that does not carry block 1, and does not connect block 1 although it has more work than the tip (Core's ActivateBestChain connects it)"
 
 [[test]]
 file = "feature_bind_extra.py"

@@ -419,6 +419,10 @@ pub struct ChainState {
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
+    /// The assumevalid decision's ancestry cache and last logged reason.
+    av_ancestry: Mutex<crate::chain::assumevalid::AvAncestry>,
+    /// Core's `-minimumchainwork`, when set; see [`Self::minimum_chain_work`].
+    minimum_chain_work_override: Option<[u8; 32]>,
     /// When [`Self::next_block_to_connect`] last ran its full block-index scan,
     /// and for which `(tip, height)`. The scan is O(index); the connector polls
     /// once a second. See the throttle in `next_block_to_connect`.
@@ -929,6 +933,8 @@ impl ChainState {
                     last_activation_attempt: Mutex::new(None),
                     reorg_aborts: AtomicU64::new(0),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
+                    av_ancestry: Mutex::new(Default::default()),
+                    minimum_chain_work_override: None,
                     connector_scan_last: Mutex::new(None),
                     num_threads,
                     address_index,
@@ -1063,6 +1069,8 @@ impl ChainState {
             last_activation_attempt: Mutex::new(None),
             reorg_aborts: AtomicU64::new(0),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
+            av_ancestry: Mutex::new(Default::default()),
+            minimum_chain_work_override: None,
             connector_scan_last: Mutex::new(None),
             num_threads,
             address_index,
@@ -1144,6 +1152,12 @@ impl ChainState {
         )
     }
 
+    /// Set Core's `-minimumchainwork`, which replaces the network's
+    /// `nMinimumChainWork` in [`Self::minimum_chain_work`]. `None` keeps it.
+    pub fn set_minimum_chain_work(&mut self, work: Option<[u8; 32]>) {
+        self.minimum_chain_work_override = work;
+    }
+
     /// Bitcoin Core's `nMinimumChainWork` for this network, big-endian like
     /// every chainwork in the block index (`kernel/chainparams.cpp`, v31.1).
     /// A custom signet has none, as in Core: its chain starts wherever its
@@ -1152,6 +1166,9 @@ impl ChainState {
     /// shown a chain worth asking for header announcements (Core's
     /// `MaybeSendSendHeaders`).
     pub fn minimum_chain_work(&self) -> [u8; 32] {
+        if let Some(work) = self.minimum_chain_work_override {
+            return work;
+        }
         let hex = match self.network {
             Network::Bitcoin => "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
             Network::Testnet => "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
@@ -3434,45 +3451,79 @@ impl ChainState {
         !matches!(self.assumevalid, AssumeValid::Disabled)
     }
 
-    /// Check if script verification should be skipped (assumevalid optimization).
-    fn should_skip_scripts(&self, height: u32) -> bool {
-        self.should_skip_scripts_at(height, crate::time::now_secs())
+    /// Whether to skip script verification for the block `hash` at `height`
+    /// (the assumevalid optimization), logging Core's line when the decision
+    /// changes. See [`crate::chain::assumevalid`].
+    fn should_skip_scripts(&self, height: u32, hash: &BlockHash) -> bool {
+        let reason = self.script_check_reason_at(height, hash, crate::time::now_secs());
+        self.av_ancestry.lock().log_reason(height, hash, reason);
+        reason.is_none()
     }
 
-    /// [`should_skip_scripts`](Self::should_skip_scripts) against an explicit
-    /// `now`, so the age comparison is testable without installing the
-    /// process-global mock clock — which every other test in this binary shares.
-    fn should_skip_scripts_at(&self, height: u32, now: u64) -> bool {
+    /// Core's `script_check_reason` for the block `hash` at `height`: why its
+    /// scripts are verified, or `None` to skip them. `now` is explicit so the
+    /// `-assumevalid=all` age comparison is testable without installing the
+    /// process-global mock clock, which every other test in this binary
+    /// shares.
+    fn script_check_reason_at(
+        &self,
+        height: u32,
+        hash: &BlockHash,
+        now: u64,
+    ) -> crate::chain::assumevalid::ScriptCheckReason {
+        use crate::chain::assumevalid as av;
         match &self.assumevalid {
-            AssumeValid::Disabled => false,
+            AssumeValid::Disabled => Some(av::ALWAYS_VERIFY),
             AssumeValid::Hash(av_hash) => {
-                // Check if we've seen the assumevalid block in the index
-                if let Some(entry) = self.store.get_block_index(av_hash) {
-                    return height <= entry.height;
+                let Some(av_entry) = self.store.get_block_index(av_hash) else {
+                    // Might still be syncing headers.
+                    return Some(av::NOT_IN_HEADERS);
+                };
+                let get = |h: &BlockHash| self.store.get_block_index(h);
+                let mut ancestry = self.av_ancestry.lock();
+                if !ancestry.is_av_ancestor(av_hash, av_entry.height, hash, height, get) {
+                    return Some(if height > av_entry.height {
+                        av::ABOVE_AV_HEIGHT
+                    } else {
+                        av::NOT_IN_AV_CHAIN
+                    });
                 }
-                // Haven't seen it yet — might still be syncing headers.
-                // Conservative: don't skip until we've confirmed the hash exists.
-                false
+                let (best_hash, best_work) = *self.best_header.read();
+                let Some(best_entry) = self.store.get_block_index(&best_hash) else {
+                    return Some(av::NOT_IN_BEST_HEADER_CHAIN);
+                };
+                if !ancestry.av_on_best_chain(av_hash, av_entry.height, &best_hash, best_entry.height, get) {
+                    return Some(av::NOT_IN_BEST_HEADER_CHAIN);
+                }
+                drop(ancestry);
+                if compare_u256(&best_work, &self.minimum_chain_work()) < 0 {
+                    return Some(av::BELOW_MIN_CHAINWORK);
+                }
+                let Some(entry) = self.store.get_block_index(hash) else {
+                    return Some(av::NOT_IN_BEST_HEADER_CHAIN);
+                };
+                if !av::more_than_two_weeks_on_top(&best_work, &entry.chainwork, best_entry.header.bits) {
+                    return Some(av::TOO_RECENT);
+                }
+                None
             }
             AssumeValid::All { max_age_secs } => {
                 // Skip scripts for blocks whose header timestamp is older than the cutoff.
                 // This naturally transitions to full verification once the node catches up.
-                if let Some(hash) = self.store.get_block_hash_by_height(height)
-                    && let Some(entry) = self.store.get_block_index(&hash)
-                {
-                    // The node clock, for the same reason as `tip_time_is_ibd`:
-                    // `block_time` is a header timestamp and headers are stamped
-                    // from `crate::time::now_secs()`, so `SystemTime::now()`
-                    // would put the two sides of this comparison on different
-                    // clocks. This one decides whether scripts are verified at
-                    // all -- under `-assumevalid=all`, a mock to a past date
-                    // (which is what Core's framework does before building its
-                    // cache chain) makes every freshly mined block look years
-                    // stale, and the whole chain connects unverified.
-                    let block_time = entry.header.time as u64;
-                    return now.saturating_sub(block_time) > *max_age_secs;
+                //
+                // The node clock, for the same reason as `tip_time_is_ibd`:
+                // `block_time` is a header timestamp and headers are stamped
+                // from `crate::time::now_secs()`, so `SystemTime::now()`
+                // would put the two sides of this comparison on different
+                // clocks. This one decides whether scripts are verified at
+                // all -- under `-assumevalid=all`, a mock to a past date
+                // (which is what Core's framework does before building its
+                // cache chain) makes every freshly mined block look years
+                // stale, and the whole chain connects unverified.
+                match self.store.get_block_index(hash) {
+                    Some(entry) if now.saturating_sub(entry.header.time as u64) > *max_age_secs => None,
+                    _ => Some(av::NEWER_THAN_AGE),
                 }
-                false
             }
         }
     }
@@ -4446,7 +4497,7 @@ impl ChainState {
         // If the prefetcher pre-verified scripts for some transactions,
         // wrap the verifier to skip those (they've already been checked
         // against the same coins the connect thread will validate).
-        let use_noop = self.should_skip_scripts(pre.height);
+        let use_noop = self.should_skip_scripts(pre.height, &pre.hash);
         let noop = NoopVerifier;
         let base_verifier: &dyn ScriptVerifier =
             if use_noop { &noop } else { &*self.script_verifier };
@@ -5375,7 +5426,7 @@ impl ChainState {
         }
 
         // Determine script verifier
-        let use_noop = self.should_skip_scripts(entry.height);
+        let use_noop = self.should_skip_scripts(entry.height, hash);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
 
@@ -6002,7 +6053,7 @@ impl ChainState {
         // rebuilt from the block files verifies every signet block once,
         // including those stored before the default signet was checked (#767).
         self.check_signet_solution(&pre.block)?;
-        let use_noop = self.should_skip_scripts(pre.height);
+        let use_noop = self.should_skip_scripts(pre.height, &pre.hash);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier =
             if use_noop { &noop } else { &*self.script_verifier };
@@ -6093,7 +6144,7 @@ impl ChainState {
             .get_block_index(&block.header.prev_blockhash)
             .ok_or(ChainError::BadPrevBlock)?;
 
-        let use_noop = self.should_skip_scripts(height);
+        let use_noop = self.should_skip_scripts(height, &hash);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier =
             if use_noop { &noop } else { &*self.script_verifier };
@@ -6767,7 +6818,7 @@ impl ChainState {
                 break;
             }
 
-            let use_noop = self.should_skip_scripts(height);
+            let use_noop = self.should_skip_scripts(height, &hash);
             let noop = NoopVerifier;
             let verifier: &dyn ScriptVerifier =
                 if use_noop { &noop } else { &*self.script_verifier };
@@ -7839,7 +7890,7 @@ impl ChainState {
                         side_hash,
                         side_entry.height,
                     )?;
-                    let use_noop = self.should_skip_scripts(side_entry.height);
+                    let use_noop = self.should_skip_scripts(side_entry.height, side_hash);
                     let noop = NoopVerifier;
                     let verifier: &dyn ScriptVerifier =
                         if use_noop { &noop } else { &*self.script_verifier };
@@ -7998,7 +8049,7 @@ impl ChainState {
         }
 
         // Determine script verifier: skip if below assumevalid height
-        let use_noop = self.should_skip_scripts(new_height);
+        let use_noop = self.should_skip_scripts(new_height, &block_hash);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
 
@@ -9737,7 +9788,7 @@ impl ChainState {
                 // chainstate connected, and a status that says otherwise is
                 // damage to refuse, not build on.
                 self.require_connected_parent(&e.header.prev_blockhash, h, e.height)?;
-                let use_noop = self.should_skip_scripts(e.height);
+                let use_noop = self.should_skip_scripts(e.height, h);
                 let noop = NoopVerifier;
                 let verifier: &dyn ScriptVerifier =
                     if use_noop { &noop } else { &*self.script_verifier };
@@ -10199,6 +10250,10 @@ mod chainsel_tests;
 #[cfg(test)]
 #[path = "state_ctxcheck_tests.rs"]
 mod ctxcheck_tests;
+
+#[cfg(test)]
+#[path = "state_assumevalid_tests.rs"]
+mod assumevalid_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
@@ -16432,155 +16487,6 @@ pub(crate) mod tests {
         let age = DEFAULT_MAX_TIP_AGE_SECS as u64;
         assert!(!ChainState::time_is_ibd_at((now - age) as u32, now));
         assert!(ChainState::time_is_ibd_at((now - age - 1) as u32, now));
-    }
-
-    #[test]
-    fn test_should_skip_scripts_disabled() {
-        let (cs, dir) = make_chain_state();
-        // make_chain_state creates with AssumeValid::Disabled
-        assert!(
-            !cs.should_skip_scripts(0),
-            "should_skip_scripts should be false at height 0 with Disabled"
-        );
-        assert!(
-            !cs.should_skip_scripts(100),
-            "should_skip_scripts should be false at height 100 with Disabled"
-        );
-        assert!(
-            !cs.should_skip_scripts(1_000_000),
-            "should_skip_scripts should be false at height 1M with Disabled"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `-assumevalid=all` decides whether scripts are verified at all, by
-    /// comparing a block's header timestamp against "now". Headers are stamped
-    /// from the node clock, so "now" must be too: mock to a past date — which
-    /// is what Core's framework does before building its cache chain — and a
-    /// system-clock "now" makes every freshly mined block look years stale, so
-    /// the whole chain connects unverified.
-    ///
-    /// Driven through `should_skip_scripts_at` rather than by installing the
-    /// process-global mock, which every other test in this binary shares.
-    #[test]
-    fn test_should_skip_scripts_all_ages_against_the_node_clock() {
-        // Must exceed genesis' median-time-past to be accepted at all.
-        const BLOCK_TIME: u32 = 1_300_000_001;
-        const MAX_AGE: u64 = 86_400;
-
-        let dir = std::env::temp_dir().join(format!(
-            "satd-av-all-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let store = Box::new(InMemoryStore::new());
-        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(
-            store,
-            flat_files,
-            Network::Regtest,
-            Box::new(NoopVerifier),
-            AssumeValid::All {
-                max_age_secs: MAX_AGE,
-            },
-            450,
-            4,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        )
-        .unwrap();
-
-        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
-        let block1 = build_test_block(genesis_hash, 1, BLOCK_TIME);
-        cs.accept_block(&block1).expect("accept block 1");
-
-        let t = BLOCK_TIME as u64;
-        // A node whose clock says "now" is when the block was mined must
-        // verify it. This is the mocked-to-the-past case.
-        assert!(
-            !cs.should_skip_scripts_at(1, t),
-            "a block mined at the current node time is not old"
-        );
-        assert!(
-            !cs.should_skip_scripts_at(1, t + MAX_AGE),
-            "the cutoff is exclusive, matching Core's `>`"
-        );
-        // One second past the cutoff it is genuinely old, and skipping is the
-        // whole point of the option.
-        assert!(cs.should_skip_scripts_at(1, t + MAX_AGE + 1));
-        // A clock behind the block's timestamp saturates to age 0, never to a
-        // huge age that would skip.
-        assert!(!cs.should_skip_scripts_at(1, t - 1));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_should_skip_scripts_hash() {
-        // Create a ChainState with AssumeValid::Hash pointing to a block we'll connect.
-        let dir = std::env::temp_dir().join(format!(
-            "satd-av-hash-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let blocks_dir = dir.join("blocks");
-        let store = Box::new(InMemoryStore::new());
-        let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
-
-        // First build the chain to find the block hash
-        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
-        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let block1_hash = block1.block_hash();
-
-        let cs = ChainState::new(
-            store,
-            flat_files,
-            Network::Regtest,
-            Box::new(NoopVerifier),
-            AssumeValid::Hash(block1_hash),
-            450,
-            4,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        )
-        .unwrap();
-
-        // Before accepting the block, should_skip_scripts returns false
-        // (hash not yet in index)
-        assert!(
-            !cs.should_skip_scripts(0),
-            "Before block is known, should not skip scripts"
-        );
-
-        // Accept the block (connects it, adding to index)
-        cs.accept_block(&block1).unwrap();
-
-        // Now the hash is in the index at height 1
-        // Height <= 1 should skip scripts
-        assert!(
-            cs.should_skip_scripts(0),
-            "Height 0 <= 1, should skip scripts"
-        );
-        assert!(
-            cs.should_skip_scripts(1),
-            "Height 1 <= 1, should skip scripts"
-        );
-        // Height > 1 should NOT skip scripts
-        assert!(
-            !cs.should_skip_scripts(2),
-            "Height 2 > 1, should not skip scripts"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

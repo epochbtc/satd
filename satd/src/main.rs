@@ -1350,6 +1350,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // and custom P2P magic. Set before sharing the ChainState.
             cs.set_signet_challenge(config.signet_challenge.clone());
             node::chain::state::ChainState::set_max_tip_age(config.maxtipage);
+            cs.set_minimum_chain_work(config.minimumchainwork);
             if cs.network == bitcoin::Network::Signet {
                 tracing::info!(
                     "Signet derived magic (message start): {}",

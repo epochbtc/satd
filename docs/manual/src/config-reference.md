@@ -243,7 +243,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `assumevalid` | per-network hash | restart | core | Skip script verification up to HASH (`0`=verify all, `all`=skip old blocks). |
+| `assumevalid` | per-network hash | restart | core | Skip script verification for HASH's buried ancestors on the best-header chain (`0`=verify all, `all`=skip old blocks). |
 | `assumevalidage` | 86400 | restart | satd | With `assumevalid=all`, still verify scripts for blocks newer than SECS. |
 | `checkpoints` | on | restart | core | Enforce the built-in block checkpoints. `-checkpoints=0` disables checkpoint validation. |
 | `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT, during initial block download too, where the node stops at HEIGHT itself. `0` is off, as in Core. |
@@ -279,6 +279,7 @@ startup error.
 | `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. Deprecated alongside `limitancestorcount`, and likewise no longer gates admission. |
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
 | `maxtipage` | 86400 s | restart | core | A tip older than this keeps the node in initial block download. |
+| `minimumchainwork` | per network | restart | core | The chain work, in hex (up to 64 digits, optional `0x`), a best header must have before `-assumevalid` skips scripts and before the node asks peers for header announcements. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `rebroadcastinterval` | 0 (auto) | hot | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers take it (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time; the pending set is persisted in `mempool.dat` so it also survives restarts. A SIGHUP interval change applies after the in-flight sleep completes. |
 | `broadcastconfirmpeers` | 1 | hot | satd | Distinct peer IPs that must take a locally-broadcast tx before it counts as propagated and rebroadcast stops. A peer takes a tx by fetching it via `getdata` (the primary signal) or announcing it back via `inv`. Counted per IP, not per connection, so a reconnecting host is one witness. Raising it demands wider observed propagation before retries stop. |

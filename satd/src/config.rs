@@ -686,6 +686,10 @@ pub struct Config {
     /// Core's `-maxtipage`, seconds: a tip older than this keeps the node in
     /// initial block download. Default 24 hours.
     pub maxtipage: i64,
+    /// Core's `-minimumchainwork`, big-endian: the work a chain must reach
+    /// before the node trusts it as the best header for `-assumevalid` and
+    /// header announcements. `None` keeps the network's default.
+    pub minimumchainwork: Option<[u8; 32]>,
     /// Core's `-peertimeout`, seconds: how long a new connection has to
     /// finish its handshake before the inactivity check drops it. Default 60.
     pub peertimeout: i64,
@@ -3038,6 +3042,16 @@ impl Config {
             },
         };
 
+        let minimumchainwork = match cli
+            .chain_work_args
+            .minimumchainwork
+            .clone()
+            .or_else(|| file_get("minimumchainwork").map(|v| v.trim().to_string()))
+        {
+            Some(v) => Some(parse_minimum_chain_work(&v)?),
+            None => None,
+        };
+
         let peertimeout = match cli.peertimeout {
             Some(v) => v,
             None => match file_get("peertimeout") {
@@ -4065,6 +4079,7 @@ impl Config {
             limitclustercount,
             mempoolexpiry,
             maxtipage,
+            minimumchainwork,
             peertimeout,
             persistmempool: cli
                 .persistmempool
@@ -5886,6 +5901,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub rpc_whitelist_args: RpcWhitelistArgs,
 
+    /// `-minimumchainwork`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
+    #[command(flatten)]
+    pub chain_work_args: ChainWorkArgs,
+
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
@@ -7284,6 +7304,53 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
     }
 }
 
+/// Bitcoin Core's `-minimumchainwork` (see [`CliArgs::chain_work_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct ChainWorkArgs {
+    pub minimumchainwork: Option<String>,
+}
+
+/// Help text is Core's own (v31.1 `src/init.cpp:512`), less its per-network
+/// defaults.
+const CHAIN_WORK_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
+    "minimumchainwork",
+    "HEX",
+    StratumArgKind::Text,
+    "Minimum work assumed to exist on a valid chain in hex (default: the network's)",
+)];
+
+impl clap::Args for ChainWorkArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in CHAIN_WORK_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for ChainWorkArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { minimumchainwork: m.remove_one("minimumchainwork") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags (see
 /// [`CliArgs::zmq_pub_args`]), indexed by [`CoreZmqTopic::index`].
 #[derive(Debug, Clone, Default)]
@@ -7828,6 +7895,21 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
 /// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
+/// Core's `-minimumchainwork` value (`uint256::FromUserHex`): an optional
+/// `0x` prefix and at most 64 hex digits, left-padded with zeros. Anything
+/// else is Core's startup error.
+fn parse_minimum_chain_work(value: &str) -> Result<[u8; 32], String> {
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    let err = || format!("Invalid minimum work specified ({value}), must be up to 64 hex digits");
+    if digits.len() > 64 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(err());
+    }
+    let padded = format!("{digits:0>64}");
+    let mut work = [0u8; 32];
+    hex::decode_to_slice(&padded, &mut work).map_err(|_| err())?;
+    Ok(work)
+}
+
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     // Translate index-control aliases first so the rest of the
     // pipeline sees the canonical `--addressindex` form.
@@ -7902,6 +7984,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitclustercount",
         "mempoolexpiry",
         "maxtipage",
+        "minimumchainwork",
         "peertimeout",
         "cjdnsreachable",
         "persistmempool",
@@ -8705,6 +8788,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "limitclustercount",
     "mempoolexpiry",
     "maxtipage",
+    "minimumchainwork",
     "peertimeout",
     "cjdnsreachable",
     "persistmempool",
@@ -9622,6 +9706,10 @@ fn check_money_range(rate: u64, raw: &str) -> Result<u64, String> {
 #[cfg(test)]
 #[path = "config_localharden_tests.rs"]
 mod localharden_tests;
+
+#[cfg(test)]
+#[path = "config_minchainwork_tests.rs"]
+mod minchainwork_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11210,6 +11298,7 @@ testactivationheight=bip34@2
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
             maxtipage: None,
+            chain_work_args: ChainWorkArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -11527,6 +11616,7 @@ testactivationheight=bip34@2
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
             maxtipage: None,
+            chain_work_args: ChainWorkArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
