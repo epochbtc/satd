@@ -3,6 +3,7 @@ pub mod addrman;
 pub mod ban;
 pub mod asmap;
 pub mod bg_catchup;
+pub mod block_source;
 pub mod compact;
 pub mod connection;
 pub mod dns;

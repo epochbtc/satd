@@ -293,3 +293,102 @@ fn a_block_ahead_of_the_clock_is_not_charged_to_its_sender() {
         ConnectError::Interrupted
     )));
 }
+
+/// The sender of a stored block that fails when the connector reaches it is
+/// charged for it, as Core's `BlockChecked` charges `mapBlockSource` (#544).
+/// A block that connected is forgotten, so a later failure of the same hash
+/// (it cannot happen, but a stale entry would) charges no one.
+#[test]
+fn the_source_of_a_block_that_fails_to_connect_is_charged() {
+    use bitcoin::hashes::Hash as _;
+    let (pm, _dir) = mk_pm();
+    let _rx = add_peer(&pm, peer(1, "10.62.0.1:50000", Direction::Inbound));
+    let _rx2 = add_peer(&pm, peer(2, "10.62.0.2:50000", Direction::Inbound));
+    let bad = bitcoin::BlockHash::from_byte_array([1; 32]);
+    let good = bitcoin::BlockHash::from_byte_array([2; 32]);
+    pm.block_sources.lock().record(bad, 1);
+    pm.block_sources.lock().record(good, 2);
+
+    pm.forget_block_source(&good);
+    pm.punish_block_source(&good, "bad-txns-inputs-missingorspent");
+    assert!(pm.peers.read().contains_key(&2), "a connected block's sender is not charged");
+
+    pm.punish_block_source(&bad, "block-script-verify-flag-failed");
+    assert_eq!(outcome(&pm, 1), Outcome::Banned);
+}
+
+/// Which refusals in the block processor charge the sender: Core's
+/// `MaybePunishNodeForBlock`. Verdicts on the block's contents and header
+/// rules do; a block ahead of the clock, a mutation (charged before the
+/// block reaches the processor), and this node's own storage faults do not.
+#[test]
+fn block_processor_refusals_charge_the_sender_as_core_does() {
+    use crate::chain::connect::ConnectError;
+    use crate::chain::state::ChainError;
+    use crate::validation::ValidationError;
+    let charged = |e: ChainError| PeerManager::block_error_is_the_blocks(&e);
+    assert!(charged(ChainError::Connect(ConnectError::LocktimeNotFinal)));
+    assert!(charged(ChainError::Connect(ConnectError::BadCoinbaseHeight)));
+    assert!(charged(ChainError::Validation(ValidationError::TimeTooOld)));
+    assert!(charged(ChainError::CheckpointMismatch(10)));
+    assert!(!charged(ChainError::Validation(ValidationError::TimeTooNew)));
+    assert!(!charged(ChainError::Validation(ValidationError::BadMerkleRoot)));
+    assert!(!charged(ChainError::Connect(ConnectError::Interrupted)));
+    assert!(!charged(ChainError::FlatFile("disk".into())));
+}
+
+/// A reorg that fails on a stored ancestor charges the peer that sent the
+/// ancestor, not the peer whose block triggered the reorg. Peer A sends a
+/// side block that spends a coin that does not exist; it stores fine and
+/// fails only when connected. Peer B sends its child, which out-works the
+/// tip, so the reorg reconnects A's block and fails there. Perturbation:
+/// charge `sender` unconditionally and B is banned, A kept.
+#[test]
+fn a_reorg_that_fails_on_a_stored_ancestor_charges_that_ancestors_sender() {
+    use crate::chain::state::tests::{build_test_block, build_test_block_spending};
+    use bitcoin::hashes::Hash as _;
+    let (pm, _dir) = mk_pm();
+    let _a = add_peer(&pm, peer(1, "10.62.0.1:50000", Direction::Inbound));
+    let _b = add_peer(&pm, peer(2, "10.62.0.2:50000", Direction::Inbound));
+    let cs = &pm.chain_state;
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let t = 1_710_000_000;
+    let b1 = build_test_block(genesis, 1, t + 600);
+    let b2 = build_test_block(b1.block_hash(), 2, t + 1200);
+    cs.accept_block(&b1).unwrap();
+    cs.accept_block(&b2).unwrap();
+
+    let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout: 0 };
+    let s2 = build_test_block_spending(b1.block_hash(), 2, t + 1201, missing);
+    assert!(matches!(cs.accept_block(&s2), Ok(crate::chain::state::BlockAcceptance::Stored(_))));
+    pm.block_sources.lock().record(s2.block_hash(), 1);
+
+    let s3 = build_test_block(s2.block_hash(), 3, t + 1800);
+    let err = cs.accept_block(&s3).expect_err("the reorg fails on s2");
+    assert!(PeerManager::block_error_is_the_blocks(&err), "{err:?}");
+    pm.charge_refused_block(&s3, 2, false, &err);
+
+    assert!(pm.peers.read().contains_key(&2), "the peer whose block triggered the reorg is not charged");
+    assert!(!pm.peers.read().contains_key(&1), "the peer that sent the failing block is");
+}
+
+/// When the refused block is the one that failed, its sender is charged,
+/// unless it was rebuilt from a compact block.
+#[test]
+fn a_block_that_fails_itself_charges_its_sender_unless_rebuilt() {
+    use crate::chain::state::tests::{build_test_block, build_test_block_spending};
+    use bitcoin::hashes::Hash as _;
+    let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout: 0 };
+    for (via_compact, charged) in [(false, true), (true, false)] {
+        let (pm, _dir) = mk_pm();
+        let _a = add_peer(&pm, peer(1, "10.62.0.1:50000", Direction::Inbound));
+        let cs = &pm.chain_state;
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_710_000_600);
+        cs.accept_block(&b1).unwrap();
+        let bad = build_test_block_spending(b1.block_hash(), 2, 1_710_001_200, missing);
+        let err = cs.accept_block(&bad).expect_err("missing input");
+        pm.charge_refused_block(&bad, 1, via_compact, &err);
+        assert_eq!(!pm.peers.read().contains_key(&1), charged, "via_compact = {via_compact}");
+    }
+}

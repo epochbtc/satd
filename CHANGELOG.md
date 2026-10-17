@@ -41,6 +41,10 @@ item below is (or will be) written up in full in the in-development
   block on the best-header chain, under Core's minimum-chain-work and
   two-week conditions, and logs Core's decision lines. `-minimumchainwork`,
   accepted and ignored before, now takes effect.
+- A peer that sends an invalid block is now charged for it like any other
+  misbehaviour (disconnected and banned; `noban` and manual peers kept, local
+  ones only disconnected), including for a block judged only when the
+  initial-block-download connector reaches it (#544).
 
 ## Releases
 

@@ -558,11 +558,14 @@ pub enum NetEvent {
 }
 
 /// A block handed to the block processor: the peer it came from, that peer's
-/// counters, the block, its in-flight guard, and whether this node asked for
-/// it. Only a block the node asked for may wait for a parent it does not
-/// know yet (see [`crate::net::orphan_blocks`]).
+/// counters, the block, its in-flight guard, whether this node asked for it,
+/// and whether it was rebuilt from a compact block. Only a block the node
+/// asked for may wait for a parent it does not know yet (see
+/// [`crate::net::orphan_blocks`]). A rebuilt block that fails is not charged
+/// to its sender, as in Core's `MaybePunishNodeForBlock(via_compact_block)`:
+/// a short-id collision can rebuild a different block from honest data.
 type IncomingBlock =
-    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight, bool);
+    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight, bool, bool);
 
 /// BIP 152: at most this many peers are asked to announce blocks to us as
 /// `cmpctblock`s (high-bandwidth mode).
@@ -1143,6 +1146,10 @@ pub struct PeerManager {
     /// are deferred here instead of triggering peer bans; reconsidered on
     /// new mempool admission and on block connect.
     orphanage: Arc<TxOrphanage>,
+    /// The peer each stored-but-unconnected block came from, so a block that
+    /// fails when the IBD connector reaches it is charged to its sender
+    /// (Core's `mapBlockSource`). See [`crate::net::block_source`].
+    block_sources: parking_lot::Mutex<crate::net::block_source::BlockSources>,
     /// BIP 158 filter index handle. Wired post-construction via
     /// `set_filter_index` (mirrors `ChainState::set_mempool` shape) so
     /// the existing constructor surface stays unchanged. The handler
@@ -1361,6 +1368,7 @@ impl PeerManager {
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
+            block_sources: parking_lot::Mutex::new(Default::default()),
             #[cfg(feature = "block-filter-index")]
             filter_index: std::sync::OnceLock::new(),
             #[cfg(feature = "block-filter-index")]
@@ -6370,7 +6378,7 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight, requested));
+        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight, requested, false));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -6420,6 +6428,8 @@ impl PeerManager {
         let hash = block.block_hash();
         match self.chain_state.store_block(&block) {
             Ok((_, height)) => {
+                // Judged when the connector reaches it; remember who sent it.
+                self.block_sources.lock().record(hash, id);
                 // Stored — Core's `new_block`. See `block_processor`.
                 if let Some(h) = self.peers.read().get(&id) {
                     h.stats.record_block();
@@ -6535,6 +6545,82 @@ impl PeerManager {
             crate::chain::state::ChainError::Connect(ce) => ce.is_verdict_on_block(),
             _ => false,
         }
+    }
+
+    /// Whether a block the block processor refused was the block's own fault,
+    /// for Core's `MaybePunishNodeForBlock`: a consensus verdict on its
+    /// contents, or a header rule (`BLOCK_CONSENSUS`, `BLOCK_INVALID_HEADER`).
+    /// Not a mutation, which the P2P path already charges before a block
+    /// reaches the processor (`mutated-block`) and which a copy rebuilt from
+    /// honest data can produce. Not `time-too-new` (`BLOCK_TIME_FUTURE`,
+    /// charged nothing), and not this node's own storage failures.
+    fn block_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
+        use crate::chain::state::ChainError;
+        match e {
+            ChainError::Validation(crate::validation::ValidationError::TimeTooNew) => false,
+            ChainError::Validation(v) => !v.is_mutation_class(),
+            ChainError::CheckpointMismatch(_) => true,
+            ChainError::Connect(ce) => ce.is_verdict_on_block(),
+            _ => false,
+        }
+    }
+
+    /// Charge the peer that sent `hash` for a block that failed a consensus
+    /// rule when it connected, as Core's `BlockChecked` does through
+    /// `MaybePunishNodeForBlock`: `Misbehaving`, which discourages and
+    /// disconnects it (here a full ban score, with the usual exemptions for
+    /// `noban`, manual and local peers in `add_ban_score`).
+    fn punish_block_source(&self, hash: &bitcoin::BlockHash, reason: &str) {
+        if let Some(id) = self.block_sources.lock().take(hash) {
+            self.add_ban_score(id, BAN_THRESHOLD, &format!("invalid block {hash}: {reason}"));
+        }
+    }
+
+    /// Charge for `block`, sent by `sender`, which `accept_block` refused
+    /// with `e`, a verdict ([`Self::block_error_is_the_blocks`]).
+    ///
+    /// The block that failed is not always this one. A block that makes a
+    /// stored side branch the best chain triggers a reorg, which reconnects
+    /// the branch's stored blocks first, and one of those can be the one that
+    /// fails. `mark_subtree_invalid` marks the failing block and everything
+    /// under it, and this block's parent was not marked before the call
+    /// (`accept_block` refuses a child of a marked block as `bad-prevblk`),
+    /// so a marked parent means an ancestor failed. The topmost newly marked
+    /// ancestor is the failing block, and its sender, if recorded when it was
+    /// stored, is charged instead. Otherwise this block failed, and `sender`
+    /// is charged unless the block was rebuilt from a compact block.
+    fn charge_refused_block(
+        &self,
+        block: &bitcoin::Block,
+        sender: PeerId,
+        via_compact: bool,
+        e: &crate::chain::state::ChainError,
+    ) {
+        use crate::storage::blockindex::BlockStatus;
+        let hash = block.block_hash();
+        let invalid = |h: &bitcoin::BlockHash| {
+            self.chain_state.get_block_index(h).is_some_and(|x| x.status == BlockStatus::Invalid)
+        };
+        let mut failed = block.header.prev_blockhash;
+        if !invalid(&failed) {
+            if !via_compact {
+                self.block_sources.lock().take(&hash);
+                self.add_ban_score(sender, BAN_THRESHOLD, &format!("invalid block {hash}: {e}"));
+            }
+            return;
+        }
+        while let Some(parent) = self.chain_state.get_block_index(&failed).map(|x| x.header.prev_blockhash)
+            && invalid(&parent)
+        {
+            failed = parent;
+        }
+        tracing::debug!(%hash, %failed, "refused block's ancestor failed; charging the ancestor's sender");
+        self.punish_block_source(&failed, &e.to_string());
+    }
+
+    /// Forget the sender of a block that connected.
+    fn forget_block_source(&self, hash: &bitcoin::BlockHash) {
+        self.block_sources.lock().take(hash);
     }
 
     /// A block's data was stored — clear it from the background download
@@ -7032,7 +7118,7 @@ impl PeerManager {
 
             // Drain all available blocks from the channel. Each block's
             // in-flight guard is counted out at the end of its iteration.
-            while let Ok((sender, sender_stats, block, _in_flight, requested)) = rx.try_recv() {
+            while let Ok((sender, sender_stats, block, _in_flight, requested, via_compact)) = rx.try_recv() {
                 let hash = block.block_hash();
                 // A block whose parent has no index entry cannot connect yet,
                 // and `accept_block` would refuse it as `PrevBlockNotFound`.
@@ -7056,6 +7142,17 @@ impl PeerManager {
                         // block the node already had.
                         if let Some(stats) = &sender_stats {
                             stats.record_block();
+                        }
+                        // A block stored but not connected is judged only if
+                        // a later reorg reaches it; remember who sent it. A
+                        // block rebuilt from a compact block is not
+                        // recorded, so it is never charged (see
+                        // `IncomingBlock`).
+                        if matches!(acceptance, crate::chain::state::BlockAcceptance::Stored(_))
+                            && !via_compact
+                            && let Some(pm) = peer_manager.upgrade()
+                        {
+                            pm.block_sources.lock().record(hash, sender);
                         }
                         chain_state.bump_connect_heartbeat();
                         // A successful steady-state connect disproves "the
@@ -7156,7 +7253,15 @@ impl PeerManager {
                         tracing::debug!(%hash, "Block builds on a block marked invalid; not kept");
                     }
                     Err(e) => {
-                        tracing::warn!(%hash, "Block rejected: {}", e);
+                        tracing::warn!(%hash, peer = sender, "Block rejected: {}", e);
+                        // Core's `MaybePunishNodeForBlock` for a block that
+                        // fails validation (#544), charged to whoever sent
+                        // the block that failed.
+                        if Self::block_error_is_the_blocks(&e)
+                            && let Some(pm) = peer_manager.upgrade()
+                        {
+                            pm.charge_refused_block(&block, sender, via_compact, &e);
+                        }
                     }
                 }
             }
@@ -7631,6 +7736,9 @@ impl PeerManager {
                         // subsequent step that takes a lock the watchdog
                         // would otherwise block on.
                         chain_state.bump_connect_heartbeat();
+                        if let Some(pm) = peer_manager.upgrade() {
+                            pm.forget_block_source(&hash);
+                        }
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
                         chain_state.warnings().clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
@@ -7801,6 +7909,9 @@ impl PeerManager {
                             "IBD: block failed validation and is marked invalid ({ce}); \
                              leaving IBD to follow the best valid header chain"
                         );
+                        if let Some(pm) = peer_manager.upgrade() {
+                            pm.punish_block_source(&hash, &ce.to_string());
+                        }
                         chain_state.warnings().clear("connect.retry");
                         *ibd.write() = None;
                         break;
@@ -9747,6 +9858,7 @@ impl PeerManager {
                     // Its header connected before it was rebuilt, so it never
                     // waits for a parent.
                     false,
+                    true,
                 ));
             }
             compact::Reconstruction::Partial { txs, missing_indices, stats } => {
@@ -9888,6 +10000,7 @@ impl PeerManager {
                     // Its header connected before it was rebuilt, so it never
                     // waits for a parent.
                     false,
+                    true,
                 ));
             }
             Err(compact::CompleteError::Invalid) => {
