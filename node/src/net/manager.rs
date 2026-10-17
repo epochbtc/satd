@@ -8030,6 +8030,21 @@ impl PeerManager {
         } else {
             prefetch_handle.stop();
         }
+
+        // Announce the tip the catch-up reached. Blocks connected here emit
+        // no chain event, so the announcement task never hears of them, and
+        // a peer that learns of blocks only from us stayed at the height it
+        // had when the catch-up began until the next block arrived. Core
+        // announces each new tip once it is out of initial block download
+        // (`UpdatedBlockTip`); a catch-up of fresh blocks never counts as
+        // that on Core, so its peers hear of the tip at once.
+        // `announce_block` still skips this while far below the best header.
+        if !*shutdown.borrow()
+            && connected_count > 0
+            && let Some(pm) = peer_manager.upgrade()
+        {
+            pm.announce_block(chain_state.tip_hash());
+        }
     }
 
     /// Extract fee rates from a connected block and feed them to the fee estimator.
