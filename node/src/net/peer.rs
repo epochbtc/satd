@@ -284,6 +284,9 @@ pub struct PeerInfo {
     /// is the one Tor dialled from, usually loopback, and says nothing about
     /// the peer.
     pub inbound_onion: bool,
+    /// The peer has sent a `getaddr` this connection. Core answers one per
+    /// connection (`m_getaddr_recvd`).
+    pub getaddr_recvd: bool,
     /// The local socket address this connection is bound to
     /// (`getsockname()`), behind `getpeerinfo`'s `addrbind`. `None` until the
     /// socket exists, and for onion peers, whose local end belongs to the
@@ -349,6 +352,7 @@ impl PeerInfo {
             bind_addr: None,
             onion_host: None,
             inbound_onion: false,
+            getaddr_recvd: false,
             conn_type: match direction {
                 Direction::Inbound => ConnType::Inbound,
                 Direction::Outbound => ConnType::OutboundFullRelay,
