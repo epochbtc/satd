@@ -663,6 +663,13 @@ pub enum NotReady {
     Stalled,
     /// The tip trails the best header by more than [`READY_LAG_BLOCKS`].
     Lag { lag: u32 },
+    /// The `tip_stall` detector is raised: no block has connected for
+    /// `-alerttipstallseconds`. A node that has lost its peers shows no lag,
+    /// because it hears of no new headers either.
+    TipStall,
+    /// The `peer_floor` detector is raised: fewer connected peers than
+    /// `-alertpeerfloor`, held for its hysteresis window.
+    PeerFloor,
 }
 
 impl std::fmt::Display for NotReady {
@@ -674,6 +681,10 @@ impl std::fmt::Display for NotReady {
                 "chain lag {} blocks exceeds ready threshold {}",
                 lag, READY_LAG_BLOCKS
             ),
+            NotReady::TipStall => {
+                f.write_str("no block has connected for longer than -alerttipstallseconds")
+            }
+            NotReady::PeerFloor => f.write_str("fewer connected peers than -alertpeerfloor"),
         }
     }
 }
@@ -692,12 +703,22 @@ pub fn readiness(
     // its peers run out of new ones. On the node that produced #567 the
     // condition stood for five and a half hours while every health surface
     // said fine.
-    if warnings
-        .list()
-        .iter()
-        .any(|w| w.id == crate::warnings::CONNECT_PERSISTENT_FAILURE)
-    {
+    let raised = warnings.list();
+    let has = |id: &str| raised.iter().any(|w| w.id == id);
+    if has(crate::warnings::CONNECT_PERSISTENT_FAILURE) {
         return Err(NotReady::Stalled);
+    }
+    // A node that has lost every peer passes both the connector check and
+    // the lag check: it hears of no new headers, so it shows no lag while
+    // its tip ages. The health detectors already watch for that, with their
+    // own thresholds, hysteresis and startup grace, so readiness reads their
+    // raised state (#979). Either set to 0 leaves readiness as it was.
+    use crate::events::status::StatusKind;
+    if has(&StatusKind::TipStall.warning_id()) {
+        return Err(NotReady::TipStall);
+    }
+    if has(&StatusKind::PeerFloor.warning_id()) {
+        return Err(NotReady::PeerFloor);
     }
     let headers_tip = headers_tip.max(tip);
     let lag = headers_tip.saturating_sub(tip);
@@ -1752,6 +1773,37 @@ mod tests {
         assert_eq!(escape_label("with \"quote\""), "with \\\"quote\\\"");
         assert_eq!(escape_label("back\\slash"), "back\\\\slash");
         assert_eq!(escape_label("line\nbreak"), "line\\nbreak");
+    }
+
+    /// A node that has lost its peers shows no lag: it hears of no new
+    /// headers. The `tip_stall` and `peer_floor` detectors catch it, and
+    /// readiness reads their raised state (#979); an unrelated alert does
+    /// not affect it. Perturbation: drop either check and its case passes.
+    #[test]
+    fn a_stalled_tip_or_too_few_peers_is_not_ready() {
+        use crate::events::status::StatusKind;
+        let warnings = crate::warnings::NodeWarnings::new();
+        let raise = |kind: StatusKind| {
+            warnings.record(
+                &kind.warning_id(),
+                crate::warnings::Severity::Error,
+                "raised".to_string(),
+                serde_json::Value::Null,
+            )
+        };
+        raise(StatusKind::DiskLow);
+        assert_eq!(readiness(&warnings, 100, 100), Ok(()), "an unrelated alert");
+
+        raise(StatusKind::TipStall);
+        assert_eq!(readiness(&warnings, 100, 100), Err(NotReady::TipStall));
+        warnings.clear(&StatusKind::TipStall.warning_id());
+
+        raise(StatusKind::PeerFloor);
+        let err = readiness(&warnings, 100, 100).expect_err("too few peers");
+        assert_eq!(err, NotReady::PeerFloor);
+        assert!(err.to_string().contains("-alertpeerfloor"), "{err}");
+        warnings.clear(&StatusKind::PeerFloor.warning_id());
+        assert_eq!(readiness(&warnings, 100, 100), Ok(()));
     }
 
     /// A wedged connector must fail readiness even when the chain lag looks

@@ -31,6 +31,8 @@ item below is (or will be) written up in full in the in-development
 - A `submitpackage` parent with an ephemeral dust output was announced on the
   mempool stream after the child that spends it; it is now announced first,
   as Core does.
+- `/readyz` is 503 while the `tip_stall` or `peer_floor` health detector is
+  raised: a node that lost its peers showed no lag and stayed ready (#979).
 
 ## Releases
 
