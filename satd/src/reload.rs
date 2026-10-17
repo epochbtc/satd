@@ -836,6 +836,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),
         restart!("maxtipage", maxtipage),
+        restart!("minimumchainwork", minimumchainwork),
         restart!("peertimeout", peertimeout),
         // ---- Proxy / Tor ----
         restart!("proxy", proxy),

@@ -121,9 +121,31 @@ accepts three forms. The third is a satd extension.
 
 | Value | Meaning | Compat |
 |---|---|---|
-| `-assumevalid=<blockhash>` | Skip script verification at or below that block. The hash must already be in the block index. A per-network default ships in the binary (for example, mainnet height 840,000), as in Core. | Core |
+| `-assumevalid=<blockhash>` | Skip script verification for that block's ancestors, under Core's conditions (below). A per-network default ships in the binary (for example, mainnet height 840,000), as in Core. | Core |
 | `-assumevalid=0` | Verify everything; no skipping. | Core |
 | `-assumevalid=all` | Skip script verification for blocks older than a cutoff age; verify recent and new blocks in full. The cutoff is `-assumevalidage` (default 86400 s, 24 h). | satd extension |
+
+With a block hash, a block's scripts are skipped only when all of these
+hold, as in Core's `ConnectBlock`:
+
+1. the assumevalid block is in the block index;
+2. the block is the assumevalid block or one of its ancestors;
+3. the block is on the best-header chain;
+4. the best header has at least the network's minimum chain work
+   (`-minimumchainwork` overrides it);
+5. the best header is more than two weeks' worth of proof of work beyond the
+   block.
+
+Otherwise the block is verified in full: for example, a side-chain block at
+or below the assumevalid height, or the most recent two weeks of the chain
+while the headers are still close to it. When the decision changes, the log
+gives Core's line: `Enabling script verification at block #N (hash):
+<reason>.` or `Disabling script verification at block #N (hash).`
+
+One difference from Core: when the best header is on a branch that does not
+carry the assumevalid block, satd verifies every block, including blocks
+below the fork point that Core would still skip. That is stricter than Core,
+never looser.
 
 > **Difference from Bitcoin Core.** Core's `-assumevalid` takes a block hash or
 > `0`. satd adds the `all` keyword and `-assumevalidage`, which trust the deep
