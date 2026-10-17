@@ -249,14 +249,32 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Result
         !crate::validation::block::segwit_active_at(chain_state.network, template.height);
     let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
 
+    // Core's `setTxIndex`: each transaction's place in the block, the
+    // coinbase being 0, so a template transaction's index is its 1-based
+    // position in `transactions`. `depends` lists, for each input that
+    // spends an earlier template transaction, that transaction's index, in
+    // input order and with repeats, as Core builds it.
+    let mut tx_index: std::collections::HashMap<bitcoin::Txid, usize> =
+        std::collections::HashMap::with_capacity(template.transactions.len());
     let txs: Vec<Value> = template
         .transactions
         .iter()
-        .map(|ttx| {
+        .enumerate()
+        .map(|(i, ttx)| {
             let raw = bitcoin::consensus::serialize(&ttx.tx);
+            let txid = ttx.tx.compute_txid();
+            let depends: Vec<usize> = ttx
+                .tx
+                .input
+                .iter()
+                .filter_map(|input| tx_index.get(&input.previous_output.txid).copied())
+                .collect();
+            tx_index.insert(txid, i + 1);
             json!({
                 "data": hex::encode(&raw),
-                "txid": ttx.tx.compute_txid().to_string(),
+                "txid": txid.to_string(),
+                "hash": ttx.tx.compute_wtxid().to_string(),
+                "depends": depends,
                 "fee": ttx.fee,
                 // Core reports each transaction's sigop cost so a client that
                 // builds its own block can keep to `sigoplimit`; pre-segwit,
@@ -535,3 +553,7 @@ pub fn submit_header(chain_state: &ChainState, hex_header: &str) -> Result<Value
         .map_err(|e| e.to_string())?;
     Ok(Value::Null)
 }
+
+#[cfg(test)]
+#[path = "mining_gbtdeps_tests.rs"]
+mod gbtdeps_tests;
