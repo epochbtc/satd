@@ -89,11 +89,20 @@ pub(crate) fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
 }
 
 /// Decode a varint from a byte slice, returning (value, bytes_consumed).
+///
+/// `None` for a varint that runs off the end of `buf` or does not fit in a
+/// `u64`. The tenth byte lands at bit 63, where only its lowest bit fits; a
+/// tenth byte with any higher value bit set would lose those bits in the
+/// shift and decode to a wrong value, so it is refused (#975).
 pub(crate) fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut val: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in buf.iter().enumerate() {
-        val |= ((byte & 0x7F) as u64) << shift;
+        let part = (byte & 0x7F) as u64;
+        if shift == 63 && part > 1 {
+            return None;
+        }
+        val |= part << shift;
         if byte & 0x80 == 0 {
             return Some((val, i + 1));
         }
@@ -185,6 +194,38 @@ impl Coin {
 
 #[cfg(test)]
 mod tests {
+    use super::{decode_varint, encode_varint};
+
+    /// Every `u64` round-trips, including the ones that need all ten bytes,
+    /// and a tenth byte with a value bit above bit 63 is refused rather than
+    /// truncated (#975). Perturbation: drop the bit-63 check and the `0x02`
+    /// case decodes to a truncated value instead of `None`.
+    #[test]
+    fn varints_fill_a_u64_and_no_more() {
+        for v in [0, 1, 0x7f, 0x80, u64::from(u32::MAX), 1 << 62, (1 << 63) - 1, 1 << 63, u64::MAX] {
+            let mut buf = Vec::new();
+            encode_varint(v, &mut buf);
+            assert_eq!(decode_varint(&buf), Some((v, buf.len())), "{v:#x}");
+        }
+        let mut max = Vec::new();
+        encode_varint(u64::MAX, &mut max);
+        assert_eq!(max.len(), 10);
+        assert_eq!(*max.last().unwrap(), 0x01, "u64::MAX ends in a 0x01 byte");
+
+        let mut over = vec![0xff; 9];
+        over.push(0x02);
+        assert_eq!(decode_varint(&over), None, "bit 64 does not fit");
+        let mut over = vec![0xff; 9];
+        over.push(0x7f);
+        assert_eq!(decode_varint(&over), None);
+        // An eleventh byte never fits either.
+        let mut long = vec![0x80; 10];
+        long.push(0x00);
+        assert_eq!(decode_varint(&long), None);
+        // Running off the end is not a value.
+        assert_eq!(decode_varint(&[0x80, 0x80]), None);
+    }
+
     use super::*;
 
     #[test]
