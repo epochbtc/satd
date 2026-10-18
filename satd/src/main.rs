@@ -4603,11 +4603,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             chain_state.script_verifier(),
             &net_datadir,
         ) {
-            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 => {
+            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 || stats.deltas > 0 => {
                 tracing::info!(
                     accepted = stats.accepted,
                     skipped = stats.skipped,
                     expired = stats.expired,
+                    deltas = stats.deltas,
                     "Re-admitted persisted mempool from mempool.dat"
                 );
             }
