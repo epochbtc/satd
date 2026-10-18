@@ -114,6 +114,19 @@ impl RecentRejects {
         }
     }
 
+    /// Record `hashes` as refused only if the verdict was reached under the
+    /// tip that is current: `judged_at` is the tip the transaction was
+    /// validated against, `tip` the tip now. A verdict about a tip that has
+    /// since moved is dropped rather than recorded under the new one.
+    pub fn insert_if_tip(&mut self, judged_at: BlockHash, tip: BlockHash, hashes: &[[u8; 32]], kind: Rejection) {
+        if judged_at != tip {
+            return;
+        }
+        for hash in hashes {
+            self.insert(tip, hash, kind);
+        }
+    }
+
     /// Whether `hash` was refused under `tip`: by the main filter, or with
     /// `include_reconsiderable` also by the fee filter (Core's
     /// `AlreadyHaveTx(gtxid, include_reconsiderable)`).
@@ -155,6 +168,15 @@ mod tests {
         r.insert(tip(1), &[7; 32], Rejection::Reconsiderable);
         assert!(r.contains(tip(1), &[7; 32], true));
         assert!(!r.contains(tip(1), &[7; 32], false));
+    }
+
+    #[test]
+    fn a_verdict_about_a_former_tip_is_not_recorded() {
+        let mut r = RecentRejects::new();
+        r.insert_if_tip(tip(1), tip(2), &[[7; 32]], Rejection::Rejected);
+        assert!(!r.contains(tip(2), &[7; 32], true));
+        r.insert_if_tip(tip(2), tip(2), &[[7; 32]], Rejection::Rejected);
+        assert!(r.contains(tip(2), &[7; 32], true));
     }
 
     #[test]

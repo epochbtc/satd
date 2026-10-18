@@ -8456,13 +8456,17 @@ impl PeerManager {
     /// spends is fixed by the txid). Core records only wtxids otherwise,
     /// so a peer without wtxid relay can still offer a correctly witnessed
     /// copy by txid.
-    fn record_rejection(&self, tx: &bitcoin::Transaction, e: &MempoolError) {
+    ///
+    /// `validated_at` is the tip the mempool judged `tx` against; nothing
+    /// is recorded if the tip has moved since.
+    fn record_rejection(&self, tx: &bitcoin::Transaction, e: &MempoolError, validated_at: bitcoin::BlockHash) {
         let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
         let Some(kind) = Self::rejection_kind(e, has_witness) else { return };
-        self.note_rejected(tx.compute_wtxid().as_byte_array(), kind);
+        let mut hashes = vec![tx.compute_wtxid().to_byte_array()];
         if has_witness && matches!(e, MempoolError::NonStandardInputs(_)) {
-            self.note_rejected(tx.compute_txid().as_byte_array(), kind);
+            hashes.push(tx.compute_txid().to_byte_array());
         }
+        self.recent_rejects.lock().insert_if_tip(validated_at, self.chain_state.tip_hash(), &hashes, kind);
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
@@ -8488,6 +8492,10 @@ impl PeerManager {
             tracing::debug!(%txid, %wtxid, peer = id, "recently rejected, not validated again");
             return;
         }
+        // The tip the verdict is about. A block can connect while the
+        // transaction is validated; a refusal judged against the old tip is
+        // then not recorded under the new one, where it may not hold.
+        let validated_at = self.chain_state.tip_hash();
         match self.mempool.accept_transaction(
             tx.clone(),
             &self.chain_state,
@@ -8566,7 +8574,7 @@ impl PeerManager {
                     tx.compute_wtxid(),
                     e.state_string()
                 );
-                self.record_rejection(&tx, &e);
+                self.record_rejection(&tx, &e, validated_at);
                 // Only consensus-invalid transactions are misbehavior; policy
                 // rejections (fee floor, dust, mempool limits, RBF, …) carry no
                 // ban score so we don't sever honest peers on low-fee networks.
@@ -15690,13 +15698,20 @@ mod tests {
         assert_eq!(kind(&MempoolError::AlreadyExists, true), None);
 
         let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let tip = pm.chain_state.tip_hash();
         let a = witness_tx(0x51, 0xaa);
-        pm.record_rejection(&a, &MempoolError::Dust);
+        pm.record_rejection(&a, &MempoolError::Dust, tip);
         assert!(pm.recently_rejected(&a.compute_wtxid().to_byte_array()));
         assert!(!pm.recently_rejected(&a.compute_txid().to_byte_array()), "another witness may pass");
         let b = witness_tx(0x52, 0xaa);
-        pm.record_rejection(&b, &MempoolError::NonStandardInputs("input 0 script unknown".into()));
+        pm.record_rejection(&b, &MempoolError::NonStandardInputs("input 0 script unknown".into()), tip);
         assert!(pm.recently_rejected(&b.compute_txid().to_byte_array()), "no witness changes what it spends");
+
+        // A verdict reached under a tip that has since moved is not recorded.
+        let c = witness_tx(0x53, 0xaa);
+        let former = bitcoin::BlockHash::from_byte_array([9; 32]);
+        pm.record_rejection(&c, &MempoolError::Dust, former);
+        assert!(!pm.recently_rejected(&c.compute_wtxid().to_byte_array()));
     }
 
     /// Core disconnects a peer that sends `wtxidrelay` after its verack: the
