@@ -553,7 +553,7 @@ fn confirmed_tx_verbose(
     verbosity: u32,
 ) -> Result<Value, (i32, String)> {
     let undo = if verbosity >= 2 && !tx.is_coinbase() {
-        chain_state.get_undo(&ctx.blockhash)
+        chain_state.read_undo(&ctx.blockhash).map_err(|_| (-32603, UNDO_UNREADABLE.to_string()))?
     } else {
         None
     };

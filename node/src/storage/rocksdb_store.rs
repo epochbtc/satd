@@ -2688,25 +2688,38 @@ impl Store for RocksDbStore {
     }
 
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
-        let cf = self.cf(CF_UNDO);
-        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        match UndoData::deserialize(&value) {
-            Ok(u) => Some(u),
+        match self.read_undo(hash) {
+            Ok(u) => u,
             Err(e) => {
                 // Log so an operator chasing "undo data missing" can
-                // distinguish genuine absence from a decode failure.
-                // The schema-version check at open should make this
-                // unreachable for legacy formats, but a corrupt row
-                // would otherwise look identical to a missing row.
+                // distinguish genuine absence from a read or decode
+                // failure. The schema-version check at open should make a
+                // decode failure unreachable for legacy formats, but a
+                // corrupt row would otherwise look identical to a missing
+                // row.
                 tracing::error!(
                     target: "storage",
                     block_hash = %hash,
                     error = %e,
-                    "undo row failed to decode; treating as missing"
+                    "undo row could not be read; treating as missing"
                 );
                 None
             }
         }
+    }
+
+    fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
+        let cf = self.cf(CF_UNDO);
+        let Some(value) = self
+            .db
+            .get_cf(&cf, hash_bytes(hash))
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        UndoData::deserialize(&value)
+            .map(Some)
+            .map_err(|e| StoreError::Serialization(e.to_string()))
     }
 
     fn for_each_block_index(
@@ -3906,6 +3919,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RocksDbStore::open(dir.path(), txindex, 16, false, -1).unwrap();
         (store, dir)
+    }
+
+    /// An undo row that is there but does not decode is an error from
+    /// `read_undo`, where `get_undo` answers `None` as for a missing row:
+    /// the RPCs that need it answer Core's internal error, not a reply
+    /// with the fees left out (#978).
+    #[test]
+    fn a_corrupt_undo_row_is_an_error_not_a_missing_row() {
+        let (store, _dir) = temp_store(false);
+        let missing = BlockHash::from_byte_array([1; 32]);
+        let corrupt = BlockHash::from_byte_array([2; 32]);
+        let cf = store.cf(CF_UNDO);
+        store.db.put_cf(&cf, hash_bytes(&corrupt), b"not an undo row").unwrap();
+        assert!(matches!(store.read_undo(&missing), Ok(None)));
+        assert!(store.read_undo(&corrupt).is_err());
+        assert_eq!(store.get_undo(&corrupt), None);
     }
 
     /// StoreBatch remove-wins contract: a key in BOTH coin_puts and

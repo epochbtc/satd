@@ -45,6 +45,9 @@ pub(crate) struct StoreControls {
     txindex_complete: Arc<AtomicBool>,
     coin_gate: Arc<std::sync::Mutex<Option<ArmedCoinGate>>>,
     fail_next_write: Arc<AtomicBool>,
+    /// Undo rows read as present but unreadable, as a corrupt RocksDB row
+    /// does.
+    undo_unreadable: Arc<AtomicBool>,
     /// How many times each ordinal read has been called. The index read
     /// paths resolve ordinals to txids in one batch per scan rather than
     /// one per row; nothing about the returned rows shows which of the
@@ -153,6 +156,10 @@ impl StoreControls {
     /// The write is refused before anything is applied, so the store is left
     /// exactly as it was — which is what the real backends do too, RocksDB
     /// applying a `WriteBatch` atomically.
+    pub(crate) fn set_undo_unreadable(&self, yes: bool) {
+        self.undo_unreadable.store(yes, Ordering::SeqCst);
+    }
+
     pub(crate) fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
     }
@@ -264,6 +271,7 @@ impl ControllableStore {
                 txindex_complete: Arc::new(AtomicBool::new(true)),
                 coin_gate: Arc::new(std::sync::Mutex::new(None)),
                 fail_next_write: Arc::new(AtomicBool::new(false)),
+                undo_unreadable: Arc::new(AtomicBool::new(false)),
                 get_tx_seq_calls: Arc::new(AtomicU64::new(0)),
                 txids_of_seqs_calls: Arc::new(AtomicU64::new(0)),
                 block_index_scans: Arc::new(AtomicU64::new(0)),
@@ -368,7 +376,15 @@ impl Store for ControllableStore {
         self.inner.write_batch_recoverable(batch, mode)
     }
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
-        self.inner.get_undo(hash)
+        self.read_undo(hash).ok().flatten()
+    }
+    fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
+        match self.inner.get_undo(hash) {
+            Some(_) if self.controls.undo_unreadable.load(Ordering::SeqCst) => {
+                Err(StoreError::Serialization("injected undo decode fault".into()))
+            }
+            u => Ok(u),
+        }
     }
     fn for_each_height_hash(
         &self,

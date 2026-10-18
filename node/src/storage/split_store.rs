@@ -232,6 +232,10 @@ impl Store for SplitStore {
         self.coins_store.get_undo(hash)
     }
 
+    fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
+        self.coins_store.read_undo(hash)
+    }
+
     fn coin_count(&self) -> u64 {
         self.coins_store.coin_count()
     }

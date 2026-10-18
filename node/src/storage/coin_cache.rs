@@ -1570,6 +1570,13 @@ impl Store for CoinCache {
         self.inner.get_undo(hash)
     }
 
+    fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
+        if let Some(undo) = self.undo_cache.lock().get(hash) {
+            return Ok(Some(undo.clone()));
+        }
+        self.inner.read_undo(hash)
+    }
+
     fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
         if let Some(&count) = self.chain_tx_cache.lock().get(hash) {
             return Some(count);

@@ -2458,6 +2458,15 @@ impl ChainState {
         self.store.get_undo(hash)
     }
 
+    /// [`Self::get_undo`], with an `Err` for a row that is there but cannot
+    /// be read, where `get_undo` answers `None` as for a missing one.
+    pub fn read_undo(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Option<crate::storage::undo::UndoData>, crate::storage::StoreError> {
+        self.store.read_undo(hash)
+    }
+
     /// Check if we have block data (not just a header) for a block.
     pub fn has_block_data(&self, hash: &BlockHash) -> bool {
         self.store

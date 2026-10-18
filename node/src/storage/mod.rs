@@ -669,6 +669,13 @@ pub trait Store: Send + Sync {
         Ok(())
     }
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData>;
+    /// [`Self::get_undo`], telling a row that is there but cannot be read or
+    /// decoded (an `Err`) from one that is not there (`Ok(None)`). Core
+    /// answers an RPC that needs undo data it cannot read with an internal
+    /// error rather than leaving fields out.
+    fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
+        Ok(self.get_undo(hash))
+    }
     fn coin_count(&self) -> u64;
     /// Sum the total amount (in satoshis) across all UTXOs.
     fn coin_total_amount(&self) -> u64;

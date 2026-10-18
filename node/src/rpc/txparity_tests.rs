@@ -6,7 +6,10 @@ use bitcoin::{Block, BlockHash, Network, OutPoint, Witness};
 use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
-use crate::chain::state::tests::{build_test_block, build_test_block_spending, make_chain_state};
+use crate::chain::state::tests::{
+    build_test_block, build_test_block_spending, make_chain_state, make_chain_state_with_store,
+};
+use crate::storage::test_store::ControllableStore;
 use crate::mempool::pool::Mempool;
 use crate::rpc::{blockchain, rawtx};
 
@@ -18,6 +21,11 @@ fn time(h: u32) -> u32 {
 /// so the spent coin is gone from the UTXO set.
 fn chain_with_a_spend() -> (ChainState, std::path::PathBuf, Vec<Block>) {
     let (cs, dir) = make_chain_state();
+    let blocks = mine_a_spend(&cs);
+    (cs, dir, blocks)
+}
+
+fn mine_a_spend(cs: &ChainState) -> Vec<Block> {
     let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
     let mut blocks: Vec<Block> = Vec::new();
     for h in 1..=103 {
@@ -31,7 +39,7 @@ fn chain_with_a_spend() -> (ChainState, std::path::PathBuf, Vec<Block>) {
         parent = b.block_hash();
         blocks.push(b);
     }
-    (cs, dir, blocks)
+    blocks
 }
 
 fn getblock(cs: &ChainState, hash: BlockHash, verbosity: u32) -> Value {
@@ -162,4 +170,50 @@ fn a_coinbase_witness_is_shown_and_decoderawtransaction_has_no_hex() {
     let v = rawtx::decode_raw_transaction(&hex_tx, None, Network::Regtest).unwrap();
     assert_eq!(v["vin"][0]["txinwitness"], json!([hex::encode([0u8; 32])]), "{v}");
     assert_eq!(v.get("hex"), None, "{v}");
+}
+
+/// Undo data that is there but cannot be read is Core's internal error,
+/// not an answer with the fees left out.
+#[test]
+fn unreadable_undo_data_is_an_internal_error() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = mine_a_spend(&cs);
+    let b = &blocks[101];
+    // Read from the store, not the cache of recently written undo rows.
+    cs.store_ref().flush().expect("flush");
+    cs.store_ref().drop_read_overlays();
+    controls.set_undo_unreadable(true);
+
+    let err = blockchain::get_block(&cs, &b.block_hash().to_string(), 2).unwrap_err();
+    assert_eq!(err, rawtx::UNDO_UNREADABLE);
+    // Verbosity 1 reads no undo data.
+    assert!(blockchain::get_block(&cs, &b.block_hash().to_string(), 1).is_ok());
+
+    let pool = Mempool::new(1_000_000, 0);
+    let txid = b.txdata[1].compute_txid().to_string();
+    let hash = b.block_hash().to_string();
+    let err = rawtx::get_raw_transaction(&cs, &pool, &txid, true, 2, Some(&hash)).unwrap_err();
+    assert_eq!(err, (-32603, rawtx::UNDO_UNREADABLE.to_string()));
+    assert!(rawtx::get_raw_transaction(&cs, &pool, &txid, true, 1, Some(&hash)).is_ok());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Without a transaction index the fee and prevouts still come from undo
+/// data: satd looked the spent coins up in the UTXO set and the index.
+#[test]
+fn getrawtransaction_needs_no_txindex_for_the_fee() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    controls.set_txindex(false, false);
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = mine_a_spend(&cs);
+    let b = &blocks[101];
+    let pool = Mempool::new(1_000_000, 0);
+    let txid = b.txdata[1].compute_txid().to_string();
+    let v = rawtx::get_raw_transaction(&cs, &pool, &txid, true, 2, Some(&b.block_hash().to_string())).unwrap();
+    assert!(v["fee"].is_number(), "{v}");
+    assert_eq!(v["vin"][0]["prevout"]["height"], json!(1), "{v}");
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -682,7 +682,9 @@ pub fn get_block(
     // `TxToUniv` a null block hash here (#978).
     let block_hash_str = hash.to_string();
     let tx_field: Value = if verbosity >= 2 {
-        let undo = chain_state.get_undo(&hash);
+        let undo = chain_state
+            .read_undo(&hash)
+            .map_err(|_| crate::rpc::rawtx::UNDO_UNREADABLE.to_string())?;
         let per_tx = match &undo {
             Some(u) => Some(crate::rpc::rawtx::undo_by_tx(&block, u)?),
             None => None,
