@@ -312,6 +312,20 @@ impl TorController {
         Ok(())
     }
 
+    /// Wait until Tor closes the control connection, which takes the hidden
+    /// service with it: when Tor stops or restarts. Nothing is sent on the
+    /// connection after `ADD_ONION`, so anything read here is ignored.
+    pub async fn wait_closed(&mut self) {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match self.reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    }
+
     /// Read a single line response from the control port, bounded by
     /// [`CONTROL_TIMEOUT`] so a silent/half-open port can't block forever (the
     /// timeout also caps an unterminated slowloris dribble of bytes).
@@ -505,6 +519,152 @@ pub fn save_onion_key(net_datadir: &std::path::Path, key: &str) -> std::io::Resu
     std::fs::rename(&tmp, &path)
 }
 
+/// The first wait before reconnecting to the control port, and the wait's
+/// growth and cap: Core's `RECONNECT_TIMEOUT_START`, `_EXP` and `_MAX`.
+const RECONNECT_START: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_EXP: f64 = 1.5;
+const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Where [`HiddenService`] reports the node's onion address: the address
+/// book's self-advertisement, and `getnetworkinfo.localaddresses`.
+pub trait OnionSink: Send + Sync {
+    /// Advertise `host:port` as the node's onion address.
+    fn advertise_onion(&self, host: String, port: u16);
+    /// Stop advertising an onion address.
+    fn withdraw_onion(&self);
+}
+
+impl OnionSink for crate::net::manager::PeerManager {
+    fn advertise_onion(&self, host: String, port: u16) {
+        self.set_advertised_onion(host, port);
+    }
+    fn withdraw_onion(&self) {
+        self.clear_advertised_onion();
+    }
+}
+
+/// The node's `-listenonion` hidden service, kept up for the node's
+/// lifetime as Core's `TorController` keeps it.
+///
+/// Tor removes the service when the control connection that added it
+/// closes, so when Tor stops or restarts the address is withdrawn and the
+/// controller reconnects, waiting [`RECONNECT_START`] and then half as long
+/// again each time up to [`RECONNECT_MAX`], and adds the service again with
+/// the saved key. satd connected once, at startup: a Tor that was not up
+/// yet, or restarted later, left the node without its service for good,
+/// still advertising the dead address (#973).
+///
+/// Core waits again only when the connection closes. satd also retries when
+/// authentication or `ADD_ONION` fails, on the same backoff, which is reset
+/// only once the service is up.
+pub struct HiddenService {
+    /// `-torcontrol`.
+    pub control: String,
+    /// `-torpassword`.
+    pub password: Option<String>,
+    /// The port the service offers on its onion address.
+    pub virtual_port: u16,
+    /// The local listener the service forwards to.
+    pub target: String,
+    /// Where [`onion_key_path`] is.
+    pub net_datadir: std::path::PathBuf,
+    /// An `-externalip` onion, advertised while the node's own service is down.
+    pub fallback: Option<(String, u16)>,
+}
+
+impl HiddenService {
+    /// Try to bring the service up once, and keep it up from then on in a
+    /// spawned task. Returns the onion address if this first try made it.
+    pub async fn start(self, sink: std::sync::Arc<dyn OnionSink>) -> Option<String> {
+        let first = self.bring_up().await;
+        let onion = match &first {
+            Ok((_, onion)) => {
+                sink.advertise_onion(onion.clone(), self.virtual_port);
+                Some(onion.clone())
+            }
+            Err(e) => {
+                tracing::error!(
+                    retry_in_secs = RECONNECT_START.as_secs_f64(),
+                    "Tor hidden service not created; retrying: {e}"
+                );
+                if let Some((host, port)) = &self.fallback {
+                    sink.advertise_onion(host.clone(), *port);
+                }
+                None
+            }
+        };
+        tokio::spawn(self.keep_up(sink, first));
+        onion
+    }
+
+    /// Connect, authenticate and add the service, with the saved key when
+    /// there is one, saving the key Tor returns for a new one.
+    async fn bring_up(&self) -> Result<(TorController, String), String> {
+        let mut controller = TorController::connect(&self.control).await?;
+        controller
+            .authenticate(self.password.as_deref())
+            .await
+            .map_err(|e| format!("Tor control authentication failed: {e}"))?;
+        // The key saved last time keeps the node at the same onion address.
+        let saved_key = load_onion_key(&self.net_datadir);
+        let (onion, new_key) = controller
+            .create_hidden_service(self.virtual_port, &self.target, saved_key.as_deref())
+            .await?;
+        if let Some(key) = new_key {
+            match save_onion_key(&self.net_datadir, &key) {
+                Ok(()) => tracing::info!(
+                    path = %onion_key_path(&self.net_datadir).display(),
+                    "Saved the hidden service's private key"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Could not save the hidden service's private key; \
+                     its onion address will change at the next start"
+                ),
+            }
+        }
+        tracing::info!(onion_addr = %onion, reused = saved_key.is_some(), "Tor hidden service created");
+        Ok((controller, onion))
+    }
+
+    async fn keep_up(
+        self,
+        sink: std::sync::Arc<dyn OnionSink>,
+        mut current: Result<(TorController, String), String>,
+    ) {
+        let mut wait = RECONNECT_START;
+        loop {
+            match current {
+                Ok((mut controller, onion)) => {
+                    wait = RECONNECT_START;
+                    controller.wait_closed().await;
+                    tracing::warn!(
+                        onion_addr = %onion,
+                        "Lost the Tor control connection, and with it the hidden service; \
+                         no longer advertising it"
+                    );
+                    match &self.fallback {
+                        Some((host, port)) => sink.advertise_onion(host.clone(), *port),
+                        None => sink.withdraw_onion(),
+                    }
+                }
+                Err(e) => tracing::debug!("{e}"),
+            }
+            tracing::debug!(
+                control = %self.control,
+                retry_in_secs = wait.as_secs_f64(),
+                "Not connected to the Tor control port; retrying"
+            );
+            tokio::time::sleep(wait).await;
+            wait = wait.mul_f64(RECONNECT_EXP).min(RECONNECT_MAX);
+            current = self.bring_up().await;
+            if let Ok((_, onion)) = &current {
+                sink.advertise_onion(onion.clone(), self.virtual_port);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +834,137 @@ mod tests {
         assert_eq!(server.await.unwrap(), "ADD_ONION ED25519-V3:a2V5 Port=8333,127.0.0.1:8334");
         assert_eq!(again, onion);
         assert_eq!(key, None, "Tor returns no key for an existing one");
+    }
+
+    /// One control connection of a Tor with null authentication: answers
+    /// `PROTOCOLINFO`, `AUTHENTICATE` and `ADD_ONION` (with a key when asked
+    /// for a new service). Returns the `ADD_ONION` line and the connection,
+    /// whose drop is Tor going away.
+    async fn fake_tor_session(listener: &TcpListener) -> (String, TcpStream) {
+        let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+            .await
+            .expect("satd did not connect to the control port again")
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut add_onion = String::new();
+        loop {
+            let mut l = String::new();
+            reader.read_line(&mut l).await.unwrap();
+            let reply = if l.starts_with("PROTOCOLINFO") {
+                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=NULL\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n".to_string()
+            } else if l.starts_with("AUTHENTICATE") {
+                "250 OK\r\n".to_string()
+            } else if l.starts_with("ADD_ONION") {
+                add_onion = l.trim_end().to_string();
+                let mut r = "250-ServiceID=abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx\r\n".to_string();
+                if l.contains("NEW:ED25519-V3") {
+                    r.push_str("250-PrivateKey=ED25519-V3:a2V5\r\n");
+                }
+                r.push_str("250 OK\r\n");
+                r
+            } else {
+                panic!("unexpected command {l:?}");
+            };
+            reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            if l.starts_with("ADD_ONION") {
+                return (add_onion, reader.into_inner());
+            }
+        }
+    }
+
+    /// What a [`HiddenService`] told the node to advertise, in order.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>, tokio::sync::Notify);
+
+    impl OnionSink for Recorder {
+        fn advertise_onion(&self, host: String, port: u16) {
+            self.0.lock().unwrap().push(format!("{host}:{port}"));
+            self.1.notify_one();
+        }
+        fn withdraw_onion(&self) {
+            self.0.lock().unwrap().push("withdrawn".to_string());
+            self.1.notify_one();
+        }
+    }
+
+    impl Recorder {
+        async fn wait_for(&self, n: usize) -> Vec<String> {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let notified = self.1.notified();
+                    let got = self.0.lock().unwrap().clone();
+                    if got.len() >= n {
+                        return got;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("the hidden service task stalled")
+        }
+    }
+
+    const FAKE_ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+
+    /// #973: when Tor restarts, the address is withdrawn, and the service is
+    /// added again, with the key saved the first time, so it comes back at
+    /// the same address. satd connected once and kept advertising the
+    /// address of a service that no longer existed.
+    #[tokio::test]
+    async fn the_hidden_service_comes_back_after_tor_restarts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sink = std::sync::Arc::new(Recorder::default());
+        let service = HiddenService {
+            control: listener.local_addr().unwrap().to_string(),
+            password: None,
+            virtual_port: 8333,
+            target: "127.0.0.1:8334".to_string(),
+            net_datadir: dir.path().to_path_buf(),
+            fallback: None,
+        };
+        let tor = tokio::spawn(async move {
+            let (first, conn) = fake_tor_session(&listener).await;
+            drop(conn); // Tor stops.
+            let (second, conn) = fake_tor_session(&listener).await;
+            (first, second, conn)
+        });
+        let onion = service.start(sink.clone()).await;
+        assert_eq!(onion.as_deref(), Some(FAKE_ONION));
+        let events = sink.wait_for(3).await;
+        let up = format!("{FAKE_ONION}:8333");
+        assert_eq!(events, [up.clone(), "withdrawn".to_string(), up]);
+        let (first, second, _conn) = tor.await.unwrap();
+        assert_eq!(first, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
+        assert_eq!(second, "ADD_ONION ED25519-V3:a2V5 Port=8333,127.0.0.1:8334");
+    }
+
+    /// #973: an `-externalip` onion is advertised while the node's own
+    /// service is down, before Tor first answers and after it goes away,
+    /// and the node's own service is advertised while it is up.
+    #[tokio::test]
+    async fn the_externalip_onion_stands_in_while_the_service_is_down() {
+        // A port nothing listens on yet: Tor is not up at startup.
+        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sink = std::sync::Arc::new(Recorder::default());
+        let manual = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion".to_string();
+        let service = HiddenService {
+            control: addr.to_string(),
+            password: None,
+            virtual_port: 8333,
+            target: "127.0.0.1:8334".to_string(),
+            net_datadir: dir.path().to_path_buf(),
+            fallback: Some((manual.clone(), 9333)),
+        };
+        assert_eq!(service.start(sink.clone()).await, None);
+        assert_eq!(sink.wait_for(1).await, [format!("{manual}:9333")]);
+        // Tor comes up, then stops.
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let (_, conn) = fake_tor_session(&listener).await;
+        assert_eq!(sink.wait_for(2).await[1], format!("{FAKE_ONION}:8333"));
+        drop(conn);
+        assert_eq!(sink.wait_for(3).await[2], format!("{manual}:9333"));
     }
 
     #[test]

@@ -1780,6 +1780,13 @@ impl PeerManager {
         *self.advertised_onion.write() = Some(PeerAddr::Onion { host, port });
     }
 
+    /// Stop advertising an onion address: the hidden service is gone (#973).
+    pub fn clear_advertised_onion(&self) {
+        if self.advertised_onion.write().take().is_some() {
+            tracing::info!("No longer advertising a hidden service to peers");
+        }
+    }
+
     /// Addresses this node advertises as its own, for `getnetworkinfo`'s
     /// `localaddresses`: operator `-externalip` entries plus our hidden
     /// service. `score` mirrors Bitcoin Core's notion of confidence; onion
