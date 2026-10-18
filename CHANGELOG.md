@@ -86,6 +86,10 @@ item below is (or will be) written up in full in the in-development
   blocks past the tip the clean-shutdown marker recorded (#983).
   `generatetoaddress`, `waitfor*` and long-polling `getblocktemplate` stop at
   shutdown.
+- `invalidateblock` disconnects to the invalidated block's parent before it
+  activates a competing branch, as Core does; a competing branch that failed
+  to connect left the node on the tip it had just marked invalid, refusing
+  every new block until a restart (#977).
 
 ## Releases
 
