@@ -60,6 +60,8 @@ item below is (or will be) written up in full in the in-development
   Core's startup refusals; `-proxy` soft-sets `-listen=0`; `-proxy=0` and
   `-onion=0` are read as Core reads them. **A node with `-proxy` and no explicit
   `-listen` stops listening.**
+- `/readyz` is 503 while the `tip_stall` or `peer_floor` health detector is
+  raised: a node that lost its peers showed no lag and stayed ready (#979).
 
 ## Releases
 
