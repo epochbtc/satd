@@ -123,6 +123,13 @@ item below is (or will be) written up in full in the in-development
   the control port with Core's backoff (1 s, growing by half, at most 10
   minutes) and adds the service again, and stops advertising the address
   while it is down. It connected once, at startup (#973).
+- `getblock` and `getrawtransaction` answer with Core v31's fields (#978):
+  `getblock` adds `strippedsize` and `coinbase_tx`, and at verbosity 2 and
+  3 each transaction's `fee` and each input's `prevout` from the block's
+  undo data, with or without `-txindex`. A coinbase shows its witness.
+  satd's own extra fields are gone: `blockheight`, a mempool
+  transaction's `confirmations: 0`, the per-transaction block fields in
+  `getblock`, and `decoderawtransaction`'s `hex`.
 
 ## Releases
 

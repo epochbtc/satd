@@ -674,24 +674,32 @@ pub fn get_block(
 
     let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
-    // Bitcoin Core's verbosity contract:
+    // Bitcoin Core's verbosity contract (`blockToJSON`):
     //   1 → tx is an array of txid strings
-    //   2+ → tx is an array of full tx-detail objects (Core caps at 3,
-    //        which adds prevout decoding; satd treats anything ≥2 as
-    //        the standard full-detail shape).
+    //   2 → full tx objects, each with its `fee` from the block's undo data
+    //   3+ → as 2, and each input with its `prevout`, also from undo data
+    // The tx objects carry no `blockhash` or `confirmations`: Core passes
+    // `TxToUniv` a null block hash here (#978).
     let block_hash_str = hash.to_string();
     let tx_field: Value = if verbosity >= 2 {
+        let undo = chain_state
+            .read_undo(&hash)
+            .map_err(|_| crate::rpc::rawtx::UNDO_UNREADABLE.to_string())?;
+        let per_tx = match &undo {
+            Some(u) => Some(crate::rpc::rawtx::undo_by_tx(&block, u)?),
+            None => None,
+        };
         let txs: Vec<Value> = block
             .txdata
             .iter()
-            .map(|tx| {
+            .enumerate()
+            .map(|(i, tx)| {
                 crate::rpc::rawtx::decode_transaction_verbose_net(
                     tx,
-                    Some(&block_hash_str),
-                    Some(entry.height),
-                    Some(confirmations),
-                    1,
                     None,
+                    per_tx.as_ref().and_then(|p| p[i]),
+                    verbosity >= 3,
+                    true,
                     chain_state.network,
                 )
             })
@@ -734,9 +742,29 @@ pub fn get_block(
         "difficulty": univalue_double(difficulty),
         "chainwork": format!("{:0>64}", chainwork_hex),
         "nTx": entry.num_tx,
+        // The block without witness data: header, tx count, and each
+        // transaction's base serialization.
+        "strippedsize": 80
+            + bitcoin::VarInt(block.txdata.len() as u64).size()
+            + block.txdata.iter().map(|t| t.base_size()).sum::<usize>(),
         "size": block_size,
         "weight": block.weight().to_wu(),
     });
+    // Core v31's `coinbase_tx` (`coinbaseTxToJSON`).
+    if let Some(coinbase) = block.txdata.first()
+        && let Some(vin0) = coinbase.input.first()
+    {
+        let mut cb = json!({
+            "version": coinbase.version.0,
+            "locktime": coinbase.lock_time.to_consensus_u32(),
+            "sequence": vin0.sequence.0,
+            "coinbase": hex::encode(vin0.script_sig.as_bytes()),
+        });
+        if let Some(reserved) = vin0.witness.iter().next() {
+            cb["witness"] = json!(hex::encode(reserved));
+        }
+        result["coinbase_tx"] = cb;
+    }
 
     if let Some(ph) = prev_hash {
         result["previousblockhash"] = Value::String(ph);

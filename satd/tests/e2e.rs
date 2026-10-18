@@ -354,9 +354,8 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
 
     // Confirm via `getrawtransaction` verbose=true — wallet-free
     // observation. After mining 1 block on top, the spend has exactly
-    // 1 confirmation. This same call also returns `blockheight: 102`
-    // (the spend lands in block 102, mined just above); both fields
-    // are part of the Core-compatible verbose response.
+    // 1 confirmation, and Core's `blockhash`, with no `blockheight`
+    // (#978).
     //
     // This node runs without `-txindex`, so the confirming block hash is
     // required — Core answers a confirmed txid from the index or from a
@@ -381,7 +380,8 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
         "tx should show 1 confirmation; got {}",
         raw
     );
-    assert_eq!(raw["result"]["blockheight"], 102);
+    assert_eq!(raw["result"]["blockhash"], serde_json::json!(confirming_hash));
+    assert_eq!(raw["result"].get("blockheight"), None, "{raw}");
 
     e2e.node.stop();
 }
@@ -2657,9 +2657,9 @@ fn test_e2e_jsonrpc_getblock_verbose_levels() {
     // Level 2: object with tx as array of full tx detail objects.
     // Same per-tx shape as `getrawtransaction verbose=true` —
     // {txid, hash, version, size, vsize, weight, locktime, vin, vout}.
-    // Block-context fields (blockhash, blockheight, confirmations)
-    // are stamped on each tx so explorers can render without a follow-up
-    // call.
+    // As in Core, the tx objects carry no block-context fields
+    // (blockhash, confirmations): `blockToJSON` passes `TxToUniv` a null
+    // block hash (#978).
     let v2 = e2e
         .node
         .rpc_call_with_params(
@@ -2679,16 +2679,9 @@ fn test_e2e_jsonrpc_getblock_verbose_levels() {
         tx[0]["vsize"].as_u64().unwrap_or(0) > 0,
         "v2 tx[0].vsize > 0"
     );
-    assert_eq!(
-        tx[0]["blockhash"].as_str(),
-        Some(h1.as_str()),
-        "v2 tx[0].blockhash stamped"
-    );
-    assert_eq!(
-        tx[0]["blockheight"].as_u64(),
-        Some(1),
-        "v2 tx[0].blockheight stamped"
-    );
+    for f in ["blockhash", "blockheight", "confirmations"] {
+        assert_eq!(tx[0].get(f), None, "v2 tx[0].{f}: {}", tx[0]);
+    }
     // Level-1 txid array must equal the txids on level-2 tx objects
     // (consistency invariant between verbosity levels).
     let v1_txids: Vec<&str> = v1["result"]["tx"]

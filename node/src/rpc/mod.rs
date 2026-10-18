@@ -69,3 +69,5 @@ pub mod util;
 
 #[cfg(test)]
 mod rpcparity_tests;
+#[cfg(test)]
+mod txparity_tests;
