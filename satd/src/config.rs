@@ -10810,17 +10810,23 @@ rpcport=8332
         assert_eq!(cfg.stream_prefix_max_bits, 32);
     }
 
+    /// Parse `argv` into a heap-allocated `Config`. `CliArgs` and `Config`
+    /// are each several KiB, and a test holding a few of them inline sits
+    /// at the edge of the 2 MiB test-thread stack (#1002).
+    #[inline(never)]
+    fn parse_boxed(argv: &[&str]) -> Box<Config> {
+        use clap::Parser;
+        let cli = Box::new(CliArgs::try_parse_from(argv).unwrap());
+        Box::new(Config::from_cli(*cli).unwrap())
+    }
+
     #[test]
     fn health_alert_threshold_defaults_and_parsing() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults come from the single source of truth in `node::health`, so
         // the config layer and the detector can never disagree about them.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
-        let cfg = Config::from_cli(cli).unwrap();
+        let cfg = parse_boxed(&["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
         // Three defaults are network-dependent, all because the alert would
@@ -10836,9 +10842,7 @@ rpcport=8332
 
         // ...all armed where the condition really does mean something is
         // wrong.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--datadir", dir.path().to_str().unwrap()]).unwrap();
-        let cfg_mainnet = Config::from_cli(cli).unwrap();
+        let cfg_mainnet = parse_boxed(&["satd", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg_mainnet.alert_tip_stall_seconds, 3_600, "mainnet keeps the hour");
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
         assert_eq!(cfg_mainnet.alert_reorg_depth, 3, "3 deep is an incident on mainnet");
@@ -10847,10 +10851,7 @@ rpcport=8332
         // thin hashrate. Paging on that trains the operator to ignore the
         // alert, which costs them the mainnet one too — so the floor is raised
         // rather than defaulted to mainnet's sensitivity.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--signet", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
-        let cfg_signet = Config::from_cli(cli).unwrap();
+        let cfg_signet = parse_boxed(&["satd", "--signet", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
         assert_eq!(cfg_signet.alert_peer_floor, 3, "but signet is a real network with peers");
         // A stall is not an ordinary property of a thin-hashrate chain the way
@@ -10859,7 +10860,7 @@ rpcport=8332
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.
-        let cli = CliArgs::try_parse_from([
+        let cfg = parse_boxed(&[
             "satd",
             "--regtest",
             "--datadir",
@@ -10874,9 +10875,7 @@ rpcport=8332
             "0",
             "--alertreorgdepth",
             "6",
-        ])
-        .unwrap();
-        let cfg = Config::from_cli(cli).unwrap();
+        ]);
         assert_eq!(cfg.alert_tip_stall_seconds, 7_200);
         assert_eq!(cfg.alert_disk_free_mb, 0, "0 must disable, not fall back");
         assert_eq!(cfg.alert_mempool_full_pct, 75);

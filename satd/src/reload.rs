@@ -877,6 +877,9 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("maxmempool", maxmempool, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
+        // Set once at startup: every mempool entry's adjusted size and the
+        // fee-rate index are computed with it.
+        restart!("bytespersigop", bytespersigop),
         live!("minrelaytxfee", minrelaytxfee, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
