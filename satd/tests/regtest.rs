@@ -7277,6 +7277,22 @@ fn a_new_datadir_and_its_files_are_private() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// #973: `-externalip=<x>.onion`, Core's manual hidden-service setup, is
+/// accepted and advertised as the node's own address. satd refused to start.
+#[test]
+fn an_onion_externalip_is_advertised_as_a_local_address() {
+    // A valid v3 address: the key 0x00..0x1f, its checksum, version 3.
+    let host = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion";
+    let mut node = TestNode::start(&[&format!("--externalip={host}")]);
+    let info = node.rpc_ok("getnetworkinfo", vec![]);
+    let local = info["localaddresses"].as_array().cloned().unwrap_or_default();
+    assert!(
+        local.iter().any(|a| a["address"] == host && a["port"] == 18444),
+        "the onion is not among the local addresses: {info}"
+    );
+    node.stop();
+}
+
 #[test]
 fn test_clean_shutdown_marker_graceful_stop() {
     // Graceful RPC stop should write the marker and next startup should see it.

@@ -624,6 +624,10 @@ pub struct Config {
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`), resolved to socket addresses. Advertised to peers.
     pub externalip: Vec<SocketAddr>,
+    /// `-externalip=<host>.onion[:port]`: a hidden service the operator runs
+    /// themselves (configured in `torrc`), advertised as the node's own, as in
+    /// Core's documented manual setup.
+    pub externalip_onion: Vec<(String, u16)>,
     /// `-whitelist` permission entries by source subnet (NetPermissions).
     pub whitelist: Vec<node::net::permissions::WhitelistEntry>,
     /// Bitcoin Core `-whitelistrelay` (default true): grant the `relay`
@@ -2388,16 +2392,22 @@ impl Config {
         // `IP` or `IP:port`; a bare IP inherits the network P2P port.
         let externalip_raw: Vec<String> = merge_list(cli.externalip.clone(), file_get_all("externalip"), None);
         let mut externalip: Vec<SocketAddr> = Vec::with_capacity(externalip_raw.len());
+        let mut externalip_onion: Vec<(String, u16)> = Vec::new();
         for raw in &externalip_raw {
             let s = raw.trim();
             if let Ok(sa) = s.parse::<SocketAddr>() {
                 externalip.push(sa);
             } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
                 externalip.push(SocketAddr::new(ip, default_p2p_port(network)));
+            } else if let Some(onion) = parse_onion_externalip(s, default_p2p_port(network)) {
+                // Core's manual hidden-service setup: the service is in
+                // `torrc`, and `-externalip` tells the node its address
+                // (#973). satd refused it at startup.
+                externalip_onion.push(onion);
             } else {
                 return Err(format!(
-                    "externalip: {s:?} is not an IP or IP:port. satd's externalip accepts \
-                     literal addresses only (hostnames/.onion are not resolved here)."
+                    "externalip: {s:?} is not an IP, IP:port or v3 .onion address. satd's \
+                     externalip does not resolve hostnames."
                 ));
             }
         }
@@ -4086,6 +4096,7 @@ impl Config {
             v2transport,
             v2only,
             externalip,
+            externalip_onion,
             whitelist,
             whitelist_relay,
             whitelist_force_relay,
@@ -7914,6 +7925,17 @@ fn merge_list(cli: Vec<String>, file: Vec<String>, negation: Option<&str>) -> Ve
     merged
 }
 
+/// `<56 base32 chars>.onion[:port]`, a v3 onion address, as `(host, port)`.
+fn parse_onion_externalip(s: &str, default_port: u16) -> Option<(String, u16)> {
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (s, default_port),
+    };
+    let host = host.to_ascii_lowercase();
+    node::net::peer::onion_host_to_torv3_pubkey(&host)?;
+    Some((host, port))
+}
+
 /// Boolean options Core negates with a `-no` prefix, which [`normalize_args`]
 /// rewrites to an explicit value.
 const NEGATABLE_BOOL_FLAGS: &[&str] = &[
@@ -9904,6 +9926,10 @@ mod bytespersigop_tests;
 #[cfg(test)]
 #[path = "config_listmerge_tests.rs"]
 mod listmerge_tests;
+
+#[cfg(test)]
+#[path = "config_externalip_tests.rs"]
+mod externalip_tests;
 
 #[cfg(test)]
 mod tests {
