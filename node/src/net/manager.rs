@@ -9450,9 +9450,12 @@ impl PeerManager {
                 }
                 // Core's "getblocks stopping, pruned or too old block": a
                 // pruning node invs nothing it may have deleted within the
-                // hour it takes the peer to ask.
+                // hour it takes the peer to ask. Whether the block is still
+                // held is Core's `BLOCK_HAVE_DATA`, read from the block
+                // index: loading each block to find out would read up to 282
+                // of them from disk to answer one small request.
                 if self.is_pruning()
-                    && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || self.chain_state.get_block(&hash).is_none())
+                    && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || !self.chain_state.has_block_data(&hash))
                 {
                     break;
                 }

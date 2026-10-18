@@ -191,7 +191,7 @@ fn a_pruned_node_serves_nothing_below_the_limited_depth() {
 /// within the hour (Core's `nPrunedBlocksLikelyToHave`).
 #[test]
 fn a_pruned_nodes_getblocks_stops_at_blocks_it_may_not_keep() {
-    let (pm, _dir) = mk_pm();
+    let (pm, dir) = mk_pm();
     let chain = mine(&pm, 300, 1);
     let tip = pm.chain_state.tip_height();
     let mut rx = add_peer(&pm, 1, false);
@@ -223,6 +223,19 @@ fn a_pruned_nodes_getblocks_stops_at_blocks_it_may_not_keep() {
     let got = invd(&mut rx);
     assert_eq!(got.len(), PRUNED_BLOCKS_LIKELY_TO_HAVE as usize, "{} blocks", got.len());
     assert_eq!(got[0], chain[from as usize], "starting just above the cut");
+
+    // Whether a block is still held comes from the block index, not from
+    // reading the block: with every block file emptied, the index still
+    // says the blocks are there, and the answer is the same.
+    for f in std::fs::read_dir(dir.path().join("blocks")).unwrap() {
+        let f = f.unwrap().path();
+        if f.file_name().unwrap().to_string_lossy().starts_with("blk") {
+            std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(0).unwrap();
+        }
+    }
+    assert!(pm.chain_state.get_block(&chain[from as usize]).is_none(), "premise: the block bodies are gone");
+    pm.handle_getblocks(1, GetBlocksMessage::new(locator(from), none));
+    assert_eq!(invd(&mut rx).len(), PRUNED_BLOCKS_LIKELY_TO_HAVE as usize, "no block is read to answer");
 }
 
 /// Core also refuses a validated stale block with 30 days' worth of proof of
