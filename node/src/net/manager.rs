@@ -4959,7 +4959,10 @@ impl PeerManager {
                     let (stalled, stale_heights, silent) = {
                         let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
-                            let stalled = scheduler.detect_stalls(Duration::from_secs(15));
+                            let mut stalled = Vec::new();
+                            while let Some(peer_id) = scheduler.take_stalled_peer() {
+                                stalled.push(peer_id);
+                            }
                             // Per-height timeout: catch heights stuck with an active peer
                             let stale = scheduler.release_stale_inflight(
                                 Duration::from_secs(60),
@@ -4976,8 +4979,20 @@ impl PeerManager {
                             (Vec::new(), 0, Vec::new())
                         }
                     };
+                    // Core disconnects a peer stalling block download. The
+                    // scheduler has already taken its blocks back; closing
+                    // the connection stops the ones it is still sending from
+                    // arriving unrequested, and keeps it out of the
+                    // assignment pass below (#972).
                     for peer_id in stalled {
-                        tracing::debug!(peer_id, "IBD: peer stalled, reassigning blocks");
+                        let timeout_secs =
+                            self.ibd.read().as_ref().map(|s| s.stall_timeout().as_secs());
+                        tracing::info!(
+                            peer_id,
+                            next_timeout_secs = timeout_secs,
+                            "IBD: peer is stalling block download, disconnecting"
+                        );
+                        self.disconnect_by_id(peer_id);
                     }
                     if stale_heights > 0 {
                         tracing::info!(stale_heights, "IBD: stale in-flight heights returned to pending");

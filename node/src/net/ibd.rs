@@ -53,6 +53,20 @@ pub struct IbdScheduler {
     /// When each height was first assigned, for per-height stale detection.
     in_flight_at: HashMap<u32, Instant>,
 
+    /// When the peer now holding each in-flight height was asked for it.
+    /// `in_flight_at` survives hand-offs, so the 60s guard sees a height that
+    /// no peer delivers; the near-cursor timeout judges the holder, and keyed
+    /// on the first request it released a height from a peer that had only
+    /// just been handed it (#972).
+    requested_at: HashMap<u32, Instant>,
+
+    /// How long a peer may hold blocks without delivering one before it is
+    /// disconnected. Core's adaptive `m_block_stalling_timeout`: doubled,
+    /// up to [`STALL_TIMEOUT_MAX`], each time a peer is dropped for stalling,
+    /// so a node short of bandwidth does not drop every peer in turn, and
+    /// brought back towards [`STALL_TIMEOUT_BASE`] as blocks connect.
+    stall_timeout: Duration,
+
     /// Heights that have been downloaded (DataStored).
     downloaded: HashSet<u32>,
 
@@ -80,6 +94,14 @@ pub struct IbdScheduler {
     /// same peer immediately re-claimed it via its priority-zone scan.
     height_peer_cooldown: HashMap<u32, HashMap<PeerId, Instant>>,
 }
+
+/// The stall timeout's floor. Core starts at 2s, but judges only the peer
+/// whose block the window is waiting on; satd judges every peer holding
+/// blocks, and has used 15s for that.
+pub const STALL_TIMEOUT_BASE: Duration = Duration::from_secs(15);
+
+/// The stall timeout's ceiling, Core's `BLOCK_STALLING_TIMEOUT_MAX`.
+pub const STALL_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 
 /// How long a peer is barred from re-claiming a height after it failed to
 /// deliver. Pegged longer than the per-height stale timeout so the release
@@ -125,6 +147,8 @@ impl IbdScheduler {
             pending: VecDeque::from(heights),
             in_flight: HashMap::new(),
             in_flight_at: HashMap::new(),
+            requested_at: HashMap::new(),
+            stall_timeout: STALL_TIMEOUT_BASE,
             downloaded: HashSet::new(),
             peer_slots: HashMap::new(),
             // Match Bitcoin Core's MAX_BLOCKS_IN_TRANSIT_PER_PEER (16). The
@@ -273,6 +297,7 @@ impl IbdScheduler {
             if let Some(&hash) = self.height_to_hash.get(&h) {
                 self.in_flight.insert(h, peer_id);
                 self.in_flight_at.entry(h).or_insert_with(Instant::now);
+                self.requested_at.insert(h, Instant::now());
                 assigned_heights.push(h);
                 hashes.push(hash);
             }
@@ -316,6 +341,7 @@ impl IbdScheduler {
             if let Some(&hash) = self.height_to_hash.get(&height) {
                 self.in_flight.insert(height, peer_id);
                 self.in_flight_at.entry(height).or_insert_with(Instant::now);
+                self.requested_at.insert(height, Instant::now());
                 assigned_heights.push(height);
                 hashes.push(hash);
             }
@@ -330,6 +356,15 @@ impl IbdScheduler {
 
         if !assigned_heights.is_empty() {
             let slots = self.peer_slots.get_mut(&peer_id).unwrap();
+            // A peer that owed nothing starts its stall clock now, as Core
+            // sets `m_downloading_since` when a peer's first block goes in
+            // flight. Its last delivery may be long past, from before a wait
+            // with nothing to give it, and judged from then it would be
+            // disconnected for stalling right after being asked. A peer that
+            // still owes blocks keeps its clock.
+            if slots.assigned.is_empty() {
+                slots.last_activity = now;
+            }
             slots.assigned.extend(assigned_heights);
         }
 
@@ -370,6 +405,7 @@ impl IbdScheduler {
             // and leaving the holder's slot occupied would leak its capacity.
             self.in_flight.remove(&height);
             self.in_flight_at.remove(&height);
+            self.requested_at.remove(&height);
             if let Some(slots) = self.peer_slots.get_mut(&holder) {
                 slots.assigned.retain(|&h| h != height);
             }
@@ -406,7 +442,9 @@ impl IbdScheduler {
         if let Some(slots) = self.peer_slots.remove(&peer_id) {
             for height in slots.assigned {
                 self.in_flight.remove(&height);
-                // in_flight_at is kept — see doc comment above.
+                // in_flight_at is kept — see doc comment above. The holder's
+                // own request time goes with the holder.
+                self.requested_at.remove(&height);
                 // Push to front for immediate reassignment
                 self.pending.push_front(height);
             }
@@ -421,32 +459,43 @@ impl IbdScheduler {
         });
     }
 
-    /// Detect stalled peers (no activity within timeout).
-    /// Returns list of stalled peer IDs. Their blocks are returned to the pool.
-    pub fn detect_stalls(&mut self, timeout: Duration) -> Vec<PeerId> {
+    /// The peer that has gone longest holding blocks without delivering one,
+    /// past the stall timeout. Its blocks go back to the pool, the timeout
+    /// doubles, and the caller disconnects it, as Core disconnects a peer
+    /// stalling block download (`net_processing.cpp`, "Peer is stalling block
+    /// download"). Call until `None`: each call judges the rest against the
+    /// doubled timeout, as Core's later peers are.
+    ///
+    /// The stall check used to only take the blocks back. The peer stayed
+    /// connected, unmarked, and could be handed the same heights again on the
+    /// same tick, while the blocks it was still sending arrived unrequested
+    /// (#972).
+    pub fn take_stalled_peer(&mut self) -> Option<PeerId> {
         let now = Instant::now();
-        let stalled: Vec<PeerId> = self
+        let peer_id = self
             .peer_slots
             .iter()
             .filter(|(_, slots)| {
                 !slots.assigned.is_empty()
-                    && now.duration_since(slots.last_activity) > timeout
+                    && now.duration_since(slots.last_activity) > self.stall_timeout
             })
-            .map(|(&id, _)| id)
-            .collect();
+            .min_by_key(|(_, slots)| slots.last_activity)
+            .map(|(&id, _)| id)?;
+        self.peer_disconnected(peer_id);
+        self.stall_timeout = (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX);
+        Some(peer_id)
+    }
 
-        for &peer_id in &stalled {
-            self.peer_disconnected(peer_id);
-        }
-
-        stalled
+    /// The current stall timeout; see [`Self::take_stalled_peer`].
+    pub fn stall_timeout(&self) -> Duration {
+        self.stall_timeout
     }
 
     /// Return individual in-flight heights that have exceeded the per-height
     /// timeout back to pending, regardless of per-peer activity.
     ///
     /// This fixes the case where a peer stays active (delivering other blocks)
-    /// but silently ignores specific heights (e.g., height 945208). `detect_stalls`
+    /// but silently ignores specific heights (e.g., height 945208). `take_stalled_peer`
     /// cannot catch this because `last_activity` is refreshed by other deliveries.
     ///
     /// `near_cursor_timeout` (typically much shorter than `timeout`) applies to
@@ -465,24 +514,33 @@ impl IbdScheduler {
     ) -> usize {
         let now = Instant::now();
         let near_cursor_end = self.connect_cursor + 10;
-        let stale: Vec<(u32, PeerId)> = self
-            .in_flight_at
+        // Two clocks. The holder's own request: the near-cursor timeout (and
+        // the 60s one) judges the peer holding the height from when it was
+        // asked. The height's first request: the 60s guard catches a height
+        // no peer delivers however often it moves. Only the holder's own
+        // clock running out is its failure; on the other alone it may have
+        // been asked a moment ago, and the delay is the peers' before it
+        // (#972).
+        let stale: Vec<(u32, PeerId, bool)> = self
+            .in_flight
             .iter()
-            .filter(|&(&h, at)| {
-                let effective = if h > self.connect_cursor && h <= near_cursor_end {
+            .filter_map(|(&h, &p)| {
+                let holder_timeout = if h > self.connect_cursor && h <= near_cursor_end {
                     near_cursor_timeout
                 } else {
                     timeout
                 };
-                now.duration_since(*at) > effective
+                let over = |at: Option<&Instant>, limit| at.is_some_and(|at| now.duration_since(*at) > limit);
+                let holder_failed = over(self.requested_at.get(&h), holder_timeout);
+                (holder_failed || over(self.in_flight_at.get(&h), timeout)).then_some((h, p, holder_failed))
             })
-            .filter_map(|(&h, _)| self.in_flight.get(&h).map(|&p| (h, p)))
             .collect();
 
         let count = stale.len();
-        for (h, peer_id) in stale {
+        for (h, peer_id, holder_failed) in stale {
             self.in_flight.remove(&h);
             self.in_flight_at.remove(&h);
+            self.requested_at.remove(&h);
             // Push to front — the connect loop is likely waiting for this height
             self.pending.push_front(h);
             if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
@@ -491,7 +549,9 @@ impl IbdScheduler {
             // Mark this peer as failed for this height so the very next
             // assign_peer_work pass doesn't hand the same height right back
             // to the same silent peer (mainnet 2026-05-13 wedge at 785197).
-            self.record_failure(peer_id, h);
+            if holder_failed {
+                self.record_failure(peer_id, h);
+            }
         }
         count
     }
@@ -499,6 +559,11 @@ impl IbdScheduler {
     /// Notify the scheduler that the connect cursor has advanced.
     /// Heights below the cursor are no longer relevant.
     pub fn connect_cursor_advanced(&mut self, new_tip: u32) {
+        // Core's `BlockConnected` brings a doubled stall timeout back down by
+        // 15% per block.
+        if new_tip > self.connect_cursor {
+            self.stall_timeout = self.stall_timeout.mul_f64(0.85).max(STALL_TIMEOUT_BASE);
+        }
         self.connect_cursor = new_tip;
         // Remove from downloaded set — they've been connected
         self.downloaded.retain(|&h| h > new_tip);
@@ -636,6 +701,7 @@ impl IbdScheduler {
         }
         self.in_flight.remove(&height);
         self.in_flight_at.remove(&height);
+        self.requested_at.remove(&height);
         self.pending.push_front(height);
         if let Some(slots) = self.peer_slots.get_mut(&owner_peer) {
             slots.assigned.retain(|&x| x != height);
@@ -673,6 +739,7 @@ impl IbdScheduler {
         // in_flight_at entry with no matching in_flight makes
         // release_stale_inflight do extra work-for-nothing on every tick.
         self.in_flight_at.remove(&height);
+        self.requested_at.remove(&height);
         // Cooldowns for a downloaded height serve no purpose; drop them.
         self.height_peer_cooldown.remove(&height);
     }
@@ -738,6 +805,7 @@ impl IbdScheduler {
             return false;
         };
         self.in_flight_at.remove(&height);
+        self.requested_at.remove(&height);
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
             slots.assigned.retain(|&h| h != height);
         }
@@ -1407,12 +1475,142 @@ mod tests {
             slots.last_activity = Instant::now() - Duration::from_secs(120);
         }
 
-        let stalled = sched.detect_stalls(Duration::from_secs(60));
-        assert_eq!(stalled, vec![1]);
+        assert_eq!(sched.take_stalled_peer(), Some(1));
+        assert_eq!(sched.take_stalled_peer(), None);
 
         // Peer should be removed and blocks returned
         assert!(!sched.peer_slots.contains_key(&1));
         assert_eq!(sched.in_flight.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #972: each peer dropped for stalling doubles the timeout the next is
+    /// judged against, as Core's `m_block_stalling_timeout` does, so a node
+    /// whose own link is slow drops one peer rather than all of them; and
+    /// connected blocks bring it back down to the floor.
+    #[test]
+    fn a_stall_disconnect_doubles_the_timeout_for_the_next_peer() {
+        let (cs, dir) = make_chain_state_with_headers(100);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+        for peer in 1..=3 {
+            sched.assign_blocks(peer);
+        }
+        let idle = |sched: &mut IbdScheduler, peer: PeerId, secs: u64| {
+            sched.peer_slots.get_mut(&peer).unwrap().last_activity =
+                Instant::now() - Duration::from_secs(secs);
+        };
+        idle(&mut sched, 1, 20);
+        idle(&mut sched, 2, 40);
+        idle(&mut sched, 3, 70);
+
+        // The longest-idle goes first; the timeout is then 30s, which peer 2
+        // (40s) is still past, and then 60s, which peer 1 (20s) is not.
+        assert_eq!(sched.take_stalled_peer(), Some(3));
+        assert_eq!(sched.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(sched.take_stalled_peer(), Some(2));
+        assert_eq!(sched.stall_timeout(), Duration::from_secs(60));
+        assert_eq!(sched.take_stalled_peer(), None, "peer 1 is inside the doubled timeout");
+        assert!(sched.peer_slots.contains_key(&1));
+
+        // Capped at Core's 64s.
+        idle(&mut sched, 1, 200);
+        assert_eq!(sched.take_stalled_peer(), Some(1));
+        assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_MAX);
+
+        // Each connected block takes 15% off, down to the floor.
+        sched.connect_cursor_advanced(1);
+        assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_MAX.mul_f64(0.85));
+        for tip in 2..20 {
+            sched.connect_cursor_advanced(tip);
+        }
+        assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_BASE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #972 review: a peer that sat idle with nothing to download, for
+    /// longer than the stall timeout, is not stalling when it is then given
+    /// blocks. Its clock starts at the assignment. A peer that already owes
+    /// blocks keeps its clock when given more.
+    #[test]
+    fn a_peer_given_work_after_an_idle_wait_is_not_stalling() {
+        let (cs, dir) = make_chain_state_with_headers(100);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+        let long_ago = Instant::now() - Duration::from_secs(200);
+        sched.register_peer(1);
+        sched.peer_slots.get_mut(&1).unwrap().last_activity = long_ago;
+        sched.assign_blocks(1);
+        assert!(!sched.peer_slots[&1].assigned.is_empty());
+        assert_eq!(sched.take_stalled_peer(), None, "peer 1 was asked just now");
+
+        // Owing blocks, more work does not reset the clock.
+        sched.register_peer(2);
+        sched.assign_blocks_up_to(2, 30);
+        assert!(!sched.peer_slots[&2].assigned.is_empty());
+        let owed = sched.peer_slots[&2].assigned.len();
+        sched.peer_slots.get_mut(&2).unwrap().last_activity = long_ago;
+        sched.assign_blocks(2);
+        assert!(sched.peer_slots[&2].assigned.len() > owed, "peer 2 was given more");
+        assert_eq!(sched.peer_slots[&2].last_activity, long_ago);
+        assert_eq!(sched.take_stalled_peer(), Some(2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #972: a near-cursor height handed to a new peer is judged from when
+    /// that peer was asked. Inheriting the first request's timestamp, it was
+    /// released from a peer asked a moment ago, and the peer was charged a
+    /// failure for the delay of the one before it.
+    #[test]
+    fn a_handed_off_height_gives_its_new_holder_a_fresh_clock() {
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let heights: Vec<u32> = sched.peer_inflight_heights(1);
+        assert!(!heights.is_empty());
+        // Asked of peer 1 twenty seconds ago: past the 15s near-cursor
+        // timeout, inside the 60s one.
+        let asked = Instant::now() - Duration::from_secs(20);
+        for h in &heights {
+            sched.in_flight_at.insert(*h, asked);
+            sched.requested_at.insert(*h, asked);
+        }
+
+        sched.peer_disconnected(1);
+        sched.register_peer(2);
+        sched.assign_blocks(2);
+        assert_eq!(sched.peer_inflight_heights(2).len(), heights.len());
+
+        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        assert_eq!(released, 0, "peer 2 was asked just now; nothing of its is stale");
+        assert_eq!(sched.peer_slots[&2].consecutive_failures, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #972: the 60s guard still releases a height no peer has delivered in
+    /// a minute, however recently it moved, but it does not charge the peer
+    /// that has held it only a moment.
+    #[test]
+    fn the_first_request_guard_releases_without_charging_a_fresh_holder() {
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let heights: Vec<u32> = sched.peer_inflight_heights(1);
+        let first = Instant::now() - Duration::from_secs(120);
+        for h in &heights {
+            sched.in_flight_at.insert(*h, first);
+        }
+
+        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        assert_eq!(released, heights.len());
+        assert_eq!(sched.peer_slots[&1].consecutive_failures, 0, "peer 1 was asked a moment ago");
+        let now = Instant::now();
+        assert!(
+            heights.iter().all(|&h| !sched.is_peer_on_cooldown(h, 1, now)),
+            "peer 1 must not be barred from heights it was not given time to deliver"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
