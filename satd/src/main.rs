@@ -2833,92 +2833,43 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // 127.0.0.1:9051 when unset. `Config::load` resolves listenonion:
     // off by default, implicitly on when -torcontrol is set (the legacy
     // satd trigger), and forced off by an explicit -listenonion=0.
-    let mut _onion_addr: Option<String> = None;
-    // The ADD_ONION service lives only as long as its originating control
-    // connection (no `Detach` flag), so the controller must be held for the
-    // process lifetime — kept in this function-scope binding and dropped at
-    // process exit, which cleanly removes the service. Dropping it earlier would
-    // tear the hidden service down immediately.
-    let mut _tor_controller: Option<node::net::tor::TorController> = None;
+    //
+    // `-externalip=<x>.onion` is a hidden service the operator runs in
+    // `torrc`. satd advertises one onion address: its own service's while
+    // that is up, the `-externalip` one otherwise (#973).
+    let externalip_onion = config.externalip_onion.first().cloned();
     if config.listenonion {
-        let torcontrol = config.torcontrol.as_deref().unwrap_or("127.0.0.1:9051");
-        match node::net::tor::TorController::connect(torcontrol).await {
-            Ok(mut controller) => {
-                // Pass the optional -torpassword through; the controller negotiates
-                // via PROTOCOLINFO and prefers SAFECOOKIE (stock-Tor default) when
-                // no password is set, so -listenonion works without a torrc
-                // HashedControlPassword.
-                match controller.authenticate(config.torpassword.as_deref()).await {
-                    Ok(()) => {
-                        // Point Tor at the *onion* bind when the operator
-                        // named one (`-bind=addr:port=onion`), as Core does
-                        // with `onion_binds`. That listener is the one whose
-                        // peers are exempt from `-whitelist` matching, so
-                        // targeting the clearnet port instead is what made an
-                        // anonymous inbound Tor peer inherit a loopback
-                        // whitelist entry.
-                        let onion_bind = config.binds.iter().find(|b| b.onion).map(|b| b.addr);
-                        let target = match onion_bind {
-                            Some(addr) => addr.to_string(),
-                            None => format!("127.0.0.1:{}", config.port),
-                        };
-                        // The key saved last time keeps the node at the same
-                        // onion address (#973).
-                        let saved_key = node::net::tor::load_onion_key(&net_datadir);
-                        match controller
-                            .create_hidden_service(config.port, &target, saved_key.as_deref())
-                            .await
-                        {
-                            Ok((onion, new_key)) => {
-                                if let Some(key) = new_key {
-                                    match node::net::tor::save_onion_key(&net_datadir, &key) {
-                                        Ok(()) => tracing::info!(
-                                            path = %node::net::tor::onion_key_path(&net_datadir).display(),
-                                            "Saved the hidden service's private key"
-                                        ),
-                                        Err(e) => tracing::warn!(
-                                            error = %e,
-                                            "Could not save the hidden service's private key; \
-                                             its onion address will change at the next start"
-                                        ),
-                                    }
-                                }
-                                tracing::info!(onion_addr = %onion, reused = saved_key.is_some(), "Tor hidden service created");
-                                // Advertise the service to peers (addrv2 TorV3 +
-                                // getnetworkinfo) so the network can discover and
-                                // dial us inbound, not just peers handed the
-                                // address out of band.
-                                peer_manager.set_advertised_onion(onion.clone(), config.port);
-                                _onion_addr = Some(onion);
-                                // Retain the control connection so Tor keeps the
-                                // service up for the node's lifetime.
-                                _tor_controller = Some(controller);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to create Tor hidden service: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Tor control authentication failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to connect to Tor control port: {}", e);
-            }
+        // Point Tor at the *onion* bind when the operator named one
+        // (`-bind=addr:port=onion`), as Core does with `onion_binds`. That
+        // listener is the one whose peers are exempt from `-whitelist`
+        // matching, so targeting the clearnet port instead is what made an
+        // anonymous inbound Tor peer inherit a loopback whitelist entry.
+        let onion_bind = config.binds.iter().find(|b| b.onion).map(|b| b.addr);
+        let target = match onion_bind {
+            Some(addr) => addr.to_string(),
+            None => format!("127.0.0.1:{}", config.port),
+        };
+        // The service lives as long as the control connection that added
+        // it (no `Detach` flag); the task holds that connection, adds the
+        // service again when Tor restarts, and withdraws the address while
+        // it is down. Pass the optional -torpassword through; the
+        // controller prefers SAFECOOKIE (the stock-Tor default) when no
+        // password is set, so -listenonion works without a torrc
+        // HashedControlPassword.
+        node::net::tor::HiddenService {
+            control: config.torcontrol.clone().unwrap_or_else(|| "127.0.0.1:9051".to_string()),
+            password: config.torpassword.clone(),
+            virtual_port: config.port,
+            target,
+            net_datadir: net_datadir.clone(),
+            fallback: externalip_onion.clone(),
         }
-    }
-
-    // `-externalip=<x>.onion`: a hidden service the operator runs in
-    // `torrc`. Advertised when the node made none of its own (#973). satd
-    // advertises one onion address, so a second is not.
-    if _onion_addr.is_none()
-        && let Some((host, port)) = config.externalip_onion.first()
-    {
+        .start(peer_manager.clone())
+        .await;
+    } else if let Some((host, port)) = &externalip_onion {
         peer_manager.set_advertised_onion(host.clone(), *port);
     }
-    if config.externalip_onion.len() > 1 || (_onion_addr.is_some() && !config.externalip_onion.is_empty()) {
+    if config.externalip_onion.len() > 1 {
         tracing::warn!(
             "satd advertises one onion address; the other -externalip .onion entries are not advertised"
         );

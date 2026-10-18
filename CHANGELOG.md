@@ -119,6 +119,10 @@ item below is (or will be) written up in full in the in-development
   world-readable.
 - `-externalip` accepts a v3 `.onion` address and advertises it, Core's
   manual hidden-service setup; satd refused it at startup (#973).
+- The Tor hidden service comes back after Tor restarts: satd reconnects to
+  the control port with Core's backoff (1 s, growing by half, at most 10
+  minutes) and adds the service again, and stops advertising the address
+  while it is down. It connected once, at startup (#973).
 
 ## Releases
 
