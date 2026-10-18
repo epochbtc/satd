@@ -53,6 +53,9 @@ item below is (or will be) written up in full in the in-development
 - BIP 30's buried-BIP 34 skip now needs Core's BIP 34 block at that height
   and ends at height 1,983,702, as in Core; testnet3, past that height, checks
   BIP 30 on every block again.
+- `getblocktemplate` transactions carry Core's `hash` (wtxid) and `depends`
+  fields; gateways that require them (such as OCEAN's DATUM gateway) refused
+  every non-empty template (#982).
 
 ## Releases
 
