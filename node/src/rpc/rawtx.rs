@@ -93,22 +93,13 @@ pub fn get_raw_transaction(
         return Err((-5, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved".to_string()));
     }
 
-    // Search mempool first (unless blockhash is specified). Bitcoin
-    // Core reports unconfirmed-tx `confirmations` as 0 in the verbose
-    // response; match that so clients that gate on the field don't
-    // have to special-case satd.
+    // Search mempool first (unless blockhash is specified). Core gives a
+    // mempool transaction no chain fields, not even `confirmations`, and at
+    // verbosity 2 no fee or prevouts: those come from undo data (#978).
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
-                Ok(decode_transaction_verbose_net(
-                    &entry.tx,
-                    None,
-                    None,
-                    Some(0),
-                    verbosity,
-                    None,
-                    chain_state.network,
-                ))
+                Ok(decode_transaction_verbose_net(&entry.tx, None, None, false, true, chain_state.network))
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))
@@ -131,23 +122,19 @@ pub fn get_raw_transaction(
             .get_block(&block_hash)
             .ok_or((-1, "Block not available (pruned data)".to_string()))?;
 
-        for tx in &block.txdata {
+        for (tx_idx, tx) in block.txdata.iter().enumerate() {
             if tx.compute_txid() == txid {
                 return if verbose {
-                    let height = Some(entry.height);
-                    let confirmations = height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                    let mut result = decode_transaction_verbose_net(
-                        tx,
-                        Some(hash_str),
-                        height,
-                        confirmations,
-                        verbosity,
-                        Some((chain_state, &block)),
-                        chain_state.network,
-                    );
+                    let confirmations = confirmations_for(chain_state, &block_hash, entry.height);
+                    let ctx = TxBlockContext {
+                        blockhash: block_hash,
+                        active: (confirmations > 0).then_some((confirmations, entry.header.time)),
+                    };
+                    let mut result =
+                        confirmed_tx_verbose(chain_state, tx, tx_idx, &block, &ctx, verbosity)?;
                     // `in_active_chain` is only present when the caller
                     // explicitly provided a blockhash.
-                    maybe_set_in_active_chain(&mut result, confirmations);
+                    result["in_active_chain"] = json!(ctx.active.is_some());
                     Ok(result)
                 } else {
                     let raw = bitcoin::consensus::serialize(tx);
@@ -179,20 +166,11 @@ pub fn get_raw_transaction(
     {
         match block.txdata.get(tx_idx) {
             Some(tx) if tx.compute_txid() == txid => {
-                let entry = chain_state.get_block_index(&block_hash);
                 return if verbose {
-                    let height = entry.as_ref().map(|e| e.height);
-                    let confirmations =
-                        height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                    Ok(decode_transaction_verbose_net(
-                        tx,
-                        Some(&block_hash.to_string()),
-                        height,
-                        confirmations,
-                        verbosity,
-                        Some((chain_state, &block)),
-                        chain_state.network,
-                    ))
+                    match TxBlockContext::new(chain_state, block_hash) {
+                        Some(ctx) => confirmed_tx_verbose(chain_state, tx, tx_idx, &block, &ctx, verbosity),
+                        None => Ok(decode_transaction_verbose_net(tx, None, None, false, true, chain_state.network)),
+                    }
                 } else {
                     let raw = bitcoin::consensus::serialize(tx);
                     Ok(Value::String(hex::encode(raw)))
@@ -273,7 +251,7 @@ pub fn decode_raw_transaction(
         hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
     let tx = decode_tx(&tx_bytes, iswitness != Some(true), iswitness != Some(false))
         .ok_or((-22i32, "TX decode failed".to_string()))?;
-    Ok(decode_transaction_verbose_net(&tx, None, None, None, 1, None, network))
+    Ok(decode_transaction_verbose_net(&tx, None, None, false, false, network))
 }
 
 /// Read a transaction the way Core's `DecodeTx` (`core_io.cpp`) does.
@@ -371,27 +349,71 @@ fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, 
     i64::from(tip.saturating_sub(block_height).saturating_add(1))
 }
 
-/// Build verbose transaction JSON (shared by getrawtransaction and
-/// decoderawtransaction). `confirmations` is `Some(0)` for a mempool
-/// hit, `Some(N)` for a confirmed tx, and `None` for offline decode
-/// (`decoderawtransaction`) where there is no chain context.
+/// Where a transaction was confirmed: what Core's `TxToJSON` adds to
+/// `getrawtransaction`'s answer for a transaction found in a block.
+pub(crate) struct TxBlockContext {
+    pub blockhash: bitcoin::BlockHash,
+    /// The block's depth and time when it is on the active chain, `None`
+    /// when it is not (`confirmations` is then 0, and there is no `time`).
+    pub active: Option<(i64, u32)>,
+}
+
+impl TxBlockContext {
+    fn new(chain_state: &ChainState, blockhash: bitcoin::BlockHash) -> Option<Self> {
+        let entry = chain_state.get_block_index(&blockhash)?;
+        let confirmations = confirmations_for(chain_state, &blockhash, entry.height);
+        let active = (confirmations > 0).then_some((confirmations, entry.header.time));
+        Some(Self { blockhash, active })
+    }
+}
+
+/// Each transaction's spent coins in a block's undo data, Core's
+/// `CBlockUndo::vtxundo`: `None` for the coinbase, which spends nothing.
+/// `spent_coins` holds one coin per non-coinbase input in block order.
 ///
-/// `verbosity`: 1 = standard verbose, 2 = include `fee` and per-input
-/// `prevout` (Core v25+). `chain_and_block` is `Some((chain, block))`
-/// when the block is available for prevout lookup (verbosity 2).
-/// Render a transaction as Core's verbose JSON.
+/// Errs, with Core's message, when the undo data does not cover the block's
+/// inputs exactly: the row is corrupt, and no fee from it can be trusted.
+pub(crate) fn undo_by_tx<'a>(
+    block: &bitcoin::Block,
+    undo: &'a crate::storage::undo::UndoData,
+) -> Result<Vec<Option<&'a [crate::storage::coinview::Coin]>>, String> {
+    let mut rest = undo.spent_coins.as_slice();
+    let mut out = Vec::with_capacity(block.txdata.len());
+    for tx in &block.txdata {
+        if tx.is_coinbase() {
+            out.push(None);
+            continue;
+        }
+        if rest.len() < tx.input.len() {
+            return Err(UNDO_UNREADABLE.to_string());
+        }
+        let (mine, after) = rest.split_at(tx.input.len());
+        out.push(Some(mine));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(UNDO_UNREADABLE.to_string());
+    }
+    Ok(out)
+}
+
+/// Core's `RPC_INTERNAL_ERROR` message for undo data it cannot use.
+pub(crate) const UNDO_UNREADABLE: &str = "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event.";
+
+/// A transaction as Core's `TxToUniv` (`core_io.cpp`) renders it, plus,
+/// with `block`, the chain fields of Core's `TxToJSON`.
 ///
-/// `verbosity` >= 2 adds prevout data (Core's `getrawtransaction` verbosity 2);
-/// `chain_and_block` supplies the chain context that needs.
+/// `undo` is the coins the transaction spent, from its block's undo data:
+/// with it the answer has `fee`, and with `show_prevout` as well each input's
+/// `prevout` (Core's `TxVerbosity::SHOW_DETAILS_AND_PREVOUT`). Core takes
+/// both from undo data and from nowhere else, so a mempool transaction, a
+/// coinbase, and a block without undo data have neither.
 pub(crate) fn decode_transaction_verbose_net(
     tx: &bitcoin::Transaction,
-    blockhash: Option<&str>,
-    block_height: Option<u32>,
-    // Signed: Core reports -1 for a transaction in a block that is not on the
-    // active chain, the same convention as the block's own `confirmations`.
-    confirmations: Option<i64>,
-    verbosity: u32,
-    chain_and_block: Option<(&ChainState, &bitcoin::Block)>,
+    block: Option<&TxBlockContext>,
+    undo: Option<&[crate::storage::coinview::Coin]>,
+    show_prevout: bool,
+    include_hex: bool,
     network: bitcoin::Network,
 ) -> Value {
     let txid = tx.compute_txid();
@@ -399,27 +421,23 @@ pub(crate) fn decode_transaction_verbose_net(
     let size = raw.len();
     let weight = tx.weight().to_wu() as usize;
     let vsize = weight.div_ceil(4);
-
-    // For verbosity 2, resolve prevouts so we can compute the fee and
-    // annotate each vin with its spent output.
-    let prevouts: Vec<Option<bitcoin::TxOut>> = if verbosity >= 2 && !tx.is_coinbase() {
-        resolve_prevouts(tx, chain_and_block)
-    } else {
-        vec![None; tx.input.len()]
-    };
+    let unit = default_unit();
+    // A coinbase has no undo data; an undo slice that does not match the
+    // inputs is not this transaction's.
+    let undo = undo.filter(|u| !tx.is_coinbase() && u.len() == tx.input.len());
 
     let vin: Vec<Value> = tx
         .input
         .iter()
         .enumerate()
         .map(|(i, input)| {
-            if tx.is_coinbase() && i == 0 {
+            let mut v = if tx.is_coinbase() {
                 json!({
                     "coinbase": hex::encode(input.script_sig.as_bytes()),
                     "sequence": input.sequence.0,
                 })
             } else {
-                let mut v = json!({
+                json!({
                     "txid": input.previous_output.txid.to_string(),
                     "vout": input.previous_output.vout,
                     "scriptSig": {
@@ -427,56 +445,33 @@ pub(crate) fn decode_transaction_verbose_net(
                         "hex": hex::encode(input.script_sig.as_bytes()),
                     },
                     "sequence": input.sequence.0,
-                });
-                if !input.witness.is_empty() {
-                    let witness: Vec<String> =
-                        input.witness.iter().map(hex::encode).collect();
-                    v["txinwitness"] = json!(witness);
-                }
-                // Verbosity 2: annotate with the spent prevout.
-                if verbosity >= 2
-                    && let Some(prevout) = &prevouts[i]
-                {
-                    let unit = default_unit();
-                    let mut spk = json!({
-                        "asm": format!("{}", prevout.script_pubkey),
-                        "hex": hex::encode(prevout.script_pubkey.as_bytes()),
-                        "type": script_type(&prevout.script_pubkey),
-                    });
-                    // Add address if derivable.
-                    if let Some(addr) = script_to_address(&prevout.script_pubkey, network) {
-                        spk["address"] = json!(addr);
-                    }
-                    // Lookup the prevout's confirming height and coinbase status.
-                    let (prev_height, prev_generated) = if let Some((cs, _)) = chain_and_block {
-                        lookup_prevout_height_generated(cs, &input.previous_output)
-                    } else {
-                        (0, false)
-                    };
-                    v["prevout"] = json!({
-                        "generated": prev_generated,
-                        "height": prev_height,
-                        "value": format_amount(prevout.value.to_sat(), unit),
-                        "scriptPubKey": spk,
-                    });
-                }
-                v
+                })
+            };
+            // Core prints the witness of every input, the coinbase's
+            // reserved value included (#978).
+            if !input.witness.is_empty() {
+                let witness: Vec<String> = input.witness.iter().map(hex::encode).collect();
+                v["txinwitness"] = json!(witness);
             }
+            if show_prevout && let Some(coin) = undo.map(|u| &u[i]) {
+                let mut spk = json!({
+                    "asm": format!("{}", coin.script_pubkey),
+                    "hex": hex::encode(coin.script_pubkey.as_bytes()),
+                    "type": script_type(&coin.script_pubkey),
+                });
+                if let Some(addr) = script_to_address(&coin.script_pubkey, network) {
+                    spk["address"] = json!(addr);
+                }
+                v["prevout"] = json!({
+                    "generated": coin.coinbase,
+                    "height": coin.height,
+                    "value": format_amount(coin.amount, unit),
+                    "scriptPubKey": spk,
+                });
+            }
+            v
         })
         .collect();
-
-    let unit = default_unit();
-
-    // Compute fee for verbosity 2 (non-coinbase, all prevouts resolved).
-    let fee: Option<u64> = if verbosity >= 2 && !tx.is_coinbase() {
-        let total_in: Option<u64> = prevouts.iter().try_fold(0u64, |acc, p| {
-            p.as_ref().map(|o| acc + o.value.to_sat())
-        });
-        let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        total_in.map(|i| i.saturating_sub(total_out))
-    } else {
-        None
-    };
 
     let vout: Vec<Value> = tx
         .output
@@ -515,119 +510,59 @@ pub(crate) fn decode_transaction_verbose_net(
         "locktime": tx.lock_time.to_consensus_u32(),
         "vin": vin,
         "vout": vout,
-        // Bitcoin Core always echoes the raw hex in verbose responses
-        // for `getrawtransaction`. `decoderawtransaction` technically
-        // omits it upstream, but echoing the caller's own input back
-        // is harmless and lets us share the same verbose builder.
-        "hex": hex::encode(&raw),
     });
-
-    // Verbosity 2: add fee (non-coinbase only).
-    if let Some(f) = fee {
-        result["fee"] = json!(format_amount(f, unit));
+    // `decoderawtransaction` echoes no hex in Core; the others do.
+    if include_hex {
+        result["hex"] = json!(hex::encode(&raw));
     }
 
-    if let Some(bh) = blockhash {
-        result["blockhash"] = Value::String(bh.to_string());
-    }
-    if let Some(h) = block_height {
-        result["blockheight"] = json!(h);
-    }
-    if let Some(c) = confirmations {
-        // `confirmations_for` returns -1 as an internal sentinel for "this
-        // block is not on the active chain", which the caller turns into
-        // `in_active_chain`. Core never puts a negative number on the wire:
-        // `TxToJSON` pushes `0` for a block the active chain does not
-        // contain, and a positive count otherwise.
-        result["confirmations"] = json!(c.max(0));
+    if let Some(spent) = undo {
+        let total_in: u64 = spent.iter().map(|c| c.amount).sum();
+        let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        result["fee"] = json!(format_amount(total_in.saturating_sub(total_out), unit));
     }
 
-    // `time`/`blocktime` mimic Core: confirmed transactions get the
-    // block's median-time-past, mempool transactions (confirmations==0)
-    // get the block's time too in Core, but we omit it for the mempool
-    // case. When we have a block header (confirmed), set both.
-    if let Some((cs, _)) = chain_and_block
-        && let Some(bh) = blockhash
-        && let Ok(block_hash) = bh.parse::<bitcoin::BlockHash>()
-        && let Some(entry) = cs.get_block_index(&block_hash)
-    {
-        result["time"] = json!(entry.header.time);
-        result["blocktime"] = json!(entry.header.time);
+    // Core's `TxToJSON`: a transaction found in a block has `blockhash`,
+    // and `confirmations`, `time` and `blocktime` when the block is on the
+    // active chain, `confirmations: 0` when it is not. A mempool
+    // transaction has none of these (#978).
+    if let Some(ctx) = block {
+        result["blockhash"] = json!(ctx.blockhash.to_string());
+        match ctx.active {
+            Some((confirmations, time)) => {
+                result["confirmations"] = json!(confirmations);
+                result["time"] = json!(time);
+                result["blocktime"] = json!(time);
+            }
+            None => result["confirmations"] = json!(0),
+        }
     }
 
     result
 }
 
-/// Resolve prevouts for the inputs of `tx`. Uses the block's own
-/// transaction list first (for intra-block spends and to avoid extra
-/// lookups), then falls back to the chain state's UTXO/block data.
-fn resolve_prevouts(
-    tx: &bitcoin::Transaction,
-    chain_and_block: Option<(&ChainState, &bitcoin::Block)>,
-) -> Vec<Option<bitcoin::TxOut>> {
-    let mut result = vec![None; tx.input.len()];
-
-    // Build a quick lookup from the block's own transactions.
-    let block_tx_map: std::collections::HashMap<bitcoin::Txid, &bitcoin::Transaction> =
-        chain_and_block
-            .map(|(_, blk)| {
-                blk.txdata.iter().map(|t| (t.compute_txid(), t)).collect()
-            })
-            .unwrap_or_default();
-
-    for (i, input) in tx.input.iter().enumerate() {
-        // Intra-block: the prevout's tx is in the same block.
-        if let Some(prev_tx) = block_tx_map.get(&input.previous_output.txid)
-            && let Some(out) = prev_tx.output.get(input.previous_output.vout as usize)
-        {
-            result[i] = Some(out.clone());
-            continue;
-        }
-        // Chain state: look up the UTXO or the full block containing the prevout.
-        if let Some((cs, _)) = chain_and_block {
-            // Try the UTXO set (unspent coins), then fall back to the
-            // txindex for spent coins.
-            if let Some(coin) = cs.get_coin(&input.previous_output) {
-                result[i] = Some(bitcoin::TxOut {
-                    value: Amount::from_sat(coin.amount),
-                    script_pubkey: coin.script_pubkey,
-                });
-            } else if let Some(block_hash) = cs.get_tx_location(&input.previous_output.txid)
-                && let Some(prev_block) = cs.get_block(&block_hash) {
-                    for ptx in &prev_block.txdata {
-                        if ptx.compute_txid() == input.previous_output.txid {
-                            if let Some(out) = ptx.output.get(input.previous_output.vout as usize) {
-                                result[i] = Some(out.clone());
-                            }
-                            break;
-                        }
-                    }
-                }
-        }
-    }
-    result
-}
-
-/// Look up the confirming height and coinbase status of a prevout for
-/// verbosity-2 annotation.
-fn lookup_prevout_height_generated(
+/// `getrawtransaction` at `verbosity` for `tx`, found in `block`: verbosity
+/// 2 adds the fee and the prevouts from the block's undo data, as Core's
+/// does. Errs when the undo data is there but does not match the block.
+fn confirmed_tx_verbose(
     chain_state: &ChainState,
-    outpoint: &OutPoint,
-) -> (u32, bool) {
-    // Try the UTXO set first.
-    if let Some(coin) = chain_state.get_coin(outpoint) {
-        return (coin.height, coin.coinbase);
-    }
-    // Fallback: txindex.
-    if let Some(block_hash) = chain_state.get_tx_location(&outpoint.txid)
-        && let Some(entry) = chain_state.get_block_index(&block_hash) {
-            // The tx at index 0 is the coinbase.
-            let is_cb = chain_state.get_block(&block_hash)
-                .and_then(|b| b.txdata.first().map(|t| t.compute_txid() == outpoint.txid))
-                .unwrap_or(false);
-            return (entry.height, is_cb);
-        }
-    (0, false)
+    tx: &bitcoin::Transaction,
+    tx_idx: usize,
+    block: &bitcoin::Block,
+    ctx: &TxBlockContext,
+    verbosity: u32,
+) -> Result<Value, (i32, String)> {
+    let undo = if verbosity >= 2 && !tx.is_coinbase() {
+        chain_state.get_undo(&ctx.blockhash)
+    } else {
+        None
+    };
+    let per_tx = match &undo {
+        Some(u) => Some(undo_by_tx(block, u).map_err(|e| (-32603, e))?),
+        None => None,
+    };
+    let spent = per_tx.as_ref().and_then(|p| p.get(tx_idx).copied().flatten());
+    Ok(decode_transaction_verbose_net(tx, Some(ctx), spent, true, true, chain_state.network))
 }
 
 /// Derive a Bitcoin address from a scriptPubKey if possible.
@@ -641,15 +576,6 @@ fn script_to_address(script: &bitcoin::Script, network: bitcoin::Network) -> Opt
     bitcoin::address::Address::from_script(script, network)
         .ok()
         .map(|a| a.to_string())
-}
-
-/// Annotate the verbose response with `in_active_chain` when the
-/// caller explicitly supplied a blockhash. Confirmations > 0 means the
-/// block is on the active chain; -1 means it is not.
-fn maybe_set_in_active_chain(result: &mut Value, confirmations: Option<i64>) {
-    if let Some(c) = confirmations {
-        result["in_active_chain"] = json!(c > 0);
-    }
 }
 
 /// `createrawtransaction` — build an unsigned raw transaction from inputs and outputs.

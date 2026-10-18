@@ -1007,7 +1007,14 @@ pub async fn start(
                 // "Block not available (...)" errors use RPC_MISC_ERROR (-1),
                 // matching Bitcoin Core; all others (e.g. "Block not found",
                 // "Invalid block hash") use RPC_INVALID_ADDRESS_OR_KEY (-5).
-                let code = if e.starts_with("Block not available") { -1 } else { -5 };
+                // Unusable undo data is RPC_INTERNAL_ERROR, as in Core.
+                let code = if e.starts_with("Block not available") {
+                    -1
+                } else if e == crate::rpc::rawtx::UNDO_UNREADABLE {
+                    -32603
+                } else {
+                    -5
+                };
                 ErrorObjectOwned::owned(code, e, None::<()>)
             })
     })?;

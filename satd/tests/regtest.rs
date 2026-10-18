@@ -25723,3 +25723,41 @@ fn under_connect_a_gossiped_address_is_learned_but_never_dialled() {
     let peer = gossip::peer_at(&node, pinned.addr);
     assert_eq!(peer["connection_type"], json!("manual"), "{peer}");
 }
+
+/// #978: without `-txindex`, a confirmed transaction's `fee` and `prevout`
+/// come from its block's undo data, as in Core, after the coin it spent is
+/// gone from the UTXO set; a mempool transaction has neither, and no
+/// `confirmations`. A mined block's coinbase shows its witness reserved
+/// value in `coinbase_tx` and in `txinwitness`.
+#[test]
+fn rpc_tx_fields_come_from_undo_data_without_a_txindex() {
+    use serde_json::json;
+    let wallet = common::DeterministicWallet::from_secret([0x42; 32]);
+    let mut node = TestNode::start(&["--txindex=0"]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    let dest = wallet.address.script_pubkey();
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
+
+    let pending = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(2)]);
+    for f in ["confirmations", "fee", "blockhash"] {
+        assert_eq!(pending.get(f), None, "{f} on a mempool tx: {pending}");
+    }
+
+    let hash = node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())])[0].clone();
+    let confirmed = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(2), hash.clone()]);
+    assert_eq!(confirmed["fee"].as_f64(), Some(0.00001), "{confirmed}");
+    assert_eq!(confirmed["vin"][0]["prevout"]["height"], json!(1), "{confirmed}");
+    assert_eq!(confirmed["vin"][0]["prevout"]["generated"], json!(true), "{confirmed}");
+    assert_eq!(confirmed["confirmations"], json!(1), "{confirmed}");
+    assert_eq!(confirmed.get("blockheight"), None, "{confirmed}");
+
+    let block = node.rpc_ok("getblock", vec![hash, json!(3)]);
+    let reserved = "00".repeat(32);
+    assert_eq!(block["coinbase_tx"]["witness"], json!(reserved), "{block}");
+    assert_eq!(block["tx"][0]["vin"][0]["txinwitness"], json!([reserved]), "{block}");
+    assert_eq!(block["tx"][1]["fee"].as_f64(), Some(0.00001), "{block}");
+    assert_eq!(block["tx"][1]["vin"][0]["prevout"]["height"], json!(1), "{block}");
+    assert!(block["strippedsize"].as_u64().unwrap() < block["size"].as_u64().unwrap(), "{block}");
+    node.stop();
+}
