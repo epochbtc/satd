@@ -206,6 +206,10 @@ carry the blocker that was actually observed once the RPC existed.
   the framework's `bind=127.0.0.1` in `bitcoin.conf` where Core listens on
   both (#995), and the `getaddr` cache expired on a clock `setmocktime` does
   not move. This put `p2p_getaddr_caching.py` in the run-set.
+- **Unknown version bits.** satd never warned when blocks signalled a soft
+  fork it did not know (#976). It now runs Core's `WarningBitsConditionChecker`
+  and raises "Unknown new rules activated (versionbit N)" in the RPC warnings.
+  This put `feature_versionbits_warning.py` in the run-set.
 - **The address-book RPCs.** `addpeeraddress`, `getnodeaddresses`,
   `getaddrmaninfo` and `getrawaddrman` exist, in Core's shapes. No row flips
   yet: `p2p_addr_selfannouncement` and `p2p_getaddr_caching` now get past

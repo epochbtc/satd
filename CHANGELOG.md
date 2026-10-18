@@ -23,6 +23,11 @@ item below is (or will be) written up in full in the in-development
   between block and mempool messages differs from Core; the streaming API
   remains the recommended interface.
 
+- The unknown-rules warning: a version-bits soft fork this node does not know
+  that locks in is logged, and one that activates raises Core's "Unknown new
+  rules activated (versionbit N)" in the RPC warnings and `-alertnotify`
+  (#976).
+
 ### Fixed
 
 - A reorg of more than about 30 blocks could overflow the chain-event channel,

@@ -333,9 +333,7 @@ note = "measured 2026-09-15: L65 KeyError 'muhash': gettxoutsetinfo ignores hash
 
 [[test]]
 file = "feature_versionbits_warning.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-16: unchanged by message ordering — L97 getmininginfo.warnings still lacks Core's unknown-new-rules-activated warning. Follow-up: unknown versionbits warning"
+status = "run"
 
 [[test]]
 file = "interface_bitcoin_cli.py"
