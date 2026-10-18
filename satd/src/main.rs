@@ -460,6 +460,7 @@ const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::f
 /// whatever outlives them. A panic in `run` and every fatal error exit take
 /// `_exit` too.
 fn main() {
+    node::set_private_umask();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
