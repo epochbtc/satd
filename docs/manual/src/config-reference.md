@@ -154,7 +154,7 @@ startup error.
 | `rpcreadonlymtls` | false | restart | satd | Require a client cert (mTLS) on the read-only TLS surface. |
 | `rpcreadonlymtlsclientca` | none | restart | satd | CA bundle client certs must chain to on the read-only TLS surface. |
 | `rpcreadonlymtlsclientallow` | any CA-signed | restart | satd | Allowlist of client-cert subjects on the read-only TLS surface. |
-| `rpcauth` | none | hot | core | HMAC-SHA256 RPC credential `user:salt$hash` (Core `rpcauth` format; repeatable). An empty or malformed entry stops startup; `-norpcauth` discards the entries before it and the config file's. |
+| `rpcauth` | none | hot | core | HMAC-SHA256 RPC credential `user:salt$hash` (Core `rpcauth` format; repeatable). An empty or malformed entry stops startup; `-norpcauth` discards the entries before it, and the config file's unless an entry follows it. |
 | `rpcwhitelist` | none | restart | core | Limit an RPC user to a list of JSON-RPC methods: `<user>:<m1>,<m2>,...` (repeatable; commas or spaces separate methods). A user listed more than once, including on the command line and in the file, keeps the intersection. A refused call is HTTP 403 with an empty body. Not combinable with `rpcdisableauth`. See [Authentication & Authorization](authentication.md#per-user-method-allowlists-rpcwhitelist). |
 | `rpcwhitelistdefault` | on if any `rpcwhitelist` is set, else off | restart | core | When on, an RPC user with no `rpcwhitelist` entry may call nothing. |
 | `authfile` | none | restart | satd | Path to unified-auth bearer-token file (TOML); enables the opt-in bearer-auth layer. Token contents reload live. |
