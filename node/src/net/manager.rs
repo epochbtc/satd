@@ -8417,6 +8417,13 @@ impl PeerManager {
         self.recent_rejects.lock().contains(tip, hash, true)
     }
 
+    /// Whether `hash` is in the main filter only, not counting a refusal on
+    /// the fee alone (Core's `RecentRejectsFilter().contains`).
+    fn hard_rejected(&self, hash: &[u8; 32]) -> bool {
+        let tip = self.chain_state.tip_hash();
+        self.recent_rejects.lock().contains(tip, hash, false)
+    }
+
     fn note_rejected(&self, hash: &[u8; 32], kind: crate::net::recent_rejects::Rejection) {
         let tip = self.chain_state.tip_hash();
         self.recent_rejects.lock().insert(tip, hash, kind);
@@ -8508,8 +8515,10 @@ impl PeerManager {
                 let missing = self.collect_missing_parents(&tx);
                 // Core keeps no orphan with a parent it refused, and refuses
                 // the orphan's txid and wtxid from then on: no witness makes
-                // it acceptable.
-                if missing.iter().any(|p| self.recently_rejected(p.as_byte_array())) {
+                // it acceptable. Only a hard refusal counts: a parent refused
+                // on its fee alone may still enter, with this child paying
+                // for it or after a `prioritisetransaction`.
+                if missing.iter().any(|p| self.hard_rejected(p.as_byte_array())) {
                     tracing::debug!(%txid, %wtxid, "not keeping orphan with rejected parents");
                     self.note_rejected(txid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
                     self.note_rejected(wtxid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
@@ -15648,6 +15657,18 @@ mod tests {
         assert!(!pm.orphanage.contains(&child.compute_txid()));
         assert!(pm.recently_rejected(&child.compute_txid().to_byte_array()));
         assert!(pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
+    }
+
+    /// A parent refused on its fee alone does not condemn its children: they
+    /// are kept as orphans, and enter once the parent does.
+    #[test]
+    fn an_orphan_of_a_fee_refused_parent_is_kept() {
+        let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let child = witness_tx(0x45, 0xaa);
+        pm.note_rejected(&[0x45; 32], crate::net::recent_rejects::Rejection::Reconsiderable);
+        pm.handle_tx(1, child.clone());
+        assert!(pm.orphanage.contains(&child.compute_txid()), "kept, waiting for its parent");
+        assert!(!pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
     }
 
     /// Which refusals Core's `MempoolRejectedTx` records, and where: fee
