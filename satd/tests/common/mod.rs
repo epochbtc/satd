@@ -56,6 +56,16 @@ pub fn test_timeout(secs: u64) -> Duration {
     Duration::from_secs_f64(secs as f64 * test_timeout_mult())
 }
 
+/// How long the harness's RPC client waits for an answer. It was a fixed
+/// 10 s, which a `generatetoaddress` of a few hundred blocks, or any call on
+/// a node the rest of the suite is crowding, outlasted: the test then failed
+/// as "did not reach the node" though the node was working. A hang still
+/// fails, a minute later, and the CI multiplier scales it like every other
+/// wait.
+pub fn rpc_timeout() -> Duration {
+    test_timeout(60)
+}
+
 /// Like [`test_timeout`], but additionally scaled by `SATD_E2E_TIMEOUT_MULT`
 /// when set. The unit-test suite uses [`test_timeout`] directly; the E2E
 /// suite chains poll loops on top of the harness's own startup wait, so it
@@ -806,7 +816,7 @@ impl TestNode {
         });
 
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(rpc_timeout())
             .build()
             .unwrap();
         let (user, pass) = self
@@ -834,7 +844,7 @@ impl TestNode {
     pub fn rpc_call_raw_body(&self, body: &str) -> Result<serde_json::Value, String> {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(rpc_timeout())
             .build()
             .unwrap();
         let (user, pass) = self
@@ -861,7 +871,7 @@ impl TestNode {
     pub fn rpc_post_raw_status(&self, body: &str) -> (u16, String) {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(rpc_timeout())
             .build()
             .unwrap();
         let (user, pass) = self
@@ -988,14 +998,16 @@ impl TestNode {
         if !self.cookie.is_empty() {
             let _ = self.rpc_call("stop");
         }
-        // Wait for process to exit, kill if it doesn't.
-        let mut attempts = 0;
+        // Wait for process to exit, kill if it doesn't. A graceful stop
+        // flushes and writes the clean-shutdown marker; three seconds, the
+        // old limit, was less than that took on a crowded machine, and the
+        // kill then failed tests that check the marker.
+        let deadline = Instant::now() + test_timeout(30);
         loop {
             match self.process.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    attempts += 1;
-                    if attempts > 30 {
+                    if Instant::now() >= deadline {
                         let _ = self.process.kill();
                         // Reap it. Without this the child is a zombie that may
                         // still hold the RocksDB LOCK and the RPC port, and a
@@ -1259,7 +1271,7 @@ impl RpcHandle {
             "params": params,
         });
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(rpc_timeout())
             .build()
             .unwrap();
         let (user, pass) = self.cookie.split_once(':').unwrap_or(("__cookie__", "none"));
