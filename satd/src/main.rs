@@ -4533,61 +4533,59 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
-    // DNS seeding: only if no explicit --connect peers and both -dns
-    // (hostname resolution) and -dnsseed (query DNS seeds) are enabled.
-    // Now that the address book persists, skip DNS when it already has
-    // entries — unless -forcednsseed demands a query regardless.
-    let dns_seeding = config.automatic_outbound
-        && config.dns
-        && config.dnsseed
-        && (config.forcednsseed || !peer_manager.addrman_has_reachable());
+    // DNS and fixed seeds, as Core's `ThreadDNSAddressSeed` and the
+    // fixed-seed fallback in `ThreadOpenConnections` run them: in the
+    // background, trying the address book first and seeding if that does not
+    // work (see `node::net::seeding`). satd seeded only at startup and only
+    // for a book with nothing reachable, so a node back on a stale
+    // `peers.dat` never seeded (#974). Both need automatic outbound; DNS
+    // seeding also `-dns` and `-dnsseed`, the fixed seeds `-fixedseeds`.
+    let dns_seeding = config.automatic_outbound && config.dns && config.dnsseed;
     // Core's `ThreadDNSAddressSeed` line when seeding is off (`-dnsseed=0`,
     // or `-connect`, which defaults it off).
     if !config.dnsseed || !config.automatic_outbound {
         tracing::info!("DNS seeding disabled");
     }
     if dns_seeding {
-        let seed_addrs = node::net::dns::resolve_seeds_with(
-            config.network,
-            config.proxy.as_deref(),
-            &config.signet_seed_nodes,
-        )
-        .await;
-        let max_dns_outbound = 64;
-        // Learned, not named: Core adds a seed's answers to its address
-        // book and dials them as automatic `outbound-full-relay`
-        // connections. Registering them as the operator's peers made every
-        // one `manual` for good -- granted the outgoing `-whitelist`, exempt
-        // from the service check at the handshake, and redialled even after
-        // a reload turned on `-connect`.
-        //
-        // They are dialled by the automatic dial pass, not one task each, so
-        // the outbound target and the one-peer-per-network-group rule hold
-        // for them as for every other automatic connection.
-        for addr in seed_addrs.into_iter().take(max_dns_outbound) {
-            peer_manager.add_learned_peer_addr(&addr);
-        }
-        peer_manager.dial_learned_peers();
+        let pm = peer_manager.clone();
+        let network = config.network;
+        let proxy = config.proxy.clone();
+        let signet_seeds = config.signet_seed_nodes.clone();
+        let force = config.forcednsseed;
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            // Learned, not named: Core adds a seed's answers to its address
+            // book and dials them as automatic `outbound-full-relay`
+            // connections, through the automatic dial pass, so the outbound
+            // target and the one-peer-per-network-group rule hold for them.
+            node::net::seeding::dns_seed(
+                &pm,
+                force,
+                node::net::seeding::SeedTimings::CORE,
+                || async move {
+                    node::net::dns::resolve_seeds_with(network, proxy.as_deref(), &signet_seeds).await
+                },
+                shutdown,
+            )
+            .await;
+        });
     }
-
-    // -fixedseeds: last-resort fallback to satd's compiled-in fixed seed
-    // list when DNS seeding did not run (disabled), the address book has no
-    // address on a reachable network, and there are no explicit -connect
-    // peers. -fixedseeds=0 forbids it.
-    if config.fixedseeds
-        && config.automatic_outbound
-        && !peer_manager.addrman_has_reachable()
-        && !dns_seeding
-    {
+    if config.fixedseeds && config.automatic_outbound {
+        let pm = peer_manager.clone();
         let fixed = node::net::dns::fixed_seeds_for_network(config.network);
-        if !fixed.is_empty() {
-            tracing::info!(count = fixed.len(), "Bootstrapping from compiled-in fixed seeds");
-            // Learned, as the DNS seeds' answers are above.
-            for addr in fixed {
-                peer_manager.add_learned_peer_addr(&addr);
-            }
-            peer_manager.dial_learned_peers();
-        }
+        // Core adds them at once only when nothing else can fill the book.
+        let other_sources = dns_seeding || !config.seednode.is_empty() || !config.addnode.is_empty();
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            node::net::seeding::fixed_seed(
+                &pm,
+                other_sources,
+                node::net::seeding::SeedTimings::CORE,
+                fixed,
+                shutdown,
+            )
+            .await;
+        });
     }
 
     // -persistmempool: re-admit the mempool persisted at the previous

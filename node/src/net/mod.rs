@@ -17,6 +17,7 @@ pub mod permissions;
 pub mod proxy;
 pub mod reachable;
 pub mod recent_rejects;
+pub mod seeding;
 pub mod send_queue;
 pub mod stats;
 pub mod tor;

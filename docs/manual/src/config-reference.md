@@ -207,9 +207,9 @@ startup error.
 | `blockreconstructionextratxn` | 100 | restart | core | Recently seen transactions that are not in the mempool — replaced, or refused by policy — kept so a compact block that includes one still reconstructs without a round trip. `0` keeps none. |
 | `maxuploadtarget` | 0 (unlimited) | hot | core | Soft cap (bytes/24h) on historical block upload. |
 | `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. With `dns=0` those options accept only literal IP addresses and `.onion` targets; a hostname is refused. |
-| `dnsseed` | true | restart | core | Query DNS seeds for peer addresses (requires `dns`). Off by default when `onlynet` leaves out both IPv4 and IPv6; `dnsseed=1` with such an `onlynet` is refused at startup, as in Core. |
-| `forcednsseed` | false | restart | core | Always query DNS seeds even with a populated address book. |
-| `fixedseeds` | true | restart | core | Allow the compiled-in fixed-seed fallback. |
+| `dnsseed` | true | restart | core | Query DNS seeds for peer addresses (requires `dns`). With nothing reachable in the address book the seeds are queried at startup; otherwise the node tries the book first and queries them if it has fewer than two full-relay outbound peers after 11 seconds (5 minutes with 1,000 or more addresses), as Core does. Off by default when `onlynet` leaves out both IPv4 and IPv6; `dnsseed=1` with such an `onlynet` is refused at startup, as in Core. |
+| `forcednsseed` | false | restart | core | Query DNS seeds at startup even with a populated address book. |
+| `fixedseeds` | true | restart | core | Allow the compiled-in fixed-seed fallback: added a minute after startup if the address book still has nothing reachable, or at startup when DNS seeding is off and no `seednode` or `addnode` is set, as in Core. |
 | `bantime` | 86400 | hot | core | Ban duration in seconds. |
 | `timeout` | 5000 ms | hot | core | P2P connection timeout in milliseconds (accepts `5s`/`5000ms`). |
 | `onlynet` | all | restart | core | Make automatic outbound connections only to these networks (repeatable): `ipv4`, `ipv6`, `onion`, `cjdns`, `i2p`. Gossiped addresses on other networks are not kept. Inbound and manual connections (`connect`, `addnode`, `seednode`) are not affected. Refused at startup as in Core: an unknown name; `onion` with neither `proxy` nor `onion` (Core also takes `listenonion`; satd cannot reach Tor through it), or with `onion=0`; `cjdns` without `cjdnsreachable`; `i2p` (satd has no I2P transport). |

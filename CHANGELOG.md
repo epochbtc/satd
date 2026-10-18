@@ -101,6 +101,11 @@ item below is (or will be) written up in full in the in-development
   command line first, as Core's `GetSettingsList` merges them; the command
   line's replaced the file's (#995). The `getaddr` cache follows
   `setmocktime`.
+- DNS and fixed seeds are tried after startup too, as Core does: the DNS
+  seeds when the node has fewer than two full-relay outbound peers 11 seconds
+  in (5 minutes with a large address book), the fixed seeds a minute in if
+  the book has nothing reachable. A stale `peers.dat` stopped all seeding
+  (#974).
 
 ## Releases
 
