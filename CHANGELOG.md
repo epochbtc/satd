@@ -70,6 +70,9 @@ item below is (or will be) written up in full in the in-development
   `IsWitnessStandard`, and the 16000 sigop-cost cap. It checked scripts under
   the block's flags alone, and relayed and mined spends of soft-fork upgrade
   hooks.
+- A transaction the mempool refused is not downloaded and validated again
+  until the tip moves, as with Core's recent-rejects filters; satd fetched it
+  from every peer that announced it.
 
 ## Releases
 
