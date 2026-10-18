@@ -15,6 +15,7 @@ pub mod orphan_blocks;
 pub mod peer;
 pub mod permissions;
 pub mod proxy;
+pub mod reachable;
 pub mod send_queue;
 pub mod stats;
 pub mod tor;

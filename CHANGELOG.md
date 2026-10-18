@@ -56,6 +56,10 @@ item below is (or will be) written up in full in the in-development
 - `getblocktemplate` transactions carry Core's `hash` (wtxid) and `depends`
   fields; gateways that require them (such as OCEAN's DATUM gateway) refused
   every non-empty template (#982).
+- `-onlynet` restricts automatic outbound connections and kept addresses, with
+  Core's startup refusals; `-proxy` soft-sets `-listen=0`; `-proxy=0` and
+  `-onion=0` are read as Core reads them. **A node with `-proxy` and no explicit
+  `-listen` stops listening.**
 
 ## Releases
 

@@ -702,3 +702,64 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
     assert!(pm.learned_addrs.read().contains(&fresh));
     assert_eq!(pm.addrman.read().len(), full);
 }
+
+/// Under `-onlynet`, an automatic dial and a gossiped address both need a
+/// reachable network (Core's `g_reachable_nets`); a manual peer does not.
+/// Perturbation: drop the reachability test from `may_dial` and the IPv6
+/// address is dialable; drop it from `add_learned_addr_from` and it is
+/// learned.
+#[test]
+fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
+    use crate::net::reachable::ReachableNets;
+    let (pm, _dir) = mk_pm();
+    pm.set_reachable(ReachableNets { ipv4: true, ipv6: false, onion: false, cjdns: false, cjdns_flip: false });
+    let source = IpAddr::from([198, 51, 100, 1]);
+    let v4 = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let v6: SocketAddr = "[2001:4860::7]:8333".parse().unwrap();
+
+    pm.add_learned_addr_from(v4, 9, source);
+    pm.add_learned_addr_from(v6, 9, source);
+    assert!(pm.learned_addrs.read().contains(&v4));
+    assert!(!pm.learned_addrs.read().contains(&v6), "an unreachable network's address is not kept");
+    assert!(!pm.addrman.read().contains(&v6));
+
+    assert!(pm.may_dial(&v4));
+    assert!(!pm.may_dial(&v6), "no automatic dial to an unreachable network");
+    pm.manual_addrs.write().insert(v6);
+    assert!(pm.may_dial(&v6), "-onlynet does not affect manual connections");
+
+    // Seeds go through the same gate, and onion candidates need onion.
+    let v6b: SocketAddr = "[2001:4860::8]:8333".parse().unwrap();
+    pm.add_learned_peer_addr(&PeerAddr::Socket(v6b));
+    assert!(!pm.learned_addrs.read().contains(&v6b));
+    pm.add_learned_peer_addr(&PeerAddr::Onion { host: "a".repeat(56) + ".onion", port: 8333 });
+    assert!(pm.connect_peer_addrs.read().is_empty(), "onion is not reachable");
+}
+
+/// `-onion=0` refuses every `.onion` dial, a manual peer's included, before
+/// any proxy is chosen (Core has no `NET_ONION` proxy). Perturbation: drop
+/// the check and the dial fails on the missing proxy instead.
+#[tokio::test]
+async fn onion_zero_refuses_even_a_manual_onion_dial() {
+    let (pm, _dir) = mk_pm();
+    pm.set_onion_disabled(true);
+    let err = pm.dial_onion(&("a".repeat(56) + ".onion"), 8333).await.expect_err("disabled");
+    assert!(err.contains("-onion=0"), "{err}");
+}
+
+/// A clearnet address book is no reason to skip seeding on a node whose
+/// `-onlynet` leaves clearnet out: `addrman_has_reachable` counts only
+/// addresses on reachable networks. Perturbation: answer with
+/// `!addrman_is_empty()` and the onion-only case reports a reachable book.
+#[test]
+fn an_address_book_of_unreachable_addresses_does_not_count() {
+    use crate::net::reachable::ReachableNets;
+    let (pm, _dir) = mk_pm();
+    let v4 = SocketAddr::from(([44, 1, 2, 3], 8333));
+    pm.add_learned_addr_from(v4, 9, IpAddr::from([198, 51, 100, 1]));
+    assert!(!pm.addrman_is_empty());
+    assert!(pm.addrman_has_reachable());
+    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
+    assert!(!pm.addrman_is_empty(), "the clearnet entry is still in the book");
+    assert!(!pm.addrman_has_reachable(), "but it is not on a reachable network");
+}
