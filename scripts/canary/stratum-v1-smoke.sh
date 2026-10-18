@@ -62,6 +62,10 @@ until [[ "$(sat_cli getblockcount)" == "$(core_peer_cli getblockcount)" ]]; do
     sleep 1
 done
 
+# The height before the miner starts. On regtest it can find its block within
+# milliseconds of authorizing, so a height read after step 1 may already
+# include it.
+START_HEIGHT="$(sat_cli getblockcount)"
 "$WORK/minerd" -a sha256d -t "$(nproc)" --no-getwork --retry-pause 1 \
     -o "stratum+tcp://$V1" -u "$STRATUM_PAYOUT_ADDR.canary" -p x \
     > "$WORK/minerd.log" 2>&1 &
@@ -72,7 +76,6 @@ wait_stratum '.connections >= 1 and .channels >= 1' 30 "cpuminer to authorize"
 echo "ok: cpuminer authorized"
 
 # ── 2. It finds a block that connects and pays the miner ──
-START_HEIGHT="$(sat_cli getblockcount)"
 wait_stratum '.blocks_found >= 1' 600 "cpuminer to find a block"
 [[ "$(sat_cli getblockcount)" -gt "$START_HEIGHT" ]] || { echo "the found block did not raise the tip" >&2; exit 1; }
 assert_last_block_pays_payout
