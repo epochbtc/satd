@@ -9583,9 +9583,16 @@ impl PeerManager {
     /// probe for the stale and invalidated blocks a node had seen, and for
     /// how far back a pruned node keeps blocks: both tell nodes apart.
     /// An unknown block falls through to the `notfound` it gets today.
+    ///
+    /// Active-chain membership comes from the height index alone
+    /// ([`ChainState::active_chain_hash_at_height_indexed`]): one read per
+    /// entry. [`ChainState::active_chain_contains`] walks from the tip before
+    /// it answers "no", and a `getdata` can name the same old side-branch
+    /// block 50000 times, none of which queues a reply to stop the loop.
     fn block_request_refusal(&self, id: PeerId, hash: &bitcoin::BlockHash) -> Option<BlockRefusal> {
         let entry = self.chain_state.get_block_index(hash)?;
-        if !self.chain_state.active_chain_contains(hash, entry.height) && !self.stale_block_request_allowed(&entry) {
+        let on_active_chain = self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(*hash);
+        if !on_active_chain && !self.stale_block_request_allowed(&entry) {
             tracing::debug!("ignoring request from peer={id} for old block that isn't in the main chain");
             return Some(BlockRefusal::Ignore);
         }

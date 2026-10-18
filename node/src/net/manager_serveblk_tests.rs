@@ -249,4 +249,16 @@ fn a_stale_block_buried_under_a_month_of_work_is_not_served() {
     mine(&pm, 1, 2);
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[1])]);
     assert!(drain(&mut rx).is_empty(), "4320 blocks on top: a month of work, not served");
+
+    // Whether a requested block is on the active chain comes from the height
+    // index alone, never a walk from the tip, which a `getdata` naming an old
+    // side block thousands of times would repeat for each entry. Proven by
+    // pointing b[0]'s row at a[1]: judged by the index, b[0] is off the chain
+    // under a month of work and is not served; a walk would find it and
+    // serve it.
+    let mut batch = crate::storage::StoreBatch::default();
+    batch.height_hash_puts.push((pm.chain_state.get_block_index(&b[0]).unwrap().height, a[1]));
+    pm.chain_state.store_for_test().write_batch(batch).unwrap();
+    pm.handle_getdata(1, vec![Inventory::WitnessBlock(b[0])]);
+    assert!(drain(&mut rx).is_empty(), "membership is read from the height index, without a walk");
 }
