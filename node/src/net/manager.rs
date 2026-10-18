@@ -2789,6 +2789,22 @@ impl PeerManager {
             .count()
     }
 
+    /// Full-relay outbound peers past the handshake: Core's
+    /// `GetFullOutboundConnCount`. Manual, block-relay-only, feeler and
+    /// addr-fetch connections are not counted.
+    pub fn full_outbound_count(&self) -> usize {
+        self.peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state == PeerState::Connected)
+            .count()
+    }
+
+    /// Addresses in the address book.
+    pub fn addrman_len(&self) -> usize {
+        self.addrman.read().len()
+    }
+
     /// Number of inbound peers currently connected.
     pub fn inbound_count(&self) -> usize {
         let peers = self.peers.read();
