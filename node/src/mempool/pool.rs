@@ -68,6 +68,10 @@ const COINBASE_MATURITY: u32 = 100;
 /// `Quarantined` event so the cause is legible.
 const INFECTIOUS_RULE: &str = "(infectious: quarantined ancestor)";
 
+/// [`Mempool::persist_snapshot`]: every entry, and the deltas of
+/// transactions not in the pool.
+pub type PersistSnapshot = (Vec<(Txid, MempoolEntry)>, Vec<(Txid, i64)>);
+
 /// Current Unix time in seconds (saturating to 0 before the epoch). Used for
 /// policy-load timestamps; the hot paths inline their own `now`.
 fn now_unix_secs() -> u64 {
@@ -3933,6 +3937,23 @@ impl Mempool {
     /// template/fee paths; per-entry [`QuarantineScope::assists_relay`] checks
     /// for the relay paths). Mixing these up is a silent correctness bug
     /// (design §2.4), so the divergence is documented at the source.
+    /// What `mempool.dat` holds: every entry, and the `prioritisetransaction`
+    /// deltas of transactions not in the pool, read under one lock. Read
+    /// separately, an eviction between the two put a delta in both its
+    /// entry's record and the deltas list, and the load applied it twice; an
+    /// admission between them put it in neither.
+    pub fn persist_snapshot(&self) -> PersistSnapshot {
+        let inner = self.inner.read();
+        let entries = inner.entries.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let deltas = inner
+            .fee_deltas
+            .iter()
+            .filter(|(txid, _)| !inner.entries.contains_key(*txid))
+            .map(|(txid, delta)| (*txid, *delta))
+            .collect();
+        (entries, deltas)
+    }
+
     pub fn get_all_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
@@ -6680,10 +6701,9 @@ impl Mempool {
                 fee,
                 weight,
                 fee_rate,
-                time: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                // The pool's clock, which follows `setmocktime`, as every
+                // other admission path's does (#981).
+                time: crate::time::now_secs(),
                 height: tip_height,
                 fee_delta: pending_delta,
                 sigop_cost,
@@ -12164,6 +12184,41 @@ mod tests {
         assert_eq!(msg, "success", "package rejected: {results:?}");
         assert!(in_pool(&mp, &parent_txid), "the ephemeral dust parent was not accepted");
         assert!(in_pool(&mp, &child_txid), "the child was not accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #981: the dust parent, admitted through the fee-bypass path, takes
+    /// its entry time from the pool's clock like the child does, so under
+    /// `setmocktime` both read the mock. It used the system clock.
+    #[test]
+    fn a_zero_fee_dust_parent_takes_its_entry_time_from_the_mock_clock() {
+        let op = outpoint(0xC4);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+        let parent = tx_from(&[op], &[(dust, 0x56), (50_000 - dust, 0x57)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0x58)],
+        );
+        let child_txid = child.compute_txid();
+
+        // A mock in the past, and held as briefly as possible: see
+        // `time::tests` for why a concurrent test cannot be harmed by one.
+        const MOCK: u64 = 1_700_000_000;
+        let times = {
+            let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::time::set_mock_time(Some(MOCK));
+            let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+            crate::time::set_mock_time(None);
+            assert_eq!(msg, "success", "package rejected: {results:?}");
+            let inner = mp.inner.read();
+            (inner.entries[&parent_txid].time, inner.entries[&child_txid].time)
+        };
+        assert_eq!(times, (MOCK, MOCK), "(parent, child) entry times under setmocktime");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

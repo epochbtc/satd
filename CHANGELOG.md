@@ -94,6 +94,9 @@ item below is (or will be) written up in full in the in-development
   adaptive stall timeout (15s here, doubling to 64s); it stayed connected and
   could be handed the same blocks again. A block handed to another peer is
   timed from that peer's request (#972).
+- `mempool.dat` keeps `prioritisetransaction` deltas for transactions not in
+  the pool, as Core does, and a zero-fee package parent's entry time follows
+  `setmocktime` (#981).
 
 ## Releases
 

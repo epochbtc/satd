@@ -21,14 +21,26 @@
 //!   flags     u8    (v2+) bit 0: tx was in the unbroadcast set
 //!   tx_len    u32   little-endian length of the encoded tx
 //!   tx_bytes  [tx_len]  consensus-encoded transaction
+//! deltas (optional trailer):
+//!   count     u64   little-endian number of deltas
+//!   txid      [32]  a transaction not in the pool
+//!   delta     i64   little-endian prioritisetransaction delta
 //! ```
 //!
 //! v2 added the `flags` byte so the unbroadcast set survives a restart —
 //! Bitcoin Core persists `m_unbroadcast_txids` in its mempool.dat for the
 //! same reason: a tx submitted just before shutdown that never reached a
 //! peer must resume rebroadcasting after the restart, not strand.
+//!
+//! The deltas trailer carries `prioritisetransaction` deltas set for
+//! transactions the pool does not hold, as Core's `DumpMempool` writes
+//! `mapDeltas` after the transactions, without the in-pool ones (#981). It
+//! needs no version bump: a file without it has no such deltas, and a reader
+//! from before it stops after the records.
 
 use std::path::Path;
+
+use bitcoin::hashes::Hash as _;
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
@@ -51,6 +63,9 @@ pub struct LoadStats {
     /// Entries not offered at all because they entered the pool longer
     /// than `-mempoolexpiry` ago.
     pub expired: usize,
+    /// `prioritisetransaction` deltas restored for transactions not in the
+    /// pool.
+    pub deltas: usize,
 }
 
 /// Serialize the current mempool to `<net_datadir>/mempool.dat`.
@@ -62,7 +77,9 @@ pub fn dump_mempool(mempool: &Mempool, net_datadir: &Path) -> std::io::Result<us
     // Parents before children, as Core writes its file (`DumpMempool` takes
     // `infoAll()`, which is in topological order), so a reload that admits
     // records in file order never meets a child before its parent.
-    let mut entries = mempool.get_all_entries();
+    // One snapshot of both, so a delta is in its entry's record or in the
+    // deltas trailer, never both and never neither.
+    let (mut entries, mut deltas) = mempool.persist_snapshot();
     entries.sort_by_key(|(txid, e)| (e.time, *txid));
     let order = parent_first_order(entries.iter().map(|(_, e)| &e.tx));
     let entries = permute(entries, &order);
@@ -81,6 +98,14 @@ pub fn dump_mempool(mempool: &Mempool, net_datadir: &Path) -> std::io::Result<us
         let tx_bytes = bitcoin::consensus::serialize(&e.tx);
         buf.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&tx_bytes);
+    }
+    // Deltas for transactions not in the pool, after the records, as Core
+    // writes `mapDeltas`. Sorted so the same state writes the same file.
+    deltas.sort();
+    buf.extend_from_slice(&(deltas.len() as u64).to_le_bytes());
+    for (txid, delta) in &deltas {
+        buf.extend_from_slice(txid.as_byte_array());
+        buf.extend_from_slice(&delta.to_le_bytes());
     }
 
     let final_path = net_datadir.join(FILE_NAME);
@@ -210,6 +235,13 @@ pub fn load_mempool(
             Err(_) => stats.skipped += 1,
         }
     }
+    // Core's `LoadMempool` applies `mapDeltas` after the transactions.
+    for (txid, delta) in parsed.deltas {
+        match mempool.prioritise_transaction(&txid, delta) {
+            Ok(_) => stats.deltas += 1,
+            Err(e) => tracing::debug!(%txid, err = %e, "persisted fee_delta not applied"),
+        }
+    }
     Ok(stats)
 }
 
@@ -279,6 +311,8 @@ struct Record {
 /// failure at a specific record).
 struct ParsedDump {
     records: Vec<Record>,
+    /// The deltas trailer; empty for a file without one.
+    deltas: Vec<(bitcoin::Txid, i64)>,
     truncation: Option<String>,
 }
 
@@ -367,8 +401,27 @@ fn parse(data: &[u8]) -> Result<ParsedDump, String> {
             }
         }
     }
+    // The deltas trailer, after a complete body. None at all is a file from
+    // before it; a trailer cut short keeps the deltas before the cut.
+    let mut deltas = Vec::new();
+    if truncation.is_none()
+        && let Some(b) = cur.take(8)
+    {
+        let n = u64::from_le_bytes(b.try_into().unwrap());
+        for i in 0..n {
+            let (Some(txid), Some(delta)) = (cur.take(32), cur.take(8)) else {
+                truncation = Some(format!("truncated at delta {i}"));
+                break;
+            };
+            deltas.push((
+                bitcoin::Txid::from_byte_array(txid.try_into().unwrap()),
+                i64::from_le_bytes(delta.try_into().unwrap()),
+            ));
+        }
+    }
     Ok(ParsedDump {
         records,
+        deltas,
         truncation,
     })
 }
@@ -564,6 +617,76 @@ mod tests {
         assert!(parsed.truncation.is_none());
         assert_eq!(parsed.records[0].flags, FLAG_UNBROADCAST);
         assert_eq!(parsed.records[1].flags, 0);
+    }
+
+    /// #981: a `prioritisetransaction` delta for a transaction the pool does
+    /// not hold survives a restart, as Core's `mapDeltas` does in its
+    /// `mempool.dat`. Only in-pool deltas were written.
+    #[test]
+    fn a_delta_for_a_transaction_not_in_the_pool_survives_a_restart() {
+        let dir = temp_datadir("deltas");
+        let mp = Mempool::new(300_000_000, 1000);
+        let absent = dummy_tx(7).compute_txid();
+        mp.prioritise_transaction(&absent, 12_345).unwrap();
+        dump_mempool(&mp, &dir).unwrap();
+
+        let cs = empty_chainstate(&dir);
+        let fresh = Mempool::new(300_000_000, 1000);
+        let stats = load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
+        assert_eq!(stats.deltas, 1);
+        assert_eq!(
+            fresh.get_prioritised_transactions().get(&absent),
+            Some(&(12_345, false, None)),
+            "the delta set ahead of the transaction was lost"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1007 review: each delta is written once. An in-pool transaction's
+    /// rides in its record and not in the trailer; an absent one's in the
+    /// trailer only. Both come back exactly, not doubled.
+    #[test]
+    fn each_delta_is_written_once_and_restored_once() {
+        let (cs, mp, dir) = funded(&[3], 0);
+        let tx = funded_spend(3, 1_000);
+        let resident = tx.compute_txid();
+        mp.accept_persisted_transaction(tx, &cs, &NoopVerifier, crate::time::now_secs() - 60).unwrap();
+        mp.prioritise_transaction(&resident, 700).unwrap();
+        let absent = dummy_tx(9).compute_txid();
+        mp.prioritise_transaction(&absent, 300).unwrap();
+        dump_mempool(&mp, &dir).unwrap();
+
+        let written = parse(&std::fs::read(dir.join("mempool.dat")).unwrap()).unwrap();
+        assert_eq!(written.records.iter().map(|r| r.fee_delta).collect::<Vec<_>>(), [700]);
+        assert_eq!(written.deltas, vec![(absent, 300)], "the resident delta must not ride in the trailer too");
+
+        let fresh = Mempool::new(300_000_000, 0);
+        load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
+        let got = fresh.get_prioritised_transactions();
+        assert_eq!(got.get(&resident).map(|d| (d.0, d.1)), Some((700, true)));
+        assert_eq!(got.get(&absent).map(|d| (d.0, d.1)), Some((300, false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file from before the trailer ends after its records: it parses
+    /// cleanly with no deltas. A trailer cut short keeps the records and the
+    /// deltas before the cut.
+    #[test]
+    fn the_deltas_trailer_is_optional_and_a_short_one_keeps_the_rest() {
+        let buf = frame(&[(100, 0, dummy_tx(1))]);
+        let parsed = parse(&buf).unwrap();
+        assert!(parsed.truncation.is_none());
+        assert!(parsed.deltas.is_empty());
+
+        let mut buf = buf;
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        buf.extend_from_slice(&[0xab; 32]);
+        buf.extend_from_slice(&(-5i64).to_le_bytes());
+        buf.extend_from_slice(&[0xcd; 20]); // the second delta, cut short
+        let parsed = parse(&buf).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.deltas, vec![(bitcoin::Txid::from_byte_array([0xab; 32]), -5)]);
+        assert!(parsed.truncation.as_deref().is_some_and(|t| t.contains("delta 1")));
     }
 
     #[test]
