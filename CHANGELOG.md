@@ -80,6 +80,12 @@ item below is (or will be) written up in full in the in-development
   every node sets `NODE_NETWORK_LIMITED`, as Core does. Blocks are served as
   in Core's `ProcessGetBlockData`: a block off the active chain only if it was
   validated, and from a pruned node nothing more than 290 below the tip.
+- Shutdown waits for running JSON-RPC calls to finish before it flushes the
+  chainstate and dumps the mempool, as Core does; a call still running could
+  admit a transaction after the dump or, with `generatetoaddress`, connect
+  blocks past the tip the clean-shutdown marker recorded (#983).
+  `generatetoaddress`, `waitfor*` and long-polling `getblocktemplate` stop at
+  shutdown.
 
 ## Releases
 

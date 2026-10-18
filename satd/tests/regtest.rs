@@ -7349,6 +7349,83 @@ fn test_sigterm_stop_joins_the_connector_and_closes_the_database() {
     );
 }
 
+/// #983: shutdown waits for the RPC calls still running before it flushes,
+/// and a `generatetoaddress` running then stops at the next block. The RPC
+/// server used to be stopped last, after the flush, the marker and the
+/// mempool dump: a `generatetoaddress` went on connecting blocks for seconds
+/// past a clean-shutdown marker recording an older tip, was never answered,
+/// and the node exited with the chainstate still open.
+#[test]
+fn test_stop_waits_for_running_rpc_calls_before_the_flush() {
+    let mut node = TestNode::start(&["--loglevel=info"]);
+    let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let mined = std::thread::scope(|s| {
+        let generate = s.spawn(|| {
+            node.rpc_call_with_params("generatetoaddress", vec![serde_json::json!(100_000), serde_json::json!(addr)])
+        });
+        // Stop once mining is under way, far short of the 100000 asked for.
+        let deadline = Instant::now() + test_timeout(60);
+        while node.rpc_call("getblockcount").ok().and_then(|r| r["result"].as_u64()).unwrap_or(0) < 20 {
+            assert!(Instant::now() < deadline, "generatetoaddress mined nothing in 60s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        node.rpc_ok("stop", vec![]);
+        let resp = generate.join().unwrap().unwrap_or_else(|e| {
+            panic!("the generatetoaddress running at stop was never answered: {e}")
+        });
+        resp["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("generatetoaddress answered without blocks: {resp}"))
+            .len() as u64
+    });
+    assert!(mined < 100_000, "generatetoaddress mined all {mined} blocks despite the stop");
+
+    let deadline = Instant::now() + test_timeout(60);
+    while node.process.try_wait().expect("wait for satd").is_none() {
+        assert!(Instant::now() < deadline, "satd did not exit within 60s of stop");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    let at = |line: &str| {
+        log.find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in the log:\n{log}"))
+    };
+    assert!(
+        at("RPC server stopped") < at("flushing the UTXO cache"),
+        "the RPC server must be drained before the flush; log:\n{log}"
+    );
+    // Every block the call mined is behind the tip the marker records, and
+    // none was connected after it.
+    let marker = std::fs::read_to_string(node.datadir.join("regtest").join(".clean_shutdown"))
+        .unwrap_or_else(|e| panic!("no clean-shutdown marker ({e}); log:\n{log}"));
+    let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
+    assert_eq!(
+        marker["tip_height"].as_u64(),
+        Some(mined),
+        "the marker's tip must be the last block generatetoaddress mined; log:\n{log}"
+    );
+}
+
+/// #983: a call still waiting when shutdown begins is answered before the
+/// node exits. `waitfornewblock` notices the shutdown at its next poll, up to
+/// half a second later; the node used to flush and exit in less than that,
+/// dropping the call unanswered. Core answers it with the current tip.
+#[test]
+fn test_stop_answers_a_waitfornewblock_still_waiting() {
+    let mut node = TestNode::start(&[]);
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+    let resp = std::thread::scope(|s| {
+        let wait = s.spawn(|| node.rpc_call_with_params("waitfornewblock", vec![serde_json::json!(60_000)]));
+        // Let the call reach its wait before the stop.
+        std::thread::sleep(Duration::from_millis(300));
+        node.rpc_ok("stop", vec![]);
+        wait.join().unwrap()
+    });
+    let resp = resp.unwrap_or_else(|e| panic!("the waitfornewblock running at stop was never answered: {e}"));
+    assert_eq!(resp["result"]["hash"], tip, "waitfornewblock must answer with the tip at shutdown: {resp}");
+    node.stop();
+}
+
 #[test]
 fn test_clean_shutdown_marker_after_kill() {
     // SIGKILL bypasses the graceful shutdown path — no marker should be written.
