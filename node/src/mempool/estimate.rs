@@ -200,12 +200,12 @@ fn ancestor_aggregate(
         return (0, 0);
     };
     let mut fee = effective_fee(root);
-    let mut weight = root.weight as u64;
+    let mut weight = root.adjusted_weight();
     let anc = ancestor_set(txid, entries, anc_memo);
     for a in &anc {
         if let Some(e) = entries.get(a) {
             fee = fee.saturating_add(effective_fee(e));
-            weight = weight.saturating_add(e.weight as u64);
+            weight = weight.saturating_add(e.adjusted_weight());
         }
     }
     (fee, weight)
@@ -266,13 +266,19 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             .collect();
         group.push(txid);
 
+        // Priced and fitted at the sigop-adjusted weight, as the template
+        // does; the block fills with the transactions' own weight
+        // (`TestChunkBlockLimits` adds the chunk's adjusted weight to the
+        // block's actual one).
         let mut group_fee: u64 = 0;
         let mut group_weight: u64 = 0;
+        let mut group_tx_weight: u64 = 0;
         let mut group_sigops: u64 = 0;
         for t in &group {
             if let Some(e) = remaining.get(t) {
                 group_fee = group_fee.saturating_add(effective_fee(e));
-                group_weight = group_weight.saturating_add(e.weight as u64);
+                group_weight = group_weight.saturating_add(e.adjusted_weight());
+                group_tx_weight = group_tx_weight.saturating_add(e.weight as u64);
                 group_sigops = group_sigops.saturating_add(e.sigop_cost);
             }
         }
@@ -298,9 +304,9 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
             continue;
         }
         let marginal_rate = crate::mempool::policy::fee_rate_sat_per_kvb(group_fee, group_weight);
-        used_weight += group_weight;
+        used_weight += group_tx_weight;
         used_sigops += group_sigops;
-        admissions.push((marginal_rate, group_weight));
+        admissions.push((marginal_rate, group_tx_weight));
         for t in group {
             included.insert(t);
         }
@@ -373,7 +379,7 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
     let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
     for entry in entries.values() {
         let rate =
-            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.weight as u64);
+            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.adjusted_weight());
         // Drop into the highest bucket whose boundary is ≤ rate.
         let mut idx: Option<usize> = None;
         for (i, b) in bounds_kvb.iter().enumerate() {
@@ -384,7 +390,7 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
             }
         }
         if let Some(i) = idx {
-            weights[i] = weights[i].saturating_add(entry.weight as u64);
+            weights[i] = weights[i].saturating_add(entry.adjusted_weight());
         }
     }
     bounds_kvb
@@ -968,6 +974,29 @@ mod tests {
             est.sim_blocks[0].min_feerate_sat_per_kvb, expected_rate,
             "sigop-heavy tx should not have set the floor"
         );
+    }
+
+    /// A sigop-dense transaction is priced and fitted at its adjusted
+    /// weight, and fills the block only with its own. 18 transactions of
+    /// 536 WU and 3941 sigops (78820 adjusted each) and 30 of 100000 WU
+    /// weigh 3009648 in all and fit one block, as the template packs them;
+    /// summing adjusted weight into the block left five out.
+    #[test]
+    fn sigop_dense_transactions_fill_the_block_with_their_own_weight() {
+        let mut snap = Vec::new();
+        for i in 0..48u8 {
+            let tx = mk_tx(&[(random_txid(100 + i), 0)], 1);
+            let entry = if i < 18 {
+                mk_entry_with_sigops(tx.clone(), 200_000, 536, 3_941)
+            } else {
+                mk_entry(tx.clone(), 75_000, 100_000)
+            };
+            snap.push((tx.compute_txid(), entry));
+        }
+        let est = estimate_from_mempool(snap, 1);
+        assert_eq!(est.sim_blocks[0].tx_count, 48);
+        assert_eq!(est.sim_blocks[0].weight, 18 * 536 + 30 * 100_000);
+        assert_eq!(est.mempool_weight, 18 * 536 + 30 * 100_000, "the weight queued, not the adjusted");
     }
 
     #[test]

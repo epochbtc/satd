@@ -690,6 +690,10 @@ pub struct Config {
     /// before the node trusts it as the best header for `-assumevalid` and
     /// header announcements. `None` keeps the network's default.
     pub minimumchainwork: Option<[u8; 32]>,
+    /// Core's `-bytespersigop` (default 20): the vbytes each unit of sigop
+    /// cost counts as when the mempool prices a transaction
+    /// (`GetSigOpsAdjustedWeight`). Startup only, as in Core.
+    pub bytespersigop: u32,
     /// Core's `-peertimeout`, seconds: how long a new connection has to
     /// finish its handshake before the inactivity check drops it. Default 60.
     pub peertimeout: i64,
@@ -3126,6 +3130,8 @@ impl Config {
             None => None,
         };
 
+        let bytespersigop = resolve_bytes_per_sigop(cli.policy_size_args, &file_get)?;
+
         let peertimeout = match cli.peertimeout {
             Some(v) => v,
             None => match file_get("peertimeout") {
@@ -4155,6 +4161,7 @@ impl Config {
             mempoolexpiry,
             maxtipage,
             minimumchainwork,
+            bytespersigop,
             peertimeout,
             persistmempool: cli
                 .persistmempool
@@ -5974,6 +5981,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub chain_work_args: ChainWorkArgs,
 
+    /// `-bytespersigop`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
+    #[command(flatten)]
+    pub policy_size_args: PolicySizeArgs,
+
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
@@ -7372,6 +7384,66 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
     }
 }
 
+/// `-bytespersigop`, the command line before the config file, default 20.
+/// Out of line, as the other `resolve_*`, to keep `Config::from_cli`'s
+/// frame from growing (the test threads' stack is tight).
+#[inline(never)]
+fn resolve_bytes_per_sigop(cli: PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
+    match cli.bytespersigop.or_else(|| file_get("bytespersigop")) {
+        Some(v) => v
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid bytespersigop {v:?}: expected a non-negative integer")),
+        None => Ok(node::mempool::policy::DEFAULT_BYTES_PER_SIGOP),
+    }
+}
+
+/// Bitcoin Core's `-bytespersigop` (see [`CliArgs::policy_size_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct PolicySizeArgs {
+    pub bytespersigop: Option<String>,
+}
+
+/// Help text is Core's own (v31.1 `src/init.cpp`).
+const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
+    "bytespersigop",
+    "N",
+    StratumArgKind::Text,
+    "Equivalent bytes per sigop in transactions for relay and mining (default: 20)",
+)];
+
+impl clap::Args for PolicySizeArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in POLICY_SIZE_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for PolicySizeArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { bytespersigop: m.remove_one("bytespersigop") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// Bitcoin Core's `-minimumchainwork` (see [`CliArgs::chain_work_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChainWorkArgs {
@@ -8128,6 +8200,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mempoolexpiry",
         "maxtipage",
         "minimumchainwork",
+        "bytespersigop",
         "peertimeout",
         "cjdnsreachable",
         "persistmempool",
@@ -8932,6 +9005,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mempoolexpiry",
     "maxtipage",
     "minimumchainwork",
+    "bytespersigop",
     "peertimeout",
     "cjdnsreachable",
     "persistmempool",
@@ -9859,6 +9933,10 @@ mod minchainwork_tests;
 mod onlynet_tests;
 
 #[cfg(test)]
+#[path = "config_bytespersigop_tests.rs"]
+mod bytespersigop_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -10732,17 +10810,23 @@ rpcport=8332
         assert_eq!(cfg.stream_prefix_max_bits, 32);
     }
 
+    /// Parse `argv` into a heap-allocated `Config`. `CliArgs` and `Config`
+    /// are each several KiB, and a test holding a few of them inline sits
+    /// at the edge of the 2 MiB test-thread stack (#1002).
+    #[inline(never)]
+    fn parse_boxed(argv: &[&str]) -> Box<Config> {
+        use clap::Parser;
+        let cli = Box::new(CliArgs::try_parse_from(argv).unwrap());
+        Box::new(Config::from_cli(*cli).unwrap())
+    }
+
     #[test]
     fn health_alert_threshold_defaults_and_parsing() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults come from the single source of truth in `node::health`, so
         // the config layer and the detector can never disagree about them.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
-        let cfg = Config::from_cli(cli).unwrap();
+        let cfg = parse_boxed(&["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
         // Three defaults are network-dependent, all because the alert would
@@ -10758,9 +10842,7 @@ rpcport=8332
 
         // ...all armed where the condition really does mean something is
         // wrong.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--datadir", dir.path().to_str().unwrap()]).unwrap();
-        let cfg_mainnet = Config::from_cli(cli).unwrap();
+        let cfg_mainnet = parse_boxed(&["satd", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg_mainnet.alert_tip_stall_seconds, 3_600, "mainnet keeps the hour");
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
         assert_eq!(cfg_mainnet.alert_reorg_depth, 3, "3 deep is an incident on mainnet");
@@ -10769,10 +10851,7 @@ rpcport=8332
         // thin hashrate. Paging on that trains the operator to ignore the
         // alert, which costs them the mainnet one too — so the floor is raised
         // rather than defaulted to mainnet's sensitivity.
-        let cli =
-            CliArgs::try_parse_from(["satd", "--signet", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
-        let cfg_signet = Config::from_cli(cli).unwrap();
+        let cfg_signet = parse_boxed(&["satd", "--signet", "--datadir", dir.path().to_str().unwrap()]);
         assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
         assert_eq!(cfg_signet.alert_peer_floor, 3, "but signet is a real network with peers");
         // A stall is not an ordinary property of a thin-hashrate chain the way
@@ -10781,7 +10860,7 @@ rpcport=8332
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.
-        let cli = CliArgs::try_parse_from([
+        let cfg = parse_boxed(&[
             "satd",
             "--regtest",
             "--datadir",
@@ -10796,9 +10875,7 @@ rpcport=8332
             "0",
             "--alertreorgdepth",
             "6",
-        ])
-        .unwrap();
-        let cfg = Config::from_cli(cli).unwrap();
+        ]);
         assert_eq!(cfg.alert_tip_stall_seconds, 7_200);
         assert_eq!(cfg.alert_disk_free_mb, 0, "0 must disable, not fall back");
         assert_eq!(cfg.alert_mempool_full_pct, 75);
@@ -11446,6 +11523,7 @@ testactivationheight=bip34@2
             signetchallenge: Vec::new(),
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
+            policy_size_args: PolicySizeArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -11764,6 +11842,7 @@ testactivationheight=bip34@2
             signetchallenge: Vec::new(),
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
+            policy_size_args: PolicySizeArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),

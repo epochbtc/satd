@@ -73,6 +73,9 @@ item below is (or will be) written up in full in the in-development
 - A transaction the mempool refused is not downloaded and validated again
   until the tip moves, as with Core's recent-rejects filters; satd fetched it
   from every peer that announced it.
+- `-bytespersigop` (default 20) takes effect: the mempool and block template
+  price a transaction at Core's sigop-adjusted size, the larger of its vsize
+  and its sigop cost times 20 bytes; it was accepted and ignored.
 
 ## Releases
 
