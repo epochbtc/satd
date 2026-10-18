@@ -90,6 +90,10 @@ item below is (or will be) written up in full in the in-development
   activates a competing branch, as Core does; a competing branch that failed
   to connect left the node on the tip it had just marked invalid, refusing
   every new block until a restart (#977).
+- A peer stalling initial block download is disconnected, with Core's
+  adaptive stall timeout (15s here, doubling to 64s); it stayed connected and
+  could be handed the same blocks again. A block handed to another peer is
+  timed from that peer's request (#972).
 
 ## Releases
 

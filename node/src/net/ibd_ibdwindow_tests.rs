@@ -145,7 +145,7 @@ fn only_a_requested_block_resets_the_stall_clock() {
     let slots = &sched.peer_slots[&1];
     assert_eq!(slots.consecutive_failures, 2, "an unrequested block reset the failure count");
     assert_eq!(slots.last_activity, old, "an unrequested block reset the stall clock");
-    assert_eq!(sched.detect_stalls(Duration::from_secs(60)), vec![1], "peer 1 still stalls");
+    assert_eq!(sched.take_stalled_peer(), Some(1), "peer 1 still stalls");
 
     // Its own block does reset it.
     let mut sched = IbdScheduler::new(40, 0, &cs, 50_000);
