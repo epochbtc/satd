@@ -27,7 +27,7 @@ const TARGET_TIMESPAN: u32 = 14 * 24 * 60 * 60;
 const TESTNET_ALLOW_MIN_DIFF_AFTER: u32 = 20 * 60;
 /// BIP 94 (testnet4) timewarp guard: the first block of a retarget period
 /// may not have a timestamp more than this many seconds before its parent.
-const MAX_TIMEWARP: u32 = 600;
+pub const MAX_TIMEWARP: u32 = 600;
 /// Bitcoin Core's `MAX_FUTURE_BLOCK_TIME` (2 hours): a block whose timestamp
 /// is more than this far ahead of the node's current time is rejected.
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
