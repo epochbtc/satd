@@ -452,22 +452,48 @@ pub(crate) fn check_block_context(
         .try_for_each(|tx| check_transaction_context(tx, height, cutoff, network))
 }
 
+/// Core's `BIP34_IMPLIES_BIP30_LIMIT`: from this height BIP 30 is checked
+/// again on every network. Coinbases of blocks below the BIP 34 height carry
+/// indicated heights from here on, so BIP 34 no longer makes their txids
+/// unique (`validation.cpp`, the comment above the constant).
+pub(crate) const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
+
 /// Whether BIP 30 (no overwriting an unspent transaction) must be enforced
-/// for a block at `height`.
+/// for a block at `height`, Core's `fEnforceBIP30` before its grandfathered
+/// exceptions ([`bip30_exempt`]).
 ///
-/// Core skips the BIP 30 scan once BIP 34 is *buried* — past BIP 34's
+/// Core skips the BIP 30 scan once BIP 34 is *buried*: past BIP 34's
 /// activation height, coinbase txids are unique by construction (the height
 /// is encoded in the scriptSig), so a duplicate-unspent-txid is impossible
-/// and the per-output scan is pure cost. On regtest/signet Core's
-/// `BIP34Hash` is null, so the buried-skip never triggers and BIP 30 is
-/// always enforced.
-fn bip30_enforced(network: Network, height: u32) -> bool {
-    match network {
-        Network::Bitcoin => height <= 227_931,
-        Network::Testnet => height <= 21_111,
-        // Regtest/Signet/Testnet4: buried-skip never triggers (null BIP34Hash).
-        _ => true,
+/// and the per-output scan is pure cost. Two conditions bound that skip, as
+/// in Core:
+///
+/// - It applies only on a chain whose block at the BIP 34 height is Core's
+///   `BIP34Hash`, read through `ancestor_at` (`pprev->GetAncestor`). A fork
+///   from below the BIP 34 height is checked in full.
+/// - It ends at [`BIP34_IMPLIES_BIP30_LIMIT`].
+///
+/// On regtest, signet and testnet4 Core's `BIP34Hash` is null, so the skip
+/// never applies and BIP 30 is always enforced.
+fn bip30_enforced(
+    network: Network,
+    height: u32,
+    ancestor_at: impl FnOnce(u32) -> Option<BlockHash>,
+) -> bool {
+    if height >= BIP34_IMPLIES_BIP30_LIMIT {
+        return true;
     }
+    let (bip34_height, bip34_hash) = match network {
+        Network::Bitcoin => (227_931, "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"),
+        Network::Testnet => (21_111, "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"),
+        _ => return true,
+    };
+    // `pprev->GetAncestor(BIP34Height)` is null until the parent reaches that
+    // height.
+    if height <= bip34_height {
+        return true;
+    }
+    ancestor_at(bip34_height).is_none_or(|h| h.to_string() != bip34_hash)
 }
 
 /// The two pre-BIP34 mainnet blocks (CVE-2012-1909) that intentionally
@@ -671,8 +697,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     let mut block_sigops: u64 = 0;
     // BIP 30: enforce the no-overwrite-of-an-unspent-txid rule unless this
     // block is past the buried BIP 34 height or is a grandfathered exception.
-    let enforce_bip30 =
-        bip30_enforced(network, height) && !bip30_exempt(network, height, &block_hash);
+    let enforce_bip30 = bip30_enforced(network, height, |h| match replay_plan {
+        Some(p) => p.hash_at(h),
+        None => store.get_block_hash_by_height(h),
+    }) && !bip30_exempt(network, height, &block_hash);
 
     // Pre-allocate based on block size
     let total_inputs: usize = block.txdata.iter().map(|tx| tx.input.len()).sum();
@@ -1570,17 +1598,44 @@ mod tests {
 
     #[test]
     fn test_bip30_enforced_gating() {
+        let main34: BlockHash =
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8".parse().unwrap();
+        let test34: BlockHash =
+            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8".parse().unwrap();
+        let on = |h: BlockHash| move |_| Some(h);
+        let unreachable = |_| -> Option<BlockHash> { panic!("not consulted at or below the BIP 34 height") };
         // Mainnet: enforced up to and including the buried BIP34 height,
-        // skipped above it (heights then guarantee unique coinbase txids).
-        assert!(bip30_enforced(Network::Bitcoin, 91_842));
-        assert!(bip30_enforced(Network::Bitcoin, 227_931));
-        assert!(!bip30_enforced(Network::Bitcoin, 227_932));
-        assert!(bip30_enforced(Network::Testnet, 21_111));
-        assert!(!bip30_enforced(Network::Testnet, 21_112));
+        // skipped above it on the chain whose BIP 34 block is Core's.
+        assert!(bip30_enforced(Network::Bitcoin, 91_842, unreachable));
+        assert!(bip30_enforced(Network::Bitcoin, 227_931, unreachable));
+        assert!(!bip30_enforced(Network::Bitcoin, 227_932, on(main34)));
+        assert!(bip30_enforced(Network::Testnet, 21_111, unreachable));
+        assert!(!bip30_enforced(Network::Testnet, 21_112, on(test34)));
         // Regtest/Signet: always enforced (Core's BIP34Hash is null there,
         // so the buried-skip never triggers).
-        assert!(bip30_enforced(Network::Regtest, 5_000_000));
-        assert!(bip30_enforced(Network::Signet, 5_000_000));
+        assert!(bip30_enforced(Network::Regtest, 5_000_000, |_| None));
+        assert!(bip30_enforced(Network::Signet, 5_000_000, |_| None));
+    }
+
+    /// The skip needs Core's `BIP34Hash` at the BIP 34 height, so a fork from
+    /// below it is checked in full, and it ends at
+    /// `BIP34_IMPLIES_BIP30_LIMIT`. Testnet3 is past that height today.
+    /// Perturbation: drop the pin and the fork case fails; drop the limit and
+    /// the two high cases fail.
+    #[test]
+    fn the_bip30_skip_is_pinned_to_the_bip34_block_and_ends_at_cores_limit() {
+        let main34: BlockHash =
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8".parse().unwrap();
+        let test34: BlockHash =
+            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8".parse().unwrap();
+        let other = BlockHash::all_zeros();
+        assert!(bip30_enforced(Network::Bitcoin, 300_000, |_| Some(other)), "a fork below BIP 34");
+        assert!(bip30_enforced(Network::Bitcoin, 300_000, |_| None), "no ancestor found");
+        assert!(!bip30_enforced(Network::Bitcoin, BIP34_IMPLIES_BIP30_LIMIT - 1, |_| Some(main34)));
+        assert!(bip30_enforced(Network::Bitcoin, BIP34_IMPLIES_BIP30_LIMIT, |_| Some(main34)));
+        assert!(bip30_enforced(Network::Testnet, 4_000_000, |_| Some(test34)));
+        // The ancestor is looked up at the BIP 34 height itself.
+        assert!(!bip30_enforced(Network::Bitcoin, 300_000, |h| (h == 227_931).then_some(main34)));
     }
 
     // ── Mandatory block-version floors (Core: bad-version) ─────────────
