@@ -8417,11 +8417,28 @@ impl PeerManager {
         self.recent_rejects.lock().contains(tip, hash, true)
     }
 
-    /// Whether `hash` is in the main filter only, not counting a refusal on
-    /// the fee alone (Core's `RecentRejectsFilter().contains`).
-    fn hard_rejected(&self, hash: &[u8; 32]) -> bool {
+    /// Core's check for an orphan: if one of `missing` was refused outright
+    /// (the main filter only: a parent refused on its fee alone may still
+    /// enter), record the orphan's txid and wtxid as refused too and return
+    /// true. One tip snapshot and one lock cover the check and the record,
+    /// and both are about `validated_at`, the tip the orphan was validated
+    /// against; if the tip has moved since, nothing is decided.
+    fn condemn_orphan_of_rejected_parent(
+        &self,
+        missing: &std::collections::HashSet<bitcoin::Txid>,
+        txid: bitcoin::Txid,
+        wtxid: bitcoin::Wtxid,
+        validated_at: bitcoin::BlockHash,
+    ) -> bool {
+        use crate::net::recent_rejects::Rejection;
         let tip = self.chain_state.tip_hash();
-        self.recent_rejects.lock().contains(tip, hash, false)
+        let mut rejects = self.recent_rejects.lock();
+        let hit = tip == validated_at && missing.iter().any(|p| rejects.contains(tip, p.as_byte_array(), false));
+        if hit {
+            rejects.insert(tip, txid.as_byte_array(), Rejection::Rejected);
+            rejects.insert(tip, wtxid.as_byte_array(), Rejection::Rejected);
+        }
+        hit
     }
 
     fn note_rejected(&self, hash: &[u8; 32], kind: crate::net::recent_rejects::Rejection) {
@@ -8526,10 +8543,8 @@ impl PeerManager {
                 // it acceptable. Only a hard refusal counts: a parent refused
                 // on its fee alone may still enter, with this child paying
                 // for it or after a `prioritisetransaction`.
-                if missing.iter().any(|p| self.hard_rejected(p.as_byte_array())) {
+                if self.condemn_orphan_of_rejected_parent(&missing, txid, wtxid, validated_at) {
                     tracing::debug!(%txid, %wtxid, "not keeping orphan with rejected parents");
-                    self.note_rejected(txid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
-                    self.note_rejected(wtxid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
                     return;
                 }
                 match self.orphanage.add(tx.clone(), id, missing.clone()) {
@@ -15664,6 +15679,22 @@ mod tests {
         pm.handle_tx(1, child.clone());
         assert!(!pm.orphanage.contains(&child.compute_txid()));
         assert!(pm.recently_rejected(&child.compute_txid().to_byte_array()));
+        assert!(pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
+    }
+
+    /// An orphan judged under a tip that has since moved is not condemned by
+    /// a parent refused under the new one.
+    #[test]
+    fn an_orphan_judged_under_a_former_tip_is_not_condemned() {
+        let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let child = witness_tx(0x47, 0xaa);
+        pm.note_rejected(&[0x47; 32], crate::net::recent_rejects::Rejection::Rejected);
+        let missing: std::collections::HashSet<_> = [bitcoin::Txid::from_byte_array([0x47; 32])].into();
+        let former = bitcoin::BlockHash::from_byte_array([9; 32]);
+        assert!(!pm.condemn_orphan_of_rejected_parent(&missing, child.compute_txid(), child.compute_wtxid(), former));
+        assert!(!pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
+        let tip = pm.chain_state.tip_hash();
+        assert!(pm.condemn_orphan_of_rejected_parent(&missing, child.compute_txid(), child.compute_wtxid(), tip));
         assert!(pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
     }
 
