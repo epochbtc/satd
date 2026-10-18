@@ -121,6 +121,13 @@ pub trait ScriptVerifier: Send + Sync {
     fn primary_engine(&self) -> PrimaryEngine {
         PrimaryEngine::Cpp
     }
+
+    /// The mempool's policy pass over `tx`'s inputs: Core's
+    /// `PolicyScriptChecks`, under [`STANDARD_SCRIPT_VERIFY_FLAGS`]. Every
+    /// engine runs it on the Rust interpreter; see [`verify_policy_scripts`].
+    fn verify_policy(&self, tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), ScriptError> {
+        verify_policy_scripts(tx, prev_outputs)
+    }
 }
 
 /// Per-network softfork activation heights for script-verification flags.
@@ -311,6 +318,47 @@ pub fn script_verify_flags(network: Network, height: u32) -> u32 {
     flags
 }
 
+/// Core's `STANDARD_SCRIPT_VERIFY_FLAGS` (`src/policy/policy.h`): the
+/// consensus flags and the policy flags a standard transaction also obeys.
+/// They hold back upgrade hooks (unknown witness versions, taproot leaf
+/// versions, `OP_SUCCESS`, upgradable NOPs and public key types) and
+/// malleable or wasteful encodings from the mempool, so a future soft fork
+/// cannot be front-run into blocks. Not a block rule.
+pub const STANDARD_SCRIPT_VERIFY_FLAGS: u32 = {
+    use consensus::flags::*;
+    VERIFY_P2SH
+        | VERIFY_DERSIG
+        | VERIFY_NULLDUMMY
+        | VERIFY_CHECKLOCKTIMEVERIFY
+        | VERIFY_CHECKSEQUENCEVERIFY
+        | VERIFY_WITNESS
+        | VERIFY_TAPROOT
+        | VERIFY_STRICTENC
+        | VERIFY_MINIMALDATA
+        | VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+        | VERIFY_CLEANSTACK
+        | VERIFY_MINIMALIF
+        | VERIFY_NULLFAIL
+        | VERIFY_LOW_S
+        | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+        | VERIFY_WITNESS_PUBKEYTYPE
+        | VERIFY_CONST_SCRIPTCODE
+        | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+        | VERIFY_DISCOURAGE_OP_SUCCESS
+        | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+};
+
+/// Core's `PolicyScriptChecks`: every input under
+/// [`STANDARD_SCRIPT_VERIFY_FLAGS`]. It runs on the Rust engine whatever
+/// `-consensus` selects, because libconsensus refuses any flag outside the
+/// consensus set (`bitcoinconsensus.cpp`, `verify_flags`). The node's own
+/// verifier then checks the same inputs under the block's flags, as Core's
+/// `ConsensusScriptChecks` does, and stays the authority on validity.
+pub fn verify_policy_scripts(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), ScriptError> {
+    consensus::verify_transaction(tx, prev_outputs, STANDARD_SCRIPT_VERIFY_FLAGS)
+        .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
+}
+
 /// Script verifier backed by Bitcoin Core's libconsensus via FFI.
 /// Supports all consensus rules including taproot.
 pub struct ConsensusVerifier {
@@ -474,6 +522,10 @@ impl ScriptVerifier for NoopVerifier {
         _prev_outputs: &[TxOut],
         _height: u32,
     ) -> Result<(), ScriptError> {
+        Ok(())
+    }
+
+    fn verify_policy(&self, _tx: &Transaction, _prev_outputs: &[TxOut]) -> Result<(), ScriptError> {
         Ok(())
     }
 }

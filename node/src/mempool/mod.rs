@@ -3,6 +3,7 @@ pub mod estimate;
 pub mod events;
 pub mod fee;
 pub mod history;
+pub mod input_policy;
 pub mod orphanage;
 pub mod persist;
 pub mod policy;

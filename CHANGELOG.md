@@ -65,6 +65,11 @@ item below is (or will be) written up in full in the in-development
 - `getaddr` is answered only for inbound peers, once per connection, from a
   cached sample of the address book per listening socket, as in Core; satd
   sent every peer its live connection list and its own addresses.
+- The mempool applies Core's script policy: the standard script verification
+  flags, `ValidateInputsStandardness` (with BIP 54's legacy sigop limit),
+  `IsWitnessStandard`, and the 16000 sigop-cost cap. It checked scripts under
+  the block's flags alone, and relayed and mined spends of soft-fork upgrade
+  hooks.
 
 ## Releases
 

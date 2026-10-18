@@ -149,6 +149,14 @@ pub enum MempoolError {
     /// failed but not on which input.
     #[error("mempool-script-verify-flag-failed ({0})")]
     Script(String, Option<String>),
+    /// A script that is valid under the block's flags but fails one of
+    /// Core's policy flags ([`STANDARD_SCRIPT_VERIFY_FLAGS`]): non-standard,
+    /// not invalid, so the peer that relayed it is not penalised. Core's
+    /// reject string and detail are the same as [`Self::Script`]'s.
+    ///
+    /// [`STANDARD_SCRIPT_VERIFY_FLAGS`]: crate::validation::script::STANDARD_SCRIPT_VERIFY_FLAGS
+    #[error("mempool-script-verify-flag-failed ({0})")]
+    PolicyScript(String, Option<String>),
     #[error("bad-txns-in-belowout")]
     BadAmounts,
     #[error("bad-txns-premature-spend-of-coinbase")]
@@ -167,6 +175,18 @@ pub enum MempoolError {
     Dust,
     #[error("datacarrier")]
     NonStandardOpReturn,
+    /// Core's `ValidateInputsStandardness`: an input spends an output of an
+    /// unknown type or an undefined witness program, a P2SH redeem script
+    /// with more than 15 signature checks, or the inputs together exceed
+    /// BIP 54's 2500 legacy sigops. The field is Core's detail.
+    #[error("bad-txns-nonstandard-inputs")]
+    NonStandardInputs(String),
+    /// Core's `IsWitnessStandard`.
+    #[error("bad-witness-nonstandard")]
+    NonStandardWitness,
+    /// Core's `MAX_STANDARD_TX_SIGOPS_COST`: the transaction's sigop cost.
+    #[error("bad-txns-too-many-sigops")]
+    TooManySigops(u64),
     /// RBF: replacement tx does not pay enough additional fee.
     /// Fields: `(new_fee, min_required, replacement_txid, detail)`.
     #[error("insufficient fee")]
@@ -238,6 +258,7 @@ impl MempoolError {
             // Core funnels through `MEMPOOL_REJECTED` -> `-26`.
             Self::BadAmounts
             | Self::Script(..)
+            | Self::PolicyScript(..)
             | Self::DecodeFailed
             | Self::PrematureCoinbaseSpend
             | Self::Validation(_)
@@ -251,6 +272,9 @@ impl MempoolError {
             | Self::NonBip68Final
             | Self::Dust
             | Self::NonStandardOpReturn
+            | Self::NonStandardInputs(_)
+            | Self::NonStandardWitness
+            | Self::TooManySigops(_)
             | Self::InsufficientReplacementFee(..)
             | Self::SpendsConflictingTx(..)
             | Self::TooManyReplacements(..)
@@ -274,7 +298,7 @@ impl MempoolError {
             MempoolError::MempoolFull => "mempool full".to_string(),
             MempoolError::MempoolMinFeeNotMet(..) => "mempool min fee not met".to_string(),
             MempoolError::Validation(s) => s.clone(),
-            MempoolError::Script(s, _) => {
+            MempoolError::Script(s, _) | MempoolError::PolicyScript(s, _) => {
                 format!("mempool-script-verify-flag-failed ({s})")
             }
             MempoolError::BadAmounts => "bad-txns-in-belowout".to_string(),
@@ -289,6 +313,9 @@ impl MempoolError {
             // datacarrier budget reports "datacarrier"; "scriptpubkey" is
             // reserved for an output that is not a standard type at all.
             MempoolError::NonStandardOpReturn => "datacarrier".to_string(),
+            MempoolError::NonStandardInputs(_) => "bad-txns-nonstandard-inputs".to_string(),
+            MempoolError::NonStandardWitness => "bad-witness-nonstandard".to_string(),
+            MempoolError::TooManySigops(_) => "bad-txns-too-many-sigops".to_string(),
             MempoolError::InsufficientReplacementFee(..) => "insufficient fee".to_string(),
             MempoolError::SpendsConflictingTx(..) => {
                 "bad-txns-spends-conflicting-tx".to_string()
@@ -325,12 +352,14 @@ impl MempoolError {
                 Some("tx with dust output must be 0-fee".to_string())
             }
             MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
+            MempoolError::NonStandardInputs(detail) => Some(detail.clone()),
+            MempoolError::TooManySigops(cost) => Some(cost.to_string()),
             // Core: `strprintf("%d < %d", package_fee, min_relay_fee)`.
             MempoolError::InsufficientFee(fee, required) => Some(format!("{fee} < {required}")),
             MempoolError::MempoolMinFeeNotMet(fee, required) => Some(format!("{fee} < {required}")),
             // Core's detail for a script failure is the *input* it failed
             // on, not the script error — that is already in the reason.
-            MempoolError::Script(_, input) => input.clone(),
+            MempoolError::Script(_, input) | MempoolError::PolicyScript(_, input) => input.clone(),
             _ => None,
         }
     }
@@ -344,7 +373,7 @@ impl MempoolError {
         let reason = self.reject_reason();
         match self.reject_details() {
             None => reason,
-            Some(detail) if matches!(self, MempoolError::Script(..)) => {
+            Some(detail) if matches!(self, MempoolError::Script(..) | MempoolError::PolicyScript(..)) => {
                 format!("{reason}, {detail}")
             }
             Some(detail) if detail.starts_with(&reason) => detail,
@@ -2562,6 +2591,33 @@ impl Mempool {
     /// standardness path (an `allow` rule may forgive these) and the eager path
     /// share one definition and can never drift. Consensus rules are **not** here
     /// — those are never exemptable (§6.2 floor).
+    /// Core's `ValidateInputsStandardness` then `IsWitnessStandard`, over the
+    /// outputs `tx` spends.
+    fn check_spend_standardness(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), MempoolError> {
+        super::input_policy::validate_inputs_standardness(tx, prev_outputs)
+            .map_err(MempoolError::NonStandardInputs)?;
+        if tx.input.iter().any(|i| !i.witness.is_empty())
+            && !super::input_policy::is_witness_standard(tx, prev_outputs)
+        {
+            return Err(MempoolError::NonStandardWitness);
+        }
+        Ok(())
+    }
+
+    /// Core's `MAX_STANDARD_TX_SIGOPS_COST` (16000), on the cost Core's
+    /// `GetTransactionSigOpCost` gives under the standard flags.
+    fn check_sigop_cost(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), MempoolError> {
+        let cost = crate::validation::sigops::transaction_sigop_cost(
+            tx,
+            prev_outputs,
+            crate::validation::sigops::SigOpFlags::P2shWitness,
+        );
+        if cost > super::input_policy::MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(MempoolError::TooManySigops(cost));
+        }
+        Ok(())
+    }
+
     fn check_standardness(
         tx: &Transaction,
         cfg: &MempoolConfig,
@@ -3008,6 +3064,19 @@ impl Mempool {
 
         let fee = sum_inputs - sum_outputs;
 
+        // What the transaction spends, and how: Core's
+        // `ValidateInputsStandardness` and `IsWitnessStandard`, in `PreChecks`
+        // right after `CheckTxInputs`. Gated on `require_standard` and
+        // forgivable by an `allow` rule like the rest of the set (§6.2).
+        if !cfg.accept_non_std_txn
+            && let Err(e) = Self::check_spend_standardness(&tx, &prev_outputs)
+        {
+            if !has_allow {
+                return Err(e);
+            }
+            deferred_nonstd.get_or_insert(e);
+        }
+
         // Ephemeral dust, parent side (Core: `PreCheckEphemeralTx`, called
         // from `PreChecks` immediately before `CheckFeeRate`). A dusty
         // transaction that pays anything is refused here, so a zero-fee dusty
@@ -3028,6 +3097,11 @@ impl Mempool {
             }
             deferred_nonstd.get_or_insert(e);
         }
+
+        // Core's `MAX_STANDARD_TX_SIGOPS_COST`, after `PreCheckEphemeralTx`.
+        // Not gated on `require_standard`: `-acceptnonstdtxn` does not lift
+        // it, and no `allow` rule forgives it.
+        Self::check_sigop_cost(&tx, &prev_outputs)?;
 
         // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
         //
@@ -3250,6 +3324,13 @@ impl Mempool {
         // and ConsensusScriptChecks before it adds the transaction and trims
         // the pool (src/validation.cpp, AcceptSingleTransactionInternal), so a
         // transaction whose scripts fail changes nothing.
+        //
+        // Two passes, as Core's `PolicyScriptChecks` and `ConsensusScriptChecks`:
+        // the node's own verifier under the block's flags, which decides
+        // validity, then Core's standard flags on the Rust engine. Core runs
+        // policy first; consensus first here tells an invalid script, whose
+        // relayer is penalised, from a merely non-standard one, at no cost
+        // beyond the two passes an accepted transaction takes anyway.
         // Use tip_height + 1 since the tx will be mined in the next block
         if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
             // Naming the script error can mean running the second engine over
@@ -3257,6 +3338,9 @@ impl Mempool {
             drop(inner);
             let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
             return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
+        }
+        if let Err(e) = script_verifier.verify_policy(&tx, &prev_outputs) {
+            return Err(MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(&tx)));
         }
 
         let mut evicted_full_pool: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
@@ -5289,8 +5373,10 @@ impl Mempool {
         // same place: before the relay floor, so a zero-fee dusty transaction
         // still reports "min relay fee not met".
         if !cfg.accept_non_std_txn {
+            Self::check_spend_standardness(tx, &prev_outputs)?;
             Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
         }
+        Self::check_sigop_cost(tx, &prev_outputs)?;
 
         let effective_fee = modified_fee(fee, priority_delta);
         let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight_u64);
@@ -5320,13 +5406,16 @@ impl Mempool {
 
         drop(inner);
 
-        // Script verification (tip + 1 = next block height)
+        // Script verification, consensus then policy, as on admission
+        // (tip + 1 = next block height).
         let tip_height = chain_state.tip_height();
         script_verifier
             .verify_transaction(tx, &prev_outputs, tip_height + 1)
             .map_err(|e| {
                 MempoolError::Script(e.reason().to_string(), e.core_debug_string(tx))
             })?;
+        script_verifier.verify_policy(tx, &prev_outputs)
+            .map_err(|e| MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(tx)))?;
 
         // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
         // `sendrawtransaction` accept this?", so it must apply the same policy
@@ -6519,14 +6608,29 @@ impl Mempool {
         }
         let fee = sum_inputs - sum_outputs;
 
-        // Skip fee rate check — this is the bypass.
+        // Skip fee rate check — this is the bypass. Everything else
+        // `PreChecks` applies to a package parent still applies: the
+        // standardness of its outputs (one dust output is allowed, as
+        // ephemeral dust needs), of what it spends, and its sigop cost. A
+        // parent that waited for its own parent reached here having checked
+        // none of them.
+        let cfg = self.config.read().clone();
+        if !cfg.accept_non_std_txn {
+            Self::check_standardness(&tx, &cfg, weight)?;
+            Self::check_spend_standardness(&tx, &prev_outputs)?;
+        }
+        Self::check_sigop_cost(&tx, &prev_outputs)?;
 
-        // Script verification; the failure is named once the pool is released,
-        // as in `accept_transaction`.
+        // Script verification, consensus then policy, as in
+        // `accept_transaction`; a consensus failure is named once the pool is
+        // released.
         if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
             drop(inner);
             let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
             return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
+        }
+        if let Err(e) = script_verifier.verify_policy(&tx, &prev_outputs) {
+            return Err(MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(&tx)));
         }
 
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
@@ -7169,6 +7273,10 @@ impl Mempool {
 mod sigops_tests;
 
 #[cfg(test)]
+#[path = "pool_policy_tests.rs"]
+mod policy_tests;
+
+#[cfg(test)]
 #[path = "pool_fullpool_tests.rs"]
 mod fullpool_tests;
 
@@ -7631,7 +7739,9 @@ mod tests {
         };
         let coin = crate::storage::coinview::Coin {
             amount: 100_000,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE
+            // A standard type to spend (P2TR), so the transaction reaches the
+            // dust check rather than Core's input standardness.
+            script_pubkey: ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0x11; 32]].concat()),
             height: 1,
             coinbase: false,
             txseq: node_index::TXSEQ_UNKNOWN,

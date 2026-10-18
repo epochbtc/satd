@@ -8372,6 +8372,13 @@ impl PeerManager {
             | MempoolError::DecodeFailed
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
+            // Core's standardness for what is spent and how, its policy
+            // script flags and its sigop cap: `TX_NOT_STANDARD` and
+            // `TX_INPUTS_NOT_STANDARD`, never scored.
+            | MempoolError::NonStandardInputs(_)
+            | MempoolError::NonStandardWitness
+            | MempoolError::TooManySigops(_)
+            | MempoolError::PolicyScript(..)
             | MempoolError::InsufficientReplacementFee(..)
             | MempoolError::SpendsConflictingTx(..)
             | MempoolError::TooManyReplacements(..)
@@ -12434,6 +12441,11 @@ mod tests {
 
         // Policy / standardness / resource / RBF / duplicate → no score.
         for e in [
+            // Valid by consensus, refused by Core's policy flags.
+            MempoolError::PolicyScript("NOPx reserved for soft-fork upgrades".into(), None),
+            MempoolError::NonStandardInputs("input 0 script unknown".into()),
+            MempoolError::NonStandardWitness,
+            MempoolError::TooManySigops(19_705),
             MempoolError::InsufficientFee(254, 1000),
             MempoolError::Dust,
             MempoolError::MempoolFull,
