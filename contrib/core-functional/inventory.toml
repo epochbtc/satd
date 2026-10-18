@@ -627,7 +627,7 @@ note = "measured 2026-09-15: L87 getblockcount 10 != 13: satd serves stale block
 file = "p2p_getaddr_caching.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-27: addpeeraddress now answers; L73 a new inbound peer receives no addr reply within the timeout. satd answers getaddr from -externalip and its connected peers, not from the address book, and keeps no per-bind response cache. Follow-up: address relay"
+note = "measured 2026-10-17: getaddr is now answered from a per-bind cached address-book sample; fails earlier, at L73: the framework's bind=127.0.0.1 in bitcoin.conf is dropped when the test passes -bind=...=onion on the command line (#995), so the default port is not bound"
 
 [[test]]
 file = "p2p_getdata.py"

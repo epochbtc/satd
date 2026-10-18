@@ -62,6 +62,9 @@ item below is (or will be) written up in full in the in-development
   `-listen` stops listening.**
 - `/readyz` is 503 while the `tip_stall` or `peer_floor` health detector is
   raised: a node that lost its peers showed no lag and stayed ready (#979).
+- `getaddr` is answered only for inbound peers, once per connection, from a
+  cached sample of the address book per listening socket, as in Core; satd
+  sent every peer its live connection list and its own addresses.
 
 ## Releases
 

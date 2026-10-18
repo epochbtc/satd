@@ -567,6 +567,59 @@ pub enum NetEvent {
 type IncomingBlock =
     (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight, bool, bool);
 
+/// Core's `MAX_ADDR_TO_SEND` and `MAX_PCT_ADDR_TO_SEND`, for a `getaddr`
+/// reply.
+const GETADDR_MAX_ADDRS: usize = 1000;
+const GETADDR_MAX_PCT: usize = 23;
+
+/// Which listener a `getaddr` came in on, for the reply cache: the local
+/// socket (`getpeerinfo`'s `addrbind`) and whether it is the onion listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GetAddrCacheKey {
+    bind: Option<SocketAddr>,
+    onion: bool,
+}
+
+/// One address in a `getaddr` reply.
+#[derive(Clone, Debug)]
+struct GetAddrEntry {
+    addr: PeerAddr,
+    time: u32,
+    services: ServiceFlags,
+}
+
+impl GetAddrEntry {
+    /// As a BIP 155 entry: an onion as `TorV3`, an IPv4-mapped address as
+    /// IPv4.
+    fn to_addrv2(&self) -> Option<bitcoin::p2p::address::AddrV2Message> {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+        let (addr, port) = match &self.addr {
+            PeerAddr::Socket(sa) => (
+                match sa.ip() {
+                    IpAddr::V4(ip) => AddrV2::Ipv4(ip),
+                    IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                        Some(ip4) => AddrV2::Ipv4(ip4),
+                        None => AddrV2::Ipv6(ip),
+                    },
+                },
+                sa.port(),
+            ),
+            PeerAddr::Onion { host, port } => {
+                (AddrV2::TorV3(crate::net::peer::onion_host_to_torv3_pubkey(host)?), *port)
+            }
+        };
+        Some(AddrV2Message { time: self.time, services: self.services, addr, port })
+    }
+
+    /// As a legacy `addr` entry; `None` for an onion, which it cannot carry.
+    fn to_addr(&self) -> Option<(u32, bitcoin::p2p::Address)> {
+        match &self.addr {
+            PeerAddr::Socket(sa) => Some((self.time, bitcoin::p2p::Address::new(sa, self.services))),
+            PeerAddr::Onion { .. } => None,
+        }
+    }
+}
+
 /// BIP 152: at most this many peers are asked to announce blocks to us as
 /// `cmpctblock`s (high-bandwidth mode).
 const MAX_HB_PEERS: usize = 3;
@@ -664,6 +717,10 @@ mod peerpunish_tests;
 #[cfg(test)]
 #[path = "manager_addrdials_tests.rs"]
 mod addrdials_tests;
+
+#[cfg(test)]
+#[path = "manager_getaddr_tests.rs"]
+mod getaddr_tests;
 
 #[cfg(test)]
 #[path = "manager_netgroup_tests.rs"]
@@ -928,6 +985,9 @@ pub struct PeerManager {
     reachable: RwLock<crate::net::reachable::ReachableNets>,
     /// `-onion=0`: no `.onion` connection at all, manual ones included.
     onion_disabled: std::sync::atomic::AtomicBool,
+    /// `getaddr` replies, per listener (local socket, and onion or not): expiry and the
+    /// entries. See [`Self::getaddr_reply`].
+    addr_response_cache: parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (std::time::Instant, Vec<GetAddrEntry>)>>,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
     /// `addnode add` (the address a name resolved to), and `-seednode`. The
     /// reconnect loop dials them whatever `automatic_outbound` says, and a
@@ -1311,6 +1371,7 @@ impl PeerManager {
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             reachable: RwLock::new(Default::default()),
             onion_disabled: std::sync::atomic::AtomicBool::new(false),
+            addr_response_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
@@ -1808,13 +1869,58 @@ impl PeerManager {
         Some((token.clone(), token))
     }
 
+    /// The self-advertisement of our `-externalip` addresses to peer `id`:
+    /// those on the peer's IP family (IPv4 with IPv4-mapped included), as
+    /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
+    /// are none, or the peer is an onion peer.
+    fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
+        let (peer_v4, wants_v2, onion) = {
+            let peers = self.peers.read();
+            let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
+            let v4 = match h.info.addr.ip() {
+                IpAddr::V4(_) => true,
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
+            };
+            (v4, h.info.wants_addrv2, h.info.onion_host.is_some())
+        };
+        if onion {
+            return None;
+        }
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let time = u32::try_from(now_unix_secs()).unwrap_or(u32::MAX);
+        let mine: Vec<GetAddrEntry> = self
+            .external_addrs
+            .read()
+            .iter()
+            .filter(|a| !a.ip().is_unspecified())
+            .filter(|a| {
+                let v4 = match a.ip() {
+                    IpAddr::V4(_) => true,
+                    IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
+                };
+                v4 == peer_v4
+            })
+            .map(|a| GetAddrEntry { addr: PeerAddr::Socket(*a), time, services })
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        Some(if wants_v2 {
+            NetworkMessage::AddrV2(mine.iter().filter_map(GetAddrEntry::to_addrv2).collect())
+        } else {
+            NetworkMessage::Addr(mine.iter().filter_map(GetAddrEntry::to_addr).collect())
+        })
+    }
+
     /// Build the `AddrV2` self-advertisement (our hidden service as a BIP 155
     /// `TorV3` entry) for peer `id`, or `None` if we have no onion to advertise
     /// or the peer didn't opt into addrv2. The pubkey is recovered from the
     /// stored host; it was validated when the onion was registered, so this is
     /// infallible in practice.
     fn self_advertise_addrv2(&self, id: PeerId) -> Option<bitcoin::p2p::address::AddrV2Message> {
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2) {
+        // A block-relay-only link carries no address traffic (Core's
+        // `SetupAddressRelay`); our onion on one would link the two.
+        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2 && h.info.relays_addrs()) {
             return None;
         }
         let onion = self.advertised_onion.read().clone()?;
@@ -1832,6 +1938,68 @@ impl PeerManager {
             addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
             port,
         })
+    }
+
+    /// The addresses a `getaddr` is answered with: Core's
+    /// `CConnman::GetAddresses`. A random sample of at most 23% of the
+    /// address book, at most [`GETADDR_MAX_ADDRS`], terrible and banned
+    /// entries left out, with the gossiped onion candidates sampled the same
+    /// way (satd's book holds sockets only). Cached per listener, the local
+    /// socket the peer reached (Core's `m_network_key`), for 21 to 27
+    /// hours, so a scraper learns no more by asking again and the two
+    /// listeners' answers cannot be matched. `uncached` (the `addr`
+    /// permission) takes a fresh sample, as Core's `GetAddressesUnsafe`.
+    fn getaddr_reply(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
+        let now = std::time::Instant::now();
+        if !uncached
+            && let Some((expiry, cached)) = self.addr_response_cache.lock().get(&listener)
+            && *expiry > now
+        {
+            return cached.clone();
+        }
+        let fresh = self.sample_getaddr_entries();
+        if !uncached {
+            use rand::Rng as _;
+            let lifetime = Duration::from_secs(21 * 3600)
+                + Duration::from_secs(rand::thread_rng().gen_range(0..6 * 3600));
+            self.addr_response_cache.lock().insert(listener, (now + lifetime, fresh.clone()));
+        }
+        fresh
+    }
+
+    fn sample_getaddr_entries(&self) -> Vec<GetAddrEntry> {
+        use rand::seq::SliceRandom as _;
+        let unix_now = now_unix_secs();
+        let mut out: Vec<GetAddrEntry> = self
+            .addrman
+            .read()
+            .get_addr(GETADDR_MAX_ADDRS, GETADDR_MAX_PCT, unix_now)
+            .into_iter()
+            .filter(|e| !self.is_peer_addr_banned(&PeerAddr::Socket(e.addr)))
+            .map(|e| GetAddrEntry {
+                addr: PeerAddr::Socket(e.addr),
+                time: u32::try_from(e.last_seen).unwrap_or(u32::MAX),
+                services: ServiceFlags::from(e.services),
+            })
+            .collect();
+        let mut onions: Vec<PeerAddr> = self
+            .connect_peer_addrs
+            .read()
+            .iter()
+            .filter(|a| a.is_onion() && !self.is_manual_target(a) && !self.is_peer_addr_banned(a))
+            .cloned()
+            .collect();
+        onions.shuffle(&mut rand::thread_rng());
+        let onion_share = (GETADDR_MAX_PCT * onions.len() / 100).min(GETADDR_MAX_ADDRS.saturating_sub(out.len()));
+        // The onion candidates carry no gossip time; they are stamped with
+        // the time of the sample, which the cache then holds for a day.
+        let stamp = u32::try_from(unix_now).unwrap_or(u32::MAX);
+        out.extend(onions.into_iter().take(onion_share).map(|addr| GetAddrEntry {
+            addr,
+            time: stamp,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        }));
+        out
     }
 
     /// Install `-whitelist` permission entries. Set once at startup.
@@ -5189,8 +5357,14 @@ impl PeerManager {
                 self.note_addr_fetch_answered(id, count);
             }
             NetworkMessage::GetAddr => {
-                // Respond with our declared external addresses (-externalip)
-                // followed by addresses of our connected peers.
+                // Core's `getaddr` handling (`ProcessMessage`): answered only
+                // for an inbound peer, only once per connection, and from a
+                // sample of the address book cached per listener for about
+                // a day (`CConnman::GetAddresses`). satd answered every
+                // peer, every time, with its live connection list (inbound
+                // and onion peers included, stamped with their connect
+                // time) and its own addresses: a map of its topology that
+                // linked its onion and clearnet faces.
                 //
                 // Not on a block-relay-only link: Core's `SetupAddressRelay`
                 // refuses one outright, because answering is what lets an
@@ -5199,115 +5373,47 @@ impl PeerManager {
                     tracing::debug!(id, "ignoring getaddr on a block-relay-only connection");
                     return;
                 }
-                // Copy what we need and drop the guard before sending.
+                // Copy what we need and drop the guard before sending:
                 // `send_to_peer` takes `peers.read()` itself, and
-                // `parking_lot`'s read lock is not reentrant: a writer
-                // arriving between the two acquisitions makes the second read
-                // queue behind it while it waits on the first, deadlocking
-                // the manager's event-drain task -- and with it the node's
-                // whole P2P loop.
-                struct AddrEntry {
-                    addr: SocketAddr,
-                    services: ServiceFlags,
-                    onion_host: Option<String>,
-                    conn_time: std::time::SystemTime,
+                // `parking_lot` locks are not reentrant.
+                let Some((inbound, repeated, listener, wants_v2, uncached)) = ({
+                    let mut peers = self.peers.write();
+                    peers.get_mut(&id).map(|h| {
+                        let inbound = h.info.direction == Direction::Inbound;
+                        let repeated = h.info.getaddr_recvd;
+                        if inbound {
+                            h.info.getaddr_recvd = true;
+                        }
+                        let listener = GetAddrCacheKey { bind: h.info.bind_addr, onion: h.info.inbound_onion };
+                        (inbound, repeated, listener, h.info.wants_addrv2, h.info.permissions.addr)
+                    })
+                }) else {
+                    return;
+                };
+                // "This asymmetric behavior for inbound and outbound
+                // connections was introduced to prevent a fingerprinting
+                // attack: an attacker can send specific fake addresses to
+                // users' AddrMan and later request them by sending getaddr
+                // messages."
+                if !inbound {
+                    tracing::debug!(id, "Ignoring \"getaddr\" from an outbound connection");
+                    return;
                 }
-                let (wants_v2, addr_entries) = {
-                    let peers = self.peers.read();
-                    let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
-                    let entries: Vec<AddrEntry> = peers
-                        .values()
-                        .filter(|h| h.info.state == PeerState::Connected)
-                        .map(|h| AddrEntry {
-                            addr: h.info.addr,
-                            services: h.info.services,
-                            onion_host: h.info.onion_host.clone(),
-                            conn_time: h.info.conn_time,
-                        })
-                        .collect();
-                    (wants_v2, entries)
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as u32;
-                let our_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-                let externals = self.external_addrs.read().clone();
-
-                let entry_time = |h: &AddrEntry| {
-                    h.conn_time
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u32
-                };
+                if repeated {
+                    tracing::debug!(id, "Ignoring repeated \"getaddr\"");
+                    return;
+                }
+                let entries = self.getaddr_reply(listener, uncached);
                 if wants_v2 {
-                    // Map a routable socket to an addrv2 entry; the 0.0.0.0
-                    // placeholder used for onion peers (and any unspecified
-                    // address) is dropped rather than relayed as a bogus IPv4.
-                    let to_v2 = |addr: SocketAddr, time: u32, services: ServiceFlags| {
-                        if addr.ip().is_unspecified() {
-                            return None;
-                        }
-                        let v2 = match addr.ip() {
-                            std::net::IpAddr::V4(ip) => bitcoin::p2p::address::AddrV2::Ipv4(ip),
-                            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                                Some(ip4) => bitcoin::p2p::address::AddrV2::Ipv4(ip4),
-                                None => bitcoin::p2p::address::AddrV2::Ipv6(ip),
-                            },
-                        };
-                        Some(bitcoin::p2p::address::AddrV2Message { time, services, addr: v2, port: addr.port() })
-                    };
-                    let mut addrs: Vec<bitcoin::p2p::address::AddrV2Message> = externals
-                        .iter()
-                        .filter_map(|a| to_v2(*a, now, our_services))
-                        .collect();
-                    // Advertise our own hidden service.
-                    if let Some(PeerAddr::Onion { host, port }) =
-                        self.advertised_onion.read().as_ref()
-                        && let Some(pubkey) = crate::net::peer::onion_host_to_torv3_pubkey(host)
-                    {
-                        addrs.push(bitcoin::p2p::address::AddrV2Message {
-                            time: now,
-                            services: our_services,
-                            addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
-                            port: *port,
-                        });
-                    }
-                    for h in &addr_entries {
-                        let time = entry_time(h);
-                        // A connected onion peer is relayed as a TorV3 entry
-                        // (its socket is the 0.0.0.0 placeholder); everything
-                        // else goes through the socket path.
-                        if let Some(host) = h.onion_host.as_deref() {
-                            if let Some(pubkey) = crate::net::peer::onion_host_to_torv3_pubkey(host) {
-                                addrs.push(bitcoin::p2p::address::AddrV2Message {
-                                    time,
-                                    services: h.services,
-                                    addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
-                                    port: h.addr.port(),
-                                });
-                            }
-                        } else if let Some(msg) = to_v2(h.addr, time, h.services) {
-                            addrs.push(msg);
-                        }
-                    }
+                    let addrs: Vec<bitcoin::p2p::address::AddrV2Message> =
+                        entries.iter().filter_map(GetAddrEntry::to_addrv2).collect();
                     if !addrs.is_empty() {
                         self.send_to_peer(id, NetworkMessage::AddrV2(addrs));
                     }
                 } else {
-                    // Legacy addr can't carry onion; skip onion peers and the
-                    // unspecified placeholder rather than relay a bogus address.
-                    let mut addrs: Vec<(u32, bitcoin::p2p::Address)> = externals
-                        .iter()
-                        .filter(|a| !a.ip().is_unspecified())
-                        .map(|a| (now, bitcoin::p2p::Address::new(a, our_services)))
-                        .collect();
-                    for h in &addr_entries {
-                        if h.onion_host.is_some() || h.addr.ip().is_unspecified() {
-                            continue;
-                        }
-                        addrs.push((entry_time(h), bitcoin::p2p::Address::new(&h.addr, h.services)));
-                    }
+                    // Legacy addr carries no onion.
+                    let addrs: Vec<(u32, bitcoin::p2p::Address)> =
+                        entries.iter().filter_map(GetAddrEntry::to_addr).collect();
                     if !addrs.is_empty() {
                         self.send_to_peer(id, NetworkMessage::Addr(addrs));
                     }
@@ -11064,6 +11170,20 @@ impl PeerManager {
         // relay it onward, which is the actual propagation seed; without it a
         // listenonion node is reachable only by peers handed the address out of
         // band.
+        //
+        // Before it, our `-externalip` addresses, to an outbound peer on the
+        // same IP family: Core pushes its local address for the peer's network
+        // (`GetLocalAddrForPeer`) when it opens an outbound connection.
+        // They used to ride in every `getaddr` reply instead, to any peer.
+        // Neither goes to a block-relay-only peer.
+        if direction == Direction::Outbound
+            && conn_type != ConnType::AddrFetch
+            && let Some(msg) = self.self_advertise_externals(id)
+            && let Err(e) = writer.send(msg).await
+        {
+            tracing::debug!(id, "self-advertise addr send failed: {}", e);
+        }
+
         if let Some(addr_msg) = self.self_advertise_addrv2(id) {
             // Best-effort gossip: a failed advertisement must NOT tear down an
             // otherwise-healthy peer we just spent a full Tor rendezvous
