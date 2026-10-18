@@ -357,6 +357,18 @@ const BG_CATCHUP_STALE_SECS: u64 = 30;
 /// A peer that has not answered gets no more until it does or its requests
 /// time out.
 const BG_CATCHUP_PER_PEER: usize = 16;
+/// Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`: the depth a pruned node
+/// promises to serve (BIP 159).
+const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
+/// Core's `nPrunedBlocksLikelyToHave` (`MIN_BLOCKS_TO_KEEP` less an hour of
+/// blocks): a pruned node's `getblocks` answer stops above this depth.
+const PRUNED_BLOCKS_LIKELY_TO_HAVE: u32 = 288 - 6;
+/// What [`PeerManager::block_request_refusal`] does with a refused request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockRefusal {
+    Ignore,
+    Disconnect,
+}
 /// Core serves a NODE_NETWORK_LIMITED peer's blocks only this far below its
 /// tip: `NODE_NETWORK_LIMITED_MIN_BLOCKS` (288) less Core's two-block margin
 /// (`net_processing.cpp:154`, `:1533`).
@@ -722,6 +734,9 @@ mod addrdials_tests;
 #[cfg(test)]
 #[path = "manager_getaddr_tests.rs"]
 mod getaddr_tests;
+#[cfg(test)]
+#[path = "manager_serveblk_tests.rs"]
+mod serveblk_tests;
 
 #[cfg(test)]
 #[path = "manager_netgroup_tests.rs"]
@@ -1892,7 +1907,7 @@ impl PeerManager {
         if onion {
             return None;
         }
-        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let services = self.local_services();
         let time = u32::try_from(now_unix_secs()).unwrap_or(u32::MAX);
         let mine: Vec<GetAddrEntry> = self
             .external_addrs
@@ -1940,7 +1955,7 @@ impl PeerManager {
             .as_secs() as u32;
         Some(bitcoin::p2p::address::AddrV2Message {
             time: now,
-            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            services: self.local_services(),
             addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
             port,
         })
@@ -9163,14 +9178,13 @@ impl PeerManager {
     }
 
     /// The half of Core's `BlockRequestAllowed` that admits a block off the
-    /// active chain: one this node validated, no more than
-    /// `STALE_RELAY_AGE_LIMIT` (30 days) older than the best header.
+    /// active chain: one this node validated, less than
+    /// `STALE_RELAY_AGE_LIMIT` (30 days) older than the best header, and with
+    /// less than 30 days' worth of proof of work on top of it at the best
+    /// header's difficulty (`GetBlockProofEquivalentTime`).
     /// `BlockStatus::Valid` is written only by `connect_block` and survives
     /// the reorg that takes the block off the active chain, as Core's
-    /// `BLOCK_VALID_SCRIPTS` does. Core also bounds the block's
-    /// work-equivalent age; that bound is not applied, so this admits a little
-    /// more than Core does.
-    #[cfg(feature = "block-filter-index")]
+    /// `BLOCK_VALID_SCRIPTS` does.
     fn stale_block_request_allowed(&self, entry: &crate::storage::blockindex::BlockIndexEntry) -> bool {
         const STALE_RELAY_AGE_LIMIT: i64 = 30 * 24 * 60 * 60;
         if entry.status != crate::storage::blockindex::BlockStatus::Valid {
@@ -9180,6 +9194,12 @@ impl PeerManager {
             .get_block_index(&self.chain_state.best_header_hash())
             .is_some_and(|best| {
                 i64::from(best.header.time) - i64::from(entry.header.time) < STALE_RELAY_AGE_LIMIT
+                    && !crate::chain::assumevalid::proof_equivalent_time_at_least(
+                        &best.chainwork,
+                        &entry.chainwork,
+                        best.header.bits,
+                        STALE_RELAY_AGE_LIMIT as u128,
+                    )
             })
     }
 
@@ -9428,6 +9448,14 @@ impl PeerManager {
                 if hash == msg.stop_hash {
                     break;
                 }
+                // Core's "getblocks stopping, pruned or too old block": a
+                // pruning node invs nothing it may have deleted within the
+                // hour it takes the peer to ask.
+                if self.is_pruning()
+                    && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || self.chain_state.get_block(&hash).is_none())
+                {
+                    break;
+                }
                 inv.push(Inventory::Block(hash));
             }
         }
@@ -9543,6 +9571,37 @@ impl PeerManager {
         }
     }
 
+    /// Core's refusals in `ProcessGetBlockData`, checked before a requested
+    /// block is read: `None` to serve it.
+    ///
+    /// A block off the active chain is served only under
+    /// [`Self::stale_block_request_allowed`] (Core's `BlockRequestAllowed`),
+    /// and the request is otherwise ignored, with no `notfound`. A node
+    /// without `NODE_NETWORK` disconnects a peer asking for a block more
+    /// than `NODE_NETWORK_LIMITED_MIN_BLOCKS` + 2 below its tip, unless the
+    /// peer has `noban`. satd served any block it held, so a peer could
+    /// probe for the stale and invalidated blocks a node had seen, and for
+    /// how far back a pruned node keeps blocks: both tell nodes apart.
+    /// An unknown block falls through to the `notfound` it gets today.
+    fn block_request_refusal(&self, id: PeerId, hash: &bitcoin::BlockHash) -> Option<BlockRefusal> {
+        let entry = self.chain_state.get_block_index(hash)?;
+        if !self.chain_state.active_chain_contains(hash, entry.height) && !self.stale_block_request_allowed(&entry) {
+            tracing::debug!("ignoring request from peer={id} for old block that isn't in the main chain");
+            return Some(BlockRefusal::Ignore);
+        }
+        let services = self.local_services();
+        let below_limit = self.chain_state.tip_height().saturating_sub(entry.height) > NODE_NETWORK_LIMITED_MIN_BLOCKS + 2;
+        if !services.has(ServiceFlags::NETWORK)
+            && services.has(ServiceFlags::NETWORK_LIMITED)
+            && below_limit
+            && !self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban)
+        {
+            tracing::debug!("Ignore block request below NODE_NETWORK_LIMITED threshold, disconnecting peer={id}");
+            return Some(BlockRefusal::Disconnect);
+        }
+        None
+    }
+
     /// Answer one `getdata` entry: queue what it asks for, or add it to the
     /// `notfound`. False when nothing could be queued and the entry is still
     /// to be served.
@@ -9565,6 +9624,15 @@ impl PeerManager {
             Inventory::Block(hash)
             | Inventory::WitnessBlock(hash)
             | Inventory::CompactBlock(hash) => {
+                match self.block_request_refusal(id, &hash) {
+                    Some(BlockRefusal::Ignore) => return true,
+                    // The peer is gone; the entry is left where it is.
+                    Some(BlockRefusal::Disconnect) => {
+                        self.disconnect_by_id(id);
+                        return false;
+                    }
+                    None => {}
+                }
                 // A `cmpctblock` that could not be queued leaves the entry to
                 // be served again once the queue drains, as below.
                 if matches!(inv, Inventory::CompactBlock(_))
@@ -12123,15 +12191,20 @@ impl PeerManager {
 
     /// The service flags this node advertises right now.
     ///
-    /// The single source of truth for both the wire and `getnetworkinfo`.
-    /// `localservices` used to be a hardcoded `0000000000000409`, claiming
-    /// `NODE_NETWORK_LIMITED` — which satd never sets — and never reflecting
-    /// `NODE_COMPACT_FILTERS`, which it does set once the filter index can
-    /// serve. So the RPC described a node that did not exist, in both
-    /// directions at once.
+    /// The single source of truth for the wire, our self-advertised
+    /// addresses and `getnetworkinfo`.
+    ///
+    /// Core's `g_local_services` starts as `NODE_NETWORK_LIMITED |
+    /// NODE_WITNESS` and adds `NODE_NETWORK` only on a node that holds the
+    /// whole chain: not pruned (`-prune`, in either form) and not still
+    /// fetching history behind an AssumeUTXO snapshot (`init.cpp`). satd
+    /// claimed `NODE_NETWORK` when pruned too, so peers asked it for blocks
+    /// it had deleted, and dropped `NODE_NETWORK_LIMITED` on every node.
     pub fn local_services(&self) -> ServiceFlags {
-        // Only the cfg-gated COMPACT_FILTERS bit below mutates this.
-        let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        if !self.is_pruning() && !self.chain_state.has_background() {
+            services |= ServiceFlags::NETWORK;
+        }
         // BIP 324 NODE_P2P_V2 (bit 11), which Core sets with -v2transport.
         if self.v2_transport_enabled() {
             services |= ServiceFlags::P2P_V2;

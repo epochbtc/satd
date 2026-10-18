@@ -199,6 +199,21 @@ pub fn more_than_two_weeks_on_top(
     block_work: &[u8; 32],
     best_bits: bitcoin::pow::CompactTarget,
 ) -> bool {
+    proof_equivalent_time_at_least(best_work, block_work, best_bits, TWO_WEEKS_IN_SECONDS + 1)
+}
+
+/// Core's `GetBlockProofEquivalentTime(best, block, best) >= secs`, with
+/// Core's integer division: whether the work on top of `block_work` up to
+/// `best_work` is worth at least `secs` of blocks at the best header's
+/// difficulty. Compared without the division, as
+/// `(best - block) * 600 >= secs * proof`. Work at or below the block's is
+/// never worth `secs > 0`.
+pub fn proof_equivalent_time_at_least(
+    best_work: &[u8; 32],
+    block_work: &[u8; 32],
+    best_bits: bitcoin::pow::CompactTarget,
+    secs: u128,
+) -> bool {
     if crate::chain::state::compare_u256(best_work, block_work) <= 0 {
         return false;
     }
@@ -209,7 +224,7 @@ pub fn more_than_two_weeks_on_top(
         // beyond it is not a real network. Distinguish the two.
         return low_u128(&diff).is_none() && low_u128(&proof).is_some();
     };
-    match (diff.checked_mul(POW_TARGET_SPACING), proof.checked_mul(TWO_WEEKS_IN_SECONDS + 1)) {
+    match (diff.checked_mul(POW_TARGET_SPACING), proof.checked_mul(secs)) {
         (Some(lhs), Some(rhs)) => lhs >= rhs,
         // `diff * 600` overflowed: the difference is far beyond two weeks.
         (None, _) => true,
@@ -344,6 +359,19 @@ mod tests {
         assert_eq!(a.last_logged, Some(None), "a first skip is logged");
         a.log_reason(2, &hash(2), Some(TOO_RECENT));
         assert_eq!(a.last_logged, Some(Some(TOO_RECENT)));
+    }
+
+    /// `BlockRequestAllowed`'s bound: 30 days at 600 s a block is 4320
+    /// blocks of the best header's work, and Core refuses at exactly that.
+    #[test]
+    fn thirty_days_of_work_is_cores_inclusive_bound() {
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let proof = u128::from_be_bytes(work_for_bits(bits)[16..].try_into().unwrap());
+        let block = u256(1000);
+        let month = 30 * 24 * 60 * 60;
+        assert!(proof_equivalent_time_at_least(&u256(1000 + 4320 * proof), &block, bits, month));
+        assert!(!proof_equivalent_time_at_least(&u256(1000 + 4320 * proof - 1), &block, bits, month));
+        assert!(!proof_equivalent_time_at_least(&block, &u256(1000 + 4320 * proof), bits, month), "less work on top");
     }
 
     #[test]
