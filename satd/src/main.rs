@@ -2861,9 +2861,28 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                             Some(addr) => addr.to_string(),
                             None => format!("127.0.0.1:{}", config.port),
                         };
-                        match controller.create_hidden_service(config.port, &target).await {
-                            Ok(onion) => {
-                                tracing::info!(onion_addr = %onion, "Tor hidden service created");
+                        // The key saved last time keeps the node at the same
+                        // onion address (#973).
+                        let saved_key = node::net::tor::load_onion_key(&net_datadir);
+                        match controller
+                            .create_hidden_service(config.port, &target, saved_key.as_deref())
+                            .await
+                        {
+                            Ok((onion, new_key)) => {
+                                if let Some(key) = new_key {
+                                    match node::net::tor::save_onion_key(&net_datadir, &key) {
+                                        Ok(()) => tracing::info!(
+                                            path = %node::net::tor::onion_key_path(&net_datadir).display(),
+                                            "Saved the hidden service's private key"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "Could not save the hidden service's private key; \
+                                             its onion address will change at the next start"
+                                        ),
+                                    }
+                                }
+                                tracing::info!(onion_addr = %onion, reused = saved_key.is_some(), "Tor hidden service created");
                                 // Advertise the service to peers (addrv2 TorV3 +
                                 // getnetworkinfo) so the network can discover and
                                 // dial us inbound, not just peers handed the

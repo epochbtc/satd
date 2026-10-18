@@ -106,6 +106,9 @@ item below is (or will be) written up in full in the in-development
   in (5 minutes with a large address book), the fixed seeds a minute in if
   the book has nothing reachable. A stale `peers.dat` stopped all seeding
   (#974).
+- The Tor hidden service keeps its address across restarts: its key is saved
+  to `onion_v3_private_key` (mode 0600) and reused, as in Core; satd asked
+  Tor to discard it (#973).
 
 ## Releases
 

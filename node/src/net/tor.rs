@@ -238,19 +238,29 @@ impl TorController {
         self.expect_250("AUTHENTICATE (null)").await
     }
 
-    /// Create an ephemeral hidden service.
-    /// Returns the .onion hostname (without the .onion suffix — caller appends it).
+    /// Create the node's hidden service. Returns its `.onion` hostname, and
+    /// the service's private key when Tor made a new one.
     ///
-    /// Uses ADD_ONION with NEW:ED25519-V3 to create a v3 onion service.
+    /// With `key` (the `ED25519-V3:<base64>` Tor returned last time, from
+    /// [`load_onion_key`]) the service is the same one, at the same address;
+    /// without it Tor makes a new one and hands back its key, for
+    /// [`save_onion_key`]. This is Core's `TorController::add_onion_cb`, which
+    /// caches the key in `onion_v3_private_key` and reuses it. satd asked
+    /// Tor to discard the key (`Flags=DiscardPK`), so the node's onion
+    /// address changed on every restart (#973).
+    ///
     /// The service maps `virtual_port` on the .onion address to `target_addr` locally.
     pub async fn create_hidden_service(
         &mut self,
         virtual_port: u16,
         target_addr: &str,
-    ) -> Result<String, String> {
+        key: Option<&str>,
+    ) -> Result<(String, Option<String>), String> {
         let cmd = format!(
-            "ADD_ONION NEW:ED25519-V3 Port={},{} Flags=DiscardPK\r\n",
-            virtual_port, target_addr
+            "ADD_ONION {} Port={},{}\r\n",
+            key.unwrap_or("NEW:ED25519-V3"),
+            virtual_port,
+            target_addr
         );
 
         self.writer
@@ -260,12 +270,16 @@ impl TorController {
 
         // Response format:
         // 250-ServiceID=<base32-hostname>
+        // 250-PrivateKey=ED25519-V3:<base64>   (a new service only)
         // 250 OK
         let mut service_id = None;
+        let mut private_key = None;
         loop {
             let line = self.read_response().await?;
             if let Some(id) = line.strip_prefix("250-ServiceID=") {
                 service_id = Some(id.trim().to_string());
+            } else if let Some(k) = line.strip_prefix("250-PrivateKey=") {
+                private_key = Some(k.trim().to_string());
             } else if line.starts_with("250 ") {
                 break;
             } else if line.starts_with("5") {
@@ -274,7 +288,7 @@ impl TorController {
         }
 
         let id = service_id.ok_or("Tor ADD_ONION: no ServiceID in response")?;
-        Ok(format!("{}.onion", id))
+        Ok((format!("{}.onion", id), private_key))
     }
 
     /// Remove a previously created hidden service.
@@ -456,6 +470,41 @@ fn unquote(s: &str) -> String {
     inner.replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
+/// Where the hidden service's private key is kept: Core's
+/// `onion_v3_private_key`, in the network's data directory.
+pub fn onion_key_path(net_datadir: &std::path::Path) -> std::path::PathBuf {
+    net_datadir.join("onion_v3_private_key")
+}
+
+/// The key saved by [`save_onion_key`], if there is one.
+pub fn load_onion_key(net_datadir: &std::path::Path) -> Option<String> {
+    let key = std::fs::read_to_string(onion_key_path(net_datadir)).ok()?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// Save the hidden service's private key, readable by the node's user only.
+/// Anyone who reads it can run the node's onion address. Written to a
+/// temporary file and renamed, so a crash cannot leave half a key that the
+/// next start hands Tor.
+pub fn save_onion_key(net_datadir: &std::path::Path, key: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = onion_key_path(net_datadir);
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(key.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +628,66 @@ mod tests {
     fn unique_cookie_path(tag: &str) -> std::path::PathBuf {
         let nonce: u64 = rand::random();
         std::env::temp_dir().join(format!("satd-test-cookie-{}-{:016x}", tag, nonce))
+    }
+
+    /// A control port that answers one `ADD_ONION`, with a private key in
+    /// the reply when the request asked for a new service. Returns the
+    /// request line.
+    async fn fake_tor_add_onion(listener: TcpListener) -> String {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(stream);
+        let mut reader = BufReader::new(rh);
+        let mut l = String::new();
+        reader.read_line(&mut l).await.unwrap();
+        let mut reply = "250-ServiceID=abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx\r\n".to_string();
+        if l.contains("NEW:ED25519-V3") {
+            reply.push_str("250-PrivateKey=ED25519-V3:a2V5\r\n");
+        }
+        reply.push_str("250 OK\r\n");
+        wh.write_all(reply.as_bytes()).await.unwrap();
+        l.trim_end().to_string()
+    }
+
+    /// #973: a new service keeps its key, and a saved key is handed back to
+    /// Tor, so the onion address survives a restart. satd sent
+    /// `Flags=DiscardPK`, and Tor never returned the key.
+    #[tokio::test]
+    async fn the_hidden_service_key_is_kept_and_reused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_add_onion(listener));
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        let (onion, key) = ctrl.create_hidden_service(8333, "127.0.0.1:8334", None).await.unwrap();
+        let sent = server.await.unwrap();
+        assert_eq!(sent, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
+        assert!(onion.ends_with(".onion"));
+        assert_eq!(key.as_deref(), Some("ED25519-V3:a2V5"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_add_onion(listener));
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        let (again, key) = ctrl
+            .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:a2V5"))
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), "ADD_ONION ED25519-V3:a2V5 Port=8333,127.0.0.1:8334");
+        assert_eq!(again, onion);
+        assert_eq!(key, None, "Tor returns no key for an existing one");
+    }
+
+    #[test]
+    fn the_saved_key_round_trips_and_only_its_owner_can_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_onion_key(dir.path()), None);
+        save_onion_key(dir.path(), "ED25519-V3:a2V5").unwrap();
+        assert_eq!(load_onion_key(dir.path()).as_deref(), Some("ED25519-V3:a2V5"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(onion_key_path(dir.path())).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[tokio::test]
