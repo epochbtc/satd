@@ -924,6 +924,19 @@ impl CompactAbandon {
     }
 }
 
+/// [`PeerManager::check_unknown_versionbits`]'s state.
+#[derive(Default)]
+struct UnknownBitsState {
+    monitor: crate::validation::versionbits::UnknownBitsMonitor,
+    /// The tip last checked, so an unchanged tip costs nothing.
+    last_tip: parking_lot::Mutex<Option<bitcoin::BlockHash>>,
+    /// One check at a time.
+    running: std::sync::atomic::AtomicBool,
+    /// What the last check found, to log a lock-in once and to clear a
+    /// warning a reorg undid.
+    reported: parking_lot::Mutex<Vec<(u8, bool)>>,
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -1004,6 +1017,9 @@ pub struct PeerManager {
     /// `getaddr` replies, per listener (local socket, and onion or not): expiry and the
     /// entries. See [`Self::getaddr_reply`].
     addr_response_cache: parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (u64, Vec<GetAddrEntry>)>>,
+    /// Soft forks this node does not know about; see
+    /// [`Self::check_unknown_versionbits`].
+    unknown_bits: Arc<UnknownBitsState>,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
     /// `addnode add` (the address a name resolved to), and `-seednode`. The
     /// reconnect loop dials them whatever `automatic_outbound` says, and a
@@ -1392,6 +1408,7 @@ impl PeerManager {
             reachable: RwLock::new(Default::default()),
             onion_disabled: std::sync::atomic::AtomicBool::new(false),
             addr_response_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            unknown_bits: Arc::new(UnknownBitsState::default()),
             dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
@@ -4266,6 +4283,52 @@ impl PeerManager {
     /// Check if we are in Initial Block Download.
     /// True when our validated tip is more than 24 blocks behind the highest
     /// header height received from peers, or when no headers have been received.
+    /// Core's unknown-rules warning (`Chainstate::UpdateTip`), run in the
+    /// background each time the tip has moved, outside initial block
+    /// download as Core runs it: a version bit this node does not know that
+    /// is active raises "Unknown new rules activated (versionbit N)" in
+    /// `getblockchaininfo.warnings` and through `-alertnotify`, and one that
+    /// is locked in is logged with Core's message (#976). The monitor caches
+    /// each period, so a check reads only the tip's own period after the
+    /// first. A warning clears if a reorg takes the activation away.
+    fn check_unknown_versionbits(&self) {
+        let tip = self.chain_state.tip_hash();
+        if *self.unknown_bits.last_tip.lock() == Some(tip)
+            || self.unknown_bits.running.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let state = self.unknown_bits.clone();
+        let chain = self.chain_state.clone();
+        tokio::task::spawn_blocking(move || {
+            let params = crate::validation::versionbits::UnknownBitsParams::for_network(chain.network);
+            let known = crate::validation::versionbits::testdummy_deployment_configured(chain.network);
+            let bits = state.monitor.check(&*chain, &tip, params, &known);
+            let mut reported = state.reported.lock();
+            for &(bit, active) in &bits {
+                let message = format!("Unknown new rules activated (versionbit {bit})");
+                if active {
+                    chain.warnings().record(
+                        &format!("versionbits.unknown.{bit}"),
+                        crate::warnings::Severity::Warn,
+                        message,
+                        serde_json::json!({ "bit": bit }),
+                    );
+                } else if !reported.contains(&(bit, false)) {
+                    tracing::warn!(bit, "{message}");
+                }
+            }
+            for &(bit, active) in reported.iter() {
+                if active && !bits.contains(&(bit, true)) {
+                    chain.warnings().clear(&format!("versionbits.unknown.{bit}"));
+                }
+            }
+            *reported = bits;
+            *state.last_tip.lock() = Some(tip);
+            state.running.store(false, Ordering::Release);
+        });
+    }
+
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
         // The best header is at least our own tip. `headers_tip` only moves
@@ -4968,6 +5031,11 @@ impl PeerManager {
             let tip_advanced = tip != last_tip;
             if tip_advanced {
                 last_tip = tip;
+            }
+            // Every 10 seconds, or as the tip moves: the check returns at once
+            // for a tip it has seen, and catches a same-height reorg here.
+            if (tip_advanced || ticks.is_multiple_of(20)) && !self.is_ibd() {
+                self.check_unknown_versionbits();
             }
 
             // IBD scheduler maintenance

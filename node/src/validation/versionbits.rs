@@ -507,6 +507,179 @@ pub fn testdummy_deployment_configured(network: Network) -> Bip9Deployment {
     testdummy_deployment(network)
 }
 
+/// The block index, for the state machines here: any block, on any branch,
+/// by hash.
+impl BlockView for crate::chain::state::ChainState {
+    fn header(&self, hash: &BlockHash) -> Option<HeaderInfo> {
+        let entry = self.get_block_index(hash)?;
+        Some(HeaderInfo {
+            prev: entry.header.prev_blockhash,
+            height: entry.height,
+            version: entry.header.version.to_consensus(),
+            time: entry.header.time,
+        })
+    }
+}
+
+/// Core's `VERSIONBITS_NUM_BITS`: the version bits a deployment can use.
+pub const VERSIONBITS_NUM_BITS: u8 = 29;
+
+/// Core's `WarningBitsConditionChecker`: a BIP 9 machine for every version
+/// bit, started from genesis and never timing out, that finds a soft fork
+/// this node does not know about.
+///
+/// A bit is counted in a block when the block is a version-bits block, sets
+/// it, is at or above `MinBIP9WarningHeight`, and this node would not have
+/// set it itself (`ComputeBlockVersion`: here only `testdummy` while it is
+/// started or locked in). A period that reaches the threshold locks the bit
+/// in, and the next period activates it: Core then warns "Unknown new rules
+/// activated (versionbit N)", which is how an operator running old software
+/// learns the network has moved on (#976).
+///
+/// The period is the retarget interval: 2016 blocks, or 144 on regtest; the
+/// threshold 90% on mainnet and 75% on the test chains.
+///
+/// States are cached by the last block of each period, as Core's
+/// `m_warning_caches` keeps them, so a check walks only the periods it has
+/// not seen: about 120 periods on mainnet the first time, none while the tip
+/// stays in a period.
+#[derive(Default)]
+pub struct UnknownBitsMonitor {
+    cache: std::sync::Mutex<std::collections::HashMap<BlockHash, [ThresholdState; VERSIONBITS_NUM_BITS as usize]>>,
+}
+
+/// One network's parameters for [`UnknownBitsMonitor`].
+#[derive(Clone, Copy, Debug)]
+pub struct UnknownBitsParams {
+    pub period: u32,
+    pub threshold: u32,
+    /// Core's `MinBIP9WarningHeight`.
+    pub min_height: u32,
+}
+
+impl UnknownBitsParams {
+    pub fn for_network(network: Network) -> Self {
+        match network {
+            // Taproot's activation height plus a confirmation window.
+            Network::Bitcoin => Self { period: 2016, threshold: 1815, min_height: 711_648 },
+            Network::Testnet => Self { period: 2016, threshold: 1512, min_height: 2_013_984 },
+            // Regtest retargets daily (`nPowTargetTimespan` of a day).
+            Network::Regtest => Self { period: 144, threshold: 108, min_height: 0 },
+            _ => Self { period: 2016, threshold: 1512, min_height: 0 },
+        }
+    }
+}
+
+impl UnknownBitsMonitor {
+    /// Core's `CheckUnknownActivations` for the block after `tip`: each
+    /// unknown bit that is locked in (`false`) or active (`true`).
+    pub fn check<V: BlockView>(
+        &self,
+        view: &V,
+        tip: &BlockHash,
+        params: UnknownBitsParams,
+        known: &Bip9Deployment,
+    ) -> Vec<(u8, bool)> {
+        let states = self.states_after(view, tip, params, known);
+        (0..VERSIONBITS_NUM_BITS)
+            .filter_map(|bit| match states[bit as usize] {
+                ThresholdState::Active => Some((bit, true)),
+                ThresholdState::LockedIn => Some((bit, false)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn states_after<V: BlockView>(
+        &self,
+        view: &V,
+        tip: &BlockHash,
+        params: UnknownBitsParams,
+        known: &Bip9Deployment,
+    ) -> [ThresholdState; VERSIONBITS_NUM_BITS as usize] {
+        let period = params.period.max(1);
+        let defined = [ThresholdState::Defined; VERSIONBITS_NUM_BITS as usize];
+        let Some(info) = view.header(tip) else {
+            return defined;
+        };
+        // The last block of the last complete period at or below the tip
+        // (Core's `GetAncestor(nHeight - ((nHeight + 1) % nPeriod))`).
+        let Some(mut cursor) = info
+            .height
+            .checked_sub((info.height + 1) % period)
+            .and_then(|h| ancestor(view, tip, h))
+        else {
+            return defined;
+        };
+        let mut to_compute = Vec::new();
+        let mut states = loop {
+            if let Some(s) = self.cache.lock().unwrap().get(&cursor.0) {
+                break *s;
+            }
+            to_compute.push(cursor);
+            match cursor.1.height.checked_sub(period).and_then(|h| ancestor(view, &cursor.0, h)) {
+                Some(older) => cursor = older,
+                None => break defined,
+            }
+        };
+        while let Some((end_hash, end)) = to_compute.pop() {
+            let counts = self.count_period(view, end, period, params.min_height, known);
+            for bit in 0..VERSIONBITS_NUM_BITS as usize {
+                states[bit] = match states[bit] {
+                    // Start time 0: started at the first period boundary.
+                    ThresholdState::Defined => ThresholdState::Started,
+                    ThresholdState::Started if counts[bit] >= params.threshold => ThresholdState::LockedIn,
+                    ThresholdState::LockedIn => ThresholdState::Active,
+                    other => other,
+                };
+            }
+            self.cache.lock().unwrap().insert(end_hash, states);
+        }
+        states
+    }
+
+    /// Per bit, the blocks of the period ending at `end` that count.
+    fn count_period<V: BlockView>(
+        &self,
+        view: &V,
+        end: HeaderInfo,
+        period: u32,
+        min_height: u32,
+        known: &Bip9Deployment,
+    ) -> [u32; VERSIONBITS_NUM_BITS as usize] {
+        let mut counts = [0u32; VERSIONBITS_NUM_BITS as usize];
+        // The bit this node sets itself, per window of the known deployment
+        // (its state, and so the mask, changes only at its own boundaries).
+        let mut expected: std::collections::HashMap<u32, i32> = std::collections::HashMap::new();
+        let mut cur = end;
+        for _ in 0..period {
+            if cur.height >= min_height && (cur.version & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS {
+                let window = cur.height / known.period.max(1);
+                let mask = *expected.entry(window).or_insert_with(|| {
+                    let prev = (cur.height > 0).then_some(cur.prev);
+                    match state_for(view, prev, known) {
+                        ThresholdState::Started | ThresholdState::LockedIn => 1i32 << known.bit,
+                        _ => 0,
+                    }
+                });
+                for (bit, count) in counts.iter_mut().enumerate() {
+                    if cur.version & (1i32 << bit) != 0 && mask & (1i32 << bit) == 0 {
+                        *count += 1;
+                    }
+                }
+            }
+            if cur.height == 0 {
+                break;
+            }
+            let Some(next) = view.header(&cur.prev) else {
+                break;
+            };
+            cur = next;
+        }
+        counts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +732,83 @@ mod tests {
         fn header(&self, hash: &BlockHash) -> Option<HeaderInfo> {
             self.headers.get(hash).copied()
         }
+    }
+
+    /// A view that counts its reads, to see the cache work.
+    struct Counting<'a>(&'a FakeChain, std::cell::Cell<u32>);
+    impl BlockView for Counting<'_> {
+        fn header(&self, hash: &BlockHash) -> Option<HeaderInfo> {
+            self.1.set(self.1.get() + 1);
+            self.0.header(hash)
+        }
+    }
+
+    const P: UnknownBitsParams = UnknownBitsParams { period: 2016, threshold: 1512, min_height: 0 };
+
+    /// #976: a bit this node does not know that 75% of a period signals is
+    /// locked in for the next period, and active for the one after: Core's
+    /// "Unknown new rules activated (versionbit N)".
+    #[test]
+    fn an_unknown_bit_signalled_past_the_threshold_locks_in_then_activates() {
+        // Period 1 (heights 2016..=4031) signals bit 5 in 1512 blocks.
+        let chain = FakeChain::new(6100, 5, |h| (2016..2016 + 1512).contains(&h));
+        let mon = UnknownBitsMonitor::default();
+        let td = testdummy_deployment(Network::Testnet4);
+        assert_eq!(mon.check(&chain, &chain.by_height[4030], P, &td), vec![], "still counting");
+        assert_eq!(mon.check(&chain, &chain.by_height[4031], P, &td), vec![(5, false)], "locked in");
+        assert_eq!(mon.check(&chain, &chain.by_height[6046], P, &td), vec![(5, false)]);
+        assert_eq!(mon.check(&chain, &chain.by_height[6047], P, &td), vec![(5, true)], "active");
+
+        // One block short of the threshold: nothing.
+        let chain = FakeChain::new(6100, 5, |h| (2016..2016 + 1511).contains(&h));
+        let mon = UnknownBitsMonitor::default();
+        assert_eq!(mon.check(&chain, &chain.by_height[6047], P, &td), vec![]);
+    }
+
+    /// The bit a deployment this node knows sets while it is started is not
+    /// unknown; the same bit with that deployment never run is. (Once the
+    /// known deployment is active, the node stops setting its bit, and Core
+    /// counts the bit as unknown again.)
+    #[test]
+    fn the_known_deployments_bit_is_not_unknown_while_it_runs() {
+        // Signalled by every block but one per 144-block window, so a known
+        // deployment needing all 144 stays started throughout.
+        let chain = FakeChain::new(6100, 28, |h| h >= 2016 && h % 144 != 0);
+        let running = Bip9Deployment { threshold: 144, ..regtest_testdummy() };
+        let mon = UnknownBitsMonitor::default();
+        assert_eq!(state_for(&chain, Some(chain.by_height[6047]), &running), ThresholdState::Started);
+        assert_eq!(mon.check(&chain, &chain.by_height[6047], P, &running), vec![]);
+        let mon = UnknownBitsMonitor::default();
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[6047], P, &testdummy_deployment(Network::Testnet4)),
+            vec![(28, true)]
+        );
+    }
+
+    /// Blocks below `MinBIP9WarningHeight` do not count, as mainnet's taproot
+    /// signalling below 711648 must not read as an unknown fork.
+    #[test]
+    fn blocks_below_the_warning_height_do_not_count() {
+        let chain = FakeChain::new(6100, 2, |h| (2016..4032).contains(&h));
+        let td = testdummy_deployment(Network::Testnet4);
+        let params = UnknownBitsParams { min_height: 4032, ..P };
+        assert_eq!(UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], params, &td), vec![]);
+        assert_eq!(UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], P, &td), vec![(2, true)]);
+    }
+
+    /// A second check in the same period reads only the tip's ancestry down
+    /// to the cached period end, not the chain again.
+    #[test]
+    fn a_second_check_reuses_the_cached_periods() {
+        let chain = FakeChain::new(6100, 5, |_| false);
+        let td = testdummy_deployment(Network::Testnet4);
+        let mon = UnknownBitsMonitor::default();
+        let first = Counting(&chain, std::cell::Cell::new(0));
+        mon.check(&first, &chain.by_height[6050], P, &td);
+        assert!(first.1.get() > 6000, "the first check counts every period");
+        let again = Counting(&chain, std::cell::Cell::new(0));
+        mon.check(&again, &chain.by_height[6060], P, &td);
+        assert!(again.1.get() < 50, "the second read {} headers", again.1.get());
     }
 
     fn regtest_testdummy() -> Bip9Deployment {
