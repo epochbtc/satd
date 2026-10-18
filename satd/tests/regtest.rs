@@ -4514,8 +4514,8 @@ fn test_node_facts_are_derived_not_constants() {
         "getnetworkinfo and getmempoolinfo must agree: {relayfee} vs {mempool_min}"
     );
 
-    // `localservices` was a fixed 0000000000000409, claiming
-    // NODE_NETWORK_LIMITED (never set).
+    // An unpruned node advertises NETWORK, WITNESS and NETWORK_LIMITED, as
+    // Core does (`init.cpp`, `g_local_services`).
     let names: Vec<&str> = net["localservicesnames"]
         .as_array()
         .expect("localservicesnames")
@@ -4523,16 +4523,13 @@ fn test_node_facts_are_derived_not_constants() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(names.contains(&"NETWORK") && names.contains(&"WITNESS"), "{net}");
-    assert!(
-        !names.contains(&"NETWORK_LIMITED"),
-        "satd does not advertise NODE_NETWORK_LIMITED: {net}"
-    );
+    assert!(names.contains(&"NETWORK_LIMITED"), "Core always sets NODE_NETWORK_LIMITED: {net}");
     let services = net["localservices"].as_str().expect("localservices");
     assert_eq!(services.len(), 16, "Core's 16-hex-digit form: {services}");
     assert_eq!(
-        u64::from_str_radix(services, 16).unwrap() & (1 << 10),
-        0,
-        "the NETWORK_LIMITED bit must not be set: {services}"
+        u64::from_str_radix(services, 16).unwrap() & 0x409,
+        0x409,
+        "NETWORK, WITNESS and NETWORK_LIMITED: {services}"
     );
 
     // `localrelay` is the inverse of -blocksonly, not a constant.

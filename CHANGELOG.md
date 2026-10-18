@@ -76,6 +76,10 @@ item below is (or will be) written up in full in the in-development
 - `-bytespersigop` (default 20) takes effect: the mempool and block template
   price a transaction at Core's sigop-adjusted size, the larger of its vsize
   and its sigop cost times 20 bytes; it was accepted and ignored.
+- A pruned node advertises `NODE_NETWORK_LIMITED` and not `NODE_NETWORK`, and
+  every node sets `NODE_NETWORK_LIMITED`, as Core does. Blocks are served as
+  in Core's `ProcessGetBlockData`: a block off the active chain only if it was
+  validated, and from a pruned node nothing more than 290 below the tip.
 
 ## Releases
 
