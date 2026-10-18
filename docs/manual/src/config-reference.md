@@ -237,7 +237,7 @@ startup error.
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. `onion=0` (`-noonion`) never reaches `.onion`, even through `proxy`. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
 | `torpassword` | none | restart | core | Tor control port password (for a `HashedControlPassword` setup). Leave unset to use SAFECOOKIE cookie auth. |
-| `listenonion` | off (on if `torcontrol` set) | restart | core | Create a Tor v3 hidden service via the control port. Soft-set off when `listen` is off, as in Core; state it explicitly to keep the service on a non-listening node. Gets its own P2P listener on `127.0.0.1:<port+1>` unless a `bind=<addr>:<port>=onion` entry names one, matching Core's `onion_binds`; peers arriving there are exempt from `whitelist` matching. |
+| `listenonion` | off (on if `torcontrol` set) | restart | core | Create a Tor v3 hidden service via the control port. Soft-set off when `listen` is off, as in Core; state it explicitly to keep the service on a non-listening node. Gets its own P2P listener on `127.0.0.1:<port+1>` unless a `bind=<addr>:<port>=onion` entry names one, matching Core's `onion_binds`; peers arriving there are exempt from `whitelist` matching. The service's private key is kept in `onion_v3_private_key` in the network's data directory (mode 0600), as Core keeps it, and reused, so the onion address stays the same across restarts; delete the file to get a new address. Anyone who can read the file can run the node's onion address. |
 
 ## Consensus
 
