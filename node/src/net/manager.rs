@@ -8441,6 +8441,9 @@ impl PeerManager {
         hit
     }
 
+    /// Record `hash` as refused under the current tip (tests set the filter
+    /// up with it).
+    #[cfg(test)]
     fn note_rejected(&self, hash: &[u8; 32], kind: crate::net::recent_rejects::Rejection) {
         let tip = self.chain_state.tip_hash();
         self.recent_rejects.lock().insert(tip, hash, kind);
