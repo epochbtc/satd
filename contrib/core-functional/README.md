@@ -202,6 +202,10 @@ carry the blocker that was actually observed once the RPC existed.
   `fRelay` and gets no address relay, `feeler` is closed on the peer's
   `version`, `addr-fetch` gets a `getaddr` and no `getheaders` and is dropped
   once answered. `getpeerinfo.connection_type` reports the real type.
+- **List options from both sources.** A `-bind` on the command line replaced
+  the framework's `bind=127.0.0.1` in `bitcoin.conf` where Core listens on
+  both (#995), and the `getaddr` cache expired on a clock `setmocktime` does
+  not move. This put `p2p_getaddr_caching.py` in the run-set.
 - **The address-book RPCs.** `addpeeraddress`, `getnodeaddresses`,
   `getaddrmaninfo` and `getrawaddrman` exist, in Core's shapes. No row flips
   yet: `p2p_addr_selfannouncement` and `p2p_getaddr_caching` now get past

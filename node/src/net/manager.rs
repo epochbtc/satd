@@ -1003,7 +1003,7 @@ pub struct PeerManager {
     onion_disabled: std::sync::atomic::AtomicBool,
     /// `getaddr` replies, per listener (local socket, and onion or not): expiry and the
     /// entries. See [`Self::getaddr_reply`].
-    addr_response_cache: parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (std::time::Instant, Vec<GetAddrEntry>)>>,
+    addr_response_cache: parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (u64, Vec<GetAddrEntry>)>>,
     /// The clearnet peers the operator named: `-connect`, `-addnode` /
     /// `addnode add` (the address a name resolved to), and `-seednode`. The
     /// reconnect loop dials them whatever `automatic_outbound` says, and a
@@ -1970,8 +1970,12 @@ impl PeerManager {
     /// hours, so a scraper learns no more by asking again and the two
     /// listeners' answers cannot be matched. `uncached` (the `addr`
     /// permission) takes a fresh sample, as Core's `GetAddressesUnsafe`.
+    ///
+    /// The expiry is on the node's clock, which follows `setmocktime`, as
+    /// Core's `GetTime` does; Core's `p2p_getaddr_caching.py` moves the mock
+    /// past it to see the answers change.
     fn getaddr_reply(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
-        let now = std::time::Instant::now();
+        let now = crate::time::now_secs();
         if !uncached
             && let Some((expiry, cached)) = self.addr_response_cache.lock().get(&listener)
             && *expiry > now
@@ -1981,8 +1985,7 @@ impl PeerManager {
         let fresh = self.sample_getaddr_entries();
         if !uncached {
             use rand::Rng as _;
-            let lifetime = Duration::from_secs(21 * 3600)
-                + Duration::from_secs(rand::thread_rng().gen_range(0..6 * 3600));
+            let lifetime = 21 * 3600 + rand::thread_rng().gen_range(0..6 * 3600);
             self.addr_response_cache.lock().insert(listener, (now + lifetime, fresh.clone()));
         }
         fresh

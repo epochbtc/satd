@@ -97,6 +97,10 @@ item below is (or will be) written up in full in the in-development
 - `mempool.dat` keeps `prioritisetransaction` deltas for transactions not in
   the pool, as Core does, and a zero-fee package parent's entry time follows
   `setmocktime` (#981).
+- A list option given on the command line and in `bitcoin.conf` takes both,
+  command line first, as Core's `GetSettingsList` merges them; the command
+  line's replaced the file's (#995). The `getaddr` cache follows
+  `setmocktime`.
 
 ## Releases
 

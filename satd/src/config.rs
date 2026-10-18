@@ -1864,16 +1864,12 @@ impl Config {
             .or_else(|| file_get("rpcport").and_then(|v| v.parse().ok()))
             .unwrap_or_else(|| default_rpc_port(network));
 
-        // --rpcbind resolution: CLI list wins (multi-flag); else config
-        // file (multi-value); else single default loopback. Each entry
+        // --rpcbind resolution: command line, then config file
+        // (`merge_list`); if neither, single default loopback. Each entry
         // is `addr[:port]` per Bitcoin Core; bare addresses inherit
         // `rpcport`. Resolved to concrete `SocketAddr`s here so the
         // server-side binding code doesn't have to re-parse.
-        let rpcbind_raw: Vec<String> = if !cli.rpcbind.is_empty() {
-            cli.rpcbind.clone()
-        } else {
-            file_get_all("rpcbind")
-        };
+        let rpcbind_raw: Vec<String> = merge_list(cli.rpcbind.clone(), file_get_all("rpcbind"), None);
         let mut rpcbind: Vec<SocketAddr> = Vec::new();
         let rpcbind_is_default = rpcbind_raw.is_empty();
         if rpcbind_is_default {
@@ -1896,15 +1892,11 @@ impl Config {
             }
         }
 
-        // --rpcallowip resolution: CLI list wins; else config (multi).
+        // --rpcallowip resolution: command line, then config file.
         // Defer the "non-loopback bind requires non-empty allowlist"
         // check until both are parsed so the operator gets one clear
         // error message instead of two.
-        let rpcallowip_raw: Vec<String> = if !cli.rpcallowip.is_empty() {
-            cli.rpcallowip.clone()
-        } else {
-            file_get_all("rpcallowip")
-        };
+        let rpcallowip_raw: Vec<String> = merge_list(cli.rpcallowip.clone(), file_get_all("rpcallowip"), None);
         let mut rpcallowip: Vec<IpAllowEntry> = Vec::new();
         // satd has no CJDNS transport, so `-cjdnsreachable` does one thing
         // here, the thing Core does to the RPC allowlist: with it set, an
@@ -1947,16 +1939,11 @@ impl Config {
             ));
         }
 
-        // --rpcauth resolution: CLI list wins; else config (multi). A
-        // `-norpcauth` discards the entries before it and the config file's.
-        let mut rpcauth_raw: Vec<String> = if !cli.rpcauth.is_empty() {
-            cli.rpcauth.clone()
-        } else {
-            file_get_all("rpcauth")
-        };
-        if let Some(last_negation) = rpcauth_raw.iter().rposition(|v| v == RPCAUTH_NEGATED) {
-            rpcauth_raw.drain(..=last_negation);
-        }
+        // --rpcauth resolution: command line, then config file (see
+        // `merge_list`). A `-norpcauth` discards the entries before it, and
+        // the config file's unless an entry follows it.
+        let rpcauth_raw: Vec<String> =
+            merge_list(cli.rpcauth.clone(), file_get_all("rpcauth"), Some(RPCAUTH_NEGATED));
         let mut rpcauth: Vec<RpcAuthEntry> = Vec::new();
         for entry in &rpcauth_raw {
             // Core refuses to start on an empty or malformed `-rpcauth`, with
@@ -2078,8 +2065,8 @@ impl Config {
         // A second listener serving the same methods behind a read-only
         // filter (reads + mempool submit), on the bounded API runtime. Off by
         // default (empty bind list) for Core-compatible single-listener
-        // behavior. Resolution mirrors `rpcbind`/`rpcallowip`: CLI list wins,
-        // else config file (repeatable).
+        // behavior. A satd option, not Core's: the command line's list, if
+        // any, replaces the config file's.
         let rpc_readonly_port = cli
             .rpcreadonlyport
             .or_else(|| file_get("rpcreadonlyport").and_then(|v| v.parse().ok()))
@@ -2205,16 +2192,11 @@ impl Config {
             ));
         }
 
-        // --signetseednode resolution: CLI list wins; else config
-        // (multi). Only meaningful on Signet; on other networks the
+        // --signetseednode resolution: command line, then config file. Only meaningful on Signet; on other networks the
         // value is parsed and stored but unused. Logging a warning
         // when set off-signet would be noisy for operators with a
         // single config used across networks via `[signet]` sections.
-        let signet_seed_nodes: Vec<String> = if !cli.signetseednode.is_empty() {
-            cli.signetseednode.clone()
-        } else {
-            file_get_all("signetseednode")
-        };
+        let signet_seed_nodes: Vec<String> = merge_list(cli.signetseednode.clone(), file_get_all("signetseednode"), None);
 
         // -signetchallenge selects a custom signet (BIP 325). Parsed
         // from hex; rejected on non-signet networks (it has no meaning
@@ -2225,11 +2207,7 @@ impl Config {
             // (`ReadSigNetArgs`), where other scalar options take the last:
             // two challenges name two different signets, and picking one
             // would join the node to a network the operator may not mean.
-            let raw = if cli.signetchallenge.is_empty() {
-                file_get_all("signetchallenge")
-            } else {
-                cli.signetchallenge.clone()
-            };
+            let raw = merge_list(cli.signetchallenge.clone(), file_get_all("signetchallenge"), None);
             if raw.len() > 1 {
                 return Err("-signetchallenge cannot be multiple values.".to_string());
             }
@@ -2406,13 +2384,9 @@ impl Config {
             .or_else(|| file_get("v2only").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
-        // -externalip: CLI list wins, else config (multi). Each entry is
+        // -externalip: command line, then config file. Each entry is
         // `IP` or `IP:port`; a bare IP inherits the network P2P port.
-        let externalip_raw: Vec<String> = if !cli.externalip.is_empty() {
-            cli.externalip.clone()
-        } else {
-            file_get_all("externalip")
-        };
+        let externalip_raw: Vec<String> = merge_list(cli.externalip.clone(), file_get_all("externalip"), None);
         let mut externalip: Vec<SocketAddr> = Vec::with_capacity(externalip_raw.len());
         for raw in &externalip_raw {
             let s = raw.trim();
@@ -2429,11 +2403,7 @@ impl Config {
         }
 
         // -whitelist: per-subnet net permissions.
-        let whitelist_raw: Vec<String> = if !cli.whitelist.is_empty() {
-            cli.whitelist.clone()
-        } else {
-            file_get_all("whitelist")
-        };
+        let whitelist_raw: Vec<String> = merge_list(cli.whitelist.clone(), file_get_all("whitelist"), None);
         let mut whitelist: Vec<node::net::permissions::WhitelistEntry> =
             Vec::with_capacity(whitelist_raw.len());
         for raw in &whitelist_raw {
@@ -2460,11 +2430,7 @@ impl Config {
 
         // -whitebind: extra permissioned listeners. `[perms@]addr`, addr
         // is a literal `IP:port` (a bare IP inherits the network port).
-        let whitebind_raw: Vec<String> = if !cli.whitebind.is_empty() {
-            cli.whitebind.clone()
-        } else {
-            file_get_all("whitebind")
-        };
+        let whitebind_raw: Vec<String> = merge_list(cli.whitebind.clone(), file_get_all("whitebind"), None);
         let mut whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)> =
             Vec::with_capacity(whitebind_raw.len());
         for raw in &whitebind_raw {
@@ -2523,11 +2489,7 @@ impl Config {
         // -bind: every listener the operator asked for. An explicit -bind
         // replaces the default listener entirely, as in Core -- it does not
         // add to it.
-        let bind_raw: Vec<String> = if !cli.bind.is_empty() {
-            cli.bind.clone()
-        } else {
-            file_get_all("bind")
-        };
+        let bind_raw: Vec<String> = merge_list(cli.bind.clone(), file_get_all("bind"), None);
         let binds: Vec<BindSpec> = {
             let raw = &bind_raw;
             // Core refuses this combination outright ("Cannot set -bind or
@@ -2612,10 +2574,7 @@ impl Config {
             }
         }
 
-        let mut connect = cli.connect;
-        if connect.is_empty() {
-            connect = file_get_all("connect");
-        }
+        let connect_file = file_get_all("connect");
         // Core's `-connect` semantics (`init.cpp`, `AppInitMain`): setting it
         // at all disables automatic outbound connections, and the value `0`
         // -- Core's `-noconnect`, i.e. a negation -- is the spelling for "and
@@ -2625,8 +2584,9 @@ impl Config {
         //
         // Whether the option was given at all is what turns automatic outbound
         // off, negation included: Core gates on
-        // `!GetArgs("-connect").empty() || IsArgNegated("-connect")`.
-        let automatic_outbound = connect.is_empty();
+        // `!GetArgs("-connect").empty() || IsArgNegated("-connect")`. Asked of
+        // both sources before they merge, since the merge drops a negation.
+        let automatic_outbound = cli.connect.is_empty() && connect_file.is_empty();
 
         // Which of the named peers survive a *negation* is `SettingsSpan`
         // (`src/common/settings.cpp`): `negated()` finds the last false value
@@ -2639,9 +2599,7 @@ impl Config {
         // dialler as an address, and `getaddrinfo` resolved it -- reopening
         // the very bug this option's handling was fixed for, in the one
         // configuration that most clearly means "connect to nothing".
-        if let Some(last_negation) = connect.iter().rposition(|v| v == CONNECT_NEGATED) {
-            connect.drain(..=last_negation);
-        }
+        let mut connect = merge_list(cli.connect, connect_file, Some(CONNECT_NEGATED));
 
         // The literal string `0` is a different value in Core, and takes a
         // different rule (`src/init.cpp`):
@@ -2753,11 +2711,7 @@ impl Config {
         // `-onlynet`, as Core's `AppInitMain` resolves it into
         // `g_reachable_nets`, with its startup refusals.
         let onlynet_raw = {
-            let mut nets = cli.onlynet.clone();
-            if nets.is_empty() {
-                nets = file_get_all("onlynet");
-            }
-            nets
+            merge_list(cli.onlynet.clone(), file_get_all("onlynet"), None)
         };
         let reachable = resolve_reachable(&ReachableInputs {
             onlynet: &onlynet_raw,
@@ -4300,11 +4254,7 @@ impl Config {
                 }
             },
             addnode: {
-                let mut nodes = cli.addnode;
-                if nodes.is_empty() {
-                    nodes = file_get_all("addnode");
-                }
-                nodes
+                merge_list(cli.addnode, file_get_all("addnode"), None)
             },
             user_agent: {
                 // Repeatable, and both sources accumulate: Core's
@@ -4313,9 +4263,6 @@ impl Config {
                 // `-uacomment=a` alongside `uacomment=b` in bitcoin.conf
                 // yields `(a; b)`. Command line first, as Core orders it.
                 //
-                // (`-addnode` above resolves CLI-or-file rather than merging.
-                // That predates this and is its own divergence; it is not the
-                // rule to copy.)
                 let mut comments = cli.uacomment;
                 comments.extend(file_get_all("uacomment"));
                 // Rejected here so a bad comment is a startup error with
@@ -4323,11 +4270,7 @@ impl Config {
                 node::format_user_agent(&comments)?
             },
             seednode: {
-                let mut nodes = cli.seednode;
-                if nodes.is_empty() {
-                    nodes = file_get_all("seednode");
-                }
-                nodes
+                merge_list(cli.seednode, file_get_all("seednode"), None)
             },
             dns: cli
                 .dns
@@ -4565,25 +4508,13 @@ impl Config {
                 .or_else(|| file_get("logsourcelocations").and_then(|v| parse_bool(&v)))
                 .unwrap_or(false),
             debug: {
-                let mut v = cli.debug;
-                if v.is_empty() {
-                    v = file_get_all("debug");
-                }
-                v
+                merge_list(cli.debug, file_get_all("debug"), None)
             },
             debugexclude: {
-                let mut v = cli.debugexclude;
-                if v.is_empty() {
-                    v = file_get_all("debugexclude");
-                }
-                v
+                merge_list(cli.debugexclude, file_get_all("debugexclude"), None)
             },
             log_level: {
-                let mut v = cli.loglevel.clone();
-                if v.is_empty() {
-                    v = file_get_all("loglevel");
-                }
-                v
+                merge_list(cli.loglevel.clone(), file_get_all("loglevel"), None)
             },
             enforce_checkpoints: cli
                 .checkpoints
@@ -7956,6 +7887,33 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// A list option's values, as Core's `GetSettingsList`
+/// (`src/common/settings.cpp`) merges them: the command line's, then the
+/// config file's (#995). satd used the command line's *instead of* the config
+/// file's whenever it had any, so `bind=127.0.0.1` in `bitcoin.conf` and
+/// `-bind=...=onion` on the command line listened only on the onion bind.
+///
+/// `negation` is the sentinel a `-no<option>` rides as, for the options that
+/// take one. Each source keeps only its values after its own last negation
+/// (`SettingsSpan::begin`), and a command line that *ends* negated drops the
+/// config file's values too. One that is negated and then given a value
+/// keeps them: Core's "zombie" config values, which it preserves for
+/// backwards compatibility.
+fn merge_list(cli: Vec<String>, file: Vec<String>, negation: Option<&str>) -> Vec<String> {
+    let after_last_negation = |values: Vec<String>| match negation
+        .and_then(|n| values.iter().rposition(|v| v == n))
+    {
+        Some(i) => values[i + 1..].to_vec(),
+        None => values,
+    };
+    let cli_ends_negated = negation.is_some_and(|n| cli.last().is_some_and(|v| v == n));
+    let mut merged = after_last_negation(cli);
+    if !cli_ends_negated {
+        merged.extend(after_last_negation(file));
+    }
+    merged
+}
+
 /// Boolean options Core negates with a `-no` prefix, which [`normalize_args`]
 /// rewrites to an explicit value.
 const NEGATABLE_BOOL_FLAGS: &[&str] = &[
@@ -9375,6 +9333,13 @@ pub(crate) fn debug_category_target(category: &str) -> Option<&'static str> {
 /// are silently dropped from the directive set.
 pub fn debug_directives(debug: &[String], debugexclude: &[String]) -> (bool, Vec<String>) {
     let norm = |s: &str| s.trim().to_ascii_lowercase();
+    // Core's `SetLoggingCategories` (`src/init/common.cpp`): categories
+    // before the last `0` or `none` are disregarded, and the ones after it
+    // still apply. `-debug=net -debug=0` enabled `net` here.
+    let debug = match debug.iter().rposition(|c| matches!(norm(c).as_str(), "0" | "none")) {
+        Some(i) => &debug[i + 1..],
+        None => debug,
+    };
     let enable_all = debug.iter().any(|c| matches!(norm(c).as_str(), "1" | "all"));
 
     let excluded: std::collections::BTreeSet<&'static str> = debugexclude
@@ -9935,6 +9900,10 @@ mod onlynet_tests;
 #[cfg(test)]
 #[path = "config_bytespersigop_tests.rs"]
 mod bytespersigop_tests;
+
+#[cfg(test)]
+#[path = "config_listmerge_tests.rs"]
+mod listmerge_tests;
 
 #[cfg(test)]
 mod tests {
@@ -15653,6 +15622,20 @@ notarealkey=1
         ])
         .unwrap();
         assert!(!Config::from_cli(cli).unwrap().persistmempool);
+    }
+
+    #[test]
+    fn debug_directives_disregards_categories_before_the_last_zero() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(debug_directives(&v(&["net", "0"]), &[]), (false, vec![]));
+        assert_eq!(debug_directives(&v(&["all", "none"]), &[]), (false, vec![]));
+        // After it, categories apply again: `-debug=0` on the command line
+        // and `debug=all` in bitcoin.conf merge to this, and Core enables
+        // everything for it.
+        assert!(debug_directives(&v(&["0", "all"]), &[]).0);
+        let (all, dirs) = debug_directives(&v(&["mempool", "0", "net"]), &[]);
+        assert!(!all);
+        assert_eq!(dirs, vec!["node::net=debug".to_string()]);
     }
 
     #[test]

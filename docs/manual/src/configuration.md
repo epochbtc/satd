@@ -18,7 +18,15 @@ repeated in **`bitcoin.conf`** takes the **first**. Core's own comment calls
 this asymmetry a backwards-compatibility quirk, but tooling depends on it — the
 command-line rule is what lets a wrapper append an override onto a base command
 line. Options that are genuinely repeatable (`bind`, `connect`, `addnode`,
-`whitebind`, `rpcallowip`, …) accumulate instead of overriding.
+`whitebind`, `rpcallowip`, …) accumulate instead of overriding, across both
+sources: the command line's values first, then the config file's, as Core's
+`GetSettingsList` merges them. A negation (`-noconnect`, `-norpcauth`) drops
+the values before it, and when it is the last value on the command line it
+drops the config file's values too; a value given after it brings the config
+file's back, a quirk Core keeps for compatibility. satd's own list options
+(the `*mtlsclientallow` lists, `esploracors`, `mcpallowedhost`,
+`statusadvertise`, `rpcreadonlybind` and `rpcreadonlyallowip`) are the
+exception: a command-line list replaces the config file's.
 
 Related chapters: [Observability & Metrics](observability.md) for the TUI,
 Prometheus, and structured logs; [JSON-RPC
