@@ -3130,18 +3130,7 @@ impl Config {
             None => None,
         };
 
-        let bytespersigop = match cli
-            .policy_size_args
-            .bytespersigop
-            .clone()
-            .or_else(|| file_get("bytespersigop").map(|v| v.trim().to_string()))
-        {
-            Some(v) => v
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| format!("invalid bytespersigop {v:?}: expected a non-negative integer"))?,
-            None => node::mempool::policy::DEFAULT_BYTES_PER_SIGOP,
-        };
+        let bytespersigop = resolve_bytes_per_sigop(cli.policy_size_args, &file_get)?;
 
         let peertimeout = match cli.peertimeout {
             Some(v) => v,
@@ -7392,6 +7381,20 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
     fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
         *self = Self::from_arg_matches_mut(m)?;
         Ok(())
+    }
+}
+
+/// `-bytespersigop`, the command line before the config file, default 20.
+/// Out of line, as the other `resolve_*`, to keep `Config::from_cli`'s
+/// frame from growing (the test threads' stack is tight).
+#[inline(never)]
+fn resolve_bytes_per_sigop(cli: PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
+    match cli.bytespersigop.or_else(|| file_get("bytespersigop")) {
+        Some(v) => v
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid bytespersigop {v:?}: expected a non-negative integer")),
+        None => Ok(node::mempool::policy::DEFAULT_BYTES_PER_SIGOP),
     }
 }
 
