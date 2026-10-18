@@ -4,7 +4,6 @@
 //! GetLocator(pindexLast))`), whether or not the batch held new headers.
 
 use super::*;
-use bitcoin::hashes::Hash as _;
 
 fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     use crate::chain::state::AssumeValid;

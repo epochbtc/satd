@@ -1,3 +1,4 @@
+use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
@@ -1212,6 +1213,10 @@ pub struct PeerManager {
     /// are deferred here instead of triggering peer bans; reconsidered on
     /// new mempool admission and on block connect.
     orphanage: Arc<TxOrphanage>,
+    /// Transactions the mempool refused since the tip last moved (Core's
+    /// recent-rejects filters), so another peer's announcement of one is
+    /// not downloaded and validated again.
+    recent_rejects: parking_lot::Mutex<crate::net::recent_rejects::RecentRejects>,
     /// The peer each stored-but-unconnected block came from, so a block that
     /// fails when the IBD connector reaches it is charged to its sender
     /// (Core's `mapBlockSource`). See [`crate::net::block_source`].
@@ -1437,6 +1442,7 @@ impl PeerManager {
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
+            recent_rejects: parking_lot::Mutex::new(crate::net::recent_rejects::RecentRejects::new()),
             block_sources: parking_lot::Mutex::new(Default::default()),
             #[cfg(feature = "block-filter-index")]
             filter_index: std::sync::OnceLock::new(),
@@ -5720,7 +5726,9 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if self.mempool.get(&txid).is_some() {
+                    if self.recently_rejected(txid.as_byte_array()) {
+                        // Core's `AlreadyHaveTx`: refused since the tip moved.
+                    } else if self.mempool.get(&txid).is_some() {
                         // We already have it. If it's one of our pending local
                         // broadcasts, a peer announcing it back is a secondary
                         // sign it propagated — count it toward stopping
@@ -5736,7 +5744,9 @@ impl PeerManager {
                 // Fetched as announced, by wtxid: a resident transaction with
                 // the same txid and another witness is not the one offered.
                 Inventory::WTx(wtxid) => {
-                    if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
+                    if self.recently_rejected(wtxid.as_byte_array()) {
+                        // Core's `AlreadyHaveTx`: refused since the tip moved.
+                    } else if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
                         self.note_broadcast_witness(id, txid);
                     } else if !self.is_ibd() && !self.blocksonly() {
                         txs_to_get.push(Inventory::WTx(wtxid));
@@ -8398,6 +8408,56 @@ impl PeerManager {
         }
     }
 
+    /// Whether `hash`, a txid or a wtxid, was refused since the tip moved,
+    /// by either filter: Core's `AlreadyHaveTx(gtxid,
+    /// include_reconsiderable = true)`, which the `inv` and `tx` handlers
+    /// ask.
+    fn recently_rejected(&self, hash: &[u8; 32]) -> bool {
+        let tip = self.chain_state.tip_hash();
+        self.recent_rejects.lock().contains(tip, hash, true)
+    }
+
+    fn note_rejected(&self, hash: &[u8; 32], kind: crate::net::recent_rejects::Rejection) {
+        let tip = self.chain_state.tip_hash();
+        self.recent_rejects.lock().insert(tip, hash, kind);
+    }
+
+    /// Which recent-rejects filter a refusal goes to, as Core's
+    /// `MempoolRejectedTx` decides it from the `TxValidationResult`. `None`
+    /// for what is not recorded: a transaction already held, missing inputs
+    /// (the orphanage's business), and a script failure of a transaction
+    /// carrying no witness, which may be a valid one stripped of its witness
+    /// (`TX_WITNESS_STRIPPED`). Core spots that case by the spent outputs;
+    /// leaving every witness-less script failure out costs at most a fetch.
+    fn rejection_kind(e: &MempoolError, has_witness: bool) -> Option<crate::net::recent_rejects::Rejection> {
+        use crate::net::recent_rejects::Rejection;
+        match e {
+            MempoolError::AlreadyExists | MempoolError::MissingInputs | MempoolError::Quarantined(_) => None,
+            MempoolError::Script(..) | MempoolError::PolicyScript(..) if !has_witness => None,
+            // `TX_RECONSIDERABLE`: the fee, and nothing else, is short.
+            MempoolError::InsufficientFee(..)
+            | MempoolError::MempoolMinFeeNotMet(..)
+            | MempoolError::MempoolFull
+            | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::DoesNotImproveFeerateDiagram(..) => Some(Rejection::Reconsiderable),
+            _ => Some(Rejection::Rejected),
+        }
+    }
+
+    /// Record a refusal of `tx`: its wtxid, and its txid as well where no
+    /// witness could make it acceptable (`TX_INPUTS_NOT_STANDARD`: what it
+    /// spends is fixed by the txid). Core records only wtxids otherwise,
+    /// so a peer without wtxid relay can still offer a correctly witnessed
+    /// copy by txid.
+    fn record_rejection(&self, tx: &bitcoin::Transaction, e: &MempoolError) {
+        let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
+        let Some(kind) = Self::rejection_kind(e, has_witness) else { return };
+        self.note_rejected(tx.compute_wtxid().as_byte_array(), kind);
+        if has_witness && matches!(e, MempoolError::NonStandardInputs(_)) {
+            self.note_rejected(tx.compute_txid().as_byte_array(), kind);
+        }
+    }
+
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
         // A peer told not to send transactions -- a block-relay-only link, or
         // any peer of a `-blocksonly` node unless it holds `relay` -- is
@@ -8414,6 +8474,13 @@ impl PeerManager {
         }
 
         let txid = tx.compute_txid();
+        // Core's TX handler: a transaction refused since the tip moved is
+        // not validated again, whoever sends it.
+        let wtxid = tx.compute_wtxid();
+        if self.recently_rejected(wtxid.as_byte_array()) {
+            tracing::debug!(%txid, %wtxid, peer = id, "recently rejected, not validated again");
+            return;
+        }
         match self.mempool.accept_transaction(
             tx.clone(),
             &self.chain_state,
@@ -8439,6 +8506,15 @@ impl PeerManager {
                 // Don't ban — peer may just be ahead of us. Defer to
                 // orphanage and ask the same peer for the parents.
                 let missing = self.collect_missing_parents(&tx);
+                // Core keeps no orphan with a parent it refused, and refuses
+                // the orphan's txid and wtxid from then on: no witness makes
+                // it acceptable.
+                if missing.iter().any(|p| self.recently_rejected(p.as_byte_array())) {
+                    tracing::debug!(%txid, %wtxid, "not keeping orphan with rejected parents");
+                    self.note_rejected(txid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
+                    self.note_rejected(wtxid.as_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
+                    return;
+                }
                 match self.orphanage.add(tx.clone(), id, missing.clone()) {
                     Ok(AddOutcome::Added) => {
                         // Core keeps a first-time orphan for reconstruction:
@@ -8481,6 +8557,7 @@ impl PeerManager {
                     tx.compute_wtxid(),
                     e.state_string()
                 );
+                self.record_rejection(&tx, &e);
                 // Only consensus-invalid transactions are misbehavior; policy
                 // rejections (fee floor, dust, mempool limits, RBF, …) carry no
                 // ban score so we don't sever honest peers on low-fee networks.
@@ -15496,6 +15573,109 @@ mod tests {
             !pm.mempool.is_unbroadcast(&resident_txid),
             "a wtxid relay peer announcing the local tx back is a propagation witness"
         );
+    }
+
+    /// A node out of IBD, with peers 1 (wtxid relay) and 2 (txid relay).
+    fn rejects_pm() -> (
+        Arc<PeerManager>,
+        tempfile::TempDir,
+        mpsc::Receiver<NetworkMessage>,
+        mpsc::Receiver<NetworkMessage>,
+    ) {
+        let (pm, dir) = mk_test_pm();
+        let tip = pm.chain_state.tip_hash();
+        let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+        pm.chain_state.accept_block(&block).expect("block connects");
+        let (mut h1, rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.wtxid_relay = true;
+        let (h2, rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        pm.peers.write().insert(2, h2);
+        (pm, dir, rx1, rx2)
+    }
+
+    /// Core's recent-rejects filter: a transaction the mempool refused is not
+    /// requested again when another peer announces it, until the tip moves.
+    #[test]
+    fn a_refused_transaction_is_not_fetched_again_until_the_tip_moves() {
+        let (pm, _dir, mut rx1, mut rx2) = rejects_pm();
+        // The same outpoint twice, no witness: `bad-txns-inputs-duplicate`,
+        // whoever sends it, and its txid is its wtxid.
+        let mut bad = witness_tx(0x21, 0);
+        bad.input[0].witness = bitcoin::Witness::new();
+        bad.input.push(bad.input[0].clone());
+        let (txid, wtxid) = (bad.compute_txid(), bad.compute_wtxid());
+        assert_eq!(txid.to_byte_array(), wtxid.to_byte_array());
+        pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
+        expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(txid)], "fetched the first time");
+
+        pm.handle_tx(2, bad);
+        pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
+        assert!(rx1.try_recv().is_err(), "not fetched again by wtxid");
+        pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
+        assert!(rx2.try_recv().is_err(), "nor by txid");
+
+        let tip = pm.chain_state.tip_hash();
+        let block = crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32 + 1);
+        pm.chain_state.accept_block(&block).expect("block connects");
+        pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
+        expect_getdata(&mut rx1, &[Inventory::WTx(wtxid)], "a new tip forgets the refusal");
+    }
+
+    /// A transaction refused since the tip moved is not validated again when
+    /// a peer sends it unasked: it does not even reach the orphanage.
+    #[test]
+    fn a_recently_rejected_transaction_is_not_processed_again() {
+        let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let orphan = witness_tx(0x31, 0xaa);
+        pm.handle_tx(1, orphan.clone());
+        assert!(pm.orphanage.contains(&orphan.compute_txid()), "an unknown parent makes it an orphan");
+
+        let other = witness_tx(0x32, 0xaa);
+        pm.note_rejected(&other.compute_wtxid().to_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
+        pm.handle_tx(1, other.clone());
+        assert!(!pm.orphanage.contains(&other.compute_txid()), "refused before, so not looked at");
+    }
+
+    /// Core keeps no orphan whose parent it refused, and refuses the orphan's
+    /// txid and wtxid from then on.
+    #[test]
+    fn an_orphan_of_a_rejected_parent_is_rejected_too() {
+        let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let child = witness_tx(0x41, 0xaa);
+        pm.note_rejected(&[0x41; 32], crate::net::recent_rejects::Rejection::Rejected);
+        pm.handle_tx(1, child.clone());
+        assert!(!pm.orphanage.contains(&child.compute_txid()));
+        assert!(pm.recently_rejected(&child.compute_txid().to_byte_array()));
+        assert!(pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
+    }
+
+    /// Which refusals Core's `MempoolRejectedTx` records, and where: fee
+    /// failures as reconsiderable, nothing for missing inputs or a script
+    /// failure that may be a stripped witness, the txid as well as the
+    /// wtxid only for spent-output standardness.
+    #[test]
+    fn refusals_are_recorded_as_core_records_them() {
+        use crate::net::recent_rejects::Rejection;
+        let kind = PeerManager::rejection_kind;
+        assert_eq!(kind(&MempoolError::InsufficientFee(1, 2), true), Some(Rejection::Reconsiderable));
+        assert_eq!(kind(&MempoolError::MempoolMinFeeNotMet(1, 2), false), Some(Rejection::Reconsiderable));
+        assert_eq!(kind(&MempoolError::MempoolFull, true), Some(Rejection::Reconsiderable));
+        assert_eq!(kind(&MempoolError::Dust, true), Some(Rejection::Rejected));
+        assert_eq!(kind(&MempoolError::Script("x".into(), None), true), Some(Rejection::Rejected));
+        assert_eq!(kind(&MempoolError::Script("x".into(), None), false), None, "maybe witness-stripped");
+        assert_eq!(kind(&MempoolError::PolicyScript("x".into(), None), false), None);
+        assert_eq!(kind(&MempoolError::MissingInputs, true), None);
+        assert_eq!(kind(&MempoolError::AlreadyExists, true), None);
+
+        let (pm, _dir, _rx1, _rx2) = rejects_pm();
+        let a = witness_tx(0x51, 0xaa);
+        pm.record_rejection(&a, &MempoolError::Dust);
+        assert!(pm.recently_rejected(&a.compute_wtxid().to_byte_array()));
+        assert!(!pm.recently_rejected(&a.compute_txid().to_byte_array()), "another witness may pass");
+        let b = witness_tx(0x52, 0xaa);
+        pm.record_rejection(&b, &MempoolError::NonStandardInputs("input 0 script unknown".into()));
+        assert!(pm.recently_rejected(&b.compute_txid().to_byte_array()), "no witness changes what it spends");
     }
 
     /// Core disconnects a peer that sends `wtxidrelay` after its verack: the
