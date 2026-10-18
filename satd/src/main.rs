@@ -2910,6 +2910,20 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
+    // `-externalip=<x>.onion`: a hidden service the operator runs in
+    // `torrc`. Advertised when the node made none of its own (#973). satd
+    // advertises one onion address, so a second is not.
+    if _onion_addr.is_none()
+        && let Some((host, port)) = config.externalip_onion.first()
+    {
+        peer_manager.set_advertised_onion(host.clone(), *port);
+    }
+    if config.externalip_onion.len() > 1 || (_onion_addr.is_some() && !config.externalip_onion.is_empty()) {
+        tracing::warn!(
+            "satd advertises one onion address; the other -externalip .onion entries are not advertised"
+        );
+    }
+
     // Stop the startup status server before the full RPC answers, so a client
     // that has seen the node come up reaches the running node's metrics
     // listener: its connection waits in the listen backlog until that

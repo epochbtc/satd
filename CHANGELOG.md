@@ -117,6 +117,8 @@ item below is (or will be) written up in full in the in-development
 - satd sets Core's `umask(077)` at startup: new files are 0600 and new
   directories 0700. `mempool.dat`, `peers.dat` and the ban list were
   world-readable.
+- `-externalip` accepts a v3 `.onion` address and advertises it, Core's
+  manual hidden-service setup; satd refused it at startup (#973).
 
 ## Releases
 
