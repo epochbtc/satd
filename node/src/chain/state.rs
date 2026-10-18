@@ -8693,12 +8693,30 @@ impl ChainState {
         // re-activate and reverse the invalidation on the next block.
         self.mark_subtree_invalid(hash)?;
 
+        // Core's `InvalidateBlock` first disconnects down to the invalidated
+        // block's parent, and only then looks for another candidate. Doing
+        // both as one reorg (#977) meant a reconnect that failed on the
+        // competing branch was rolled back to the pre-invalidation tip: a
+        // block just marked `Invalid`, which the node then stood on, refusing
+        // every block that extends the real best chain until a restart ran
+        // `reconcile_invalid_tip`. Truncating first makes the parent the tip a
+        // failed activation below returns to. It reconnects nothing, so all it
+        // can fail on is reading its own undo data.
+        let truncate_to_parent = || -> Result<(), ChainError> {
+            if self.active_chain_contains(&hash, entry.height) {
+                let parent = self
+                    .store
+                    .get_block_index(&entry.header.prev_blockhash)
+                    .ok_or(ChainError::BadPrevBlock)?;
+                self.reorg_to(&parent)?;
+            }
+            Ok(())
+        };
+
         // Re-activate the best valid chain. If `hash` was on the active chain
-        // the current tip is now invalid (a descendant of `hash`), so the best
-        // valid candidate differs and a reorg follows — a pure truncation to
-        // the parent, or onto a competing side chain that now carries more
-        // work. If `hash` was only on a side chain the active tip stays best
-        // and this is a no-op.
+        // the tip is now its parent, and a competing side chain that carries
+        // more work takes over from there. If `hash` was only on a side chain
+        // the active tip stays best and this is a no-op.
         //
         // A failure here is a *partial* success, and saying so is the point.
         // The marks above are already durable and stay that way — that is
@@ -8707,7 +8725,9 @@ impl ChainState {
         // failed when half of it did not. On the node that produced #567 the
         // whole visible trace of a reorg that destroyed eight blocks was a
         // one-line `bad-txns-inputs-missingorspent` from this call.
-        self.activate_best_chain().map_err(|e| {
+        // The truncation's failure is the same partial success: the marks
+        // are durable either way.
+        truncate_to_parent().and_then(|()| self.activate_best_chain()).map_err(|e| {
             tracing::error!(
                 %hash,
                 height = entry.height,
@@ -12448,6 +12468,63 @@ pub(crate) mod tests {
                 BlockStatus::Invalid
             );
         }
+        // #977: the failed activation leaves the node on a1's parent, not
+        // back on a2, which it has just marked invalid.
+        assert_eq!(cs.tip_hash(), base_tip, "the tip must fall back to the invalidated block's parent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #977: `invalidateblock` whose re-activation fails on an invalid block
+    /// of the competing branch ends on the invalidated block's parent, with
+    /// that branch marked invalid, as Core's `InvalidateBlock` does. It used to
+    /// run the truncation and the reconnect as one reorg, and the abort put
+    /// the node back on the pre-invalidation tip -- a block it had just marked
+    /// `Invalid` -- where it refused every block extending the real best chain
+    /// until a restart.
+    #[test]
+    fn invalidateblock_whose_reactivation_fails_ends_on_the_parent() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+        let a2 = build_test_block(a1.block_hash(), 5, 1_600_000_005);
+        cs.accept_block(&a2).unwrap();
+
+        // A heavier branch whose second block spends a coin that does not
+        // exist: it is stored, and fails when the re-activation connects it.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let b1 = build_test_block(base_tip, 4, 1_600_000_014);
+        let b2 = build_test_block_spending(b1.block_hash(), 5, 1_600_000_015, missing);
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        for b in [&b1, &b2, &b3] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+
+        let err = cs
+            .invalidate_block(a1.block_hash())
+            .expect_err("re-activation fails on b2");
+        assert!(matches!(err, ChainError::ReactivationFailed(_)), "got {err:?}");
+
+        assert_eq!(cs.tip_hash(), base_tip, "the tip must fall back to the invalidated block's parent");
+        assert_eq!(cs.tip_height(), 3);
+        assert_eq!(cs.get_block_index(&base_tip).unwrap().status, BlockStatus::Valid);
+        for b in [&a1, &a2, &b2, &b3] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{} must be marked invalid",
+                b.block_hash()
+            );
+        }
+
+        // The node goes on from the parent: a block extending it connects.
+        let c1 = build_test_block(base_tip, 4, 1_600_000_024);
+        cs.accept_block(&c1).unwrap();
+        assert_eq!(cs.tip_hash(), c1.block_hash());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
