@@ -300,8 +300,21 @@ pub fn mine_blocks(
     count: u32,
     max_tries: u64,
 ) -> Result<Vec<String>, MineError> {
+    mine_blocks_until(chain_state, mempool, address, count, max_tries, &|| false)
+}
+
+/// [`mine_blocks`], stopping once `stop` says so; see
+/// [`mine_blocks_to_script_until`].
+pub fn mine_blocks_until(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    address: &str,
+    count: u32,
+    max_tries: u64,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<String>, MineError> {
     let script = address_to_script(chain_state, address)?;
-    mine_blocks_to_script(chain_state, mempool, script, count, max_tries)
+    mine_blocks_to_script_until(chain_state, mempool, script, count, max_tries, stop)
 }
 
 /// Mine multiple blocks paying to an arbitrary output script, returning their hashes.
@@ -319,9 +332,28 @@ pub fn mine_blocks_to_script(
     count: u32,
     max_tries: u64,
 ) -> Result<Vec<String>, MineError> {
+    mine_blocks_to_script_until(chain_state, mempool, script, count, max_tries, &|| false)
+}
+
+/// [`mine_blocks_to_script`], stopping before the next block once `stop`
+/// says so; the caller gets the blocks already mined. Core's
+/// `generateBlocks` checks `chainman.m_interrupt` the same way, so a
+/// `generatetoaddress` running when the node shuts down does not go on
+/// connecting blocks past the chainstate flush.
+pub fn mine_blocks_to_script_until(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    script: ScriptBuf,
+    count: u32,
+    max_tries: u64,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<String>, MineError> {
     let mut budget = max_tries;
     let mut hashes = Vec::new();
     for _ in 0..count {
+        if stop() {
+            break;
+        }
         let Some(block) =
             mine_block_to_script_within(chain_state, mempool, script.clone(), &mut budget)?
         else {

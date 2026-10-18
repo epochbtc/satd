@@ -171,8 +171,9 @@ pub fn generate_to_address(
     nblocks: u32,
     address: &str,
     max_tries: u64,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Value, (i32, String)> {
-    let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks, max_tries)
+    let hashes = crate::mining::miner::mine_blocks_until(chain_state, mempool, address, nblocks, max_tries, stop)
         .map_err(|e| match &e {
             crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
             _ => (-1, e.to_string()),
@@ -188,6 +189,7 @@ pub fn generate_to_descriptor(
     nblocks: u32,
     descriptor: &str,
     max_tries: u64,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Value, (i32, String)> {
     // `descriptor_to_coinbase_script` is the full key-based parser
     // `generateblock` already uses, and it answers `-5` as Core's
@@ -202,7 +204,7 @@ pub fn generate_to_descriptor(
     )?;
 
     let hashes =
-        crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks, max_tries)
+        crate::mining::miner::mine_blocks_to_script_until(chain_state, mempool, script, nblocks, max_tries, stop)
         .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))

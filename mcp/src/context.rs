@@ -39,4 +39,8 @@ pub struct McpContext {
     pub health: Option<Arc<node::health::HealthState>>,
     /// Webhook delivery counters, for the same reason. `None` in tests.
     pub webhooks: Option<Arc<node::metrics::WebhookMetrics>>,
+    /// The node's shutdown watch, so `generate_blocks` stops mining once
+    /// shutdown begins rather than connecting blocks past the chainstate
+    /// flush. `None` in tests.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }

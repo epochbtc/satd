@@ -3550,6 +3550,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             addr_subs: Some(address_index_concrete.subscription_registry()),
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
+            shutdown: Some(shutdown_rx.clone()),
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.
@@ -4873,6 +4874,36 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
+    // Stop the JSON-RPC server and wait for the calls it is still running,
+    // before anything is persisted (#983). The shutdown watch already stopped
+    // its listeners accepting, but a call in flight went on: a
+    // `sendrawtransaction` admitted after the mempool dump was lost, a
+    // `setban` after the banlist flush was answered and not written, and a
+    // `generatetoaddress` connected blocks past the tip the clean-shutdown
+    // marker recorded. Core stops its HTTP server, waiting for its workers,
+    // first thing in `Shutdown()`. The `stop` call's own reply is one of the
+    // calls waited for. A quarter of what is left of the budget: mining stops
+    // at the next block and the wait-for RPCs return on the shutdown watch,
+    // so a call still running then is a slow one, and like a connector still
+    // in a block it costs the marker rather than the flush.
+    let _ = server_handle.stop();
+    let rpc_budget = (shutdown_deadline.saturating_sub(shutdown_started.elapsed()) / 4)
+        .max(std::time::Duration::from_secs(1));
+    tracing::info!(
+        budget_secs = rpc_budget.as_secs(),
+        "Shutdown: waiting for running RPC calls to finish"
+    );
+    let rpc_drained = tokio::time::timeout(rpc_budget, server_handle.stopped()).await.is_ok();
+    if rpc_drained {
+        tracing::info!("RPC server stopped");
+    } else {
+        tracing::warn!(
+            waited_secs = rpc_budget.as_secs(),
+            "RPC calls still running at their share of --max-shutdown-secs; \
+             flushing without the clean-shutdown marker"
+        );
+    }
+
     // Wait for the block connector to stop before flushing. Until it does it
     // can still connect blocks, and a block connected after the flush is
     // past the tip the clean-shutdown marker records. It was signalled with
@@ -4995,10 +5026,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     };
 
     // Write the clean-shutdown marker only if the flush actually succeeded
-    // and the connector had stopped, so the tip it records is final. If
-    // either did not, leaving the marker absent is correct — it tells the
-    // next startup (and the operator) that this exit was dirty.
-    if flushed_ok && connector_stopped {
+    // and neither the connector nor an RPC call can still move the tip, so
+    // the tip it records is final. If any of that does not hold, leaving the
+    // marker absent is correct — it tells the next startup (and the
+    // operator) that this exit was dirty.
+    if flushed_ok && connector_stopped && rpc_drained {
         if let Err(e) = node::shutdown::write_marker(&net_datadir, &tip_hash, tip_height) {
             tracing::warn!(error = %e, "Failed to write clean-shutdown marker");
         } else {
@@ -5027,8 +5059,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // never runs, and the ban is lost at shutdown having been reported as
     // accepted.
     peer_manager.flush_banlist();
-
-    server_handle.stop().expect("Failed to stop server");
 
     // The isolated API runtime is torn down by `ApiRuntimeGuard` when `main`
     // returns (it drains surfaces with a bounded deadline on a plain OS

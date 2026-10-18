@@ -408,6 +408,21 @@ impl RpcServerHandle {
         }
         Ok(())
     }
+
+    /// Resolves once every listener has stopped and every call it accepted
+    /// has been answered. A stopped listener accepts nothing new, but a call
+    /// already running goes on: a `sendrawtransaction` admitting into the
+    /// mempool, a `generatetoaddress` connecting blocks. jsonrpsee resolves
+    /// `ServerHandle::stopped` when the last `StopHandle` is dropped, and the
+    /// accept loop, each open connection and the service it calls all hold
+    /// one. Core's `StopHTTPServer` waits for its worker threads the same
+    /// way before `Shutdown()` dumps the mempool and flushes the chainstate.
+    pub async fn stopped(&self) {
+        // In turn: done once the slowest is, so the order costs nothing.
+        for h in self.plain.iter().chain(&self.tls).chain(&self.readonly) {
+            h.clone().stopped().await;
+        }
+    }
 }
 
 /// Configuration for the opt-in read-only JSON-RPC listener.
@@ -1563,7 +1578,10 @@ pub async fn start(
         // at all (#688).
         let max_tries: u64 = args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
-        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address, max_tries)
+        // A call still mining when the node shuts down stops at the next
+        // block, so main's wait for the RPC server to drain ends.
+        let stopping = || *ctx.shutdown_tx.borrow();
+        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address, max_tries, &stopping)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1574,12 +1592,14 @@ pub async fn start(
         let max_tries: u64 =
             args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
+        let stopping = || *ctx.shutdown_tx.borrow();
         mining::generate_to_descriptor(
             &ctx.chain_state,
             &ctx.mempool,
             nblocks,
             &descriptor,
             max_tries,
+            &stopping,
         )
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -4101,7 +4121,9 @@ pub async fn start(
                         "height": height,
                     }));
                 }
-                if std::time::Instant::now() >= deadline {
+                // Core answers with the tip it has once shutdown begins, so
+                // the call does not hold up the node's wait for RPC to drain.
+                if std::time::Instant::now() >= deadline || *ctx.shutdown_tx.borrow() {
                     let hash = ctx.chain_state.tip_hash();
                     return Ok(serde_json::json!({
                         "hash": hash.to_string(),
@@ -4134,7 +4156,7 @@ pub async fn start(
                     "height": height,
                 }));
             }
-            if std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline || *ctx.shutdown_tx.borrow() {
                 let height = ctx.chain_state.tip_height();
                 return Ok(serde_json::json!({
                     "hash": current_hash.to_string(),
@@ -4167,7 +4189,7 @@ pub async fn start(
                     "height": entry.height,
                 }));
             }
-            if std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline || *ctx.shutdown_tx.borrow() {
                 let height = ctx.chain_state.tip_height();
                 return Ok(serde_json::json!({
                     "hash": ctx.chain_state.tip_hash().to_string(),
@@ -4582,9 +4604,9 @@ async fn spawn_tls_surface(
 
     // Bridge: when the process-wide `shutdown_tx` fires (Ctrl-C,
     // SIGTERM, or the `stop` RPC), also stop this surface. main.rs
-    // additionally calls `RpcServerHandle::stop()` after the flush
-    // phase, which idempotently re-fires the same stop — both paths
-    // are safe (AlreadyStopped is ignored).
+    // additionally calls `RpcServerHandle::stop()` before the flush
+    // phase, and waits on `stopped()`, which idempotently re-fires the
+    // same stop — both paths are safe (AlreadyStopped is ignored).
     let bridge_handle = server_handle.clone();
     let mut bridge_rx = shutdown_rx.clone();
     tokio::spawn(async move {
@@ -5112,6 +5134,11 @@ async fn wait_for_longpoll(ctx: &RpcContext, lpval: &serde_json::Value) -> Resul
     loop {
         if ctx.chain_state.tip_hash() != watched {
             return Ok(());
+        }
+        // Core's `getblocktemplate` ends a long poll at shutdown with
+        // `RPC_CLIENT_NOT_CONNECTED` "Shutting down".
+        if *ctx.shutdown_tx.borrow() {
+            return Err(ErrorObjectOwned::owned(-9, "Shutting down", None::<()>));
         }
         if started.elapsed() >= check_txs_at {
             if ctx.mempool.mempool_sequence() != seq {
