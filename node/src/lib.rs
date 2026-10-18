@@ -78,6 +78,22 @@ pub fn set_user_agent(ua: String) -> bool {
     USER_AGENT_OVERRIDE.set(ua).is_ok()
 }
 
+/// Core's `SetupEnvironment` umask: files and directories the process
+/// creates are its user's alone (0600 and 0700), unless code sets a mode
+/// explicitly, as the RPC cookie does for `-rpccookieperms`. Without it the
+/// datadir was created 0755, and `mempool.dat` (whose unbroadcast flags mark
+/// the node's own transactions), `peers.dat` and the ban list 0644, readable
+/// by every account on the machine. Core sets it unconditionally outside
+/// Windows; call it first thing in `main`, before any thread or file exists.
+pub fn set_private_umask() {
+    #[cfg(unix)]
+    // SAFETY: `umask` only swaps the process's file-creation mask; it cannot
+    // fail and touches no memory.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
 /// Build the BIP 14 user agent from `-uacomment` values, as Bitcoin Core's
 /// `FormatSubVersion` does: `/satd:<version>(comment1; comment2)/`.
 ///

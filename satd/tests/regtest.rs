@@ -7258,6 +7258,25 @@ fn test_sighup_reload_applies_mempool_policy_live() {
     node.stop();
 }
 
+/// The files a node writes are its user's alone, as Core's
+/// `umask(077)` makes them: the network datadir 0700, and `peers.dat`
+/// and `mempool.dat` 0600. satd left them 0755 and 0644.
+#[cfg(unix)]
+#[test]
+fn a_new_datadir_and_its_files_are_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let datadir = fresh_test_datadir("satd-umask");
+    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--persistmempool=1"]);
+    node.stop();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let net = datadir.join("regtest");
+    assert_eq!(mode(&net), 0o700, "{}", net.display());
+    for f in ["peers.dat", "mempool.dat"] {
+        assert_eq!(mode(&net.join(f)), 0o600, "{f}");
+    }
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 #[test]
 fn test_clean_shutdown_marker_graceful_stop() {
     // Graceful RPC stop should write the marker and next startup should see it.

@@ -114,6 +114,9 @@ item below is (or will be) written up in full in the in-development
 - The Tor hidden service keeps its address across restarts: its key is saved
   to `onion_v3_private_key` (mode 0600) and reused, as in Core; satd asked
   Tor to discard it (#973).
+- satd sets Core's `umask(077)` at startup: new files are 0600 and new
+  directories 0700. `mempool.dat`, `peers.dat` and the ban list were
+  world-readable.
 
 ## Releases
 
