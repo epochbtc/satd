@@ -549,6 +549,7 @@ fn a_child_failing_after_its_parent_restores_what_the_parent_replaced() {
     let (cs, mp, dir) = floor_env(&[1, 2]);
     let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
     let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    mp.mark_unbroadcast(a_id);
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
     mp.set_event_sender(tx);
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
@@ -561,6 +562,7 @@ fn a_child_failing_after_its_parent_restores_what_the_parent_replaced() {
     assert_eq!(pool(&mp), HashSet::from([a_id]));
     assert!(stream(&mut rx).is_empty(), "the replacement that did not happen was announced");
     assert_eq!(mp.spending_tx(&prev(1)).map(|(t, _)| t), Some(a_id), "a spends its coin again");
+    assert!(mp.is_unbroadcast(&a_id), "a is still rebroadcast until it has propagated");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

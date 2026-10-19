@@ -1620,8 +1620,10 @@ struct PackageAdmit {
     /// replacing package's parent, which comes back out, its evictions
     /// restored, if the child cannot follow.
     hold_events: bool,
-    /// The entries a `hold_events` admission evicted, as they were.
-    evicted_entries: Vec<(Txid, MempoolEntry)>,
+    /// The entries a `hold_events` admission evicted, as they were, each
+    /// with its unbroadcast record (the peers that have shown they hold it)
+    /// if it had one.
+    evicted_entries: Vec<(Txid, MempoolEntry, Option<HashSet<std::net::IpAddr>>)>,
     /// The transactions a `hold_events` admission replaced, kept from the
     /// replaced-transaction sink until the caller commits.
     held_replaced_txs: Vec<Transaction>,
@@ -3691,13 +3693,13 @@ impl Mempool {
                 for ci in &evict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
-                inner.unbroadcast.remove(evict_txid);
+                let unbroadcast = inner.unbroadcast.remove(evict_txid);
                 if was_acting {
                     replaced.push((*evict_txid, seq));
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
                 if pkg.hold_events {
-                    pkg.evicted_entries.push((*evict_txid, evict_entry.clone()));
+                    pkg.evicted_entries.push((*evict_txid, evict_entry.clone(), unbroadcast));
                 }
                 replaced_txs.push(evict_entry.tx);
                 pkg.replaced.push(*evict_txid);
@@ -8029,7 +8031,7 @@ impl Mempool {
     fn undo_package_parent(
         &self,
         parent: Txid,
-        evicted: Vec<(Txid, MempoolEntry)>,
+        evicted: Vec<(Txid, MempoolEntry, Option<HashSet<std::net::IpAddr>>)>,
         held: &[MempoolEvent],
         chain_state: &ChainState,
     ) {
@@ -8041,7 +8043,14 @@ impl Mempool {
                 _ => None,
             })
             .collect();
-        let mut entries: FxHashMap<Txid, MempoolEntry> = evicted.into_iter().collect();
+        let mut unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>> = HashMap::new();
+        let mut entries: FxHashMap<Txid, MempoolEntry> = FxHashMap::default();
+        for (txid, entry, record) in evicted {
+            if let Some(record) = record {
+                unbroadcast.insert(txid, record);
+            }
+            entries.insert(txid, entry);
+        }
         let order = Self::topological_order(&entries);
         let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
         {
@@ -8064,6 +8073,9 @@ impl Mempool {
                     let size = bitcoin::consensus::serialize(&entry.tx).len();
                     inner.account_insert(entry.scope, size);
                     inner.entries.insert(txid, entry);
+                    if let Some(record) = unbroadcast.remove(&txid) {
+                        inner.unbroadcast.insert(txid, record);
+                    }
                 } else if entry.scope.is_acting() {
                     gone.push((txid, entry.scope, left_at.get(&txid).copied().unwrap_or(0)));
                 }
