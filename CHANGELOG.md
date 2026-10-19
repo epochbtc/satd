@@ -141,6 +141,9 @@ item below is (or will be) written up in full in the in-development
   Core's BIP 94 floor at a retarget height: no more than 600 seconds before
   the parent. A testnet4 block stamped at the advertised `mintime` could fail
   as a timewarp.
+- A custom signet (`-signetchallenge`) no longer uses the default signet's
+  checkpoints or assumevalid block. Its block at height 50,000 failed as a
+  checkpoint mismatch, and the node stopped following the chain.
 
 ## Releases
 
