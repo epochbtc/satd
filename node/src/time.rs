@@ -130,7 +130,9 @@ mod tests {
     /// future-block check only rejects timestamps that are too new, so a past
     /// mock is strictly stricter than the real clock and cannot make a
     /// concurrent test pass something it should have failed. Do not mock
-    /// forward here.
+    /// forward here. And only *just* in the past: a transaction a concurrent
+    /// test admits under the mock takes the mock as its entry time, and one
+    /// years old is expired by the next acceptance once the mock is cleared.
     #[test]
     fn mock_replaces_the_system_clock_and_can_be_cleared() {
         let _clock = CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -138,9 +140,10 @@ mod tests {
         let real = now_secs();
         assert!(real > 1_600_000_000, "system clock looks wrong: {real}");
 
-        set_mock_time(Some(1_296_688_602));
-        assert_eq!(now_secs(), 1_296_688_602);
-        assert_eq!(mock_time(), Some(1_296_688_602));
+        let mock = real - 60;
+        set_mock_time(Some(mock));
+        assert_eq!(now_secs(), mock);
+        assert_eq!(mock_time(), Some(mock));
 
         // A mock does not advance on its own; tests depend on that.
         assert_eq!(now_secs(), now_secs());

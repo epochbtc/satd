@@ -269,7 +269,7 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains the flag. |
-| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB, measured by the serialized size of the transactions held. Bitcoin Core measures its memory use instead, so at the same setting satd holds more transactions than Core and uses more memory than the figure. |
+| `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB, measured by the serialized size of the transactions held. Bitcoin Core measures its memory use instead, so at the same setting satd holds more transactions than Core and uses more memory than the figure. At least 5, or 0, as in Core: a smaller value refuses to start. |
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |

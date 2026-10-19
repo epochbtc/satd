@@ -2917,6 +2917,17 @@ impl Config {
             .maxmempool
             .or_else(|| file_get("maxmempool").and_then(|v| v.parse().ok()))
             .unwrap_or(300); // MB
+        // Core's floor (`CTxMemPool` `Flatten`): room for 40 of the largest
+        // cluster, 101 kvB by default, rounded up to whole MB. A pool smaller
+        // than one package would trim away what it just admitted. Zero is
+        // Core's too, and allowed.
+        const MIN_MAXMEMPOOL_BYTES: usize = 101_000 * 40;
+        if maxmempool > 0 && maxmempool.saturating_mul(1_000_000) < MIN_MAXMEMPOOL_BYTES {
+            return Err(format!(
+                "-maxmempool must be at least {} MB",
+                MIN_MAXMEMPOOL_BYTES.div_ceil(1_000_000)
+            ));
+        }
 
         let quarantinemempool = cli
             .quarantinemempool
@@ -10225,6 +10236,29 @@ blockmintxfee=0.00001
         let cli = CliArgs::try_parse_from(args).expect("repeatable options must parse");
         assert_eq!(cli.bind.len(), 2, "-bind must accumulate: {:?}", cli.bind);
         assert_eq!(cli.connect.len(), 2, "-connect must accumulate");
+    }
+
+    /// Core refuses a `-maxmempool` too small to hold 40 of its largest
+    /// clusters, with this message, and allows 0. satd accepted any size.
+    #[test]
+    fn maxmempool_below_cores_floor_is_refused() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |mb: &str| {
+            Config::from_cli(
+                CliArgs::try_parse_from([
+                    "satd",
+                    "--regtest",
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    &format!("--maxmempool={mb}"),
+                ])
+                .unwrap(),
+            )
+        };
+        assert_eq!(load("4").err().as_deref(), Some("-maxmempool must be at least 5 MB"));
+        assert_eq!(load("5").expect("Core's floor is allowed").maxmempool, 5);
+        assert_eq!(load("0").expect("Core allows 0").maxmempool, 0);
     }
 
     /// Core's stock Tor configuration must load: the two bare entries are
