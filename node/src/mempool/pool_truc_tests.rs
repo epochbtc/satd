@@ -510,3 +510,81 @@ fn a_package_member_tried_alone_may_evict_a_sibling() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Admission itself refuses a sibling eviction to a package member, so a
+/// member let in below the floors never takes anything out of the pool it
+/// could not put back if the package then fails. The package's own TRUC
+/// check normally stops such a member first; this is the admission's half.
+#[test]
+fn a_package_member_never_evicts_a_sibling_on_admission() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 2, 1));
+    let half = parent.output[1].value.to_sat();
+    let sibling = v3(spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2));
+    for tx in [&parent, &sibling] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+    let rich = v3(spend(&[out(parent.compute_txid(), 1)], half, 20_000, 1, 3));
+
+    let admitted = mp.accept_transaction_led(
+        rich.clone(),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+        Vec::new(),
+        &mut PackageAdmit { no_sibling_eviction: true, ..Default::default() },
+    );
+
+    assert_eq!(
+        admitted.expect_err("refused").state_string(),
+        format!("TRUC-violation, tx {} would exceed descendant count limit", id(&parent))
+    );
+    assert_eq!(pool(&mp), txids(&[&parent, &sibling]));
+    // The same transaction on its own evicts the sibling.
+    accept(&mp, &cs, &rich).expect("sibling eviction");
+    assert_eq!(pool(&mp), txids(&[&parent, &rich]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without full RBF, a conflict must signal replaceability, but a TRUC
+/// transaction always may be replaced (BIP 431), and a sibling evicted by the
+/// TRUC rules is not asked to signal at all. Only a reorg can leave a TRUC
+/// parent a sibling that is not itself TRUC, and so not replaceable already.
+#[test]
+fn truc_transactions_are_replaceable_without_signalling() {
+    let (cs, mp, dir) = env(&[1, 2, 3]);
+    mp.config.write().full_rbf = false;
+    // `spend` builds every input with a final sequence: no BIP 125 signal.
+    let plain = spend(&[prev(3)], COIN_VALUE, 1_000, 1, 1);
+    accept(&mp, &cs, &plain).expect("admitted");
+    let plain_replacement = spend(&[prev(3)], COIN_VALUE, 5_000, 1, 2);
+    assert!(
+        matches!(accept(&mp, &cs, &plain_replacement), Err(MempoolError::ConflictingSpend)),
+        "the fixture needs a pool that asks a conflict to signal"
+    );
+
+    // A direct replacement of a TRUC child.
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1));
+    let child = v3(spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 1_000, 1, 2));
+    for tx in [&parent, &child] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+    let replacement = v3(spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 5_000, 1, 3));
+    accept(&mp, &cs, &replacement).expect("a TRUC conflict is replaceable");
+
+    // A sibling eviction of a version 2 child a reorg returned.
+    let reorged_parent = v3(spend(&[prev(2)], COIN_VALUE, 1_000, 2, 4));
+    let half = reorged_parent.output[1].value.to_sat();
+    let plain_child = spend(&[out(reorged_parent.compute_txid(), 0)], reorged_parent.output[0].value.to_sat(), 1_000, 1, 5);
+    for tx in [&reorged_parent, &plain_child] {
+        mp.accept_reorged_transaction(tx.clone(), &cs, &NoopVerifier).expect("a reorg skips TRUC");
+    }
+    let sibling = v3(spend(&[out(reorged_parent.compute_txid(), 1)], half, 20_000, 1, 6));
+    accept(&mp, &cs, &sibling).expect("an evicted sibling need not signal");
+
+    assert_eq!(pool(&mp), txids(&[&plain, &parent, &replacement, &reorged_parent, &sibling]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
