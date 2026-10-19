@@ -447,6 +447,25 @@ impl Store for ControllableStore {
         self.served(rows.len());
         rows
     }
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrFundingKey, u64)> {
+        self.addr_read();
+        let rows = self.inner.iter_addr_funding_limited(sh, limit);
+        self.served(rows.len());
+        rows
+    }
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrSpendingKey, OutPoint)> {
+        let rows = self.inner.iter_addr_spending_limited(sh, limit);
+        self.served(rows.len());
+        rows
+    }
     fn addr_rows_desc(
         &self,
         sh: &Scripthash,

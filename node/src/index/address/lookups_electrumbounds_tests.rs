@@ -255,3 +255,194 @@ fn a_deep_page_resolves_only_the_rows_near_it() {
         assert_eq!(page, whole.confirmed_txs_newest_first(&SH, cursor, 25).unwrap());
     }
 }
+
+// ── History cap: refuse an over-long history after reading O(cap) ────
+
+/// The distinct confirmed transactions of `SH`, from the unbounded read.
+fn distinct_count(index: &RocksAddressIndex) -> usize {
+    index
+        .confirmed_distinct_history_limited(&SH, usize::MAX)
+        .unwrap()
+        .len()
+}
+
+/// The cap counts distinct transactions, not rows: the mixed fixture has
+/// transactions with several funding rows and transactions that both fund
+/// and spend, so a row count would refuse a history at the cap.
+#[test]
+fn check_history_cap_counts_transactions_and_refuses_one_past_the_cap() {
+    let (index, _) = chain(60, 4, mixed);
+    let n = distinct_count(&index);
+    let rows = index.confirmed_history(&SH).unwrap().len();
+    assert!(rows > n, "fixture premise: more rows ({rows}) than transactions ({n})");
+
+    assert!(index.check_history_cap(&SH, n).is_ok(), "a history at the cap is served");
+    assert!(index.check_history_cap(&SH, n + 1).is_ok());
+    assert!(matches!(
+        index.check_history_cap(&SH, n - 1),
+        Err(IndexError::HistoryTooLarge { cap }) if cap == n - 1
+    ));
+    assert!(matches!(
+        index.check_history_cap(&SH, 0),
+        Err(IndexError::HistoryTooLarge { cap: 0 })
+    ));
+    // `OTHER`'s rows are not `SH`'s, and an unknown script has none.
+    assert!(index.check_history_cap(&[0x77; 32], 0).is_ok());
+}
+
+/// The point of the cap: refusing a long history reads about `cap` rows
+/// and resolves none of them. Before, the Electrum `get_history` refusal
+/// read and resolved every row of the history first, and the status,
+/// balance and Esplora stats read it with no cap at all.
+#[test]
+fn refusing_a_long_history_reads_only_about_cap_rows() {
+    let (index, controls) = chain(3_000, 2, |_, pos| {
+        if pos == 1 { Touch::Pays(1) } else { Touch::Nothing }
+    });
+    assert_eq!(distinct_count(&index), 3_000);
+
+    controls.reset_ordinal_read_counts();
+    assert!(matches!(
+        index.check_history_cap(&SH, 100),
+        Err(IndexError::HistoryTooLarge { cap: 100 })
+    ));
+    let (read, resolved) = (controls.addr_rows_served(), controls.ordinals_resolved());
+    assert!(
+        read <= 101 && resolved == 0,
+        "refusing at cap 100 read {read} rows and resolved {resolved} ordinals of a \
+         3000-transaction history"
+    );
+
+    // The Electrum path: the status and `get_history` build their rows
+    // through `capped_history_rows`.
+    controls.reset_ordinal_read_counts();
+    let refused = node_index::capped_history_rows(&index, &SH, 100, |_| None);
+    assert!(matches!(refused, Err(IndexError::HistoryTooLarge { cap: 100 })));
+    let (read, resolved) = (controls.addr_rows_served(), controls.ordinals_resolved());
+    assert!(
+        read <= 101 && resolved == 0,
+        "capped_history_rows at cap 100 read {read} rows and resolved {resolved} ordinals"
+    );
+}
+
+/// The count runs over several `addr_rows_desc` runs once the cap is past
+/// one run's worth of transactions, and stops in the run that passes it.
+#[test]
+fn the_count_spans_several_runs_and_stops_past_the_cap() {
+    let total = crate::storage::ADDR_COUNT_RUN_TXS as u32 + 700;
+    let (index, controls) = chain(total, 1, |_, _| Touch::Pays(1));
+    let cap = crate::storage::ADDR_COUNT_RUN_TXS + 300;
+
+    controls.reset_ordinal_read_counts();
+    assert!(matches!(
+        index.check_history_cap(&SH, cap),
+        Err(IndexError::HistoryTooLarge { .. })
+    ));
+    assert_eq!(
+        controls.addr_rows_served(),
+        cap as u64 + 1,
+        "the count must stop at the first transaction past the cap"
+    );
+    assert!(index.check_history_cap(&SH, total as usize).is_ok());
+}
+
+/// Under the cap, the capped rows are the uncapped rows: same transactions,
+/// same order, nothing dropped.
+#[test]
+fn capped_history_rows_under_the_cap_match_the_uncapped_rows() {
+    let (index, _) = chain(60, 4, mixed);
+    let n = distinct_count(&index);
+    let uncapped = node_index::history_rows(&index, &SH, usize::MAX, |_| None).unwrap();
+    assert_eq!(uncapped.len(), n);
+    assert_eq!(
+        node_index::capped_history_rows(&index, &SH, n, |_| None).unwrap(),
+        uncapped
+    );
+    assert!(matches!(
+        node_index::capped_history_rows(&index, &SH, n - 1, |_| None),
+        Err(IndexError::HistoryTooLarge { .. })
+    ));
+}
+
+/// `confirmed_history`'s order is `(height, display txid, funding first)`.
+/// The sort key now compares reversed bytes instead of building hex strings;
+/// the order must be the one the strings gave.
+#[test]
+fn confirmed_history_order_is_the_display_string_order() {
+    let (index, _) = chain(60, 4, mixed);
+    let got = index.confirmed_history(&SH).unwrap();
+    // `got` is in the old comparator's order exactly when sorting it by
+    // that comparator leaves it unchanged.
+    let mut expected = got.clone();
+    expected.sort_by(|a, b| {
+        let key = |e: &HistoryEntry| {
+            (e.height(), e.txid().to_string(), matches!(e, HistoryEntry::Spending { .. }))
+        };
+        key(a).cmp(&key(b))
+    });
+    assert_eq!(got, expected);
+    // Fixture premise: some block holds several distinct txids.
+    assert!(got.windows(2).any(|w| w[0].height() == w[1].height() && w[0].txid() != w[1].txid()));
+}
+
+/// What `get_first_use` answered before: the lowest `(height, txid)` over
+/// the whole confirmed history.
+fn first_use_from_whole_history(index: &RocksAddressIndex) -> Option<(u32, Txid)> {
+    index
+        .confirmed_history(&SH)
+        .unwrap()
+        .iter()
+        .min_by_key(|e| (e.height(), e.txid()))
+        .map(|e| (e.height(), e.txid()))
+}
+
+#[test]
+fn first_confirmed_tx_is_the_lowest_txid_of_the_first_block() {
+    // The first block holds three of `SH`'s transactions, and `txid` runs
+    // against block position, so the answer is the LAST of them by
+    // position.
+    let (index, _) = chain(20, 4, |height, pos| match (height, pos) {
+        (1, 1..=3) => Touch::Pays(1),
+        (1, _) => Touch::Nothing,
+        _ => mixed(height, pos),
+    });
+    let got = index.first_confirmed_tx(&SH).unwrap();
+    assert_eq!(got, Some((1, txid(1, 3))));
+    assert_eq!(got, first_use_from_whole_history(&index));
+
+    // An empty history has no first use.
+    assert_eq!(index.first_confirmed_tx(&[0x77; 32]).unwrap(), None);
+
+    // The first block's rows outnumber the first read window: a
+    // transaction with many outputs, then a lower txid in the same block.
+    let (index, _) = chain(20, 3, |height, pos| match (height, pos) {
+        (1, 0) => Touch::Pays(40),
+        (1, 2) => Touch::Pays(1),
+        (1, _) => Touch::Nothing,
+        _ => Touch::Pays(1),
+    });
+    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), Some((1, txid(1, 2))));
+    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), first_use_from_whole_history(&index));
+
+    // A script whose first row is a spend.
+    let (index, _) = chain(10, 2, |height, pos| match (height, pos) {
+        (3, 1) => Touch::Spends,
+        (5, _) => Touch::Pays(1),
+        _ => Touch::Nothing,
+    });
+    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), Some((3, txid(3, 1))));
+}
+
+/// `get_first_use` read and resolved the whole history to report its first
+/// row; it now reads the first block's rows.
+#[test]
+fn first_confirmed_tx_reads_only_the_first_rows_of_a_long_history() {
+    let (index, controls) = chain(3_000, 2, |_, pos| {
+        if pos == 1 { Touch::Pays(1) } else { Touch::Nothing }
+    });
+    controls.reset_ordinal_read_counts();
+    let got = index.first_confirmed_tx(&SH).unwrap();
+    let read = controls.addr_rows_served();
+    assert_eq!(got, Some((1, txid(1, 1))));
+    assert!(read <= 32, "first use read {read} rows of a 3000-transaction history");
+}

@@ -64,6 +64,13 @@ item below is (or will be) written up in full in the in-development
   from every one of them. The next announcer is asked when the request times
   out (60 s), the peer answers `notfound`, or it disconnects; inbound and
   txid-only announcements wait Core's 2 s delays.
+- Electrum and Esplora scripthash queries read the whole history before
+  applying any cap, so one request for a busy scripthash could use GBs of
+  memory. `get_history`, `get_balance`, `listunspent`, `subscribe` and the
+  Esplora address stats and `/utxo` now stop counting at 200,000
+  transactions and refuse a longer history (Electrum `history too large`,
+  Esplora 400 `Too many history entries`); `get_first_use` reads only the
+  first block.
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
   does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,

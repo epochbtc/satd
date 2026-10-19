@@ -14,7 +14,9 @@
 //! for the initial response.
 
 use node::mempool::pool::Mempool;
-use node_index::{AddressIndex, IndexError, MempoolTxFacts, history_rows, history_status_hash};
+use node_index::{
+    AddressIndex, IndexError, MempoolTxFacts, capped_history_rows, history_status_hash,
+};
 
 use crate::handlers::blockchain::mempool_tx_has_unconfirmed_inputs;
 use crate::types::ScripthashHex;
@@ -33,12 +35,20 @@ use crate::types::ScripthashHex;
 /// response as it arrived. `mempool` supplies each mempool row's height,
 /// `0` for unconfirmed-no-deps and `-1` for unconfirmed-with-deps
 /// (`romanz/electrs`'s `Height::as_i64`).
+///
+/// A history over `cap` transactions is
+/// `Err(IndexError::HistoryTooLarge)`, found after reading at most
+/// `cap + 1` of them: its status could only be computed by reading the
+/// whole history. `get_history` refuses the same history, so a client
+/// could not check the status anyway. ElectrumX and Fulcrum refuse such a
+/// subscribe too.
 pub fn compute_status_hash(
     idx: &dyn AddressIndex,
     mempool: &Mempool,
     sh: ScripthashHex,
+    cap: usize,
 ) -> Result<[u8; 32], IndexError> {
-    let rows = history_rows(idx, &sh.0, usize::MAX, |txid| mempool_facts(mempool, txid))?;
+    let rows = capped_history_rows(idx, &sh.0, cap, |txid| mempool_facts(mempool, txid))?;
     Ok(history_status_hash(&rows))
 }
 
@@ -152,7 +162,7 @@ mod tests {
     fn empty_history_returns_zero_sentinel() {
         let idx = FakeIndex::default();
         let mp = empty_mempool();
-        let h = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32])).unwrap();
+        let h = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32]), usize::MAX).unwrap();
         assert_eq!(h, [0u8; 32]);
         assert!(status_hash_to_json(h).is_none());
     }
@@ -169,7 +179,7 @@ mod tests {
             amount_sat: 1000,
         });
 
-        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32])).unwrap();
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xab; 32]), usize::MAX).unwrap();
         let expected = node_index::status_hash(&[(100, txid)]);
         assert_eq!(got, expected);
         assert!(status_hash_to_json(got).is_some());
@@ -195,7 +205,7 @@ mod tests {
             .lock()
             .push(MempoolHistoryEntry { txid: txid_mp });
 
-        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xcc; 32])).unwrap();
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xcc; 32]), usize::MAX).unwrap();
         assert_eq!(got, node_index::status_hash(&[(100, txid_conf)]));
         assert_ne!(
             got,
@@ -230,7 +240,7 @@ mod tests {
             },
         ]);
 
-        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xee; 32])).unwrap();
+        let got = compute_status_hash(&idx, &mp, ScripthashHex([0xee; 32]), usize::MAX).unwrap();
         let single = node_index::status_hash(&[(200, txid)]);
         let double = node_index::status_hash(&[(200, txid), (200, txid)]);
         assert_eq!(got, single, "(height, txid) should dedupe to one row");
@@ -244,7 +254,7 @@ mod tests {
             ..Default::default()
         };
         let mp = empty_mempool();
-        let result = compute_status_hash(&idx, &mp, ScripthashHex([0; 32]));
+        let result = compute_status_hash(&idx, &mp, ScripthashHex([0; 32]), usize::MAX);
         assert!(matches!(result, Err(IndexError::Disabled)));
     }
 

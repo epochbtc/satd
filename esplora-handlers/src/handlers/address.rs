@@ -260,10 +260,18 @@ fn build_address_info(
 }
 
 /// Chain stats — derived purely from confirmed-history rows.
+///
+/// The stats sum over the whole confirmed history, so a history over
+/// `max_history_entries` transactions is refused (400 `Too many history
+/// entries`) by a count that stops at the first transaction past the cap,
+/// before the history is read.
 fn build_chain_stats(
     state: &EsploraState,
     sh: &Scripthash,
 ) -> EsploraResult<AddressStatsJson> {
+    state
+        .address_index
+        .check_history_cap(sh, state.config.max_history_entries)?;
     let history = state.address_index.confirmed_history(sh)?;
     Ok(compute_chain_stats_from_history(&history))
 }
@@ -335,6 +343,10 @@ fn compute_chain_stats_from_history(history: &[HistoryEntry]) -> AddressStatsJso
 #[cfg(test)]
 #[path = "address_esplorapaging_tests.rs"]
 mod esplorapaging_tests;
+
+#[cfg(test)]
+#[path = "address_historycap_tests.rs"]
+mod historycap_tests;
 
 #[cfg(test)]
 mod tests {
@@ -725,6 +737,11 @@ fn build_utxos(
     let mempool_spends: std::collections::HashSet<OutPoint> =
         collect_mempool_spent_outpoints(state, &mempool_entries);
 
+    // The UTXO walk checks every funding row for a live coin, so its cost
+    // follows the history: refuse a history over the cap before it starts.
+    state
+        .address_index
+        .check_history_cap(sh, state.config.max_history_entries)?;
     let utxos = state.address_index.utxos(sh)?;
     let mut out = Vec::with_capacity(utxos.len());
     for u in utxos {

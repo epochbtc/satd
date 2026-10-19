@@ -91,6 +91,12 @@ impl RocksAddressIndex {
         self.subs.clone()
     }
 
+    /// The history cap the subscription status recompute applies
+    /// ([`AddressIndexConfig::max_history_entries`]).
+    pub(crate) fn max_history_entries(&self) -> usize {
+        self.cfg.max_history_entries
+    }
+
     /// Record that a status recompute was refused by the serving gate.
     pub(crate) fn note_status_recompute_owed(&self) {
         self.status_recompute_owed
@@ -169,18 +175,18 @@ impl AddressIndex for RocksAddressIndex {
                 prev_outpoint: prev,
             });
         }
-        out.sort_by(|a, b| {
-            let key_a = (
-                a.height(),
-                a.txid().to_string(),
-                matches!(a, HistoryEntry::Spending { .. }),
-            );
-            let key_b = (
-                b.height(),
-                b.txid().to_string(),
-                matches!(b, HistoryEntry::Spending { .. }),
-            );
-            key_a.cmp(&key_b)
+        // `(height, display txid, is_spending)`. The display hex is the
+        // reversed bytes, and hex preserves byte order, so comparing the
+        // reversed bytes is the hex-string order without building two
+        // strings per comparison.
+        out.sort_by_key(|e| {
+            let mut display = bitcoin::hashes::Hash::to_byte_array(e.txid());
+            display.reverse();
+            (
+                e.height(),
+                display,
+                matches!(e, HistoryEntry::Spending { .. }),
+            )
         });
         // M3 truncate-after-merge so the public contract is exact.
         // Saturating math guards `limit = usize::MAX` (unbounded).
@@ -253,8 +259,10 @@ impl AddressIndex for RocksAddressIndex {
         // the full per-scripthash history into Vec; the M4 raw-row
         // bound is intentionally NOT applied here because shrinking
         // the scan window would re-introduce the silent-truncation
-        // bug. Tighter bounding would need a streaming Store API,
-        // which is queued as a separate cleanup.
+        // bug. The public surfaces bound the work instead by calling
+        // `check_history_cap` first, which counts the history's
+        // transactions from a streaming read and refuses past the cap
+        // before this read runs.
         self.check_serving()?;
 
         let funding = self.store.iter_addr_funding(sh);
@@ -387,6 +395,48 @@ impl AddressIndex for RocksAddressIndex {
         Ok(Some(walked.into_iter().skip(start).take(limit).collect()))
     }
 
+    fn check_history_cap(&self, sh: &Scripthash, cap: usize) -> Result<(), IndexError> {
+        self.check_serving()?;
+        // Counts ordinals from the raw rows, newest first, and stops at the
+        // first one past `cap`: no row is resolved, and no more than
+        // `cap + 1` transactions' rows are read.
+        if self.store.addr_tx_count_capped(sh, cap) > cap {
+            return Err(IndexError::HistoryTooLarge { cap });
+        }
+        Ok(())
+    }
+
+    fn first_confirmed_tx(
+        &self,
+        sh: &Scripthash,
+    ) -> Result<Option<(u32, bitcoin::Txid)>, IndexError> {
+        self.check_serving()?;
+        // Each family's rows leave the store in ordinal order, which is
+        // chain order, so the first rows read are the script's first
+        // block. That block can hold several of its transactions, and the
+        // answer is the lowest txid among them: read the first rows in
+        // growing windows until one reaches past the first block (or the
+        // rows run out), so only that block's rows are ever resolved.
+        let funding = first_in_lowest_block(|n| {
+            self.store
+                .iter_addr_funding_limited(sh, n)
+                .into_iter()
+                .map(|(k, _)| (k.height, k.txid))
+                .collect()
+        });
+        let spending = first_in_lowest_block(|n| {
+            self.store
+                .iter_addr_spending_limited(sh, n)
+                .into_iter()
+                .map(|(k, _)| (k.height, k.txid))
+                .collect()
+        });
+        Ok(match (funding, spending) {
+            (Some(f), Some(s)) => Some(f.min(s)),
+            (f, s) => f.or(s),
+        })
+    }
+
     fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         self.utxos_limited(sh, usize::MAX)
     }
@@ -441,6 +491,32 @@ impl AddressIndex for RocksAddressIndex {
         self.subs.seed_status(sh, status_hash);
     }
 }
+
+/// The lowest `(height, txid)` of one address family, from `read(n)`: the
+/// family's first `n` rows in chain order, returned sorted by
+/// `(height, txid, ..)`. The first rows read always include the family's
+/// lowest ordinal, so the first sorted row has the lowest height; the
+/// window is grown until it holds a row above that height or the family
+/// ran out, at which point every row of the lowest block is in it and the
+/// first sorted row is the answer.
+fn first_in_lowest_block(
+    read: impl Fn(usize) -> Vec<(u32, bitcoin::Txid)>,
+) -> Option<(u32, bitcoin::Txid)> {
+    let mut n = FIRST_USE_WINDOW;
+    loop {
+        let rows = read(n);
+        let first = *rows.first()?;
+        let complete = rows.len() < n || rows.last().is_some_and(|r| r.0 > first.0);
+        if complete || n == usize::MAX {
+            return Some(first);
+        }
+        n = n.saturating_mul(4);
+    }
+}
+
+/// First window of [`first_in_lowest_block`]: most scripts' first block
+/// holds one or two of their rows.
+const FIRST_USE_WINDOW: usize = 16;
 
 /// How many of `walked` are settled and come after `cursor` in
 /// `(height, txid)` order. `walked` is in walk order, so its height never

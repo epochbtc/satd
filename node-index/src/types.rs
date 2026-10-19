@@ -28,6 +28,16 @@ pub enum IndexError {
     Incomplete,
     #[error("storage error: {0}")]
     Storage(String),
+    /// The scripthash's history holds more than `cap` transactions, so
+    /// the request was refused rather than computed. Returned by the
+    /// capped reads ([`AddressIndex::check_history_cap`] and
+    /// [`crate::history::capped_history_rows`]), which stop reading once
+    /// the cap is passed: serving a history that size would cost memory
+    /// and reads in proportion to the whole history.
+    ///
+    /// [`AddressIndex::check_history_cap`]: crate::AddressIndex::check_history_cap
+    #[error("history too large (more than {cap} transactions)")]
+    HistoryTooLarge { cap: usize },
 }
 
 /// One confirmed history row: either a funding or a spending event.

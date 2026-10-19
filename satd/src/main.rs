@@ -3860,6 +3860,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 } else {
                     None
                 },
+                max_history_entries: node_index::DEFAULT_MAX_HISTORY_ENTRIES,
             };
             // Semaphore sized for SSE only — distinct from the request
             // concurrency layer which doesn't bound long-lived streams

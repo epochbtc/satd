@@ -55,6 +55,21 @@ its workers: a request that reads a long history does not hold up other
 connections, Esplora, events gRPC or `/metrics`, and the request timeout
 answers on time.
 
+### History cap
+
+A scripthash whose history holds more than 200,000 transactions is refused
+rather than served. `blockchain.scripthash.get_history`, `get_balance`,
+`listunspent` and `subscribe` answer with code `2`, `history too large (cap =
+200000 entries)`, as ElectrumX ("history too large") and Fulcrum ("exceeds
+max history") refuse the same methods above their `max_history`. For
+`get_history` and `subscribe` the cap counts confirmed plus mempool
+transactions. The refusal counts the history and stops at the first
+transaction past the cap, so it costs a bounded read however long the
+history is; a refused `subscribe` is not kept. A subscribed scripthash whose
+history grows past the cap gets no further status notifications.
+`get_first_use` and `get_mempool` are not capped: they read only the first
+block and the mempool. The cap is not configurable.
+
 ## Supported methods
 
 A scripthash is the SHA-256 of an output `scriptPubKey`, reversed (hex),
@@ -285,6 +300,8 @@ backend.
   `get_history`, `listunspent` and `get_balance` return exactly the rows,
   in exactly the order, that they did before. Nothing on the Electrum
   wire carries an ordinal.
+- **Histories over the cap are refused**, not truncated: see
+  [History cap](#history-cap).
 - satd advertises a single protocol version (`protocol_min == protocol_max
   == 1.4`); it does not negotiate a range.
 - `server.peers.subscribe` returns an empty list: satd does not participate

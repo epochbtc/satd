@@ -135,9 +135,13 @@ impl JsonRpcError {
         Self::new(1, format!("batch too large: {requests} requests (cap = {cap})"))
     }
 
-    /// History (or listunspent) result would exceed the per-request
-    /// cap. Code `2` (DaemonError-style — semantic limit, dynamic
-    /// message). Logged at warn (operator-actionable cap).
+    /// The scripthash's history is over the per-request cap
+    /// (`get_history`, `get_balance`, `listunspent`, `subscribe`), so the
+    /// request is refused rather than computed — ElectrumX ("history too
+    /// large") and Fulcrum ("exceeds max history") refuse the same
+    /// requests above their `max_history`. Code `2` (DaemonError-style —
+    /// semantic limit, dynamic message). Logged at warn
+    /// (operator-actionable cap).
     pub fn history_too_large(limit: usize) -> Self {
         tracing::warn!(target = "electrum::rpc", limit, "history too large — rejecting");
         Self::new(2, format!("history too large (cap = {limit} entries)"))
@@ -160,6 +164,7 @@ impl JsonRpcError {
                 Self::internal("address index is incomplete — restart with --reindex-chainstate")
             }
             node_index::IndexError::Storage(s) => Self::internal(format!("storage: {s}")),
+            node_index::IndexError::HistoryTooLarge { cap } => Self::history_too_large(cap),
         }
     }
 

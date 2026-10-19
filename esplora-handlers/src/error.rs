@@ -31,6 +31,12 @@ pub enum EsploraError {
     /// from the node-wide `addrindexsubscriptions` cap (which is `ServiceUnavailable`/503).
     #[error("watch-set quota exceeded")]
     WatchQuotaExceeded,
+    /// 400: the script's history is over the per-request cap, so the
+    /// request is refused rather than computed. mempool.space's electrs
+    /// answers the same way (400, "Too many history entries") above its
+    /// history limit.
+    #[error("Too many history entries (more than {0} transactions)")]
+    HistoryTooLarge(usize),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -49,6 +55,7 @@ impl From<node_index::IndexError> for EsploraError {
             // redundant.)
             node_index::IndexError::Incomplete => EsploraError::ServiceUnavailable,
             node_index::IndexError::Storage(s) => EsploraError::Internal(s),
+            node_index::IndexError::HistoryTooLarge { cap } => EsploraError::HistoryTooLarge(cap),
         }
     }
 }
@@ -59,6 +66,7 @@ impl IntoResponse for EsploraError {
             EsploraError::NotFound => StatusCode::NOT_FOUND,
             EsploraError::NotFoundReason(_) => StatusCode::NOT_FOUND,
             EsploraError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            EsploraError::HistoryTooLarge(_) => StatusCode::BAD_REQUEST,
             EsploraError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             EsploraError::IndexDisabled => StatusCode::SERVICE_UNAVAILABLE,
             EsploraError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,

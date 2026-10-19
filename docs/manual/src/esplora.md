@@ -108,7 +108,10 @@ format differs from Electrum's.
 | GET | `/address/:address/utxo` <br> `/scripthash/:hash/utxo` | JSON: live UTXOs (confirmed + mempool funding) with `{txid, vout, value, status}`. |
 
 Wrong-network addresses return 400, as do malformed addresses and bad
-scripthash hex (non-hex characters or wrong length).
+scripthash hex (non-hex characters or wrong length). The stats and `utxo`
+routes also return 400 `Too many history entries` for a script with more
+than 200,000 confirmed transactions; see
+[High-history scripts](#compatibility-statement).
 
 ### Mempool & Fee
 
@@ -274,10 +277,17 @@ blockstream.info and mempool.space within these constraints:
   confirmed part of `/address/:addr/txs` (with or without `?after_txid=`) read
   the history from the cursor down and stop once the page is complete, so a
   page costs about the same however long the history is. `/address/:addr`
-  (the stats) and `/address/:addr/utxo` still read the script's whole history
-  on every request. For high-activity scripts (exchange hot wallets, mining
-  pools, popular donation addresses) such a request can cost multi-MB
-  allocations and sub-second latency. Every address and scripthash route
+  (the stats) and `/address/:addr/utxo` read the script's whole history, so
+  they are capped: a script whose confirmed history holds more than 200,000
+  transactions gets 400 `Too many history entries (more than 200000
+  transactions)`, as mempool.space's electrs answers above its history
+  limit. The refusal counts the history's transactions and stops at the
+  first one past the cap, so it costs a bounded read however long the
+  history is; below the cap the answers are unchanged. The cap is not
+  configurable; page such a script's history through `/txs/chain` instead.
+  Under the cap, a high-activity script (exchange hot wallet, mining pool,
+  popular donation address) can still cost multi-MB allocations and
+  sub-second latency per request. Every address and scripthash route
   runs its reads on a blocking thread rather than on the API runtime's
   workers, so a slow read does not hold up other requests and
   `--esplorarequesttimeout` answers 503 on time; reads still running after a

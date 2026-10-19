@@ -16,6 +16,15 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 /// `confirmed_history` query.
 pub const DEFAULT_PER_CHANNEL_CAPACITY: usize = 32;
 
+/// Default cap on the transactions in one scripthash's history that a
+/// public read surface (Electrum `get_history` / `get_balance` /
+/// `listunspent` / `subscribe` status, Esplora address stats and UTXO
+/// list) will serve. Above it the request is refused with
+/// [`IndexError::HistoryTooLarge`](crate::IndexError::HistoryTooLarge)
+/// after reading at most `cap + 1` transactions' rows. 200,000 is the
+/// Electrum surface's long-standing `get_history` cap.
+pub const DEFAULT_MAX_HISTORY_ENTRIES: usize = 200_000;
+
 #[derive(Clone, Debug)]
 pub struct AddressIndexConfig {
     /// Whether per-block emission of address-index rows is active.
@@ -25,6 +34,12 @@ pub struct AddressIndexConfig {
     pub max_subscriptions: usize,
     /// Buffer depth of each per-scripthash broadcast channel.
     pub per_channel_capacity: usize,
+    /// History cap for the subscription status recompute: a subscribed
+    /// scripthash whose history grows past it gets no further status
+    /// pushes (its status cannot be computed without reading the whole
+    /// history). Defaults to [`DEFAULT_MAX_HISTORY_ENTRIES`], the same
+    /// cap the Electrum handlers apply.
+    pub max_history_entries: usize,
 }
 
 impl Default for AddressIndexConfig {
@@ -33,6 +48,7 @@ impl Default for AddressIndexConfig {
             enabled: true,
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             per_channel_capacity: DEFAULT_PER_CHANNEL_CAPACITY,
+            max_history_entries: DEFAULT_MAX_HISTORY_ENTRIES,
         }
     }
 }

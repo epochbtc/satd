@@ -602,6 +602,12 @@ pub(crate) fn cut_addr_run(mut rows: Vec<AddrRowKey>, min_txs: usize) -> AddrRow
     AddrRowsDesc { rows, next_below }
 }
 
+/// Transactions per [`Store::addr_rows_desc`] run that
+/// [`Store::addr_tx_count_capped`] asks for: large enough that counting to
+/// the Electrum cap takes a handful of runs, small enough that one run's
+/// rows stay a few hundred KiB.
+pub const ADDR_COUNT_RUN_TXS: usize = 16_384;
+
 /// Abstract storage backend for block index, UTXO set, and metadata.
 pub trait Store: Send + Sync {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry>;
@@ -1003,6 +1009,40 @@ pub trait Store: Send + Sync {
             rows,
             next_below: None,
         }
+    }
+
+    /// How many distinct transactions `sh`'s address rows name, counted no
+    /// further than `cap + 1`: `cap + 1` means "more than `cap`". The
+    /// refusal check of the public history surfaces
+    /// (`AddressIndex::check_history_cap`).
+    ///
+    /// Reads [`addr_rows_desc`](Self::addr_rows_desc) runs newest first and
+    /// stops at the first transaction past `cap`, so the work and memory
+    /// are bounded by the cap (plus one run), never by the history. Rows
+    /// are only counted, not resolved: an ordinal is one transaction.
+    /// Every backend with a seeking `addr_rows_desc` (RocksDB and the
+    /// `CoinCache` over it, which merges its unflushed rows) gets the
+    /// bound from this default.
+    fn addr_tx_count_capped(&self, sh: &Scripthash, cap: usize) -> usize {
+        let want = cap.saturating_add(1);
+        let mut count = 0usize;
+        let mut below: Option<u64> = None;
+        while count < want {
+            let page = (want - count).min(ADDR_COUNT_RUN_TXS);
+            let run = self.addr_rows_desc(sh, below, page);
+            let mut last: Option<u64> = None;
+            for row in &run.rows {
+                if last != Some(row.txseq) {
+                    count += 1;
+                    last = Some(row.txseq);
+                }
+            }
+            match run.next_below {
+                Some(b) => below = Some(b),
+                None => break,
+            }
+        }
+        count.min(want)
     }
 
     /// Look up the input that spent `outpoint` on the active chain.

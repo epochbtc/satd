@@ -138,6 +138,32 @@ pub fn history_rows(
     Ok(rows)
 }
 
+/// `sh`'s Electrum history in protocol order, refused above `cap` rows:
+/// `Err(IndexError::HistoryTooLarge { cap })` when the confirmed history
+/// alone, or the confirmed history plus the mempool rows, holds more than
+/// `cap` transactions. ElectrumX and Fulcrum refuse an over-long history
+/// the same way rather than serve part of it.
+///
+/// The confirmed history is first checked with
+/// [`AddressIndex::check_history_cap`], which stops reading at the first
+/// transaction past `cap`, so a busy script costs `O(cap)` reads and
+/// memory, never `O(history)`.
+pub fn capped_history_rows(
+    idx: &dyn AddressIndex,
+    sh: &Scripthash,
+    cap: usize,
+    mempool: impl Fn(&Txid) -> Option<MempoolTxFacts>,
+) -> Result<Vec<HistoryRow>, IndexError> {
+    idx.check_history_cap(sh, cap)?;
+    // `cap + 1` rows: a history that grew past the cap since the check, or
+    // whose mempool rows take it past, comes back one row too long.
+    let rows = history_rows(idx, sh, cap.saturating_add(1), mempool)?;
+    if rows.len() > cap {
+        return Err(IndexError::HistoryTooLarge { cap });
+    }
+    Ok(rows)
+}
+
 /// The Electrum status of a history already in protocol order: sha256 over
 /// `"tx_hash:height:"` per row, rows taken in the order given. The all-zero
 /// array stands for an empty history (the wire answer is `null`).

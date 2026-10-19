@@ -33,7 +33,7 @@ use crate::index::address::keys::Scripthash;
 use crate::index::address::lookups::RocksAddressIndex;
 use crate::index::address::subscribe::SubscriptionRegistry;
 use crate::mempool::pool::Mempool;
-use node_index::{MempoolTxFacts, history_rows, history_status_hash};
+use node_index::{MempoolTxFacts, capped_history_rows, history_status_hash};
 
 /// How often the notifier prunes empty channels from the registry as a
 /// belt-and-suspenders measure on top of the per-subscribe prune.
@@ -219,7 +219,13 @@ fn recompute_one(
     // pushed status by hashing that response as it arrived. Building the
     // rows through the same helper as the Electrum handlers keeps the two
     // from drifting apart.
-    let rows = match history_rows(index, sh, usize::MAX, |txid| mempool_facts(mempool, txid)) {
+    //
+    // A history over the cap is refused here as it is by the handlers, so
+    // the recompute costs at most `cap + 1` transactions' rows: no status
+    // is pushed for it (a client could not check one against
+    // `get_history`, which refuses the same history).
+    let cap = index.max_history_entries();
+    let rows = match capped_history_rows(index, sh, cap, |txid| mempool_facts(mempool, txid)) {
         Ok(rows) => rows,
         // A backfill is mid-run. Whatever changed is pushed when serving
         // resumes (`notifier_task` checks every `OWED_RECOMPUTE_INTERVAL`).

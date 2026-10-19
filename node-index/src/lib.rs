@@ -20,10 +20,10 @@ pub mod trait_def;
 pub mod txseq;
 pub mod types;
 
-pub use config::AddressIndexConfig;
+pub use config::{AddressIndexConfig, DEFAULT_MAX_HISTORY_ENTRIES};
 pub use cursor::{BackfillCursor, BackfillState};
 pub use history::{
-    HistoryRow, MempoolTxFacts, history_rows, history_status_hash, mempool_history_rows,
+    HistoryRow, MempoolTxFacts, capped_history_rows, history_rows, history_status_hash, mempool_history_rows,
     sort_confirmed_rows, sort_mempool_rows,
 };
 pub use keys::{
