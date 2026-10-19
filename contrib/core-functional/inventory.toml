@@ -487,7 +487,7 @@ status = "run"
 file = "mempool_truc.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L69 no exception raised: satd has no TRUC (v3) topology policy. Follow-up: TRUC"
+note = "measured 2026-10-18 with TRUC (#1020): L238 no exception raised: -limitclustercount=1 admits a 1-parent-1-child cluster (satd caps ancestors, not the cluster), and the restart that follows needs -limitclustersize. Measured past it, 9 of 14 cases pass; the rest stop at multi-transaction testmempoolaccept (L297 KeyError package-error: not evaluated as a package) and L604 replacement-failed (RBF fallback for a parent with two children). Follow-up: package testmempoolaccept, RBF fallback, cluster limits"
 
 [[test]]
 file = "mempool_unbroadcast.py"
