@@ -6209,14 +6209,16 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
     ) -> Result<(Txid, usize, u64), MempoolError> {
-        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting())
+        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting(), None)
             .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
     }
 
     /// [`Self::test_finish`], also returning the quarantine scope the policy
     /// would give the transaction. `inherited` is the scope of a parent not
     /// yet in the mempool, which the transaction takes on as it would from a
-    /// mempool ancestor.
+    /// mempool ancestor. `mempool_bytes` is the mempool size the policy sees
+    /// in place of the current one: a package child is judged at admission
+    /// after its parent has replaced what it conflicts with.
     fn test_finish_scoped(
         &self,
         tx: &Transaction,
@@ -6224,6 +6226,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
         inherited: QuarantineScope,
+        mempool_bytes: Option<usize>,
     ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
         let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
@@ -6271,7 +6274,7 @@ impl Mempool {
             let ctx = PolicyCtx {
                 network: chain_state.network,
                 height: tip_height,
-                mempool_bytes: inner.total_bytes,
+                mempool_bytes: mempool_bytes.unwrap_or(inner.total_bytes),
             };
             let verdict = policy_engine::evaluate(
                 rs, tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight, &cfg, ctx,
@@ -6616,11 +6619,24 @@ impl Mempool {
         Self::rbf_improves_diagram(&inner, &cfg, weight, fee, &[], &conflicts, &HashSet::new(), &evicted)
             .map_err(|e| failed(&e.reject_details().unwrap_or_else(|| e.reject_reason()), None))?;
 
-        if !cfg.accept_non_std_txn
-            && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, members)
-        {
+        // Unconditionally, unlike `testmempoolaccept`: admission enforces the
+        // dust spends whatever `-acceptnonstdtxn` says, and a refusal there
+        // would come after the parent had evicted its conflicts.
+        if let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, members) {
             return Err(PackageRbfRefusal::Member(i, e.state_string()));
         }
+
+        // The mempool size the child's policy sees on admission: after the
+        // parent has replaced what it conflicts with and gone in.
+        let parent_evicted = Self::rbf_conflict_set(&inner, &pre[0].conflicts, usize::MAX)
+            .map(|(set, _)| set)
+            .unwrap_or_default();
+        let freed: usize = parent_evicted
+            .iter()
+            .filter_map(|t| inner.entries.get(t))
+            .map(|e| bitcoin::consensus::serialize(&e.tx).len())
+            .sum();
+        let child_sees = inner.total_bytes.saturating_sub(freed) + bitcoin::consensus::serialize(&members[0]).len();
         drop(inner);
 
         // Scripts and the policy, the child taking on its parent's scope.
@@ -6631,7 +6647,7 @@ impl Mempool {
         for (i, (tx, checked)) in members.iter().zip(pre).enumerate() {
             let own_conflicts = checked.conflicts.clone();
             let (_, _, _, scope) = self
-                .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited)
+                .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited, (i > 0).then_some(child_sees))
                 .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
             if scope.is_quarantined()
                 && own_conflicts

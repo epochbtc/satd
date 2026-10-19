@@ -457,3 +457,58 @@ fn a_child_held_through_its_parent_is_judged_held() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With `-acceptnonstdtxn`, the dust a parent leaves must still be swept:
+/// admission enforces it, so the package checks do too, before the parent
+/// replaces anything.
+#[test]
+fn unswept_dust_is_refused_before_eviction_even_with_acceptnonstdtxn() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    mp.config.write().accept_non_std_txn = true;
+    let a = spend(&[prev(1)], COIN_VALUE, 2_000, 1, 1);
+    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let mut parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 3);
+    parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 1_100);
+    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_100, 20_000, 1, 4);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert!(
+        res.tx_results[&child.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().starts_with("missing-ephemeral-spends"),
+        "{:?}",
+        res.tx_results
+    );
+    assert!(res.replaced.is_empty());
+    assert_eq!(pool(&mp), HashSet::from([a_id]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The child's policy is judged at the mempool size it will see on
+/// admission, after its parent has replaced what it conflicts with.
+#[test]
+fn the_childs_policy_sees_the_mempool_after_its_parent() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let a_size = bitcoin::consensus::serialize(&a).len();
+    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    // A larger parent than A, so the mempool grows when it replaces A.
+    let parent = version(spend(&[prev(1)], COIN_VALUE, 0, 3, 3), 1);
+    let parent_size = bitcoin::consensus::serialize(&parent).len();
+    assert!(parent_size > a_size);
+    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 20_000, 1, 4);
+    // Holds a version 2 transaction from relay once the mempool is past A's size.
+    let rule = format!("version 1\nquarantine catch when tx.version == 2 and node.mempool_bytes > {a_size}");
+    mp.set_policy(std::sync::Arc::new(satd_policy::parse_ruleset(&rule).expect("ruleset")));
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert!(
+        res.tx_results[&child.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().starts_with("txn-policy-quarantined"),
+        "{:?}",
+        res.tx_results
+    );
+    assert!(res.replaced.is_empty());
+    assert_eq!(pool(&mp), HashSet::from([a_id]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
