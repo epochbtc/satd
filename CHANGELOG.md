@@ -42,7 +42,9 @@ item below is (or will be) written up in full in the in-development
   `-limitclustercount` (64) connected unconfirmed transactions, itself
   included, and at most `-limitclustersize` (101 kvB, now accepted) of them.
   satd counted ancestors only, so a parent took any number of children and
-  a chain of 65 passed at 64.
+  a chain of 65 passed at 64. A reorg's returned transactions are held to
+  the limits too, and a cluster they grow past them by joining their
+  mempool spenders is trimmed, as in Core.
 
 - `gettxspendingprevout`, as in Core v31: the mempool spender of each
   output, and under `-txospenderindex` the confirmed spender and its block,
@@ -57,6 +59,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `getrawmempool` lists transactions in Core's mining order: best chunk
+  feerate first, a cluster's transactions in its order. It listed them in
+  hash-map order, which changed when a reorg returned the same
+  transactions.
 - The Rust script engine computes a tapscript signature hash as Core does,
   from the annex hashed once per input instead of once per signature check.
   A spend with many checks and a large annex verified many times slower than
