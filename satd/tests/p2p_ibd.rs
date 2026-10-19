@@ -103,48 +103,89 @@ fn version() -> VersionMessage {
 }
 
 /// #972: a peer that is asked for blocks during initial block download and
-/// sends none is disconnected once the stall timeout (15s) passes, as Core
-/// disconnects a peer stalling block download. satd only took the blocks
-/// back: the peer stayed connected and was handed the same heights again on
-/// the same tick, until the silent-peer check dropped it about a minute
-/// later.
+/// sends none, while another peer is delivering, is disconnected once the
+/// stall timeout (15s) passes, as Core disconnects a peer stalling block
+/// download. satd only took the blocks back: the peer stayed connected and
+/// was handed the same heights again on the same tick, until the silent-peer
+/// check dropped it about a minute later.
+///
+/// A second peer serves blocks throughout. Without one, no peer is judged
+/// stalling until Core's ten-minute block download timeout: the silence is
+/// then more likely the node's own link (see `IbdScheduler::take_stalled_peer`).
 #[test]
 fn a_peer_stalling_block_download_is_disconnected() {
-    // The chain the stalling peer claims to have: real headers, mined by a
-    // second node, far enough ahead to start initial block download.
+    // The chain both peers claim to have: real headers and blocks, mined by a
+    // second node. 300 blocks is more than one peer's 128-block share, so
+    // the serving peer is given work of its own while the staller holds the
+    // heights it took first.
+    const BLOCKS: u32 = 300;
     let mut source = TestNode::start(&[]);
-    source.mine_blocks(60, ADDR);
-    let headers: Vec<bitcoin::block::Header> = (1..=60)
-        .map(|h| {
-            let hash = source.rpc_ok("getblockhash", vec![serde_json::json!(h)]);
-            let hex = source.rpc_ok("getblockheader", vec![hash, serde_json::json!(false)]);
-            deserialize(&hex::decode(hex.as_str().unwrap()).unwrap()).unwrap()
-        })
-        .collect();
+    source.mine_blocks(u64::from(BLOCKS), ADDR);
+    let mut headers = Vec::new();
+    let mut blocks = std::collections::HashMap::new();
+    for h in 1..=BLOCKS {
+        let hash = source.rpc_ok("getblockhash", vec![serde_json::json!(h)]);
+        let hex = source.rpc_ok("getblock", vec![hash, serde_json::json!(0)]);
+        let block: bitcoin::Block = deserialize(&hex::decode(hex.as_str().unwrap()).unwrap()).unwrap();
+        headers.push(block.header);
+        blocks.insert(block.block_hash(), block);
+    }
 
     let node = TestNode::start(&["--loglevel=info"]);
-    let mut peer = Peer::connect(node.p2p_port.unwrap());
-    peer.send(NetworkMessage::Headers(headers));
+    let port = node.p2p_port.unwrap();
+    let mut staller = Peer::connect(port);
+    staller.send(NetworkMessage::Headers(headers.clone()));
 
-    // The node asks the peer for blocks, which it never sends.
+    // The node asks the staller for blocks, which it never sends.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        match peer.recv(left) {
+        match staller.recv(left) {
             Ok(NetworkMessage::GetData(inv))
                 if inv.iter().any(|i| matches!(i, Inventory::WitnessBlock(_) | Inventory::Block(_))) =>
             {
                 break;
             }
-            Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
+            Ok(NetworkMessage::Ping(n)) => staller.send(NetworkMessage::Pong(n)),
             Ok(_) => {}
             Err(e) => panic!("the node never asked the peer for blocks: {e}"),
         }
     }
 
+    // The serving peer answers every block request, about ten blocks a
+    // second, so it is still delivering when the staller's timeout runs out.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = {
+        let stop = stop.clone();
+        let mut peer = Peer::connect(port);
+        peer.send(NetworkMessage::Headers(headers));
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match peer.recv(Duration::from_millis(200)) {
+                    Ok(NetworkMessage::GetData(inv)) => {
+                        for i in inv {
+                            if let Inventory::WitnessBlock(hash) | Inventory::Block(hash) = i
+                                && let Some(block) = blocks.get(&hash)
+                            {
+                                peer.send(NetworkMessage::Block(block.clone()));
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                    }
+                    Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
     // 15s of stall timeout plus the 2s scheduler tick, with room for a slow
     // runner; the silent-peer path took about a minute.
-    let closed = peer.closed_within(Duration::from_secs(35));
+    let closed = staller.closed_within(Duration::from_secs(35));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
     assert!(closed.is_some(), "the stalling peer is still connected 35s after its getdata; log:\n{log}");
     assert!(
