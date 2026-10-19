@@ -347,11 +347,11 @@ mod tests {
     /// chunk, so the chunks come out in descending feerate.
     #[test]
     fn a_later_richer_segment_merges_into_the_chunk_before() {
-        // A (alone 10/100) and B (alone 1/100) are unrelated; C spends B and
-        // pays 30/100. Ancestor sets: {A} 0.10, {B} 0.01, {B, C} 0.155: B
-        // and C first, then A.
-        let chunks = cluster_chunks(&[(ff(10, 100), 0), (ff(1, 100), 0), (ff(30, 100), 0b10)]).unwrap();
-        assert_eq!(chunks, vec![ff(31, 200), ff(10, 100)]);
+        // P pays nothing; C1 pays 300 and C2 200, each over 100. P goes with
+        // C1 first ({P, C1} at 1.5 beats {P, C2} at 1.0); then C2 alone pays
+        // 2.0, more than that chunk, and joins it.
+        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(300, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(500, 300)]);
         for pair in chunks.windows(2) {
             assert_ne!(feerate_compare(pair[0], pair[1]), Ordering::Less);
         }
