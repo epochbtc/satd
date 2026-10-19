@@ -313,6 +313,8 @@ fn an_eviction_reranks_the_parent_it_leaves_behind() {
 #[test]
 fn a_family_too_large_to_walk_ranks_by_the_parent_alone() {
     let (cs, mp, dir) = env(&[1, 2]);
+    // Past the cluster limit, as only a reorg leaves a family.
+    mp.config.write().max_cluster_count = 1_000;
     let children = DESCENDANT_SCORE_WALK as u64 + 1;
     let parent = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 0, children, 1));
     let per = COIN_VALUE / children;
@@ -326,6 +328,7 @@ fn a_family_too_large_to_walk_ranks_by_the_parent_alone() {
 
     // One child fewer, and the family is walked: the parent ranks with it.
     let (cs2, mp2, dir2) = env(&[1]);
+    mp2.config.write().max_cluster_count = 1_000;
     let parent2 = admit(&mp2, &cs2, spend(&[prev(1)], COIN_VALUE, 0, children - 1, 1));
     let per = COIN_VALUE / (children - 1);
     for vout in 0..(children - 1) as u32 {

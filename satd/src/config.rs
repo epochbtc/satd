@@ -686,6 +686,9 @@ pub struct Config {
     /// selection. Default and maximum are both 64 (`txgraph.h`
     /// `MAX_CLUSTER_COUNT_LIMIT`), so the option can only lower it.
     pub limitclustercount: usize,
+    /// Core v31's `-limitclustersize`, kvB: the most sigop-adjusted virtual
+    /// size one mempool cluster may hold. Default 101.
+    pub limitclustersize: u64,
     pub mempoolexpiry: u64,
     /// Core's `-maxtipage`, seconds: a tip older than this keeps the node in
     /// initial block download. Default 24 hours.
@@ -2913,19 +2916,21 @@ impl Config {
             .or_else(|| file_get("mempoolfullrbf").and_then(|v| parse_bool(&v)))
             .unwrap_or(true); // full RBF on by default (matches Bitcoin Core v28+)
 
+        let limitclustersize = resolve_limit_cluster_size(&cli.policy_size_args, &file_get)?;
+
         let maxmempool = cli
             .maxmempool
             .or_else(|| file_get("maxmempool").and_then(|v| v.parse().ok()))
             .unwrap_or(300); // MB
         // Core's floor (`CTxMemPool` `Flatten`): room for 40 of the largest
-        // cluster, 101 kvB by default, rounded up to whole MB. A pool smaller
-        // than one package would trim away what it just admitted. Zero is
-        // Core's too, and allowed.
-        const MIN_MAXMEMPOOL_BYTES: usize = 101_000 * 40;
-        if maxmempool > 0 && maxmempool.saturating_mul(1_000_000) < MIN_MAXMEMPOOL_BYTES {
+        // cluster (`-limitclustersize`, 101 kvB by default), rounded up to
+        // whole MB. A pool smaller than one package would trim away what it
+        // just admitted. Zero is Core's too, and allowed.
+        let min_maxmempool_bytes = (limitclustersize.saturating_mul(1_000 * 40)) as usize;
+        if maxmempool > 0 && maxmempool.saturating_mul(1_000_000) < min_maxmempool_bytes {
             return Err(format!(
                 "-maxmempool must be at least {} MB",
-                MIN_MAXMEMPOOL_BYTES.div_ceil(1_000_000)
+                min_maxmempool_bytes.div_ceil(1_000_000)
             ));
         }
 
@@ -3105,7 +3110,7 @@ impl Config {
             None => None,
         };
 
-        let bytespersigop = resolve_bytes_per_sigop(cli.policy_size_args, &file_get)?;
+        let bytespersigop = resolve_bytes_per_sigop(&cli.policy_size_args, &file_get)?;
 
         let peertimeout = match cli.peertimeout {
             Some(v) => v,
@@ -4134,6 +4139,7 @@ impl Config {
             limitancestorcount,
             limitdescendantcount,
             limitclustercount,
+            limitclustersize,
             mempoolexpiry,
             maxtipage,
             minimumchainwork,
@@ -5934,7 +5940,7 @@ pub struct CliArgs {
     #[command(flatten)]
     pub chain_work_args: ChainWorkArgs,
 
-    /// `-bytespersigop`, hand-built for the same stack-frame reason as
+    /// `-bytespersigop` and `-limitclustersize`, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub policy_size_args: PolicySizeArgs,
@@ -7341,8 +7347,8 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
 /// Out of line, as the other `resolve_*`, to keep `Config::from_cli`'s
 /// frame from growing (the test threads' stack is tight).
 #[inline(never)]
-fn resolve_bytes_per_sigop(cli: PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
-    match cli.bytespersigop.or_else(|| file_get("bytespersigop")) {
+fn resolve_bytes_per_sigop(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
+    match cli.bytespersigop.clone().or_else(|| file_get("bytespersigop")) {
         Some(v) => v
             .trim()
             .parse::<u32>()
@@ -7351,19 +7357,42 @@ fn resolve_bytes_per_sigop(cli: PolicySizeArgs, file_get: &dyn Fn(&str) -> Optio
     }
 }
 
-/// Bitcoin Core's `-bytespersigop` (see [`CliArgs::policy_size_args`]).
+/// Core v31's `-limitclustersize`, kvB, out of `CliArgs` for the same
+/// reason as [`resolve_bytes_per_sigop`].
+#[inline(never)]
+fn resolve_limit_cluster_size(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u64, String> {
+    match cli.limitclustersize.clone().or_else(|| file_get("limitclustersize")) {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid limitclustersize {v:?}: expected a non-negative integer")),
+        None => Ok(node::mempool::policy::DEFAULT_CLUSTER_SIZE_LIMIT_KVB),
+    }
+}
+
+/// Bitcoin Core's `-bytespersigop` and `-limitclustersize` (see
+/// [`CliArgs::policy_size_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct PolicySizeArgs {
     pub bytespersigop: Option<String>,
+    pub limitclustersize: Option<String>,
 }
 
 /// Help text is Core's own (v31.1 `src/init.cpp`).
-const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
-    "bytespersigop",
-    "N",
-    StratumArgKind::Text,
-    "Equivalent bytes per sigop in transactions for relay and mining (default: 20)",
-)];
+const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "bytespersigop",
+        "N",
+        StratumArgKind::Text,
+        "Equivalent bytes per sigop in transactions for relay and mining (default: 20)",
+    ),
+    (
+        "limitclustersize",
+        "N",
+        StratumArgKind::Text,
+        "Do not accept transactions whose virtual size with all in-mempool connected transactions exceeds <n> kilobytes (default: 101)",
+    ),
+];
 
 impl clap::Args for PolicySizeArgs {
     fn augment_args(mut cmd: clap::Command) -> clap::Command {
@@ -7384,7 +7413,10 @@ impl clap::FromArgMatches for PolicySizeArgs {
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { bytespersigop: m.remove_one("bytespersigop") })
+        Ok(Self {
+            bytespersigop: m.remove_one("bytespersigop"),
+            limitclustersize: m.remove_one("limitclustersize"),
+        })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -8188,6 +8220,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitancestorcount",
         "limitdescendantcount",
         "limitclustercount",
+        "limitclustersize",
         "mempoolexpiry",
         "maxtipage",
         "minimumchainwork",
@@ -8993,6 +9026,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "limitancestorcount",
     "limitdescendantcount",
     "limitclustercount",
+    "limitclustersize",
     "mempoolexpiry",
     "maxtipage",
     "minimumchainwork",
@@ -10259,6 +10293,27 @@ blockmintxfee=0.00001
         assert_eq!(load("4").err().as_deref(), Some("-maxmempool must be at least 5 MB"));
         assert_eq!(load("5").expect("Core's floor is allowed").maxmempool, 5);
         assert_eq!(load("0").expect("Core allows 0").maxmempool, 0);
+    }
+
+    /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`
+    /// floor with it: room for 40 of the largest cluster. It used to be an
+    /// unknown option, so Core's own tests could not start satd with it.
+    #[test]
+    fn limitclustersize_is_read_and_moves_the_maxmempool_floor() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        assert_eq!(load(&[]).expect("defaults").limitclustersize, 101);
+        assert_eq!(load(&["-limitclustersize=10"]).expect("Core's spelling").limitclustersize, 10);
+        assert_eq!(
+            load(&["-limitclustersize=200", "-maxmempool=7"]).err().as_deref(),
+            Some("-maxmempool must be at least 8 MB")
+        );
+        assert_eq!(load(&["-limitclustersize=200", "-maxmempool=8"]).expect("at the floor").maxmempool, 8);
     }
 
     /// Core's stock Tor configuration must load: the two bare entries are

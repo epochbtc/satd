@@ -55,19 +55,14 @@ pub const DEFAULT_DATA_CARRIER_SIZE: usize = 100_000;
 /// and the reject string they produced (`too-long-mempool-chain`) is gone
 /// from Core's source entirely.
 ///
-/// satd tracks the transitive ancestor and descendant sets rather than a
-/// true cluster. For the linear chains this limit actually governs the two
-/// coincide, so the cluster bound is applied to each — a real cluster
-/// implementation is separate work.
+/// The cluster is the transaction's connected component in the mempool's
+/// spend graph, itself included: a parent's other children count, as do
+/// their descendants and ancestors.
 pub const MAX_CLUSTER_COUNT: usize = 64;
 
-/// Maximum number of in-mempool ancestors for a single transaction.
-/// See [`MAX_CLUSTER_COUNT`] for why this is the cluster bound.
-pub const MAX_ANCESTOR_COUNT: usize = MAX_CLUSTER_COUNT;
-
-/// Maximum number of in-mempool descendants for a single transaction.
-/// See [`MAX_CLUSTER_COUNT`] for why this is the cluster bound.
-pub const MAX_DESCENDANT_COUNT: usize = MAX_CLUSTER_COUNT;
+/// Maximum sigop-adjusted virtual size of one mempool cluster, in kvB:
+/// Core v31's `DEFAULT_CLUSTER_SIZE_LIMIT_KVB` (`-limitclustersize`).
+pub const DEFAULT_CLUSTER_SIZE_LIMIT_KVB: u64 = 101;
 
 /// Mempool expiry time in seconds (14 days).
 pub const MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;

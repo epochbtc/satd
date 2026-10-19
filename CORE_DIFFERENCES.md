@@ -789,8 +789,8 @@ silently returning an empty or wrong answer.
 
   Eviction ranks by descendant score, which is how Core trimmed before the
   cluster mempool; v31 trims by chunk feerate. A family of more than 100
-  descendants ranks by the parent's own feerate, since satd does not limit
-  descendants.
+  descendants, which only a reorg can leave past the cluster limits, ranks
+  by the parent's own feerate.
 
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
@@ -837,11 +837,11 @@ silently returning an empty or wrong answer.
   figure, and starts evicting (and raising `mempoolminfee`) later.
   `getmempoolinfo.usage` is satd's estimate of the memory its entries occupy,
   added up from what each entry holds rather than measured from the
-  allocator, so it is a lower bound. `-limitclustercount` caps a
-  transaction's unconfirmed *ancestors*: one with more than that many in the
-  mempool is refused as `too-large-cluster`. Descendants are not counted, so
-  a transaction can gain any number of children, where Core bounds
-  descendants too (v30's `-limitdescendantcount`, v31's cluster limit).
+  allocator, so it is a lower bound. Core admits a transaction a reorg
+  returns and then trims any cluster past `-limitclustercount` or
+  `-limitclustersize`; satd exempts such a transaction from the cluster
+  limits and does not trim, so after a reorg it can hold a cluster larger
+  than the limits.
 
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
