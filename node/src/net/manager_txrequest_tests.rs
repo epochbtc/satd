@@ -94,13 +94,24 @@ fn add_peer_with(
     direction: Direction,
     tweak: impl FnOnce(&mut PeerInfo),
 ) -> mpsc::Receiver<NetworkMessage> {
+    add_peer_cap(pm, id, direction, 64, tweak)
+}
+
+/// [`add_peer_with`] with a send queue of `capacity` messages.
+fn add_peer_cap(
+    pm: &PeerManager,
+    id: PeerId,
+    direction: Direction,
+    capacity: usize,
+    tweak: impl FnOnce(&mut PeerInfo),
+) -> mpsc::Receiver<NetworkMessage> {
     let addr: SocketAddr = format!("10.0.0.{id}:8333").parse().unwrap();
     let mut info = PeerInfo::new(id, addr, direction);
     info.state = PeerState::Connected;
     info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     info.wtxid_relay = true;
     tweak(&mut info);
-    let (tx, rx) = mpsc::channel::<NetworkMessage>(64);
+    let (tx, rx) = mpsc::channel::<NetworkMessage>(capacity);
     pm.peers.write().insert(
         id,
         PeerHandle {
@@ -423,4 +434,126 @@ fn a_confirmed_transaction_is_not_requested() {
     clock.advance(NONPREF_PEER_TX_DELAY);
     pm.send_all_tx_requests();
     assert!(tx_getdata(&mut rx1).is_empty());
+}
+
+/// A `getdata` the peer's full send queue refused is not a request: the
+/// transaction stays this peer's to ask, and goes out on the next pass
+/// once the queue drains, without waiting out the 60 s expiry.
+#[test]
+fn a_getdata_that_could_not_be_queued_is_retried_on_the_next_pass() {
+    let _clock = MockClock::install();
+    let (pm, _dir) = mk_pm();
+    let mut rx = add_peer_cap(&pm, 1, Direction::Outbound, 1, |_| {});
+    pm.send_to_peer(1, NetworkMessage::Verack);
+    let w = wtxid(7);
+    pm.handle_inv(1, vec![Inventory::WTx(w)]);
+    assert!(matches!(rx.try_recv(), Ok(NetworkMessage::Verack)), "only the filler was queued");
+    assert!(rx.try_recv().is_err());
+    assert_eq!(pm.tx_requests.lock().count_in_flight(1), 0, "nothing sent, nothing in flight");
+
+    pm.send_all_tx_requests();
+    assert_eq!(tx_getdata(&mut rx), vec![Inventory::WTx(w)], "asked again at once");
+    assert_eq!(pm.tx_requests.lock().count_in_flight(1), 1);
+}
+
+/// Fails every input that carries no witness, the way a script check fails
+/// a segwit spend stripped of its witness, and passes the rest.
+struct StrippedFails;
+
+impl StrippedFails {
+    fn check(tx: &bitcoin::Transaction) -> Result<(), crate::validation::script::ScriptError> {
+        match tx.input.iter().position(|i| i.witness.is_empty()) {
+            Some(input) => Err(crate::validation::script::ScriptError::VerifyFailed {
+                input,
+                reason: "Witness program was passed an empty witness".into(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+impl crate::validation::script::ScriptVerifier for StrippedFails {
+    fn verify_transaction(
+        &self,
+        tx: &bitcoin::Transaction,
+        _prev_outputs: &[bitcoin::TxOut],
+        _height: u32,
+    ) -> Result<(), crate::validation::script::ScriptError> {
+        Self::check(tx)
+    }
+
+    fn verify_policy(
+        &self,
+        tx: &bitcoin::Transaction,
+        _prev_outputs: &[bitcoin::TxOut],
+    ) -> Result<(), crate::validation::script::ScriptError> {
+        Self::check(tx)
+    }
+}
+
+/// Two txid-relay peers announce a segwit transaction. The one asked sends
+/// it stripped of its witness, which fails its scripts: Core's
+/// `TX_WITNESS_STRIPPED`, after which nothing is forgotten
+/// (`txdownloadman_impl.cpp:438-440`). A stripped transaction's wtxid is
+/// its txid, so forgetting it dropped the other announcer, the one that can
+/// send the witnessed copy.
+#[test]
+fn a_witness_stripped_reply_leaves_the_other_announcers_of_the_txid() {
+    let _clock = MockClock::install();
+    let p2wpkh = {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0x11; 20]);
+        bitcoin::ScriptBuf::from_bytes(spk)
+    };
+    let prev = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([0x61; 32]), vout: 0 };
+    let coin = crate::storage::coinview::Coin {
+        amount: 100_000,
+        script_pubkey: p2wpkh.clone(),
+        height: 1,
+        coinbase: false,
+        txseq: node_index::TXSEQ_UNKNOWN,
+    };
+    let (cs, mp, dir) =
+        crate::mining::template::tests::make_funded_template_env_with(&[(prev, coin)], Box::new(StrippedFails));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    std::mem::forget(shutdown_tx);
+    let pm = PeerManager::new(Arc::new(cs), Arc::new(mp), Arc::new(FeeEstimator::new()), Network::Regtest, shutdown_rx);
+    let tip = pm.chain_state.tip_hash();
+    let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+    pm.chain_state.accept_block(&block).expect("block connects");
+
+    let witnessed = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: prev,
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::from_slice(&[vec![0x30; 72], vec![0x02; 33]]),
+        }],
+        output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(90_000), script_pubkey: p2wpkh }],
+    };
+    let mut stripped = witnessed.clone();
+    stripped.input[0].witness = bitcoin::Witness::new();
+    let txid = witnessed.compute_txid();
+    assert_eq!(stripped.compute_wtxid().to_byte_array(), txid.to_byte_array());
+
+    let mut rx1 = add_peer_with(&pm, 1, Direction::Outbound, |i| i.wtxid_relay = false);
+    let mut rx2 = add_peer_with(&pm, 2, Direction::Outbound, |i| i.wtxid_relay = false);
+    pm.handle_inv(1, vec![Inventory::Transaction(txid)]);
+    pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
+    assert_eq!(tx_getdata(&mut rx1), vec![Inventory::WitnessTransaction(txid)]);
+    assert!(tx_getdata(&mut rx2).is_empty());
+
+    pm.handle_tx(1, stripped);
+    assert!(pm.mempool.get(&txid).is_none(), "the stripped copy fails its scripts");
+    pm.send_all_tx_requests();
+    assert_eq!(
+        tx_getdata(&mut rx2),
+        vec![Inventory::WitnessTransaction(txid)],
+        "the other announcer is asked for the witnessed copy"
+    );
+    pm.handle_tx(2, witnessed);
+    assert!(pm.mempool.get(&txid).is_some(), "the witnessed copy is accepted");
+    let _ = std::fs::remove_dir_all(dir);
 }

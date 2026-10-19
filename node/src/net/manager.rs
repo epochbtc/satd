@@ -6007,24 +6007,39 @@ impl PeerManager {
         // The mempool is consulted without the scheduler's lock held: its
         // read lock can wait behind a long admission.
         let have: Vec<bool> = requestable.iter().map(|g| self.already_have_tx(g, false)).collect();
-        let mut getdata = Vec::with_capacity(requestable.len());
+        let mut wanted = Vec::with_capacity(requestable.len());
         {
             let mut tracker = self.tx_requests.lock();
             for (gtxid, have) in requestable.into_iter().zip(have) {
                 if have {
                     tracker.forget_tx_hash(&gtxid.hash());
-                    continue;
+                } else {
+                    wanted.push(gtxid);
                 }
-                tracing::debug!(peer = id, ?gtxid, "requesting tx");
-                tracker.requested_tx(id, &gtxid.hash(), now.saturating_add(GETDATA_TX_INTERVAL));
-                getdata.push(match gtxid {
-                    GenTxid::Txid(txid) => Inventory::WitnessTransaction(txid),
-                    GenTxid::Wtxid(wtxid) => Inventory::WTx(wtxid),
-                });
             }
         }
-        for chunk in getdata.chunks(MAX_GETDATA_SZ) {
-            self.send_to_peer(id, NetworkMessage::GetData(chunk.to_vec()));
+        // A request is marked in flight only once its `getdata` is queued to
+        // the peer. The queue is bounded, and a request marked but never
+        // sent would hold the transaction back for the whole 60 s expiry and
+        // then retire this peer's announcement for good. Unsent, it stays
+        // this peer's to ask on the next tick. Core's send cannot fail.
+        for chunk in wanted.chunks(MAX_GETDATA_SZ) {
+            let inv: Vec<Inventory> = chunk
+                .iter()
+                .map(|gtxid| match gtxid {
+                    GenTxid::Txid(txid) => Inventory::WitnessTransaction(*txid),
+                    GenTxid::Wtxid(wtxid) => Inventory::WTx(*wtxid),
+                })
+                .collect();
+            if !self.send_to_peer(id, NetworkMessage::GetData(inv)) {
+                tracing::debug!(peer = id, count = chunk.len(), "tx getdata not queued; retrying next tick");
+                break;
+            }
+            let mut tracker = self.tx_requests.lock();
+            for gtxid in chunk {
+                tracing::debug!(peer = id, ?gtxid, "requesting tx");
+                tracker.requested_tx(id, &gtxid.hash(), now.saturating_add(GETDATA_TX_INTERVAL));
+            }
         }
     }
 
@@ -8946,11 +8961,21 @@ impl PeerManager {
                 // make it acceptable: another peer may still offer a
                 // correctly witnessed copy of the same txid. One we already
                 // hold is not wanted under either id.
+                //
+                // A script failure of a copy with no witness at all is
+                // Core's `TX_WITNESS_STRIPPED` (the case `rejection_kind`
+                // keeps out of the rejects filters): nothing is forgotten
+                // (`txdownloadman_impl.cpp:438-440`). Its wtxid is its txid,
+                // so forgetting it would drop the other announcers of the
+                // txid, the peers that can send the witnessed copy. The
+                // sender's own announcement was answered above.
+                let witness_stripped =
+                    !has_witness && matches!(e, MempoolError::Script(..) | MempoolError::PolicyScript(..));
                 if matches!(e, MempoolError::AlreadyExists)
                     || (has_witness && matches!(e, MempoolError::NonStandardInputs(_)))
                 {
                     self.forget_tx_requests(txid, wtxid);
-                } else {
+                } else if !witness_stripped {
                     self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
                 }
                 // Only consensus-invalid transactions are misbehavior; policy
