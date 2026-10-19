@@ -432,3 +432,28 @@ fn a_held_child_conflicting_with_an_acting_transaction_evicts_nothing() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The child takes on its parent's hold before it reaches the mempool: a
+/// held parent replacing a held transaction, with a child that conflicts
+/// with an acting one, is refused before the parent evicts anything.
+#[test]
+fn a_child_held_through_its_parent_is_judged_held() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let b = version(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2), 1);
+    let b_id = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+    let rs = satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2").expect("ruleset");
+    mp.set_policy(std::sync::Arc::new(rs));
+    let x = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let x_id = mp.accept_transaction(x, &cs, &NoopVerifier, TxSource::Rpc, false).expect("x, held");
+
+    // Both held by the rule's version or by descent; the child is version 1.
+    let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
+    let child = version(spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4), 1);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(res.tx_results[&child.compute_wtxid().to_string()]["error"], "txn-mempool-conflict", "{:?}", res.tx_results);
+    assert!(res.replaced.is_empty());
+    assert_eq!(pool(&mp), HashSet::from([x_id, b_id]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
