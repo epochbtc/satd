@@ -2175,91 +2175,103 @@ pub async fn start(
             return Ok(serde_json::json!(results));
         }
 
-        let mut results = Vec::new();
-        for tx in &decoded {
-            // Check if tx is already confirmed.
-            let txid_check = tx.compute_txid();
-            // Core (`validation.cpp`) reports `txn-already-known` only when
-            // one of *this* transaction's outputs is still an unspent coin.
-            // satd looked at output 0 alone, and also at the txindex — which
-            // finds a confirmed transaction forever, so a fully-spent one was
-            // reported as "already known" where Core says `missing-inputs`,
-            // its own inputs having been spent.
-            if rawtx::has_output_in_utxo_set(&ctx.chain_state, tx) {
-                // `wtxid` is on *every* Core result, including the refusals.
-                // Omitting it here made `mempool_accept.py` fail on a
-                // `KeyError` before it could compare anything.
-                results.push(serde_json::json!({
-                    "txid": txid_check.to_string(),
-                    "wtxid": tx.compute_wtxid().to_string(),
-                    "allowed": false,
-                    "reject-reason": "txn-already-known",
-                }));
-                continue;
-            }
-            match ctx
-                .mempool
-                .test_accept(tx, &ctx.chain_state, ctx.chain_state.script_verifier())
-            {
-                Ok((txid, vsize, fees)) => {
+        // One result, Core's shape: `allowed` with `vsize` and `fees`, or a
+        // refusal. `max-fee-exceeded` is the caller's own limit, checked here
+        // as Core's RPC checks it; it returns true when the rest of a package
+        // is left unjudged.
+        let render = |tx: &bitcoin::Transaction,
+                      judged: &Result<(usize, u64), crate::mempool::pool::MempoolError>,
+                      entry: &mut serde_json::Value|
+         -> bool {
+            match judged {
+                Ok((vsize, fees)) => {
+                    let (vsize, fees) = (*vsize, *fees);
                     let wtxid = tx.compute_wtxid();
-                    // Check maxfeerate.
                     let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
                     if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
-                        results.push(serde_json::json!({
-                            "txid": txid.to_string(),
-                            "wtxid": wtxid.to_string(),
-                            "allowed": false,
-                            "reject-reason": "max-fee-exceeded",
-                        }));
-                    } else {
-                        // Core reports what it judged the transaction by, not
-                        // just its base fee: for a single transaction the
-                        // effective feerate is its own modified feerate and
-                        // `effective-includes` is its own wtxid.
-                        results.push(serde_json::json!({
-                            "txid": txid.to_string(),
-                            "wtxid": wtxid.to_string(),
-                            "allowed": true,
-                            "vsize": vsize,
-                            "fees": {
-                                "base": format_amount(fees, default_unit()),
-                                "effective-feerate": format_amount(
-                                    feerate_sat_per_kvb,
-                                    default_unit(),
-                                ),
-                                "effective-includes": [wtxid.to_string()],
-                            },
-                        }));
+                        entry["allowed"] = false.into();
+                        entry["reject-reason"] = "max-fee-exceeded".into();
+                        return true;
                     }
+                    // Core reports what it judged the transaction by, not
+                    // just its base fee: for a transaction judged alone the
+                    // effective feerate is its own modified feerate and
+                    // `effective-includes` is its own wtxid.
+                    entry["allowed"] = true.into();
+                    entry["vsize"] = vsize.into();
+                    entry["fees"] = serde_json::json!({
+                        "base": format_amount(fees, default_unit()),
+                        "effective-feerate": format_amount(feerate_sat_per_kvb, default_unit()),
+                        "effective-includes": [wtxid.to_string()],
+                    });
                 }
                 Err(e) => {
-                    let txid = tx.compute_txid();
-                    let wtxid = tx.compute_wtxid();
+                    entry["allowed"] = false.into();
                     // Core (`rpc/mempool.cpp`) reports a missing input as
                     // `missing-inputs`, not by the reject reason the mempool
                     // recorded, and gives it no `reject-details`: it is the
                     // one refusal that says nothing about the transaction
                     // itself, only about what the node has not seen yet.
                     if matches!(e, crate::mempool::pool::MempoolError::MissingInputs) {
-                        results.push(serde_json::json!({
-                            "txid": txid.to_string(),
-                            "wtxid": wtxid.to_string(),
-                            "allowed": false,
-                            "reject-reason": "missing-inputs",
-                        }));
-                        continue;
+                        entry["reject-reason"] = "missing-inputs".into();
+                    } else {
+                        entry["reject-reason"] = e.reject_reason().into();
+                        // Core pushes `state.ToString()` for every rejection.
+                        entry["reject-details"] = e.state_string().into();
                     }
-                    let mut entry = serde_json::json!({
-                        "txid": txid.to_string(),
-                        "wtxid": wtxid.to_string(),
-                        "allowed": false,
-                        "reject-reason": e.reject_reason(),
-                    });
-                    // Core pushes `state.ToString()` for every rejection.
-                    entry["reject-details"] = serde_json::Value::String(e.state_string());
-                    results.push(entry);
                 }
+            }
+            false
+        };
+        let base = |tx: &bitcoin::Transaction| {
+            // `wtxid` is on *every* Core result, including the refusals.
+            serde_json::json!({
+                "txid": tx.compute_txid().to_string(),
+                "wtxid": tx.compute_wtxid().to_string(),
+            })
+        };
+        // Core (`validation.cpp`) reports `txn-already-known` only when one
+        // of *this* transaction's outputs is still an unspent coin. satd
+        // looked at output 0 alone, and also at the txindex, which finds a
+        // confirmed transaction forever.
+        let already_known = |tx: &bitcoin::Transaction| rawtx::has_output_in_utxo_set(&ctx.chain_state, tx);
+
+        let mut results = Vec::new();
+        if decoded.len() == 1 {
+            let tx = &decoded[0];
+            let judged = if already_known(tx) {
+                Err(crate::mempool::pool::MempoolError::AlreadyKnown)
+            } else {
+                ctx.mempool
+                    .test_accept(tx, &ctx.chain_state, ctx.chain_state.script_verifier())
+                    .map(|(_, vsize, fee)| (vsize, fee))
+            };
+            let mut entry = base(tx);
+            render(tx, &judged, &mut entry);
+            results.push(entry);
+        } else {
+            // Core's `ProcessNewPackage` with `test_accept`: the transactions
+            // are judged together (`AcceptMultipleTransactions`). A
+            // package-wide refusal is every member's `package-error`; a
+            // member left unjudged has only its ids.
+            let package = ctx.mempool.test_accept_package(
+                &decoded,
+                &ctx.chain_state,
+                ctx.chain_state.script_verifier(),
+                &already_known,
+            );
+            let mut exit_early = false;
+            for tx in &decoded {
+                let mut entry = base(tx);
+                if let Some(e) = &package.package_error {
+                    entry["package-error"] = e.clone().into();
+                }
+                if let Some(judged) = package.results.get(&tx.compute_wtxid())
+                    && !exit_early
+                {
+                    exit_early = render(tx, judged, &mut entry);
+                }
+                results.push(entry);
             }
         }
         Ok::<_, ErrorObjectOwned>(serde_json::json!(results))

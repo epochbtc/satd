@@ -117,6 +117,10 @@ fn format_btc(sats: u64) -> String {
 pub enum MempoolError {
     #[error("txn-already-in-mempool")]
     AlreadyExists,
+    /// Core's `txn-already-known`: an output of the transaction is already
+    /// an unspent coin, so it is confirmed.
+    #[error("txn-already-known")]
+    AlreadyKnown,
     /// A transaction with this txid and another witness is already in the
     /// pool: the same transaction as far as a txid can tell, a different one
     /// by wtxid (BIP 339). Core's `PreChecks` tells the two apart.
@@ -208,6 +212,11 @@ pub enum MempoolError {
     /// Field: detail message.
     #[error("insufficient feerate: does not improve feerate diagram")]
     DoesNotImproveFeerateDiagram(String),
+    /// A multi-transaction `testmempoolaccept` member conflicts with the
+    /// mempool. Core evaluates those with replacement off
+    /// (`m_allow_replacement`).
+    #[error("bip125-replacement-disallowed")]
+    ReplacementDisallowed,
     /// The transaction's connected component would exceed the cluster limit.
     /// Core v31's reject string (`validation.cpp`, `CheckMemPoolPolicyLimits`);
     /// the pre-cluster `too-long-mempool-chain` no longer exists in Core.
@@ -278,6 +287,7 @@ impl MempoolError {
             | Self::PrematureCoinbaseSpend
             | Self::Validation(_)
             | Self::AlreadyExists
+            | Self::AlreadyKnown
             | Self::SameNonWitnessData
             | Self::ConflictingSpend
             | Self::InsufficientFee(..)
@@ -297,6 +307,7 @@ impl MempoolError {
             | Self::EphemeralDustFee
             | Self::MissingEphemeralSpends(..)
             | Self::TrucViolation(_)
+            | Self::ReplacementDisallowed
             | Self::TooLongMempoolChain => -26,
             Self::SiblingEviction(inner) => inner.rpc_code(),
         }
@@ -319,6 +330,7 @@ impl MempoolError {
     pub fn reject_reason(&self) -> String {
         match self {
             MempoolError::AlreadyExists => "txn-already-in-mempool".to_string(),
+            MempoolError::AlreadyKnown => "txn-already-known".to_string(),
             MempoolError::SameNonWitnessData => "txn-same-nonwitness-data-in-mempool".to_string(),
             MempoolError::ConflictingSpend => "txn-mempool-conflict".to_string(),
             MempoolError::MissingInputs => "bad-txns-inputs-missingorspent".to_string(),
@@ -355,6 +367,7 @@ impl MempoolError {
             // err_string)` — the diagram explanation is the *detail*.
             MempoolError::DoesNotImproveFeerateDiagram(..) => "replacement-failed".to_string(),
             MempoolError::TooLongMempoolChain => "too-large-cluster".to_string(),
+            MempoolError::ReplacementDisallowed => "bip125-replacement-disallowed".to_string(),
             // `ephemeral_policy.cpp`: reason "dust", debug "tx with dust
             // output must be 0-fee" — the detail goes to `reject_details`.
             MempoolError::EphemeralDustFee => "dust".to_string(),
@@ -1533,6 +1546,35 @@ pub struct PackageResult {
     pub package_msg: String,
     pub tx_results: serde_json::Map<String, serde_json::Value>,
     pub replaced: Vec<Txid>,
+}
+
+/// The answer to a multi-transaction `testmempoolaccept`
+/// ([`Mempool::test_accept_package`]).
+#[derive(Default)]
+pub struct PackageTestResult {
+    /// Core's `PCKG_POLICY` refusal, which every member reports as
+    /// `package-error`: a TRUC violation or `too-large-cluster`.
+    pub package_error: Option<String>,
+    /// Each member judged, by wtxid: its vsize and fee, or its refusal.
+    /// A member missing here was not judged.
+    pub results: HashMap<Wtxid, Result<(usize, u64), MempoolError>>,
+}
+
+/// What [`Mempool::test_prechecks`] learned about a transaction, for the
+/// script checks and the package checks that follow.
+struct TestPrechecked {
+    txid: Txid,
+    vsize: usize,
+    fee: u64,
+    fee_rate: u64,
+    weight: usize,
+    /// Sigop-adjusted weight.
+    adj_weight: u64,
+    prev_outputs: Vec<TxOut>,
+    prev_is_coinbase: Vec<bool>,
+    ancestors: HashSet<Txid>,
+    mempool_parents: Vec<Txid>,
+    cfg: MempoolConfig,
 }
 
 /// How [`Mempool::accept_package`] has a member judged, or how a reorg has a
@@ -5819,6 +5861,22 @@ impl Mempool {
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<(Txid, usize, u64), MempoolError> {
+        let pre = self.test_prechecks(tx, chain_state, None)?;
+        self.test_finish(tx, chain_state, script_verifier, pre)
+    }
+
+    /// Everything `testmempoolaccept` checks before scripts: Core's
+    /// `PreChecks` and, for a single transaction, `ReplacementChecks` and the
+    /// cluster limits. `package` is the members ahead of `tx` in a
+    /// multi-transaction `testmempoolaccept`: their outputs may be spent,
+    /// replacement and sibling eviction are refused, and the cluster limits
+    /// are left to the caller, who checks the package as a whole.
+    fn test_prechecks(
+        &self,
+        tx: &Transaction,
+        chain_state: &ChainState,
+        package: Option<&[Transaction]>,
+    ) -> Result<TestPrechecked, MempoolError> {
         let txid = tx.compute_txid();
         let cfg = self.config.read().clone();
 
@@ -5869,6 +5927,12 @@ impl Mempool {
             if let Some(conflict_txid) = inner.spends.get(&input.previous_output) {
                 conflicts.insert(*conflict_txid);
             }
+        }
+
+        // Core's `PreChecks` with `m_allow_replacement` off, as a
+        // multi-transaction `testmempoolaccept` runs it.
+        if package.is_some() && !conflicts.is_empty() {
+            return Err(MempoolError::ReplacementDisallowed);
         }
 
         // Look up inputs
@@ -5924,6 +5988,24 @@ impl Mempool {
                         ancestors.insert(input.previous_output.txid);
                         continue;
                     }
+                // An earlier member of the package being tested: unconfirmed,
+                // like a mempool parent, but not in the mempool's graph.
+                if let Some(output) = package
+                    .and_then(|members| {
+                        members.iter().find(|m| m.compute_txid() == input.previous_output.txid)
+                    })
+                    .and_then(|m| m.output.get(input.previous_output.vout as usize))
+                {
+                    if bip68_enforced
+                        && !Self::bip68_satisfied(chain_state, input.sequence.0, next_height, next_height, tip_mtp)
+                    {
+                        return Err(MempoolError::NonBip68Final);
+                    }
+                    sum_inputs += output.value.to_sat();
+                    prev_outputs.push(output.clone());
+                    prev_is_coinbase.push(false);
+                    continue;
+                }
                 return Err(MempoolError::MissingInputs);
             }
         }
@@ -5995,14 +6077,15 @@ impl Mempool {
         // TRUC, then RBF: the same `truc_admission` and `rbf_check`
         // `accept_transaction` runs, so `testmempoolaccept` and
         // `sendrawtransaction` cannot disagree. Core's single-transaction
-        // `testmempoolaccept` allows sibling eviction.
+        // `testmempoolaccept` allows sibling eviction; a multi-transaction
+        // one does not (`m_allow_sibling_eviction`).
         let sibling = Self::truc_admission(
             &inner,
             tx,
             weight_u64,
             &mempool_parents,
             &mut conflicts,
-            &PackageAdmit::default(),
+            &PackageAdmit { no_sibling_eviction: package.is_some(), ..Default::default() },
         )?;
         let mut evicted: HashSet<Txid> = HashSet::new();
         if !conflicts.is_empty() {
@@ -6019,10 +6102,38 @@ impl Mempool {
             )
             .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
         }
-        Self::check_cluster_limits(&inner, &cfg, &mempool_parents, weight_u64, &evicted)?;
+        // A package is held to the limits as a whole, by the caller.
+        if package.is_none() {
+            Self::check_cluster_limits(&inner, &cfg, &mempool_parents, weight_u64, &evicted)?;
+        }
 
-        drop(inner);
+        Ok(TestPrechecked {
+            txid,
+            vsize,
+            fee,
+            fee_rate,
+            weight,
+            adj_weight: weight_u64,
+            prev_outputs,
+            prev_is_coinbase,
+            ancestors,
+            mempool_parents,
+            cfg,
+        })
+    }
 
+    /// Scripts, then the policy dry run: the rest of `testmempoolaccept`
+    /// after [`Self::test_prechecks`].
+    fn test_finish(
+        &self,
+        tx: &Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        pre: TestPrechecked,
+    ) -> Result<(Txid, usize, u64), MempoolError> {
+        let TestPrechecked {
+            txid, vsize, fee, fee_rate, weight, prev_outputs, prev_is_coinbase, mut ancestors, cfg, ..
+        } = pre;
         // Script verification, consensus then policy, as on admission
         // (tip + 1 = next block height).
         let tip_height = chain_state.tip_height();
@@ -6096,6 +6207,202 @@ impl Mempool {
         }
 
         Ok((txid, vsize, fee))
+    }
+
+    /// A multi-transaction `testmempoolaccept`: Core's
+    /// `AcceptMultipleTransactions` with `PackageTestAccept`'s arguments. The
+    /// transactions are judged together, so a member may spend an earlier
+    /// one, and in Core's order:
+    ///
+    /// 1. each member's own checks, in order, with replacement and sibling
+    ///    eviction off ([`Self::test_prechecks`]); `already_known` is Core's
+    ///    `txn-already-known`, a member whose outputs are already coins;
+    /// 2. the TRUC package checks, a refusal of the whole package;
+    /// 3. the cluster limits, over the package and its mempool relatives;
+    /// 4. the ephemeral dust spends;
+    /// 5. each member's scripts.
+    ///
+    /// The first refusal in 1, 4 or 5 ends the evaluation with that member's
+    /// error; the members after it are not judged. Members are judged by
+    /// their own feerates (`m_package_feerates` is off).
+    ///
+    /// The caller has checked the package is well formed.
+    pub fn test_accept_package(
+        &self,
+        txs: &[Transaction],
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        already_known: &dyn Fn(&Transaction) -> bool,
+    ) -> PackageTestResult {
+        let mut out = PackageTestResult::default();
+        let mut pre: Vec<TestPrechecked> = Vec::with_capacity(txs.len());
+        for (i, tx) in txs.iter().enumerate() {
+            let checked = if already_known(tx) {
+                Err(MempoolError::AlreadyKnown)
+            } else {
+                self.test_prechecks(tx, chain_state, Some(&txs[..i]))
+            };
+            match checked {
+                Ok(p) => pre.push(p),
+                Err(e) => {
+                    out.results.insert(tx.compute_wtxid(), Err(e));
+                    return out;
+                }
+            }
+        }
+
+        let cfg = self.config.read().clone();
+        {
+            let inner = self.inner.read();
+            let members: Vec<&Transaction> = txs.iter().collect();
+            for (tx, p) in txs.iter().zip(&pre) {
+                let vsize = policy::weight_to_vsize(p.adj_weight);
+                if let Some(detail) = truc::package_truc_checks(&*inner, tx, vsize, &members, &p.mempool_parents) {
+                    out.package_error = Some(format!("TRUC-violation, {detail}"));
+                    return out;
+                }
+            }
+            let weights: Vec<u64> = pre.iter().map(|p| p.adj_weight).collect();
+            if Self::check_package_cluster_limits(&inner, &cfg, txs, &weights).is_err() {
+                out.package_error = Some("too-large-cluster".to_string());
+                return out;
+            }
+            if !cfg.accept_non_std_txn
+                && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, txs)
+            {
+                out.results.insert(txs[i].compute_wtxid(), Err(e));
+                return out;
+            }
+        }
+
+        for (tx, p) in txs.iter().zip(pre) {
+            let wtxid = tx.compute_wtxid();
+            match self.test_finish(tx, chain_state, script_verifier, p) {
+                Ok((_, vsize, fee)) => {
+                    out.results.insert(wtxid, Ok((vsize, fee)));
+                }
+                Err(e) => {
+                    out.results.insert(wtxid, Err(e));
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// The cluster limits over a package and the mempool together: every
+    /// group of members and mempool transactions connected through spends
+    /// may hold at most `max_cluster_count` transactions and
+    /// `max_cluster_vsize` sigop-adjusted vbytes. `weights` are the members'
+    /// sigop-adjusted weights. Each walk stops at the first limit passed.
+    fn check_package_cluster_limits(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        txs: &[Transaction],
+        weights: &[u64],
+    ) -> Result<(), MempoolError> {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Node {
+            Member(usize),
+            Pool(Txid),
+        }
+        let txids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let member_of = |t: &Txid| txids.iter().position(|m| m == t);
+        // The members spending each transaction, by its txid.
+        let mut spenders: HashMap<Txid, Vec<usize>> = HashMap::new();
+        for (i, tx) in txs.iter().enumerate() {
+            for input in &tx.input {
+                spenders.entry(input.previous_output.txid).or_default().push(i);
+            }
+        }
+        let max_weight = cfg.max_cluster_vsize.saturating_mul(4);
+        let mut seen: HashSet<Node> = HashSet::new();
+        let mut buf: Vec<Txid> = Vec::new();
+        for start in 0..txs.len() {
+            if !seen.insert(Node::Member(start)) {
+                continue;
+            }
+            let (mut count, mut weight) = (0usize, 0u64);
+            let mut queue = vec![Node::Member(start)];
+            while let Some(node) = queue.pop() {
+                let mut next: Vec<Node> = Vec::new();
+                let txid = match node {
+                    Node::Member(i) => {
+                        weight = weight.saturating_add(weights[i]);
+                        for input in &txs[i].input {
+                            let p = input.previous_output.txid;
+                            if let Some(j) = member_of(&p) {
+                                next.push(Node::Member(j));
+                            } else if inner.entries.contains_key(&p) {
+                                next.push(Node::Pool(p));
+                            }
+                        }
+                        txids[i]
+                    }
+                    Node::Pool(t) => {
+                        let Some(entry) = inner.entries.get(&t) else { continue };
+                        weight = weight.saturating_add(entry.adjusted_weight());
+                        buf.clear();
+                        Self::collect_children(inner, &t, &mut buf);
+                        buf.extend(entry.tx.input.iter().map(|i| i.previous_output.txid));
+                        next.extend(buf.iter().filter(|n| inner.entries.contains_key(*n)).map(|n| Node::Pool(*n)));
+                        t
+                    }
+                };
+                count += 1;
+                if count > cfg.max_cluster_count || weight > max_weight {
+                    return Err(MempoolError::TooLongMempoolChain);
+                }
+                next.extend(spenders.get(&txid).into_iter().flatten().map(|j| Node::Member(*j)));
+                for n in next {
+                    if seen.insert(n) {
+                        queue.push(n);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Core's `CheckEphemeralSpends` over a package: a member spending a
+    /// parent with dust outputs, in the package or the mempool, must spend
+    /// all of them. Returns the first member that does not, and its error.
+    fn package_ephemeral_spends(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        txs: &[Transaction],
+    ) -> Option<(usize, MempoolError)> {
+        for (i, tx) in txs.iter().enumerate() {
+            let mut checked: HashSet<Txid> = HashSet::new();
+            for input in &tx.input {
+                let parent_txid = input.previous_output.txid;
+                if !checked.insert(parent_txid) {
+                    continue;
+                }
+                let parent = txs[..i]
+                    .iter()
+                    .find(|m| m.compute_txid() == parent_txid)
+                    .or_else(|| inner.entries.get(&parent_txid).map(|e| &e.tx));
+                let Some(parent) = parent else { continue };
+                let dust = Self::dust_output_indices(parent, cfg.dust_relay_fee);
+                let sweeps_all = dust.iter().all(|&di| {
+                    tx.input
+                        .iter()
+                        .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
+                });
+                if !sweeps_all {
+                    return Some((
+                        i,
+                        MempoolError::MissingEphemeralSpends(format!(
+                            "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                            tx.compute_txid(),
+                            tx.compute_wtxid()
+                        )),
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Count how many dust outputs a transaction has (below the dust threshold
@@ -8293,6 +8600,10 @@ mod cluster_tests;
 #[cfg(test)]
 #[path = "pool_rbf_cluster_tests.rs"]
 mod rbf_cluster_tests;
+
+#[cfg(test)]
+#[path = "pool_package_test_tests.rs"]
+mod package_test_tests;
 
 #[cfg(test)]
 #[path = "pool_mempoolrpc_tests.rs"]

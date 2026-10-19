@@ -442,9 +442,7 @@ status = "run"
 
 [[test]]
 file = "mempool_package_limits.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L29 KeyError 'package-error' where 'too-large-cluster' is expected; the test uses Core v31 cluster limits and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+status = "run"
 
 [[test]]
 file = "mempool_package_rbf.py"
@@ -455,8 +453,8 @@ note = "measured 2026-09-15: L110 reject-reason 'insufficient fee' where 'bip125
 [[test]]
 file = "mempool_packages.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L62 wait_for_broadcast times out; the test uses Core v31 cluster limits and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+reason = "rpc-missing"
+note = "measured 2026-10-19 with cluster limits: L87 gettxspendingprevout is Method not found. Follow-up: gettxspendingprevout"
 
 [[test]]
 file = "mempool_persist.py"
@@ -485,9 +483,7 @@ status = "run"
 
 [[test]]
 file = "mempool_truc.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-18 with TRUC (#1020): L238 no exception raised: -limitclustercount=1 admits a 1-parent-1-child cluster (satd caps ancestors, not the cluster), and the restart that follows needs -limitclustersize. Measured past it, 9 of 14 cases pass; the rest stop at multi-transaction testmempoolaccept (L297 KeyError package-error: not evaluated as a package) and L604 replacement-failed (RBF fallback for a parent with two children). Follow-up: package testmempoolaccept, RBF fallback, cluster limits"
+status = "run"
 
 [[test]]
 file = "mempool_unbroadcast.py"
@@ -945,7 +941,7 @@ note = "measured 2026-09-15: L52 getorphantxs is Method not found. Follow-up: ge
 file = "rpc_packages.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-10-01: the four wtxid announcements at L546 arrive (#714); L111 testmempoolaccept of independent transactions plus one with missing inputs validates the others in full, where Core stops at the missing input and returns only their txid and wtxid. Follow-up: package validation stops at the first missing input"
+note = "measured 2026-10-19 with package testmempoolaccept: every testmempoolaccept section passes; L394 submitpackage of an undecodable transaction answers 'TX decode failed' without Core's hex and 'Make sure the tx has at least one input.' suffix. Follow-up: Core's decode message in submitpackage"
 
 [[test]]
 file = "rpc_preciousblock.py"

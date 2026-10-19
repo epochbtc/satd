@@ -46,6 +46,11 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- A multi-transaction `testmempoolaccept` evaluates its transactions
+  together, as Core does: a transaction may spend an earlier one, the TRUC
+  package checks and cluster limits apply to the set as `package-error`,
+  replacement is refused as `bip125-replacement-disallowed`, and the first
+  refusal ends the evaluation.
 - A replacement in a cluster the two-transaction diagrams cannot describe,
   such as one of several children of a cheap parent, is judged over the
   clusters it touches, as in Core v31. The per-conflict rule satd used there

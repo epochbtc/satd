@@ -8495,6 +8495,7 @@ impl PeerManager {
             // Everything else is local policy / standardness / resource limits /
             // RBF / duplicates — not misbehavior.
             MempoolError::AlreadyExists
+            | MempoolError::AlreadyKnown
             | MempoolError::SameNonWitnessData
             | MempoolError::ConflictingSpend
             | MempoolError::MissingInputs
@@ -8531,6 +8532,7 @@ impl PeerManager {
             | MempoolError::MissingEphemeralSpends(_)
             // BIP 431 topology and size policy.
             | MempoolError::TrucViolation(_)
+            | MempoolError::ReplacementDisallowed
             | MempoolError::SiblingEviction(_) => 0,
         }
     }

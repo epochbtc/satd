@@ -776,16 +776,12 @@ silently returning an empty or wrong answer.
   package as Core's `AcceptPackage` does: members on their own first, then
   those refused only for their feerate or for missing package inputs
   together, by their combined feerate, and one trim at the end. TRUC
-  (BIP 431) applies to packages as in Core. Three pieces of Core's package
-  policy are absent:
+  (BIP 431) applies to packages as in Core. A multi-transaction
+  `testmempoolaccept` evaluates its transactions together, as Core's does.
+  Two pieces of Core's package policy are absent:
   - **Package RBF.** A parent below the floors that conflicts with a mempool
     transaction keeps its fee refusal. Core replaces when a 1-parent-1-child
     package pays for the replacement.
-  - **Package `testmempoolaccept`.** A multi-transaction `testmempoolaccept`
-    checks each transaction against the mempool alone, so a transaction
-    spending an earlier one is reported `missing-inputs`, and the TRUC
-    package checks do not run there. Core evaluates the transactions
-    together and reports a package-wide refusal as `package-error`.
   - **Package relay.** A below-floor parent and its child reach satd only
     through `submitpackage`; satd does not do Core's opportunistic
     1-parent-1-child relay. Core peers still get such a package from satd,
