@@ -192,14 +192,11 @@ async fn an_address_read_past_the_request_timeout_is_answered_503_on_time() {
     let (addr, _dir) = serve(index, Duration::from_millis(300), 256).await;
 
     on_thread(move || {
+        // `/utxo` reads the history too: it counts it against the history
+        // cap before the UTXO walk.
         for route in ["", "/txs", "/txs/chain", "/utxo"] {
             let path = format!("{SH_PATH}{route}");
             let (status, waited) = get(addr, &path);
-            if route == "/utxo" {
-                // `/utxo` reads no history; it answers at once.
-                assert_eq!(status, 200, "{path}");
-                continue;
-            }
             assert_eq!(status, 503, "{path}");
             assert!(
                 waited < SLOW - Duration::from_millis(400),

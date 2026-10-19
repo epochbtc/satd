@@ -17,7 +17,7 @@
 use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use node_index::{history_rows, mempool_history_rows, scripthash_of};
+use node_index::{capped_history_rows, mempool_history_rows, scripthash_of};
 use serde_json::{Value, json};
 
 use crate::dispatch::{require_array, require_array_range};
@@ -132,23 +132,17 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
     // notifier hash. A client checks the announced status by hashing this
     // response in the order it arrives, so the two must agree row for row.
     //
-    // Asking for `cap + 1` rows bounds the work: confirmed rows are read
-    // as at most `cap + 1` DISTINCT `(height, txid)` entries (round-3
-    // review H1 — the schema has one row per matching output AND input,
-    // so a raw-row bound could silently truncate), and mempool rows are
-    // added only while there is room.
+    // A history over `cap` transactions (confirmed, or confirmed plus
+    // mempool) is refused with `history too large`. The confirmed part is
+    // counted first by a read that stops at the first transaction past
+    // the cap, so the refusal costs `O(cap)` reads and memory, never the
+    // whole history; the cap counts DISTINCT transactions (round-3 review
+    // H1 — the schema has one row per matching output AND input).
     let mempool = state.mempool.as_ref();
-    let rows = history_rows(
-        state.address_index.as_ref(),
-        &sh.0,
-        cap.saturating_add(1),
-        |txid| mempool_facts(mempool, txid),
-    )
+    let rows = capped_history_rows(state.address_index.as_ref(), &sh.0, cap, |txid| {
+        mempool_facts(mempool, txid)
+    })
     .map_err(JsonRpcError::from_index)?;
-
-    if rows.len() > cap {
-        return Err(JsonRpcError::history_too_large(cap));
-    }
 
     // `fee` (sats) is set on mempool rows only, from the live mempool
     // entry, which pre-computes it at admission.
@@ -166,6 +160,14 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
 
 pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_balance")?;
+    // The confirmed balance is summed over every funding row, so its cost
+    // follows the history. Refuse a history over the cap first, as Fulcrum
+    // does for `get_balance` above its `max_history`.
+    let cap = state.config.max_history_entries;
+    state
+        .address_index
+        .check_history_cap(&sh.0, cap)
+        .map_err(JsonRpcError::from_index)?;
     let (confirmed, unconfirmed) = state
         .address_index
         .balance(&sh.0)
@@ -181,6 +183,14 @@ pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Va
     let sh = parse_scripthash(&params, "blockchain.scripthash.listunspent")?;
     // Round-1 review M4: bound the index walk at cap + 1 UTXOs.
     let cap = state.config.max_history_entries;
+    // The UTXO walk checks every funding row for a live coin, so its cost
+    // follows the history, not the UTXO count: refuse a history over the
+    // cap before it starts (Fulcrum refuses `listunspent` above its
+    // `max_history` too).
+    state
+        .address_index
+        .check_history_cap(&sh.0, cap)
+        .map_err(JsonRpcError::from_index)?;
     let utxos = state
         .address_index
         .utxos_limited(&sh.0, cap.saturating_add(1))
@@ -282,14 +292,12 @@ pub fn scripthash_get_first_use(
     params: Value,
 ) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_first_use")?;
-    let confirmed = state
+    // Only the script's first block is read, so this is not capped: the
+    // answer costs the same for a history of one transaction or millions.
+    let earliest = state
         .address_index
-        .confirmed_history(&sh.0)
+        .first_confirmed_tx(&sh.0)
         .map_err(JsonRpcError::from_index)?;
-    let earliest = confirmed
-        .iter()
-        .min_by_key(|e| (e.height(), e.txid()))
-        .map(|e| (e.height(), e.txid()));
     match earliest {
         Some((height, txid)) => {
             let block_hash = state
@@ -309,8 +317,13 @@ pub fn scripthash_get_first_use(
 
 pub fn scripthash_subscribe(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.subscribe")?;
-    let h = compute_status_hash(state.address_index.as_ref(), state.mempool.as_ref(), sh)
-        .map_err(JsonRpcError::from_index)?;
+    let h = compute_status_hash(
+        state.address_index.as_ref(),
+        state.mempool.as_ref(),
+        sh,
+        state.config.max_history_entries,
+    )
+    .map_err(JsonRpcError::from_index)?;
     Ok(match status_hash_to_json(h) {
         Some(s) => Value::String(s),
         None => Value::Null,
@@ -823,6 +836,10 @@ pub(crate) fn fee_histogram_buckets(
     }
     out
 }
+
+#[cfg(test)]
+#[path = "blockchain_historycap_tests.rs"]
+mod historycap_tests;
 
 #[cfg(test)]
 mod tests {

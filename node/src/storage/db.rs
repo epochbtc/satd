@@ -532,9 +532,19 @@ impl Store for InMemoryStore {
     }
 
     fn iter_addr_funding(&self, sh: &Scripthash) -> Vec<(AddrFundingKey, u64)> {
+        self.iter_addr_funding_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_funding_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrFundingKey, u64)> {
         // The on-disk shape, resolved and ordered exactly as the RocksDB
         // backend does — an in-memory store that skipped the resolution
         // would let a test pass against rows the real one cannot serve.
+        // `limit` keeps the first rows in key (ordinal) order before
+        // resolving, as the RocksDB prefix scan does.
         let mut raw: Vec<(u64, u32, u64)> = self
             .addr_funding
             .read()
@@ -543,6 +553,7 @@ impl Store for InMemoryStore {
             .map(|r| (r.txseq, r.vout, r.amount_sat))
             .collect();
         raw.sort_unstable();
+        raw.truncate(limit);
         let seqs: Vec<u64> = raw.iter().map(|(seq, _, _)| *seq).collect();
         let resolved = crate::index::resolve::resolve_txseqs(self, &seqs);
         let mut rows: Vec<(AddrFundingKey, u64)> = raw
@@ -603,8 +614,16 @@ impl Store for InMemoryStore {
     }
 
     fn iter_addr_spending(&self, sh: &Scripthash) -> Vec<(AddrSpendingKey, OutPoint)> {
+        self.iter_addr_spending_limited(sh, usize::MAX)
+    }
+
+    fn iter_addr_spending_limited(
+        &self,
+        sh: &Scripthash,
+        limit: usize,
+    ) -> Vec<(AddrSpendingKey, OutPoint)> {
         // The on-disk shape, resolved and ordered exactly as the RocksDB
-        // backend does. See `iter_addr_funding`.
+        // backend does. See `iter_addr_funding_limited`.
         let mut raw: Vec<(u64, u32, u64, u32)> = self
             .addr_spending
             .read()
@@ -613,6 +632,7 @@ impl Store for InMemoryStore {
             .map(|r| (r.txseq, r.vin, r.funding_txseq, r.funding_vout))
             .collect();
         raw.sort_unstable();
+        raw.truncate(limit);
         let mut seqs: Vec<u64> = Vec::with_capacity(raw.len() * 2);
         for (txseq, _, funding_txseq, _) in &raw {
             seqs.push(*txseq);

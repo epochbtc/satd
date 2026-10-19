@@ -125,6 +125,52 @@ pub trait AddressIndex: Send + Sync {
         Ok(Some(newest_first.into_iter().skip(start).take(limit).collect()))
     }
 
+    /// Refuse a history above `cap`: `Err(IndexError::HistoryTooLarge {
+    /// cap })` when `sh`'s confirmed history holds more than `cap`
+    /// distinct transactions, `Ok(())` otherwise.
+    ///
+    /// The public read surfaces call this before any read whose cost
+    /// follows the whole history (the Electrum history, balance, UTXO list
+    /// and status; the Esplora address stats and UTXO list), so that one
+    /// request for a busy script costs at most `cap + 1` transactions'
+    /// rows instead of the history. A history can grow between this check
+    /// and the read that follows it, by the blocks connected in between.
+    ///
+    /// The chainstate-backed index counts the raw rows' transactions and
+    /// stops at the first one past `cap`, without resolving any of them.
+    /// The default counts through
+    /// [`confirmed_distinct_history_limited`](Self::confirmed_distinct_history_limited),
+    /// which for a backend without a streaming read is as costly as the
+    /// history.
+    fn check_history_cap(&self, sh: &Scripthash, cap: usize) -> Result<(), IndexError> {
+        if self
+            .confirmed_distinct_history_limited(sh, cap.saturating_add(1))?
+            .len()
+            > cap
+        {
+            return Err(IndexError::HistoryTooLarge { cap });
+        }
+        Ok(())
+    }
+
+    /// The first confirmed transaction of `sh` in `(height, txid)` order —
+    /// lowest height, then `Txid`'s own order — or `None` for an empty
+    /// confirmed history. Electrum's `blockchain.scripthash.get_first_use`.
+    ///
+    /// The default is the first row of
+    /// [`confirmed_distinct_history_limited`](Self::confirmed_distinct_history_limited).
+    /// The chainstate-backed index reads only the rows of the script's
+    /// first block, however long the history.
+    fn first_confirmed_tx(
+        &self,
+        sh: &Scripthash,
+    ) -> Result<Option<(u32, bitcoin::Txid)>, IndexError> {
+        Ok(self
+            .confirmed_distinct_history_limited(sh, 1)?
+            .into_iter()
+            .next())
+    }
+
     /// Unconfirmed (mempool) entries for `sh`.
     fn mempool_history(&self, sh: &Scripthash) -> Vec<MempoolHistoryEntry>;
 

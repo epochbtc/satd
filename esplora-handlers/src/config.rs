@@ -73,6 +73,14 @@ pub struct EsploraConfig {
     /// the `esplora:read` capability, on top of (or instead of) the legacy
     /// `auth` credential. `None` is today's behavior.
     pub auth_bearer: Option<Arc<satd_auth::TokenStore>>,
+    /// Most transactions a script's history may hold for the address
+    /// stats (`GET /address/:addr`, `GET /scripthash/:hash`) and the UTXO
+    /// list (`.../utxo`) to be served: both cost reads in proportion to
+    /// the whole history. Above it they answer 400 `Too many history
+    /// entries`, after reading at most `cap + 1` transactions' rows. The
+    /// paged `/txs` routes read one page and are not capped. Defaults to
+    /// [`node_index::DEFAULT_MAX_HISTORY_ENTRIES`], the Electrum cap.
+    pub max_history_entries: usize,
 }
 
 impl Default for EsploraConfig {
@@ -98,6 +106,7 @@ impl Default for EsploraConfig {
             max_sse_conns: 256,
             auth: EsploraAuth::None,
             auth_bearer: None,
+            max_history_entries: node_index::DEFAULT_MAX_HISTORY_ENTRIES,
         }
     }
 }

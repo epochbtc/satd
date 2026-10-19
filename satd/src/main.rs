@@ -1329,6 +1329,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         node::index::address::AddressIndexConfig {
             enabled: config.addressindex,
             max_subscriptions: config.addrindexsubscriptions,
+            max_history_entries: config.address_history_cap(),
             ..Default::default()
         },
         // BIP 158 filter index: gated on `--blockfilterindex=basic`.
@@ -2518,6 +2519,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::index::address::AddressIndexConfig {
                 enabled: config.addressindex,
                 max_subscriptions: config.addrindexsubscriptions,
+                max_history_entries: config.address_history_cap(),
                 ..Default::default()
             },
             mempool_addr_index.clone(),
@@ -2972,6 +2974,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let addr_cfg = node::index::address::AddressIndexConfig {
             enabled: config.addressindex,
             max_subscriptions: config.addrindexsubscriptions,
+            max_history_entries: config.address_history_cap(),
             ..Default::default()
         };
         let shutdown = shutdown_rx.clone();
@@ -3860,6 +3863,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 } else {
                     None
                 },
+                max_history_entries: config.address_history_cap(),
             };
             // Semaphore sized for SSE only — distinct from the request
             // concurrency layer which doesn't bound long-lived streams
@@ -3885,6 +3889,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     Arc::new(node::index::address::AddressIndexConfig {
                         enabled: config.addressindex,
                         max_subscriptions: config.addrindexsubscriptions,
+                        max_history_entries: config.address_history_cap(),
                         ..Default::default()
                     }),
                 )),
@@ -4113,7 +4118,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             banner: config.electrum_banner.clone(),
             server_name: config.electrum_server_name.clone(),
             donation_address: String::new(),
-            max_history_entries: electrum_proto::config::MAX_HISTORY_ENTRIES,
+            max_history_entries: config.address_history_cap(),
             max_headers_per_request: electrum_proto::config::MAX_HEADERS_PER_REQUEST,
             max_conns: config.electrum_max_conns,
             max_subs_per_conn: config.electrum_max_subs_per_conn,
@@ -4154,6 +4159,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 Arc::new(node::index::address::AddressIndexConfig {
                     enabled: config.addressindex,
                     max_subscriptions: config.addrindexsubscriptions,
+                    max_history_entries: config.address_history_cap(),
                     ..Default::default()
                 }),
             ));

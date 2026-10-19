@@ -153,16 +153,19 @@ async fn queued_block_events_share_one_recompute() {
     ));
     next_push(&mut rx).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // One pass over a subscribed history is two address reads: the count
+    // against the history cap, then the history itself.
+    const READS_PER_PASS: u64 = 2;
     assert_eq!(
         f.controls.addr_reads(),
-        1,
+        READS_PER_PASS,
         "five queued block events should cost one pass over the subscribed histories"
     );
 
     // A block after that pass gets a pass of its own.
     chain_tx.send(block(6)).unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(f.controls.addr_reads(), 2);
+    assert_eq!(f.controls.addr_reads(), 2 * READS_PER_PASS);
     sd_tx.send(true).unwrap();
 }
 

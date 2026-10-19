@@ -257,6 +257,7 @@ startup error.
 |---|---|---|---|---|
 | `txindex` | off | restart | core | Maintain a full transaction index. |
 | `addressindex` | on | restart | satd | Maintain an address-history index (backs native Electrum/Esplora). |
+| `addrindexmaxhistory` | 200000 | restart | satd | Largest scripthash history (transactions) the Electrum and Esplora address queries serve; a busier script is refused. `0` = no cap, which restores whole-history reads. See the Electrum chapter's History cap. |
 | `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |

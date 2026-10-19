@@ -160,5 +160,8 @@ fn index_error_to_rpc(e: IndexError) -> (i32, String) {
         // reindex (round-3 H2).
         IndexError::Incomplete => (-32605, e.to_string()),
         IndexError::Storage(_) => (-32603, e.to_string()),
+        // The operator RPCs read without a cap and never return this;
+        // map it like any other refusal should one appear.
+        IndexError::HistoryTooLarge { .. } => (-32603, e.to_string()),
     }
 }

@@ -12,13 +12,18 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Defaults align with `romanz/electrs` where possible:
-/// - `MAX_HISTORY_ENTRIES`: cap on confirmed-history rows returned by
-///   `blockchain.scripthash.get_history` so a pathological scripthash
-///   doesn't OOM the server. electrs uses 200,000.
+/// - `MAX_HISTORY_ENTRIES`: cap on the transactions in a scripthash's
+///   history that `blockchain.scripthash.get_history`, `get_balance`,
+///   `listunspent` and `subscribe` will serve, so a pathological
+///   scripthash doesn't OOM the server; above it they answer
+///   `history too large` (code 2) after reading at most `cap + 1`
+///   transactions' rows. Same value as
+///   [`node_index::DEFAULT_MAX_HISTORY_ENTRIES`], which the
+///   subscription notifier applies.
 /// - `MAX_HEADERS_PER_REQUEST`: max headers `blockchain.block.headers`
 ///   will return in a single call. electrs uses 2016 (one retarget
 ///   period).
-pub const MAX_HISTORY_ENTRIES: usize = 200_000;
+pub const MAX_HISTORY_ENTRIES: usize = node_index::DEFAULT_MAX_HISTORY_ENTRIES;
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2016;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONNS: usize = 64;
@@ -95,8 +100,9 @@ pub struct ElectrumConfig {
     /// Donation address returned by `server.donation_address`. Empty
     /// string is the documented "no donations" sentinel.
     pub donation_address: String,
-    /// Max confirmed-history entries any single `get_history` call
-    /// will return before erroring with `history_too_large`.
+    /// Most transactions a scripthash's history may hold for
+    /// `get_history`, `get_balance`, `listunspent` and `subscribe` to be
+    /// served; above it they error with `history_too_large`.
     pub max_history_entries: usize,
     /// Max headers per `blockchain.block.headers` response.
     pub max_headers_per_request: u32,

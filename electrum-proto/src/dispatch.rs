@@ -366,12 +366,24 @@ fn handle_scripthash_subscribe(
     // `SubscriptionRegistry::maybe_notify`.
     subs.add_scripthash(sh, state.address_index.as_ref())?;
 
-    let h = compute_status_hash(
+    let h = match compute_status_hash(
         state.address_index.as_ref(),
         state.mempool.as_ref(),
         ScripthashHex(sh),
-    )
-    .map_err(JsonRpcError::from_index)?;
+        state.config.max_history_entries,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            // A history over the cap is refused, and the refused
+            // subscription is dropped: kept, it would hold a slot and have
+            // the notifier re-check the cap on every block for a status it
+            // can never push.
+            if matches!(e, node_index::IndexError::HistoryTooLarge { .. }) {
+                let _ = subs.remove_scripthash(&sh);
+            }
+            return Err(JsonRpcError::from_index(e));
+        }
+    };
     // Record the answer so the next event that leaves the status
     // unchanged does not push it straight back. The registry only takes
     // it while this connection is the scripthash's sole subscriber.

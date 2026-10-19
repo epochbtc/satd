@@ -25905,5 +25905,78 @@ fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
 
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
     assert!(pool(&node).is_empty(), "the template left the pair out");
+
+    node.stop();
+}
+
+/// `-addrindexmaxhistory` sets the history cap Esplora and Electrum enforce.
+/// At a cap of 2, an address with two transactions is served on both, and
+/// refused on both once it has a third.
+#[test]
+fn test_addrindexmaxhistory_sets_the_served_history_cap() {
+    use bitcoin::hashes::Hash as _;
+    use std::io::{BufRead, BufReader, Write};
+    use std::str::FromStr as _;
+
+    const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let esplora_port = find_available_port();
+    let electrum_port = find_available_port();
+    let args: Vec<String> = vec![
+        "--esplora=1".into(),
+        format!("--esplorabind=127.0.0.1:{esplora_port}"),
+        "--electrum=1".into(),
+        format!("--electrumbind=127.0.0.1:{electrum_port}"),
+        "--addrindexmaxhistory=2".into(),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut node = TestNode::start(&args);
+
+    let spk = bitcoin::Address::from_str(ADDR).unwrap().assume_checked().script_pubkey();
+    let mut electrum_sh = bitcoin::hashes::sha256::Hash::hash(spk.as_bytes()).to_byte_array();
+    electrum_sh.reverse();
+    let electrum_sh = hex::encode(electrum_sh);
+    let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let esplora = || {
+        let r = http.get(format!("http://127.0.0.1:{esplora_port}/address/{ADDR}")).send().unwrap();
+        (r.status().as_u16(), r.text().unwrap())
+    };
+    let electrum = || -> serde_json::Value {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", electrum_port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let req = serde_json::json!({"jsonrpc": "2.0", "id": 1,
+            "method": "blockchain.scripthash.get_history", "params": [electrum_sh]});
+        s.write_all(format!("{req}\n").as_bytes()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let indexed = |n: u64| {
+        poll_until(
+            || {
+                let (status, body) = esplora();
+                status == 200
+                    && serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v["chain_stats"]["tx_count"].as_u64())
+                        == Some(n)
+            },
+            test_timeout(30),
+            "the address index never caught up",
+        )
+    };
+
+    node.mine_blocks(2, ADDR);
+    indexed(2);
+    let served = electrum();
+    assert_eq!(served["result"].as_array().map(Vec::len), Some(2), "two transactions are within the cap: {served}");
+
+    node.mine_blocks(1, ADDR);
+    poll_until(|| esplora().0 == 400, test_timeout(30), "Esplora never refused the third transaction");
+    let (_, body) = esplora();
+    assert!(body.contains("Too many history entries"), "Esplora refusal: {body}");
+    let refused = electrum();
+    assert!(
+        refused["error"]["message"].as_str().is_some_and(|m| m.contains("history too large")),
+        "Electrum refusal: {refused}"
+    );
+
     node.stop();
 }
