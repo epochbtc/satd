@@ -208,6 +208,194 @@ pub fn old_diagram(evicted: &[EvictedTx]) -> Vec<FeeFrac> {
     chunks
 }
 
+/// The most transactions [`cluster_chunks`] takes: Core's
+/// `MAX_CLUSTER_COUNT_LIMIT`, and one bit each in a `u64`.
+pub const MAX_CHUNKED_CLUSTER: usize = 64;
+
+/// A cluster for the functions below: `txs[i]` is a transaction's fee and
+/// size and the bitmask of its parents among `txs`. At most
+/// [`MAX_CHUNKED_CLUSTER`] transactions.
+pub type ClusterTxs = [(FeeFrac, u64)];
+
+/// Each transaction's ancestors within the cluster, itself included.
+fn ancestor_masks(txs: &ClusterTxs) -> Vec<u64> {
+    let n = txs.len();
+    let mut anc: Vec<u64> = (0..n).map(|i| (1u64 << i) | txs[i].1).collect();
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            let mut grown = anc[i];
+            let mut rest = anc[i] & !(1u64 << i);
+            while rest != 0 {
+                let p = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                grown |= anc[p];
+            }
+            if grown != anc[i] {
+                anc[i] = grown;
+                changed = true;
+            }
+        }
+        if !changed {
+            return anc;
+        }
+    }
+}
+
+fn sum_of(txs: &ClusterTxs, set: u64) -> FeeFrac {
+    let mut total = FeeFrac::default();
+    let mut rest = set;
+    while rest != 0 {
+        let i = rest.trailing_zeros() as usize;
+        rest &= rest - 1;
+        total = total + txs[i].0;
+    }
+    total
+}
+
+fn all_of(n: usize) -> u64 {
+    if n == 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// A cluster's linearization by ancestor-set feerate, as Core mined before
+/// the cluster mempool: the remaining transaction whose remaining ancestors
+/// pay the best feerate goes next, with them. Each chosen set is laid out
+/// by the same rule, its ancestors first and the transaction it was chosen
+/// for last. Laying a set out as one block folded a cheap tail into the
+/// chunk ahead of it.
+pub fn linearize(txs: &ClusterTxs) -> Vec<usize> {
+    let n = txs.len();
+    assert!(n <= MAX_CHUNKED_CLUSTER);
+    let anc = ancestor_masks(txs);
+    // The best ancestor set within `within`: highest feerate, then the
+    // smaller, then the lower index, so the order is deterministic.
+    let best_set = |within: u64| -> (u64, usize) {
+        let mut best: Option<(u64, usize, FeeFrac)> = None;
+        let mut rest = within;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let set = anc[i] & within;
+            let ff = sum_of(txs, set);
+            let better = match best {
+                None => true,
+                Some((_, _, b)) => match feerate_compare(ff, b) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => ff.size < b.size,
+                    Ordering::Less => false,
+                },
+            };
+            if better {
+                best = Some((set, i, ff));
+            }
+        }
+        let (set, top, _) = best.expect("within is not empty");
+        (set, top)
+    };
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    // (mask still to lay out, the transaction to place once it is empty)
+    let mut stack: Vec<(u64, Option<usize>)> = vec![(all_of(n), None)];
+    while let Some((mask, then)) = stack.pop() {
+        if mask == 0 {
+            order.extend(then);
+            continue;
+        }
+        let (set, top) = best_set(mask);
+        // The rest of `mask` after this set, then this set without its top,
+        // then the top: pushed in reverse.
+        stack.push((mask & !set, then));
+        stack.push((set & !(1u64 << top), Some(top)));
+    }
+    order
+}
+
+/// The chunks of `order` restricted to `todo`, with their sets: a
+/// transaction that pays more than the chunk before it joins that chunk.
+fn chunk_sets(txs: &ClusterTxs, order: &[usize], todo: u64) -> Vec<(u64, FeeFrac)> {
+    let mut chunks: Vec<(u64, FeeFrac)> = Vec::new();
+    for &i in order {
+        if todo & (1u64 << i) == 0 {
+            continue;
+        }
+        let (mut set, mut ff) = (1u64 << i, txs[i].0);
+        while let Some(&(last_set, last_ff)) = chunks.last()
+            && feerate_compare(ff, last_ff) == Ordering::Greater
+        {
+            set |= last_set;
+            ff = ff + last_ff;
+            chunks.pop();
+        }
+        chunks.push((set, ff));
+    }
+    chunks
+}
+
+/// The chunks of a linearization, in descending feerate.
+pub fn chunk_order(txs: &ClusterTxs, order: &[usize]) -> Vec<FeeFrac> {
+    chunk_sets(txs, order, all_of(txs.len())).into_iter().map(|(_, ff)| ff).collect()
+}
+
+/// Core's `MergeLinearizations` (v29 `cluster_linearize.h`): a
+/// linearization whose diagram is at least as good as both inputs'
+/// everywhere. Each step takes the better of the two first remaining
+/// chunks, cut down to its shortest intersection with the other order's
+/// chunk prefixes that pays no less (`IntersectPrefixes`).
+///
+/// Core v31 dropped it because its linearizer starts from the existing
+/// order and only improves it. satd starts afresh, so it merges the fresh
+/// order with the old one instead: a replacement that improves on what it
+/// replaces in place can then never chunk worse than the original.
+pub fn merge_linearizations(txs: &ClusterTxs, lin1: &[usize], lin2: &[usize]) -> Vec<usize> {
+    let n = txs.len();
+    let anc = ancestor_masks(txs);
+    // Shortest intersection of `subset` with prefixes of `chunks` paying
+    // no less than `subset`.
+    let intersect = |chunks: &[(u64, FeeFrac)], subset: (u64, FeeFrac)| -> (u64, FeeFrac) {
+        let mut acc = (0u64, FeeFrac::default());
+        for &(chunk, _) in chunks {
+            let to_add = chunk & subset.0;
+            if to_add == 0 {
+                continue;
+            }
+            acc.0 |= to_add;
+            if acc.0 == subset.0 {
+                break;
+            }
+            acc.1 = acc.1 + sum_of(txs, to_add);
+            if feerate_compare(acc.1, subset.1) != Ordering::Less {
+                return acc;
+            }
+        }
+        subset
+    };
+    let mut todo = all_of(n);
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    while todo != 0 {
+        let c1 = chunk_sets(txs, lin1, todo);
+        let c2 = chunk_sets(txs, lin2, todo);
+        let best = if feerate_compare(c2[0].1, c1[0].1) == Ordering::Greater {
+            intersect(&c1, c2[0])
+        } else {
+            intersect(&c2, c1[0])
+        };
+        // Core's `AppendTopo`: by ancestor count, then index.
+        let mut picked: Vec<usize> = (0..n).filter(|i| best.0 & (1u64 << i) != 0).collect();
+        picked.sort_by_key(|&i| (anc[i].count_ones(), i));
+        out.extend(picked);
+        todo &= !best.0;
+    }
+    out
+}
+
+/// The chunks of one cluster's [`linearize`] order, in descending feerate,
+/// or `None` past [`MAX_CHUNKED_CLUSTER`] transactions.
+pub fn cluster_chunks(txs: &ClusterTxs) -> Option<Vec<FeeFrac>> {
+    if txs.len() > MAX_CHUNKED_CLUSTER {
+        return None;
+    }
+    Some(chunk_order(txs, &linearize(txs)))
+}
+
 /// Sort a diagram the way `CompareChunks` requires: descending feerate.
 pub fn sort_chunks(chunks: &mut [FeeFrac]) {
     // Core sorts with `std::greater()` on `FeeFrac`, whose ordering is
@@ -226,6 +414,110 @@ mod tests {
 
     fn ff(fee: i64, size: i64) -> FeeFrac {
         FeeFrac::new(fee, size)
+    }
+
+    /// A parent with one child that pays for it is one chunk; a second,
+    /// poorer child is a chunk of its own.
+    #[test]
+    fn a_child_that_pays_for_its_parent_shares_its_chunk() {
+        let chunks = cluster_chunks(&[(ff(100, 100), 0), (ff(3_000, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(3_100, 200), ff(200, 100)]);
+    }
+
+    /// A richer parent goes first on its own, and children that pay less
+    /// follow, best first.
+    #[test]
+    fn a_rich_parent_is_its_own_chunk() {
+        let chunks = cluster_chunks(&[(ff(5_000, 100), 0), (ff(100, 100), 0b1), (ff(300, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(5_000, 100), ff(300, 100), ff(100, 100)]);
+    }
+
+    /// A grandchild's ancestors come with it, through the child: a poor
+    /// parent and child are pulled up by a rich grandchild.
+    #[test]
+    fn ancestors_are_taken_transitively() {
+        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(0, 100), 0b1), (ff(9_000, 100), 0b10)]).unwrap();
+        assert_eq!(chunks, vec![ff(9_000, 300)]);
+    }
+
+    /// A later segment that pays more than the chunk before it joins that
+    /// chunk, so the chunks come out in descending feerate.
+    #[test]
+    fn a_later_richer_segment_merges_into_the_chunk_before() {
+        // P pays nothing; C1 pays 300 and C2 200, each over 100. P goes with
+        // C1 first ({P, C1} at 1.5 beats {P, C2} at 1.0); then C2 alone pays
+        // 2.0, more than that chunk, and joins it.
+        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(300, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(500, 300)]);
+        for pair in chunks.windows(2) {
+            assert_ne!(feerate_compare(pair[0], pair[1]), Ordering::Less);
+        }
+    }
+
+    /// A diamond: A parents B and C, and D spends both. Bumping only D's fee
+    /// must not chunk worse than before. Laying out D's ancestor set as one
+    /// block made it a single chunk, (7000, 6400), which at 4000 pays 4375
+    /// against the original's 4600.
+    #[test]
+    fn a_fee_bump_of_a_diamonds_tail_chunks_no_worse() {
+        let diamond = |d_fee| {
+            [(ff(600, 1600), 0), (ff(2600, 1600), 0b1), (ff(1400, 800), 0b1), (ff(d_fee, 2400), 0b110)]
+        };
+        let before = cluster_chunks(&diamond(1400)).unwrap();
+        let after = cluster_chunks(&diamond(2400)).unwrap();
+        assert_eq!(before, vec![ff(4600, 4000), ff(1400, 2400)]);
+        assert_eq!(after, vec![ff(4600, 4000), ff(2400, 2400)]);
+        assert_eq!(compare_chunks(&after, &before), DiagramOrdering::Better);
+    }
+
+    /// Devin's tree: A parents B and C, D spends B. Bumping only D's fee
+    /// reorders the fresh linearization (A, B, D, C) into one chunk that,
+    /// at 3200, pays less than the original order did. Merged with the old
+    /// order carrying the bump, it is no worse anywhere.
+    #[test]
+    fn merging_with_the_old_order_keeps_a_fee_bump_no_worse() {
+        let tree = |d_fee| [(ff(800, 2000), 0), (ff(1800, 800), 0b1), (ff(1300, 400), 0b1), (ff(d_fee, 2000), 0b10)];
+        let before = tree(500);
+        let after = tree(2400);
+        let old_order = linearize(&before);
+        assert_eq!(chunk_order(&before, &old_order), vec![ff(3900, 3200), ff(500, 2000)]);
+        // Fresh, the bump comes out worse than the original.
+        let fresh = linearize(&after);
+        assert_ne!(compare_chunks(&chunk_order(&after, &fresh), &chunk_order(&before, &old_order)), DiagramOrdering::Better);
+        // Merged with the original order, it is better.
+        let merged = merge_linearizations(&after, &fresh, &old_order);
+        assert_eq!(compare_chunks(&chunk_order(&after, &merged), &chunk_order(&before, &old_order)), DiagramOrdering::Better);
+    }
+
+    /// A merge is no worse than either input anywhere, and keeps every
+    /// parent ahead of its children.
+    #[test]
+    fn a_merge_is_at_least_as_good_as_both_and_topological() {
+        let txs = [(ff(100, 100), 0), (ff(900, 100), 0b1), (ff(50, 100), 0), (ff(700, 100), 0b100), (ff(300, 100), 0b1010)];
+        let a = vec![0, 1, 2, 3, 4];
+        let b = vec![2, 3, 0, 1, 4];
+        let m = merge_linearizations(&txs, &a, &b);
+        for lin in [&a, &b] {
+            assert!(matches!(
+                compare_chunks(&chunk_order(&txs, &m), &chunk_order(&txs, lin)),
+                DiagramOrdering::Better | DiagramOrdering::Equal
+            ));
+        }
+        let pos = |i: usize| m.iter().position(|&x| x == i).unwrap();
+        for (i, (_, parents)) in txs.iter().enumerate() {
+            for p in 0..txs.len() {
+                if parents & (1 << p) != 0 {
+                    assert!(pos(p) < pos(i));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cluster_past_sixty_four_is_not_chunked() {
+        let txs: Vec<(FeeFrac, u64)> = (0..65).map(|_| (ff(1, 1), 0)).collect();
+        assert!(cluster_chunks(&txs).is_none());
+        assert_eq!(cluster_chunks(&txs[..64]).unwrap().len(), 64, "equal feerates are not merged");
     }
 
     /// Feerates are compared by cross-product, so no division rounds a
