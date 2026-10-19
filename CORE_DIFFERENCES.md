@@ -762,6 +762,10 @@ silently returning an empty or wrong answer.
   children, an ancestor with relatives — satd compares diagrams over every
   cluster the replacement touches, as v31 does, but linearizes each cluster
   by ancestor-set feerate where Core searches for the optimal linearization.
+  The side after the replacement merges that order with the old one carrying
+  the replacement in place (Core v29's `MergeLinearizations`), so a
+  replacement that does better in place never chunks worse than the
+  original.
   The two agree on the small clusters a replacement usually touches; on a
   larger, tangled one satd's chunks can be slightly worse than Core's, and a
   replacement at the margin can then be judged differently. A cluster past
