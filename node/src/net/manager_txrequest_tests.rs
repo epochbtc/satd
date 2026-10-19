@@ -84,7 +84,7 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
 
 /// A connected peer that relays by wtxid and serves blocks. Outbound is a
 /// preferred announcer (Core's `fPreferredDownload`); inbound is not.
-fn add_peer(pm: &PeerManager, id: PeerId, direction: Direction) -> mpsc::Receiver<NetworkMessage> {
+pub(super) fn add_peer(pm: &PeerManager, id: PeerId, direction: Direction) -> mpsc::Receiver<NetworkMessage> {
     add_peer_with(pm, id, direction, |_| {})
 }
 

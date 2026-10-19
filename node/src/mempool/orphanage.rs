@@ -223,6 +223,24 @@ impl TxOrphanage {
             .unwrap_or_default()
     }
 
+    /// Core's `GetChildrenFromSamePeer`: the orphans `peer` sent that spend
+    /// `parent`, newest first. Only that peer's, so another peer cannot
+    /// crowd out the real child with fake ones.
+    pub fn children_from_peer(&self, parent: &Txid, peer: PeerId) -> Vec<Transaction> {
+        let inner = self.inner.lock();
+        let mut kids: Vec<(u64, Transaction)> = inner
+            .by_parent
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| inner.by_txid.get(t))
+            .filter(|e| e.from_peer == peer)
+            .map(|e| (e.seq, e.tx.clone()))
+            .collect();
+        kids.sort_by(|a, b| b.0.cmp(&a.0));
+        kids.into_iter().map(|(_, tx)| tx).collect()
+    }
+
     /// Remove and return the orphan entry for `txid`, if present. Cleans
     /// all indexes atomically.
     pub fn remove(&self, txid: &Txid) -> Option<OrphanEntry> {

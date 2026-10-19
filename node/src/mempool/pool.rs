@@ -7015,6 +7015,21 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         client_maxfeerate: Option<u64>,
     ) -> PackageResult {
+        self.accept_package_from(txs, chain_state, script_verifier, client_maxfeerate, TxSource::Rpc)
+    }
+
+    /// [`Self::accept_package_with`] for a package from `source`: a local
+    /// surface's, refused where a member would be relay-quarantined, or a
+    /// peer's (Core's 1-parent-1-child relay), quarantined as relayed
+    /// transactions are.
+    pub fn accept_package_from(
+        &self,
+        txs: Vec<Transaction>,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        client_maxfeerate: Option<u64>,
+        source: TxSource,
+    ) -> PackageResult {
         use serde_json::json;
 
         // Until the last member is in or taken back out.
@@ -7215,7 +7230,7 @@ impl Mempool {
                 ptx.tx.clone(),
                 chain_state,
                 script_verifier,
-                TxSource::Rpc,
+                source,
                 false,
                 Vec::new(),
                 &mut admit,
@@ -7545,7 +7560,7 @@ impl Mempool {
                             parent.tx.clone(),
                             chain_state,
                             script_verifier,
-                            TxSource::Rpc,
+                            source,
                             false,
                             Vec::new(),
                             None,
@@ -7562,7 +7577,7 @@ impl Mempool {
                                     child.tx.clone(),
                                     chain_state,
                                     script_verifier,
-                                    TxSource::Rpc,
+                                    source,
                                     false,
                                     Vec::new(),
                                     None,
@@ -7647,7 +7662,7 @@ impl Mempool {
                 p.tx.clone(),
                 chain_state,
                 script_verifier,
-                TxSource::Rpc,
+                source,
                 false,
                 Vec::new(),
                 &mut admit,
@@ -7917,7 +7932,7 @@ impl Mempool {
                 child_tx.clone(),
                 chain_state,
                 script_verifier,
-                TxSource::Rpc,
+                source,
                 false,
                 lead,
                 &mut admit,

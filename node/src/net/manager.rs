@@ -8734,10 +8734,18 @@ impl PeerManager {
         self.recent_rejects.lock().contains(tip, hash, true)
     }
 
-    /// Core's check for an orphan: if one of `missing` was refused outright
-    /// (the main filter only: a parent refused on its fee alone may still
-    /// enter), record the orphan's txid and wtxid as refused too and return
-    /// true. One tip snapshot and one lock cover the check and the record,
+    /// Whether `hash` is in the main rejects filter (Core's
+    /// `AlreadyHaveTx(gtxid, include_reconsiderable = false)` as far as
+    /// rejections go).
+    fn recently_rejected_outright(&self, hash: &[u8; 32]) -> bool {
+        let tip = self.chain_state.tip_hash();
+        self.recent_rejects.lock().contains(tip, hash, false)
+    }
+
+    /// Core's check for an orphan: if one of `missing` was refused outright,
+    /// or two of them on their fee alone (one such parent may still enter
+    /// with this orphan as a 1-parent-1-child package; two cannot), record
+    /// the orphan's txid and wtxid as refused too and return true. One tip snapshot and one lock cover the check and the record,
     /// and both are about `validated_at`, the tip the orphan was validated
     /// against; if the tip has moved since, nothing is decided.
     fn condemn_orphan_of_rejected_parent(
@@ -8750,7 +8758,12 @@ impl PeerManager {
         use crate::net::recent_rejects::Rejection;
         let tip = self.chain_state.tip_hash();
         let mut rejects = self.recent_rejects.lock();
-        let hit = tip == validated_at && missing.iter().any(|p| rejects.contains(tip, p.as_byte_array(), false));
+        // Core tolerates one parent refused on its fee alone, which the
+        // orphan may pay for as a 1-parent-1-child package, but not two.
+        // It looks each parent up by txid, as here.
+        let hit = tip == validated_at
+            && (missing.iter().any(|p| rejects.contains(tip, p.as_byte_array(), false))
+                || missing.iter().filter(|p| rejects.contains_reconsiderable(tip, p.as_byte_array())).count() > 1);
         if hit {
             rejects.insert(tip, txid.as_byte_array(), Rejection::Rejected);
             rejects.insert(tip, wtxid.as_byte_array(), Rejection::Rejected);
@@ -8835,10 +8848,19 @@ impl PeerManager {
                 tracker.received_response(id, &wtxid.to_byte_array());
             }
         }
-        // Core's TX handler: a transaction refused since the tip moved is
-        // not validated again, whoever sends it.
-        if self.recently_rejected(wtxid.as_byte_array()) {
+        // Core's `ReceivedTx`: a transaction refused since the tip moved is
+        // not validated again, whoever sends it. One refused on its fee
+        // alone may still enter with a child of it this peer sent, which
+        // waits in the orphanage (1-parent-1-child relay).
+        if self.recently_rejected_outright(wtxid.as_byte_array()) {
             tracing::debug!(%txid, %wtxid, peer = id, "recently rejected, not validated again");
+            return;
+        }
+        if self.recently_rejected(wtxid.as_byte_array()) {
+            tracing::debug!(%txid, %wtxid, peer = id, "in reconsiderable rejects, looking for a child in the orphanage");
+            if let Some(child) = self.find_1p1c_package(&tx, id) {
+                self.submit_1p1c_package(id, tx, child);
+            }
             return;
         }
         // The tip the verdict is about. A block can connect while the
@@ -8956,6 +8978,14 @@ impl PeerManager {
                     e.state_string()
                 );
                 self.record_rejection(&tx, &e, validated_at);
+                // Core's `MempoolRejectedTx`: a first refusal on the fee
+                // alone looks for a child in the orphanage that may pay for
+                // it.
+                let reconsiderable = matches!(
+                    Self::rejection_kind(&e, has_witness),
+                    Some(crate::net::recent_rejects::Rejection::Reconsiderable)
+                );
+                let package = if reconsiderable { self.find_1p1c_package(&tx, id) } else { None };
                 // Core's `MempoolRejectedTx` forgets the wtxid, and the txid
                 // only for `TX_INPUTS_NOT_STANDARD`, where no witness could
                 // make it acceptable: another peer may still offer a
@@ -8989,9 +9019,96 @@ impl PeerManager {
                     // policy may still include it. Core's first-time-reject
                     // insertion. A consensus-invalid transaction is not kept,
                     // and one we already hold is not a rejection.
-                    self.keep_for_reconstruction(tx);
+                    if package.is_some() {
+                        self.keep_for_reconstruction(tx.clone());
+                    } else {
+                        self.keep_for_reconstruction(tx);
+                        return;
+                    }
+                }
+                if let Some(child) = package {
+                    self.submit_1p1c_package(id, tx, child);
                 }
             }
+        }
+    }
+
+    /// Core's `Find1P1CPackage`: for `parent`, refused on its fee alone, a
+    /// child in the orphanage that the same peer sent. Only that peer's
+    /// children are looked at, so another peer cannot crowd the real one
+    /// out with fakes. The newest goes first. A pairing already refused as
+    /// a package, or a child refused outright, is passed over.
+    fn find_1p1c_package(&self, parent: &bitcoin::Transaction, peer: PeerId) -> Option<bitcoin::Transaction> {
+        let parent_wtxid = parent.compute_wtxid();
+        let tip = self.chain_state.tip_hash();
+        let candidates = self.orphanage.children_from_peer(&parent.compute_txid(), peer);
+        let mut rejects = self.recent_rejects.lock();
+        candidates.into_iter().find(|child| {
+            let hash = crate::net::recent_rejects::package_hash(&[parent_wtxid, child.compute_wtxid()]);
+            !rejects.contains_reconsiderable(tip, &hash)
+                && !rejects.contains(tip, child.compute_txid().as_byte_array(), false)
+        })
+    }
+
+    /// Validate `parent` and `child` as a package (Core's
+    /// `ProcessNewPackage` and `ProcessPackageResult`). A refused package
+    /// is remembered by its hash in the fee filter, so the pairing is not
+    /// tried again. Each member that entered is treated as an accepted
+    /// transaction: announced, its requests forgotten, its orphans
+    /// reconsidered. A child left out leaves the orphanage, unless it is
+    /// still missing inputs.
+    fn submit_1p1c_package(&self, peer: PeerId, parent: bitcoin::Transaction, child: bitcoin::Transaction) {
+        let validated_at = self.chain_state.tip_hash();
+        let members: Vec<(bitcoin::Txid, bitcoin::Wtxid)> =
+            [&parent, &child].iter().map(|tx| (tx.compute_txid(), tx.compute_wtxid())).collect();
+        let child_tx = child.clone();
+        let result = self.mempool.accept_package_from(
+            vec![parent, child],
+            &self.chain_state,
+            self.chain_state.script_verifier(),
+            None,
+            crate::mempool::pool::TxSource::P2p,
+        );
+        tracing::debug!(
+            parent = %members[0].0,
+            child = %members[1].0,
+            peer,
+            "package evaluation: {}",
+            result.package_msg
+        );
+        if result.package_msg != "success" {
+            let hash = crate::net::recent_rejects::package_hash(&[members[0].1, members[1].1]);
+            self.recent_rejects.lock().insert_if_tip(
+                validated_at,
+                self.chain_state.tip_hash(),
+                &[hash],
+                crate::net::recent_rejects::Rejection::Reconsiderable,
+            );
+        }
+        // The child first, as Core walks the package backwards, so it is out
+        // of the orphanage before its parent's orphans are reconsidered.
+        let mut entered = Vec::new();
+        for (i, (txid, wtxid)) in members.iter().enumerate().rev() {
+            if self.mempool.get(txid).is_some() {
+                if let Some(h) = self.peers.read().get(&peer) {
+                    h.stats.record_transaction();
+                }
+                self.forget_tx_requests(*txid, *wtxid);
+                self.orphanage.remove(txid);
+                entered.push(*txid);
+            } else if i == 1 {
+                // Core keeps a child refused for `TX_MISSING_INPUTS`: one
+                // still missing a parent besides this one.
+                let mut missing = self.collect_missing_parents(&child_tx);
+                missing.remove(&members[0].0);
+                if missing.is_empty() {
+                    self.orphanage.remove(txid);
+                }
+            }
+        }
+        for txid in entered.into_iter().rev() {
+            self.broadcast_inv(peer, txid);
+            self.drain_orphans_for_parent(txid);
         }
     }
 
@@ -12688,6 +12805,10 @@ mod chainsel_tests;
 #[cfg(test)]
 #[path = "manager_txrequest_tests.rs"]
 mod txrequest_tests;
+
+#[cfg(test)]
+#[path = "manager_1p1c_tests.rs"]
+mod p1c_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
