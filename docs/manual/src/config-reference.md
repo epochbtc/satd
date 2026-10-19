@@ -48,10 +48,9 @@ track Bitcoin Core v30.
   override the profile's values.
 
 > **Note.** Compatibility is pinned to Bitcoin Core v30, a frozen and
-> verifiable surface. Keys Core adds in v31 or later (for example
-> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are not
-> recognized and are rejected as typos until the
-> pin is bumped. Keys Core removed at or before v30 (for example `upnp`,
+> verifiable surface. Keys Core adds in v31 or later are not recognized,
+> and are rejected as typos, unless satd implements them (`limitclustercount`,
+> `limitclustersize` and `txospenderindex` are; `privatebroadcast` is not). Keys Core removed at or before v30 (for example `upnp`,
 > `maxorphantx`) are likewise not honored. A `bitcoin.conf` migrated from a
 > newer Core that contains a v31+ key stops satd at startup with an "unknown
 > key" error. This is intentional.
@@ -263,7 +262,7 @@ startup error.
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
 | `coinstatsindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd implements no UTXO-set hash index: the key sets nothing, and `getindexinfo` reports the index as never synced rather than claiming a readiness it cannot deliver. |
-| `txospenderindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd has no separate spender index and does not implement `gettxspendingprevout`; `getindexinfo` answers from the `spent` index that backs Esplora's outspend endpoints. |
+| `txospenderindex` | off | restart | core | `gettxspendingprevout` also finds spenders in blocks, as in Core. satd answers from the address index's spend rows, which back Esplora's outspend endpoints, so the key needs `addressindex` and adds no index of its own. Refused with `prune`, as in Core. |
 
 ## Mempool / relay policy
 

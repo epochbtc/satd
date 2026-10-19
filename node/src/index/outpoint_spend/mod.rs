@@ -14,10 +14,8 @@
 //! Consumers:
 //! - Esplora `/tx/:txid/outspend/:vout` and `/tx/:txid/outspends`
 //! - Future Electrum `blockchain.outpoint.subscribe` (post-M5)
-//!
-//! satd does not implement Core's `gettxspendingprevout`; when it does,
-//! this is what would back its confirmed side (mempool inputs stay in
-//! the mempool's existing tracker).
+//! - `gettxspendingprevout`'s confirmed side under `-txospenderindex`
+//!   (mempool spenders come from the mempool's own tracker)
 //!
 //! Schema and codec live in `node-index::spend_keys`. This module
 //! contains only the integration surface (emit helpers, lookup

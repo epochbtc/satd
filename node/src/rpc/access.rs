@@ -130,6 +130,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getstratuminfo"
         | "getsysteminfo"
         | "gettxout"
+        // Mempool and spend-index point reads.
+        | "gettxspendingprevout"
         // Merkle-proof build/verify over stored blocks; neither mutates state.
         | "gettxoutproof"
         | "verifytxoutproof"
@@ -328,6 +330,7 @@ mod tests {
             "getblockcount",
             "getrawtransaction",
             "gettxout",
+            "gettxspendingprevout",
             "getaddresshistory",
             "getrawmempool",
             "estimatesmartfee",

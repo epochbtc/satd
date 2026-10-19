@@ -61,6 +61,7 @@ pub mod policy;
 pub mod psbt;
 pub mod psbt_v2;
 pub mod rawtx;
+pub mod txospender;
 pub mod readonly;
 pub mod warmup;
 pub mod whitelist;

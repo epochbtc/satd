@@ -941,9 +941,10 @@ pub struct Config {
     /// UTXO-set hash index; the flag is accepted for drop-in config
     /// compat and reported as always-synced in `getindexinfo`.
     pub coinstatsindex: bool,
-    /// Bitcoin Core's `-txospenderindex` (v31+). satd does not implement
-    /// a per-outpoint spender index; the flag is accepted for drop-in
-    /// config compat and reported as always-synced in `getindexinfo`.
+    /// Bitcoin Core's `-txospenderindex` (v31+): `gettxspendingprevout`
+    /// looks past the mempool by default. satd answers from the address
+    /// index's spend rows, so the flag needs `-addressindex`; like Core,
+    /// it is refused with pruning.
     pub txospenderindex: bool,
     /// Whether to advertise `NODE_COMPACT_FILTERS` and answer
     /// `getcfilters` / `getcfheaders` / `getcfcheckpt` over the BIP
@@ -3771,8 +3772,8 @@ impl Config {
             })
             .unwrap_or(false);
 
-        // Core-compat stub indexes: accepted for drop-in config compat,
-        // reported in `getindexinfo` as always-synced when enabled.
+        // `coinstatsindex` is a Core-compat stub, accepted for drop-in
+        // config compat. `txospenderindex` is served by the address index.
         let coinstatsindex = cli
             .coinstatsindex
             .or_else(|| file_get("coinstatsindex").and_then(|v| parse_bool(&v)))
@@ -4031,6 +4032,20 @@ impl Config {
         // still catches the operator who explicitly enables both).
         if pruning && txindex {
             return Err("prune mode is incompatible with -txindex".to_string());
+        }
+        // Core refuses `-txospenderindex` with pruning: a spender in a pruned
+        // block could not be returned. satd's spender index is the address
+        // index's spend rows, so it needs that index as well.
+        if pruning && txospenderindex {
+            return Err("Prune mode is incompatible with -txospenderindex.".to_string());
+        }
+        if txospenderindex && !addressindex {
+            return Err(
+                "txospenderindex=1 with addressindex=0: refusing to start. \
+                 satd's spender index is kept by the address index — enable it with \
+                 --addressindex=1, or set --txospenderindex=0."
+                    .into(),
+            );
         }
 
         // Validate auth consistency
@@ -5984,7 +5999,7 @@ pub struct CliArgs {
         value_parser = parse_bool_arg,
         num_args = 0..=1,
         default_missing_value = "1",
-        help = "Accepted for Bitcoin Core drop-in config compat. satd does not implement a per-outpoint spender index; the flag is accepted silently and the index is reported as always-synced in getindexinfo."
+        help = "Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0). satd answers from the address index, so this needs -addressindex; incompatible with -prune."
     )]
     pub txospenderindex: Option<bool>,
 
@@ -10395,6 +10410,28 @@ blockmintxfee=0.00001
             Some("-maxmempool must be at least 8 MB")
         );
         assert_eq!(load(&["-limitclustersize=200", "-maxmempool=8"]).expect("at the floor").maxmempool, 8);
+    }
+
+    /// `-txospenderindex` is refused with pruning, as in Core, and without the
+    /// address index whose spend rows serve it.
+    #[test]
+    fn txospenderindex_needs_the_address_index_and_no_pruning() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        assert!(load(&["-txospenderindex"]).expect("with the default address index").txospenderindex);
+        assert_eq!(
+            load(&["-txospenderindex", "-prune=550"]).err().as_deref(),
+            Some("Prune mode is incompatible with -txospenderindex.")
+        );
+        assert!(load(&["-prune=550"]).is_ok(), "pruning alone still loads");
+        let without = load(&["-txospenderindex", "-addressindex=0", "-esplora=0", "-electrum=0"]).err().unwrap_or_default();
+        assert!(without.starts_with("txospenderindex=1 with addressindex=0"), "{without}");
+        assert!(load(&["-addressindex=0", "-esplora=0", "-electrum=0"]).is_ok(), "no address index alone still loads");
     }
 
     /// Core's stock Tor configuration must load: the two bare entries are

@@ -4367,6 +4367,15 @@ impl Mempool {
         Some((spending_txid, vin))
     }
 
+    /// The acting transaction spending `outpoint`, read under one lock:
+    /// Core's `GetConflictTx` for `gettxspendingprevout`, on the same
+    /// acting view as [`Self::spending_tx_acting`].
+    pub fn spending_transaction_acting(&self, outpoint: &OutPoint) -> Option<Transaction> {
+        let inner = self.inner.read();
+        let entry = inner.entries.get(inner.spends.get(outpoint)?)?;
+        entry.scope.is_acting().then(|| entry.tx.clone())
+    }
+
     /// Remove transactions that have been in the mempool longer than the expiry time.
     /// Returns the number of transactions removed.
     pub fn remove_expired(&self) -> usize {
