@@ -59,6 +59,11 @@ item below is (or will be) written up in full in the in-development
   cluster order approximates Core's optimal one. A replacement past the
   cluster limits is now `replacement-failed, cluster size limit exceeded`,
   as in Core.
+- An announced transaction is requested from one peer at a time, as by Core's
+  `TxRequestTracker`: a transaction announced by several peers was downloaded
+  from every one of them. The next announcer is asked when the request times
+  out (60 s), the peer answers `notfound`, or it disconnects; inbound and
+  txid-only announcements wait Core's 2 s delays.
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
   does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,

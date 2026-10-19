@@ -29,6 +29,7 @@ use crate::net::peer::{default_p2p_port, ConnType, Direction, PeerAddr, PeerId, 
 use crate::net::proxy;
 use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
+use crate::net::txrequest::{AnnouncerInfo, GenTxid, GETDATA_TX_INTERVAL, MAX_GETDATA_SZ};
 
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
@@ -1248,6 +1249,10 @@ pub struct PeerManager {
     /// recent-rejects filters), so another peer's announcement of one is
     /// not downloaded and validated again.
     recent_rejects: parking_lot::Mutex<crate::net::recent_rejects::RecentRejects>,
+    /// Who announced which transaction we lack, and which one request for
+    /// each is outstanding: Core's `TxRequestTracker`. See
+    /// [`crate::net::txrequest`].
+    tx_requests: parking_lot::Mutex<crate::net::txrequest::TxRequestTracker>,
     /// The peer each stored-but-unconnected block came from, so a block that
     /// fails when the IBD connector reaches it is charged to its sender
     /// (Core's `mapBlockSource`). See [`crate::net::block_source`].
@@ -1475,6 +1480,7 @@ impl PeerManager {
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
             recent_rejects: parking_lot::Mutex::new(crate::net::recent_rejects::RecentRejects::new()),
+            tx_requests: parking_lot::Mutex::new(crate::net::txrequest::TxRequestTracker::new()),
             block_sources: parking_lot::Mutex::new(Default::default()),
             #[cfg(feature = "block-filter-index")]
             filter_index: std::sync::OnceLock::new(),
@@ -5220,6 +5226,11 @@ impl PeerManager {
 
             ticks += 1;
 
+            // Transaction requests whose delay has passed, and the next
+            // announcer of any whose request expired. Core runs this in
+            // every peer's `SendMessages`.
+            self.send_all_tx_requests();
+
             // Bring stale fee filters up to date every 4 ticks (2 seconds),
             // and on the tick the tip moves: that is when the node leaves
             // IBD, and a peer still holding the IBD maximum filters out every
@@ -5342,6 +5353,10 @@ impl PeerManager {
         self.pending_compact.write().remove(&id);
         self.hb_peers.lock().retain(|p| *p != id);
         self.in_flight_blocks.write().remove(&id);
+        // Core's `TxDownloadManagerImpl::DisconnectedPeer`: its announcements
+        // go, and what it was asked for goes to the next announcer at once.
+        self.tx_requests.lock().disconnected_peer(id);
+        self.send_all_tx_requests();
     }
 
     /// `in_flight` is this message's place in the peer's queue: the socket
@@ -5637,10 +5652,29 @@ impl PeerManager {
                 // indefinitely. Release the heights now so the next
                 // `assign_all_peers` tick can try a different peer.
                 let mut block_hashes: Vec<bitcoin::BlockHash> = Vec::new();
+                let mut tx_hashes: Vec<[u8; 32]> = Vec::new();
                 for inv in &inventory {
-                    if let Inventory::Block(h) | Inventory::WitnessBlock(h) = inv {
-                        block_hashes.push(*h);
+                    match inv {
+                        Inventory::Block(h) | Inventory::WitnessBlock(h) => block_hashes.push(*h),
+                        Inventory::Transaction(t) | Inventory::WitnessTransaction(t) => {
+                            tx_hashes.push(t.to_byte_array())
+                        }
+                        Inventory::WTx(w) => tx_hashes.push(w.to_byte_array()),
+                        _ => {}
                     }
+                }
+                // Core's `ReceivedNotFound`: the peer will not send these, so
+                // the next announcer of each is asked now rather than after
+                // the request expires. A `notfound` for something never asked
+                // of this peer changes nothing.
+                if !tx_hashes.is_empty() {
+                    {
+                        let mut tracker = self.tx_requests.lock();
+                        for hash in &tx_hashes {
+                            tracker.received_response(id, hash);
+                        }
+                    }
+                    self.send_all_tx_requests();
                 }
                 if block_hashes.is_empty() {
                     tracing::debug!(id, count = inventory.len(), "Peer sent notfound (non-block)");
@@ -5803,7 +5837,7 @@ impl PeerManager {
 
     fn handle_inv(&self, id: PeerId, inventory: Vec<Inventory>) {
         let mut blocks_to_get = Vec::new();
-        let mut txs_to_get = Vec::new();
+        let mut txs_announced = Vec::new();
         let reject_tx_invs = self.rejects_incoming_txs(id);
         let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
 
@@ -5862,7 +5896,7 @@ impl PeerManager {
                     } else if !self.is_ibd() && !self.blocksonly() {
                         // Don't request transactions during IBD — we can't
                         // validate them — nor under -blocksonly (no tx relay).
-                        txs_to_get.push(Inventory::WitnessTransaction(txid));
+                        txs_announced.push(GenTxid::Txid(txid));
                     }
                 }
                 // Fetched as announced, by wtxid: a resident transaction with
@@ -5873,7 +5907,7 @@ impl PeerManager {
                     } else if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
                         self.note_broadcast_witness(id, txid);
                     } else if !self.is_ibd() && !self.blocksonly() {
-                        txs_to_get.push(Inventory::WTx(wtxid));
+                        txs_announced.push(GenTxid::Wtxid(wtxid));
                     }
                 }
                 _ => {}
@@ -5894,8 +5928,153 @@ impl PeerManager {
             // getheaders per message.
             self.maybe_send_getheaders(id);
         }
-        if !txs_to_get.is_empty() {
-            self.send_to_peer(id, NetworkMessage::GetData(txs_to_get));
+        if !txs_announced.is_empty() {
+            self.add_tx_announcements(id, &txs_announced);
+            // A preferred peer's announcement is requested at once, before
+            // anything else the peer sent is answered, as Core's
+            // `SendMessages` runs right after the `inv` is processed.
+            self.send_tx_requests(id);
+        }
+    }
+
+    /// The announcer facts the request scheduler needs about `info`. Core's
+    /// `fPreferredDownload` (`net_processing.cpp:3745`): outbound or
+    /// `noban`, not an addr-fetch connection, and able to serve blocks; and
+    /// `NetPermissionFlags::Relay` (`net_processing.cpp:3887`).
+    fn tx_announcer_info(info: &PeerInfo) -> AnnouncerInfo {
+        AnnouncerInfo {
+            preferred: (info.direction == Direction::Outbound || info.permissions.noban)
+                && info.conn_type != ConnType::AddrFetch
+                && info.advertises_blocks(),
+            relay_permission: info.permissions.relay || info.permissions.force_relay,
+        }
+    }
+
+    /// The announcer facts for peer `id`, and how many connected peers relay
+    /// by wtxid (Core's `m_num_wtxid_peers`), which decides whether a txid
+    /// announcement waits [`TXID_RELAY_DELAY`](crate::net::txrequest::TXID_RELAY_DELAY).
+    fn tx_announcer(&self, id: PeerId) -> Option<(AnnouncerInfo, usize)> {
+        let peers = self.peers.read();
+        let info = Self::tx_announcer_info(&peers.get(&id)?.info);
+        let wtxid_peers = peers
+            .values()
+            .filter(|h| h.info.state == PeerState::Connected && h.info.wtxid_relay)
+            .count();
+        Some((info, wtxid_peers))
+    }
+
+    /// Record peer `id`'s announcements of transactions we lack, for the
+    /// request scheduler: Core's `AddTxAnnouncement`, whose `AlreadyHaveTx`
+    /// half the caller has already applied.
+    fn add_tx_announcements(&self, id: PeerId, gtxids: &[GenTxid]) {
+        let Some((info, wtxid_peers)) = self.tx_announcer(id) else { return };
+        let now = crate::time::now_micros();
+        let mut tracker = self.tx_requests.lock();
+        for gtxid in gtxids {
+            tracker.add_announcement(id, *gtxid, info, wtxid_peers, now);
+        }
+    }
+
+    /// Whether `gtxid` needs no download: Core's `AlreadyHaveTx` over what
+    /// satd keeps (the recent-rejects filters and the mempool). The `inv`
+    /// path counts a fee-only refusal (`include_reconsiderable`); the request
+    /// path does not, so an orphan's low-fee parent is still fetched for the
+    /// package that may carry it.
+    fn already_have_tx(&self, gtxid: &GenTxid, include_reconsiderable: bool) -> bool {
+        let tip = self.chain_state.tip_hash();
+        if self.recent_rejects.lock().contains(tip, &gtxid.hash(), include_reconsiderable) {
+            return true;
+        }
+        match gtxid {
+            GenTxid::Txid(txid) => self.mempool.get(txid).is_some(),
+            GenTxid::Wtxid(wtxid) => self.mempool.txid_of_wtxid(wtxid).is_some(),
+        }
+    }
+
+    /// Send peer `id` a `getdata` for every transaction the scheduler says
+    /// to ask it for now: Core's `GetRequestsToSend` and the transaction
+    /// `getdata` of `SendMessages` (`net_processing.cpp:6202-6212`), in
+    /// messages of at most `MAX_GETDATA_SZ`.
+    fn send_tx_requests(&self, id: PeerId) {
+        let now = crate::time::now_micros();
+        let (requestable, expired) = self.tx_requests.lock().get_requestable(id, now);
+        for (peer, gtxid) in expired {
+            tracing::debug!(peer, ?gtxid, "timeout of inflight tx request");
+        }
+        if requestable.is_empty() {
+            return;
+        }
+        // The mempool is consulted without the scheduler's lock held: its
+        // read lock can wait behind a long admission.
+        let have: Vec<bool> = requestable.iter().map(|g| self.already_have_tx(g, false)).collect();
+        let mut wanted = Vec::with_capacity(requestable.len());
+        {
+            let mut tracker = self.tx_requests.lock();
+            for (gtxid, have) in requestable.into_iter().zip(have) {
+                if have {
+                    tracker.forget_tx_hash(&gtxid.hash());
+                } else {
+                    wanted.push(gtxid);
+                }
+            }
+        }
+        // A request is marked in flight only once its `getdata` is queued to
+        // the peer. The queue is bounded, and a request marked but never
+        // sent would hold the transaction back for the whole 60 s expiry and
+        // then retire this peer's announcement for good. Unsent, it stays
+        // this peer's to ask on the next tick. Core's send cannot fail.
+        for chunk in wanted.chunks(MAX_GETDATA_SZ) {
+            let inv: Vec<Inventory> = chunk
+                .iter()
+                .map(|gtxid| match gtxid {
+                    GenTxid::Txid(txid) => Inventory::WitnessTransaction(*txid),
+                    GenTxid::Wtxid(wtxid) => Inventory::WTx(*wtxid),
+                })
+                .collect();
+            if !self.send_to_peer(id, NetworkMessage::GetData(inv)) {
+                tracing::debug!(peer = id, count = chunk.len(), "tx getdata not queued; retrying next tick");
+                break;
+            }
+            let mut tracker = self.tx_requests.lock();
+            for gtxid in chunk {
+                tracing::debug!(peer = id, ?gtxid, "requesting tx");
+                tracker.requested_tx(id, &gtxid.hash(), now.saturating_add(GETDATA_TX_INTERVAL));
+            }
+        }
+    }
+
+    /// [`send_tx_requests`](Self::send_tx_requests) for every connected
+    /// peer: run from the periodic tick, so a delayed announcement or an
+    /// expired request is acted on without waiting for another `inv`, and
+    /// after a `notfound` or a disconnect hands a transaction to another
+    /// announcer.
+    fn send_all_tx_requests(&self) {
+        if self.tx_requests.lock().is_empty() {
+            return;
+        }
+        let ids: Vec<PeerId> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.send_tx_requests(id);
+        }
+    }
+
+    /// Forget every request for the transactions of a block that joined the
+    /// active chain, by txid and by wtxid: Core's
+    /// `TxDownloadManagerImpl::BlockConnected` (`txdownloadman_impl.cpp:98-110`).
+    pub fn forget_tx_requests_for_block(&self, block: &bitcoin::Block) {
+        let mut tracker = self.tx_requests.lock();
+        if tracker.is_empty() {
+            return;
+        }
+        for tx in &block.txdata {
+            tracker.forget_tx_hash(&tx.compute_txid().to_byte_array());
+            tracker.forget_tx_hash(&tx.compute_wtxid().to_byte_array());
         }
     }
 
@@ -7467,6 +7646,9 @@ impl PeerManager {
                             fee_estimator.record_block(&fees);
                             mempool.remove_for_block(&block, height);
                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
+                            if let Some(pm) = peer_manager.upgrade() {
+                                pm.forget_tx_requests_for_block(&block);
+                            }
                             if chain_state.tip_hash() == hash
                                 && let Some(pm) = peer_manager.upgrade()
                             {
@@ -7494,6 +7676,9 @@ impl PeerManager {
                                             fee_estimator.record_block(&b_fees);
                                             mempool.remove_for_block(&b, h);
                                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
+                                            if let Some(pm) = peer_manager.upgrade() {
+                                                pm.forget_tx_requests_for_block(&b);
+                                            }
                                         }
                                         // Another block waiting on the same
                                         // parent may still connect. Each pass
@@ -7705,6 +7890,9 @@ impl PeerManager {
                     fee_estimator.record_block(&fees);
                     mempool.remove_for_block(&block, block_height);
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
+                    if let Some(pm) = peer_manager.upgrade() {
+                        pm.forget_tx_requests_for_block(&block);
+                    }
                     connected += 1;
                     // `-stopatheight`. The connect's event reaches the watcher
                     // in `main` as well, but only after this walk has gone
@@ -8636,9 +8824,19 @@ impl PeerManager {
         }
 
         let txid = tx.compute_txid();
+        let wtxid = tx.compute_wtxid();
+        let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
+        // Core's `TxDownloadManagerImpl::ReceivedTx`: the peer answered, by
+        // txid and by wtxid.
+        {
+            let mut tracker = self.tx_requests.lock();
+            tracker.received_response(id, &txid.to_byte_array());
+            if has_witness {
+                tracker.received_response(id, &wtxid.to_byte_array());
+            }
+        }
         // Core's TX handler: a transaction refused since the tip moved is
         // not validated again, whoever sends it.
-        let wtxid = tx.compute_wtxid();
         if self.recently_rejected(wtxid.as_byte_array()) {
             tracing::debug!(%txid, %wtxid, peer = id, "recently rejected, not validated again");
             return;
@@ -8663,6 +8861,8 @@ impl PeerManager {
                 if let Some(h) = self.peers.read().get(&id) {
                     h.stats.record_transaction();
                 }
+                // Core's `MempoolAcceptedTx`: no announcer of it is asked.
+                self.forget_tx_requests(txid, wtxid);
                 self.broadcast_inv(id, txid);
                 // A new parent just entered the mempool — walk orphans
                 // that were waiting on it and try to admit them.
@@ -8679,15 +8879,47 @@ impl PeerManager {
                 // for it or after a `prioritisetransaction`.
                 if self.condemn_orphan_of_rejected_parent(&missing, txid, wtxid, validated_at) {
                     tracing::debug!(%txid, %wtxid, "not keeping orphan with rejected parents");
+                    self.forget_tx_requests(txid, wtxid);
                     return;
                 }
+                // Who else announced the orphan, before its announcements
+                // are forgotten below: Core asks each of them for the
+                // parents too (`MempoolRejectedTx`,
+                // `txdownloadman_impl.cpp:397-406`).
+                let other_announcers: Vec<PeerId> = {
+                    let tracker = self.tx_requests.lock();
+                    let mut peers = tracker.candidate_peers(&txid.to_byte_array());
+                    if has_witness {
+                        peers.extend(tracker.candidate_peers(&wtxid.to_byte_array()));
+                    }
+                    peers.sort_unstable();
+                    peers.dedup();
+                    peers.retain(|p| *p != id);
+                    peers
+                };
+                // Once in the orphanage it is had: no announcer is asked.
+                self.forget_tx_requests(txid, wtxid);
                 match self.orphanage.add(tx.clone(), id, missing.clone()) {
                     Ok(AddOutcome::Added) => {
                         // Core keeps a first-time orphan for reconstruction:
                         // its parents may well confirm alongside it.
                         self.keep_for_reconstruction(tx);
-                        let want: Vec<bitcoin::Txid> = missing.into_iter().collect();
-                        self.send_to_peer(id, sync::make_getdata_txs(&want));
+                        // The parents are fetched through the scheduler, as
+                        // if the sender (and every other announcer of the
+                        // orphan) had announced them by txid, so a parent
+                        // two orphans share, or one already on its way, is
+                        // not downloaded twice.
+                        let mut parents: Vec<bitcoin::Txid> = missing.into_iter().collect();
+                        parents.sort_unstable();
+                        for peer in std::iter::once(id).chain(other_announcers) {
+                            if let Some((info, wtxid_peers)) = self.tx_announcer(peer) {
+                                let now = crate::time::now_micros();
+                                self.tx_requests
+                                    .lock()
+                                    .add_orphan_resolution_candidate(peer, &parents, info, wtxid_peers, now);
+                            }
+                        }
+                        self.send_tx_requests(id);
                         tracing::debug!(%txid, peer = id, "Tx deferred to orphanage");
                     }
                     Ok(AddOutcome::Duplicate) => {
@@ -8724,6 +8956,28 @@ impl PeerManager {
                     e.state_string()
                 );
                 self.record_rejection(&tx, &e, validated_at);
+                // Core's `MempoolRejectedTx` forgets the wtxid, and the txid
+                // only for `TX_INPUTS_NOT_STANDARD`, where no witness could
+                // make it acceptable: another peer may still offer a
+                // correctly witnessed copy of the same txid. One we already
+                // hold is not wanted under either id.
+                //
+                // A script failure of a copy with no witness at all is
+                // Core's `TX_WITNESS_STRIPPED` (the case `rejection_kind`
+                // keeps out of the rejects filters): nothing is forgotten
+                // (`txdownloadman_impl.cpp:438-440`). Its wtxid is its txid,
+                // so forgetting it would drop the other announcers of the
+                // txid, the peers that can send the witnessed copy. The
+                // sender's own announcement was answered above.
+                let witness_stripped =
+                    !has_witness && matches!(e, MempoolError::Script(..) | MempoolError::PolicyScript(..));
+                if matches!(e, MempoolError::AlreadyExists)
+                    || (has_witness && matches!(e, MempoolError::NonStandardInputs(_)))
+                {
+                    self.forget_tx_requests(txid, wtxid);
+                } else if !witness_stripped {
+                    self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
+                }
                 // Only consensus-invalid transactions are misbehavior; policy
                 // rejections (fee floor, dust, mempool limits, RBF, …) carry no
                 // ban score so we don't sever honest peers on low-fee networks.
@@ -8739,6 +8993,14 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    /// Forget every announcement of a transaction we no longer need, by
+    /// txid and by wtxid (Core's paired `ForgetTxHash` calls).
+    fn forget_tx_requests(&self, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid) {
+        let mut tracker = self.tx_requests.lock();
+        tracker.forget_tx_hash(&txid.to_byte_array());
+        tracker.forget_tx_hash(&wtxid.to_byte_array());
     }
 
     /// Inspect `tx`'s inputs and return the set of parent txids whose
@@ -12423,6 +12685,10 @@ mod orphanbuf_tests;
 #[path = "manager_chainsel_tests.rs"]
 mod chainsel_tests;
 
+#[cfg(test)]
+#[path = "manager_txrequest_tests.rs"]
+mod txrequest_tests;
+
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
 /// Standalone so the `block_processor` thread — which doesn't have a
@@ -15763,9 +16029,13 @@ mod tests {
         let new = witness_tx(2, 0xaa);
         let (new_txid, new_wtxid) = (new.compute_txid(), new.compute_wtxid());
 
+        // Preferred announcers (outbound, serving blocks), so a `MSG_WTX` is
+        // requested at once.
         let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
-        let (h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let (mut h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        h2.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let (mut h3, mut rx3) = mk_handle_rx(3, "10.0.0.3:8333".parse().unwrap(), PeerState::Connected, 0);
         h3.info.conn_type = ConnType::BlockRelay;
         let (mut h4, _rx4) = mk_handle_rx(4, "10.0.0.4:8333".parse().unwrap(), PeerState::Connected, 0);
@@ -15779,14 +16049,34 @@ mod tests {
             peers.insert(4, h4);
         }
 
+        // The node clock, so the txid announcements' `TXID_RELAY_DELAY` can
+        // be stepped past.
+        let mut clock = super::txrequest_tests::MockClock::install();
+        let txid_relay_delay = crate::net::txrequest::TXID_RELAY_DELAY;
+
         pm.handle_inv(1, vec![Inventory::Transaction(new_txid), Inventory::WTx(new_wtxid)]);
         expect_getdata(&mut rx1, &[Inventory::WTx(new_wtxid)], "a wtxid relay peer's MSG_WTX, not its MSG_TX");
         // Core skips only `MSG_TX` on a wtxid link; `MSG_WITNESS_TX` is a
-        // getdata type that nothing announces, and passes.
+        // getdata type that nothing announces, and passes -- by txid, so
+        // after `TXID_RELAY_DELAY`.
         pm.handle_inv(1, vec![Inventory::WitnessTransaction(new_txid)]);
+        assert!(rx1.try_recv().is_err(), "a txid announcement waits while wtxid peers are connected");
+        clock.advance(txid_relay_delay);
+        pm.send_all_tx_requests();
         expect_getdata(&mut rx1, &[Inventory::WitnessTransaction(new_txid)], "MSG_WITNESS_TX");
 
+        // The other peer's `MSG_TX` only. It names the txid already asked of
+        // peer 1, so peer 2 is the fallback, asked once peer 1 says
+        // `notfound`.
         pm.handle_inv(2, vec![Inventory::WTx(new_wtxid), Inventory::Transaction(new_txid)]);
+        clock.advance(txid_relay_delay);
+        pm.send_all_tx_requests();
+        assert!(rx2.try_recv().is_err(), "one request at a time for a txid");
+        pm.handle_message(
+            1,
+            NetworkMessage::NotFound(vec![Inventory::WitnessTransaction(new_txid)]),
+            crate::net::flow::InFlight::new(None),
+        );
         expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(new_txid)], "the other peer's MSG_TX only");
 
         pm.handle_inv(3, vec![Inventory::WTx(new_wtxid)]);
@@ -15822,7 +16112,9 @@ mod tests {
         pm.chain_state.accept_block(&block).expect("block connects");
         let (mut h1, rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
-        let (h2, rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let (mut h2, rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        h2.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         pm.peers.write().insert(1, h1);
         pm.peers.write().insert(2, h2);
         (pm, dir, rx1, rx2)
@@ -15832,6 +16124,12 @@ mod tests {
     /// requested again when another peer announces it, until the tip moves.
     #[test]
     fn a_refused_transaction_is_not_fetched_again_until_the_tip_moves() {
+        let mut clock = super::txrequest_tests::MockClock::install();
+        // Past every request delay: a txid announcement waits
+        // `TXID_RELAY_DELAY` while a wtxid peer is connected.
+        let mut wait = || {
+            clock.advance(crate::net::txrequest::TXID_RELAY_DELAY);
+        };
         let (pm, _dir, mut rx1, mut rx2) = rejects_pm();
         // The same outpoint twice, no witness: `bad-txns-inputs-duplicate`,
         // whoever sends it, and its txid is its wtxid.
@@ -15841,12 +16139,16 @@ mod tests {
         let (txid, wtxid) = (bad.compute_txid(), bad.compute_wtxid());
         assert_eq!(txid.to_byte_array(), wtxid.to_byte_array());
         pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
+        wait();
+        pm.send_all_tx_requests();
         expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(txid)], "fetched the first time");
 
         pm.handle_tx(2, bad);
         pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
-        assert!(rx1.try_recv().is_err(), "not fetched again by wtxid");
         pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
+        wait();
+        pm.send_all_tx_requests();
+        assert!(rx1.try_recv().is_err(), "not fetched again by wtxid");
         assert!(rx2.try_recv().is_err(), "nor by txid");
 
         let tip = pm.chain_state.tip_hash();

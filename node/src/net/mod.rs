@@ -21,6 +21,7 @@ pub mod seeding;
 pub mod send_queue;
 pub mod stats;
 pub mod tor;
+pub mod txrequest;
 pub mod sync;
 pub mod v2transport;
 
