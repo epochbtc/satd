@@ -2,11 +2,12 @@
 //! use with our SignatureChecker trait.
 #![allow(clippy::nonminimal_bool)]
 
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+use bitcoin::consensus::Encodable;
+use bitcoin::hashes::{sha256, sha256d, Hash, HashEngine};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::secp256k1::{self, Message, Secp256k1, VerifyOnly};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -35,14 +36,68 @@ fn secp_ctx() -> &'static Secp256k1<VerifyOnly> {
     CTX.get_or_init(Secp256k1::verification_only)
 }
 
-/// Shared `SighashCache` container. `SighashCache` lazily populates per-tx
-/// hashes (`hashPrevouts`, `hashSequence`, `hashOutputs`) which are identical
-/// across all inputs of a transaction — so one cache per tx is correct and
-/// optimal.  `RefCell` gives us interior mutability so `check_*` methods can
-/// keep their `&self` trait signature while the cache's encode helpers
-/// require `&mut self`.  `Rc` lets a higher-level batch verify share a single
-/// cache across per-input `TxSignatureChecker`s.
-pub type SharedSighashCache<'a> = Rc<RefCell<SighashCache<&'a Transaction>>>;
+/// Per-transaction sighash state, shared by every input's checker.
+///
+/// `SighashCache` lazily populates the legacy and BIP143 per-tx hashes
+/// (`hashPrevouts`, `hashSequence`, `hashOutputs`). The BIP341 per-tx hashes
+/// live beside it in `taproot`, filled on the first Schnorr check: they are
+/// identical across all inputs of a transaction, as Core's
+/// `PrecomputedTransactionData`.
+pub struct TxSighashCache<'a> {
+    pub legacy: SighashCache<&'a Transaction>,
+    taproot: Option<TaprootTxHashes>,
+}
+
+impl<'a> TxSighashCache<'a> {
+    pub fn new(tx: &'a Transaction) -> Self {
+        Self { legacy: SighashCache::new(tx), taproot: None }
+    }
+}
+
+/// `RefCell` gives us interior mutability so `check_*` methods can keep their
+/// `&self` trait signature while the cache's encode helpers require
+/// `&mut self`. `Rc` lets a higher-level batch verify share a single cache
+/// across per-input `TxSignatureChecker`s.
+pub type SharedSighashCache<'a> = Rc<RefCell<TxSighashCache<'a>>>;
+
+/// BIP 341's single-SHA256 per-transaction hashes.
+#[derive(Clone, Copy)]
+struct TaprootTxHashes {
+    prevouts: [u8; 32],
+    amounts: [u8; 32],
+    script_pubkeys: [u8; 32],
+    sequences: [u8; 32],
+    outputs: [u8; 32],
+}
+
+impl TaprootTxHashes {
+    fn compute(tx: &Transaction, spent: &[TxOut]) -> Self {
+        let mut prevouts = sha256::Hash::engine();
+        let mut sequences = sha256::Hash::engine();
+        for input in &tx.input {
+            input.previous_output.consensus_encode(&mut prevouts).expect("engines do not fail");
+            input.sequence.consensus_encode(&mut sequences).expect("engines do not fail");
+        }
+        let mut amounts = sha256::Hash::engine();
+        let mut script_pubkeys = sha256::Hash::engine();
+        for out in spent {
+            out.value.consensus_encode(&mut amounts).expect("engines do not fail");
+            out.script_pubkey.consensus_encode(&mut script_pubkeys).expect("engines do not fail");
+        }
+        let mut outputs = sha256::Hash::engine();
+        for out in &tx.output {
+            out.consensus_encode(&mut outputs).expect("engines do not fail");
+        }
+        let done = |e: sha256::HashEngine| sha256::Hash::from_engine(e).to_byte_array();
+        Self {
+            prevouts: done(prevouts),
+            amounts: done(amounts),
+            script_pubkeys: done(script_pubkeys),
+            sequences: done(sequences),
+            outputs: done(outputs),
+        }
+    }
+}
 
 /// A signature checker backed by an actual transaction, delegating sighash
 /// computation to `bitcoin::sighash::SighashCache`.
@@ -52,6 +107,8 @@ pub struct TxSignatureChecker<'a> {
     amount: Amount,
     prev_outputs: &'a [TxOut],
     cache: SharedSighashCache<'a>,
+    /// BIP 341 `sha_single_output` for this input, hashed on first use.
+    single_output_hash: OnceCell<Option<[u8; 32]>>,
 }
 
 impl<'a> TxSignatureChecker<'a> {
@@ -68,7 +125,7 @@ impl<'a> TxSignatureChecker<'a> {
             input_index,
             amount,
             prev_outputs,
-            Rc::new(RefCell::new(SighashCache::new(tx))),
+            Rc::new(RefCell::new(TxSighashCache::new(tx))),
         )
     }
 
@@ -89,7 +146,73 @@ impl<'a> TxSignatureChecker<'a> {
             amount,
             prev_outputs,
             cache,
+            single_output_hash: OnceCell::new(),
         }
+    }
+
+    /// Core's `SignatureHashSchnorr` (src/script/interpreter.cpp): the BIP 341
+    /// signature message, from hashes computed once per transaction (the
+    /// shared cache), once per input (the annex and tapleaf hashes in
+    /// `exec_data`, and the SIGHASH_SINGLE output here), never per check.
+    /// `None` where Core returns false: an undefined hash type, spent outputs
+    /// missing, or SIGHASH_SINGLE with no output at this input's index.
+    fn taproot_sighash(&self, hash_type: u8, sig_version: SigVersion, exec_data: &ExecData) -> Option<[u8; 32]> {
+        if !(hash_type <= 0x03 || (0x81..=0x83).contains(&hash_type)) {
+            return None;
+        }
+        if self.prev_outputs.len() != self.tx.input.len() {
+            return None;
+        }
+        let output_type = if hash_type == 0x00 { 0x01 } else { hash_type & 0x03 };
+        let anyone_can_pay = hash_type & 0x80 != 0;
+        let tx_hashes = {
+            let mut cache = self.cache.borrow_mut();
+            *cache.taproot.get_or_insert_with(|| TaprootTxHashes::compute(self.tx, self.prev_outputs))
+        };
+
+        let mut e = bitcoin::TapSighash::engine();
+        let ok = "engines do not fail";
+        e.input(&[0x00, hash_type]); // epoch, hash type
+        self.tx.version.consensus_encode(&mut e).expect(ok);
+        self.tx.lock_time.consensus_encode(&mut e).expect(ok);
+        if !anyone_can_pay {
+            e.input(&tx_hashes.prevouts);
+            e.input(&tx_hashes.amounts);
+            e.input(&tx_hashes.script_pubkeys);
+            e.input(&tx_hashes.sequences);
+        }
+        if output_type == 0x01 {
+            e.input(&tx_hashes.outputs);
+        }
+        let ext_flag: u8 = if sig_version == SigVersion::Tapscript { 1 } else { 0 };
+        e.input(&[(ext_flag << 1) | u8::from(exec_data.annex_present)]);
+        if anyone_can_pay {
+            let input = &self.tx.input[self.input_index];
+            input.previous_output.consensus_encode(&mut e).expect(ok);
+            self.prev_outputs[self.input_index].consensus_encode(&mut e).expect(ok);
+            input.sequence.consensus_encode(&mut e).expect(ok);
+        } else {
+            (self.input_index as u32).consensus_encode(&mut e).expect(ok);
+        }
+        if exec_data.annex_present {
+            e.input(&exec_data.annex_hash);
+        }
+        if output_type == 0x03 {
+            let single = self.single_output_hash.get_or_init(|| {
+                self.tx.output.get(self.input_index).map(|out| {
+                    let mut h = sha256::Hash::engine();
+                    out.consensus_encode(&mut h).expect(ok);
+                    sha256::Hash::from_engine(h).to_byte_array()
+                })
+            });
+            e.input(&(*single)?);
+        }
+        if sig_version == SigVersion::Tapscript {
+            e.input(&exec_data.tapleaf_hash);
+            e.input(&[0x00]); // key_version
+            exec_data.codeseparator_pos.consensus_encode(&mut e).expect(ok);
+        }
+        Some(bitcoin::TapSighash::from_engine(e).to_byte_array())
     }
 }
 
@@ -148,7 +271,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
                 // NONE routing is identical after normalisation.
                 let mut cache = self.cache.borrow_mut();
                 let mut buf = Vec::with_capacity(256);
-                match cache.segwit_v0_encode_signing_data_to(
+                match cache.legacy.segwit_v0_encode_signing_data_to(
                     &mut buf,
                     self.input_index,
                     script_code_obj,
@@ -168,7 +291,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
                 let cache = self.cache.borrow();
                 // Remove OP_CODESEPARATOR from script_code for legacy
                 let script_code_buf = remove_codeseparators(script_code);
-                match cache.legacy_signature_hash(
+                match cache.legacy.legacy_signature_hash(
                     self.input_index,
                     &script_code_buf,
                     hash_type_byte as u32,
@@ -219,75 +342,11 @@ impl SignatureChecker for TxSignatureChecker<'_> {
         let schnorr_sig = secp256k1::schnorr::Signature::from_slice(sig_data)
             .map_err(|_| ScriptError::SchnorrSig)?;
 
-        // Compute taproot sighash
-        let tap_sighash_type =
-            TapSighashType::from_consensus_u8(hash_type_byte).map_err(|_| ScriptError::SchnorrSigHashtype)?;
+        let sighash = self
+            .taproot_sighash(hash_type_byte, sig_version, exec_data)
+            .ok_or(ScriptError::SchnorrSigHashtype)?;
 
-        let mut cache = self.cache.borrow_mut();
-        let prevouts = Prevouts::All(self.prev_outputs);
-
-        // Build annex from ExecData if present
-        let annex_data: Option<Vec<u8>> = if exec_data.annex_init && exec_data.annex_present {
-            // We need the original annex bytes for sighash computation.
-            // ExecData only stores the hash. We need the raw annex from the witness.
-            // For now, reconstruct from the transaction's witness data.
-            let witness = &self.tx.input[self.input_index].witness;
-            let wit_items: Vec<&[u8]> = witness.iter().collect();
-            if wit_items.len() >= 2 {
-                let last = wit_items[wit_items.len() - 1];
-                if !last.is_empty() && last[0] == 0x50 {
-                    Some(last.to_vec())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let annex = annex_data
-            .as_deref()
-            .and_then(|bytes| sighash::Annex::new(bytes).ok());
-
-        let sighash = match sig_version {
-            SigVersion::Taproot => {
-                // Key-path spending: no leaf hash or codeseparator
-                let mut engine = bitcoin::TapSighash::engine();
-                cache
-                    .taproot_encode_signing_data_to(
-                        &mut engine,
-                        self.input_index,
-                        &prevouts,
-                        annex,
-                        None, // no leaf hash for key-path
-                        tap_sighash_type,
-                    )
-                    .map_err(|_| ScriptError::SchnorrSigHashtype)?;
-                bitcoin::TapSighash::from_engine(engine)
-            }
-            SigVersion::Tapscript => {
-                // Script-path spending: include leaf hash and codeseparator position
-                let leaf_hash = bitcoin::TapLeafHash::from_byte_array(exec_data.tapleaf_hash);
-                let codesep_pos = exec_data.codeseparator_pos;
-                let mut engine = bitcoin::TapSighash::engine();
-                cache
-                    .taproot_encode_signing_data_to(
-                        &mut engine,
-                        self.input_index,
-                        &prevouts,
-                        annex,
-                        Some((leaf_hash, codesep_pos)),
-                        tap_sighash_type,
-                    )
-                    .map_err(|_| ScriptError::SchnorrSigHashtype)?;
-                bitcoin::TapSighash::from_engine(engine)
-            }
-            _ => unreachable!(),
-        };
-
-        let msg = Message::from_digest(sighash.to_byte_array());
+        let msg = Message::from_digest(sighash);
         match secp_ctx().verify_schnorr(&schnorr_sig, &msg, &xonly) {
             Ok(()) => Ok(true),
             Err(_) => Err(ScriptError::SchnorrSig),
