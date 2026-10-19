@@ -133,11 +133,11 @@ fn a_replacement_is_counted_without_what_it_evicts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A reorg's returned transaction is not held to the cluster limits: satd
-/// does not trim a cluster afterwards the way Core does, so it keeps what
-/// the block gave back.
+/// A reorg's returned transaction is held to the cluster limits, as Core
+/// holds it whatever `bypass_limits` says. satd let it past them, having no
+/// trim to cut the cluster back afterwards.
 #[test]
-fn a_reorg_is_not_held_to_the_cluster_limits() {
+fn a_reorg_returns_a_transaction_only_within_the_cluster_limits() {
     let (cs, mp, dir) = env(&[1]);
     mp.config.write().max_cluster_count = 2;
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2, 1);
@@ -146,30 +146,109 @@ fn a_reorg_is_not_held_to_the_cluster_limits() {
     accept(&mp, &cs, &spend(&[out(p, 1)], share, 1_000, 1, 2)).expect("child");
 
     let second = spend(&[out(p, 0)], parent.output[0].value.to_sat(), 1_000, 1, 3);
-    assert!(too_large(accept(&mp, &cs, &second)));
-    mp.accept_reorged_transaction(second, &cs, &NoopVerifier).expect("a reorg skips the cluster limits");
+    assert!(too_large(mp.accept_reorged_transaction(second, &cs, &NoopVerifier)));
+    assert_eq!(pool(&mp).len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reorg that returns a chain of 66 keeps 64: the 65th is past the
+/// cluster count and the 66th has lost its parent. Core's
+/// `mempool_packages.py` expects this of a node at a lower limit.
+#[test]
+fn a_reorg_returns_a_chain_up_to_the_cluster_count() {
+    let (cs, mp, dir) = env(&[1]);
+    let mut prevout = prev(1);
+    let mut value = COIN_VALUE;
+    let mut results = Vec::new();
+    for _ in 0..66 {
+        let tx = spend(&[prevout], value, 100, 1, 1);
+        value -= 100;
+        prevout = out(tx.compute_txid(), 0);
+        results.push(mp.accept_reorged_transaction(tx, &cs, &NoopVerifier));
+    }
+    assert!(results[..64].iter().all(|r| r.is_ok()));
+    assert!(matches!(results[64], Err(ref e) if e.state_string() == "too-large-cluster"));
+    assert!(matches!(results[65], Err(MempoolError::MissingInputs)));
+    assert_eq!(pool(&mp).len(), 64);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a reorg, a cluster its returned transactions share with the
+/// mempool's spenders is cut back to the limits, and what is cut leaves as
+/// a reorg eviction. Here the limit is lowered after the fact, which gives
+/// the same cluster a reorg would: a returned root with a chain of spenders
+/// past the count.
+#[test]
+fn a_reorg_trims_a_cluster_its_spenders_take_past_the_limit() {
+    let (cs, mp, dir) = env(&[1]);
+    let root = spend(&[prev(1)], COIN_VALUE, 5_000, 1, 1);
+    let r = accept(&mp, &cs, &root).expect("root");
+    let mut prevout = out(r, 0);
+    let mut value = root.output[0].value.to_sat();
+    let mut chain = Vec::new();
+    for _ in 0..4 {
+        let tx = spend(&[prevout], value, 1_000, 1, 1);
+        value -= 1_000;
+        let t = accept(&mp, &cs, &tx).expect("spender");
+        prevout = out(t, 0);
+        chain.push(t);
+    }
+    mp.config.write().max_cluster_count = 3;
+    let (sender, mut rx) = tokio::sync::broadcast::channel(16);
+    mp.set_event_sender(sender);
+
+    mp.trim_reorged_clusters(&[r]);
+
+    assert_eq!(pool(&mp), HashSet::from([r, chain[0], chain[1]]));
+    let mut gone = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let MempoolEvent::LeaveEvicted { txid, reason, .. } = event {
+            assert_eq!(reason, EvictReason::Reorg);
+            gone.push(txid);
+        }
+    }
+    gone.sort();
+    let mut expected = vec![chain[2], chain[3]];
+    expected.sort();
+    assert_eq!(gone, expected);
+
+    // A cluster within the limits, or none returned, is left alone.
+    mp.trim_reorged_clusters(&[r]);
+    mp.trim_reorged_clusters(&[]);
     assert_eq!(pool(&mp).len(), 3);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The exemption covers the ancestor count too: a reorg that returns a chain
-/// of 65 keeps all of it. The walk refused the 65th, and every descendant
-/// after it then failed for missing inputs.
+/// `getrawmempool` lists in mining order, the same whatever order the
+/// transactions arrived in: a reorg that puts the same set back gives the
+/// same list, which Core's `mempool_packages.py` checks.
 #[test]
-fn a_reorg_keeps_a_chain_longer_than_the_cluster_count() {
-    let (cs, mp, dir) = env(&[1]);
-    let mut prevout = prev(1);
-    let mut value = COIN_VALUE;
-    for _ in 0..66 {
-        let tx = spend(&[prevout], value, 100, 1, 1);
-        value -= 100;
-        prevout = out(
-            mp.accept_reorged_transaction(tx, &cs, &NoopVerifier).expect("a reorg skips the cluster limits"),
-            0,
-        );
+fn the_mining_order_does_not_depend_on_arrival() {
+    let (cs, mp, dir) = env(&[1, 2, 3]);
+    let (cs2, mp2, dir2) = env(&[1, 2, 3]);
+    let cheap_parent = spend(&[prev(1)], COIN_VALUE, 500, 1, 1);
+    let rich_child = spend(&[out(cheap_parent.compute_txid(), 0)], cheap_parent.output[0].value.to_sat(), 20_000, 1, 2);
+    let middling = spend(&[prev(2)], COIN_VALUE, 5_000, 1, 3);
+    let poor = spend(&[prev(3)], COIN_VALUE, 300, 1, 4);
+    for tx in [&cheap_parent, &rich_child, &middling, &poor] {
+        accept(&mp, &cs, tx).expect("in order");
     }
-    assert_eq!(pool(&mp).len(), 66);
+    for tx in [&poor, &middling, &cheap_parent, &rich_child] {
+        accept(&mp2, &cs2, tx).expect("another order");
+    }
+    let order = mp.acting_txids_in_mining_order();
+    assert_eq!(order, mp2.acting_txids_in_mining_order());
+    // The child pays for its parent, so they come first, together.
+    let txid = |t: &Transaction| t.compute_txid();
+    assert_eq!(order, vec![txid(&cheap_parent), txid(&rich_child), txid(&middling), txid(&poor)]);
+    let listed = crate::rpc::rawtx::get_raw_mempool(&mp, false);
+    let listed: Vec<Txid> = listed.as_array().expect("a list").iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect();
+    assert_eq!(listed, order);
+    assert_eq!(mp.acting_txids_with_sequence().0, order);
 
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
 }

@@ -1,3 +1,4 @@
+pub mod clusters;
 pub mod feefrac;
 pub mod estimate;
 pub mod events;

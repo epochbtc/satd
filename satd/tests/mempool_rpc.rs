@@ -222,3 +222,40 @@ fn gettxspendingprevout_reads_the_mempool_then_the_chain() {
         "the disconnected spender is gone from the index"
     );
 }
+
+/// A reorg that returns a transaction whose spenders are already in the
+/// mempool joins them into one cluster, and Core trims one past the cluster
+/// limits (`UpdateTransactionsFromBlock`). Here a parent is mined, three
+/// spenders chain off it in the mempool at `-limitclustercount=3`, and
+/// `invalidateblock` returns the parent: a cluster of four, cut back to
+/// three by dropping the last spender.
+#[test]
+fn a_reorg_trims_the_cluster_its_returned_parent_grows_past_the_limit() {
+    let wallet = DeterministicWallet::from_secret([0x5d; 32]);
+    let mut node = funded_node(&["-limitclustercount=3"], &wallet);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (parent_hex, parent, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 10_000);
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    node.mine_blocks(1, &wallet.address.to_string());
+    let block = node.rpc_ok("getbestblockhash", vec![]);
+
+    let mut spenders = Vec::new();
+    let mut prevout = bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 };
+    let mut value = 50 * 100_000_000 - 10_000;
+    for _ in 0..3 {
+        let (hex, txid) = build_signed_p2tr_keypath_spend(&secp, &kp, prevout, spk.clone(), value, spk.clone(), 10_000);
+        node.rpc_ok("sendrawtransaction", vec![json!(hex)]);
+        prevout = bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&txid).unwrap(), vout: 0 };
+        value -= 10_000;
+        spenders.push(txid);
+    }
+
+    node.rpc_ok("invalidateblock", vec![block]);
+    let mut pool: Vec<String> = serde_json::from_value(node.rpc_ok("getrawmempool", vec![])).unwrap();
+    pool.sort();
+    let mut expected = vec![parent, spenders[0].clone(), spenders[1].clone()];
+    expected.sort();
+    assert_eq!(pool, expected, "the last spender is trimmed");
+
+    node.stop();
+}

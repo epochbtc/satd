@@ -1909,6 +1909,27 @@ impl ChainState {
         self.reorg_log.get()
     }
 
+    /// Offer `disconnected` (a reorg's disconnected blocks' transactions,
+    /// oldest first) back to `mempool`, then trim as Core's
+    /// `UpdateTransactionsFromBlock` does: the returned transactions now
+    /// share clusters with the mempool transactions already spending them,
+    /// and one past the cluster limits is cut back. The caller runs
+    /// `remove_for_reorg` after, as Core runs `removeForReorg`.
+    fn return_to_mempool(&self, mempool: &crate::mempool::pool::Mempool, disconnected: &[bitcoin::Transaction]) {
+        let mut returned = Vec::new();
+        for tx in disconnected {
+            match mempool.accept_reorged_transaction(tx.clone(), self, &*self.script_verifier) {
+                Ok(txid) => returned.push(txid),
+                Err(e) => tracing::debug!(
+                    txid = %tx.compute_txid(),
+                    err = ?e,
+                    "Reorg: re-add to mempool failed (likely conflict with new chain)"
+                ),
+            }
+        }
+        mempool.trim_reorged_clusters(&returned);
+    }
+
     pub fn tip_hash(&self) -> BlockHash {
         self.tip.read().hash
     }
@@ -8225,20 +8246,7 @@ impl ChainState {
             mempool.remove_for_block(block, new_height);
 
             if let Some(pending) = pending_reorg.as_ref() {
-                for tx in &pending.disconnected_txs {
-                    let txid = tx.compute_txid();
-                    if let Err(e) = mempool.accept_reorged_transaction(
-                        tx.clone(),
-                        self,
-                        &*self.script_verifier,
-                    ) {
-                        tracing::debug!(
-                            %txid,
-                            err = ?e,
-                            "Reorg: re-add to mempool failed (likely conflict with new chain)"
-                        );
-                    }
-                }
+                self.return_to_mempool(mempool, &pending.disconnected_txs);
 
                 // Core: removeForReorg — evict any pre-existing mempool tx
                 // (or freshly re-added disconnected tx) that is no longer
@@ -9917,18 +9925,7 @@ impl ChainState {
             for (block, height) in &reconnected_blocks {
                 mempool.remove_for_block(block, *height);
             }
-            for tx in &disconnect_info.disconnected_txs {
-                if let Err(e) = mempool.accept_reorged_transaction(
-                    tx.clone(),
-                    self,
-                    &*self.script_verifier,
-                ) {
-                    tracing::debug!(
-                        err = ?e,
-                        "Reorg: mempool re-add failed (likely conflict)"
-                    );
-                }
-            }
+            self.return_to_mempool(mempool, &disconnect_info.disconnected_txs);
             // Core: removeForReorg — evict mempool txs that are no longer
             // valid against the post-reorg chain tip (non-final locktime,
             // immature coinbase spend, unsatisfied BIP 68 lock).

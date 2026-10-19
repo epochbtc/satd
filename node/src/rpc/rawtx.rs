@@ -57,12 +57,15 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     // are simply absent, exactly as on a Core node whose relay policy refused
     // them. `entry_map` below is therefore acting-only, so the ancestor /
     // descendant rollups and counts never include a quarantined relative.
-    let entries = mempool.get_acting_entries();
-
     if !verbose {
-        let txids: Vec<String> = entries.iter().map(|(txid, _)| txid.to_string()).collect();
+        // Core's order: by mining score, with the clusters' topology.
+        let txids: Vec<String> = mempool.acting_txids_in_mining_order().iter().map(|t| t.to_string()).collect();
         return json!(txids);
     }
+
+    // The verbose object's keys come out sorted by txid: satd's JSON
+    // objects do not keep insertion order.
+    let entries = mempool.get_acting_entries();
 
     let mut result = serde_json::Map::new();
     for (txid, _entry) in &entries {
