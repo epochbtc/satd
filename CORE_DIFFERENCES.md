@@ -789,9 +789,7 @@ silently returning an empty or wrong answer.
     parent of an orphan child from the peer that sent it.
 
   Eviction ranks by descendant score, which is how Core trimmed before the
-  cluster mempool; v31 trims by chunk feerate. A family of more than 100
-  descendants, which only a reorg can leave past the cluster limits, ranks
-  by the parent's own feerate.
+  cluster mempool; v31 trims by chunk feerate.
 
 - **Transaction download** — satd schedules transaction requests as Core's
   `TxRequestTracker` does (one request per transaction at a time, Core's
@@ -849,11 +847,19 @@ silently returning an empty or wrong answer.
   figure, and starts evicting (and raising `mempoolminfee`) later.
   `getmempoolinfo.usage` is satd's estimate of the memory its entries occupy,
   added up from what each entry holds rather than measured from the
-  allocator, so it is a lower bound. Core admits a transaction a reorg
-  returns and then trims any cluster past `-limitclustercount` or
-  `-limitclustersize`; satd exempts such a transaction from the cluster
-  limits and does not trim, so after a reorg it can hold a cluster larger
-  than the limits.
+  allocator, so it is a lower bound. After a reorg both trim a cluster
+  that its returned transactions grow past `-limitclustercount` or
+  `-limitclustersize`, the same way. Core ranks what it keeps by the
+  linearizations its clusters already had; satd linearizes each cluster
+  afresh, so on a tangled cluster the two can keep different transactions.
+
+- **`getrawmempool` order** — both list in mining order: chunks by
+  feerate, each cluster's transactions in its linearization. satd
+  linearizes each cluster afresh by ancestor-set feerate, where Core keeps
+  and improves an optimal linearization, so on a tangled cluster the two
+  can list differently. On chains and other simple clusters they agree. The
+  verbose object's keys are sorted by txid; Core's follow the same mining
+  order.
 
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes

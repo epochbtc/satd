@@ -452,9 +452,8 @@ note = "measured 2026-10-19 with package RBF: L118 sync_all times out because th
 
 [[test]]
 file = "mempool_packages.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-19 with gettxspendingprevout: L219 node1 (-limitclustercount=10) should hold 20 transactions, but after invalidateblock it keeps all 64 of the reorged chain; satd exempts reorged transactions from the cluster limits and has no trim of an oversized cluster afterwards (CORE_DIFFERENCES.md). Follow-up: trim clusters over the limit after a reorg, as Core does"
+status = "run"
+note = "flipped 2026-10-19: reorged transactions held to the cluster limits, oversized clusters trimmed after a reorg, getrawmempool in mining order"
 
 [[test]]
 file = "mempool_persist.py"
