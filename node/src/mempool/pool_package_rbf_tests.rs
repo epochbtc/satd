@@ -711,3 +711,38 @@ fn a_peers_replacing_package_keeps_its_held_child() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A dust parent that spends another member of its package is refused when
+/// a `prioritisetransaction` delta is set on it, as Core's
+/// `PreCheckEphemeralTx` refuses any dusty transaction whose modified fee
+/// is not zero. Its old admission path never looked at the delta.
+#[test]
+fn a_dust_parent_spending_its_package_is_refused_with_a_fee_delta() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let grand = spend(&[prev(1)], COIN_VALUE, 2_000, 2, 1);
+    let half = grand.output[1].value.to_sat();
+    let g = grand.compute_txid();
+    let mut parent = spend(&[out(g, 0)], grand.output[0].value.to_sat(), 0, 1, 2);
+    parent.output[0].value = bitcoin::Amount::from_sat(parent.output[0].value.to_sat() - 100);
+    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    let p = parent.compute_txid();
+    let child = spend(&[out(g, 1), out(p, 0), out(p, 1)], half + grand.output[0].value.to_sat(), 20_000, 1, 3);
+
+    mp.prioritise_transaction(&p, 1_000).expect("a delta set ahead of the transaction");
+    let r = submit(&mp, &cs, &[&grand, &parent, &child]);
+    assert_eq!(
+        r.tx_results[&parent.compute_wtxid().to_string()]["error"],
+        MempoolError::EphemeralDustFee.to_string(),
+        "{:?}",
+        r.tx_results
+    );
+    assert!(!pool(&mp).contains(&p));
+
+    // Without the delta the same package goes in.
+    let (cs2, mp2, dir2) = floor_env(&[1]);
+    let r = submit(&mp2, &cs2, &[&grand, &parent, &child]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
