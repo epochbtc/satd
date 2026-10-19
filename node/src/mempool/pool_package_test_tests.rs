@@ -215,3 +215,20 @@ fn an_already_known_member_ends_the_evaluation() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The first refusal ends the evaluation: a later member that would also be
+/// refused has no result. Core's `rpc_packages.py` returns only the ids of
+/// the transactions after a missing input.
+#[test]
+fn the_first_refusal_ends_the_evaluation() {
+    let (cs, mp, dir) = env(&[1]);
+    mp.accept_transaction(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("resident");
+    let orphan = spend(&[prev(9)], COIN_VALUE, 1_000, 1, 2);
+    let conflict = spend(&[prev(1)], COIN_VALUE, 50_000, 1, 3);
+    let r = test(&mp, &cs, &[&orphan, &conflict]);
+    assert!(matches!(r.results.get(&orphan.compute_wtxid()), Some(Err(MempoolError::MissingInputs))));
+    assert!(!judged(&r, &conflict), "the second refusal is never reached");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
