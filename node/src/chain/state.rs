@@ -8211,13 +8211,10 @@ impl ChainState {
             if let Some(pending) = pending_reorg.as_ref() {
                 for tx in &pending.disconnected_txs {
                     let txid = tx.compute_txid();
-                    if let Err(e) = mempool.accept_transaction(
+                    if let Err(e) = mempool.accept_reorged_transaction(
                         tx.clone(),
                         self,
                         &*self.script_verifier,
-                        crate::mempool::pool::TxSource::Reload,
-                        // Reorged-out txs re-enter and quarantine normally; never refused.
-                        false,
                     ) {
                         tracing::debug!(
                             %txid,
@@ -9905,12 +9902,10 @@ impl ChainState {
                 mempool.remove_for_block(block, *height);
             }
             for tx in &disconnect_info.disconnected_txs {
-                if let Err(e) = mempool.accept_transaction(
+                if let Err(e) = mempool.accept_reorged_transaction(
                     tx.clone(),
                     self,
                     &*self.script_verifier,
-                    crate::mempool::pool::TxSource::Reload,
-                    false,
                 ) {
                     tracing::debug!(
                         err = ?e,

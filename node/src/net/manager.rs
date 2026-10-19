@@ -8528,7 +8528,10 @@ impl PeerManager {
             | MempoolError::Quarantined(_)
             // Ephemeral dust policy errors: local package submission only.
             | MempoolError::EphemeralDustFee
-            | MempoolError::MissingEphemeralSpends(_) => 0,
+            | MempoolError::MissingEphemeralSpends(_)
+            // BIP 431 topology and size policy.
+            | MempoolError::TrucViolation(_)
+            | MempoolError::SiblingEviction(_) => 0,
         }
     }
 
@@ -8583,6 +8586,8 @@ impl PeerManager {
     fn rejection_kind(e: &MempoolError, has_witness: bool) -> Option<crate::net::recent_rejects::Rejection> {
         use crate::net::recent_rejects::Rejection;
         match e {
+            // The replacement refusal it wraps decides.
+            MempoolError::SiblingEviction(inner) => Self::rejection_kind(inner, has_witness),
             MempoolError::AlreadyExists | MempoolError::MissingInputs | MempoolError::Quarantined(_) => None,
             MempoolError::Script(..) | MempoolError::PolicyScript(..) if !has_witness => None,
             // `TX_RECONSIDERABLE`: the fee, and nothing else, is short.

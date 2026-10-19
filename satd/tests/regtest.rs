@@ -25818,3 +25818,92 @@ fn submitpackage_lets_a_child_pay_for_a_parent_below_the_relay_floor() {
     assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([]), "the template left the pair out");
     node.stop();
 }
+
+/// BIP 431 over RPC, with real signatures and script checks: a TRUC parent
+/// takes one child, a grandchild and a version 2 child are refused with
+/// Core's `TRUC-violation`, a second child that pays enough evicts the first,
+/// and the block template mines the pair.
+#[test]
+fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use serde_json::json;
+
+    let wallet = common::DeterministicWallet::from_secret([0x44; 32]);
+    let mut node = TestNode::start(&[]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    let spk = wallet.address.script_pubkey();
+
+    // Spend `prevouts` (outpoint, value) to `outputs` at `version`, signed.
+    let signed = |version: i32, prevouts: &[(OutPoint, u64)], outputs: &[u64]| -> Transaction {
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version(version),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: prevouts
+                .iter()
+                .map(|(op, _)| TxIn {
+                    previous_output: *op,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: outputs.iter().map(|v| TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() }).collect(),
+        };
+        for (i, (_, value)) in prevouts.iter().enumerate() {
+            let sighash = SighashCache::new(&tx)
+                .p2wpkh_signature_hash(i, &spk, Amount::from_sat(*value), EcdsaSighashType::All)
+                .unwrap();
+            let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+            let mut sig_bytes = sig.serialize_der().to_vec();
+            sig_bytes.push(EcdsaSighashType::All as u8);
+            tx.input[i].witness = Witness::from_slice(&[sig_bytes, wallet.pk.to_bytes()]);
+        }
+        tx
+    };
+    let hex = |tx: &Transaction| hex::encode(bitcoin::consensus::serialize(tx));
+    let send = |node: &TestNode, tx: &Transaction| node.rpc_call_with_params("sendrawtransaction", vec![json!(hex(tx))]).unwrap();
+    let id = |tx: &Transaction| format!("{} (wtxid={})", tx.compute_txid(), tx.compute_wtxid());
+    let pool = |node: &TestNode| -> std::collections::HashSet<String> {
+        node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
+    };
+
+    let block1 = node.rpc_ok("getblockhash", vec![json!(1)]);
+    let coinbase: Txid =
+        node.rpc_ok("getblock", vec![block1, json!(1)])["tx"][0].as_str().unwrap().parse().unwrap();
+    let coin = 50 * 100_000_000u64;
+    let half = (coin - 10_000) / 2;
+
+    let parent = signed(3, &[(OutPoint { txid: coinbase, vout: 0 }, coin)], &[half, half]);
+    assert_eq!(send(&node, &parent)["result"], json!(parent.compute_txid().to_string()));
+    let first = signed(3, &[(OutPoint { txid: parent.compute_txid(), vout: 0 }, half)], &[half - 10_000]);
+    assert_eq!(send(&node, &first)["result"], json!(first.compute_txid().to_string()));
+
+    let grandchild = signed(3, &[(OutPoint { txid: first.compute_txid(), vout: 0 }, half - 10_000)], &[half - 20_000]);
+    let r = send(&node, &grandchild);
+    assert_eq!(r["error"]["code"], json!(-26), "{r}");
+    assert_eq!(
+        r["error"]["message"],
+        json!(format!("TRUC-violation, tx {} would have too many ancestors", id(&grandchild)))
+    );
+    let plain = signed(2, &[(OutPoint { txid: parent.compute_txid(), vout: 1 }, half)], &[half - 50_000]);
+    let r = send(&node, &plain);
+    assert_eq!(
+        r["error"]["message"],
+        json!(format!("TRUC-violation, non-version=3 tx {} cannot spend from version=3 tx {}", id(&plain), id(&parent))),
+        "{r}"
+    );
+
+    // No input in common with `first`, and pays for its eviction.
+    let second = signed(3, &[(OutPoint { txid: parent.compute_txid(), vout: 1 }, half)], &[half - 50_000]);
+    assert_eq!(send(&node, &second)["result"], json!(second.compute_txid().to_string()));
+    let expected: std::collections::HashSet<String> =
+        [&parent, &second].iter().map(|t| t.compute_txid().to_string()).collect();
+    assert_eq!(pool(&node), expected);
+
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    assert!(pool(&node).is_empty(), "the template left the pair out");
+    node.stop();
+}

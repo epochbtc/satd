@@ -9,6 +9,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::events::{EvictReason, MempoolEvent, QuarantineEvent};
 use crate::mempool::policy::{self, MAX_STANDARD_TX_WEIGHT};
 use crate::mempool::policy_engine::{self, PolicyCtx};
+use crate::mempool::truc::{self, TrucView};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
@@ -229,6 +230,16 @@ pub enum MempoolError {
     /// ephemeral dust output(s).
     #[error("{0}")]
     MissingEphemeralSpends(String),
+    /// BIP 431: a version 3 transaction outside the TRUC topology or size
+    /// limits, or a spend across the version 3 boundary. Field: Core's debug
+    /// string (`policy/truc_policy.cpp`).
+    #[error("TRUC-violation")]
+    TrucViolation(String),
+    /// A replacement refusal for a TRUC transaction that would also have
+    /// evicted its sibling. Core appends " (including sibling eviction)" to
+    /// the reason (`validation.cpp`, `ReplacementChecks`).
+    #[error("{0} (including sibling eviction)")]
+    SiblingEviction(Box<MempoolError>),
 }
 
 impl MempoolError {
@@ -285,7 +296,20 @@ impl MempoolError {
             | Self::DoesNotImproveFeerateDiagram(..)
             | Self::EphemeralDustFee
             | Self::MissingEphemeralSpends(..)
+            | Self::TrucViolation(_)
             | Self::TooLongMempoolChain => -26,
+            Self::SiblingEviction(inner) => inner.rpc_code(),
+        }
+    }
+
+    /// The replacement refusals Core marks as including sibling eviction
+    /// when there was a sibling; anything else is unchanged.
+    fn including_sibling_eviction(self) -> Self {
+        match self {
+            e @ (Self::InsufficientReplacementFee(..) | Self::TooManyReplacements(_)) => {
+                Self::SiblingEviction(Box::new(e))
+            }
+            e => e,
         }
     }
 
@@ -335,6 +359,10 @@ impl MempoolError {
             // output must be 0-fee" — the detail goes to `reject_details`.
             MempoolError::EphemeralDustFee => "dust".to_string(),
             MempoolError::MissingEphemeralSpends(_) => "missing-ephemeral-spends".to_string(),
+            MempoolError::TrucViolation(_) => "TRUC-violation".to_string(),
+            MempoolError::SiblingEviction(inner) => {
+                format!("{} (including sibling eviction)", inner.reject_reason())
+            }
             MempoolError::Quarantined(rule) => {
                 format!("txn-policy-quarantined: held by policy rule '{rule}'")
             }
@@ -356,6 +384,16 @@ impl MempoolError {
                 Some("tx with dust output must be 0-fee".to_string())
             }
             MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
+            MempoolError::TrucViolation(detail) => Some(detail.clone()),
+            // The replacement details open with their reason; this one's
+            // reason is longer.
+            MempoolError::SiblingEviction(inner) => inner.reject_details().map(|detail| {
+                let reason = inner.reject_reason();
+                match detail.strip_prefix(&reason) {
+                    Some(rest) => format!("{}{rest}", self.reject_reason()),
+                    None => detail,
+                }
+            }),
             MempoolError::NonStandardInputs(detail) => Some(detail.clone()),
             MempoolError::TooManySigops(cost) => Some(cost.to_string()),
             // Core: `strprintf("%d < %d", package_fee, min_relay_fee)`.
@@ -1070,6 +1108,74 @@ impl<'a> IntoIterator for &'a EntryMap {
     }
 }
 
+/// The TRUC rules look no further than a parent and a child, so every walk
+/// stops at `cap`, however a reorg left the graph.
+impl TrucView for MempoolInner {
+    fn mempool_tx(&self, txid: &Txid) -> Option<&Transaction> {
+        self.entries.get(txid).map(|e| &e.tx)
+    }
+
+    fn ancestor_count(&self, txid: &Txid, cap: usize) -> usize {
+        if !self.entries.contains_key(txid) {
+            return 0;
+        }
+        let mut seen: HashSet<Txid> = HashSet::from([*txid]);
+        let mut queue = vec![*txid];
+        while let Some(current) = queue.pop() {
+            let Some(entry) = self.entries.get(&current) else { continue };
+            for input in &entry.tx.input {
+                let parent = input.previous_output.txid;
+                if self.entries.contains_key(&parent) && seen.insert(parent) {
+                    if seen.len() >= cap {
+                        return cap;
+                    }
+                    queue.push(parent);
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// Bounded by the ancestor limit every admission enforces.
+    fn descends_from(&self, txid: &Txid, ancestor: &Txid) -> bool {
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let mut queue = vec![*txid];
+        while let Some(current) = queue.pop() {
+            let Some(entry) = self.entries.get(&current) else { continue };
+            for input in &entry.tx.input {
+                let parent = input.previous_output.txid;
+                if parent == *ancestor && self.entries.contains_key(&parent) {
+                    return true;
+                }
+                if self.entries.contains_key(&parent) && seen.insert(parent) {
+                    queue.push(parent);
+                }
+            }
+        }
+        false
+    }
+
+    fn descendants(&self, txid: &Txid, cap: usize) -> Vec<Txid> {
+        let mut out: Vec<Txid> = Vec::new();
+        let mut queue = vec![*txid];
+        let mut children = Vec::new();
+        while let Some(current) = queue.pop() {
+            children.clear();
+            Mempool::collect_children(self, &current, &mut children);
+            for child in &children {
+                if *child != *txid && !out.contains(child) && self.entries.contains_key(child) {
+                    if out.len() >= cap {
+                        return out;
+                    }
+                    out.push(*child);
+                    queue.push(*child);
+                }
+            }
+        }
+        out
+    }
+}
+
 impl MempoolInner {
     /// Bytes occupied by the **acting class** (everything not quarantined). The
     /// acting capacity check (`max_size_bytes`) is measured against this, not
@@ -1425,8 +1531,8 @@ pub struct PackageResult {
     pub replaced: Vec<Txid>,
 }
 
-/// How [`Mempool::accept_package`] has a member judged. The default is a
-/// transaction on its own.
+/// How [`Mempool::accept_package`] has a member judged, or how a reorg has a
+/// transaction it returns judged. The default is a transaction on its own.
 #[derive(Default)]
 struct PackageAdmit {
     /// Core's `m_package_feerates`: the member's own fee is not held to the
@@ -1436,12 +1542,23 @@ struct PackageAdmit {
     /// Core's `m_package_submission`: no room is made for the member, and the
     /// package trims the pool once it is all in.
     defer_trim: bool,
+    /// The opposite of Core's `m_allow_sibling_eviction`: a TRUC member
+    /// evaluated with the rest of its package may not evict a sibling.
+    no_sibling_eviction: bool,
+    /// Core's `m_bypass_limits` as far as TRUC goes: a transaction a reorg
+    /// returns is not held to the TRUC rules, which the block it left may
+    /// have broken.
+    skip_truc: bool,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
     /// The events of a member let in by `skip_fee_floor`, kept back for the
     /// caller to send with the child that pays for it.
     held: Vec<MempoolEvent>,
+    /// Everything the admission replaced: conflicts, their descendants and
+    /// any sibling the TRUC rules evicted. Core's `m_replaced_transactions`,
+    /// which `submitpackage` reports.
+    replaced: Vec<Txid>,
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -2781,6 +2898,29 @@ impl Mempool {
         )
     }
 
+    /// [`Self::accept_transaction`] for a transaction a reorg took out of a
+    /// block. Core returns those with `bypass_limits`, which among other
+    /// things skips the TRUC rules: the block may have held a TRUC family
+    /// larger than they allow, and the mempool takes it back as it was.
+    pub fn accept_reorged_transaction(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<Txid, MempoolError> {
+        let _admission = self.admission.lock();
+        self.accept_transaction_led(
+            tx,
+            chain_state,
+            script_verifier,
+            // Reorged-out txs re-enter and quarantine normally; never refused.
+            TxSource::Reload,
+            false,
+            Vec::new(),
+            &mut PackageAdmit { skip_truc: true, ..Default::default() },
+        )
+    }
+
     /// [`Self::accept_transaction`], emitting `lead` ahead of the
     /// transaction's own events if it is accepted and dropping it if not.
     /// [`Self::accept_package`] passes the `Enter` of each parent whose place
@@ -3081,6 +3221,10 @@ impl Mempool {
             return Err(MempoolError::MissingInputs);
         }
 
+        // Before `ancestors` becomes the transitive set: the TRUC rules read
+        // the direct parents.
+        let mempool_parents = Self::direct_mempool_parents(&tx, &ancestors);
+
         // CPFP: build full ancestor set (transitive) and enforce limits
         Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
@@ -3089,27 +3233,6 @@ impl Mempool {
         // later, where Core checks it.
         let sigop_cost = Self::sigop_cost_of(&tx, &prev_outputs);
         let adj_weight = policy::sigops_adjusted_weight(weight as u64, sigop_cost);
-
-        // RBF: every replacement rule, shared with `test_accept` so the two
-        // cannot answer differently. See `rbf_check`.
-        if !conflicts.is_empty() {
-            let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-            if sum_inputs < sum_outputs {
-                return Err(MempoolError::BadAmounts);
-            }
-            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
-            let new_fee = modified_fee(sum_inputs - sum_outputs, new_delta);
-            Self::rbf_check(
-                &inner,
-                &cfg,
-                &tx,
-                &txid,
-                adj_weight,
-                new_fee,
-                &conflicts,
-                &ancestors,
-            )?;
-        }
 
         // Check amounts
         let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -3186,6 +3309,26 @@ impl Mempool {
             && let Some(e) = deferred_nonstd.take()
         {
             return Err(e);
+        }
+
+        // TRUC, then RBF, as Core's `PreChecks` ends and `ReplacementChecks`
+        // follows: a sibling the TRUC rules offer for eviction is replaced
+        // under the same rules as a conflict.
+        let sibling = Self::truc_admission(&inner, &tx, adj_weight, &mempool_parents, &mut conflicts, pkg)?;
+        if !conflicts.is_empty() {
+            let new_fee = modified_fee(fee, fee_delta);
+            Self::rbf_check(
+                &inner,
+                &cfg,
+                &tx,
+                &txid,
+                adj_weight,
+                new_fee,
+                &conflicts,
+                &ancestors,
+                sibling,
+            )
+            .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
         }
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
@@ -3456,6 +3599,7 @@ impl Mempool {
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
                 replaced_txs.push(evict_entry.tx);
+                pkg.replaced.push(*evict_txid);
             }
         }
         self.sync_unbroadcast_len(&inner);
@@ -4500,6 +4644,48 @@ impl Mempool {
         Ok(())
     }
 
+    /// `tx`'s direct parents in the mempool, in input order. `parents` is the
+    /// set of them, before it is widened to every ancestor.
+    fn direct_mempool_parents(tx: &Transaction, parents: &HashSet<Txid>) -> Vec<Txid> {
+        let mut out: Vec<Txid> = Vec::new();
+        for input in &tx.input {
+            let parent = input.previous_output.txid;
+            if parents.contains(&parent) && !out.contains(&parent) {
+                out.push(parent);
+            }
+        }
+        out
+    }
+
+    /// Core's `SingleTRUCChecks` on admission. When the only fault is a second
+    /// child of a TRUC parent and sibling eviction is allowed, the sibling
+    /// joins `conflicts`, to be replaced under the RBF rules, and is returned.
+    fn truc_admission(
+        inner: &MempoolInner,
+        tx: &Transaction,
+        adj_weight: u64,
+        mempool_parents: &[Txid],
+        conflicts: &mut HashSet<Txid>,
+        pkg: &PackageAdmit,
+    ) -> Result<Option<Txid>, MempoolError> {
+        if pkg.skip_truc {
+            return Ok(None);
+        }
+        let vsize = policy::weight_to_vsize(adj_weight);
+        let Some(failure) = truc::single_truc_checks(inner, tx, vsize, mempool_parents, conflicts) else {
+            return Ok(None);
+        };
+        match failure.sibling {
+            Some(sibling) if !pkg.no_sibling_eviction => {
+                conflicts.insert(sibling);
+                Ok(Some(sibling))
+            }
+            _ => Err(MempoolError::TrucViolation(failure.detail)),
+        }
+    }
+
+    /// `sibling` is a conflict only by TRUC sibling eviction, which Core does
+    /// not ask to signal replaceability.
     #[allow(clippy::too_many_arguments)]
     fn rbf_check(
         inner: &MempoolInner,
@@ -4510,17 +4696,23 @@ impl Mempool {
         new_fee: u64,
         conflicts: &HashSet<Txid>,
         ancestors: &HashSet<Txid>,
+        sibling: Option<Txid>,
     ) -> Result<HashSet<Txid>, MempoolError> {
         // Opt-in RBF: each direct conflict must signal replaceability.
         for conflict_txid in conflicts {
+            if sibling == Some(*conflict_txid) {
+                continue;
+            }
             if let Some(conflict_entry) = inner.entries.get(conflict_txid)
                 && !cfg.full_rbf
             {
-                let signals_rbf = conflict_entry
-                    .tx
-                    .input
-                    .iter()
-                    .any(|i| i.sequence.0 < 0xffff_fffe);
+                // BIP 431: a TRUC transaction is always replaceable.
+                let signals_rbf = conflict_entry.tx.version.0 == truc::TRUC_VERSION
+                    || conflict_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.sequence.0 < 0xffff_fffe);
                 if !signals_rbf {
                     return Err(MempoolError::ConflictingSpend);
                 }
@@ -5420,28 +5612,12 @@ impl Mempool {
         // two paths judge different chunks: a replacement with an unconfirmed
         // grandparent passed `testmempoolaccept` and failed
         // `sendrawtransaction`.
+        let mempool_parents = Self::direct_mempool_parents(tx, &ancestors);
         Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
         // Core's sigop-adjusted weight, as on admission.
         let sigop_cost = Self::sigop_cost_of(tx, &prev_outputs);
         let weight_u64 = policy::sigops_adjusted_weight(weight as u64, sigop_cost);
-
-        // RBF: the same `rbf_check` `accept_transaction` runs, so
-        // `testmempoolaccept` and `sendrawtransaction` cannot disagree.
-        if !conflicts.is_empty() {
-            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
-            let new_fee = modified_fee(fee, new_delta);
-            Self::rbf_check(
-                &inner,
-                &cfg,
-                tx,
-                &txid,
-                weight_u64,
-                new_fee,
-                &conflicts,
-                &ancestors,
-            )?;
-        }
 
         // Fee rate check (sat/kvB), on Core's *modified* fee: a pending
         // `prioritisetransaction` delta counts toward the min-relay gate, so
@@ -5486,6 +5662,33 @@ impl Mempool {
         // the fee rate check so 0-fee txs get "min relay fee not met" (Core).
         if !cfg.accept_non_std_txn {
             Self::check_standardness(tx, &cfg, weight)?;
+        }
+
+        // TRUC, then RBF: the same `truc_admission` and `rbf_check`
+        // `accept_transaction` runs, so `testmempoolaccept` and
+        // `sendrawtransaction` cannot disagree. Core's single-transaction
+        // `testmempoolaccept` allows sibling eviction.
+        let sibling = Self::truc_admission(
+            &inner,
+            tx,
+            weight_u64,
+            &mempool_parents,
+            &mut conflicts,
+            &PackageAdmit::default(),
+        )?;
+        if !conflicts.is_empty() {
+            Self::rbf_check(
+                &inner,
+                &cfg,
+                tx,
+                &txid,
+                weight_u64,
+                effective_fee,
+                &conflicts,
+                &ancestors,
+                sibling,
+            )
+            .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
         }
 
         drop(inner);
@@ -5839,6 +6042,10 @@ impl Mempool {
         // conflicts *and* their descendants, which the replacement evicts
         // too. Sampling only the direct spenders under-reported every
         // replacement of a transaction with children.
+        // What the members' own admissions replaced, which includes a
+        // sibling a TRUC member evicted: no input of the package touches it,
+        // so `conflicts_before` cannot see it.
+        let mut member_replaced: HashSet<Txid> = HashSet::new();
         let conflicts_before: HashSet<Txid> = {
             let inner = self.inner.read();
             let direct: HashSet<Txid> = pkg
@@ -5878,15 +6085,18 @@ impl Mempool {
 
             // Try normal acceptance. Room is made once the whole package is
             // in, not member by member.
-            match self.accept_transaction_led(
+            let mut admit = PackageAdmit { defer_trim: true, ..Default::default() };
+            let accepted = self.accept_transaction_led(
                 ptx.tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
                 Vec::new(),
-                &mut PackageAdmit { defer_trim: true, ..Default::default() },
-            ) {
+                &mut admit,
+            );
+            member_replaced.extend(admit.replaced);
+            match accepted {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
                     let inner = self.inner.read();
@@ -6053,7 +6263,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(ptx.wtxid, e.to_string());
+                    failed.insert(ptx.wtxid, e.state_string());
                 }
             }
         }
@@ -6076,10 +6286,60 @@ impl Mempool {
             }
         };
         let mut package_eval = !eval.is_empty();
+        // A package-wide refusal, which Core reports as `package_msg`.
+        let mut package_error: Option<String> = None;
         if package_eval && quit_early {
             refuse_deferred(&mut failed, &eval);
             package_eval = false;
-        } else if package_eval {
+        }
+        if package_eval {
+            // The TRUC rules, as `AcceptMultipleTransactions` applies them:
+            // each member's own (`PreChecks`), against the mempool alone and
+            // without sibling eviction, then the package's together. Before
+            // the combined feerate, as in Core.
+            let members: Vec<&Transaction> = eval.iter().map(|p| &p.tx).collect();
+            let vsizes: Vec<Option<u64>> = eval
+                .iter()
+                .map(|p| {
+                    self.package_member_fee(&p.tx, chain_state, &pkg_tx_map)
+                        .map(|(_, w)| policy::weight_to_vsize(w))
+                })
+                .collect();
+            let inner = self.inner.read();
+            let parents_in_pool = |tx: &Transaction| {
+                let resident: HashSet<Txid> = tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .filter(|t| inner.entries.contains_key(t))
+                    .collect();
+                Self::direct_mempool_parents(tx, &resident)
+            };
+            let member_failure = eval.iter().zip(&vsizes).enumerate().find_map(|(i, (p, vsize))| {
+                let conflicts: HashSet<Txid> =
+                    p.tx.input.iter().filter_map(|i| inner.spends.get(&i.previous_output).copied()).collect();
+                truc::single_truc_checks(&*inner, &p.tx, (*vsize)?, &parents_in_pool(&p.tx), &conflicts)
+                    .map(|f| (i, f.detail))
+            });
+            let package_failure = || {
+                eval.iter().zip(&vsizes).find_map(|(p, vsize)| {
+                    truc::package_truc_checks(&*inner, &p.tx, (*vsize)?, &members, &parents_in_pool(&p.tx))
+                })
+            };
+            if let Some((i, detail)) = member_failure {
+                // Core stops at the member; the others keep what they were
+                // refused for alone.
+                let rest: Vec<&PkgTx> = eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+                refuse_deferred(&mut failed, &rest);
+                failed.insert(eval[i].wtxid, MempoolError::TrucViolation(detail).state_string());
+                package_eval = false;
+            } else if let Some(detail) = package_failure() {
+                refuse_deferred(&mut failed, &eval);
+                package_error = Some(MempoolError::TrucViolation(detail).state_string());
+                package_eval = false;
+            }
+        }
+        if package_eval {
             // `AcceptMultipleTransactions`' `CheckFeeRate` over the subpackage:
             // its total modified fee against the floors for its total size.
             // A fee that cannot be known (an input resolves nowhere) is left
@@ -6115,7 +6375,12 @@ impl Mempool {
         let mut cpfp_admitted: Vec<Txid> = Vec::new();
         let mut cpfp_held: HashMap<Txid, Vec<MempoolEvent>> = HashMap::new();
         for p in pkg.iter().filter(|p| cpfp_parents.contains_key(&p.txid)) {
-            let mut admit = PackageAdmit { skip_fee_floor: true, defer_trim: true, ..Default::default() };
+            let mut admit = PackageAdmit {
+                skip_fee_floor: true,
+                defer_trim: true,
+                no_sibling_eviction: true,
+                ..Default::default()
+            };
             match self.accept_transaction_led(
                 p.tx.clone(),
                 chain_state,
@@ -6126,6 +6391,7 @@ impl Mempool {
                 &mut admit,
             ) {
                 Ok(txid) => {
+                    member_replaced.extend(admit.replaced.drain(..));
                     accepted_txids.insert(txid);
                     if admit.floor_skipped {
                         cpfp_admitted.push(txid);
@@ -6279,7 +6545,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(wtxid, e.to_string());
+                    failed.insert(wtxid, e.state_string());
                 }
             }
         }
@@ -6384,15 +6650,18 @@ impl Mempool {
                 _ => 0,
             });
 
-            match self.accept_transaction_led(
+            let mut admit = PackageAdmit { defer_trim: true, no_sibling_eviction: true, ..Default::default() };
+            let accepted = self.accept_transaction_led(
                 child_tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
                 lead,
-                &mut PackageAdmit { defer_trim: true, ..Default::default() },
-            ) {
+                &mut admit,
+            );
+            member_replaced.extend(admit.replaced);
+            match accepted {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
                     for parent in &paid_for {
@@ -6410,7 +6679,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(wtxid, e.to_string());
+                    failed.insert(wtxid, e.state_string());
                 }
             }
         }
@@ -6527,6 +6796,8 @@ impl Mempool {
         // every member was refused.
         let package_msg = if unspent_dust {
             "unspent-dust".to_string()
+        } else if let Some(e) = package_error.filter(|_| !trimmed_member) {
+            e
         } else if !failed.is_empty() || !over_maxfeerate.is_empty() || trimmed_member {
             "transaction failed".to_string()
         } else {
@@ -6551,7 +6822,7 @@ impl Mempool {
         let replaced: Vec<Txid> = {
             let inner = self.inner.read();
             conflicts_before
-                .iter()
+                .union(&member_replaced)
                 .filter(|t| !inner.entries.contains_key(*t))
                 .copied()
                 .collect()
@@ -7680,6 +7951,10 @@ mod fullpool_tests;
 #[cfg(test)]
 #[path = "pool_cpfp_tests.rs"]
 mod cpfp_tests;
+
+#[cfg(test)]
+#[path = "pool_truc_tests.rs"]
+mod truc_tests;
 
 #[cfg(test)]
 #[path = "pool_mempoolrpc_tests.rs"]

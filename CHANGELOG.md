@@ -33,6 +33,11 @@ item below is (or will be) written up in full in the in-development
   package's combined feerate, as in Core (#984). The pool trims once per
   package and evicts by descendant score.
 
+- TRUC (BIP 431) policy for version 3 transactions: one unconfirmed parent or
+  child, a 1,000 vB child cap, a 10,000 vB cap, sibling eviction, and Core's
+  `TRUC-violation` reasons, in `sendrawtransaction`, `testmempoolaccept`,
+  `submitpackage` and relay (#1020).
+
 ### Fixed
 
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
