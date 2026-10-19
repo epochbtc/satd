@@ -67,6 +67,9 @@ item below is (or will be) written up in full in the in-development
   feerate first, a cluster's transactions in its order. It listed them in
   hash-map order, which changed when a reorg returned the same
   transactions.
+- A `submitpackage` ephemeral dust parent is judged by the transaction
+  policy (`policyfile=`); it skipped the policy, so a rule matching it did
+  not hold or refuse it.
 - The Rust script engine computes a tapscript signature hash as Core does,
   from the annex hashed once per input instead of once per signature check.
   A spend with many checks and a large annex verified many times slower than
