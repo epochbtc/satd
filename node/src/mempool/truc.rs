@@ -39,6 +39,8 @@ pub(crate) trait TrucView {
     /// The in-mempool descendants of `txid`, itself excluded, up to `cap` of
     /// them.
     fn descendants(&self, txid: &Txid, cap: usize) -> Vec<Txid>;
+    /// Whether `ancestor` is an in-mempool ancestor of `txid`.
+    fn descends_from(&self, txid: &Txid, ancestor: &Txid) -> bool;
 }
 
 fn is_truc(tx: &Transaction) -> bool {
@@ -115,9 +117,11 @@ pub(crate) fn single_truc_checks(
 
     // This is the parent's only child. A reorg can leave it with more, so
     // more is handled too. A child this transaction replaces does not count:
-    // any descendant of a TRUC transaction is a direct child.
+    // any descendant of a TRUC transaction is a direct child. Asked of the
+    // conflicts rather than of the descendants, which are counted only as
+    // far as the limit needs: a reorg can leave any number.
     let descendants = view.descendants(parent_txid, TRUC_DESCENDANT_LIMIT + 1);
-    let child_will_be_replaced = descendants.iter().any(|d| direct_conflicts.contains(d));
+    let child_will_be_replaced = direct_conflicts.iter().any(|c| view.descends_from(c, parent_txid));
     if descendants.len() + 2 > TRUC_DESCENDANT_LIMIT && !child_will_be_replaced {
         // Sibling eviction is on offer only when the parent has exactly one
         // child and that child has no other ancestors, so there is no choice

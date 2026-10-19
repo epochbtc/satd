@@ -1136,6 +1136,25 @@ impl TrucView for MempoolInner {
         seen.len()
     }
 
+    /// Bounded by the ancestor limit every admission enforces.
+    fn descends_from(&self, txid: &Txid, ancestor: &Txid) -> bool {
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let mut queue = vec![*txid];
+        while let Some(current) = queue.pop() {
+            let Some(entry) = self.entries.get(&current) else { continue };
+            for input in &entry.tx.input {
+                let parent = input.previous_output.txid;
+                if parent == *ancestor && self.entries.contains_key(&parent) {
+                    return true;
+                }
+                if self.entries.contains_key(&parent) && seen.insert(parent) {
+                    queue.push(parent);
+                }
+            }
+        }
+        false
+    }
+
     fn descendants(&self, txid: &Txid, cap: usize) -> Vec<Txid> {
         let mut out: Vec<Txid> = Vec::new();
         let mut queue = vec![*txid];
@@ -1536,6 +1555,10 @@ struct PackageAdmit {
     /// The events of a member let in by `skip_fee_floor`, kept back for the
     /// caller to send with the child that pays for it.
     held: Vec<MempoolEvent>,
+    /// Everything the admission replaced: conflicts, their descendants and
+    /// any sibling the TRUC rules evicted. Core's `m_replaced_transactions`,
+    /// which `submitpackage` reports.
+    replaced: Vec<Txid>,
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -3576,6 +3599,7 @@ impl Mempool {
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
                 replaced_txs.push(evict_entry.tx);
+                pkg.replaced.push(*evict_txid);
             }
         }
         self.sync_unbroadcast_len(&inner);
@@ -6018,6 +6042,10 @@ impl Mempool {
         // conflicts *and* their descendants, which the replacement evicts
         // too. Sampling only the direct spenders under-reported every
         // replacement of a transaction with children.
+        // What the members' own admissions replaced, which includes a
+        // sibling a TRUC member evicted: no input of the package touches it,
+        // so `conflicts_before` cannot see it.
+        let mut member_replaced: HashSet<Txid> = HashSet::new();
         let conflicts_before: HashSet<Txid> = {
             let inner = self.inner.read();
             let direct: HashSet<Txid> = pkg
@@ -6057,15 +6085,18 @@ impl Mempool {
 
             // Try normal acceptance. Room is made once the whole package is
             // in, not member by member.
-            match self.accept_transaction_led(
+            let mut admit = PackageAdmit { defer_trim: true, ..Default::default() };
+            let accepted = self.accept_transaction_led(
                 ptx.tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
                 Vec::new(),
-                &mut PackageAdmit { defer_trim: true, ..Default::default() },
-            ) {
+                &mut admit,
+            );
+            member_replaced.extend(admit.replaced);
+            match accepted {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
                     let inner = self.inner.read();
@@ -6360,6 +6391,7 @@ impl Mempool {
                 &mut admit,
             ) {
                 Ok(txid) => {
+                    member_replaced.extend(admit.replaced.drain(..));
                     accepted_txids.insert(txid);
                     if admit.floor_skipped {
                         cpfp_admitted.push(txid);
@@ -6618,15 +6650,18 @@ impl Mempool {
                 _ => 0,
             });
 
-            match self.accept_transaction_led(
+            let mut admit = PackageAdmit { defer_trim: true, no_sibling_eviction: true, ..Default::default() };
+            let accepted = self.accept_transaction_led(
                 child_tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
                 lead,
-                &mut PackageAdmit { defer_trim: true, no_sibling_eviction: true, ..Default::default() },
-            ) {
+                &mut admit,
+            );
+            member_replaced.extend(admit.replaced);
+            match accepted {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
                     for parent in &paid_for {
@@ -6787,7 +6822,7 @@ impl Mempool {
         let replaced: Vec<Txid> = {
             let inner = self.inner.read();
             conflicts_before
-                .iter()
+                .union(&member_replaced)
                 .filter(|t| !inner.entries.contains_key(*t))
                 .copied()
                 .collect()

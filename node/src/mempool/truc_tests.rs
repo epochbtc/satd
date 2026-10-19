@@ -40,6 +40,11 @@ impl TrucView for Pool {
         n.min(cap)
     }
 
+    fn descends_from(&self, txid: &Txid, ancestor: &Txid) -> bool {
+        let Some(tx) = self.0.get(txid) else { return false };
+        self.parents(tx).iter().any(|p| p == ancestor || self.descends_from(p, ancestor))
+    }
+
     fn descendants(&self, txid: &Txid, cap: usize) -> Vec<Txid> {
         let mut out: Vec<Txid> = Vec::new();
         for (t, tx) in &self.0 {

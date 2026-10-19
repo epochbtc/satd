@@ -605,3 +605,53 @@ fn truc_transactions_are_replaceable_without_signalling() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// However many children a reorg leaves a TRUC parent with, a direct
+/// replacement of any one of them adds none, and is let through to the
+/// replacement rules.
+#[test]
+fn every_child_of_a_reorged_parent_can_be_replaced_directly() {
+    let (cs, mp, dir) = env(&[1]);
+    let n = 8;
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, n, 1));
+    accept(&mp, &cs, &parent).expect("parent");
+    let children: Vec<Transaction> = (0..n as u32)
+        .map(|vout| {
+            let value = parent.output[vout as usize].value.to_sat();
+            v3(spend(&[out(parent.compute_txid(), vout)], value, 500, 1, 2))
+        })
+        .collect();
+    for child in &children {
+        mp.accept_reorged_transaction(child.clone(), &cs, &NoopVerifier).expect("a reorg skips TRUC");
+    }
+
+    for (vout, child) in children.iter().enumerate() {
+        let value = parent.output[vout].value.to_sat();
+        let replacement = v3(spend(&[out(parent.compute_txid(), vout as u32)], value, 3_000, 1, 3));
+        accept(&mp, &cs, &replacement).unwrap_or_else(|e| panic!("child {vout}: {}", e.state_string()));
+        assert!(!pool(&mp).contains(&child.compute_txid()));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sibling a package member evicts is reported in `replaced-transactions`
+/// with any other replacement, though no input of the package touches it.
+#[test]
+fn a_sibling_a_package_member_evicts_is_reported_replaced() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 2, 1));
+    let sibling = v3(spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2));
+    for tx in [&parent, &sibling] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+    let rich = v3(spend(&[out(parent.compute_txid(), 1)], parent.output[1].value.to_sat(), 20_000, 1, 3));
+
+    let r = submit(&mp, &cs, &[&parent, &rich]);
+
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(pool(&mp), txids(&[&parent, &rich]));
+    assert_eq!(r.replaced, vec![sibling.compute_txid()]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
