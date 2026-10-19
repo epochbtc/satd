@@ -328,3 +328,54 @@ fn the_conflicts_of_both_members_count_toward_rule_five() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The parent and child are held to the cluster limits as a pair.
+#[test]
+fn the_package_is_held_to_the_cluster_limits() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    mp.config.write().max_cluster_count = 1;
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert_eq!(r.package_msg, "too-large-cluster");
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A zero-fee dust parent that replaces must have its dust swept by its
+/// child, as any package's (`CheckEphemeralSpends`), and nothing is evicted
+/// when it is not.
+#[test]
+fn a_replacing_dust_parent_needs_its_dust_swept() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    let mut parent = v3(spend(&[prev(1)], COIN_VALUE, 0, 1, 3));
+    parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 100);
+    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    let p = parent.compute_txid();
+    let around = v3(spend(&[out(p, 0)], COIN_VALUE - 100, 20_000, 1, 4));
+
+    let r = submit(&mp, &cs, &[&parent, &around]);
+    assert_eq!(
+        r.tx_results[&around.compute_wtxid().to_string()]["error"],
+        format!(
+            "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+            around.compute_txid(),
+            around.compute_wtxid()
+        ),
+        "{:?}",
+        r.tx_results
+    );
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let sweeps = v3(spend(&[out(p, 0), out(p, 1)], COIN_VALUE, 20_000, 1, 5));
+    let r = submit(&mp, &cs, &[&parent, &sweeps]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(pool(&mp), ids(&[&parent, &sweeps]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

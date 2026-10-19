@@ -448,7 +448,7 @@ status = "run"
 file = "mempool_package_rbf.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L110 reject-reason 'insufficient fee' where 'bip125-replacement-disallowed' is expected; satd has no package RBF. Follow-up: package RBF"
+note = "measured 2026-10-19 with package RBF: L118 sync_all times out because the second node never gets the replacing package; satd has no opportunistic 1-parent-1-child package relay. With that sync_all removed, every case passes. Follow-up: 1p1c package relay"
 
 [[test]]
 file = "mempool_packages.py"
