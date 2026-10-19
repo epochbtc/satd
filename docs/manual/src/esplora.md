@@ -108,9 +108,9 @@ format differs from Electrum's.
 | GET | `/address/:address/utxo` <br> `/scripthash/:hash/utxo` | JSON: live UTXOs (confirmed + mempool funding) with `{txid, vout, value, status}`. |
 
 Wrong-network addresses return 400, as do malformed addresses and bad
-scripthash hex (non-hex characters or wrong length). The stats and `utxo`
-routes also return 400 `Too many history entries` for a script with more
-than 200,000 confirmed transactions; see
+scripthash hex (non-hex characters or wrong length). The stats, `utxo` and
+`sse` routes also return 400 `Too many history entries` for a script with
+more than 200,000 confirmed transactions; see
 [High-history scripts](#compatibility-statement).
 
 ### Mempool & Fee
@@ -281,7 +281,10 @@ blockstream.info and mempool.space within these constraints:
   they are capped: a script whose confirmed history holds more than 200,000
   transactions gets 400 `Too many history entries (more than 200000
   transactions)`, as mempool.space's electrs answers above its history
-  limit. The refusal counts the history's transactions and stops at the
+  limit. Opening `/address/:addr/sse` or `/scripthash/:hash/sse` for such a
+  script gets the same 400: its status is not recomputed above the cap, so
+  the stream would carry no events, and a stream already open for a script
+  that grows past the cap stops receiving them. The refusal counts the history's transactions and stops at the
   first one past the cap, so it costs a bounded read however long the
   history is; below the cap the answers are unchanged. The cap is not
   configurable; page such a script's history through `/txs/chain` instead.

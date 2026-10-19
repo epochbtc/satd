@@ -132,6 +132,7 @@ pub async fn address_sse(
     Path(addr): Path<String>,
 ) -> EsploraResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let sh = parse_address(&addr, state.network)?;
+    refuse_over_history_cap(&state, sh).await?;
     let permit = acquire_sse_permit(&state)?;
     // Per-tenant watch-set quota (above the node-wide subscription cap). The
     // lease must outlive the stream so a disconnect releases the unit.
@@ -146,10 +147,24 @@ pub async fn scripthash_sse(
     Path(hash): Path<String>,
 ) -> EsploraResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let sh = parse_scripthash(&hash)?;
+    refuse_over_history_cap(&state, sh).await?;
     let permit = acquire_sse_permit(&state)?;
     let lease = acquire_watch_lease(&state, principal.as_deref())?;
     let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
     Ok(build_status_sse(rx, hash, permit, lease))
+}
+
+/// Refuse a status stream for a script whose history is over
+/// `max_history_entries` (400 `Too many history entries`): its status is
+/// never recomputed, so the stream would stay silent. The count stops at
+/// the first transaction past the cap and runs on the blocking pool.
+async fn refuse_over_history_cap(state: &EsploraState, sh: Scripthash) -> EsploraResult<()> {
+    crate::blocking::off_worker(state, move |st| {
+        Ok(st
+            .address_index
+            .check_history_cap(&sh, st.config.max_history_entries)?)
+    })
+    .await
 }
 
 /// Charge one watch unit against the principal's per-tenant watch-set quota.

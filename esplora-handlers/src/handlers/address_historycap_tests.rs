@@ -1,6 +1,7 @@
 //! The history cap on the Esplora address routes whose cost follows the
-//! whole history: the stats (`/address/:addr`, `/scripthash/:hash`) and the
-//! UTXO list.
+//! whole history: the stats (`/address/:addr`, `/scripthash/:hash`), the
+//! UTXO list, and the status stream (`.../sse`), whose updates come from a
+//! status recompute over the history.
 //!
 //! The index holds a five-transaction history (one transaction funds and
 //! spends, one funds twice), so the cap counts transactions, not rows. Each
@@ -92,7 +93,8 @@ impl AddressIndex for FixedIndex {
         Ok(vec![utxo(5, 3, 1, 3_000), utxo(8, 4, 0, 4_000), utxo(8, 4, 1, 5_000)])
     }
     fn subscribe(&self, _sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
-        Err(SubscribeError::CapReached(0))
+        // The stream holds the receiver; the sender may go.
+        Ok(broadcast::channel(4).1)
     }
 }
 
@@ -210,5 +212,26 @@ fn utxo_list_is_refused_over_the_history_cap_and_unchanged_at_it() {
             (txid(4).to_string(), 0, 4_000),
             (txid(4).to_string(), 1, 5_000),
         ]
+    );
+}
+
+/// The status stream's updates come from a recompute the notifier refuses
+/// over the cap, so a stream for such a script would stay silent: it is
+/// refused when it is opened.
+#[tokio::test]
+async fn status_stream_is_refused_over_the_cap_and_opens_at_it() {
+    use axum::extract::{Path, State};
+
+    let wire = hex::encode(SH);
+    let (state, _dir) = esplora_state(4);
+    match crate::handlers::sse::scripthash_sse(State(state), None, Path(wire.clone())).await {
+        Err(err) => assert_refused(err, 4),
+        Ok(_) => panic!("a stream over the cap must be refused"),
+    }
+
+    let (state, _dir) = esplora_state(5);
+    assert!(
+        crate::handlers::sse::scripthash_sse(State(state), None, Path(wire)).await.is_ok(),
+        "a stream at the cap opens"
     );
 }

@@ -67,7 +67,7 @@ item below is (or will be) written up in full in the in-development
 - Electrum and Esplora scripthash queries read the whole history before
   applying any cap, so one request for a busy scripthash could use GBs of
   memory. `get_history`, `get_balance`, `listunspent`, `subscribe` and the
-  Esplora address stats and `/utxo` now stop counting at 200,000
+  Esplora address stats, `/utxo` and `/sse` now stop counting at 200,000
   transactions and refuse a longer history (Electrum `history too large`,
   Esplora 400 `Too many history entries`); `get_first_use` reads only the
   first block.

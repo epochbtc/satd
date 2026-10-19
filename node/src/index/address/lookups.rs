@@ -411,9 +411,8 @@ impl AddressIndex for RocksAddressIndex {
         sh: &Scripthash,
     ) -> Result<Option<(u32, bitcoin::Txid)>, IndexError> {
         self.check_serving()?;
-        // Each family's rows leave the store in ordinal order, which is
-        // chain order, so the first rows read are the script's first
-        // block. That block can hold several of its transactions, and the
+        // Each family's rows are read in ordinal order, which is chain
+        // order, so the first rows read are the script's first block. That block can hold several of its transactions, and the
         // answer is the lowest txid among them: read the first rows in
         // growing windows until one reaches past the first block (or the
         // rows run out), so only that block's rows are ever resolved.
