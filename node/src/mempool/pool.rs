@@ -1436,6 +1436,10 @@ pub struct Mempool {
     /// reconstruction (Core's `m_replaced_transactions` →
     /// `AddToCompactExtraTransactions`).
     replaced_tx_sink: Mutex<Option<ReplacedTxSink>>,
+    /// Run between a replacing package's parent and child admissions, so a
+    /// test can move the chain there.
+    #[cfg(test)]
+    between_package_members: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Bounded ring of recent events for MCP snapshot consumption.
     /// Always maintained (cheap) so MCP tools work whether or not
     /// the broadcast sender is wired.
@@ -1611,6 +1615,16 @@ struct PackageAdmit {
     /// single-transaction replacement rules, and may be below the floors
     /// with `skip_fee_floor` although it replaces something.
     package_rbf: bool,
+    /// Every event of the admission, its replacements' included, is kept in
+    /// `held` for the caller, and what it evicts in `evicted_entries`: a
+    /// replacing package's parent, which comes back out, its evictions
+    /// restored, if the child cannot follow.
+    hold_events: bool,
+    /// The entries a `hold_events` admission evicted, as they were.
+    evicted_entries: Vec<(Txid, MempoolEntry)>,
+    /// The transactions a `hold_events` admission replaced, kept from the
+    /// replaced-transaction sink until the caller commits.
+    held_replaced_txs: Vec<Transaction>,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -1742,6 +1756,8 @@ impl Mempool {
             policy_reload_failures: std::sync::atomic::AtomicU64::new(0),
             event_tx: Mutex::new(None),
             replaced_tx_sink: Mutex::new(None),
+            #[cfg(test)]
+            between_package_members: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
             sp_gate: arc_swap::ArcSwap::from_pointee(std::sync::atomic::AtomicUsize::new(0)),
@@ -3680,6 +3696,9 @@ impl Mempool {
                     replaced.push((*evict_txid, seq));
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
+                if pkg.hold_events {
+                    pkg.evicted_entries.push((*evict_txid, evict_entry.clone()));
+                }
                 replaced_txs.push(evict_entry.tx);
                 pkg.replaced.push(*evict_txid);
             }
@@ -3738,7 +3757,8 @@ impl Mempool {
 
         // A member let in below the floors stays only if the child paying for
         // it does, so its events go out with that child's, not now.
-        if pkg.floor_skipped {
+        let hold = pkg.floor_skipped || pkg.hold_events;
+        if hold {
             pkg.held.extend(lead);
         } else {
             // Inserted before anything this acceptance changed, so their
@@ -3752,13 +3772,20 @@ impl Mempool {
         // for them would be a phantom Leave leaking a withheld txid (§10).
         self.emit_evicted(&evicted_full_pool, evict_reason);
         for (conflict_txid, seq) in &replaced {
-            self.emit(MempoolEvent::LeaveReplaced {
+            let leave = MempoolEvent::LeaveReplaced {
                 txid: *conflict_txid,
                 replacing_txid: txid,
                 mempool_sequence: *seq,
-            });
+            };
+            if pkg.hold_events {
+                pkg.held.push(leave);
+            } else {
+                self.emit(leave);
+            }
         }
-        if !replaced_txs.is_empty()
+        if pkg.hold_events {
+            pkg.held_replaced_txs.extend(replaced_txs);
+        } else if !replaced_txs.is_empty()
             && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
         {
             sink(replaced_txs);
@@ -3785,7 +3812,7 @@ impl Mempool {
                 mempool_sequence,
                 raw_tx,
             };
-            if pkg.floor_skipped {
+            if hold {
                 pkg.held.push(enter);
             } else {
                 self.emit(enter);
@@ -7294,58 +7321,88 @@ impl Mempool {
                     failed.insert(eval[i].wtxid, err);
                 }
                 Ok(()) => {
-                    // Parent, then child. A parent below the floors keeps its
-                    // events back for the child to send, as a CPFP parent
-                    // does, and leaves with it if the child cannot follow.
-                    let mut lead: Vec<MempoolEvent> = Vec::new();
-                    let mut below_floor: Vec<Txid> = Vec::new();
-                    for p in &eval {
-                        let mut admit = PackageAdmit {
-                            skip_fee_floor: true,
-                            defer_trim: true,
-                            no_sibling_eviction: true,
-                            package_rbf: true,
-                            ..Default::default()
-                        };
-                        let accepted = self.accept_transaction_led(
-                            p.tx.clone(),
-                            chain_state,
-                            script_verifier,
-                            TxSource::Rpc,
-                            false,
-                            std::mem::take(&mut lead),
-                            &mut admit,
-                        );
-                        member_replaced.extend(admit.replaced.drain(..));
-                        match accepted {
-                            Ok(txid) => {
-                                accepted_txids.insert(txid);
-                                if admit.floor_skipped {
-                                    below_floor.push(txid);
-                                    lead = std::mem::take(&mut admit.held);
-                                }
-                                let inner = self.inner.read();
-                                if let Some(entry) = inner.entries.get(&txid) {
-                                    accepted_results.push(AcceptedMember::from_entry(
-                                        p.wtxid,
-                                        txid,
-                                        entry,
-                                        Admission::Subpackage,
-                                    ));
-                                }
+                    // Parent, then child. Everything the parent's admission
+                    // would announce waits for the child: if the child cannot
+                    // follow (a block can connect in between, which the
+                    // package lock does not hold off), the parent comes back
+                    // out unannounced and what it evicted is restored.
+                    let (parent, child) = (eval[0], eval[1]);
+                    let mut parent_admit = PackageAdmit {
+                        skip_fee_floor: true,
+                        defer_trim: true,
+                        no_sibling_eviction: true,
+                        package_rbf: true,
+                        hold_events: true,
+                        ..Default::default()
+                    };
+                    let parent_accepted = self.accept_transaction_led(
+                        parent.tx.clone(),
+                        chain_state,
+                        script_verifier,
+                        TxSource::Rpc,
+                        false,
+                        Vec::new(),
+                        &mut parent_admit,
+                    );
+                    match parent_accepted {
+                        Err(e) => {
+                            failed.insert(parent.wtxid, e.state_string());
+                            refuse_deferred(&mut failed, &[child]);
+                        }
+                        Ok(parent_txid) => {
+                            #[cfg(test)]
+                            if let Some(hook) = self.between_package_members.lock().as_ref() {
+                                hook();
                             }
-                            Err(e) => {
-                                failed.insert(p.wtxid, e.state_string());
-                                for txid in self.remove_unannounced(&below_floor) {
-                                    accepted_txids.remove(&txid);
-                                    accepted_results.retain(|m| m.txid != txid);
-                                    if let Some(parent) = eval.iter().find(|m| m.txid == txid)
-                                        && let Some(err) = deferred_err.get(&txid).or_else(|| cpfp_parents.get(&txid))
+                            let held = std::mem::take(&mut parent_admit.held);
+                            let mut child_admit = PackageAdmit {
+                                defer_trim: true,
+                                no_sibling_eviction: true,
+                                package_rbf: true,
+                                ..Default::default()
+                            };
+                            let child_accepted = self.accept_transaction_led(
+                                child.tx.clone(),
+                                chain_state,
+                                script_verifier,
+                                TxSource::Rpc,
+                                false,
+                                held.clone(),
+                                &mut child_admit,
+                            );
+                            match child_accepted {
+                                Ok(child_txid) => {
+                                    member_replaced.extend(parent_admit.replaced.drain(..));
+                                    member_replaced.extend(child_admit.replaced.drain(..));
+                                    let replaced_txs = std::mem::take(&mut parent_admit.held_replaced_txs);
+                                    if !replaced_txs.is_empty()
+                                        && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
                                     {
-                                        failed.insert(parent.wtxid, err.clone());
+                                        sink(replaced_txs);
+                                    }
+                                    let inner = self.inner.read();
+                                    for (p, txid) in [(parent, parent_txid), (child, child_txid)] {
+                                        accepted_txids.insert(txid);
+                                        if let Some(entry) = inner.entries.get(&txid) {
+                                            accepted_results.push(AcceptedMember::from_entry(
+                                                p.wtxid,
+                                                txid,
+                                                entry,
+                                                Admission::Subpackage,
+                                            ));
+                                        }
                                     }
                                 }
-                                break;
+                                Err(e) => {
+                                    failed.insert(child.wtxid, e.state_string());
+                                    self.undo_package_parent(
+                                        parent_txid,
+                                        std::mem::take(&mut parent_admit.evicted_entries),
+                                        &held,
+                                        chain_state,
+                                    );
+                                    refuse_deferred(&mut failed, &[parent]);
+                                }
                             }
                         }
                     }
@@ -7961,6 +8018,59 @@ impl Mempool {
         }
         self.sync_unbroadcast_len(&inner);
         removed
+    }
+
+    /// Take a replacing package's parent back out after its child failed,
+    /// and put back what it evicted. Nothing about the parent was announced
+    /// (`PackageAdmit::hold_events`), so the mempool is as it was, less what
+    /// the chain has since made invalid: an evicted transaction whose input
+    /// is gone or now spent is left out, with its descendants, and announced
+    /// as a block conflict under the sequence number its eviction took.
+    fn undo_package_parent(
+        &self,
+        parent: Txid,
+        evicted: Vec<(Txid, MempoolEntry)>,
+        held: &[MempoolEvent],
+        chain_state: &ChainState,
+    ) {
+        self.remove_unannounced(&[parent]);
+        let left_at: HashMap<Txid, u64> = held
+            .iter()
+            .filter_map(|event| match event {
+                MempoolEvent::LeaveReplaced { txid, mempool_sequence, .. } => Some((*txid, *mempool_sequence)),
+                _ => None,
+            })
+            .collect();
+        let mut entries: FxHashMap<Txid, MempoolEntry> = evicted.into_iter().collect();
+        let order = Self::topological_order(&entries);
+        let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
+        {
+            let mut inner = self.inner.write();
+            for txid in order {
+                let Some(entry) = entries.remove(&txid) else { continue };
+                let valid = !inner.entries.contains_key(&txid)
+                    && entry.tx.input.iter().all(|i| {
+                        !inner.spends.contains_key(&i.previous_output)
+                            && (inner
+                                .entries
+                                .get(&i.previous_output.txid)
+                                .is_some_and(|p| (i.previous_output.vout as usize) < p.tx.output.len())
+                                || chain_state.get_coin(&i.previous_output).is_some())
+                    });
+                if valid {
+                    for input in &entry.tx.input {
+                        inner.spends.insert(input.previous_output, txid);
+                    }
+                    let size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.account_insert(entry.scope, size);
+                    inner.entries.insert(txid, entry);
+                } else if entry.scope.is_acting() {
+                    gone.push((txid, entry.scope, left_at.get(&txid).copied().unwrap_or(0)));
+                }
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+        self.emit_evicted(&gone, EvictReason::BlockConflict);
     }
 
     /// Core's `TrimToSize`: evict, lowest descendant score first, until each

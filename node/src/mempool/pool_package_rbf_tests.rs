@@ -512,3 +512,77 @@ fn the_childs_policy_sees_the_mempool_after_its_parent() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Between the parent's and the child's admissions, spend the given coins
+/// as a block connecting there would.
+fn spend_between(mp: &Mempool, cs: &ChainState, coins: Vec<OutPoint>) {
+    use crate::storage::Store as _;
+    let store = cs.store_ref().clone();
+    *mp.between_package_members.lock() = Some(Box::new(move || {
+        let batch = crate::storage::StoreBatch {
+            coin_removes: coins.iter().map(|c| (*c, COIN_VALUE, 1)).collect(),
+            ..Default::default()
+        };
+        store.write_batch(batch).expect("spend the coins");
+    }));
+}
+
+/// The leave and enter events sent so far.
+fn stream(rx: &mut tokio::sync::broadcast::Receiver<MempoolEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            MempoolEvent::Enter { txid, .. } => out.push(format!("enter {txid}")),
+            MempoolEvent::LeaveReplaced { txid, .. } => out.push(format!("replaced {txid}")),
+            MempoolEvent::LeaveEvicted { txid, reason, .. } => out.push(format!("evicted {txid} {reason:?}")),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A block spending the child's other coin can connect after the parent
+/// has replaced its conflict: the child then fails, the parent comes back
+/// out, and what it replaced is restored. Nothing about it was announced.
+#[test]
+fn a_child_failing_after_its_parent_restores_what_the_parent_replaced() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+    mp.set_event_sender(tx);
+    let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
+    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+    spend_between(&mp, &cs, vec![prev(2)]);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(res.package_msg, "transaction failed");
+    assert!(res.replaced.is_empty(), "{:?}", res.replaced);
+    assert_eq!(pool(&mp), HashSet::from([a_id]));
+    assert!(stream(&mut rx).is_empty(), "the replacement that did not happen was announced");
+    assert_eq!(mp.spending_tx(&prev(1)).map(|(t, _)| t), Some(a_id), "a spends its coin again");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the parent replaced is restored only where the chain still allows
+/// it: a replaced transaction whose own coin the block spent stays out, and
+/// leaves as a block conflict.
+#[test]
+fn a_replaced_transaction_the_block_invalidated_is_not_restored() {
+    let (cs, mp, dir) = floor_env(&[1, 2, 3]);
+    let a = spend(&[prev(1), prev(3)], 2 * COIN_VALUE, 1_000, 1, 1);
+    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+    mp.set_event_sender(tx);
+    let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
+    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+    spend_between(&mp, &cs, vec![prev(2), prev(3)]);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(res.package_msg, "transaction failed");
+    assert!(pool(&mp).is_empty());
+    assert_eq!(stream(&mut rx), vec![format!("evicted {a_id} BlockConflict")]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
