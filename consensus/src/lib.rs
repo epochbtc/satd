@@ -228,7 +228,7 @@ pub fn verify_transaction(
     }
 
     // One SighashCache for the whole tx — the key optimisation of this API.
-    let cache = Rc::new(RefCell::new(bitcoin::sighash::SighashCache::new(tx)));
+    let cache = Rc::new(RefCell::new(sighash::TxSighashCache::new(tx)));
 
     // TxSignatureChecker only reads prev_outputs in the BIP341 taproot path.
     // For non-taproot verifies we can pass an empty slice to skip the

@@ -214,7 +214,13 @@ pub fn verify_witness_program(
         // Check for annex (last element starts with 0x50)
         if stack.len() >= 2 && !stack.last().unwrap().is_empty() && stack.last().unwrap()[0] == ANNEX_TAG {
             let annex = stack.pop().unwrap();
-            exec_data.annex_hash = Sha256::digest(&annex).into();
+            // BIP 341's sha_annex covers the annex with its compact-size
+            // length, as Core's `(HashWriter{} << annex).GetSHA256()`. It is
+            // hashed once here; every signature check of the input reuses it.
+            let mut hasher = Sha256::new();
+            hasher.update(bitcoin::consensus::encode::serialize(&bitcoin::VarInt(annex.len() as u64)));
+            hasher.update(&annex);
+            exec_data.annex_hash = hasher.finalize().into();
             exec_data.annex_present = true;
         } else {
             exec_data.annex_present = false;

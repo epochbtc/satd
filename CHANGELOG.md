@@ -46,6 +46,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- The Rust script engine computes a tapscript signature hash as Core does,
+  from the annex hashed once per input instead of once per signature check.
+  A spend with many checks and a large annex verified many times slower than
+  in libbitcoinconsensus.
 - A multi-transaction `testmempoolaccept` evaluates its transactions
   together, as Core does: a transaction may spend an earlier one, the TRUC
   package checks and cluster limits apply to the set as `package-error`,
