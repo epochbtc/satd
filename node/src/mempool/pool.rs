@@ -4711,8 +4711,8 @@ impl Mempool {
     /// count limit. It refuses nothing: the ancestors are part of the
     /// cluster, so [`Self::check_cluster_limits`] refuses that transaction
     /// later. That is where Core refuses it: after the replacement checks,
-    /// or inside them as `cluster size limit exceeded`, with no ancestor
-    /// count of its own ahead of them. A set cut short is never used past
+    /// or inside them ahead of the diagram, with no ancestor count of its
+    /// own ahead of them. A set cut short is never used past
     /// that refusal. `bounded` is false for a transaction a reorg returns,
     /// which is exempt from the cluster limits: its walk is bounded by the
     /// chain the disconnected blocks held.
@@ -4961,15 +4961,11 @@ impl Mempool {
             ));
         }
 
-        // Core's `CalculateChunksForRBF` checks the cluster limits before it
-        // builds a diagram, so a replacement whose cluster would pass them
-        // fails here, as a replacement, not later as `too-large-cluster`.
+        // Core's `ReplacementChecks` checks the cluster limits after the fees
+        // and before the diagram, and refuses a replacement past them as
+        // `too-large-cluster`, as it refuses any other transaction.
         let parents = Self::direct_mempool_parents(tx, ancestors);
-        if Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted).is_err() {
-            return Err(MempoolError::DoesNotImproveFeerateDiagram(
-                "cluster size limit exceeded".to_string(),
-            ));
-        }
+        Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted)?;
 
         Self::rbf_improves_diagram(
             inner, cfg, weight, new_fee, &parents, conflicts, ancestors, &all_evicted,
