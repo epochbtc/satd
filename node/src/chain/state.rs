@@ -1916,17 +1916,7 @@ impl ChainState {
     /// and one past the cluster limits is cut back. The caller runs
     /// `remove_for_reorg` after, as Core runs `removeForReorg`.
     fn return_to_mempool(&self, mempool: &crate::mempool::pool::Mempool, disconnected: &[bitcoin::Transaction]) {
-        let mut returned = Vec::new();
-        for tx in disconnected {
-            match mempool.accept_reorged_transaction(tx.clone(), self, &*self.script_verifier) {
-                Ok(txid) => returned.push(txid),
-                Err(e) => tracing::debug!(
-                    txid = %tx.compute_txid(),
-                    err = ?e,
-                    "Reorg: re-add to mempool failed (likely conflict with new chain)"
-                ),
-            }
-        }
+        let returned = mempool.accept_reorged_transactions(disconnected, self, &*self.script_verifier);
         mempool.trim_reorged_clusters(&returned);
     }
 

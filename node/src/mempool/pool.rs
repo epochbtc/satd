@@ -1624,6 +1624,12 @@ struct PackageAdmit {
     held_replaced_txs: Vec<Transaction>,
     /// A `hold_events` admission's quarantine-channel event.
     held_quarantine: Vec<QuarantineEvent>,
+    /// Set for a transaction a reorg returns: the transactions this reorg
+    /// has returned so far. Core links a returned transaction to the
+    /// mempool transactions already spending it only once every
+    /// disconnected transaction has been offered, so the cluster check does
+    /// not step from a returned transaction to one of those.
+    reorg_returned: Option<HashSet<Txid>>,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -3026,8 +3032,49 @@ impl Mempool {
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<Txid, MempoolError> {
+        self.accept_reorged_with(tx, chain_state, script_verifier, &mut HashSet::new())
+    }
+
+    /// Offer a reorg's disconnected transactions (oldest first) back, as
+    /// [`Self::accept_reorged_transaction`] each, and return the txids of
+    /// those accepted. Each is checked against the cluster limits without
+    /// the links from an earlier returned transaction to the mempool
+    /// transactions already spending it, which Core adds only after the
+    /// whole reorg is offered; [`Self::trim_reorged_clusters`] then deals
+    /// with what those links make too large.
+    pub fn accept_reorged_transactions(
+        &self,
+        txs: &[Transaction],
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Vec<Txid> {
+        let mut returned: HashSet<Txid> = HashSet::new();
+        let mut order = Vec::new();
+        for tx in txs {
+            match self.accept_reorged_with(tx.clone(), chain_state, script_verifier, &mut returned) {
+                Ok(txid) => order.push(txid),
+                Err(e) => tracing::debug!(
+                    txid = %tx.compute_txid(),
+                    err = ?e,
+                    "Reorg: re-add to mempool failed (likely conflict with new chain)"
+                ),
+            }
+        }
+        order
+    }
+
+    /// One returned transaction, with `returned` the ones before it; it
+    /// joins them if accepted.
+    fn accept_reorged_with(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        returned: &mut HashSet<Txid>,
+    ) -> Result<Txid, MempoolError> {
         let _admission = self.admission.lock();
-        self.accept_transaction_led(
+        let mut pkg = PackageAdmit { skip_truc: true, reorg_returned: Some(std::mem::take(returned)), ..Default::default() };
+        let result = self.accept_transaction_led(
             tx,
             chain_state,
             script_verifier,
@@ -3035,8 +3082,13 @@ impl Mempool {
             TxSource::Reload,
             false,
             Vec::new(),
-            &mut PackageAdmit { skip_truc: true, ..Default::default() },
-        )
+            &mut pkg,
+        );
+        *returned = pkg.reorg_returned.take().unwrap_or_default();
+        if let Ok(txid) = &result {
+            returned.insert(*txid);
+        }
+        result
     }
 
     /// [`Self::accept_transaction`], emitting `lead` ahead of the
@@ -3467,7 +3519,7 @@ impl Mempool {
         // cluster yet, as they are not in Core's, whose `TxGraph` links
         // them after the reorg; `trim_reorged_clusters` then cuts back a
         // cluster that comes out past the limits.
-        Self::check_cluster_limits(&inner, &cfg, &mempool_parents, adj_weight, &evicted)?;
+        Self::check_cluster_limits(&inner, &cfg, &mempool_parents, adj_weight, &evicted, pkg.reorg_returned.as_ref())?;
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
         // The single policy eval point: after the DoS floor (fee / RBF / ancestor
@@ -4953,6 +5005,7 @@ impl Mempool {
         mempool_parents: &[Txid],
         adj_weight: u64,
         evicted: &HashSet<Txid>,
+        reorg_returned: Option<&HashSet<Txid>>,
     ) -> Result<(), MempoolError> {
         // Core's txgraph counts weight against `cluster_size_vbytes * 4`.
         let max_weight = cfg.max_cluster_vsize.saturating_mul(4);
@@ -4981,6 +5034,13 @@ impl Mempool {
             }
             buf.clear();
             Self::collect_children(inner, &current, &mut buf);
+            // A reorg's returned transaction is not linked to the mempool
+            // transactions already spending it until the reorg is offered.
+            if let Some(returned) = reorg_returned
+                && returned.contains(&current)
+            {
+                buf.retain(|child| returned.contains(child));
+            }
             buf.extend(entry.tx.input.iter().map(|i| i.previous_output.txid));
             for next in buf.drain(..) {
                 if !evicted.contains(&next) && inner.entries.contains_key(&next) && seen.insert(next) {
@@ -5121,7 +5181,7 @@ impl Mempool {
         // and before the diagram, and refuses a replacement past them as
         // `too-large-cluster`, as it refuses any other transaction.
         let parents = Self::direct_mempool_parents(tx, ancestors);
-        Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted)?;
+        Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted, None)?;
 
         Self::rbf_improves_diagram(
             inner, cfg, weight, new_fee, &parents, conflicts, ancestors, &all_evicted,
@@ -6347,7 +6407,7 @@ impl Mempool {
         }
         // A package is held to the limits as a whole, by the caller.
         if package.is_none() {
-            Self::check_cluster_limits(&inner, &cfg, &mempool_parents, weight_u64, &evicted)?;
+            Self::check_cluster_limits(&inner, &cfg, &mempool_parents, weight_u64, &evicted, None)?;
         }
 
         Ok(TestPrechecked {

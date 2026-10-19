@@ -252,3 +252,34 @@ fn the_mining_order_does_not_depend_on_arrival() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+/// The cluster check of a reorg's returned transaction does not step from
+/// an earlier returned one to the mempool transactions already spending it,
+/// as Core links those only after the whole reorg is offered. Counting them
+/// refused a high-fee child of a returned parent and kept the parent's
+/// cheaper mempool spenders; the trim keeps the child instead.
+#[test]
+fn a_returned_child_is_checked_without_its_parents_mempool_spenders() {
+    let (cs, mp, dir) = env(&[1]);
+    mp.config.write().max_cluster_count = 3;
+    let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2, 1);
+    let share = parent.output[1].value.to_sat();
+    let r = accept(&mp, &cs, &parent).expect("the returned parent");
+    let a_tx = spend(&[out(r, 1)], share, 1_000, 1, 2);
+    let a = accept(&mp, &cs, &a_tx).expect("a mempool spender");
+    let b = accept(&mp, &cs, &spend(&[out(a, 0)], a_tx.output[0].value.to_sat(), 1_000, 1, 3)).expect("its child");
+    let child = spend(&[out(r, 0)], parent.output[0].value.to_sat(), 20_000, 1, 4);
+
+    // Without the reorg's returned set, the walk counts a and b.
+    assert!(too_large(mp.accept_reorged_transaction(child.clone(), &cs, &NoopVerifier)));
+
+    let mut returned = HashSet::from([r]);
+    let s = mp.accept_reorged_with(child, &cs, &NoopVerifier, &mut returned).expect("checked as Core checks it");
+    assert_eq!(returned, HashSet::from([r, s]));
+
+    mp.trim_reorged_clusters(&[r, s]);
+    assert_eq!(pool(&mp), HashSet::from([r, s, a]));
+    assert!(!pool(&mp).contains(&b));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
