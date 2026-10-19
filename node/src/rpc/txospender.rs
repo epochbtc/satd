@@ -84,6 +84,19 @@ pub fn get_tx_spending_prevout(
     outputs: Vec<Value>,
     options: Option<Map<String, Value>>,
 ) -> Result<Value, (i32, String)> {
+    answer(chain, mempool, index, outputs, options, crate::rpc::RPC_MAX_RESPONSE_SIZE)
+}
+
+/// [`get_tx_spending_prevout`], refusing an answer whose spending
+/// transactions' hex would pass `response_limit` bytes.
+fn answer(
+    chain: &ChainState,
+    mempool: &Mempool,
+    index: Option<&dyn SpendIndex>,
+    outputs: Vec<Value>,
+    options: Option<Map<String, Value>>,
+    response_limit: usize,
+) -> Result<Value, (i32, String)> {
     if outputs.is_empty() {
         return Err((-8, "Invalid parameter, outputs are missing".into()));
     }
@@ -120,13 +133,25 @@ pub fn get_tx_spending_prevout(
     let (in_mempool, mempool_txs) = mempool.spending_transactions_acting(&outpoints, return_spending_tx);
     let mut hex: HashMap<Txid, String> = HashMap::new();
     let mut last_block: Option<(BlockHash, Block)> = None;
+    // The answer repeats a spender's hex for every output it spends, as
+    // Core's does. jsonrpsee refuses a reply past `RPC_MAX_RESPONSE_SIZE`
+    // only once it is built, so the copies are counted as they are made and
+    // the same refusal is given before they outgrow it.
+    let mut hex_bytes: usize = 0;
+    let mut copy_hex = |h: &String| -> Result<Value, (i32, String)> {
+        hex_bytes = hex_bytes.saturating_add(h.len());
+        if hex_bytes > response_limit {
+            return Err((-32008, "Response is too big".to_string()));
+        }
+        Ok(Value::String(h.clone()))
+    };
     let mut result = Vec::with_capacity(prevouts.len());
     for ((outpoint, mut o), spender) in prevouts.into_iter().zip(in_mempool) {
         if let Some(spending_txid) = spender {
             o.insert("spendingtxid".into(), Value::String(spending_txid.to_string()));
             if let Some(tx) = mempool_txs.get(&spending_txid) {
                 let h = hex.entry(spending_txid).or_insert_with(|| serialize_hex(tx));
-                o.insert("spendingtx".into(), Value::String(h.clone()));
+                o.insert("spendingtx".into(), copy_hex(h)?);
             }
         } else if !mempool_only {
             let unavailable = || {
@@ -160,7 +185,7 @@ pub fn get_tx_spending_prevout(
                                 e.insert(serialize_hex(tx))
                             }
                         };
-                        o.insert("spendingtx".into(), Value::String(h.clone()));
+                        o.insert("spendingtx".into(), copy_hex(h)?);
                     }
                 }
                 // Core's `BlockUntilSyncedToCurrentChain` failing: the index

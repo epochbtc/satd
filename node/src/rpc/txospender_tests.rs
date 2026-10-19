@@ -196,3 +196,25 @@ fn outputs_spent_by_one_transaction_name_it_for_each() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The hex of a spender repeated for every output it spends counts toward
+/// the reply's size, and an answer past the limit is refused as jsonrpsee
+/// refuses a reply that is too big, before it is built.
+#[test]
+fn spending_tx_copies_are_held_to_the_response_limit() {
+    let (cs, mp, dir) = env();
+    let tx = spend(prev(1));
+    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    let one = serialize_hex(&tx).len();
+    let options = json!({"return_spending_tx": true}).as_object().cloned();
+    let outputs = vec![arg(prev(1)); 3];
+
+    assert!(answer(&cs, &mp, None, outputs.clone(), options.clone(), 3 * one).is_ok(), "three copies fit");
+    assert_eq!(
+        answer(&cs, &mp, None, outputs.clone(), options, 3 * one - 1),
+        Err((-32008, "Response is too big".to_string()))
+    );
+    assert!(answer(&cs, &mp, None, outputs, None, 0).is_ok(), "no copies, nothing counted");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
