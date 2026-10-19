@@ -112,9 +112,12 @@ pub fn get_tx_spending_prevout(
             o.insert("spendingtx".into(), Value::String(serialize_hex(tx)));
         }
     };
+    // The mempool pass first, as one snapshot, then the index.
+    let outpoints: Vec<OutPoint> = prevouts.iter().map(|(op, _)| *op).collect();
+    let in_mempool = mempool.spending_transactions_acting(&outpoints);
     let mut result = Vec::with_capacity(prevouts.len());
-    for (outpoint, mut o) in prevouts {
-        if let Some(tx) = mempool.spending_transaction_acting(&outpoint) {
+    for ((outpoint, mut o), spender) in prevouts.into_iter().zip(in_mempool) {
+        if let Some(tx) = spender {
             o.insert("spendingtxid".into(), Value::String(tx.compute_txid().to_string()));
             with_tx(&mut o, &tx);
         } else if !mempool_only {

@@ -4367,13 +4367,21 @@ impl Mempool {
         Some((spending_txid, vin))
     }
 
-    /// The acting transaction spending `outpoint`, read under one lock:
-    /// Core's `GetConflictTx` for `gettxspendingprevout`, on the same
-    /// acting view as [`Self::spending_tx_acting`].
-    pub fn spending_transaction_acting(&self, outpoint: &OutPoint) -> Option<Transaction> {
+    /// The acting transaction spending each of `outpoints`, all read under
+    /// one lock: Core's `GetConflictTx` over `gettxspendingprevout`'s
+    /// outputs, which Core answers holding `mempool.cs` throughout, on the
+    /// same acting view as [`Self::spending_tx_acting`]. One snapshot, so a
+    /// replacement cannot land between two outputs and name spenders that
+    /// were never in the mempool together.
+    pub fn spending_transactions_acting(&self, outpoints: &[OutPoint]) -> Vec<Option<Transaction>> {
         let inner = self.inner.read();
-        let entry = inner.entries.get(inner.spends.get(outpoint)?)?;
-        entry.scope.is_acting().then(|| entry.tx.clone())
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                let entry = inner.entries.get(inner.spends.get(outpoint)?)?;
+                entry.scope.is_acting().then(|| entry.tx.clone())
+            })
+            .collect()
     }
 
     /// Remove transactions that have been in the mempool longer than the expiry time.

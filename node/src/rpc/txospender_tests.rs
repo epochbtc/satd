@@ -177,3 +177,18 @@ fn arguments_are_checked_as_core_checks_them() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One transaction spending two of the outputs asked about is named for
+/// both, from one read of the mempool.
+#[test]
+fn outputs_spent_by_one_transaction_name_it_for_each() {
+    let (cs, mp, dir) = env();
+    let mut tx = spend(prev(1));
+    tx.input.push(TxIn { previous_output: prev(2), script_sig: Default::default(), sequence: Sequence::MAX, witness: Witness::new() });
+    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    assert_eq!(mp.spending_transactions_acting(&[prev(1), prev(2), prev(3)]), vec![Some(tx.clone()), Some(tx.clone()), None]);
+    let r = call(&cs, &mp, None, vec![arg(prev(1)), arg(prev(2))], Value::Null).unwrap();
+    assert_eq!(r[0]["spendingtxid"], r[1]["spendingtxid"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
