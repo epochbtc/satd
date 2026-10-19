@@ -28,8 +28,15 @@ item below is (or will be) written up in full in the in-development
   rules activated (versionbit N)" in the RPC warnings and `-alertnotify`
   (#976).
 
+- Package CPFP in `submitpackage`: a parent below the relay floor or the
+  rolling minimum fee is accepted with a child that pays for both, by the
+  package's combined feerate, as in Core (#984). The pool trims once per
+  package and evicts by descendant score.
+
 ### Fixed
 
+- `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
+  does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,
   and streaming subscribers silently missed blocks from it; the channel now
   holds 1024 events.

@@ -15,13 +15,13 @@ use crate::validation::script::{NoopVerifier, ScriptError};
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Sequence, TxIn, Witness};
 
-const COIN_VALUE: u64 = 100_000;
+pub(super) const COIN_VALUE: u64 = 100_000;
 
-fn prev(tag: u8) -> OutPoint {
+pub(super) fn prev(tag: u8) -> OutPoint {
     OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
 }
 
-fn p2wpkh(tag: u8) -> ScriptBuf {
+pub(super) fn p2wpkh(tag: u8) -> ScriptBuf {
     let mut spk = vec![0x00, 0x14];
     spk.extend_from_slice(&[tag; 20]);
     ScriptBuf::from_bytes(spk)
@@ -40,7 +40,7 @@ fn coin() -> Coin {
 /// Spend `prevs` (worth `in_value` together), paying `fee` and splitting the
 /// rest over `outs` P2WPKH outputs. One input and one output is 82 bytes;
 /// each further output adds 31.
-fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, outs: u64, tag: u8) -> Transaction {
+pub(super) fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, outs: u64, tag: u8) -> Transaction {
     let each = (in_value - fee) / outs;
     let mut output: Vec<TxOut> = (0..outs)
         .map(|_| TxOut { value: Amount::from_sat(each), script_pubkey: p2wpkh(tag) })
@@ -64,7 +64,7 @@ fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, outs: u64, tag: u8) -> Tra
 
 /// A regtest chain holding one coin per tag, and an empty pool with no relay
 /// floor.
-fn env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
+pub(super) fn env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
     let coins: Vec<(OutPoint, Coin)> = tags.iter().map(|t| (prev(*t), coin())).collect();
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     *mp.config.write() =
@@ -73,26 +73,26 @@ fn env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
 }
 
 /// Set the size limit without going through `reload_policy`.
-fn set_max(mp: &Mempool, max: usize) {
+pub(super) fn set_max(mp: &Mempool, max: usize) {
     mp.config.write().max_size_bytes = max;
 }
 
-fn admit(mp: &Mempool, cs: &ChainState, tx: Transaction) -> Txid {
+pub(super) fn admit(mp: &Mempool, cs: &ChainState, tx: Transaction) -> Txid {
     mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::P2p, false).expect("admitted")
 }
 
-fn pool(mp: &Mempool) -> HashSet<Txid> {
+pub(super) fn pool(mp: &Mempool) -> HashSet<Txid> {
     mp.inner.read().entries.keys().copied().collect()
 }
 
-fn events(mp: &Mempool) -> broadcast::Receiver<MempoolEvent> {
+pub(super) fn events(mp: &Mempool) -> broadcast::Receiver<MempoolEvent> {
     let (tx, rx) = broadcast::channel(1024);
     mp.set_event_sender(tx);
     rx
 }
 
 /// The `LeaveEvicted { FullPool }` events sent so far.
-fn evicted(rx: &mut broadcast::Receiver<MempoolEvent>) -> Vec<Txid> {
+pub(super) fn evicted(rx: &mut broadcast::Receiver<MempoolEvent>) -> Vec<Txid> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         if let MempoolEvent::LeaveEvicted { txid, reason: EvictReason::FullPool, .. } = ev {
@@ -281,7 +281,9 @@ fn evicting_a_parent_takes_every_descendant() {
     let two_outs = admit(&mp, &cs, spend(&[out(parent, 1), out(parent, 2)], 2 * per, 5_000, 1, 2));
     let one_out = admit(&mp, &cs, spend(&[out(parent, 0)], COIN_VALUE - 100 - 2 * per, 5_000, 1, 3));
     let grandchild = admit(&mp, &cs, spend(&[out(two_outs, 0)], 2 * per - 5_000, 5_000, 1, 4));
-    let other = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 1_000, 1, 5));
+    // Pays more than the family as a package, so the family goes first: the
+    // order is by descendant score, and the parent ranks with its children.
+    let other = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 50_000, 1, 5));
     let other_size = bitcoin::consensus::serialize(&mp.get(&other).unwrap().tx).len();
 
     let mut inner = mp.inner.write();

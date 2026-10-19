@@ -25761,3 +25761,60 @@ fn rpc_tx_fields_come_from_undo_data_without_a_txindex() {
     assert!(block["strippedsize"].as_u64().unwrap() < block["size"].as_u64().unwrap(), "{block}");
     node.stop();
 }
+
+/// Package CPFP (#984): a parent that pays nothing, as a pre-signed
+/// commitment transaction can once fees have risen past it, is refused on its
+/// own and accepted by `submitpackage` with a child that pays for both. The
+/// block template then mines the pair.
+#[test]
+fn submitpackage_lets_a_child_pay_for_a_parent_below_the_relay_floor() {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use serde_json::json;
+
+    let wallet = common::DeterministicWallet::from_secret([0x43; 32]);
+    let mut node = TestNode::start(&[]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    let spk = wallet.address.script_pubkey();
+    let (parent_hex, parent_txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, spk.clone(), 0);
+
+    let alone = node.rpc_call_with_params("sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let msg = alone["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.starts_with("min relay fee not met"), "{alone}");
+
+    let value = 50 * 100_000_000;
+    let mut child = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: parent_txid.parse().unwrap(), vout: 0 },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(value - 10_000), script_pubkey: spk.clone() }],
+    };
+    let sighash = SighashCache::new(&child)
+        .p2wpkh_signature_hash(0, &spk, Amount::from_sat(value), EcdsaSighashType::All)
+        .unwrap();
+    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    child.input[0].witness = Witness::from_slice(&[sig_bytes, wallet.pk.to_bytes()]);
+    let child_txid = child.compute_txid().to_string();
+    let child_hex = hex::encode(bitcoin::consensus::serialize(&child));
+
+    let r = node.rpc_ok("submitpackage", vec![json!([parent_hex, child_hex])]);
+    assert_eq!(r["package_msg"], json!("success"), "{r}");
+    let pool = node.rpc_ok("getrawmempool", vec![]);
+    for txid in [&parent_txid, &child_txid] {
+        assert!(pool.as_array().unwrap().contains(&json!(txid)), "{pool}");
+    }
+
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([]), "the template left the pair out");
+    node.stop();
+}

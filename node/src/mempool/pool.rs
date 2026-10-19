@@ -1341,6 +1341,9 @@ pub struct Mempool {
     emit_raw_tx: std::sync::atomic::AtomicBool,
 }
 
+/// The most descendants [`Mempool::descendant_score`] walks; see there.
+const DESCENDANT_SCORE_WALK: usize = 100;
+
 /// Bitcoin Core's `MAX_PACKAGE_COUNT` (`src/policy/packages.h`).
 pub const MAX_PACKAGE_COUNT: usize = 25;
 /// Bitcoin Core's `MAX_PACKAGE_WEIGHT` (`src/policy/packages.h`).
@@ -1413,6 +1416,25 @@ pub struct PackageResult {
     pub package_msg: String,
     pub tx_results: serde_json::Map<String, serde_json::Value>,
     pub replaced: Vec<Txid>,
+}
+
+/// How [`Mempool::accept_package`] has a member judged. The default is a
+/// transaction on its own.
+#[derive(Default)]
+struct PackageAdmit {
+    /// Core's `m_package_feerates`: the member's own fee is not held to the
+    /// relay floor or the rolling minimum, because the package's combined
+    /// feerate already was.
+    skip_fee_floor: bool,
+    /// Core's `m_package_submission`: no room is made for the member, and the
+    /// package trims the pool once it is all in.
+    defer_trim: bool,
+    /// Set when the member was below the floors and let in by
+    /// `skip_fee_floor`.
+    floor_skipped: bool,
+    /// The events of a member let in by `skip_fee_floor`, kept back for the
+    /// caller to send with the child that pays for it.
+    held: Vec<MempoolEvent>,
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -1819,28 +1841,12 @@ impl Mempool {
     /// are not re-evaluated, except that a lower size limit trims the pool to
     /// it at once.
     pub fn reload_policy(&self, new: MempoolConfig) {
-        let (max_size_bytes, quarantine_max_bytes, incremental_relay_fee) =
-            (new.max_size_bytes, new.quarantine_max_bytes, new.incremental_relay_fee);
         *self.config.write() = new;
 
         // Core never leaves the pool over `-maxmempool`: every admission ends
         // in `LimitMempoolSize` → `TrimToSize` (src/validation.cpp). Left over a
         // lowered limit, the pool refused every admission until it drained.
-        let none = HashSet::new();
-        let (acting, held) = {
-            let mut inner = self.inner.write();
-            let over = inner.acting_bytes().saturating_sub(max_size_bytes);
-            let acting =
-                Self::evict_lowest_fee_entries_except(&mut inner, over, false, incremental_relay_fee, &none);
-            let over = inner.quarantine_bytes.saturating_sub(quarantine_max_bytes);
-            let held =
-                Self::evict_lowest_fee_entries_except(&mut inner, over, true, incremental_relay_fee, &none);
-            self.sync_unbroadcast_len(&inner);
-            (acting, held)
-        };
-        // Reported as admission reports them: only what was acting.
-        self.emit_evicted(&acting, EvictReason::FullPool);
-        self.emit_evicted(&held, EvictReason::Policy);
+        self.trim_to_size();
     }
 
     /// Load (or replace) the transaction-filtering ruleset from a file. Returns
@@ -2755,13 +2761,23 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
-        self.accept_transaction_led(tx, chain_state, script_verifier, source, allow_quarantined, Vec::new())
+        self.accept_transaction_led(
+            tx,
+            chain_state,
+            script_verifier,
+            source,
+            allow_quarantined,
+            Vec::new(),
+            &mut PackageAdmit::default(),
+        )
     }
 
     /// [`Self::accept_transaction`], emitting `lead` ahead of the
     /// transaction's own events if it is accepted and dropping it if not.
-    /// [`Self::accept_package`] passes the `Enter` of each dust parent whose
-    /// place in the pool depends on this transaction.
+    /// [`Self::accept_package`] passes the `Enter` of each parent whose place
+    /// in the pool depends on this transaction, and `pkg` says how a package
+    /// member is judged.
+    #[allow(clippy::too_many_arguments)]
     fn accept_transaction_led(
         &self,
         tx: Transaction,
@@ -2770,6 +2786,7 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
         lead: Vec<MempoolEvent>,
+        pkg: &mut PackageAdmit,
     ) -> Result<Txid, MempoolError> {
         let accepted = self.accept_transaction_unexpired(
             tx,
@@ -2779,6 +2796,7 @@ impl Mempool {
             allow_quarantined,
             lead,
             None,
+            pkg,
         )?;
         // Core expires the pool after every acceptance (`LimitMempoolSize` in
         // `MemPoolAccept::Finalize`), so `-mempoolexpiry` is enforced at the
@@ -2808,14 +2826,15 @@ impl Mempool {
             false,
             Vec::new(),
             Some(time),
+            &mut PackageAdmit::default(),
         )?;
         self.remove_expired();
         Ok(accepted)
     }
 
-    // `lead` (package dust-parent events) and `entry_time` (the persisted
-    // time of a `mempool.dat` record) are independent inputs from two
-    // callers.
+    // `lead` (package parent events), `entry_time` (the persisted time of a
+    // `mempool.dat` record) and `pkg` (package admission) are independent
+    // inputs from different callers.
     #[allow(clippy::too_many_arguments)]
     fn accept_transaction_unexpired(
         &self,
@@ -2826,6 +2845,7 @@ impl Mempool {
         allow_quarantined: bool,
         lead: Vec<MempoolEvent>,
         entry_time: Option<u64>,
+        pkg: &mut PackageAdmit,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
@@ -3138,24 +3158,16 @@ impl Mempool {
         // prioritised transaction — one of #660's bullets.
         let effective_fee = modified_fee(fee, fee_delta);
         let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, adj_weight);
-        // Core's `CheckFeeRate`: the rolling minimum a full pool raised comes
-        // first, then the static relay floor.
-        let acting_bytes = inner.acting_bytes();
-        let min_fee = inner.rolling.lock().at(
-            crate::time::now_secs() as i64,
-            acting_bytes,
-            cfg.max_size_bytes,
-            cfg.incremental_relay_fee,
-        );
-        let required = policy::fee_for_rate(min_fee, adj_weight);
-        if required > 0 && effective_fee < required {
-            return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
-        }
-        if fee_rate < cfg.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(
-                effective_fee,
-                policy::fee_for_rate(cfg.min_fee_rate, adj_weight),
-            ));
+        if let Some(e) = Self::fee_floor_failure(&inner, &cfg, effective_fee, adj_weight) {
+            // Core's `m_package_feerates`: a package member below the floors
+            // is let through on the package's combined feerate, which the
+            // caller has already checked. Not when it replaces anything:
+            // that is Core's package RBF, which satd does not do, and the
+            // member could not be taken back out once its conflicts were gone.
+            if !pkg.skip_fee_floor || !conflicts.is_empty() {
+                return Err(e);
+            }
+            pkg.floor_skipped = true;
         }
 
         // Apply any deferred standardness error now that the fee rate check
@@ -3325,16 +3337,22 @@ impl Mempool {
         } else {
             EvictReason::FullPool
         };
-        let needs_room = class_bytes + tx_size > class_budget;
+        // A package member makes no room for itself: Core admits the whole
+        // package and trims once, after the last member
+        // (`m_package_submission`), so a parent is not evicted before the
+        // child that pays for it arrives.
+        let needs_room = !pkg.defer_trim && class_bytes + tx_size > class_budget;
         if needs_room {
             // Only evict if the new tx outbids the cheapest entry *in its own
             // class* that it may evict. Its own in-pool ancestors stay (see the
-            // eviction below), so they are not that bar.
+            // eviction below), so they are not that bar. Cheapest by
+            // descendant score, the order the eviction takes them in.
+            let none = HashSet::new();
             let Some(min_class_fee_rate) = inner
                 .entries
                 .iter()
                 .filter(|(t, e)| e.scope.is_quarantined() == quarantined && !ancestors.contains(*t))
-                .map(|(_, e)| e.fee_rate)
+                .filter_map(|(t, _)| Self::descendant_score(&inner, t, &none))
                 .min()
             else {
                 return Err(MempoolError::MempoolFull);
@@ -3482,10 +3500,16 @@ impl Mempool {
         // are best-effort but keeping the lock duration tight is the rule.
         drop(inner);
 
-        // Inserted before anything this acceptance changed, so their sequence
-        // numbers are lower.
-        for event in lead {
-            self.emit(event);
+        // A member let in below the floors stays only if the child paying for
+        // it does, so its events go out with that child's, not now.
+        if pkg.floor_skipped {
+            pkg.held.extend(lead);
+        } else {
+            // Inserted before anything this acceptance changed, so their
+            // sequence numbers are lower.
+            for event in lead {
+                self.emit(event);
+            }
         }
         // Acting-class evictions go on the standard stream as before;
         // quarantine-class ones never emitted an `Enter`, so a `LeaveEvicted`
@@ -3516,7 +3540,7 @@ impl Mempool {
                 time: now,
             });
         } else {
-            self.emit(MempoolEvent::Enter {
+            let enter = MempoolEvent::Enter {
                 txid,
                 fee,
                 vsize: vsize_u64,
@@ -3524,7 +3548,12 @@ impl Mempool {
                 time: now,
                 mempool_sequence,
                 raw_tx,
-            });
+            };
+            if pkg.floor_skipped {
+                pkg.held.push(enter);
+            } else {
+                self.emit(enter);
+            }
         }
 
         Ok(txid)
@@ -5775,6 +5804,14 @@ impl Mempool {
         // fee or dust are candidates for ephemeral dust handling.
         let mut accepted_txids: HashSet<Txid> = HashSet::new();
         let mut ephemeral_parents: HashMap<Txid, Transaction> = HashMap::new();
+        // Parents refused only for their feerate, with no dust: Core's
+        // `TX_RECONSIDERABLE`, which a child in the package may pay for. Each
+        // with the error it got on its own.
+        let mut cpfp_parents: HashMap<Txid, String> = HashMap::new();
+        // What each deferred member was refused for on its own, which is what
+        // Core reports for it if the package is not evaluated together, or
+        // fails as a whole for a reason that belongs to another member.
+        let mut deferred_err: HashMap<Txid, String> = HashMap::new();
         let mut failed: HashMap<bitcoin::Wtxid, String> = HashMap::new();
         let mut accepted_results: Vec<AcceptedMember> = Vec::new();
         // Members whose txid is resident under a *different* witness: Core's
@@ -5827,13 +5864,16 @@ impl Mempool {
                 }
             }
 
-            // Try normal acceptance
-            match self.accept_transaction(
+            // Try normal acceptance. Room is made once the whole package is
+            // in, not member by member.
+            match self.accept_transaction_led(
                 ptx.tx.clone(),
                 chain_state,
                 script_verifier,
                 TxSource::Rpc,
                 false,
+                Vec::new(),
+                &mut PackageAdmit { defer_trim: true, ..Default::default() },
             ) {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
@@ -5918,7 +5958,17 @@ impl Mempool {
                         failed.insert(ptx.wtxid, e.to_string());
                     } else if dust_count == 1 && base_fee == 0 {
                         // Valid ephemeral dust candidate — defer acceptance.
+                        deferred_err.insert(ptx.txid, orig_err.state_string());
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    } else if dust_count == 0
+                        && matches!(
+                            orig_err,
+                            MempoolError::InsufficientFee(..) | MempoolError::MempoolMinFeeNotMet(..)
+                        )
+                    {
+                        // Below a floor and nothing else: the child may pay
+                        // for it.
+                        cpfp_parents.insert(ptx.txid, orig_err.state_string());
                     } else if matches!(orig_err, MempoolError::MempoolMinFeeNotMet(..)) {
                         // The rolling minimum refused it and it is not a dust
                         // parent: report what refused it, with Core's
@@ -5943,6 +5993,7 @@ impl Mempool {
                 Err(MempoolError::MissingInputs) => {
                     // Might be a child spending from a package parent — defer
                     // and retry after parents are accepted.
+                    deferred_err.insert(ptx.txid, MempoolError::MissingInputs.to_string());
                     let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     if dust_count == 1 {
                         // Resolve inputs to check fee
@@ -5991,6 +6042,95 @@ impl Mempool {
                 }
                 Err(e) => {
                     failed.insert(ptx.wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Core's `AcceptPackage`: the members refused on their own only for
+        // their feerate, or for missing inputs a package parent provides, are
+        // evaluated together — unless some member was refused for anything
+        // else, which no package feerate changes. Then each keeps the reason
+        // it was refused for alone.
+        let quit_early = !failed.is_empty() || !over_maxfeerate.is_empty();
+        let eval: Vec<&PkgTx> = pkg
+            .iter()
+            .filter(|p| cpfp_parents.contains_key(&p.txid) || ephemeral_parents.contains_key(&p.txid))
+            .collect();
+        let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, String>, members: &[&PkgTx]| {
+            for p in members {
+                if let Some(err) = cpfp_parents.get(&p.txid).or_else(|| deferred_err.get(&p.txid)) {
+                    failed.insert(p.wtxid, err.clone());
+                }
+            }
+        };
+        let mut package_eval = !eval.is_empty();
+        if package_eval && quit_early {
+            refuse_deferred(&mut failed, &eval);
+            package_eval = false;
+        } else if package_eval {
+            // `AcceptMultipleTransactions`' `CheckFeeRate` over the subpackage:
+            // its total modified fee against the floors for its total size.
+            // A fee that cannot be known (an input resolves nowhere) is left
+            // for acceptance to refuse, with the reason that says so.
+            let totals = eval.iter().try_fold((0u64, 0u64), |(fee, weight), p| {
+                let (base, w) = self.package_member_fee(&p.tx, chain_state, &pkg_tx_map)?;
+                let delta = self.inner.read().fee_deltas.get(&p.txid).copied().unwrap_or(0);
+                Some((fee.saturating_add(modified_fee(base, delta)), weight + w))
+            });
+            if let Some((fee, weight)) = totals {
+                let floor = {
+                    let inner = self.inner.read();
+                    Self::fee_floor_failure(&inner, &cfg, fee, weight)
+                };
+                if let Some(e) = floor {
+                    // Core's `FeeFailure` goes on the last member; the others
+                    // keep what they were refused for alone.
+                    let (last, rest) = eval.split_last().expect("eval is not empty");
+                    refuse_deferred(&mut failed, rest);
+                    failed.insert(last.wtxid, e.state_string());
+                    package_eval = false;
+                }
+            }
+        }
+        if !package_eval {
+            ephemeral_parents.clear();
+            cpfp_parents.clear();
+        }
+
+        // The parents the child pays for, admitted below the floors. Their
+        // events wait for the child's, and they leave again if it does not get
+        // in.
+        let mut cpfp_admitted: Vec<Txid> = Vec::new();
+        let mut cpfp_held: HashMap<Txid, Vec<MempoolEvent>> = HashMap::new();
+        for p in pkg.iter().filter(|p| cpfp_parents.contains_key(&p.txid)) {
+            let mut admit = PackageAdmit { skip_fee_floor: true, defer_trim: true, ..Default::default() };
+            match self.accept_transaction_led(
+                p.tx.clone(),
+                chain_state,
+                script_verifier,
+                TxSource::Rpc,
+                false,
+                Vec::new(),
+                &mut admit,
+            ) {
+                Ok(txid) => {
+                    accepted_txids.insert(txid);
+                    if admit.floor_skipped {
+                        cpfp_admitted.push(txid);
+                        cpfp_held.insert(txid, admit.held);
+                    }
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&txid) {
+                        accepted_results.push(AcceptedMember::from_entry(
+                            p.wtxid,
+                            txid,
+                            entry,
+                            Admission::Subpackage,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failed.insert(p.wtxid, e.state_string());
                 }
             }
         }
@@ -6211,10 +6351,26 @@ impl Mempool {
                 .map(|(parent, seq)| (*seq, *parent))
                 .collect();
             swept.sort_unstable();
-            let lead: Vec<MempoolEvent> = swept
+            let mut lead: Vec<MempoolEvent> = swept
                 .iter()
                 .filter_map(|(seq, parent)| self.dust_parent_enter(parent, *seq))
                 .collect();
+            // The held events of the below-floor parents it pays for, all in
+            // the order the parents went in.
+            let paid_for: Vec<Txid> = cpfp_admitted
+                .iter()
+                .filter(|parent| child_tx.input.iter().any(|i| i.previous_output.txid == **parent))
+                .copied()
+                .collect();
+            for parent in &paid_for {
+                if let Some(events) = cpfp_held.get(parent) {
+                    lead.extend(events.iter().cloned());
+                }
+            }
+            lead.sort_by_key(|event| match event {
+                MempoolEvent::Enter { mempool_sequence, .. } => *mempool_sequence,
+                _ => 0,
+            });
 
             match self.accept_transaction_led(
                 child_tx.clone(),
@@ -6223,9 +6379,13 @@ impl Mempool {
                 TxSource::Rpc,
                 false,
                 lead,
+                &mut PackageAdmit { defer_trim: true, ..Default::default() },
             ) {
                 Ok(txid) => {
                     accepted_txids.insert(txid);
+                    for parent in &paid_for {
+                        cpfp_held.remove(parent);
+                    }
                     announced.extend(swept.iter().map(|(_, parent)| *parent));
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&txid) {
@@ -6271,6 +6431,29 @@ impl Mempool {
         // parent had been accepted.
         accepted_results.retain(|m| !stranded.contains(&m.txid));
 
+        // A parent let in below the floors on its child's fee leaves with that
+        // child. Core cannot reach this — it commits the package only once all
+        // of it has validated — and reports the parent's own refusal.
+        let unpaid: Vec<Txid> = cpfp_admitted
+            .iter()
+            .filter(|parent| {
+                !pkg.iter().any(|m| {
+                    accepted_txids.contains(&m.txid)
+                        && m.tx.input.iter().any(|i| i.previous_output.txid == **parent)
+                })
+            })
+            .copied()
+            .collect();
+        for txid in self.remove_unannounced(&unpaid) {
+            accepted_txids.remove(&txid);
+            accepted_results.retain(|m| m.txid != txid);
+            if let Some(p) = pkg.iter().find(|p| p.txid == txid)
+                && let Some(err) = cpfp_parents.get(&txid)
+            {
+                failed.insert(p.wtxid, err.clone());
+            }
+        }
+
         // Announce any ephemeral parent that survived without a child from the
         // loop above announcing it.
         //
@@ -6305,8 +6488,24 @@ impl Mempool {
         // `PCKG_TX, "unspent-dust"` -- and it is checked before any per-member
         // policy failure can be reported, so it wins over `transaction failed`
         // whenever both are present (`src/validation.cpp`).
+        // Core's `LimitMempoolSize` after the package: one trim, now that every
+        // member is in and a parent ranks with the child that pays for it. A
+        // member trimmed away is reported as `mempool full`, whether it came
+        // in with this package or was already resident.
+        let trimmed = self.trim_to_size();
+        let mut trimmed_member = false;
+        for p in &pkg {
+            if trimmed.contains(&p.txid) {
+                accepted_results.retain(|m| m.txid != p.txid);
+                accepted_txids.remove(&p.txid);
+                same_txid_other_witness.remove(&p.txid);
+                failed.insert(p.wtxid, MempoolError::MempoolFull.to_string());
+                trimmed_member = true;
+            }
+        }
+
         let unspent_dust = !stranded.is_empty()
-            || parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
+            || parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid) && !trimmed.contains(txid));
         //
         // A member refused for the caller's `maxfeerate` ceiling never enters
         // the acceptance loop, so it is in `over_maxfeerate` and not `failed`
@@ -6316,7 +6515,7 @@ impl Mempool {
         // every member was refused.
         let package_msg = if unspent_dust {
             "unspent-dust".to_string()
-        } else if !failed.is_empty() || !over_maxfeerate.is_empty() {
+        } else if !failed.is_empty() || !over_maxfeerate.is_empty() || trimmed_member {
             "transaction failed".to_string()
         } else {
             "success".to_string()
@@ -6354,8 +6553,12 @@ impl Mempool {
             subpackage.iter().map(|m| m.modified_fee).sum(),
             subpackage.iter().map(|m| m.weight).sum(),
         );
-        let subpackage_includes: Vec<String> =
-            subpackage.iter().map(|m| m.wtxid.to_string()).collect();
+        // In package order, as Core lists the subpackage's wtxids.
+        let subpackage_includes: Vec<String> = pkg
+            .iter()
+            .filter(|p| subpackage.iter().any(|m| m.wtxid == p.wtxid))
+            .map(|p| p.wtxid.to_string())
+            .collect();
 
         for ptx in &pkg {
             if let Some(err) = failed.get(&ptx.wtxid) {
@@ -6440,6 +6643,80 @@ impl Mempool {
         })
     }
 
+    /// Core's `CheckFeeRate`: the rolling minimum a full pool raised, then the
+    /// static relay floor, for a modified `fee` over a sigop-adjusted
+    /// `adj_weight` — one transaction's, or a package's totals.
+    fn fee_floor_failure(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        fee: u64,
+        adj_weight: u64,
+    ) -> Option<MempoolError> {
+        let min_fee = inner.rolling.lock().at(
+            crate::time::now_secs() as i64,
+            inner.acting_bytes(),
+            cfg.max_size_bytes,
+            cfg.incremental_relay_fee,
+        );
+        let required = policy::fee_for_rate(min_fee, adj_weight);
+        if required > 0 && fee < required {
+            return Some(MempoolError::MempoolMinFeeNotMet(fee, required));
+        }
+        if policy::fee_rate_sat_per_kvb(fee, adj_weight) < cfg.min_fee_rate {
+            return Some(MempoolError::InsufficientFee(fee, policy::fee_for_rate(cfg.min_fee_rate, adj_weight)));
+        }
+        None
+    }
+
+    /// Take package members back out of the pool without a `Leave`: their
+    /// `Enter` was never sent. Returns the txids that were in the pool.
+    fn remove_unannounced(&self, txids: &[Txid]) -> Vec<Txid> {
+        if txids.is_empty() {
+            return Vec::new();
+        }
+        let mut removed: Vec<Txid> = Vec::new();
+        let mut inner = self.inner.write();
+        for txid in txids {
+            if let Some(entry) = inner.entries.remove(txid) {
+                let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                inner.account_remove(entry.scope, tx_size);
+                for input in &entry.tx.input {
+                    inner.spends.remove(&input.previous_output);
+                }
+                inner.unbroadcast.remove(txid);
+                removed.push(*txid);
+            }
+        }
+        self.sync_unbroadcast_len(&inner);
+        removed
+    }
+
+    /// Core's `TrimToSize`: evict, lowest descendant score first, until each
+    /// class is within its budget, and announce what went. Returns every
+    /// txid evicted.
+    fn trim_to_size(&self) -> HashSet<Txid> {
+        let (max_size_bytes, quarantine_max_bytes, incremental_relay_fee) = {
+            let cfg = self.config.read();
+            (cfg.max_size_bytes, cfg.quarantine_max_bytes, cfg.incremental_relay_fee)
+        };
+        let none = HashSet::new();
+        let (acting, held) = {
+            let mut inner = self.inner.write();
+            let over = inner.acting_bytes().saturating_sub(max_size_bytes);
+            let acting =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, false, incremental_relay_fee, &none);
+            let over = inner.quarantine_bytes.saturating_sub(quarantine_max_bytes);
+            let held =
+                Self::evict_lowest_fee_entries_except(&mut inner, over, true, incremental_relay_fee, &none);
+            self.sync_unbroadcast_len(&inner);
+            (acting, held)
+        };
+        // Reported as admission reports them: only what was acting.
+        self.emit_evicted(&acting, EvictReason::FullPool);
+        self.emit_evicted(&held, EvictReason::Policy);
+        acting.iter().chain(held.iter()).map(|(txid, _, _)| *txid).collect()
+    }
+
     /// Remove any ephemeral dust parent that made it into the mempool without
     /// the child that was supposed to sweep its dust.
     ///
@@ -6494,22 +6771,7 @@ impl Mempool {
             return stranded;
         }
 
-        let mut removed: Vec<Txid> = Vec::new();
-        {
-            let mut inner = self.inner.write();
-            for txid in &stranded {
-                if let Some(entry) = inner.entries.remove(txid) {
-                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
-                    inner.account_remove(entry.scope, tx_size);
-                    for input in &entry.tx.input {
-                        inner.spends.remove(&input.previous_output);
-                    }
-                    inner.unbroadcast.remove(txid);
-                    removed.push(*txid);
-                }
-            }
-            self.sync_unbroadcast_len(&inner);
-        }
+        let removed = self.remove_unannounced(&stranded);
 
         // No `LeaveEvicted`: the caller emits a parent's `Enter` only with the
         // accepted child that sweeps its dust, or *after* this runs, precisely
@@ -6749,6 +7011,50 @@ impl Mempool {
         .collect()
     }
 
+    /// Core's descendant score (`CompareTxMemPoolEntryByDescendantScore`):
+    /// the higher of an entry's own modified feerate and the modified feerate
+    /// of the entry with all its in-pool descendants, leaving out those in
+    /// `excluded`. `None` if the entry is not in the pool.
+    ///
+    /// An entry with more than [`DESCENDANT_SCORE_WALK`] descendants is
+    /// scored by its own feerate. satd does not limit descendants (Core's
+    /// v30 limit is 25), and a trim re-scores an entry each time it surfaces,
+    /// under the pool's write lock: an unbounded family would make that cost
+    /// grow with the square of its size.
+    fn descendant_score(inner: &MempoolInner, txid: &Txid, excluded: &HashSet<Txid>) -> Option<u64> {
+        let entry = inner.entries.get(txid)?;
+        let own_fee = modified_fee(entry.fee, entry.fee_delta);
+        let own_weight = entry.adjusted_weight();
+        let own_rate = policy::fee_rate_sat_per_kvb(own_fee, own_weight);
+        let mut children: Vec<Txid> = Vec::new();
+        Self::collect_children(inner, txid, &mut children);
+        // Most entries have no children; they need no walk.
+        if children.is_empty() {
+            return Some(own_rate);
+        }
+        let (mut fee, mut weight) = (own_fee, own_weight);
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = Vec::new();
+        loop {
+            for child in children.drain(..) {
+                if excluded.contains(&child) || !seen.insert(child) {
+                    continue;
+                }
+                if seen.len() > DESCENDANT_SCORE_WALK {
+                    return Some(own_rate);
+                }
+                if let Some(e) = inner.entries.get(&child) {
+                    fee = fee.saturating_add(modified_fee(e.fee, e.fee_delta));
+                    weight += e.adjusted_weight();
+                    queue.push(child);
+                }
+            }
+            let Some(next) = queue.pop() else { break };
+            Self::collect_children(inner, &next, &mut children);
+        }
+        Some(own_rate.max(policy::fee_rate_sat_per_kvb(fee, weight)))
+    }
+
     /// [`evict_lowest_fee_entries`](Self::evict_lowest_fee_entries), never
     /// choosing an entry in `keep`. Admission passes the incoming
     /// transaction's in-pool ancestors: evicting one would leave that
@@ -6774,29 +7080,27 @@ impl Mempool {
         if bytes_needed == 0 {
             return Vec::new();
         }
-        // *This class's* entries, lowest fee rate first; the other class is
-        // never an eviction candidate (its own budget governs it).
+        // *This class's* entries, lowest descendant score first; the other
+        // class is never an eviction candidate (its own budget governs it).
         //
         // On the *modified* fee rate. `entry.fee_rate` is the rate as of
         // admission and `prioritisetransaction` never rewrites it, so a
         // transaction an operator deliberately lifted was evicted as if the
-        // delta did not exist — which defeats the point of the RPC. Core
-        // evicts on the modified feerate (`CTxMemPool::TrimToSize` sorts by
-        // descendant-modified feerate).
-        let mut by_fee_rate: std::collections::BinaryHeap<std::cmp::Reverse<(u64, Txid)>> = inner
+        // delta did not exist — which defeats the point of the RPC.
+        //
+        // And on the descendant score, not the entry's own rate, as Core's
+        // `CTxMemPool::TrimToSize` sorts. Ranking a parent by its own rate
+        // evicted a parent a child pays for — the package `submitpackage`
+        // just admitted by its combined feerate — at the next trim.
+        let none = HashSet::new();
+        let mut by_score: std::collections::BinaryHeap<std::cmp::Reverse<(u64, Txid)>> = inner
             .entries
             .iter()
             .filter(|(txid, entry)| {
                 entry.scope.is_quarantined() == want_quarantined && !keep.contains(*txid)
             })
-            .map(|(txid, entry)| {
-                std::cmp::Reverse((
-                    policy::fee_rate_sat_per_kvb(
-                        modified_fee(entry.fee, entry.fee_delta),
-                        entry.adjusted_weight(),
-                    ),
-                    *txid,
-                ))
+            .filter_map(|(txid, _)| {
+                Self::descendant_score(inner, txid, &none).map(|score| std::cmp::Reverse((score, *txid)))
             })
             .collect();
 
@@ -6807,12 +7111,25 @@ impl Mempool {
         let mut children: Vec<Txid> = Vec::new();
 
         while freed < bytes_needed {
-            let Some(std::cmp::Reverse((_, txid))) = by_fee_rate.pop() else {
+            let Some(std::cmp::Reverse((score, txid))) = by_score.pop() else {
                 break;
             };
-            if !removing.insert(txid) {
+            if removing.contains(&txid) {
                 continue;
             }
+            // Evicting a package changes the score of every ancestor it
+            // leaves behind, and only ever raises it: what went had the lowest
+            // score, so it paid no more than the ancestor's own package.
+            // Re-ranking an entry when it surfaces is therefore enough; one
+            // whose score has risen goes back in at its new place.
+            let Some(current) = Self::descendant_score(inner, &txid, &removing) else {
+                continue;
+            };
+            if current > score {
+                by_score.push(std::cmp::Reverse((current, txid)));
+                continue;
+            }
+            removing.insert(txid);
             let package_start = to_remove.len();
             to_remove.push(txid);
             if let Some(entry) = inner.entries.get(&txid) {
@@ -6872,7 +7189,17 @@ impl Mempool {
         }
 
         if !evicted.is_empty() {
-            tracing::info!(evicted = evicted.len(), "Mempool eviction complete");
+            if want_quarantined {
+                tracing::info!(evicted = evicted.len(), "Mempool eviction complete");
+            } else {
+                // Core's wording (`TrimToSize`), which its tests look for.
+                let rate = inner.rolling.lock().rate;
+                tracing::info!(
+                    "Removed {} txn, rolling minimum fee bumped to {} sat/kvB",
+                    evicted.len(),
+                    rate as u64
+                );
+            }
         }
         evicted
     }
@@ -7323,6 +7650,10 @@ mod sigopsize_tests;
 #[cfg(test)]
 #[path = "pool_fullpool_tests.rs"]
 mod fullpool_tests;
+
+#[cfg(test)]
+#[path = "pool_cpfp_tests.rs"]
+mod cpfp_tests;
 
 #[cfg(test)]
 #[path = "pool_mempoolrpc_tests.rs"]
@@ -12147,6 +12478,16 @@ mod tests {
         policy::dust_threshold(&p2wpkh_spk(0x11))
     }
 
+    /// `tx` with a one-block relative lock on every input: final only once
+    /// what it spends has a confirmation, so acceptance refuses it as
+    /// `non-BIP68-final` while its parent is in the mempool.
+    fn bip68_locked(mut tx: Transaction) -> Transaction {
+        for input in &mut tx.input {
+            input.sequence = bitcoin::Sequence(1);
+        }
+        tx
+    }
+
     fn err_of(results: &serde_json::Map<String, serde_json::Value>, tx: &Transaction) -> String {
         results
             .get(&tx.compute_wtxid().to_string())
@@ -12317,7 +12658,9 @@ mod tests {
 
     /// A dust parent submitted on its own has no child to spend the dust, so
     /// it must not enter -- and the package reports why rather than claiming
-    /// success over an empty result.
+    /// success over an empty result. Core judges a one-transaction package as
+    /// that transaction, so it is refused for its zero fee
+    /// (`AcceptPackage`'s `package.size() == 1`), before any dust check.
     #[test]
     fn a_lone_dust_parent_is_not_accepted() {
         let op = outpoint(0xC4);
@@ -12327,9 +12670,10 @@ mod tests {
         let parent = tx_from(&[op], &[(dust, 0x5D), (50_000 - dust, 0x5E)]);
         let parent_txid = parent.compute_txid();
 
-        let (msg, results) = mp.accept_package(vec![parent], &cs, &NoopVerifier);
+        let (msg, results) = mp.accept_package(vec![parent.clone()], &cs, &NoopVerifier);
 
-        assert_eq!(msg, "unspent-dust", "{results:?}");
+        assert_eq!(msg, "transaction failed", "{results:?}");
+        assert!(err_of(&results, &parent).starts_with("min relay fee not met, 0 < "), "{results:?}");
         assert!(!in_pool(&mp, &parent_txid), "a lone dust parent entered the mempool");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12352,20 +12696,22 @@ mod tests {
 
         let parent = tx_from(&[op], &[(dust, 0x61), (50_000 - dust, 0x62)]);
         let parent_txid = parent.compute_txid();
-        // Sweeps the dust, so the parent is structurally allowed in — but pays
-        // 1 sat, far below the floor, so acceptance refuses it.
-        let child = tx_from(
+        // Sweeps the dust and pays for both, so the parent is admitted — but
+        // a relative lock on its unconfirmed parent makes it non-final, which
+        // acceptance finds only once the parent is in the pool.
+        let child = bip68_locked(tx_from(
             &[
                 OutPoint { txid: parent_txid, vout: 0 },
                 OutPoint { txid: parent_txid, vout: 1 },
             ],
-            &[(50_000 - 1, 0x63)],
-        );
+            &[(40_000, 0x63)],
+        ));
         let child_txid = child.compute_txid();
 
-        let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+        let (msg, results) = mp.accept_package(vec![parent, child.clone()], &cs, &NoopVerifier);
 
-        assert!(!in_pool(&mp, &child_txid), "the underpaying child was accepted: {results:?}");
+        assert!(!in_pool(&mp, &child_txid), "the non-final child was accepted: {results:?}");
+        assert_eq!(err_of(&results, &child), "non-BIP68-final", "{results:?}");
         assert!(
             !in_pool(&mp, &parent_txid),
             "a zero-fee dust parent was left in the mempool with its dust unswept: {results:?}"
@@ -12459,12 +12805,14 @@ mod tests {
             &[(dust, 0x75), (25_000, 0x76), (50_000 - dust - 25_000, 0x77)],
         );
         let parent_txid = parent.compute_txid();
+        // Pays for both at the raised floor: Core holds the package's
+        // combined feerate to it.
         let sweeper = tx_from(
             &[
                 OutPoint { txid: parent_txid, vout: 0 },
                 OutPoint { txid: parent_txid, vout: 1 },
             ],
-            &[(20_000, 0x78)],
+            &[(10_000, 0x78)],
         );
         let sweeper_txid = sweeper.compute_txid();
         let (msg, results) = mp.accept_package(vec![parent, sweeper], &cs, &NoopVerifier);
@@ -13112,6 +13460,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Core's early exit (`AcceptPackage`, `quit_early`): once a member is
+    /// refused for something no package feerate changes, the rest are not
+    /// evaluated together. The dust parent keeps its own refusal instead of
+    /// going in on the strength of a child that cannot get in anyway.
+    #[test]
+    fn a_member_refused_outright_stops_the_package_evaluation() {
+        let op = outpoint(0xCB);
+        let op2 = outpoint(0xCC);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x80), (50_000 - dust, 0x81)]);
+        let parent_txid = parent.compute_txid();
+        // Pays out more than it spends.
+        let invalid = tx_from(&[op2], &[(60_000, 0x82)]);
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint { txid: invalid.compute_txid(), vout: 0 },
+            ],
+            &[(100_000, 0x83)],
+        );
+
+        let (msg, results) = mp.accept_package(vec![parent.clone(), invalid, child.clone()], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "transaction failed", "{results:?}");
+        assert!(err_of(&results, &parent).starts_with("min relay fee not met, 0 < "), "{results:?}");
+        assert_eq!(err_of(&results, &child), "bad-txns-inputs-missingorspent");
+        assert!(!in_pool(&mp, &parent_txid), "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The other half: a parent that does *not* survive must never be
     /// announced. Emitting on admission and retracting after the unwind would
     /// put an Enter/Leave pair on the stream for a transaction that was never
@@ -13126,14 +13507,15 @@ mod tests {
 
         let parent = tx_from(&[op], &[(dust, 0x78), (50_000 - dust, 0x79)]);
         let parent_txid = parent.compute_txid();
-        // Sweeps the dust, so the parent is admitted — then refused for its fee.
-        let child = tx_from(
+        // Sweeps the dust, so the parent is admitted — then refused as
+        // non-final.
+        let child = bip68_locked(tx_from(
             &[
                 OutPoint { txid: parent_txid, vout: 0 },
                 OutPoint { txid: parent_txid, vout: 1 },
             ],
-            &[(50_000 - 1, 0x7A)],
-        );
+            &[(40_000, 0x7A)],
+        ));
 
         let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
         assert_eq!(msg, "unspent-dust", "{results:?}");

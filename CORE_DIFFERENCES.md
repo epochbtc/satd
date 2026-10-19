@@ -381,8 +381,8 @@ New integrations should use the streaming API. Where satd differs:
    `rawblock`.
 4. **Mempool sequence gaps.** The mempool sequence number counts every
    change, including those to quarantined transactions (with a `policyfile`
-   loaded) and to an ephemeral-dust parent unwound from a failed package,
-   which publish nothing. `getrawmempool(false, true)` does not list those
+   loaded) and to a package parent (ephemeral dust, or below the fee floors)
+   unwound from a failed package, which publish nothing. `getrawmempool(false, true)` does not list those
    transactions either, so a snapshot and the stream still agree.
 5. **No messages for blocks connected during initial block download or
    `-reindex`.** Core publishes each such block's transactions and
@@ -763,6 +763,27 @@ silently returning an empty or wrong answer.
   than refusing the replacement, which would be *stricter* than Core. The
   fallback can therefore accept a replacement Core's full linearization would
   decline.
+
+- **Package acceptance (`submitpackage`)** — satd judges a child-with-parents
+  package as Core's `AcceptPackage` does: members on their own first, then
+  those refused only for their feerate or for missing package inputs
+  together, by their combined feerate, and one trim at the end. Three
+  pieces of Core's package policy are absent:
+  - **Package RBF.** A parent below the floors that conflicts with a mempool
+    transaction keeps its fee refusal. Core replaces when a 1-parent-1-child
+    package pays for the replacement.
+  - **TRUC (v3) rules.** satd applies no version-3 topology or size limits,
+    in a package or out of one.
+  - **Package relay.** A below-floor parent and its child reach satd only
+    through `submitpackage`; satd does not do Core's opportunistic
+    1-parent-1-child relay. Core peers still get such a package from satd,
+    because they request the parent of an orphan child from the peer that
+    sent it.
+
+  Eviction ranks by descendant score, which is how Core trimmed before the
+  cluster mempool; v31 trims by chunk feerate. A family of more than 100
+  descendants ranks by the parent's own feerate, since satd does not limit
+  descendants.
 
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so

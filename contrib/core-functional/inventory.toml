@@ -438,9 +438,7 @@ status = "run"
 
 [[test]]
 file = "mempool_limit.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: the rolling mempool minimum landed and fill_mempool passes; L229 then submits a package whose child bumps a parent below that minimum, and satd's package path admits a below-floor parent only as ephemeral dust. Follow-up: package CPFP of a below-minimum parent"
+status = "run"
 
 [[test]]
 file = "mempool_package_limits.py"
