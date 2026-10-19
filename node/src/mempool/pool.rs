@@ -3236,7 +3236,8 @@ impl Mempool {
         let mempool_parents = Self::direct_mempool_parents(&tx, &ancestors);
 
         // CPFP: build full ancestor set (transitive) and enforce limits
-        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
+        // A reorg is exempt from the count, as from the cluster check below.
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors, !pkg.skip_cluster_limits)?;
 
         // Core's sigop-adjusted weight (`-bytespersigop`): the size every
         // feerate from here on charges. The cap on the cost itself comes
@@ -4630,7 +4631,9 @@ impl Mempool {
     /// the full transitive set, refusing one that, with the transaction,
     /// already exceeds the cluster count limit. The ancestors are part of the
     /// cluster, so [`Self::check_cluster_limits`] would refuse it too; this
-    /// bounds the walk.
+    /// bounds the walk. `enforce_limit` is false for a transaction a reorg
+    /// returns, which is exempt from the cluster limits: its walk is bounded
+    /// by the chain the disconnected blocks held.
     ///
     /// One function for `accept_transaction` and `test_accept`. The RBF
     /// diagram is built over this set, so the two have to hand `rbf_check`
@@ -4640,6 +4643,7 @@ impl Mempool {
         inner: &MempoolInner,
         cfg: &MempoolConfig,
         ancestors: &mut HashSet<Txid>,
+        enforce_limit: bool,
     ) -> Result<(), MempoolError> {
         if ancestors.is_empty() {
             return Ok(());
@@ -4656,7 +4660,7 @@ impl Mempool {
             }
             // `+ 1`: the cluster counts the transaction itself. Without it a
             // chain of 65 got in at the default limit of 64.
-            if ancestors.len() + 1 > cfg.max_cluster_count {
+            if enforce_limit && ancestors.len() + 1 > cfg.max_cluster_count {
                 return Err(MempoolError::TooLongMempoolChain);
             }
         }
@@ -5687,7 +5691,7 @@ impl Mempool {
         // grandparent passed `testmempoolaccept` and failed
         // `sendrawtransaction`.
         let mempool_parents = Self::direct_mempool_parents(tx, &ancestors);
-        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors, true)?;
 
         // Core's sigop-adjusted weight, as on admission.
         let sigop_cost = Self::sigop_cost_of(tx, &prev_outputs);

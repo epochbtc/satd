@@ -152,3 +152,24 @@ fn a_reorg_is_not_held_to_the_cluster_limits() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The exemption covers the ancestor count too: a reorg that returns a chain
+/// of 65 keeps all of it. The walk refused the 65th, and every descendant
+/// after it then failed for missing inputs.
+#[test]
+fn a_reorg_keeps_a_chain_longer_than_the_cluster_count() {
+    let (cs, mp, dir) = env(&[1]);
+    let mut prevout = prev(1);
+    let mut value = COIN_VALUE;
+    for _ in 0..66 {
+        let tx = spend(&[prevout], value, 100, 1, 1);
+        value -= 100;
+        prevout = out(
+            mp.accept_reorged_transaction(tx, &cs, &NoopVerifier).expect("a reorg skips the cluster limits"),
+            0,
+        );
+    }
+    assert_eq!(pool(&mp).len(), 66);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
