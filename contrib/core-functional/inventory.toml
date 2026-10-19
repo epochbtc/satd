@@ -792,9 +792,7 @@ status = "run"
 
 [[test]]
 file = "p2p_tx_download.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-01: a MSG_WTX inv is fetched by wtxid (#714); L171 two peers announcing the same wtxid are both sent a getdata, where Core's TxRequestTracker asks one and falls back to the other on expiry. Follow-up: Core's tx download scheduling"
+status = "run"
 
 [[test]]
 file = "p2p_tx_privacy.py"
