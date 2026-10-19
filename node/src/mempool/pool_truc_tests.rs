@@ -268,6 +268,25 @@ fn a_child_replacing_the_only_child_counts_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Replacing the only child directly is an ordinary replacement, not a
+/// sibling eviction, and a refusal says so.
+#[test]
+fn a_direct_replacement_of_the_only_child_is_not_a_sibling_eviction() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1));
+    let child = v3(spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 2_000, 1, 2));
+    for tx in [&parent, &child] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+    let cheaper = v3(spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 1_000, 1, 3));
+
+    let e = accept(&mp, &cs, &cheaper).expect_err("refused");
+    assert_eq!(e.reject_reason(), "insufficient fee");
+    assert_eq!(pool(&mp), txids(&[&parent, &child]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A version 2 replacement of a TRUC child still may not spend the TRUC
 /// parent.
 #[test]
