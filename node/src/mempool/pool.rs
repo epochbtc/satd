@@ -1574,6 +1574,10 @@ struct TestPrechecked {
     prev_is_coinbase: Vec<bool>,
     ancestors: HashSet<Txid>,
     mempool_parents: Vec<Txid>,
+    /// The mempool transactions it spends an input of.
+    conflicts: HashSet<Txid>,
+    /// The fee with any `prioritisetransaction` delta.
+    modified_fee: u64,
     cfg: MempoolConfig,
 }
 
@@ -1601,6 +1605,12 @@ struct PackageAdmit {
     /// such trim, so it keeps what the reorg returns whole, as it does under
     /// the TRUC rules.
     skip_cluster_limits: bool,
+    /// A member of a package whose replacement `submitpackage` has already
+    /// judged as a whole (Core's `PackageRBFChecks`): it evicts its
+    /// conflicts and their descendants without being held to the
+    /// single-transaction replacement rules, and may be below the floors
+    /// with `skip_fee_floor` although it replaces something.
+    package_rbf: bool,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -1611,6 +1621,15 @@ struct PackageAdmit {
     /// any sibling the TRUC rules evicted. Core's `m_replaced_transactions`,
     /// which `submitpackage` reports.
     replaced: Vec<Txid>,
+}
+
+/// Why [`Mempool::package_rbf_checks`] refused a package.
+enum PackageRbfRefusal {
+    /// The package as a whole: Core's `PCKG_POLICY`, the `package_msg`.
+    Package(String),
+    /// One member, by its index among those evaluated: Core's `PCKG_TX`,
+    /// that member's error.
+    Member(usize, String),
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -3347,10 +3366,11 @@ impl Mempool {
         if let Some(e) = Self::fee_floor_failure(&inner, &cfg, effective_fee, adj_weight) {
             // Core's `m_package_feerates`: a package member below the floors
             // is let through on the package's combined feerate, which the
-            // caller has already checked. Not when it replaces anything:
-            // that is Core's package RBF, which satd does not do, and the
-            // member could not be taken back out once its conflicts were gone.
-            if !pkg.skip_fee_floor || !conflicts.is_empty() {
+            // caller has already checked. Not when it replaces anything,
+            // unless the caller judged that replacement for the package as a
+            // whole: the member could not be taken back out once its
+            // conflicts were gone.
+            if !pkg.skip_fee_floor || (!conflicts.is_empty() && !pkg.package_rbf) {
                 return Err(e);
             }
             pkg.floor_skipped = true;
@@ -3369,7 +3389,11 @@ impl Mempool {
         // under the same rules as a conflict.
         let sibling = Self::truc_admission(&inner, &tx, adj_weight, &mempool_parents, &mut conflicts, pkg)?;
         let mut evicted: HashSet<Txid> = HashSet::new();
-        if !conflicts.is_empty() {
+        if !conflicts.is_empty() && pkg.package_rbf {
+            evicted = Self::rbf_conflict_set(&inner, &conflicts, usize::MAX)
+                .expect("an unbounded walk cannot exceed usize::MAX")
+                .0;
+        } else if !conflicts.is_empty() {
             let new_fee = modified_fee(fee, fee_delta);
             evicted = Self::rbf_check(
                 &inner,
@@ -4922,44 +4946,17 @@ impl Mempool {
             }
         }
 
-        // Rule 3: the replacement's modified fee must cover every evicted
-        // modified fee.
-        if new_fee < conflict_fee_total {
-            let detail = format!(
-                "insufficient fee, rejecting replacement {}, less fees than \
-                 conflicting txs; {} < {}",
-                txid, format_btc(new_fee), format_btc(conflict_fee_total),
-            );
-            return Err(MempoolError::InsufficientReplacementFee(
-                new_fee,
-                conflict_fee_total,
-                txid.to_string(),
-                detail,
-            ));
-        }
-
-        // Rule 4: the additional fee must pay for the replacement's own relay.
-        let additional = new_fee - conflict_fee_total;
-        // Saturating: the release profile has no overflow checks, so a
-        // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
-        // floor — the opposite of what the operator asked for.
-        let min_relay = cfg
-            .incremental_relay_fee
-            .saturating_mul(policy::weight_to_vsize(weight))
-            .div_ceil(1000);
-        if additional < min_relay {
-            let detail = format!(
-                "insufficient fee, rejecting replacement {}, not enough \
-                 additional fees to relay; {} < {}",
-                txid, format_btc(additional), format_btc(min_relay),
-            );
-            return Err(MempoolError::InsufficientReplacementFee(
-                new_fee,
-                conflict_fee_total + min_relay,
-                txid.to_string(),
-                detail,
-            ));
-        }
+        // Rules 3 and 4.
+        Self::pays_for_rbf(conflict_fee_total, new_fee, policy::weight_to_vsize(weight), cfg, txid).map_err(
+            |(required, err)| {
+                MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    required,
+                    txid.to_string(),
+                    format!("insufficient fee, {err}"),
+                )
+            },
+        )?;
 
         // Core's `ReplacementChecks` checks the cluster limits after the fees
         // and before the diagram, and refuses a replacement past them as
@@ -4972,6 +4969,47 @@ impl Mempool {
         )?;
 
         Ok(all_evicted)
+    }
+
+    /// Core's `PaysForRBF` (`src/policy/rbf.cpp`), rules 3 and 4: a
+    /// replacement pays at least what it evicts, and on top of that its own
+    /// relay at the incremental feerate. On failure, the fee it needed and
+    /// Core's message, which the single and package paths each prefix.
+    fn pays_for_rbf(
+        original_fees: u64,
+        replacement_fees: u64,
+        replacement_vsize: u64,
+        cfg: &MempoolConfig,
+        txid: &Txid,
+    ) -> Result<(), (u64, String)> {
+        if replacement_fees < original_fees {
+            return Err((
+                original_fees,
+                format!(
+                    "rejecting replacement {}, less fees than conflicting txs; {} < {}",
+                    txid,
+                    format_btc(replacement_fees),
+                    format_btc(original_fees),
+                ),
+            ));
+        }
+        let additional = replacement_fees - original_fees;
+        // Saturating: the release profile has no overflow checks, so a
+        // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
+        // floor — the opposite of what the operator asked for.
+        let min_relay = cfg.incremental_relay_fee.saturating_mul(replacement_vsize).div_ceil(1000);
+        if additional < min_relay {
+            return Err((
+                original_fees + min_relay,
+                format!(
+                    "rejecting replacement {}, not enough additional fees to relay; {} < {}",
+                    txid,
+                    format_btc(additional),
+                    format_btc(min_relay),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Core's `ImprovesFeerateDiagram`: the mempool the replacement would
@@ -5892,7 +5930,7 @@ impl Mempool {
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<(Txid, usize, u64), MempoolError> {
-        let pre = self.test_prechecks(tx, chain_state, None)?;
+        let pre = self.test_prechecks(tx, chain_state, None, false)?;
         self.test_finish(tx, chain_state, script_verifier, pre)
     }
 
@@ -5902,11 +5940,19 @@ impl Mempool {
     /// multi-transaction `testmempoolaccept`: their outputs may be spent,
     /// replacement and sibling eviction are refused, and the cluster limits
     /// are left to the caller, who checks the package as a whole.
+    ///
+    /// `replacing` is a member of a package that replaces mempool
+    /// transactions, as `submitpackage` judges one before committing it
+    /// (Core's `PreChecks` under `m_package_feerates`, ahead of
+    /// `PackageRBFChecks`): its conflicts are allowed, and neither its own
+    /// feerate nor its replacement is judged here, because the caller judges
+    /// the package's together.
     fn test_prechecks(
         &self,
         tx: &Transaction,
         chain_state: &ChainState,
         package: Option<&[Transaction]>,
+        replacing: bool,
     ) -> Result<TestPrechecked, MempoolError> {
         let txid = tx.compute_txid();
         let cfg = self.config.read().clone();
@@ -5962,7 +6008,7 @@ impl Mempool {
 
         // Core's `PreChecks` with `m_allow_replacement` off, as a
         // multi-transaction `testmempoolaccept` runs it.
-        if package.is_some() && !conflicts.is_empty() {
+        if package.is_some() && !conflicts.is_empty() && !replacing {
             return Err(MempoolError::ReplacementDisallowed);
         }
 
@@ -6089,10 +6135,10 @@ impl Mempool {
             cfg.incremental_relay_fee,
         );
         let required = policy::fee_for_rate(min_fee, weight_u64);
-        if required > 0 && effective_fee < required {
+        if required > 0 && effective_fee < required && !replacing {
             return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
         }
-        if fee_rate < cfg.min_fee_rate {
+        if fee_rate < cfg.min_fee_rate && !replacing {
             return Err(MempoolError::InsufficientFee(
                 effective_fee,
                 policy::fee_for_rate(cfg.min_fee_rate, weight_u64),
@@ -6119,7 +6165,7 @@ impl Mempool {
             &PackageAdmit { no_sibling_eviction: package.is_some(), ..Default::default() },
         )?;
         let mut evicted: HashSet<Txid> = HashSet::new();
-        if !conflicts.is_empty() {
+        if !conflicts.is_empty() && !replacing {
             evicted = Self::rbf_check(
                 &inner,
                 &cfg,
@@ -6149,6 +6195,8 @@ impl Mempool {
             prev_is_coinbase,
             ancestors,
             mempool_parents,
+            conflicts,
+            modified_fee: effective_fee,
             cfg,
         })
     }
@@ -6271,7 +6319,7 @@ impl Mempool {
             let checked = if already_known(tx) {
                 Err(MempoolError::AlreadyKnown)
             } else {
-                self.test_prechecks(tx, chain_state, Some(&txs[..i]))
+                self.test_prechecks(tx, chain_state, Some(&txs[..i]), false)
             };
             match checked {
                 Ok(p) => pre.push(p),
@@ -6434,6 +6482,123 @@ impl Mempool {
             }
         }
         None
+    }
+
+    /// Core's package RBF, everything before the commit
+    /// (`AcceptMultipleTransactions` with `m_allow_replacement`): each
+    /// member's `PreChecks`, then `PackageRBFChecks`, the cluster limits,
+    /// `CheckEphemeralSpends` and the scripts. Nothing is evicted or admitted
+    /// here, so a package refused at any step leaves the mempool as it was;
+    /// the caller commits a package that passes.
+    ///
+    /// `members` are the transactions `submitpackage` evaluates together, in
+    /// package order, after the rest were admitted or refused on their own.
+    fn package_rbf_checks(
+        &self,
+        members: &[Transaction],
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<(), PackageRbfRefusal> {
+        let mut pre = Vec::with_capacity(members.len());
+        for (i, tx) in members.iter().enumerate() {
+            let checked = self
+                .test_prechecks(tx, chain_state, Some(&members[..i]), true)
+                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+            pre.push(checked);
+        }
+        let failed = |reason: &str, detail: Option<String>| {
+            PackageRbfRefusal::Package(match detail {
+                Some(detail) => format!("package RBF failed: {reason}, {detail}"),
+                None => format!("package RBF failed: {reason}"),
+            })
+        };
+
+        // Only a parent and its child: with more, or with an unconfirmed
+        // parent in the mempool, the new cluster would hold more than the
+        // two of them, which the checks below do not describe.
+        if pre.len() != 2 || !members[1].input.iter().any(|i| i.previous_output.txid == pre[0].txid) {
+            return Err(failed("package must be 1-parent-1-child", None));
+        }
+        if pre.iter().any(|p| !p.mempool_parents.is_empty()) {
+            return Err(failed("new transaction cannot have mempool ancestors", None));
+        }
+
+        let cfg = self.config.read().clone();
+        let inner = self.inner.read();
+        let child = pre[1].txid;
+        let conflicts: HashSet<Txid> = pre.iter().flat_map(|p| p.conflicts.iter().copied()).collect();
+
+        // Rule 5 over the conflicts of both, as the child's replacement.
+        let bound = Self::rbf_eviction_bound(&cfg);
+        let clusters =
+            Self::conflicting_cluster_count(&inner, &conflicts, policy::MAX_REPLACEMENT_CANDIDATES, bound);
+        if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
+            return Err(failed(
+                "too many potential replacements",
+                Some(format!(
+                    "rejecting replacement {child}; too many conflicting clusters ({clusters} > {})",
+                    policy::MAX_REPLACEMENT_CANDIDATES
+                )),
+            ));
+        }
+        let Some((evicted, conflict_fees)) = Self::rbf_conflict_set(&inner, &conflicts, bound) else {
+            return Err(failed(
+                "too many potential replacements",
+                Some(format!("rejecting replacement {child}; the eviction set exceeds {bound} transactions")),
+            ));
+        };
+
+        // Rules 3 and 4 over the package: its fees against everything it
+        // evicts, and its own relay on top, at its summed vsize.
+        let fee: u64 = pre.iter().map(|p| p.modified_fee).sum();
+        let vsize: u64 = pre.iter().map(|p| p.vsize as u64).sum();
+        let weight: u64 = pre.iter().map(|p| p.adj_weight).sum();
+        Self::pays_for_rbf(conflict_fees, fee, vsize, &cfg, &child)
+            .map_err(|(_, err)| failed("insufficient anti-DoS fees", Some(err)))?;
+
+        // The two must be one chunk, the child paying for its parent, not
+        // only for the replacement's relay. Core's `CFeeRate` comparison is
+        // exact; its text is the rate per kvB, rounded down.
+        let parent_fee = pre[0].modified_fee;
+        let parent_vsize = pre[0].vsize as u64;
+        if u128::from(fee) * u128::from(parent_vsize) <= u128::from(parent_fee) * u128::from(vsize) {
+            let per_kvb = |fee: u64, vsize: u64| {
+                let rate = fee.saturating_mul(1000) / vsize.max(1);
+                format!("{}.{:08} BTC/kvB", rate / 100_000_000, rate % 100_000_000)
+            };
+            return Err(failed(
+                "package feerate is less than or equal to parent feerate",
+                Some(format!(
+                    "package feerate {} <= parent feerate is {}",
+                    per_kvb(fee, vsize),
+                    per_kvb(parent_fee, parent_vsize)
+                )),
+            ));
+        }
+
+        // The two make a cluster of their own: no mempool parent, and
+        // nothing in the mempool spends them yet.
+        if pre.len() > cfg.max_cluster_count || weight > cfg.max_cluster_vsize.saturating_mul(4) {
+            return Err(PackageRbfRefusal::Package(MempoolError::TooLongMempoolChain.state_string()));
+        }
+
+        // A single chunk, so the new side of the diagram is the package as
+        // one transaction with no mempool parents.
+        Self::rbf_improves_diagram(&inner, &cfg, weight, fee, &[], &conflicts, &HashSet::new(), &evicted)
+            .map_err(|e| failed(&e.reject_details().unwrap_or_else(|| e.reject_reason()), None))?;
+
+        if !cfg.accept_non_std_txn
+            && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, members)
+        {
+            return Err(PackageRbfRefusal::Member(i, e.state_string()));
+        }
+        drop(inner);
+
+        for (i, (tx, checked)) in members.iter().zip(pre).enumerate() {
+            self.test_finish(tx, chain_state, script_verifier, checked)
+                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+        }
+        Ok(())
     }
 
     /// Count how many dust outputs a transaction has (below the dust threshold
@@ -6691,6 +6856,10 @@ impl Mempool {
         // `TX_RECONSIDERABLE`, which a child in the package may pay for. Each
         // with the error it got on its own.
         let mut cpfp_parents: HashMap<Txid, String> = HashMap::new();
+        // Members refused on their own only for what their replacement pays:
+        // Core's `TX_RECONSIDERABLE` from `ReplacementChecks`, which the
+        // package may pay for together (package RBF).
+        let mut rbf_members: HashSet<Txid> = HashSet::new();
         // What each deferred member was refused for on its own, which is what
         // Core reports for it if the package is not evaluated together, or
         // fails as a whole for a reason that belongs to another member.
@@ -6930,6 +7099,13 @@ impl Mempool {
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                     }
                 }
+                Err(
+                    e @ (MempoolError::InsufficientReplacementFee(..)
+                    | MempoolError::DoesNotImproveFeerateDiagram(..)),
+                ) => {
+                    deferred_err.insert(ptx.txid, e.state_string());
+                    rbf_members.insert(ptx.txid);
+                }
                 Err(e) => {
                     failed.insert(ptx.wtxid, e.state_string());
                 }
@@ -6944,7 +7120,11 @@ impl Mempool {
         let quit_early = !failed.is_empty() || !over_maxfeerate.is_empty();
         let eval: Vec<&PkgTx> = pkg
             .iter()
-            .filter(|p| cpfp_parents.contains_key(&p.txid) || ephemeral_parents.contains_key(&p.txid))
+            .filter(|p| {
+                cpfp_parents.contains_key(&p.txid)
+                    || ephemeral_parents.contains_key(&p.txid)
+                    || rbf_members.contains(&p.txid)
+            })
             .collect();
         let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, String>, members: &[&PkgTx]| {
             for p in members {
@@ -7031,6 +7211,86 @@ impl Mempool {
                     package_eval = false;
                 }
             }
+        }
+        // Core's package RBF: members evaluated together that replace mempool
+        // transactions. Judged whole, scripts included, before anything is
+        // evicted; then committed, and the paths below have nothing left.
+        let replaces = package_eval && {
+            let inner = self.inner.read();
+            eval.iter().any(|p| p.tx.input.iter().any(|i| inner.spends.contains_key(&i.previous_output)))
+        };
+        if replaces {
+            let members: Vec<Transaction> = eval.iter().map(|p| p.tx.clone()).collect();
+            match self.package_rbf_checks(&members, chain_state, script_verifier) {
+                Err(PackageRbfRefusal::Package(msg)) => {
+                    refuse_deferred(&mut failed, &eval);
+                    package_error = Some(msg);
+                }
+                Err(PackageRbfRefusal::Member(i, err)) => {
+                    let rest: Vec<&PkgTx> =
+                        eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+                    refuse_deferred(&mut failed, &rest);
+                    failed.insert(eval[i].wtxid, err);
+                }
+                Ok(()) => {
+                    // Parent, then child. A parent below the floors keeps its
+                    // events back for the child to send, as a CPFP parent
+                    // does, and leaves with it if the child cannot follow.
+                    let mut lead: Vec<MempoolEvent> = Vec::new();
+                    let mut below_floor: Vec<Txid> = Vec::new();
+                    for p in &eval {
+                        let mut admit = PackageAdmit {
+                            skip_fee_floor: true,
+                            defer_trim: true,
+                            no_sibling_eviction: true,
+                            package_rbf: true,
+                            ..Default::default()
+                        };
+                        let accepted = self.accept_transaction_led(
+                            p.tx.clone(),
+                            chain_state,
+                            script_verifier,
+                            TxSource::Rpc,
+                            false,
+                            std::mem::take(&mut lead),
+                            &mut admit,
+                        );
+                        member_replaced.extend(admit.replaced.drain(..));
+                        match accepted {
+                            Ok(txid) => {
+                                accepted_txids.insert(txid);
+                                if admit.floor_skipped {
+                                    below_floor.push(txid);
+                                    lead = std::mem::take(&mut admit.held);
+                                }
+                                let inner = self.inner.read();
+                                if let Some(entry) = inner.entries.get(&txid) {
+                                    accepted_results.push(AcceptedMember::from_entry(
+                                        p.wtxid,
+                                        txid,
+                                        entry,
+                                        Admission::Subpackage,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                failed.insert(p.wtxid, e.state_string());
+                                for txid in self.remove_unannounced(&below_floor) {
+                                    accepted_txids.remove(&txid);
+                                    accepted_results.retain(|m| m.txid != txid);
+                                    if let Some(parent) = eval.iter().find(|m| m.txid == txid)
+                                        && let Some(err) = deferred_err.get(&txid).or_else(|| cpfp_parents.get(&txid))
+                                    {
+                                        failed.insert(parent.wtxid, err.clone());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            package_eval = false;
         }
         if !package_eval {
             ephemeral_parents.clear();
@@ -8615,6 +8875,10 @@ mod sigopsize_tests;
 #[cfg(test)]
 #[path = "pool_fullpool_tests.rs"]
 mod fullpool_tests;
+
+#[cfg(test)]
+#[path = "pool_package_rbf_tests.rs"]
+mod package_rbf_tests;
 
 #[cfg(test)]
 #[path = "pool_cpfp_tests.rs"]

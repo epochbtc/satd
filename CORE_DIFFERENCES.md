@@ -776,17 +776,17 @@ silently returning an empty or wrong answer.
   package as Core's `AcceptPackage` does: members on their own first, then
   those refused only for their feerate or for missing package inputs
   together, by their combined feerate, and one trim at the end. TRUC
-  (BIP 431) applies to packages as in Core. A multi-transaction
-  `testmempoolaccept` evaluates its transactions together, as Core's does.
-  Two pieces of Core's package policy are absent:
-  - **Package RBF.** A parent below the floors that conflicts with a mempool
-    transaction keeps its fee refusal. Core replaces when a 1-parent-1-child
-    package pays for the replacement.
-  - **Package relay.** A below-floor parent and its child reach satd only
-    through `submitpackage`; satd does not do Core's opportunistic
-    1-parent-1-child relay. Core peers still get such a package from satd,
-    because they request the parent of an orphan child from the peer that
-    sent it.
+  (BIP 431) applies to packages as in Core, and so does package RBF: a
+  parent and child that replace mempool transactions are judged together
+  by Core's `PackageRBFChecks`, scripts included, before anything is
+  evicted. A multi-transaction `testmempoolaccept` evaluates its
+  transactions together, as Core's does. One piece of Core's package
+  policy is absent:
+  - **Package relay.** A below-floor parent and its child, or a package
+    that replaces only together, reach satd only through `submitpackage`;
+    satd does not do Core's opportunistic 1-parent-1-child relay. Core
+    peers still get such a package from satd, because they request the
+    parent of an orphan child from the peer that sent it.
 
   Eviction ranks by descendant score, which is how Core trimmed before the
   cluster mempool; v31 trims by chunk feerate. A family of more than 100

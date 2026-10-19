@@ -1,0 +1,330 @@
+//! Package RBF in `submitpackage`, through the cases of Core's
+//! `mempool_package_rbf.py`: a child pays for its parent's replacement
+//! (`AcceptMultipleTransactions` with `PackageRBFChecks`), and a package
+//! refused at any step leaves the mempool as it was.
+
+use super::fullpool_tests::{COIN_VALUE, env, pool, prev, spend};
+use super::*;
+use crate::validation::script::{NoopVerifier, ScriptError};
+
+fn out(txid: Txid, vout: u32) -> OutPoint {
+    OutPoint { txid, vout }
+}
+
+/// [`env`] with Core's default relay floor, 1 sat/vB.
+fn floor_env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
+    let (cs, mp, dir) = env(tags);
+    mp.config.write().min_fee_rate = 1_000;
+    (cs, mp, dir)
+}
+
+fn submit(mp: &Mempool, cs: &ChainState, txs: &[&Transaction]) -> PackageResult {
+    mp.accept_package_with(txs.iter().map(|t| (*t).clone()).collect(), cs, &NoopVerifier, None)
+}
+
+/// A parent spending `coin` and its child, paying `fees`. `tag` keeps the
+/// transactions of one package apart from another's on the same coin.
+fn package(coin: OutPoint, fees: (u64, u64), tag: u8) -> (Transaction, Transaction) {
+    let parent = spend(&[coin], COIN_VALUE, fees.0, 1, tag);
+    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), fees.1, 1, tag + 1);
+    (parent, child)
+}
+
+fn ids(txs: &[&Transaction]) -> HashSet<Txid> {
+    txs.iter().map(|t| t.compute_txid()).collect()
+}
+
+fn v3(mut tx: Transaction) -> Transaction {
+    tx.version = bitcoin::transaction::Version(3);
+    tx
+}
+
+/// A child pays to replace its parent's conflict and that conflict's child,
+/// which the parent alone could not.
+#[test]
+fn a_child_pays_to_replace_its_parents_conflicts() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+    assert!(
+        matches!(
+            mp.test_accept(&p2, &cs, &NoopVerifier),
+            Err(MempoolError::InsufficientReplacementFee(..))
+        ),
+        "the fixture needs a parent that cannot replace on its own"
+    );
+
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(r.replaced.iter().copied().collect::<HashSet<_>>(), ids(&[&p1, &c1]));
+    assert_eq!(pool(&mp), ids(&[&p2, &c2]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The conflict may be a lone transaction.
+#[test]
+fn a_child_pays_to_replace_a_single_conflict() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let single = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    mp.accept_transaction(single.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("single");
+    let (p, c) = package(prev(1), (1_000, 2_000), 3);
+
+    let r = submit(&mp, &cs, &[&p, &c]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(r.replaced, vec![single.compute_txid()]);
+    assert_eq!(pool(&mp), ids(&[&p, &c]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Rules 3 and 4 over the package: its fees against everything it evicts,
+/// then its own relay on top, at its summed vsize.
+#[test]
+fn the_package_pays_for_what_it_evicts_and_for_its_relay() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 4_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+
+    let (p2, c2) = package(prev(1), (1_000, 3_999), 3);
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert_eq!(
+        r.package_msg,
+        format!(
+            "package RBF failed: insufficient anti-DoS fees, rejecting replacement {}, less fees than conflicting txs; {} < {}",
+            c2.compute_txid(),
+            format_btc(4_999),
+            format_btc(5_000)
+        )
+    );
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    // The incremental relay fee for the package's size, five sats short.
+    let (probe, probe_child) = package(prev(1), (1_000, 4_000), 5);
+    let vsize = policy::weight_to_vsize(probe.weight().to_wu()) + policy::weight_to_vsize(probe_child.weight().to_wu());
+    let required = (100 * vsize).div_ceil(1000);
+    let (p3, c3) = package(prev(1), (1_000, 4_000 + required - 5), 5);
+    let r = submit(&mp, &cs, &[&p3, &c3]);
+    assert_eq!(
+        r.package_msg,
+        format!(
+            "package RBF failed: insufficient anti-DoS fees, rejecting replacement {}, not enough additional fees to relay; {} < {}",
+            c3.compute_txid(),
+            format_btc(required - 5),
+            format_btc(required)
+        )
+    );
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let (p4, c4) = package(prev(1), (1_000, 4_000 + required), 7);
+    assert_eq!(submit(&mp, &cs, &[&p4, &c4]).package_msg, "success");
+    assert_eq!(pool(&mp), ids(&[&p4, &c4]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The child must raise the package above its parent's feerate: a child
+/// that only pays the replacement's way is not a CPFP.
+#[test]
+fn the_package_must_outpay_its_parent() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 4_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+
+    // A parent and child of one size, paying alike: equal rates.
+    let (p2, c2) = package(prev(1), (4_000, 4_000), 3);
+    assert_eq!(p2.weight(), c2.weight(), "the fixture needs equal sizes");
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert!(
+        r.package_msg.starts_with("package RBF failed: package feerate is less than or equal to parent feerate, package feerate "),
+        "{}",
+        r.package_msg
+    );
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let (p3, c3) = package(prev(1), (4_000, 4_001), 5);
+    assert_eq!(submit(&mp, &cs, &[&p3, &c3]).package_msg, "success");
+    assert_eq!(pool(&mp), ids(&[&p3, &c3]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only one parent and its child are judged together: two replacing
+/// parents are refused.
+#[test]
+fn package_rbf_takes_one_parent_and_one_child() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let (a1, a2) = package(prev(1), (1_000, 4_000), 1);
+    let (b1, b2) = package(prev(2), (1_000, 4_000), 3);
+    assert_eq!(submit(&mp, &cs, &[&a1, &a2]).package_msg, "success");
+    assert_eq!(submit(&mp, &cs, &[&b1, &b2]).package_msg, "success");
+
+    let pa = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 5);
+    let pb = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 6);
+    let child = spend(
+        &[out(pa.compute_txid(), 0), out(pb.compute_txid(), 0)],
+        pa.output[0].value.to_sat() + pb.output[0].value.to_sat(),
+        20_000,
+        1,
+        7,
+    );
+    let r = submit(&mp, &cs, &[&pa, &pb, &child]);
+    assert_eq!(r.package_msg, "package RBF failed: package must be 1-parent-1-child");
+    assert_eq!(pool(&mp), ids(&[&a1, &a2, &b1, &b2]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A member with a parent in the mempool is refused, including one that
+/// entered on its own from the same package.
+#[test]
+fn package_rbf_takes_no_mempool_ancestors() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let (p1, c1) = package(prev(1), (1_000, 4_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+
+    let replacing = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 3);
+    let alone = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 4);
+    let child = spend(
+        &[out(replacing.compute_txid(), 0), out(alone.compute_txid(), 0)],
+        replacing.output[0].value.to_sat() + alone.output[0].value.to_sat(),
+        20_000,
+        1,
+        5,
+    );
+    let r = submit(&mp, &cs, &[&replacing, &alone, &child]);
+    assert_eq!(r.package_msg, "package RBF failed: new transaction cannot have mempool ancestors");
+    assert_eq!(pool(&mp), ids(&[&p1, &c1, &alone]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's last case: the child conflicts with its own parent's mempool
+/// parent. The parent has a mempool ancestor, so the package is refused
+/// and the grandparent stays.
+#[test]
+fn a_child_conflicting_with_its_grandparent_is_refused() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let grandparent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let g = mp.accept_transaction(grandparent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("grandparent");
+    let parent = spend(&[out(g, 0)], grandparent.output[0].value.to_sat(), 0, 1, 2);
+    let child = spend(
+        &[out(parent.compute_txid(), 0), prev(1)],
+        parent.output[0].value.to_sat() + COIN_VALUE,
+        40_000,
+        1,
+        3,
+    );
+    let r = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(r.package_msg, "package RBF failed: new transaction cannot have mempool ancestors");
+    assert_eq!(pool(&mp), HashSet::from([g]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// More fees and a higher package feerate are not enough when the conflict
+/// is a parent richer than the package's own rate.
+#[test]
+fn a_package_that_worsens_the_diagram_is_refused() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (4_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+
+    let (p2, c2) = package(prev(1), (3_999, 4_000), 3);
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert_eq!(r.package_msg, "package RBF failed: insufficient feerate: does not improve feerate diagram");
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A zero-fee TRUC parent below the relay floor replaces its conflict on
+/// its child's fee.
+#[test]
+fn a_zero_fee_truc_parent_replaces_on_its_childs_fee() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let p1 = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1));
+    let c1 = v3(spend(&[out(p1.compute_txid(), 0)], p1.output[0].value.to_sat(), 1_000, 1, 2));
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+
+    let p2 = v3(spend(&[prev(1)], COIN_VALUE, 0, 1, 3));
+    let c2 = v3(spend(&[out(p2.compute_txid(), 0)], COIN_VALUE, 20_000, 1, 4));
+    let r = submit(&mp, &cs, &[&p2, &c2]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(r.replaced.iter().copied().collect::<HashSet<_>>(), ids(&[&p1, &c1]));
+    assert_eq!(pool(&mp), ids(&[&p2, &c2]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Refuses the scripts of one transaction.
+struct RefusesOne(Txid);
+
+impl ScriptVerifier for RefusesOne {
+    fn verify_transaction(&self, tx: &Transaction, _: &[TxOut], _: u32) -> Result<(), ScriptError> {
+        if tx.compute_txid() == self.0 {
+            return Err(ScriptError::VerifyFailed { input: 0, reason: "Invalid Schnorr signature".into() });
+        }
+        Ok(())
+    }
+
+    fn verify_policy(&self, _: &Transaction, _: &[TxOut]) -> Result<(), ScriptError> {
+        Ok(())
+    }
+}
+
+/// A child whose scripts fail evicts nothing: both members are checked,
+/// scripts included, before the parent replaces anything.
+#[test]
+fn a_child_with_bad_scripts_evicts_nothing() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+
+    let r = mp.accept_package_with(vec![p2.clone(), c2.clone()], &cs, &RefusesOne(c2.compute_txid()), None);
+    assert_eq!(r.package_msg, "transaction failed");
+    assert!(
+        r.tx_results[&c2.compute_wtxid().to_string()]["error"].as_str().unwrap().contains("script"),
+        "{:?}",
+        r.tx_results
+    );
+    assert!(r.replaced.is_empty());
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Rule 5 over the conflicts of both members together.
+#[test]
+fn the_conflicts_of_both_members_count_toward_rule_five() {
+    let tags: Vec<u8> = (1..=101).collect();
+    let (cs, mp, dir) = floor_env(&tags);
+    for &t in &tags {
+        mp.accept_transaction(spend(&[prev(t)], COIN_VALUE, 1_000, 1, t), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("one cluster per coin");
+    }
+    // The parent conflicts with 50 clusters, the child with the other 51.
+    let parent_coins: Vec<OutPoint> = (1..=50).map(prev).collect();
+    let child_coins: Vec<OutPoint> = (51..=101).map(prev).collect();
+    let parent = spend(&parent_coins, 50 * COIN_VALUE, 50_000, 1, 200);
+    let mut child_inputs = vec![out(parent.compute_txid(), 0)];
+    child_inputs.extend(child_coins);
+    let child = spend(&child_inputs, parent.output[0].value.to_sat() + 51 * COIN_VALUE, 1_000_000, 1, 201);
+    let before = pool(&mp);
+
+    let r = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(
+        r.package_msg,
+        format!(
+            "package RBF failed: too many potential replacements, rejecting replacement {}; too many conflicting clusters (101 > 100)",
+            child.compute_txid()
+        ),
+        "{:?}",
+        r.tx_results
+    );
+    assert_eq!(pool(&mp), before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
