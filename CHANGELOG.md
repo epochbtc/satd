@@ -46,6 +46,12 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- A replacement in a cluster the two-transaction diagrams cannot describe,
+  such as one of several children of a cheap parent, is judged over the
+  clusters it touches, as in Core v31. The per-conflict rule satd used there
+  refused bumps Core accepts and accepted replacements that drop a rich
+  descendant. A replacement past the cluster limits is now
+  `replacement-failed, cluster size limit exceeded`, as in Core.
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
   does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,

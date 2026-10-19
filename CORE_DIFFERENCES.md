@@ -758,14 +758,15 @@ silently returning an empty or wrong answer.
   on their own; the pre-cluster Core put the replacement in on its own.
   An ancestor of the replacement unrelated to the conflicts stands on both
   sides of the comparison when it has no in-mempool relatives of its own. For
-  anything larger — a conflict inside a longer chain, an ancestor with
-  relatives — satd falls back to the older per-conflict feerate rule rather
-  than refusing the replacement, which would be *stricter* than Core. The
-  fallback can therefore accept a replacement Core's full linearization would
-  decline. It can also decline one Core accepts: it weighs the replacement
-  together with its unconfirmed ancestors but each conflict on its own, so
-  bumping one of several children of a low-feerate parent can be refused
-  where Core sees the parent's cluster improve.
+  anything larger — a conflict inside a longer chain, a parent with several
+  children, an ancestor with relatives — satd compares diagrams over every
+  cluster the replacement touches, as v31 does, but linearizes each cluster
+  by ancestor-set feerate where Core searches for the optimal linearization.
+  The two agree on the small clusters a replacement usually touches; on a
+  larger, tangled one satd's chunks can be slightly worse than Core's, and a
+  replacement at the margin can then be judged differently. A cluster past
+  64 transactions, which only a reorg leaves in satd, falls back to the older
+  per-conflict feerate rule.
 
 - **Package acceptance (`submitpackage`)** — satd judges a child-with-parents
   package as Core's `AcceptPackage` does: members on their own first, then
