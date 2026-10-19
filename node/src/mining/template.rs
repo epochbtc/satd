@@ -69,11 +69,31 @@ pub struct BlockTemplate {
     pub height: u32,
     pub bits: CompactTarget,
     pub cur_time: u32,
-    /// The earliest timestamp a block on this template may carry: the
-    /// median time past of the tip, plus one (Core's `mintime`).
+    /// The earliest timestamp this template advertises, from
+    /// [`minimum_time`] (Core's `mintime`).
     pub min_time: u32,
     pub transactions: Vec<TemplateTx>,
     pub coinbase_value: u64,
+}
+
+/// The earliest timestamp a template for a block at `height` advertises,
+/// as Core's `GetMinimumTime` (src/node/miner.cpp) computes it: one past the
+/// tip's median time past, raised at the first block of a retarget period to
+/// `MAX_TIMEWARP` seconds before the parent (`parent_time`).
+///
+/// That floor is BIP 94's timewarp rule, which only testnet4 enforces. Core
+/// applies it on every network, and so does this, so a miner that honours
+/// `mintime` builds a block that passes the rule wherever it is enforced. Without the floor in `mintime`, a testnet4
+/// miner that stamps a retarget block at the advertised `mintime` builds one
+/// that fails `check_difficulty` as a timewarp.
+fn minimum_time(median_time_past: u32, height: u32, parent_time: u32) -> u32 {
+    use crate::validation::pow::{MAX_TIMEWARP, RETARGET_INTERVAL};
+    let min_time = median_time_past + 1;
+    if height.is_multiple_of(RETARGET_INTERVAL) {
+        min_time.max(parent_time.saturating_sub(MAX_TIMEWARP))
+    } else {
+        min_time
+    }
 }
 
 /// Create a block template from the current chain state and mempool.
@@ -277,17 +297,8 @@ fn assemble_template(
     // Saturating keeps the value in range so the future-block check can do its
     // job on it.
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
-    let min_time = template_mtp + 1;
-    let mut cur_time = std::cmp::max(now, min_time);
-    // BIP 94 (testnet4): the first block of a retarget period may not be
-    // stamped more than 600 s before its parent. Core's `UpdateTime` lifts the
-    // timestamp to that floor; without it a node whose clock trails the tip
-    // builds a template that fails `check_difficulty` as a timewarp.
-    if chain_state.network == bitcoin::Network::Testnet4
-        && height.is_multiple_of(crate::validation::pow::RETARGET_INTERVAL)
-    {
-        cur_time = cur_time.max(tip_entry.header.time.saturating_sub(600));
-    }
+    let min_time = minimum_time(template_mtp, height, tip_entry.header.time);
+    let cur_time = std::cmp::max(now, min_time);
 
     // Difficulty for a block at `cur_time` on this tip — the same computation
     // `check_difficulty` compares a received block against, so a template is
@@ -772,6 +783,52 @@ pub(crate) mod tests {
     use crate::storage::flatfile::FlatFileManager;
     use crate::validation::script::NoopVerifier;
     use bitcoin::Network;
+
+    #[test]
+    fn minimum_time_is_one_past_the_median_off_a_retarget_height() {
+        // Parent stamped far ahead of the median: only a retarget height
+        // brings it into play.
+        assert_eq!(minimum_time(1_700_000_000, 2015, 1_700_010_000), 1_700_000_001);
+        assert_eq!(minimum_time(1_700_000_000, 2017, 1_700_010_000), 1_700_000_001);
+    }
+
+    #[test]
+    fn minimum_time_at_a_retarget_height_is_at_most_600_s_before_the_parent() {
+        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+        use crate::validation::pow::check_difficulty;
+        use crate::validation::ValidationError;
+
+        let mtp = 1_700_000_000;
+        let parent_time = mtp + 10_000;
+        for height in [2016, 4032] {
+            assert_eq!(minimum_time(mtp, height, parent_time), parent_time - 600);
+        }
+        // The median already above the floor wins.
+        assert_eq!(minimum_time(mtp, 2016, mtp + 300), mtp + 1);
+        // A parent stamped before 600 s past the epoch does not underflow.
+        assert_eq!(minimum_time(0, 2016, 100), 1);
+
+        // On testnet4 a block stamped at the advertised minimum passes BIP 94,
+        // where one stamped at the median plus one is a timewarp.
+        let mut parent_header = bitcoin::constants::genesis_block(Network::Testnet4).header;
+        parent_header.time = parent_time;
+        let parent = BlockIndexEntry {
+            header: parent_header,
+            height: 2015,
+            status: BlockStatus::Valid,
+            num_tx: 1,
+            file_number: 0,
+            data_pos: 0,
+            chainwork: [0u8; 32],
+        };
+        let mut header = parent_header;
+        header.time = minimum_time(mtp, 2016, parent_time);
+        let res = check_difficulty(&header, &parent, Network::Testnet4, |_| None);
+        assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        header.time = mtp + 1;
+        let res = check_difficulty(&header, &parent, Network::Testnet4, |_| None);
+        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+    }
 
     #[test]
     fn test_create_empty_template() {

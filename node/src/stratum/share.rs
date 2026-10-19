@@ -39,7 +39,8 @@ pub enum ShareResult {
     Stale,
     /// The same solution was already submitted for this job.
     Duplicate,
-    /// The timestamp is below the median time past or too far in the future.
+    /// The timestamp is below the template's minimum time or too far in the
+    /// future.
     BadTime,
 }
 

@@ -130,6 +130,10 @@ item below is (or will be) written up in full in the in-development
   satd's own extra fields are gone: `blockheight`, a mempool
   transaction's `confirmations: 0`, the per-transaction block fields in
   `getblock`, and `decoderawtransaction`'s `hex`.
+- `getblocktemplate`'s `mintime`, and its `curtime` on every network, take
+  Core's BIP 94 floor at a retarget height: no more than 600 seconds before
+  the parent. A testnet4 block stamped at the advertised `mintime` could fail
+  as a timewarp.
 
 ## Releases
 

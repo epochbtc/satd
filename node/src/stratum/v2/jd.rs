@@ -410,7 +410,7 @@ pub fn check_custom_job(
         return Err(refuse("invalid-job-param-value-nbits", "nbits is not the required difficulty"));
     }
     if msg.min_ntime < work.min_time {
-        return Err(refuse("invalid-job-param-value-min_ntime", "min_ntime is below the median time past"));
+        return Err(refuse("invalid-job-param-value-min_ntime", "min_ntime is below the template's minimum time"));
     }
     if msg.merkle_path != job.merkle_branch {
         return Err(refuse("invalid-job-param-value-merkle_path", "the merkle path is not the declared job's"));
