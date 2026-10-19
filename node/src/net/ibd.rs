@@ -516,10 +516,13 @@ impl IbdScheduler {
             .peer_slots
             .iter()
             .filter(|&(&id, slots)| {
+                // The download timeout stands on its own: the stall clock
+                // restarts on every reassignment, and a peer whose heights
+                // keep timing out and coming back to it may never reach it.
                 !slots.assigned.is_empty()
-                    && now.duration_since(slots.last_activity) > self.stall_timeout
                     && (now.duration_since(slots.quiet_since) > QUIET_DOWNLOAD_TIMEOUT
-                        || self.another_peer_delivered_within(id, now, self.stall_timeout))
+                        || (now.duration_since(slots.last_activity) > self.stall_timeout
+                            && self.another_peer_delivered_within(id, now, self.stall_timeout)))
             })
             .min_by_key(|(_, slots)| slots.last_activity)
             .map(|(&id, _)| id)?;
@@ -1774,9 +1777,12 @@ mod tests {
         assert!(!sched.peer_slots[&1].assigned.is_empty());
         assert_eq!(sched.peer_slots[&1].quiet_since, quiet_since);
 
-        let slots = sched.peer_slots.get_mut(&1).unwrap();
-        slots.last_activity = Instant::now() - Duration::from_secs(20);
-        slots.quiet_since = Instant::now() - QUIET_DOWNLOAD_TIMEOUT - Duration::from_secs(1);
+        // Ten minutes on, its heights have just come back to it again, so its
+        // stall clock is fresh, and a doubled stall timeout would keep it
+        // fresh for longer still. The download timeout drops it regardless.
+        sched.stall_timeout = STALL_TIMEOUT_MAX;
+        sched.peer_slots.get_mut(&1).unwrap().quiet_since =
+            Instant::now() - QUIET_DOWNLOAD_TIMEOUT - Duration::from_secs(1);
         assert_eq!(sched.take_stalled_peer(), Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
