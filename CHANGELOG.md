@@ -38,6 +38,12 @@ item below is (or will be) written up in full in the in-development
   `TRUC-violation` reasons, in `sendrawtransaction`, `testmempoolaccept`,
   `submitpackage` and relay (#1020).
 
+- Cluster limits on admission, as in Core v31: a transaction joins at most
+  `-limitclustercount` (64) connected unconfirmed transactions, itself
+  included, and at most `-limitclustersize` (101 kvB, now accepted) of them.
+  satd counted ancestors only, so a parent took any number of children and
+  a chain of 65 passed at 64.
+
 ### Fixed
 
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core

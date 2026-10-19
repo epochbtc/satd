@@ -307,12 +307,11 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         dust_relay_fee: c.dustrelayfee,
         data_carrier: c.datacarrier,
         data_carrier_size: c.datacarriersize,
-        // Core v31 gates admission on the cluster limit, not on the
+        // Core v31 gates admission on the cluster limits, not on the
         // deprecated ancestor/descendant settings (which it keeps only for
-        // wallet coin selection). satd approximates the cluster by the
-        // transitive ancestor and descendant sets, so both take that bound.
-        max_ancestor_count: c.limitclustercount,
-        max_descendant_count: c.limitclustercount,
+        // wallet coin selection).
+        max_cluster_count: c.limitclustercount,
+        max_cluster_vsize: c.limitclustersize.saturating_mul(1_000),
         expiry_secs: c.mempoolexpiry.saturating_mul(3600),
         permit_bare_multisig: c.permitbaremultisig,
         accept_non_std_txn: c.acceptnonstdtxn,
@@ -899,6 +898,9 @@ fn field_specs() -> Vec<FieldSpec> {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
         live!("limitclustercount", limitclustercount, |c, h| {
+            h.mempool.reload_policy(mempool_config_from(c))
+        }),
+        live!("limitclustersize", limitclustersize, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
         live!("mempoolexpiry", mempoolexpiry, |c, h| {

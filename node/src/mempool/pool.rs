@@ -1291,8 +1291,12 @@ pub struct MempoolConfig {
     pub dust_relay_fee: u64,
     pub data_carrier: bool,
     pub data_carrier_size: usize,
-    pub max_ancestor_count: usize,
-    pub max_descendant_count: usize,
+    /// Core v31's `-limitclustercount`: the most transactions one mempool
+    /// cluster may hold, the new one included.
+    pub max_cluster_count: usize,
+    /// Core v31's `-limitclustersize`, in vbytes: the most sigop-adjusted
+    /// virtual size one mempool cluster may hold.
+    pub max_cluster_vsize: u64,
     pub expiry_secs: u64,
     pub permit_bare_multisig: bool,
     /// Bitcoin Core's `-acceptnonstdtxn`: when true, skip the *standardness*
@@ -1329,8 +1333,8 @@ impl Default for MempoolConfig {
             dust_relay_fee: policy::DUST_RELAY_FEE_RATE,
             data_carrier: true,
             data_carrier_size: policy::DEFAULT_DATA_CARRIER_SIZE,
-            max_ancestor_count: policy::MAX_ANCESTOR_COUNT,
-            max_descendant_count: policy::MAX_DESCENDANT_COUNT,
+            max_cluster_count: policy::MAX_CLUSTER_COUNT,
+            max_cluster_vsize: policy::DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1_000,
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
             permit_bare_multisig: true,
             accept_non_std_txn: false,
@@ -1549,6 +1553,12 @@ struct PackageAdmit {
     /// returns is not held to the TRUC rules, which the block it left may
     /// have broken.
     skip_truc: bool,
+    /// A transaction a reorg returns is not held to the cluster limits.
+    /// Core checks one, then links the mempool descendants that already
+    /// spend it and trims any cluster that comes out too large. satd has no
+    /// such trim, so it keeps what the reorg returns whole, as it does under
+    /// the TRUC rules.
+    skip_cluster_limits: bool,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -2917,7 +2927,7 @@ impl Mempool {
             TxSource::Reload,
             false,
             Vec::new(),
-            &mut PackageAdmit { skip_truc: true, ..Default::default() },
+            &mut PackageAdmit { skip_truc: true, skip_cluster_limits: true, ..Default::default() },
         )
     }
 
@@ -3315,9 +3325,10 @@ impl Mempool {
         // follows: a sibling the TRUC rules offer for eviction is replaced
         // under the same rules as a conflict.
         let sibling = Self::truc_admission(&inner, &tx, adj_weight, &mempool_parents, &mut conflicts, pkg)?;
+        let mut evicted: HashSet<Txid> = HashSet::new();
         if !conflicts.is_empty() {
             let new_fee = modified_fee(fee, fee_delta);
-            Self::rbf_check(
+            evicted = Self::rbf_check(
                 &inner,
                 &cfg,
                 &tx,
@@ -3329,6 +3340,10 @@ impl Mempool {
                 sibling,
             )
             .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
+        }
+        // A reorg is exempt: see `PackageAdmit::skip_cluster_limits`.
+        if !pkg.skip_cluster_limits {
+            Self::check_cluster_limits(&inner, &cfg, &mempool_parents, adj_weight, &evicted)?;
         }
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
@@ -4612,8 +4627,10 @@ impl Mempool {
     ///
     /// Returns the set of transactions the replacement would evict.
     /// Expand `ancestors` — a transaction's direct in-mempool parents — to
-    /// the full transitive set, refusing a chain longer than
-    /// `max_ancestor_count` (Core's `too-long-mempool-chain`).
+    /// the full transitive set, refusing one that, with the transaction,
+    /// already exceeds the cluster count limit. The ancestors are part of the
+    /// cluster, so [`Self::check_cluster_limits`] would refuse it too; this
+    /// bounds the walk.
     ///
     /// One function for `accept_transaction` and `test_accept`. The RBF
     /// diagram is built over this set, so the two have to hand `rbf_check`
@@ -4637,8 +4654,65 @@ impl Mempool {
                     }
                 }
             }
-            if ancestors.len() > cfg.max_ancestor_count {
+            // `+ 1`: the cluster counts the transaction itself. Without it a
+            // chain of 65 got in at the default limit of 64.
+            if ancestors.len() + 1 > cfg.max_cluster_count {
                 return Err(MempoolError::TooLongMempoolChain);
+            }
+        }
+        Ok(())
+    }
+
+    /// Core v31's cluster limits (`CheckMemPoolPolicyLimits`, after
+    /// `ReplacementChecks`): with `tx` in and `evicted` out, the cluster `tx`
+    /// joins may hold at most `max_cluster_count` transactions and
+    /// `max_cluster_vsize` sigop-adjusted vbytes. Refused as
+    /// `too-large-cluster`.
+    ///
+    /// The cluster is everything connected to `tx` through spends, in either
+    /// direction: a parent's other children count, and so do theirs. The
+    /// ancestor and descendant sets alone missed that, so a parent took any
+    /// number of children. The walk stops as soon as either limit is passed,
+    /// so it visits at most `max_cluster_count` transactions.
+    fn check_cluster_limits(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        mempool_parents: &[Txid],
+        adj_weight: u64,
+        evicted: &HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        // Core's txgraph counts weight against `cluster_size_vbytes * 4`.
+        let max_weight = cfg.max_cluster_vsize.saturating_mul(4);
+        let mut count = 1usize;
+        let mut weight = adj_weight;
+        let oversized = |count: usize, weight: u64| count > cfg.max_cluster_count || weight > max_weight;
+        if oversized(count, weight) {
+            return Err(MempoolError::TooLongMempoolChain);
+        }
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = Vec::new();
+        for p in mempool_parents {
+            if !evicted.contains(p) && inner.entries.contains_key(p) && seen.insert(*p) {
+                queue.push(*p);
+            }
+        }
+        let mut buf: Vec<Txid> = Vec::new();
+        while let Some(current) = queue.pop() {
+            let Some(entry) = inner.entries.get(&current) else {
+                continue;
+            };
+            count += 1;
+            weight = weight.saturating_add(entry.adjusted_weight());
+            if oversized(count, weight) {
+                return Err(MempoolError::TooLongMempoolChain);
+            }
+            buf.clear();
+            Self::collect_children(inner, &current, &mut buf);
+            buf.extend(entry.tx.input.iter().map(|i| i.previous_output.txid));
+            for next in buf.drain(..) {
+                if !evicted.contains(&next) && inner.entries.contains_key(&next) && seen.insert(next) {
+                    queue.push(next);
+                }
             }
         }
         Ok(())
@@ -5113,13 +5187,13 @@ impl Mempool {
     ///
     /// Rule 5 already bounds the *clusters* at
     /// `MAX_REPLACEMENT_CANDIDATES`, and a cluster holds at most
-    /// `max_ancestor_count` transactions, so their product is a ceiling no
+    /// `max_cluster_count` transactions, so their product is a ceiling no
     /// replacement Core would accept can reach. Deriving it that way — rather
     /// than reusing the cluster limit directly — is what keeps this a
     /// backstop against a pathological mempool instead of a second, stricter
     /// policy that refuses replacements Core allows.
     fn rbf_eviction_bound(cfg: &MempoolConfig) -> usize {
-        policy::MAX_REPLACEMENT_CANDIDATES.saturating_mul(cfg.max_ancestor_count.max(1))
+        policy::MAX_REPLACEMENT_CANDIDATES.saturating_mul(cfg.max_cluster_count.max(1))
     }
 
     /// The number of distinct mempool clusters the direct conflicts belong to
@@ -5676,8 +5750,9 @@ impl Mempool {
             &mut conflicts,
             &PackageAdmit::default(),
         )?;
+        let mut evicted: HashSet<Txid> = HashSet::new();
         if !conflicts.is_empty() {
-            Self::rbf_check(
+            evicted = Self::rbf_check(
                 &inner,
                 &cfg,
                 tx,
@@ -5690,6 +5765,7 @@ impl Mempool {
             )
             .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
         }
+        Self::check_cluster_limits(&inner, &cfg, &mempool_parents, weight_u64, &evicted)?;
 
         drop(inner);
 
@@ -7957,6 +8033,10 @@ mod cpfp_tests;
 mod truc_tests;
 
 #[cfg(test)]
+#[path = "pool_cluster_tests.rs"]
+mod cluster_tests;
+
+#[cfg(test)]
 #[path = "pool_mempoolrpc_tests.rs"]
 mod mempoolrpc_tests;
 
@@ -8603,6 +8683,9 @@ mod tests {
     fn rule_five_counts_clusters_not_conflicts() {
         let op = outpoint(0xE0);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(10_000_000))]);
+        // A cluster this big gets past the cluster limit only through a
+        // reorg, which is where Rule 5 can see one.
+        mp.config.write().max_cluster_count = 1_000;
 
         // A parent with 120 outputs, and a child spending each one: 121
         // transactions in one connected component.
@@ -8690,7 +8773,7 @@ mod tests {
             max_size_bytes: 1_000_000,
             min_fee_rate: 0,
             dust_relay_fee: 3_000,
-            max_ancestor_count: 2,
+            max_cluster_count: 3,
             ..Default::default()
         });
 
@@ -8881,6 +8964,9 @@ mod tests {
     fn a_replacement_conflicting_with_one_big_cluster_is_accepted() {
         let op = outpoint(0xED);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(20_000_000))]);
+        // A cluster this big gets past the cluster limit only through a
+        // reorg, which is where Rule 5 can see one.
+        mp.config.write().max_cluster_count = 1_000;
 
         // A parent with 120 outputs, and a child on each: 120 conflicts, one
         // cluster.
@@ -9330,8 +9416,8 @@ mod tests {
     fn default_chain_limit_is_the_cluster_limit() {
         assert_eq!(policy::MAX_CLUSTER_COUNT, 64);
         let cfg = MempoolConfig::default();
-        assert_eq!(cfg.max_ancestor_count, policy::MAX_CLUSTER_COUNT);
-        assert_eq!(cfg.max_descendant_count, policy::MAX_CLUSTER_COUNT);
+        assert_eq!(cfg.max_cluster_count, policy::MAX_CLUSTER_COUNT);
+        assert_eq!(cfg.max_cluster_vsize, 101_000);
     }
 
     #[test]
