@@ -72,8 +72,8 @@ item below is (or will be) written up in full in the in-development
   refused bumps Core accepts and accepted replacements that drop a rich
   descendant, so some replacements satd accepted are now refused. The
   cluster order approximates Core's optimal one. A replacement past the
-  cluster limits is now `replacement-failed, cluster size limit exceeded`,
-  as in Core.
+  cluster limits is refused as `too-large-cluster` before its diagram is
+  compared, as in Core.
 - An announced transaction is requested from one peer at a time, as by Core's
   `TxRequestTracker`: a transaction announced by several peers was downloaded
   from every one of them. The next announcer is asked when the request times
