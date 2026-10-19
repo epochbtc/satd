@@ -1491,6 +1491,22 @@ mod tests {
         }
     }
 
+    /// The cluster limits reach the mempool, `-limitclustersize` from kvB
+    /// to vbytes, and both are live.
+    #[test]
+    fn cluster_limits_reach_the_mempool_config() {
+        let (mut c, _dir) = test_config();
+        c.limitclustercount = 7;
+        c.limitclustersize = 10;
+        let m = mempool_config_from(&c);
+        assert_eq!(m.max_cluster_count, 7);
+        assert_eq!(m.max_cluster_vsize, 10_000);
+        let specs = field_specs();
+        for key in ["limitclustercount", "limitclustersize"] {
+            assert!(specs.iter().find(|s| s.key == key).unwrap().apply.is_some(), "{key} is live");
+        }
+    }
+
     /// `webhook_target_from` mirrors the config: `None` with no URL, else the
     /// URL plus optional secret. This is what the reload apply stores into the
     /// shared target the dispatcher reads.

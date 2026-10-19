@@ -103,6 +103,12 @@ fn a_cluster_is_held_to_its_size() {
     mp.config.write().max_cluster_vsize = total;
     accept(&mp, &cs, &child).expect("at the size limit");
 
+    // A transaction alone can be too large for a cluster.
+    let (cs2, mp2, dir2) = env(&[1]);
+    mp2.config.write().max_cluster_vsize = vsize(&parent) - 1;
+    assert!(too_large(accept(&mp2, &cs2, &parent)));
+    let _ = std::fs::remove_dir_all(&dir2);
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
