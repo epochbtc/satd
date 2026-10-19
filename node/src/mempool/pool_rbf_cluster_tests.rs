@@ -175,3 +175,26 @@ fn a_fee_bump_of_a_diamonds_tail_is_accepted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A fee-only bump of a tree's tail (A parents B and C, D spends B) is
+/// accepted. Linearized afresh, the bump reordered the cluster into one
+/// chunk that paid less at 800 vB than the original order did, and was
+/// refused; merged with the old order it can only do better.
+#[test]
+fn a_fee_bump_that_reorders_a_cluster_is_accepted() {
+    let (cs, mp, dir) = env(&[1]);
+    let a = sized(spend(&[prev(1)], COIN_VALUE, 800, 2, 1), 500);
+    let a_id = accept(&mp, &cs, &a).expect("a");
+    let b = sized(spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 1_800, 1, 2), 200);
+    let b_id = accept(&mp, &cs, &b).expect("b");
+    let c = sized(spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_300, 1, 3), 100);
+    let c_id = accept(&mp, &cs, &c).expect("c");
+    let d_in = b.output[0].value.to_sat();
+    accept(&mp, &cs, &sized(spend(&[out(b_id, 0)], d_in, 500, 1, 4), 500)).expect("d");
+
+    let bump = sized(spend(&[out(b_id, 0)], d_in, 2_400, 1, 5), 500);
+    let r = accept(&mp, &cs, &bump).expect("a fee-only bump improves the diagram");
+    assert_eq!(pool(&mp), HashSet::from([a_id, b_id, c_id, r]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
