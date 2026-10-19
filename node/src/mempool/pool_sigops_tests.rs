@@ -117,18 +117,17 @@ fn the_policy_view_sees_cores_sigop_cost() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `submitpackage` ephemeral-dust parent enters through the fee-bypass
-/// path. It records the same sigop cost and prevout metadata as any other
-/// admission; it recorded zero and nothing, so the template under-counted
-/// it.
+/// A `submitpackage` ephemeral-dust parent records the same sigop cost and
+/// prevout metadata as any other admission. Its old fee-bypass path recorded
+/// zero and nothing, so the template under-counted it.
 #[test]
-fn a_fee_bypass_admission_records_its_sigop_cost_and_prevouts() {
+fn a_dust_parent_admission_records_its_sigop_cost_and_prevouts() {
     let ws = heavy_script();
     let coins = vec![(prev(1), p2wsh_coin(&ws))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
 
     let (txid, _) = mp
-        .accept_transaction_bypass_fee(spend_p2wsh(&[prev(1)], &ws, 0, 0x21), &cs, &NoopVerifier)
+        .admit_dust_parent(spend_p2wsh(&[prev(1)], &ws, 0, 0x21), &cs, &NoopVerifier, TxSource::Rpc)
         .expect("admitted");
     let entry = mp.get(&txid).unwrap();
     assert_eq!(entry.sigop_cost, HEAVY);

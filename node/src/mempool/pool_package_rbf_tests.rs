@@ -609,3 +609,140 @@ fn no_reader_sees_a_replacing_package_half_admitted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn submit_from(mp: &Mempool, cs: &ChainState, txs: &[&Transaction], source: TxSource) -> PackageResult {
+    mp.accept_package_from(txs.iter().map(|t| (*t).clone()).collect(), cs, &NoopVerifier, None, source)
+}
+
+/// A zero-fee parent with one dust output and the child that sweeps it, the
+/// parent at version 2 and the child at version 1.
+fn dust_package(coin: OutPoint) -> (Transaction, Transaction) {
+    let mut parent = spend(&[coin], COIN_VALUE, 0, 1, 3);
+    parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 100);
+    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    let p = parent.compute_txid();
+    let child = version(spend(&[out(p, 0), out(p, 1)], COIN_VALUE, 20_000, 1, 4), 1);
+    (parent, child)
+}
+
+/// A peer's ephemeral dust parent is judged by the policy like any
+/// transaction: a rule matching it holds it, and its child with it. The
+/// parent used to enter by a path that skipped the policy, so a peer could
+/// get a transaction the rules hold relayed and mined.
+#[test]
+fn a_peers_dust_parent_is_held_by_the_policy() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    mp.set_policy(std::sync::Arc::new(
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2").expect("ruleset"),
+    ));
+    let (parent, child) = dust_package(prev(1));
+    let r = submit_from(&mp, &cs, &[&parent, &child], TxSource::P2p);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    for tx in [&parent, &child] {
+        let entry = mp.get(&tx.compute_txid()).expect("in the pool");
+        assert!(entry.scope.relay && entry.scope.template, "held, the child through its parent");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same parent submitted locally is refused the relay quarantine, as a
+/// local submission is, and nothing enters.
+#[test]
+fn a_local_dust_parent_the_policy_would_hold_is_refused() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    mp.set_policy(std::sync::Arc::new(
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2").expect("ruleset"),
+    ));
+    let (parent, child) = dust_package(prev(1));
+    let r = submit_from(&mp, &cs, &[&parent, &child], TxSource::Rpc);
+    assert_ne!(r.package_msg, "success");
+    let err = r.tx_results[&parent.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().to_string();
+    assert!(err.starts_with("txn-policy-quarantined"), "{:?}", r.tx_results);
+    assert!(pool(&mp).is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The package RBF checks judge a peer's package as a peer's: a rule that
+/// holds only local submissions does not refuse it. They judged every
+/// package as a local one, so it did.
+#[test]
+fn package_rbf_judges_a_peers_package_by_its_source() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    mp.set_policy(std::sync::Arc::new(
+        satd_policy::parse_ruleset("version 1\nquarantine local when tx.source == rpc").expect("ruleset"),
+    ));
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+
+    let local = submit_from(&mp, &cs, &[&p2, &c2], TxSource::Rpc);
+    assert_ne!(local.package_msg, "success", "a local package the rule holds is refused");
+    assert_eq!(pool(&mp), ids(&[&p1, &c1]));
+
+    let r = submit_from(&mp, &cs, &[&p2, &c2], TxSource::P2p);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(pool(&mp), ids(&[&p2, &c2]));
+    for tx in [&p2, &c2] {
+        assert!(mp.get(&tx.compute_txid()).unwrap().scope.is_acting());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer's replacing package whose child the policy holds is admitted,
+/// the child held: only a local submission is refused a relay quarantine.
+#[test]
+fn a_peers_replacing_package_keeps_its_held_child() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    mp.set_policy(std::sync::Arc::new(
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 1").expect("ruleset"),
+    ));
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+    let c2 = version(c2, 1);
+
+    let r = submit_from(&mp, &cs, &[&p2, &c2], TxSource::P2p);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert!(mp.get(&p2.compute_txid()).unwrap().scope.is_acting());
+    assert!(mp.get(&c2.compute_txid()).unwrap().scope.relay);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dust parent that spends another member of its package is refused when
+/// a `prioritisetransaction` delta is set on it, as Core's
+/// `PreCheckEphemeralTx` refuses any dusty transaction whose modified fee
+/// is not zero. Its old admission path never looked at the delta.
+#[test]
+fn a_dust_parent_spending_its_package_is_refused_with_a_fee_delta() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let grand = spend(&[prev(1)], COIN_VALUE, 2_000, 2, 1);
+    let half = grand.output[1].value.to_sat();
+    let g = grand.compute_txid();
+    let mut parent = spend(&[out(g, 0)], grand.output[0].value.to_sat(), 0, 1, 2);
+    parent.output[0].value = bitcoin::Amount::from_sat(parent.output[0].value.to_sat() - 100);
+    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    let p = parent.compute_txid();
+    let child = spend(&[out(g, 1), out(p, 0), out(p, 1)], half + grand.output[0].value.to_sat(), 20_000, 1, 3);
+
+    mp.prioritise_transaction(&p, 1_000).expect("a delta set ahead of the transaction");
+    let r = submit(&mp, &cs, &[&grand, &parent, &child]);
+    assert_eq!(
+        r.tx_results[&parent.compute_wtxid().to_string()]["error"],
+        MempoolError::EphemeralDustFee.to_string(),
+        "{:?}",
+        r.tx_results
+    );
+    assert!(!pool(&mp).contains(&p));
+
+    // Without the delta the same package goes in.
+    let (cs2, mp2, dir2) = floor_env(&[1]);
+    let r = submit(&mp2, &cs2, &[&grand, &parent, &child]);
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

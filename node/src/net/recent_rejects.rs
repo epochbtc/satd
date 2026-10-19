@@ -135,6 +135,29 @@ impl RecentRejects {
         let key = self.key(hash);
         self.rejected.contains(key) || (include_reconsiderable && self.reconsiderable.contains(key))
     }
+
+    /// Whether `hash` is in the fee filter alone (Core's
+    /// `RecentRejectsReconsiderableFilter().contains`).
+    pub fn contains_reconsiderable(&mut self, tip: BlockHash, hash: &[u8; 32]) -> bool {
+        self.sync_tip(tip);
+        let key = self.key(hash);
+        self.reconsiderable.contains(key)
+    }
+}
+
+/// Core's `GetPackageHash` (`policy/packages.cpp`): the SHA256 of the
+/// members' wtxids, sorted as numbers (by their bytes from the last), each
+/// written in its own byte order. A failed package is remembered by it in
+/// the fee filter, so the same pairing is not tried again.
+pub fn package_hash(wtxids: &[bitcoin::Wtxid]) -> [u8; 32] {
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
+    let mut sorted: Vec<[u8; 32]> = wtxids.iter().map(|w| w.to_byte_array()).collect();
+    sorted.sort_by(|a, b| a.iter().rev().cmp(b.iter().rev()));
+    let mut engine = sha256::Hash::engine();
+    for w in &sorted {
+        engine.input(w);
+    }
+    sha256::Hash::from_engine(engine).to_byte_array()
 }
 
 impl Default for RecentRejects {
@@ -150,6 +173,37 @@ mod tests {
 
     fn tip(b: u8) -> BlockHash {
         BlockHash::from_byte_array([b; 32])
+    }
+
+    /// What Core's `txpackage_tests.cpp` checks of `GetPackageHash`: the
+    /// order the wtxids come in does not matter, and they are sorted as
+    /// their hex strings read (the bytes from the last), not by the byte
+    /// array, where these two would sort the other way round.
+    #[test]
+    fn the_package_hash_sorts_the_wtxids_as_numbers() {
+        use bitcoin::hashes::{sha256, HashEngine};
+        // As numbers, `low` < `high`, though `low`'s first byte is larger.
+        let mut low = [0u8; 32];
+        low[0] = 0xff;
+        low[31] = 0x01;
+        let mut high = [0u8; 32];
+        high[31] = 0x02;
+        let (lw, hw) = (bitcoin::Wtxid::from_byte_array(low), bitcoin::Wtxid::from_byte_array(high));
+        let mut engine = sha256::Hash::engine();
+        engine.input(&low);
+        engine.input(&high);
+        let expected = sha256::Hash::from_engine(engine).to_byte_array();
+        assert_eq!(package_hash(&[hw, lw]), expected);
+        assert_eq!(package_hash(&[lw, hw]), expected);
+    }
+
+    #[test]
+    fn the_fee_filter_is_asked_alone() {
+        let mut r = RecentRejects::new();
+        r.insert(tip(1), &[7; 32], Rejection::Reconsiderable);
+        r.insert(tip(1), &[8; 32], Rejection::Rejected);
+        assert!(r.contains_reconsiderable(tip(1), &[7; 32]));
+        assert!(!r.contains_reconsiderable(tip(1), &[8; 32]));
     }
 
     #[test]

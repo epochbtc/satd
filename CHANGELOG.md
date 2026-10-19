@@ -51,6 +51,10 @@ item below is (or will be) written up in full in the in-development
   read from the address index's spend rows. `-txospenderindex` is now
   refused with pruning, as in Core, and without `-addressindex`.
 
+- Core's opportunistic 1-parent-1-child package relay: a parent a peer
+  sends, refused on its fee alone, enters with a child of it the same peer
+  sent, as a package (CPFP, ephemeral dust or package RBF).
+
 - Package RBF in `submitpackage`, as in Core v31: a child may pay for its
   parent's replacement, which the parent could not afford alone. Core's
   `PackageRBFChecks` apply (one parent and one child, no unconfirmed
@@ -63,6 +67,9 @@ item below is (or will be) written up in full in the in-development
   feerate first, a cluster's transactions in its order. It listed them in
   hash-map order, which changed when a reorg returned the same
   transactions.
+- A `submitpackage` ephemeral dust parent is judged by the transaction
+  policy (`policyfile=`); it skipped the policy, so a rule matching it did
+  not hold or refuse it.
 - The Rust script engine computes a tapscript signature hash as Core does,
   from the annex hashed once per input instead of once per signature check.
   A spend with many checks and a large annex verified many times slower than

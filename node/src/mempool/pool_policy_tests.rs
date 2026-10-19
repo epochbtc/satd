@@ -170,10 +170,11 @@ fn the_sigop_cost_of_a_transaction_is_capped_at_16000() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The fee-bypass path a `submitpackage` ephemeral-dust parent takes applies
-/// the same checks: it skipped every standardness check.
+/// A `submitpackage` ephemeral-dust parent is held to the same checks as
+/// any transaction. Its old fee-bypass path skipped every standardness
+/// check.
 #[test]
-fn the_fee_bypass_path_applies_the_same_policy() {
+fn a_dust_parent_admission_applies_the_same_policy() {
     let ws = heavy_script();
     let mut coins = vec![
         (prev(1), coin(ScriptBuf::from_bytes(vec![0x51]))),
@@ -182,14 +183,15 @@ fn the_fee_bypass_path_applies_the_same_policy() {
     coins.extend((3..=7).map(|t| (prev(t), coin(p2wsh(&ws)))));
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
 
-    let err = mp.accept_transaction_bypass_fee(spend(&[prev(1)], &[]), &cs, &NoopVerifier).expect_err("refused");
+    let err = mp.admit_dust_parent(spend(&[prev(1)], &[]), &cs, &NoopVerifier, TxSource::Rpc).map(|r| r.0).expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-nonstandard-inputs");
     let err = mp
-        .accept_transaction_bypass_fee(spend(&[prev(2)], &[UPGRADABLE_NOP]), &cs, &rust())
+        .admit_dust_parent(spend(&[prev(2)], &[UPGRADABLE_NOP]), &cs, &rust(), TxSource::Rpc)
+        .map(|r| r.0)
         .expect_err("refused");
     assert!(matches!(err, MempoolError::PolicyScript(..)), "{err:?}");
     let five: Vec<_> = (3..=7).map(prev).collect();
-    let err = mp.accept_transaction_bypass_fee(spend(&five, &[&ws]), &cs, &NoopVerifier).expect_err("refused");
+    let err = mp.admit_dust_parent(spend(&five, &[&ws]), &cs, &NoopVerifier, TxSource::Rpc).map(|r| r.0).expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-too-many-sigops");
     let _ = std::fs::remove_dir_all(&dir);
 }

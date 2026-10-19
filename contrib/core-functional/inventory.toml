@@ -446,9 +446,8 @@ status = "run"
 
 [[test]]
 file = "mempool_package_rbf.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-19 with package RBF: L118 sync_all times out because the second node never gets the replacing package; satd has no opportunistic 1-parent-1-child package relay. With that sync_all removed, every case passes. Follow-up: 1p1c package relay"
+status = "run"
+note = "flipped 2026-10-19: package RBF in submitpackage, and 1-parent-1-child package relay carries the replacing package to the second node"
 
 [[test]]
 file = "mempool_packages.py"
@@ -523,8 +522,8 @@ status = "run"
 [[test]]
 file = "p2p_1p1c_network.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-16: the L105 scheduler stall is gone; the test reaches L126 getorphantxs, which satd does not implement. Follow-up: getorphantxs and 1P1C relay"
+reason = "rpc-missing"
+note = "measured 2026-10-19 with 1p1c relay: L126 getorphantxs is Method not found. Follow-up: getorphantxs"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -724,8 +723,8 @@ note = "measured 2026-09-15: L126 nServices 9 where 1032 (v2: 3080) is expected:
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L620 fill_mempool: mempoolminfee never rises above minrelaytxfee. Behind it: 1P1C package relay. Follow-up: dynamic mempool minimum fee, then package relay"
+reason = "rpc-missing"
+note = "measured 2026-10-19 with 1p1c relay: every package case passes (parent then child, child then parent, two candidate children, consensus failures, multiple parents, 1p1c on 1p1c); L461 test_orphanage_dos_large calls getorphantxs, Method not found. Follow-up: getorphantxs"
 
 [[test]]
 file = "p2p_orphan_handling.py"
