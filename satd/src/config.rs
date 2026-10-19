@@ -747,6 +747,10 @@ pub struct Config {
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
     pub addrindexsubscriptions: usize,
+    /// Largest scripthash history the public Electrum and Esplora
+    /// surfaces will serve; a busier script is refused. `0` means no
+    /// cap. Default 200000 (`node_index::DEFAULT_MAX_HISTORY_ENTRIES`).
+    pub addrindexmaxhistory: usize,
     /// Native Esplora REST server (see `docs/manual/src/native-protocol-surfaces.md`). On by
     /// default; `--esplora=0` disables. Requires `--addressindex=1`.
     pub esplora: bool,
@@ -1496,6 +1500,12 @@ pub enum NoteLevel {
 }
 
 impl Config {
+    /// `-addrindexmaxhistory` as the history cap the index surfaces
+    /// enforce: `0` (no cap) is `usize::MAX`.
+    pub fn address_history_cap(&self) -> usize {
+        if self.addrindexmaxhistory == 0 { usize::MAX } else { self.addrindexmaxhistory }
+    }
+
     /// Load configuration by merging CLI args → config file → defaults.
     ///
     /// Retained as the canonical entry point (and for the intra-doc links that
@@ -3180,10 +3190,9 @@ impl Config {
         // Per-scripthash subscription cap. Default 10000 covers
         // typical xpub-derivation patterns; operators serving public
         // Electrum/Esplora endpoints may want to raise this.
-        let addrindexsubscriptions = cli
-            .addrindexsubscriptions
-            .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
-            .unwrap_or(10_000);
+        // Resolved in a helper, to keep `from_cli`'s debug-build stack frame
+        // from growing.
+        let (addrindexsubscriptions, addrindexmaxhistory) = resolve_addrindex_limits(cli.addrindex_args, &file_get);
 
         // BIP 158 compact-block-filter index + peerblockfilters: see
         // the resolution block below near line 833 (it includes the
@@ -4157,6 +4166,7 @@ impl Config {
             addressindex,
             silentpaymentindex,
             addrindexsubscriptions,
+            addrindexmaxhistory,
             esplora,
             esplora_bind,
             esplora_tls_bind,
@@ -5661,13 +5671,6 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        value_name = "N",
-        help = "Maximum concurrent per-scripthash subscriptions (default: 10000)"
-    )]
-    pub addrindexsubscriptions: Option<usize>,
-
-    #[arg(
-        long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
         num_args = 0..=1,
@@ -5944,6 +5947,11 @@ pub struct CliArgs {
     /// [`StratumArgs`].
     #[command(flatten)]
     pub policy_size_args: PolicySizeArgs,
+
+    /// `-addrindexsubscriptions` and `-addrindexmaxhistory`, hand-built for
+    /// the same stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub addrindex_args: AddrIndexArgs,
 
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
@@ -7429,6 +7437,58 @@ impl clap::FromArgMatches for PolicySizeArgs {
     }
 }
 
+/// The address-index limits (see [`CliArgs::addrindex_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct AddrIndexArgs {
+    pub addrindexsubscriptions: Option<usize>,
+    pub addrindexmaxhistory: Option<usize>,
+}
+
+const ADDRINDEX_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    ("addrindexsubscriptions", "N", StratumArgKind::Usize, "Maximum concurrent per-scripthash subscriptions (default: 10000)"),
+    (
+        "addrindexmaxhistory",
+        "N",
+        StratumArgKind::Usize,
+        "Refuse Electrum and Esplora queries for a script with more than N transactions; 0 = no cap (default: 200000)",
+    ),
+];
+
+impl clap::Args for AddrIndexArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in ADDRINDEX_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for AddrIndexArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            addrindexsubscriptions: m.remove_one("addrindexsubscriptions"),
+            addrindexmaxhistory: m.remove_one("addrindexmaxhistory"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// Bitcoin Core's `-minimumchainwork` (see [`CliArgs::chain_work_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChainWorkArgs {
@@ -7707,6 +7767,21 @@ fn resolve_rpc_whitelist(
         },
     };
     Ok(node::rpc::whitelist::RpcWhitelist::new(&entries, default))
+}
+
+/// Resolve `-addrindexsubscriptions` and `-addrindexmaxhistory` from CLI
+/// then config file.
+#[inline(never)]
+fn resolve_addrindex_limits(cli: AddrIndexArgs, file_get: &dyn Fn(&str) -> Option<String>) -> (usize, usize) {
+    let subscriptions = cli
+        .addrindexsubscriptions
+        .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
+        .unwrap_or(10_000);
+    let max_history = cli
+        .addrindexmaxhistory
+        .or_else(|| file_get("addrindexmaxhistory").and_then(|v| v.parse().ok()))
+        .unwrap_or(node_index::DEFAULT_MAX_HISTORY_ENTRIES);
+    (subscriptions, max_history)
 }
 
 /// Resolve `-cmpctblockprefill` and `-cmpctblockprefillbytes` from CLI then
@@ -8235,6 +8310,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "addressindex",
         "silentpaymentindex",
         "addrindexsubscriptions",
+        "addrindexmaxhistory",
         "esplora",
         "esplorabind",
         "esploratlsbind",
@@ -9012,6 +9088,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "addressindex",
     "silentpaymentindex",
     "addrindexsubscriptions",
+    "addrindexmaxhistory",
     "blockfilterindex",
     "coinstatsindex",
     "txospenderindex",
@@ -9963,6 +10040,10 @@ mod minchainwork_tests;
 #[cfg(test)]
 #[path = "config_onlynet_tests.rs"]
 mod onlynet_tests;
+
+#[cfg(test)]
+#[path = "config_addrindexmaxhistory_tests.rs"]
+mod addrindexmaxhistory_tests;
 
 #[cfg(test)]
 #[path = "config_bytespersigop_tests.rs"]
@@ -11608,6 +11689,7 @@ testactivationheight=bip34@2
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
             policy_size_args: PolicySizeArgs::default(),
+            addrindex_args: AddrIndexArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -11685,7 +11767,6 @@ testactivationheight=bip34@2
             txindex: None,
             addressindex: None,
             silentpaymentindex: None,
-            addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
             esploratlsbind: None,
@@ -11927,6 +12008,7 @@ testactivationheight=bip34@2
             maxtipage: None,
             chain_work_args: ChainWorkArgs::default(),
             policy_size_args: PolicySizeArgs::default(),
+            addrindex_args: AddrIndexArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -12004,7 +12086,6 @@ testactivationheight=bip34@2
             txindex: None,
             addressindex: None,
             silentpaymentindex: None,
-            addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
             esploratlsbind: None,

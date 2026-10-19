@@ -975,6 +975,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("electrummtls", electrum_mtls),
         restart!("electrummtlsclientca", electrum_mtls_client_ca),
         restart!("electrummtlsclientallow", electrum_mtls_client_allow),
+        restart!("addrindexmaxhistory", addrindexmaxhistory),
         restart!("electrummaxconns", electrum_max_conns),
         restart!("electrummaxsubsperconn", electrum_max_subs_per_conn),
         restart!("electrumrequesttimeout", electrum_request_timeout),

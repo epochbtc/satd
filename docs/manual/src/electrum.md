@@ -68,7 +68,9 @@ transaction past the cap, so it costs a bounded read however long the
 history is; a refused `subscribe` is not kept. A subscribed scripthash whose
 history grows past the cap gets no further status notifications.
 `get_first_use` and `get_mempool` are not capped: they read only the first
-block and the mempool. The cap is not configurable.
+block and the mempool. `-addrindexmaxhistory=<n>` sets the cap, for Electrum
+and Esplora together; `0` removes it, and a request for a busy scripthash
+then reads its whole history again.
 
 ## Supported methods
 

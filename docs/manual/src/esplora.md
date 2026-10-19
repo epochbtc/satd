@@ -286,8 +286,10 @@ blockstream.info and mempool.space within these constraints:
   the stream would carry no events, and a stream already open for a script
   that grows past the cap stops receiving them. The refusal counts the history's transactions and stops at the
   first one past the cap, so it costs a bounded read however long the
-  history is; below the cap the answers are unchanged. The cap is not
-  configurable; page such a script's history through `/txs/chain` instead.
+  history is; below the cap the answers are unchanged. Set the cap with
+  `-addrindexmaxhistory=<n>` (shared with Electrum; `0` for none, which
+  serves every script again at the cost of reading its whole history), or
+  page such a script's history through `/txs/chain`.
   Under the cap, a high-activity script (exchange hot wallet, mining pool,
   popular donation address) can still cost multi-MB allocations and
   sub-second latency per request. Every address and scripthash route
