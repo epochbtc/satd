@@ -1436,6 +1436,10 @@ pub struct Mempool {
     /// reconstruction (Core's `m_replaced_transactions` →
     /// `AddToCompactExtraTransactions`).
     replaced_tx_sink: Mutex<Option<ReplacedTxSink>>,
+    /// Run between a replacing package's parent and child admissions, so a
+    /// test can move the chain there.
+    #[cfg(test)]
+    between_package_members: Mutex<Option<PackageHook>>,
     /// Bounded ring of recent events for MCP snapshot consumption.
     /// Always maintained (cheap) so MCP tools work whether or not
     /// the broadcast sender is wired.
@@ -1574,6 +1578,10 @@ struct TestPrechecked {
     prev_is_coinbase: Vec<bool>,
     ancestors: HashSet<Txid>,
     mempool_parents: Vec<Txid>,
+    /// The mempool transactions it spends an input of.
+    conflicts: HashSet<Txid>,
+    /// The fee with any `prioritisetransaction` delta.
+    modified_fee: u64,
     cfg: MempoolConfig,
 }
 
@@ -1601,6 +1609,26 @@ struct PackageAdmit {
     /// such trim, so it keeps what the reorg returns whole, as it does under
     /// the TRUC rules.
     skip_cluster_limits: bool,
+    /// A member of a package whose replacement `submitpackage` has already
+    /// judged as a whole (Core's `PackageRBFChecks`): it evicts its
+    /// conflicts and their descendants without being held to the
+    /// single-transaction replacement rules, and may be below the floors
+    /// with `skip_fee_floor` although it replaces something.
+    package_rbf: bool,
+    /// Every event of the admission, its replacements' included, is kept in
+    /// `held` for the caller, and what it evicts in `evicted_entries`: a
+    /// replacing package's parent, which comes back out, its evictions
+    /// restored, if the child cannot follow.
+    hold_events: bool,
+    /// The entries a `hold_events` admission evicted, as they were, each
+    /// with its unbroadcast record (the peers that have shown they hold it)
+    /// if it had one.
+    evicted_entries: Vec<(Txid, MempoolEntry, Option<HashSet<std::net::IpAddr>>)>,
+    /// The transactions a `hold_events` admission replaced, kept from the
+    /// replaced-transaction sink until the caller commits.
+    held_replaced_txs: Vec<Transaction>,
+    /// A `hold_events` admission's quarantine-channel event.
+    held_quarantine: Vec<QuarantineEvent>,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -1611,6 +1639,47 @@ struct PackageAdmit {
     /// any sibling the TRUC rules evicted. Core's `m_replaced_transactions`,
     /// which `submitpackage` reports.
     replaced: Vec<Txid>,
+}
+
+/// A test's look at the mempool between a replacing package's parent and
+/// child.
+#[cfg(test)]
+type PackageHook = Box<dyn Fn(&Mempool) + Send + Sync>;
+
+/// The mempool write lock an admission works under: its own, or one its
+/// caller holds across several admissions (a replacing package's parent and
+/// child, which no reader may see half done).
+enum InnerWrite<'a> {
+    Own(parking_lot::RwLockWriteGuard<'a, MempoolInner>),
+    Held(&'a mut MempoolInner),
+}
+
+impl std::ops::Deref for InnerWrite<'_> {
+    type Target = MempoolInner;
+    fn deref(&self) -> &MempoolInner {
+        match self {
+            InnerWrite::Own(guard) => guard,
+            InnerWrite::Held(inner) => inner,
+        }
+    }
+}
+
+impl std::ops::DerefMut for InnerWrite<'_> {
+    fn deref_mut(&mut self) -> &mut MempoolInner {
+        match self {
+            InnerWrite::Own(guard) => guard,
+            InnerWrite::Held(inner) => inner,
+        }
+    }
+}
+
+/// Why [`Mempool::package_rbf_checks`] refused a package.
+enum PackageRbfRefusal {
+    /// The package as a whole: Core's `PCKG_POLICY`, the `package_msg`.
+    Package(String),
+    /// One member, by its index among those evaluated: Core's `PCKG_TX`,
+    /// that member's error.
+    Member(usize, String),
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -1723,6 +1792,8 @@ impl Mempool {
             policy_reload_failures: std::sync::atomic::AtomicU64::new(0),
             event_tx: Mutex::new(None),
             replaced_tx_sink: Mutex::new(None),
+            #[cfg(test)]
+            between_package_members: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
             sp_gate: arc_swap::ArcSwap::from_pointee(std::sync::atomic::AtomicUsize::new(0)),
@@ -2997,6 +3068,7 @@ impl Mempool {
             allow_quarantined,
             lead,
             None,
+            None,
             pkg,
         )?;
         // Core expires the pool after every acceptance (`LimitMempoolSize` in
@@ -3028,6 +3100,7 @@ impl Mempool {
             false,
             Vec::new(),
             Some(time),
+            None,
             &mut PackageAdmit::default(),
         )?;
         self.remove_expired();
@@ -3047,6 +3120,7 @@ impl Mempool {
         allow_quarantined: bool,
         lead: Vec<MempoolEvent>,
         entry_time: Option<u64>,
+        locked: Option<&mut MempoolInner>,
         pkg: &mut PackageAdmit,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
@@ -3140,8 +3214,12 @@ impl Mempool {
 
         let tx_size = bitcoin::consensus::serialize(&tx).len();
 
-        // Take write lock for the rest (prevents TOCTOU races)
-        let mut inner = self.inner.write();
+        // Take write lock for the rest (prevents TOCTOU races), unless the
+        // caller already holds it for more than this one admission.
+        let mut inner = match locked {
+            Some(held) => InnerWrite::Held(held),
+            None => InnerWrite::Own(self.inner.write()),
+        };
 
         // Check not already in mempool
         inner.entries.check_not_resident(&txid, &tx)?;
@@ -3347,10 +3425,11 @@ impl Mempool {
         if let Some(e) = Self::fee_floor_failure(&inner, &cfg, effective_fee, adj_weight) {
             // Core's `m_package_feerates`: a package member below the floors
             // is let through on the package's combined feerate, which the
-            // caller has already checked. Not when it replaces anything:
-            // that is Core's package RBF, which satd does not do, and the
-            // member could not be taken back out once its conflicts were gone.
-            if !pkg.skip_fee_floor || !conflicts.is_empty() {
+            // caller has already checked. Not when it replaces anything,
+            // unless the caller judged that replacement for the package as a
+            // whole: the member could not be taken back out once its
+            // conflicts were gone.
+            if !pkg.skip_fee_floor || (!conflicts.is_empty() && !pkg.package_rbf) {
                 return Err(e);
             }
             pkg.floor_skipped = true;
@@ -3369,7 +3448,11 @@ impl Mempool {
         // under the same rules as a conflict.
         let sibling = Self::truc_admission(&inner, &tx, adj_weight, &mempool_parents, &mut conflicts, pkg)?;
         let mut evicted: HashSet<Txid> = HashSet::new();
-        if !conflicts.is_empty() {
+        if !conflicts.is_empty() && pkg.package_rbf {
+            evicted = Self::rbf_conflict_set(&inner, &conflicts, usize::MAX)
+                .expect("an unbounded walk cannot exceed usize::MAX")
+                .0;
+        } else if !conflicts.is_empty() {
             let new_fee = modified_fee(fee, fee_delta);
             evicted = Self::rbf_check(
                 &inner,
@@ -3651,11 +3734,14 @@ impl Mempool {
                 for ci in &evict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
-                inner.unbroadcast.remove(evict_txid);
+                let unbroadcast = inner.unbroadcast.remove(evict_txid);
                 if was_acting {
                     replaced.push((*evict_txid, seq));
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
+                if pkg.hold_events {
+                    pkg.evicted_entries.push((*evict_txid, evict_entry.clone(), unbroadcast));
+                }
                 replaced_txs.push(evict_entry.tx);
                 pkg.replaced.push(*evict_txid);
             }
@@ -3714,7 +3800,8 @@ impl Mempool {
 
         // A member let in below the floors stays only if the child paying for
         // it does, so its events go out with that child's, not now.
-        if pkg.floor_skipped {
+        let hold = pkg.floor_skipped || pkg.hold_events;
+        if hold {
             pkg.held.extend(lead);
         } else {
             // Inserted before anything this acceptance changed, so their
@@ -3728,13 +3815,20 @@ impl Mempool {
         // for them would be a phantom Leave leaking a withheld txid (§10).
         self.emit_evicted(&evicted_full_pool, evict_reason);
         for (conflict_txid, seq) in &replaced {
-            self.emit(MempoolEvent::LeaveReplaced {
+            let leave = MempoolEvent::LeaveReplaced {
                 txid: *conflict_txid,
                 replacing_txid: txid,
                 mempool_sequence: *seq,
-            });
+            };
+            if pkg.hold_events {
+                pkg.held.push(leave);
+            } else {
+                self.emit(leave);
+            }
         }
-        if !replaced_txs.is_empty()
+        if pkg.hold_events {
+            pkg.held_replaced_txs.extend(replaced_txs);
+        } else if !replaced_txs.is_empty()
             && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
         {
             sink(replaced_txs);
@@ -3744,13 +3838,18 @@ impl Mempool {
         // `Quarantined` on the separate channel instead; acting placements emit
         // `Enter` exactly as before.
         if scope.is_quarantined() {
-            self.emit_quarantine(QuarantineEvent::Quarantined {
+            let event = QuarantineEvent::Quarantined {
                 txid,
                 rule: quarantine_rule.unwrap_or_else(|| "(policy)".to_string()),
                 relay: scope.relay,
                 template: scope.template,
                 time: now,
-            });
+            };
+            if pkg.hold_events {
+                pkg.held_quarantine.push(event);
+            } else {
+                self.emit_quarantine(event);
+            }
         } else {
             let enter = MempoolEvent::Enter {
                 txid,
@@ -3761,7 +3860,7 @@ impl Mempool {
                 mempool_sequence,
                 raw_tx,
             };
-            if pkg.floor_skipped {
+            if hold {
                 pkg.held.push(enter);
             } else {
                 self.emit(enter);
@@ -4711,8 +4810,8 @@ impl Mempool {
     /// count limit. It refuses nothing: the ancestors are part of the
     /// cluster, so [`Self::check_cluster_limits`] refuses that transaction
     /// later. That is where Core refuses it: after the replacement checks,
-    /// or inside them as `cluster size limit exceeded`, with no ancestor
-    /// count of its own ahead of them. A set cut short is never used past
+    /// or inside them ahead of the diagram, with no ancestor count of its
+    /// own ahead of them. A set cut short is never used past
     /// that refusal. `bounded` is false for a transaction a reorg returns,
     /// which is exempt from the cluster limits: its walk is bounded by the
     /// chain the disconnected blocks held.
@@ -4861,17 +4960,9 @@ impl Mempool {
             }
             if let Some(conflict_entry) = inner.entries.get(conflict_txid)
                 && !cfg.full_rbf
+                && !Self::signals_rbf(&conflict_entry.tx)
             {
-                // BIP 431: a TRUC transaction is always replaceable.
-                let signals_rbf = conflict_entry.tx.version.0 == truc::TRUC_VERSION
-                    || conflict_entry
-                        .tx
-                        .input
-                        .iter()
-                        .any(|i| i.sequence.0 < 0xffff_fffe);
-                if !signals_rbf {
-                    return Err(MempoolError::ConflictingSpend);
-                }
+                return Err(MempoolError::ConflictingSpend);
             }
         }
 
@@ -4922,60 +5013,77 @@ impl Mempool {
             }
         }
 
-        // Rule 3: the replacement's modified fee must cover every evicted
-        // modified fee.
-        if new_fee < conflict_fee_total {
-            let detail = format!(
-                "insufficient fee, rejecting replacement {}, less fees than \
-                 conflicting txs; {} < {}",
-                txid, format_btc(new_fee), format_btc(conflict_fee_total),
-            );
-            return Err(MempoolError::InsufficientReplacementFee(
-                new_fee,
-                conflict_fee_total,
-                txid.to_string(),
-                detail,
-            ));
-        }
+        // Rules 3 and 4.
+        Self::pays_for_rbf(conflict_fee_total, new_fee, policy::weight_to_vsize(weight), cfg, txid).map_err(
+            |(required, err)| {
+                MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    required,
+                    txid.to_string(),
+                    format!("insufficient fee, {err}"),
+                )
+            },
+        )?;
 
-        // Rule 4: the additional fee must pay for the replacement's own relay.
-        let additional = new_fee - conflict_fee_total;
-        // Saturating: the release profile has no overflow checks, so a
-        // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
-        // floor — the opposite of what the operator asked for.
-        let min_relay = cfg
-            .incremental_relay_fee
-            .saturating_mul(policy::weight_to_vsize(weight))
-            .div_ceil(1000);
-        if additional < min_relay {
-            let detail = format!(
-                "insufficient fee, rejecting replacement {}, not enough \
-                 additional fees to relay; {} < {}",
-                txid, format_btc(additional), format_btc(min_relay),
-            );
-            return Err(MempoolError::InsufficientReplacementFee(
-                new_fee,
-                conflict_fee_total + min_relay,
-                txid.to_string(),
-                detail,
-            ));
-        }
-
-        // Core's `CalculateChunksForRBF` checks the cluster limits before it
-        // builds a diagram, so a replacement whose cluster would pass them
-        // fails here, as a replacement, not later as `too-large-cluster`.
+        // Core's `ReplacementChecks` checks the cluster limits after the fees
+        // and before the diagram, and refuses a replacement past them as
+        // `too-large-cluster`, as it refuses any other transaction.
         let parents = Self::direct_mempool_parents(tx, ancestors);
-        if Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted).is_err() {
-            return Err(MempoolError::DoesNotImproveFeerateDiagram(
-                "cluster size limit exceeded".to_string(),
-            ));
-        }
+        Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted)?;
 
         Self::rbf_improves_diagram(
             inner, cfg, weight, new_fee, &parents, conflicts, ancestors, &all_evicted,
         )?;
 
         Ok(all_evicted)
+    }
+
+    /// BIP 125 opt-in: a transaction may be replaced under
+    /// `-mempoolfullrbf=0` when an input signals it. BIP 431: a TRUC
+    /// transaction always may.
+    fn signals_rbf(tx: &Transaction) -> bool {
+        tx.version.0 == truc::TRUC_VERSION || tx.input.iter().any(|i| i.sequence.0 < 0xffff_fffe)
+    }
+
+    /// Core's `PaysForRBF` (`src/policy/rbf.cpp`), rules 3 and 4: a
+    /// replacement pays at least what it evicts, and on top of that its own
+    /// relay at the incremental feerate. On failure, the fee it needed and
+    /// Core's message, which the single and package paths each prefix.
+    fn pays_for_rbf(
+        original_fees: u64,
+        replacement_fees: u64,
+        replacement_vsize: u64,
+        cfg: &MempoolConfig,
+        txid: &Txid,
+    ) -> Result<(), (u64, String)> {
+        if replacement_fees < original_fees {
+            return Err((
+                original_fees,
+                format!(
+                    "rejecting replacement {}, less fees than conflicting txs; {} < {}",
+                    txid,
+                    format_btc(replacement_fees),
+                    format_btc(original_fees),
+                ),
+            ));
+        }
+        let additional = replacement_fees - original_fees;
+        // Saturating: the release profile has no overflow checks, so a
+        // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
+        // floor — the opposite of what the operator asked for.
+        let min_relay = cfg.incremental_relay_fee.saturating_mul(replacement_vsize).div_ceil(1000);
+        if additional < min_relay {
+            return Err((
+                original_fees + min_relay,
+                format!(
+                    "rejecting replacement {}, not enough additional fees to relay; {} < {}",
+                    txid,
+                    format_btc(additional),
+                    format_btc(min_relay),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Core's `ImprovesFeerateDiagram`: the mempool the replacement would
@@ -5896,7 +6004,7 @@ impl Mempool {
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<(Txid, usize, u64), MempoolError> {
-        let pre = self.test_prechecks(tx, chain_state, None)?;
+        let pre = self.test_prechecks(tx, chain_state, None, false)?;
         self.test_finish(tx, chain_state, script_verifier, pre)
     }
 
@@ -5906,11 +6014,19 @@ impl Mempool {
     /// multi-transaction `testmempoolaccept`: their outputs may be spent,
     /// replacement and sibling eviction are refused, and the cluster limits
     /// are left to the caller, who checks the package as a whole.
+    ///
+    /// `replacing` is a member of a package that replaces mempool
+    /// transactions, as `submitpackage` judges one before committing it
+    /// (Core's `PreChecks` under `m_package_feerates`, ahead of
+    /// `PackageRBFChecks`): its conflicts are allowed, and neither its own
+    /// feerate nor its replacement is judged here, because the caller judges
+    /// the package's together.
     fn test_prechecks(
         &self,
         tx: &Transaction,
         chain_state: &ChainState,
         package: Option<&[Transaction]>,
+        replacing: bool,
     ) -> Result<TestPrechecked, MempoolError> {
         let txid = tx.compute_txid();
         let cfg = self.config.read().clone();
@@ -5966,7 +6082,7 @@ impl Mempool {
 
         // Core's `PreChecks` with `m_allow_replacement` off, as a
         // multi-transaction `testmempoolaccept` runs it.
-        if package.is_some() && !conflicts.is_empty() {
+        if package.is_some() && !conflicts.is_empty() && !replacing {
             return Err(MempoolError::ReplacementDisallowed);
         }
 
@@ -6093,10 +6209,10 @@ impl Mempool {
             cfg.incremental_relay_fee,
         );
         let required = policy::fee_for_rate(min_fee, weight_u64);
-        if required > 0 && effective_fee < required {
+        if required > 0 && effective_fee < required && !replacing {
             return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
         }
-        if fee_rate < cfg.min_fee_rate {
+        if fee_rate < cfg.min_fee_rate && !replacing {
             return Err(MempoolError::InsufficientFee(
                 effective_fee,
                 policy::fee_for_rate(cfg.min_fee_rate, weight_u64),
@@ -6123,7 +6239,7 @@ impl Mempool {
             &PackageAdmit { no_sibling_eviction: package.is_some(), ..Default::default() },
         )?;
         let mut evicted: HashSet<Txid> = HashSet::new();
-        if !conflicts.is_empty() {
+        if !conflicts.is_empty() && !replacing {
             evicted = Self::rbf_check(
                 &inner,
                 &cfg,
@@ -6153,6 +6269,8 @@ impl Mempool {
             prev_is_coinbase,
             ancestors,
             mempool_parents,
+            conflicts,
+            modified_fee: effective_fee,
             cfg,
         })
     }
@@ -6166,6 +6284,26 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
     ) -> Result<(Txid, usize, u64), MempoolError> {
+        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting(), None)
+            .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
+    }
+
+    /// [`Self::test_finish`], also returning the quarantine scope the policy
+    /// would give the transaction. `inherited` is the scope of a parent not
+    /// yet in the mempool, which the transaction takes on as it would from a
+    /// mempool ancestor. `mempool_bytes` is the mempool size the policy sees
+    /// in place of the current one: a package child is judged at admission
+    /// after its parent has replaced what it conflicts with.
+    fn test_finish_scoped(
+        &self,
+        tx: &Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        pre: TestPrechecked,
+        inherited: QuarantineScope,
+        mempool_bytes: Option<usize>,
+    ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
+        let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
             txid, vsize, fee, fee_rate, weight, prev_outputs, prev_is_coinbase, mut ancestors, cfg, ..
         } = pre;
@@ -6211,7 +6349,7 @@ impl Mempool {
             let ctx = PolicyCtx {
                 network: chain_state.network,
                 height: tip_height,
-                mempool_bytes: inner.total_bytes,
+                mempool_bytes: mempool_bytes.unwrap_or(inner.total_bytes),
             };
             let verdict = policy_engine::evaluate(
                 rs, tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight, &cfg, ctx,
@@ -6234,14 +6372,17 @@ impl Mempool {
                     scope.template |= ae.scope.template;
                 }
             }
+            scope.relay |= inherited.relay;
+            scope.template |= inherited.template;
             if scope.relay {
                 return Err(MempoolError::Quarantined(
                     own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()),
                 ));
             }
+            final_scope = scope;
         }
 
-        Ok((txid, vsize, fee))
+        Ok((txid, vsize, fee, final_scope))
     }
 
     /// A multi-transaction `testmempoolaccept`: Core's
@@ -6275,7 +6416,7 @@ impl Mempool {
             let checked = if already_known(tx) {
                 Err(MempoolError::AlreadyKnown)
             } else {
-                self.test_prechecks(tx, chain_state, Some(&txs[..i]))
+                self.test_prechecks(tx, chain_state, Some(&txs[..i]), false)
             };
             match checked {
                 Ok(p) => pre.push(p),
@@ -6438,6 +6579,162 @@ impl Mempool {
             }
         }
         None
+    }
+
+    /// Core's package RBF, everything before the commit
+    /// (`AcceptMultipleTransactions` with `m_allow_replacement`): each
+    /// member's `PreChecks`, then `PackageRBFChecks`, the cluster limits,
+    /// `CheckEphemeralSpends` and the scripts. Nothing is evicted or admitted
+    /// here, so a package refused at any step leaves the mempool as it was;
+    /// the caller commits a package that passes.
+    ///
+    /// `members` are the transactions `submitpackage` evaluates together, in
+    /// package order, after the rest were admitted or refused on their own.
+    fn package_rbf_checks(
+        &self,
+        members: &[Transaction],
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<(), PackageRbfRefusal> {
+        let mut pre = Vec::with_capacity(members.len());
+        for (i, tx) in members.iter().enumerate() {
+            let checked = self
+                .test_prechecks(tx, chain_state, Some(&members[..i]), true)
+                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+            pre.push(checked);
+        }
+        let failed = |reason: &str, detail: Option<String>| {
+            PackageRbfRefusal::Package(match detail {
+                Some(detail) => format!("package RBF failed: {reason}, {detail}"),
+                None => format!("package RBF failed: {reason}"),
+            })
+        };
+
+        // Only a parent and its child: with more, or with an unconfirmed
+        // parent in the mempool, the new cluster would hold more than the
+        // two of them, which the checks below do not describe.
+        if pre.len() != 2 || !members[1].input.iter().any(|i| i.previous_output.txid == pre[0].txid) {
+            return Err(failed("package must be 1-parent-1-child", None));
+        }
+        if pre.iter().any(|p| !p.mempool_parents.is_empty()) {
+            return Err(failed("new transaction cannot have mempool ancestors", None));
+        }
+
+        let cfg = self.config.read().clone();
+        let inner = self.inner.read();
+        let child = pre[1].txid;
+        let conflicts: HashSet<Txid> = pre.iter().flat_map(|p| p.conflicts.iter().copied()).collect();
+
+        // `-mempoolfullrbf=0`: every direct conflict must signal, as
+        // `rbf_check` asks of a single replacement. Core has no such switch.
+        if !cfg.full_rbf {
+            for (i, p) in pre.iter().enumerate() {
+                if p.conflicts.iter().any(|c| inner.entries.get(c).is_some_and(|e| !Self::signals_rbf(&e.tx))) {
+                    return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+                }
+            }
+        }
+
+        // Rule 5 over the conflicts of both, as the child's replacement.
+        let bound = Self::rbf_eviction_bound(&cfg);
+        let clusters =
+            Self::conflicting_cluster_count(&inner, &conflicts, policy::MAX_REPLACEMENT_CANDIDATES, bound);
+        if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
+            return Err(failed(
+                "too many potential replacements",
+                Some(format!(
+                    "rejecting replacement {child}; too many conflicting clusters ({clusters} > {})",
+                    policy::MAX_REPLACEMENT_CANDIDATES
+                )),
+            ));
+        }
+        let Some((evicted, conflict_fees)) = Self::rbf_conflict_set(&inner, &conflicts, bound) else {
+            return Err(failed(
+                "too many potential replacements",
+                Some(format!("rejecting replacement {child}; the eviction set exceeds {bound} transactions")),
+            ));
+        };
+
+        // Rules 3 and 4 over the package: its fees against everything it
+        // evicts, and its own relay on top, at its summed vsize.
+        let fee: u64 = pre.iter().map(|p| p.modified_fee).sum();
+        let vsize: u64 = pre.iter().map(|p| p.vsize as u64).sum();
+        let weight: u64 = pre.iter().map(|p| p.adj_weight).sum();
+        Self::pays_for_rbf(conflict_fees, fee, vsize, &cfg, &child)
+            .map_err(|(_, err)| failed("insufficient anti-DoS fees", Some(err)))?;
+
+        // The two must be one chunk, the child paying for its parent, not
+        // only for the replacement's relay. Core's `CFeeRate` comparison is
+        // exact; its text is the rate per kvB, rounded down.
+        let parent_fee = pre[0].modified_fee;
+        let parent_vsize = pre[0].vsize as u64;
+        if u128::from(fee) * u128::from(parent_vsize) <= u128::from(parent_fee) * u128::from(vsize) {
+            let per_kvb = |fee: u64, vsize: u64| {
+                let rate = fee.saturating_mul(1000) / vsize.max(1);
+                format!("{}.{:08} BTC/kvB", rate / 100_000_000, rate % 100_000_000)
+            };
+            return Err(failed(
+                "package feerate is less than or equal to parent feerate",
+                Some(format!(
+                    "package feerate {} <= parent feerate is {}",
+                    per_kvb(fee, vsize),
+                    per_kvb(parent_fee, parent_vsize)
+                )),
+            ));
+        }
+
+        // The two make a cluster of their own: no mempool parent, and
+        // nothing in the mempool spends them yet.
+        if pre.len() > cfg.max_cluster_count || weight > cfg.max_cluster_vsize.saturating_mul(4) {
+            return Err(PackageRbfRefusal::Package(MempoolError::TooLongMempoolChain.state_string()));
+        }
+
+        // A single chunk, so the new side of the diagram is the package as
+        // one transaction with no mempool parents.
+        Self::rbf_improves_diagram(&inner, &cfg, weight, fee, &[], &conflicts, &HashSet::new(), &evicted)
+            .map_err(|e| failed(&e.reject_details().unwrap_or_else(|| e.reject_reason()), None))?;
+
+        // Unconditionally, unlike `testmempoolaccept`: admission enforces the
+        // dust spends whatever `-acceptnonstdtxn` says, and a refusal there
+        // would come after the parent had evicted its conflicts.
+        if let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, members) {
+            return Err(PackageRbfRefusal::Member(i, e.state_string()));
+        }
+
+        // The mempool size the child's policy sees on admission: after the
+        // parent has replaced what it conflicts with and gone in.
+        let parent_evicted = Self::rbf_conflict_set(&inner, &pre[0].conflicts, usize::MAX)
+            .map(|(set, _)| set)
+            .unwrap_or_default();
+        let freed: usize = parent_evicted
+            .iter()
+            .filter_map(|t| inner.entries.get(t))
+            .map(|e| bitcoin::consensus::serialize(&e.tx).len())
+            .sum();
+        let child_sees = inner.total_bytes.saturating_sub(freed) + bitcoin::consensus::serialize(&members[0]).len();
+        drop(inner);
+
+        // Scripts and the policy, the child taking on its parent's scope.
+        // A member the policy would hold may not displace an acting
+        // transaction, as admission refuses it (two-class isolation); found
+        // here, before the parent evicts anything.
+        let mut inherited = QuarantineScope::acting();
+        for (i, (tx, checked)) in members.iter().zip(pre).enumerate() {
+            let own_conflicts = checked.conflicts.clone();
+            let (_, _, _, scope) = self
+                .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited, (i > 0).then_some(child_sees))
+                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+            if scope.is_quarantined()
+                && own_conflicts
+                    .iter()
+                    .any(|c| self.inner.read().entries.get(c).is_some_and(|e| e.scope.is_acting()))
+            {
+                return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+            }
+            inherited.relay |= scope.relay;
+            inherited.template |= scope.template;
+        }
+        Ok(())
     }
 
     /// Count how many dust outputs a transaction has (below the dust threshold
@@ -6695,6 +6992,10 @@ impl Mempool {
         // `TX_RECONSIDERABLE`, which a child in the package may pay for. Each
         // with the error it got on its own.
         let mut cpfp_parents: HashMap<Txid, String> = HashMap::new();
+        // Members refused on their own only for what their replacement pays:
+        // Core's `TX_RECONSIDERABLE` from `ReplacementChecks`, which the
+        // package may pay for together (package RBF).
+        let mut rbf_members: HashSet<Txid> = HashSet::new();
         // What each deferred member was refused for on its own, which is what
         // Core reports for it if the package is not evaluated together, or
         // fails as a whole for a reason that belongs to another member.
@@ -6934,6 +7235,13 @@ impl Mempool {
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                     }
                 }
+                Err(
+                    e @ (MempoolError::InsufficientReplacementFee(..)
+                    | MempoolError::DoesNotImproveFeerateDiagram(..)),
+                ) => {
+                    deferred_err.insert(ptx.txid, e.state_string());
+                    rbf_members.insert(ptx.txid);
+                }
                 Err(e) => {
                     failed.insert(ptx.wtxid, e.state_string());
                 }
@@ -6948,7 +7256,11 @@ impl Mempool {
         let quit_early = !failed.is_empty() || !over_maxfeerate.is_empty();
         let eval: Vec<&PkgTx> = pkg
             .iter()
-            .filter(|p| cpfp_parents.contains_key(&p.txid) || ephemeral_parents.contains_key(&p.txid))
+            .filter(|p| {
+                cpfp_parents.contains_key(&p.txid)
+                    || ephemeral_parents.contains_key(&p.txid)
+                    || rbf_members.contains(&p.txid)
+            })
             .collect();
         let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, String>, members: &[&PkgTx]| {
             for p in members {
@@ -7035,6 +7347,132 @@ impl Mempool {
                     package_eval = false;
                 }
             }
+        }
+        // Core's package RBF: members evaluated together that replace mempool
+        // transactions. Judged whole, scripts included, before anything is
+        // evicted; then committed, and the paths below have nothing left.
+        let replaces = package_eval && {
+            let inner = self.inner.read();
+            eval.iter().any(|p| p.tx.input.iter().any(|i| inner.spends.contains_key(&i.previous_output)))
+        };
+        if replaces {
+            let members: Vec<Transaction> = eval.iter().map(|p| p.tx.clone()).collect();
+            match self.package_rbf_checks(&members, chain_state, script_verifier) {
+                Err(PackageRbfRefusal::Package(msg)) => {
+                    refuse_deferred(&mut failed, &eval);
+                    package_error = Some(msg);
+                }
+                Err(PackageRbfRefusal::Member(i, err)) => {
+                    let rest: Vec<&PkgTx> =
+                        eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+                    refuse_deferred(&mut failed, &rest);
+                    failed.insert(eval[i].wtxid, err);
+                }
+                Ok(()) => {
+                    // Parent, then child, under one hold of the mempool lock,
+                    // so no reader sees the parent in and the child not, as
+                    // Core commits a package's changeset at once. A block can
+                    // still commit between the two (the chainstate is not
+                    // under this lock), and then the child fails; the parent
+                    // comes back out and what it evicted is restored, under
+                    // the same hold. Every event waits for the lock's release.
+                    let (parent, child) = (eval[0], eval[1]);
+                    let hold = || PackageAdmit {
+                        defer_trim: true,
+                        no_sibling_eviction: true,
+                        package_rbf: true,
+                        hold_events: true,
+                        ..Default::default()
+                    };
+                    let mut parent_admit = PackageAdmit { skip_fee_floor: true, ..hold() };
+                    let mut child_admit = hold();
+                    let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
+                    let outcome = {
+                        let mut inner = self.inner.write();
+                        match self.accept_transaction_unexpired(
+                            parent.tx.clone(),
+                            chain_state,
+                            script_verifier,
+                            TxSource::Rpc,
+                            false,
+                            Vec::new(),
+                            None,
+                            Some(&mut inner),
+                            &mut parent_admit,
+                        ) {
+                            Err(e) => Err((parent, e.state_string())),
+                            Ok(parent_txid) => {
+                                #[cfg(test)]
+                                if let Some(hook) = self.between_package_members.lock().as_ref() {
+                                    hook(self);
+                                }
+                                match self.accept_transaction_unexpired(
+                                    child.tx.clone(),
+                                    chain_state,
+                                    script_verifier,
+                                    TxSource::Rpc,
+                                    false,
+                                    Vec::new(),
+                                    None,
+                                    Some(&mut inner),
+                                    &mut child_admit,
+                                ) {
+                                    Ok(child_txid) => Ok((parent_txid, child_txid)),
+                                    Err(e) => {
+                                        gone = self.undo_package_parent(
+                                            &mut inner,
+                                            parent_txid,
+                                            std::mem::take(&mut parent_admit.evicted_entries),
+                                            &parent_admit.held,
+                                            chain_state,
+                                        );
+                                        Err((child, e.state_string()))
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match outcome {
+                        Ok((parent_txid, child_txid)) => {
+                            for admit in [&mut parent_admit, &mut child_admit] {
+                                for event in admit.held.drain(..) {
+                                    self.emit(event);
+                                }
+                                for event in admit.held_quarantine.drain(..) {
+                                    self.emit_quarantine(event);
+                                }
+                                let replaced_txs = std::mem::take(&mut admit.held_replaced_txs);
+                                if !replaced_txs.is_empty()
+                                    && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
+                                {
+                                    sink(replaced_txs);
+                                }
+                                member_replaced.extend(admit.replaced.drain(..));
+                            }
+                            let inner = self.inner.read();
+                            for (p, txid) in [(parent, parent_txid), (child, child_txid)] {
+                                accepted_txids.insert(txid);
+                                if let Some(entry) = inner.entries.get(&txid) {
+                                    accepted_results.push(AcceptedMember::from_entry(
+                                        p.wtxid,
+                                        txid,
+                                        entry,
+                                        Admission::Subpackage,
+                                    ));
+                                }
+                            }
+                        }
+                        Err((member, err)) => {
+                            self.emit_evicted(&gone, EvictReason::BlockConflict);
+                            failed.insert(member.wtxid, err);
+                            let other = if member.txid == parent.txid { child } else { parent };
+                            refuse_deferred(&mut failed, &[other]);
+                        }
+                    }
+                    self.remove_expired();
+                }
+            }
+            package_eval = false;
         }
         if !package_eval {
             ephemeral_parents.clear();
@@ -7629,8 +8067,16 @@ impl Mempool {
         if txids.is_empty() {
             return Vec::new();
         }
-        let mut removed: Vec<Txid> = Vec::new();
         let mut inner = self.inner.write();
+        let removed = Self::remove_unannounced_locked(&mut inner, txids);
+        self.sync_unbroadcast_len(&inner);
+        removed
+    }
+
+    /// [`Self::remove_unannounced`] under a lock the caller holds; the
+    /// caller syncs the unbroadcast count.
+    fn remove_unannounced_locked(inner: &mut MempoolInner, txids: &[Txid]) -> Vec<Txid> {
+        let mut removed: Vec<Txid> = Vec::new();
         for txid in txids {
             if let Some(entry) = inner.entries.remove(txid) {
                 let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
@@ -7642,8 +8088,69 @@ impl Mempool {
                 removed.push(*txid);
             }
         }
-        self.sync_unbroadcast_len(&inner);
         removed
+    }
+
+    /// Take a replacing package's parent back out after its child failed,
+    /// and put back what it evicted. Nothing about the parent was announced
+    /// (`PackageAdmit::hold_events`), so the mempool is as it was, less what
+    /// the chain has since made invalid: an evicted transaction whose input
+    /// is gone or now spent is left out, with its descendants, and returned
+    /// for the caller to announce as a block conflict, under the sequence
+    /// number its eviction took, once it has released the lock.
+    fn undo_package_parent(
+        &self,
+        inner: &mut MempoolInner,
+        parent: Txid,
+        evicted: Vec<(Txid, MempoolEntry, Option<HashSet<std::net::IpAddr>>)>,
+        held: &[MempoolEvent],
+        chain_state: &ChainState,
+    ) -> Vec<(Txid, QuarantineScope, u64)> {
+        Self::remove_unannounced_locked(inner, &[parent]);
+        let left_at: HashMap<Txid, u64> = held
+            .iter()
+            .filter_map(|event| match event {
+                MempoolEvent::LeaveReplaced { txid, mempool_sequence, .. } => Some((*txid, *mempool_sequence)),
+                _ => None,
+            })
+            .collect();
+        let mut unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>> = HashMap::new();
+        let mut entries: FxHashMap<Txid, MempoolEntry> = FxHashMap::default();
+        for (txid, entry, record) in evicted {
+            if let Some(record) = record {
+                unbroadcast.insert(txid, record);
+            }
+            entries.insert(txid, entry);
+        }
+        let order = Self::topological_order(&entries);
+        let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
+        for txid in order {
+            let Some(entry) = entries.remove(&txid) else { continue };
+            let valid = !inner.entries.contains_key(&txid)
+                && entry.tx.input.iter().all(|i| {
+                    !inner.spends.contains_key(&i.previous_output)
+                        && (inner
+                            .entries
+                            .get(&i.previous_output.txid)
+                            .is_some_and(|p| (i.previous_output.vout as usize) < p.tx.output.len())
+                            || chain_state.get_coin(&i.previous_output).is_some())
+                });
+            if valid {
+                for input in &entry.tx.input {
+                    inner.spends.insert(input.previous_output, txid);
+                }
+                let size = bitcoin::consensus::serialize(&entry.tx).len();
+                inner.account_insert(entry.scope, size);
+                inner.entries.insert(txid, entry);
+                if let Some(record) = unbroadcast.remove(&txid) {
+                    inner.unbroadcast.insert(txid, record);
+                }
+            } else if entry.scope.is_acting() {
+                gone.push((txid, entry.scope, left_at.get(&txid).copied().unwrap_or(0)));
+            }
+        }
+        self.sync_unbroadcast_len(inner);
+        gone
     }
 
     /// Core's `TrimToSize`: evict, lowest descendant score first, until each
@@ -8619,6 +9126,10 @@ mod sigopsize_tests;
 #[cfg(test)]
 #[path = "pool_fullpool_tests.rs"]
 mod fullpool_tests;
+
+#[cfg(test)]
+#[path = "pool_package_rbf_tests.rs"]
+mod package_rbf_tests;
 
 #[cfg(test)]
 #[path = "pool_cpfp_tests.rs"]

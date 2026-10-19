@@ -165,11 +165,10 @@ fn an_unpaid_parent_leaves_with_its_child() {
 }
 
 /// A parent below the floors that replaces a mempool transaction is Core's
-/// package RBF, which satd does not do. It keeps its fee refusal, and what it
-/// would have replaced stays: a replacement cannot be undone if the child
-/// then fails.
+/// package RBF: the child pays for the parent and for what it replaces. The
+/// parent's events wait for the child's, as any parent's below the floors.
 #[test]
-fn a_parent_below_the_floor_that_replaces_is_refused() {
+fn a_parent_below_the_floor_replaces_on_its_childs_fee() {
     let (cs, mp, dir) = floor_env(&[1]);
     let resident = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 200, 1, 9));
     mp.inner.write().rolling.lock().package_removed(20_000);
@@ -177,13 +176,18 @@ fn a_parent_below_the_floor_that_replaces_is_refused() {
     // floor, so only a package could let it in.
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
     let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 10_000, 1, 2);
+    assert!(matches!(
+        mp.test_accept(&parent, &cs, &NoopVerifier),
+        Err(MempoolError::MempoolMinFeeNotMet(..))
+    ));
+    let mut rx = events(&mp);
 
     let r = submit(&mp, &cs, &[&parent, &child]);
 
-    assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
-    assert!(error(&r, &parent).starts_with("mempool min fee not met"), "{:?}", r.tx_results);
-    assert_eq!(pool(&mp), HashSet::from([resident]));
-    assert!(r.replaced.is_empty());
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    assert_eq!(pool(&mp), HashSet::from([parent.compute_txid(), child.compute_txid()]));
+    assert_eq!(r.replaced, vec![resident]);
+    assert_eq!(entered(&mut rx), vec![parent.compute_txid(), child.compute_txid()], "parent first, with its child");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

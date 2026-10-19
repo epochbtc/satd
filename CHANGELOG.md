@@ -49,6 +49,12 @@ item below is (or will be) written up in full in the in-development
   read from the address index's spend rows. `-txospenderindex` is now
   refused with pruning, as in Core, and without `-addressindex`.
 
+- Package RBF in `submitpackage`, as in Core v31: a child may pay for its
+  parent's replacement, which the parent could not afford alone. Core's
+  `PackageRBFChecks` apply (one parent and one child, no unconfirmed
+  ancestors, the package's fees and feerate, the feerate diagram), and
+  both transactions' scripts are checked before anything is evicted.
+
 ### Fixed
 
 - The Rust script engine computes a tapscript signature hash as Core does,
@@ -66,8 +72,8 @@ item below is (or will be) written up in full in the in-development
   refused bumps Core accepts and accepted replacements that drop a rich
   descendant, so some replacements satd accepted are now refused. The
   cluster order approximates Core's optimal one. A replacement past the
-  cluster limits is now `replacement-failed, cluster size limit exceeded`,
-  as in Core.
+  cluster limits is refused as `too-large-cluster` before its diagram is
+  compared, as in Core.
 - An announced transaction is requested from one peer at a time, as by Core's
   `TxRequestTracker`: a transaction announced by several peers was downloaded
   from every one of them. The next announcer is asked when the request times

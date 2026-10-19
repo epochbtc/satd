@@ -87,12 +87,12 @@ fn a_replacement_that_drops_a_rich_grandchild_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Core checks the cluster limits inside the replacement checks
-/// (`CalculateChunksForRBF`), so a replacement that would grow its cluster
-/// past them is `replacement-failed, cluster size limit exceeded`, not
-/// `too-large-cluster`.
+/// Core checks the cluster limits inside `ReplacementChecks`, after the
+/// fees and before the diagram, so a replacement that would grow its
+/// cluster past them is `too-large-cluster` even where its diagram would
+/// fail too.
 #[test]
-fn a_replacement_past_the_cluster_limit_fails_as_a_replacement() {
+fn a_replacement_past_the_cluster_limit_is_too_large_before_its_diagram() {
     let (cs, mp, dir) = env(&[1, 2]);
     mp.config.write().max_cluster_count = 2;
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
@@ -103,13 +103,21 @@ fn a_replacement_past_the_cluster_limit_fails_as_a_replacement() {
     let o = accept(&mp, &cs, &other).expect("an unrelated transaction");
 
     // Replaces the child and also spends the unrelated one: three together.
+    // Padded, it pays more than the child but at a lower feerate, which
+    // leaves the diagram worse at its start.
     let replacement =
-        spend(&[out(p, 0), out(o, 0)], value + other.output[0].value.to_sat(), 10_000, 1, 4);
+        padded(spend(&[out(p, 0), out(o, 0)], value + other.output[0].value.to_sat(), 10_000, 1, 4), 5_000);
     let err = accept(&mp, &cs, &replacement).expect_err("refused");
-    assert_eq!(err.state_string(), "replacement-failed, cluster size limit exceeded");
+    assert_eq!(err.state_string(), "too-large-cluster");
     assert_eq!(
         mp.test_accept(&replacement, &cs, &NoopVerifier).expect_err("refused").state_string(),
-        "replacement-failed, cluster size limit exceeded"
+        "too-large-cluster"
+    );
+    // Within the limits, the diagram is what refuses it.
+    mp.config.write().max_cluster_count = 64;
+    assert_eq!(
+        mp.test_accept(&replacement, &cs, &NoopVerifier).expect_err("refused").state_string(),
+        "replacement-failed, insufficient feerate: does not improve feerate diagram"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
