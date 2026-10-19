@@ -115,9 +115,9 @@ fn version() -> VersionMessage {
 #[test]
 fn a_peer_stalling_block_download_is_disconnected() {
     // The chain both peers claim to have: real headers and blocks, mined by a
-    // second node. 300 blocks is more than one peer's 128-block share, so
-    // the serving peer is given work of its own while the staller holds the
-    // heights it took first.
+    // second node. 300 blocks is far more than one peer's share of the
+    // download (16 blocks in flight), so the serving peer is given work of
+    // its own while the staller holds the heights it took first.
     const BLOCKS: u32 = 300;
     let mut source = TestNode::start(&[]);
     source.mine_blocks(u64::from(BLOCKS), ADDR);
