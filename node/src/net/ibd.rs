@@ -33,6 +33,10 @@ struct PeerSlots {
     /// Last time `record_failure` actually incremented `consecutive_failures`
     /// for this peer. Used to dedupe release bursts.
     last_failure_at: Option<Instant>,
+    /// Last time this peer delivered a block it was asked for. Unlike
+    /// `last_activity`, which an assignment also restarts, only a delivery
+    /// moves it, so it says whether the peer, and our link to it, is alive.
+    last_delivery: Option<Instant>,
 }
 
 /// BitTorrent-style download coordinator for parallel IBD.
@@ -102,6 +106,13 @@ pub const STALL_TIMEOUT_BASE: Duration = Duration::from_secs(15);
 
 /// The stall timeout's ceiling, Core's `BLOCK_STALLING_TIMEOUT_MAX`.
 pub const STALL_TIMEOUT_MAX: Duration = Duration::from_secs(64);
+
+/// How long a peer may hold blocks without delivering one when no other peer
+/// is delivering either. Core's block download timeout
+/// (`BLOCK_DOWNLOAD_TIMEOUT_BASE` times the 10-minute block spacing,
+/// `net_processing.cpp`) is the backstop that disconnects such a peer, since
+/// its stall detection needs another peer to be waiting on it.
+pub const QUIET_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long a peer is barred from re-claiming a height after it failed to
 /// deliver. Pegged longer than the per-height stale timeout so the release
@@ -252,6 +263,7 @@ impl IbdScheduler {
                 last_activity: Instant::now(),
                 consecutive_failures: 0,
                 last_failure_at: None,
+                last_delivery: None,
             });
 
         let current_assigned = slots.assigned.len() as u32;
@@ -421,6 +433,7 @@ impl IbdScheduler {
                 // The peer delivered what it was asked for: it is alive.
                 slots.blocks_received += 1;
                 slots.last_activity = Instant::now();
+                slots.last_delivery = Some(slots.last_activity);
                 slots.consecutive_failures = 0;
                 slots.last_failure_at = None;
             }
@@ -470,20 +483,47 @@ impl IbdScheduler {
     /// connected, unmarked, and could be handed the same heights again on the
     /// same tick, while the blocks it was still sending arrived unrequested
     /// (#972).
+    ///
+    /// A peer is judged stalling only while another peer has delivered a
+    /// block within the stall timeout. When none has, the silence is more
+    /// likely our own link than every peer at once, and dropping them all
+    /// would leave the node to redial from scratch once the link is back.
+    /// Core's stall detection likewise needs another peer to be waiting on
+    /// the staller. Such a peer is dropped only after
+    /// [`QUIET_DOWNLOAD_TIMEOUT`], Core's block download timeout.
     pub fn take_stalled_peer(&mut self) -> Option<PeerId> {
         let now = Instant::now();
         let peer_id = self
             .peer_slots
             .iter()
-            .filter(|(_, slots)| {
+            .filter(|&(&id, slots)| {
+                let idle = now.duration_since(slots.last_activity);
                 !slots.assigned.is_empty()
-                    && now.duration_since(slots.last_activity) > self.stall_timeout
+                    && idle > self.stall_timeout
+                    && (idle > QUIET_DOWNLOAD_TIMEOUT
+                        || self.another_peer_delivered_within(id, now, self.stall_timeout))
             })
             .min_by_key(|(_, slots)| slots.last_activity)
             .map(|(&id, _)| id)?;
         self.peer_disconnected(peer_id);
         self.stall_timeout = (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX);
         Some(peer_id)
+    }
+
+    /// Whether a peer other than `peer` delivered a block within `window`
+    /// of `now`.
+    fn another_peer_delivered_within(&self, peer: PeerId, now: Instant, window: Duration) -> bool {
+        self.peer_slots.iter().any(|(&id, slots)| {
+            id != peer && slots.last_delivery.is_some_and(|at| now.duration_since(at) <= window)
+        })
+    }
+
+    /// Register `peer` as having just delivered a block: the other peer a
+    /// stall judgement needs (see [`Self::take_stalled_peer`]).
+    #[cfg(test)]
+    fn note_delivering_peer(&mut self, peer: PeerId) {
+        self.register_peer(peer);
+        self.peer_slots.get_mut(&peer).unwrap().last_delivery = Some(Instant::now());
     }
 
     /// The current stall timeout; see [`Self::take_stalled_peer`].
@@ -531,8 +571,15 @@ impl IbdScheduler {
                     timeout
                 };
                 let over = |at: Option<&Instant>, limit| at.is_some_and(|at| now.duration_since(*at) > limit);
-                let holder_failed = over(self.requested_at.get(&h), holder_timeout);
-                (holder_failed || over(self.in_flight_at.get(&h), timeout)).then_some((h, p, holder_failed))
+                let holder_timed_out = over(self.requested_at.get(&h), holder_timeout);
+                // The holder's timeout running out is its failure only while
+                // another peer is delivering: when none is, the silence is
+                // likely our own link, and counting it would have
+                // `silent_peers` drop every peer (see `take_stalled_peer`).
+                // The height goes back to the pool either way.
+                let holder_failed =
+                    holder_timed_out && self.another_peer_delivered_within(p, now, holder_timeout);
+                (holder_timed_out || over(self.in_flight_at.get(&h), timeout)).then_some((h, p, holder_failed))
             })
             .collect();
 
@@ -727,6 +774,7 @@ impl IbdScheduler {
             last_activity: Instant::now(),
             consecutive_failures: 0,
             last_failure_at: None,
+            last_delivery: None,
         });
     }
 
@@ -1469,6 +1517,7 @@ mod tests {
         let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
 
         let _ = sched.assign_blocks(1);
+        sched.note_delivering_peer(2);
 
         // Artificially set last_activity to the past
         if let Some(slots) = sched.peer_slots.get_mut(&1) {
@@ -1496,6 +1545,7 @@ mod tests {
         for peer in 1..=3 {
             sched.assign_blocks(peer);
         }
+        sched.note_delivering_peer(4);
         let idle = |sched: &mut IbdScheduler, peer: PeerId, secs: u64| {
             sched.peer_slots.get_mut(&peer).unwrap().last_activity =
                 Instant::now() - Duration::from_secs(secs);
@@ -1515,6 +1565,7 @@ mod tests {
 
         // Capped at Core's 64s.
         idle(&mut sched, 1, 200);
+        sched.note_delivering_peer(4);
         assert_eq!(sched.take_stalled_peer(), Some(1));
         assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_MAX);
 
@@ -1538,6 +1589,7 @@ mod tests {
         let (cs, dir) = make_chain_state_with_headers(100);
         let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
         let long_ago = Instant::now() - Duration::from_secs(200);
+        sched.note_delivering_peer(3);
         sched.register_peer(1);
         sched.peer_slots.get_mut(&1).unwrap().last_activity = long_ago;
         sched.assign_blocks(1);
@@ -1611,6 +1663,96 @@ mod tests {
             heights.iter().all(|&h| !sched.is_peer_on_cooldown(h, 1, now)),
             "peer 1 must not be barred from heights it was not given time to deliver"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When no peer has delivered a block within the stall timeout, the
+    /// silence is more likely our own link than every peer at once. With
+    /// every peer judged on one clock, an uplink outage of a minute or so
+    /// dropped them one after another as the timeout doubled, and then the
+    /// rest in a single pass.
+    #[test]
+    fn peers_all_quiet_together_are_not_dropped_for_stalling() {
+        let (cs, dir) = make_chain_state_with_headers(100);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+        for peer in 1..=3 {
+            sched.assign_blocks(peer);
+            sched.peer_slots.get_mut(&peer).unwrap().last_activity =
+                Instant::now() - Duration::from_secs(70);
+        }
+        // Delivered once, but not within the stall timeout.
+        sched.peer_slots.get_mut(&1).unwrap().last_delivery =
+            Some(Instant::now() - Duration::from_secs(70));
+
+        assert_eq!(sched.take_stalled_peer(), None);
+        assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_BASE, "nothing dropped, nothing doubled");
+        assert!((1..=3).all(|p| sched.peer_slots.contains_key(&p)));
+
+        // Once one peer delivers, the others are judged again.
+        sched.note_delivering_peer(4);
+        assert_eq!(sched.take_stalled_peer().map(|p| (1..=3).contains(&p)), Some(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's block download timeout is the backstop: a peer that holds
+    /// blocks for ten minutes without delivering is dropped even when no
+    /// other peer is delivering, so a node whose peers are all dead does not
+    /// keep them forever.
+    #[test]
+    fn a_quiet_peer_is_dropped_after_the_download_timeout() {
+        let (cs, dir) = make_chain_state_with_headers(50);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let idle = |sched: &mut IbdScheduler, secs: u64| {
+            sched.peer_slots.get_mut(&1).unwrap().last_activity =
+                Instant::now() - Duration::from_secs(secs);
+        };
+
+        idle(&mut sched, 120);
+        assert_eq!(sched.take_stalled_peer(), None, "alone and quiet for two minutes");
+        idle(&mut sched, QUIET_DOWNLOAD_TIMEOUT.as_secs() + 1);
+        assert_eq!(sched.take_stalled_peer(), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timed-out height goes back to the pool whether or not anyone is
+    /// delivering, but it counts against its holder only while another peer
+    /// is: otherwise an outage long enough for three releases had
+    /// `silent_peers` drop every peer.
+    #[test]
+    fn a_release_while_no_peer_delivers_charges_no_failure() {
+        let (cs, dir) = make_chain_state_with_headers(10);
+        let mut sched = IbdScheduler::new(10, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let heights: Vec<u32> = sched.peer_inflight_heights(1);
+        assert!(!heights.is_empty());
+        let backdate = |sched: &mut IbdScheduler, heights: &[u32]| {
+            let asked = Instant::now() - Duration::from_secs(120);
+            for h in heights {
+                sched.in_flight_at.insert(*h, asked);
+                sched.requested_at.insert(*h, asked);
+            }
+        };
+        backdate(&mut sched, &heights);
+
+        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        assert_eq!(released, heights.len(), "the heights go back to the pool");
+        assert_eq!(sched.peer_slots[&1].consecutive_failures, 0);
+
+        // With another peer delivering, the same release is peer 1's failure.
+        sched.note_delivering_peer(2);
+        sched.assign_blocks(1);
+        let heights: Vec<u32> = sched.peer_inflight_heights(1);
+        assert!(!heights.is_empty());
+        backdate(&mut sched, &heights);
+        assert_eq!(
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)),
+            heights.len()
+        );
+        assert_eq!(sched.peer_slots[&1].consecutive_failures, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

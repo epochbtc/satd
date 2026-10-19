@@ -132,6 +132,7 @@ fn only_a_requested_block_resets_the_stall_clock() {
     let mut sched = IbdScheduler::new(40, 0, &cs, 50_000);
     sched.assign_blocks(1);
     sched.assign_blocks(2);
+    sched.note_delivering_peer(3);
     let theirs = sched.peer_inflight_heights(2)[0];
     let old = Instant::now() - Duration::from_secs(100);
     {
