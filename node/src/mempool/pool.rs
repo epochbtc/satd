@@ -4885,17 +4885,9 @@ impl Mempool {
             }
             if let Some(conflict_entry) = inner.entries.get(conflict_txid)
                 && !cfg.full_rbf
+                && !Self::signals_rbf(&conflict_entry.tx)
             {
-                // BIP 431: a TRUC transaction is always replaceable.
-                let signals_rbf = conflict_entry.tx.version.0 == truc::TRUC_VERSION
-                    || conflict_entry
-                        .tx
-                        .input
-                        .iter()
-                        .any(|i| i.sequence.0 < 0xffff_fffe);
-                if !signals_rbf {
-                    return Err(MempoolError::ConflictingSpend);
-                }
+                return Err(MempoolError::ConflictingSpend);
             }
         }
 
@@ -4969,6 +4961,13 @@ impl Mempool {
         )?;
 
         Ok(all_evicted)
+    }
+
+    /// BIP 125 opt-in: a transaction may be replaced under
+    /// `-mempoolfullrbf=0` when an input signals it. BIP 431: a TRUC
+    /// transaction always may.
+    fn signals_rbf(tx: &Transaction) -> bool {
+        tx.version.0 == truc::TRUC_VERSION || tx.input.iter().any(|i| i.sequence.0 < 0xffff_fffe)
     }
 
     /// Core's `PaysForRBF` (`src/policy/rbf.cpp`), rules 3 and 4: a
@@ -6210,6 +6209,23 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
     ) -> Result<(Txid, usize, u64), MempoolError> {
+        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting())
+            .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
+    }
+
+    /// [`Self::test_finish`], also returning the quarantine scope the policy
+    /// would give the transaction. `inherited` is the scope of a parent not
+    /// yet in the mempool, which the transaction takes on as it would from a
+    /// mempool ancestor.
+    fn test_finish_scoped(
+        &self,
+        tx: &Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        pre: TestPrechecked,
+        inherited: QuarantineScope,
+    ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
+        let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
             txid, vsize, fee, fee_rate, weight, prev_outputs, prev_is_coinbase, mut ancestors, cfg, ..
         } = pre;
@@ -6278,14 +6294,17 @@ impl Mempool {
                     scope.template |= ae.scope.template;
                 }
             }
+            scope.relay |= inherited.relay;
+            scope.template |= inherited.template;
             if scope.relay {
                 return Err(MempoolError::Quarantined(
                     own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()),
                 ));
             }
+            final_scope = scope;
         }
 
-        Ok((txid, vsize, fee))
+        Ok((txid, vsize, fee, final_scope))
     }
 
     /// A multi-transaction `testmempoolaccept`: Core's
@@ -6528,6 +6547,16 @@ impl Mempool {
         let child = pre[1].txid;
         let conflicts: HashSet<Txid> = pre.iter().flat_map(|p| p.conflicts.iter().copied()).collect();
 
+        // `-mempoolfullrbf=0`: every direct conflict must signal, as
+        // `rbf_check` asks of a single replacement. Core has no such switch.
+        if !cfg.full_rbf {
+            for (i, p) in pre.iter().enumerate() {
+                if p.conflicts.iter().any(|c| inner.entries.get(c).is_some_and(|e| !Self::signals_rbf(&e.tx))) {
+                    return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+                }
+            }
+        }
+
         // Rule 5 over the conflicts of both, as the child's replacement.
         let bound = Self::rbf_eviction_bound(&cfg);
         let clusters =
@@ -6594,9 +6623,25 @@ impl Mempool {
         }
         drop(inner);
 
+        // Scripts and the policy, the child taking on its parent's scope.
+        // A member the policy would hold may not displace an acting
+        // transaction, as admission refuses it (two-class isolation); found
+        // here, before the parent evicts anything.
+        let mut inherited = QuarantineScope::acting();
         for (i, (tx, checked)) in members.iter().zip(pre).enumerate() {
-            self.test_finish(tx, chain_state, script_verifier, checked)
+            let own_conflicts = checked.conflicts.clone();
+            let (_, _, _, scope) = self
+                .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited)
                 .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+            if scope.is_quarantined()
+                && own_conflicts
+                    .iter()
+                    .any(|c| self.inner.read().entries.get(c).is_some_and(|e| e.scope.is_acting()))
+            {
+                return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+            }
+            inherited.relay |= scope.relay;
+            inherited.template |= scope.template;
         }
         Ok(())
     }

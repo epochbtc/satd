@@ -379,3 +379,56 @@ fn a_replacing_dust_parent_needs_its_dust_swept() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn version(mut tx: Transaction, v: i32) -> Transaction {
+    tx.version = bitcoin::transaction::Version(v);
+    tx
+}
+
+/// With `-mempoolfullrbf=0`, a package replaces only what signals, as a
+/// single replacement does. The parent below the floor reaches the package
+/// checks without the single replacement rules, so they must ask.
+#[test]
+fn without_full_rbf_a_package_replaces_only_what_signals() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    mp.config.write().full_rbf = false;
+    let resident = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let r = mp.accept_transaction(resident.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("resident");
+    let (parent, child) = package(prev(1), (0, 20_000), 3);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(res.package_msg, "transaction failed", "{:?}", res.tx_results);
+    assert_eq!(res.tx_results[&parent.compute_wtxid().to_string()]["error"], "txn-mempool-conflict");
+    assert_eq!(pool(&mp), HashSet::from([r]));
+
+    // A resident that signals is replaced.
+    mp.config.write().full_rbf = true;
+    assert_eq!(submit(&mp, &cs, &[&parent, &child]).package_msg, "success");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A child the policy would hold may not displace an acting transaction.
+/// That is found before the parent evicts its own conflict, so a refused
+/// package takes nothing out.
+#[test]
+fn a_held_child_conflicting_with_an_acting_transaction_evicts_nothing() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let a = version(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), 1);
+    let b = version(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2), 1);
+    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let b_id = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+    let rs = satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2").expect("ruleset");
+    mp.set_policy(std::sync::Arc::new(rs));
+
+    // The parent replaces A; the child, which the rule holds, also spends B's coin.
+    let parent = version(spend(&[prev(1)], COIN_VALUE, 0, 1, 3), 1);
+    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+
+    let res = submit(&mp, &cs, &[&parent, &child]);
+    assert_eq!(res.tx_results[&child.compute_wtxid().to_string()]["error"], "txn-mempool-conflict", "{:?}", res.tx_results);
+    assert!(res.replaced.is_empty());
+    assert_eq!(pool(&mp), HashSet::from([a_id, b_id]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
