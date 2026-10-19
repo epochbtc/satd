@@ -339,3 +339,98 @@ fn a_family_too_large_to_walk_ranks_by_the_parent_alone() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+/// Evicting a child shared by two parents can *lower* the score of the
+/// parent it leaves behind, so the survivors are re-ranked as each package
+/// goes. Here B's package (B with the shared child C) goes first; A then pays
+/// only its own 10 sat/vB and is next, ahead of D. Ranked by its stale score
+/// A would outlast D, and the pool would drop the better-paying transaction.
+#[test]
+fn evicting_a_shared_child_reranks_its_other_parent_down() {
+    let (cs, mp, dir) = env(&[1, 2, 4]);
+    let a = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 820, 1, 1));
+    let b = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 0, 1, 2));
+    let c = admit(&mp, &cs, spend(&[out(a, 0), out(b, 0)], 2 * COIN_VALUE - 820, 12_300, 1, 3));
+    let d = admit(&mp, &cs, spend(&[prev(4)], COIN_VALUE, 5_084, 1, 4));
+    let size = |t: &Txid| bitcoin::consensus::serialize(&mp.get(t).unwrap().tx).len();
+    let need = size(&b) + size(&c) + 1;
+
+    let mut inner = mp.inner.write();
+    let score = |t: &Txid| Mempool::descendant_score(&inner, t, &HashSet::new()).unwrap();
+    assert!(score(&b) < score(&d) && score(&d) < score(&a), "the fixture needs B < D < A");
+    let mut gone: Vec<Txid> =
+        Mempool::evict_lowest_fee_entries(&mut inner, need, false, 0).into_iter().map(|(t, _)| t).collect();
+    drop(inner);
+
+    gone.sort();
+    let mut expected = vec![a, b, c];
+    expected.sort();
+    assert_eq!(gone, expected);
+    assert_eq!(pool(&mp), HashSet::from([d]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fails the scripts of one transaction, after letting a concurrent
+/// admission try to run while the package is still under way.
+struct RacesThenFails {
+    fail: Txid,
+    go: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+}
+
+impl ScriptVerifier for RacesThenFails {
+    fn verify_transaction(
+        &self,
+        tx: &Transaction,
+        _prev_outputs: &[TxOut],
+        _height: u32,
+    ) -> Result<(), crate::validation::script::ScriptError> {
+        if tx.compute_txid() != self.fail {
+            return Ok(());
+        }
+        let _ = self.go.lock().unwrap().send(());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Err(crate::validation::script::ScriptError::VerifyFailed { input: 0, reason: "forged".into() })
+    }
+
+    fn verify_policy(
+        &self,
+        _tx: &Transaction,
+        _prev_outputs: &[TxOut],
+    ) -> Result<(), crate::validation::script::ScriptError> {
+        Ok(())
+    }
+}
+
+/// While a package is under way its below-floor parent is in the pool, and
+/// it comes back out if the child fails. A transaction admitted in between
+/// could spend that parent and then be left with no input, so admissions wait
+/// for the package to finish, as Core's lock does.
+#[test]
+fn an_admission_waits_for_a_package_that_may_take_its_parent_back() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let parent = spend(&[prev(1)], COIN_VALUE, 0, 2, 1);
+    let per = COIN_VALUE / 2;
+    let child = spend(&[out(parent.compute_txid(), 0)], per, 1_000, 1, 2);
+    let racer = spend(&[out(parent.compute_txid(), 1)], COIN_VALUE - per, 5_000, 1, 3);
+    let (go, ready) = std::sync::mpsc::channel();
+    let verifier = RacesThenFails { fail: child.compute_txid(), go: std::sync::Mutex::new(go) };
+
+    let (r, raced) = std::thread::scope(|s| {
+        let (mp, cs, racer) = (&mp, &cs, &racer);
+        let racing = s.spawn(move || {
+            // Bounded, so a package that never reaches the child fails the
+            // test rather than hanging it.
+            let _ = ready.recv_timeout(std::time::Duration::from_secs(10));
+            mp.accept_transaction(racer.clone(), cs, &NoopVerifier, TxSource::P2p, false)
+        });
+        let r = mp.accept_package_with(vec![parent.clone(), child.clone()], cs, &verifier, None);
+        (r, racing.join().unwrap())
+    });
+
+    assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
+    assert!(matches!(raced, Err(MempoolError::MissingInputs)), "{raced:?}");
+    assert!(pool(&mp).is_empty(), "a transaction was left spending a parent that left");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

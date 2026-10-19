@@ -1242,6 +1242,13 @@ pub type ReplacedTxSink = Box<dyn Fn(Vec<Transaction>) + Send + Sync>;
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
+    /// Held for the whole of an admission: one transaction, or every member
+    /// of a package. A package admits members one at a time and may take a
+    /// parent back out if its child fails; without this, a transaction
+    /// admitted in between could spend that parent and be left with no
+    /// input. Core holds `cs_main` and the pool's lock across a package for
+    /// the same reason.
+    admission: Mutex<()>,
     /// Mirror of `inner.unbroadcast.len()`, maintained at every mutation
     /// site (under the `inner` write lock, so it is always coherent with
     /// the map). Lets the hot P2P paths (`inv`/`getdata` handlers asking
@@ -1533,6 +1540,7 @@ impl Mempool {
                 sequence: 1,
                 rolling: Mutex::new(RollingMinFee::default()),
             }),
+            admission: Mutex::new(()),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             load_tried: std::sync::atomic::AtomicBool::new(false),
             config: RwLock::new(config),
@@ -2761,6 +2769,7 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
+        let _admission = self.admission.lock();
         self.accept_transaction_led(
             tx,
             chain_state,
@@ -2817,6 +2826,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         time: u64,
     ) -> Result<Txid, MempoolError> {
+        let _admission = self.admission.lock();
         let accepted = self.accept_transaction_unexpired(
             tx,
             chain_state,
@@ -5683,6 +5693,8 @@ impl Mempool {
     ) -> PackageResult {
         use serde_json::json;
 
+        // Until the last member is in or taken back out.
+        let _admission = self.admission.lock();
         let cfg = self.config.read().clone();
         let mut tx_results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
@@ -7018,9 +7030,9 @@ impl Mempool {
     ///
     /// An entry with more than [`DESCENDANT_SCORE_WALK`] descendants is
     /// scored by its own feerate. satd does not limit descendants (Core's
-    /// v30 limit is 25), and a trim re-scores an entry each time it surfaces,
-    /// under the pool's write lock: an unbounded family would make that cost
-    /// grow with the square of its size.
+    /// v30 limit is 25), and a trim re-scores every ancestor of each package
+    /// it evicts, under the pool's write lock: an unbounded family would make
+    /// that cost grow with the square of its size.
     fn descendant_score(inner: &MempoolInner, txid: &Txid, excluded: &HashSet<Txid>) -> Option<u64> {
         let entry = inner.entries.get(txid)?;
         let own_fee = modified_fee(entry.fee, entry.fee_delta);
@@ -7103,6 +7115,10 @@ impl Mempool {
                 Self::descendant_score(inner, txid, &none).map(|score| std::cmp::Reverse((score, *txid)))
             })
             .collect();
+        // Each candidate's current score. A heap entry whose key differs is
+        // stale and skipped.
+        let mut current: HashMap<Txid, u64> =
+            by_score.iter().map(|std::cmp::Reverse((score, txid))| (*txid, *score)).collect();
 
         let mut freed = 0usize;
         let mut to_remove: Vec<Txid> = Vec::new();
@@ -7114,19 +7130,7 @@ impl Mempool {
             let Some(std::cmp::Reverse((score, txid))) = by_score.pop() else {
                 break;
             };
-            if removing.contains(&txid) {
-                continue;
-            }
-            // Evicting a package changes the score of every ancestor it
-            // leaves behind, and only ever raises it: what went had the lowest
-            // score, so it paid no more than the ancestor's own package.
-            // Re-ranking an entry when it surfaces is therefore enough; one
-            // whose score has risen goes back in at its new place.
-            let Some(current) = Self::descendant_score(inner, &txid, &removing) else {
-                continue;
-            };
-            if current > score {
-                by_score.push(std::cmp::Reverse((current, txid)));
+            if removing.contains(&txid) || current.get(&txid) != Some(&score) {
                 continue;
             }
             removing.insert(txid);
@@ -7157,6 +7161,28 @@ impl Mempool {
                     }
                     to_remove.push(child);
                     desc_queue.push(child);
+                }
+            }
+            // Evicting a package changes the score of every ancestor it leaves
+            // behind, up or down: a child shared with another parent goes
+            // with this one. Re-rank them now, as Core's index does on
+            // removal, so the next pick is by what they pay without it.
+            let mut up: Vec<Txid> = to_remove[package_start..].to_vec();
+            let mut walked: HashSet<Txid> = HashSet::new();
+            while let Some(t) = up.pop() {
+                let Some(entry) = inner.entries.get(&t) else { continue };
+                for input in &entry.tx.input {
+                    let parent = input.previous_output.txid;
+                    if removing.contains(&parent) || !walked.insert(parent) {
+                        continue;
+                    }
+                    if current.contains_key(&parent)
+                        && let Some(score) = Self::descendant_score(inner, &parent, &removing)
+                    {
+                        current.insert(parent, score);
+                        by_score.push(std::cmp::Reverse((score, parent)));
+                    }
+                    up.push(parent);
                 }
             }
             // Core's `TrimToSize`: the rolling minimum rises to the evicted
@@ -12547,19 +12573,19 @@ mod tests {
         );
         let child_txid = child.compute_txid();
 
-        // A mock in the past, and held as briefly as possible: see
+        // A mock just in the past, and held as briefly as possible: see
         // `time::tests` for why a concurrent test cannot be harmed by one.
-        const MOCK: u64 = 1_700_000_000;
+        let mock = crate::time::now_secs() - 60;
         let times = {
             let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            crate::time::set_mock_time(Some(MOCK));
+            crate::time::set_mock_time(Some(mock));
             let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
             crate::time::set_mock_time(None);
             assert_eq!(msg, "success", "package rejected: {results:?}");
             let inner = mp.inner.read();
             (inner.entries[&parent_txid].time, inner.entries[&child_txid].time)
         };
-        assert_eq!(times, (MOCK, MOCK), "(parent, child) entry times under setmocktime");
+        assert_eq!(times, (mock, mock), "(parent, child) entry times under setmocktime");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
