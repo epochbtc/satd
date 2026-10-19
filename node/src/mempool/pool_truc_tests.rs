@@ -369,9 +369,7 @@ fn a_parent_a_reorg_left_with_two_children_offers_no_sibling() {
     let second = v3(spend(&[out(parent.compute_txid(), 2)], share, 1_000, 1, 3));
     accept(&mp, &cs, &parent).expect("parent");
     accept(&mp, &cs, &first).expect("first child");
-    for tx in [&second] {
-        mp.accept_reorged_transaction(tx.clone(), &cs, &NoopVerifier).expect("a reorg skips TRUC");
-    }
+    mp.accept_reorged_transaction(second.clone(), &cs, &NoopVerifier).expect("a reorg skips TRUC");
 
     let third = v3(spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 20_000, 1, 4));
     assert_eq!(

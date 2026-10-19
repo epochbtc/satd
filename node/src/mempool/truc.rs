@@ -102,9 +102,7 @@ pub(crate) fn single_truc_checks(
         return fail(format!("tx {txid} (wtxid={wtxid}) would have too many ancestors"));
     }
 
-    let Some(parent_txid) = mempool_parents.first() else {
-        return None;
-    };
+    let parent_txid = mempool_parents.first()?;
     // The parent may not have unconfirmed ancestors of its own.
     if view.ancestor_count(parent_txid, TRUC_ANCESTOR_LIMIT + 1) + 1 > TRUC_ANCESTOR_LIMIT {
         return fail(format!("tx {txid} (wtxid={wtxid}) would have too many ancestors"));
@@ -201,7 +199,7 @@ pub(crate) fn package_truc_checks(
 
     // Exactly one parent, in the mempool or in the package.
     let (parent, parent_has_mempool_descendant) = if let Some(parent_txid) = mempool_parents.first() {
-        let Some(parent) = view.mempool_tx(parent_txid) else { return None };
+        let parent = view.mempool_tx(parent_txid)?;
         (parent, !view.descendants(parent_txid, 1).is_empty())
     } else if let Some(parent) = in_package_parents.first() {
         (*parent, false)
