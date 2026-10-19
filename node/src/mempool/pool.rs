@@ -3237,7 +3237,7 @@ impl Mempool {
 
         // CPFP: build full ancestor set (transitive) and enforce limits
         // A reorg is exempt from the count, as from the cluster check below.
-        Self::expand_ancestors(&inner, &cfg, &mut ancestors, !pkg.skip_cluster_limits)?;
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors, !pkg.skip_cluster_limits);
 
         // Core's sigop-adjusted weight (`-bytespersigop`): the size every
         // feerate from here on charges. The cap on the cost itself comes
@@ -4628,25 +4628,29 @@ impl Mempool {
     ///
     /// Returns the set of transactions the replacement would evict.
     /// Expand `ancestors` — a transaction's direct in-mempool parents — to
-    /// the full transitive set, refusing one that, with the transaction,
-    /// already exceeds the cluster count limit. The ancestors are part of the
-    /// cluster, so [`Self::check_cluster_limits`] would refuse it too; this
-    /// bounds the walk. `enforce_limit` is false for a transaction a reorg
-    /// returns, which is exempt from the cluster limits: its walk is bounded
-    /// by the chain the disconnected blocks held.
+    /// the full transitive set.
+    ///
+    /// The walk stops once the set and the transaction pass the cluster
+    /// count limit. It refuses nothing: the ancestors are part of the
+    /// cluster, so [`Self::check_cluster_limits`] refuses that transaction
+    /// later. That is where Core refuses it: after the replacement checks,
+    /// or inside them as `cluster size limit exceeded`, with no ancestor
+    /// count of its own ahead of them. A set cut short is never used past
+    /// that refusal. `bounded` is false for a transaction a reorg returns,
+    /// which is exempt from the cluster limits: its walk is bounded by the
+    /// chain the disconnected blocks held.
     ///
     /// One function for `accept_transaction` and `test_accept`. The RBF
     /// diagram is built over this set, so the two have to hand `rbf_check`
-    /// the same one; and the chain limit is a policy `testmempoolaccept`
-    /// has to report as `sendrawtransaction` would.
+    /// the same one.
     fn expand_ancestors(
         inner: &MempoolInner,
         cfg: &MempoolConfig,
         ancestors: &mut HashSet<Txid>,
-        enforce_limit: bool,
-    ) -> Result<(), MempoolError> {
+        bounded: bool,
+    ) {
         if ancestors.is_empty() {
-            return Ok(());
+            return;
         }
         let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
         while let Some(ancestor_txid) = queue.pop() {
@@ -4658,13 +4662,10 @@ impl Mempool {
                     }
                 }
             }
-            // `+ 1`: the cluster counts the transaction itself. Without it a
-            // chain of 65 got in at the default limit of 64.
-            if enforce_limit && ancestors.len() + 1 > cfg.max_cluster_count {
-                return Err(MempoolError::TooLongMempoolChain);
+            if bounded && ancestors.len() + 1 > cfg.max_cluster_count {
+                return;
             }
         }
-        Ok(())
     }
 
     /// Core v31's cluster limits (`CheckMemPoolPolicyLimits`, after
@@ -4883,8 +4884,18 @@ impl Mempool {
             ));
         }
 
+        // Core's `CalculateChunksForRBF` checks the cluster limits before it
+        // builds a diagram, so a replacement whose cluster would pass them
+        // fails here, as a replacement, not later as `too-large-cluster`.
+        let parents = Self::direct_mempool_parents(tx, ancestors);
+        if Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted).is_err() {
+            return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                "cluster size limit exceeded".to_string(),
+            ));
+        }
+
         Self::rbf_improves_diagram(
-            inner, cfg, weight, new_fee, conflicts, ancestors, &all_evicted,
+            inner, cfg, weight, new_fee, &parents, conflicts, ancestors, &all_evicted,
         )?;
 
         Ok(all_evicted)
@@ -4911,6 +4922,7 @@ impl Mempool {
         cfg: &MempoolConfig,
         weight: u64,
         new_fee: u64,
+        parents: &[Txid],
         conflicts: &HashSet<Txid>,
         ancestors: &HashSet<Txid>,
         all_evicted: &HashSet<Txid>,
@@ -5010,6 +5022,20 @@ impl Mempool {
         }
 
         if !simple_topology {
+            // Core v31's diagrams: every cluster the replacement touches,
+            // linearized before and after.
+            if let Some((old_chunks, new_chunks)) =
+                Self::rbf_cluster_diagrams(inner, weight, new_fee, parents, ancestors, all_evicted)
+            {
+                if compare_chunks(&new_chunks, &old_chunks) != DiagramOrdering::Better {
+                    return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                        "insufficient feerate: does not improve feerate diagram".to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            // A cluster past what `cluster_chunks` takes, which only a reorg
+            // leaves: the older per-conflict rule.
             let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight);
             let mut anc_fee_total: u64 = new_fee;
             let mut anc_weight_total: u64 = weight;
@@ -5141,6 +5167,142 @@ impl Mempool {
         }
         let _ = cfg;
         Ok(())
+    }
+
+    /// The diagrams Core v31 compares for a replacement
+    /// (`GetMainStagingDiagrams`): the chunks of every cluster the
+    /// replacement touches, before and after. The region is the clusters of
+    /// what it evicts and of its mempool ancestors. Before, those clusters
+    /// as they stand; after, the same transactions less the evicted ones,
+    /// plus the replacement spending `parents`, regrouped into the clusters
+    /// that leaves. Sizes are sigop-adjusted weight, as in Core's txgraph.
+    ///
+    /// `None` when a cluster is too large to chunk, which the cluster limits
+    /// allow only after a reorg, or the region past what one replacement may
+    /// touch.
+    fn rbf_cluster_diagrams(
+        inner: &MempoolInner,
+        weight: u64,
+        new_fee: u64,
+        parents: &[Txid],
+        ancestors: &HashSet<Txid>,
+        all_evicted: &HashSet<Txid>,
+    ) -> Option<(Vec<crate::mempool::feefrac::FeeFrac>, Vec<crate::mempool::feefrac::FeeFrac>)> {
+        use crate::mempool::feefrac::{FeeFrac, MAX_CHUNKED_CLUSTER, cluster_chunks, sort_chunks};
+
+        // Rule 5 bounds the clusters at MAX_REPLACEMENT_CANDIDATES, and the
+        // ancestors add at most one more.
+        let region_bound = (policy::MAX_REPLACEMENT_CANDIDATES + 1) * MAX_CHUNKED_CLUSTER;
+        let neighbours = |t: &Txid, buf: &mut Vec<Txid>| {
+            buf.clear();
+            Self::collect_children(inner, t, buf);
+            if let Some(e) = inner.entries.get(t) {
+                buf.extend(e.tx.input.iter().map(|i| i.previous_output.txid));
+            }
+            buf.retain(|n| inner.entries.contains_key(n));
+        };
+
+        let mut region: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = all_evicted
+            .iter()
+            .chain(ancestors.iter())
+            .filter(|t| inner.entries.contains_key(*t))
+            .copied()
+            .collect();
+        region.extend(queue.iter().copied());
+        let mut buf: Vec<Txid> = Vec::new();
+        while let Some(t) = queue.pop() {
+            neighbours(&t, &mut buf);
+            for n in buf.drain(..) {
+                if region.insert(n) {
+                    if region.len() > region_bound {
+                        return None;
+                    }
+                    queue.push(n);
+                }
+            }
+        }
+
+        // The chunks of each connected group of `nodes`, `None` standing for
+        // the replacement. `edges` gives a node's neighbours within `nodes`.
+        let entry_ff = |t: &Txid| {
+            let e = &inner.entries[t];
+            FeeFrac::new(modified_fee(e.fee, e.fee_delta) as i64, e.adjusted_weight() as i64)
+        };
+        let new_ff = FeeFrac::new(new_fee as i64, weight as i64);
+        let chunks_of = |nodes: &HashSet<Option<Txid>>| -> Option<Vec<FeeFrac>> {
+            let parents_of = |n: &Option<Txid>| -> Vec<Option<Txid>> {
+                match n {
+                    None => parents.iter().map(|p| Some(*p)).collect(),
+                    Some(t) => inner.entries[t]
+                        .tx
+                        .input
+                        .iter()
+                        .map(|i| Some(i.previous_output.txid))
+                        .collect(),
+                }
+            };
+            // Children within `nodes`: the replacement is nobody's parent.
+            let mut children: HashMap<Option<Txid>, Vec<Option<Txid>>> = HashMap::new();
+            for n in nodes {
+                for p in parents_of(n) {
+                    if nodes.contains(&p) {
+                        children.entry(p).or_default().push(*n);
+                    }
+                }
+            }
+            let mut out: Vec<FeeFrac> = Vec::new();
+            let mut seen: HashSet<Option<Txid>> = HashSet::new();
+            for start in nodes {
+                if !seen.insert(*start) {
+                    continue;
+                }
+                let mut component: Vec<Option<Txid>> = vec![*start];
+                let mut i = 0;
+                while i < component.len() {
+                    let n = component[i];
+                    i += 1;
+                    let mut next = parents_of(&n);
+                    next.extend(children.get(&n).into_iter().flatten().copied());
+                    for m in next {
+                        if nodes.contains(&m) && seen.insert(m) {
+                            component.push(m);
+                        }
+                    }
+                }
+                if component.len() > MAX_CHUNKED_CLUSTER {
+                    return None;
+                }
+                let index: HashMap<Option<Txid>, usize> =
+                    component.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+                let txs: Vec<(FeeFrac, u64)> = component
+                    .iter()
+                    .map(|n| {
+                        let ff = match n {
+                            None => new_ff,
+                            Some(t) => entry_ff(t),
+                        };
+                        let mask = parents_of(n)
+                            .iter()
+                            .filter_map(|p| index.get(p))
+                            .fold(0u64, |m, i| m | (1u64 << i));
+                        (ff, mask)
+                    })
+                    .collect();
+                out.extend(cluster_chunks(&txs)?);
+            }
+            sort_chunks(&mut out);
+            Some(out)
+        };
+
+        let old_nodes: HashSet<Option<Txid>> = region.iter().map(|t| Some(*t)).collect();
+        let mut new_nodes: HashSet<Option<Txid>> = region
+            .iter()
+            .filter(|t| !all_evicted.contains(*t))
+            .map(|t| Some(*t))
+            .collect();
+        new_nodes.insert(None);
+        Some((chunks_of(&old_nodes)?, chunks_of(&new_nodes)?))
     }
 
     /// Collect all txids that would be evicted by replacing `conflicts` and
@@ -5691,7 +5853,7 @@ impl Mempool {
         // grandparent passed `testmempoolaccept` and failed
         // `sendrawtransaction`.
         let mempool_parents = Self::direct_mempool_parents(tx, &ancestors);
-        Self::expand_ancestors(&inner, &cfg, &mut ancestors, true)?;
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors, true);
 
         // Core's sigop-adjusted weight, as on admission.
         let sigop_cost = Self::sigop_cost_of(tx, &prev_outputs);
@@ -8039,6 +8201,10 @@ mod truc_tests;
 #[cfg(test)]
 #[path = "pool_cluster_tests.rs"]
 mod cluster_tests;
+
+#[cfg(test)]
+#[path = "pool_rbf_cluster_tests.rs"]
+mod rbf_cluster_tests;
 
 #[cfg(test)]
 #[path = "pool_mempoolrpc_tests.rs"]

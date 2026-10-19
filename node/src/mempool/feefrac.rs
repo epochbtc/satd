@@ -208,6 +208,97 @@ pub fn old_diagram(evicted: &[EvictedTx]) -> Vec<FeeFrac> {
     chunks
 }
 
+/// The most transactions [`cluster_chunks`] takes: Core's
+/// `MAX_CLUSTER_COUNT_LIMIT`, and one bit each in a `u64`.
+pub const MAX_CHUNKED_CLUSTER: usize = 64;
+
+/// The chunks of one cluster, in descending feerate. `txs[i]` is a
+/// transaction's fee and size and the bitmask of its parents among `txs`.
+///
+/// Core v31 builds an RBF diagram from each affected cluster's
+/// linearization. This linearizes by ancestor-set feerate, as Core mined
+/// before the cluster mempool: the remaining transaction whose remaining
+/// ancestors pay the best feerate goes next, with them. The order is then
+/// chunked: a segment that pays more than the chunk before it joins it.
+/// That is optimal for the small clusters an RBF usually touches (a parent
+/// and its children, a short chain) and close for the rest.
+///
+/// Returns `None` past [`MAX_CHUNKED_CLUSTER`] transactions.
+pub fn cluster_chunks(txs: &[(FeeFrac, u64)]) -> Option<Vec<FeeFrac>> {
+    let n = txs.len();
+    if n > MAX_CHUNKED_CLUSTER {
+        return None;
+    }
+    let bit = |i: usize| 1u64 << i;
+    // Each transaction with all its ancestors in the cluster.
+    let mut anc: Vec<u64> = (0..n).map(|i| bit(i) | txs[i].1).collect();
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            let mut grown = anc[i];
+            let mut rest = anc[i] & !bit(i);
+            while rest != 0 {
+                let p = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                grown |= anc[p];
+            }
+            if grown != anc[i] {
+                anc[i] = grown;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let sum = |set: u64| {
+        let mut total = FeeFrac::default();
+        let mut rest = set;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            total = total + txs[i].0;
+        }
+        total
+    };
+
+    let mut remaining: u64 = if n == 64 { u64::MAX } else { bit(n) - 1 };
+    let mut chunks: Vec<FeeFrac> = Vec::new();
+    while remaining != 0 {
+        // The best remaining ancestor set: highest feerate, then the
+        // smaller, then the lower index, so the order is deterministic.
+        let mut best: Option<(u64, FeeFrac)> = None;
+        let mut rest = remaining;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let set = anc[i] & remaining;
+            let ff = sum(set);
+            let better = match best {
+                None => true,
+                Some((_, b)) => match feerate_compare(ff, b) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => ff.size < b.size,
+                    Ordering::Less => false,
+                },
+            };
+            if better {
+                best = Some((set, ff));
+            }
+        }
+        let (set, mut segment) = best.expect("remaining is not empty");
+        remaining &= !set;
+        while let Some(last) = chunks.last()
+            && feerate_compare(segment, *last) == Ordering::Greater
+        {
+            segment = segment + *last;
+            chunks.pop();
+        }
+        chunks.push(segment);
+    }
+    Some(chunks)
+}
+
 /// Sort a diagram the way `CompareChunks` requires: descending feerate.
 pub fn sort_chunks(chunks: &mut [FeeFrac]) {
     // Core sorts with `std::greater()` on `FeeFrac`, whose ordering is
@@ -226,6 +317,51 @@ mod tests {
 
     fn ff(fee: i64, size: i64) -> FeeFrac {
         FeeFrac::new(fee, size)
+    }
+
+    /// A parent with one child that pays for it is one chunk; a second,
+    /// poorer child is a chunk of its own.
+    #[test]
+    fn a_child_that_pays_for_its_parent_shares_its_chunk() {
+        let chunks = cluster_chunks(&[(ff(100, 100), 0), (ff(3_000, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(3_100, 200), ff(200, 100)]);
+    }
+
+    /// A richer parent goes first on its own, and children that pay less
+    /// follow, best first.
+    #[test]
+    fn a_rich_parent_is_its_own_chunk() {
+        let chunks = cluster_chunks(&[(ff(5_000, 100), 0), (ff(100, 100), 0b1), (ff(300, 100), 0b1)]).unwrap();
+        assert_eq!(chunks, vec![ff(5_000, 100), ff(300, 100), ff(100, 100)]);
+    }
+
+    /// A grandchild's ancestors come with it, through the child: a poor
+    /// parent and child are pulled up by a rich grandchild.
+    #[test]
+    fn ancestors_are_taken_transitively() {
+        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(0, 100), 0b1), (ff(9_000, 100), 0b10)]).unwrap();
+        assert_eq!(chunks, vec![ff(9_000, 300)]);
+    }
+
+    /// A later segment that pays more than the chunk before it joins that
+    /// chunk, so the chunks come out in descending feerate.
+    #[test]
+    fn a_later_richer_segment_merges_into_the_chunk_before() {
+        // A (alone 10/100) and B (alone 1/100) are unrelated; C spends B and
+        // pays 30/100. Ancestor sets: {A} 0.10, {B} 0.01, {B, C} 0.155: B
+        // and C first, then A.
+        let chunks = cluster_chunks(&[(ff(10, 100), 0), (ff(1, 100), 0), (ff(30, 100), 0b10)]).unwrap();
+        assert_eq!(chunks, vec![ff(31, 200), ff(10, 100)]);
+        for pair in chunks.windows(2) {
+            assert_ne!(feerate_compare(pair[0], pair[1]), Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn a_cluster_past_sixty_four_is_not_chunked() {
+        let txs: Vec<(FeeFrac, u64)> = (0..65).map(|_| (ff(1, 1), 0)).collect();
+        assert!(cluster_chunks(&txs).is_none());
+        assert_eq!(cluster_chunks(&txs[..64]).unwrap().len(), 64, "equal feerates are not merged");
     }
 
     /// Feerates are compared by cross-product, so no division rounds a
