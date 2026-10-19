@@ -6444,7 +6444,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
     ) -> Result<(Txid, usize, u64), MempoolError> {
-        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting(), None)
+        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting(), None, TxSource::Rpc)
             .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
     }
 
@@ -6453,7 +6453,10 @@ impl Mempool {
     /// yet in the mempool, which the transaction takes on as it would from a
     /// mempool ancestor. `mempool_bytes` is the mempool size the policy sees
     /// in place of the current one: a package child is judged at admission
-    /// after its parent has replaced what it conflicts with.
+    /// after its parent has replaced what it conflicts with. `source` is
+    /// what the policy sees, and only a local source is refused a relay
+    /// quarantine, as on admission; a peer's transaction is held instead.
+    #[allow(clippy::too_many_arguments)]
     fn test_finish_scoped(
         &self,
         tx: &Transaction,
@@ -6462,6 +6465,7 @@ impl Mempool {
         pre: TestPrechecked,
         inherited: QuarantineScope,
         mempool_bytes: Option<usize>,
+        source: TxSource,
     ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
         let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
@@ -6513,7 +6517,7 @@ impl Mempool {
             };
             let verdict = policy_engine::evaluate(
                 rs, tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight, &cfg, ctx,
-                TxSource::Rpc, false,
+                source, false,
             );
             let (mut scope, own_rule) = match &verdict {
                 satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
@@ -6534,7 +6538,7 @@ impl Mempool {
             }
             scope.relay |= inherited.relay;
             scope.template |= inherited.template;
-            if scope.relay {
+            if scope.relay && source.is_local() {
                 return Err(MempoolError::Quarantined(
                     own_rule.unwrap_or_else(|| INFECTIOUS_RULE.to_string()),
                 ));
@@ -6749,12 +6753,14 @@ impl Mempool {
     /// the caller commits a package that passes.
     ///
     /// `members` are the transactions `submitpackage` evaluates together, in
-    /// package order, after the rest were admitted or refused on their own.
+    /// package order, after the rest were admitted or refused on their own,
+    /// coming from `source`.
     fn package_rbf_checks(
         &self,
         members: &[Transaction],
         chain_state: &ChainState,
         script_verifier: &dyn ScriptVerifier,
+        source: TxSource,
     ) -> Result<(), PackageRbfRefusal> {
         let mut pre = Vec::with_capacity(members.len());
         for (i, tx) in members.iter().enumerate() {
@@ -6882,7 +6888,15 @@ impl Mempool {
         for (i, (tx, checked)) in members.iter().zip(pre).enumerate() {
             let own_conflicts = checked.conflicts.clone();
             let (_, _, _, scope) = self
-                .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited, (i > 0).then_some(child_sees))
+                .test_finish_scoped(
+                    tx,
+                    chain_state,
+                    script_verifier,
+                    checked,
+                    inherited,
+                    (i > 0).then_some(child_sees),
+                    source,
+                )
                 .map_err(|e| PackageRbfRefusal::Member(i, e))?;
             if scope.is_quarantined()
                 && own_conflicts
@@ -7537,7 +7551,7 @@ impl Mempool {
         };
         if replaces {
             let members: Vec<Transaction> = eval.iter().map(|p| p.tx.clone()).collect();
-            match self.package_rbf_checks(&members, chain_state, script_verifier) {
+            match self.package_rbf_checks(&members, chain_state, script_verifier, source) {
                 Err(PackageRbfRefusal::Package(msg)) => {
                     refuse_deferred(&mut failed, &eval);
                     package_error = Some(msg);
@@ -7710,6 +7724,9 @@ impl Mempool {
         // The mempool sequence number each admitted ephemeral parent took,
         // for its `Enter`, which waits for the child that sweeps its dust.
         let mut parent_sequence: HashMap<Txid, u64> = HashMap::new();
+        // The quarantine-channel events of the dust parents, sent for those
+        // still in once the package is settled.
+        let mut dust_quarantine: HashMap<Txid, Vec<QuarantineEvent>> = HashMap::new();
         // The admitted ephemeral parents whose `Enter` has gone out.
         let mut announced: HashSet<Txid> = HashSet::new();
         let mut children_to_accept: Vec<Txid> = Vec::new();
@@ -7812,15 +7829,25 @@ impl Mempool {
                 continue;
             }
 
-            // Accept the parent with bypass_limits: zero fee is OK.
-            // We need to inject it into the mempool bypassing the fee check.
-            match self.accept_transaction_bypass_fee(
-                parent_tx.clone(),
-                chain_state,
-                script_verifier,
-            ) {
-                Ok((_, seq)) => {
-                    parent_sequence.insert(parent_txid, seq);
+            // The parent goes through the ordinary admission, below the
+            // floors (Core's `m_package_feerates`) and with every event held:
+            // its `Enter` goes out with the child that sweeps its dust, and an
+            // unwound parent is never announced. It is judged by the policy
+            // like any member, so a peer's dust parent quarantines (and a
+            // local one is refused) as its rules say.
+            match self.admit_dust_parent(parent_tx.clone(), chain_state, script_verifier, source) {
+                Ok((_, mut admit)) => {
+                    // An acting parent's `Enter` waits for its child. A held
+                    // one has none: it is off the standard stream, and only
+                    // its quarantine-channel event goes out, once settled.
+                    let seq = admit.held.iter().find_map(|e| match e {
+                        MempoolEvent::Enter { mempool_sequence, .. } => Some(*mempool_sequence),
+                        _ => None,
+                    });
+                    dust_quarantine.insert(parent_txid, std::mem::take(&mut admit.held_quarantine));
+                    if let Some(seq) = seq {
+                        parent_sequence.insert(parent_txid, seq);
+                    }
                     accepted_txids.insert(parent_txid);
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&parent_txid) {
@@ -8024,7 +8051,7 @@ impl Mempool {
         // Announce any ephemeral parent that survived without a child from the
         // loop above announcing it.
         //
-        // `accept_transaction_bypass_fee` inserts without emitting, and it has
+        // The parent's admission holds its events, and it has
         // to: at that point the parent's fate still depends on a child that has
         // not been through acceptance. Emitting there and retracting after the
         // unwind would put an Enter/Leave pair on the stream for a transaction
@@ -8035,8 +8062,8 @@ impl Mempool {
         // is what a consumer reconstructing mempool membership from the stream
         // needs.
         for parent_txid in &parents_to_accept {
-            // Every parent still in `accepted_txids` here was admitted by the
-            // bypass above, which recorded its sequence number.
+            // Every parent still in `accepted_txids` here was admitted above,
+            // which recorded its sequence number.
             if !accepted_txids.contains(parent_txid) || announced.contains(parent_txid) {
                 continue;
             }
@@ -8045,6 +8072,18 @@ impl Mempool {
             };
             if let Some(event) = self.dust_parent_enter(parent_txid, mempool_sequence) {
                 self.emit(event);
+            }
+        }
+        {
+            let inner = self.inner.read();
+            let kept: Vec<QuarantineEvent> = dust_quarantine
+                .into_iter()
+                .filter(|(txid, _)| inner.entries.contains_key(txid))
+                .flat_map(|(_, events)| events)
+                .collect();
+            drop(inner);
+            for event in kept {
+                self.emit_quarantine(event);
             }
         }
 
@@ -8197,9 +8236,31 @@ impl Mempool {
         PackageResult { package_msg, tx_results, replaced, member_errors }
     }
 
-    /// The `Enter` of an ephemeral dust parent, which
-    /// [`Self::accept_transaction_bypass_fee`] admitted without one, with the
-    /// sequence number its insert took. `None` if it is no longer in the pool.
+    /// Admit an ephemeral dust parent of a package: the ordinary admission,
+    /// below the floors (Core's `m_package_feerates`), with every event
+    /// held for the caller, so its `Enter` can go out with the child that
+    /// sweeps its dust and an unwound parent is never announced.
+    fn admit_dust_parent(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        source: TxSource,
+    ) -> Result<(Txid, PackageAdmit), MempoolError> {
+        let mut admit = PackageAdmit {
+            skip_fee_floor: true,
+            defer_trim: true,
+            no_sibling_eviction: true,
+            hold_events: true,
+            ..Default::default()
+        };
+        let txid =
+            self.accept_transaction_led(tx, chain_state, script_verifier, source, false, Vec::new(), &mut admit)?;
+        Ok((txid, admit))
+    }
+
+    /// The `Enter` of an ephemeral dust parent, whose admission held it back,
+    /// with the sequence number its insert took. `None` if it is no longer in the pool.
     fn dust_parent_enter(&self, txid: &Txid, mempool_sequence: u64) -> Option<MempoolEvent> {
         let entry = self.get(txid)?;
         Some(MempoolEvent::Enter {
@@ -8426,200 +8487,6 @@ impl Mempool {
             );
         }
         stranded
-    }
-
-    /// Accept a transaction bypassing the minimum fee rate check — used for
-    /// ephemeral dust parents that have zero fee. Still applies all other
-    /// validation (consensus, standardness except dust, script verification).
-    /// Returns the txid and the mempool sequence number the insert took.
-    fn accept_transaction_bypass_fee(
-        &self,
-        tx: Transaction,
-        chain_state: &ChainState,
-        script_verifier: &dyn ScriptVerifier,
-    ) -> Result<(Txid, u64), MempoolError> {
-        use crate::validation::tx::check_transaction;
-
-        let txid = tx.compute_txid();
-
-        check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
-
-        if tx.is_coinbase() {
-            return Err(MempoolError::Validation("coinbase not accepted".to_string()));
-        }
-
-        // Absolute finality
-        let next_height = chain_state.tip_height() + 1;
-        let locktime = tx.lock_time.to_consensus_u32();
-        if locktime > 0
-            && !tx
-                .input
-                .iter()
-                .all(|i| i.sequence == bitcoin::Sequence::MAX)
-        {
-            let cutoff = if locktime < 500_000_000 {
-                next_height
-            } else {
-                chain_state.get_median_time_past(next_height)
-            };
-            if locktime >= cutoff {
-                return Err(MempoolError::NonFinal);
-            }
-        }
-
-        let bip68_enforced = (tx.version.0 as u32) >= 2;
-        let tip_mtp = chain_state.get_median_time_past(next_height);
-
-        let weight = tx.weight().to_wu() as usize;
-        let tx_size = bitcoin::consensus::serialize(&tx).len();
-        let prevout_meta = self.config.read().prevout_meta;
-
-        // Take write lock
-        let mut inner = self.inner.write();
-
-        inner.entries.check_not_resident(&txid, &tx)?;
-
-        // No two mempool entries may spend the same outpoint.
-        //
-        // `accept_transaction` enforces this by collecting conflicts from
-        // `inner.spends` and putting them through the RBF gate. This path had
-        // neither check and simply `extend`ed `inner.spends` below, so the
-        // second of two conflicting package members overwrote the first's
-        // entry while both stayed in `entries` — the mempool then held a
-        // double spend. `assemble_template` resolves inputs against the UTXO
-        // set and has no cross-transaction check of its own precisely because
-        // it relies on that invariant, so it would emit a template containing
-        // both and hand a miner a block that fails
-        // `bad-txns-inputs-missingorspent`.
-        //
-        // Refusing rather than replacing is what Core does here: this path is
-        // reachable only from `accept_package`, and Core rejects the whole
-        // package at `IsConsistentPackage` with `conflict-in-package`.
-        for input in &tx.input {
-            if inner.spends.contains_key(&input.previous_output) {
-                return Err(MempoolError::ConflictingSpend);
-            }
-        }
-
-        // Look up inputs
-        let tip_height = chain_state.tip_height();
-        let mut sum_inputs: u64 = 0;
-        let mut prev_outputs: Vec<TxOut> = Vec::new();
-        let mut ancestors: HashSet<Txid> = HashSet::new();
-
-        for input in &tx.input {
-            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                let spend_height = tip_height + 1;
-                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
-                    return Err(MempoolError::PrematureCoinbaseSpend);
-                }
-                if bip68_enforced
-                    && !Self::bip68_satisfied(chain_state, input.sequence.0, coin.height, next_height, tip_mtp)
-                {
-                    return Err(MempoolError::NonBip68Final);
-                }
-                sum_inputs += coin.amount;
-                prev_outputs.push(TxOut {
-                    value: bitcoin::Amount::from_sat(coin.amount),
-                    script_pubkey: coin.script_pubkey.clone(),
-                });
-            } else {
-                let parent_txid = input.previous_output.txid;
-                let parent_vout = input.previous_output.vout as usize;
-                if let Some(parent) = inner.entries.get(&parent_txid)
-                    && let Some(output) = parent.tx.output.get(parent_vout)
-                {
-                    if bip68_enforced
-                        && !Self::bip68_satisfied(chain_state, input.sequence.0, next_height, next_height, tip_mtp)
-                    {
-                        return Err(MempoolError::NonBip68Final);
-                    }
-                    ancestors.insert(parent_txid);
-                    sum_inputs += output.value.to_sat();
-                    prev_outputs.push(output.clone());
-                } else {
-                    return Err(MempoolError::MissingInputs);
-                }
-            }
-        }
-
-        let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        if sum_inputs < sum_outputs {
-            return Err(MempoolError::BadAmounts);
-        }
-        let fee = sum_inputs - sum_outputs;
-
-        // Skip fee rate check — this is the bypass. Everything else
-        // `PreChecks` applies to a package parent still applies: the
-        // standardness of its outputs (one dust output is allowed, as
-        // ephemeral dust needs), of what it spends, and its sigop cost. A
-        // parent that waited for its own parent reached here having checked
-        // none of them.
-        let cfg = self.config.read().clone();
-        if !cfg.accept_non_std_txn {
-            Self::check_standardness(&tx, &cfg, weight)?;
-            Self::check_spend_standardness(&tx, &prev_outputs)?;
-        }
-        let sigop_cost = Self::sigop_cost_of(&tx, &prev_outputs);
-        Self::check_sigop_cost(sigop_cost)?;
-
-        // Script verification, consensus then policy, as in
-        // `accept_transaction`; a consensus failure is named once the pool is
-        // released.
-        if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
-            drop(inner);
-            let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
-            return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
-        }
-        if let Err(e) = script_verifier.verify_policy(&tx, &prev_outputs) {
-            return Err(MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(&tx)));
-        }
-
-        let fee_rate = policy::fee_rate_sat_per_kvb(fee, policy::sigops_adjusted_weight(weight as u64, sigop_cost));
-
-        // The same sigop cost and prevout metadata `accept_transaction`
-        // records. A zero cost here let the block template count this entry
-        // as free against the block sigop limit.
-        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
-            self.spend_record(prevout_meta, &tx, &prev_outputs);
-
-        // Insert into mempool
-        let scope = QuarantineScope::acting();
-        inner.spends.extend(
-            tx.input
-                .iter()
-                .map(|input| (input.previous_output, txid)),
-        );
-
-        // Same persistent map the single-tx admission path reads (it keeps
-        // the delta rather than consuming it).
-        let pending_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
-
-        inner.entries.insert(
-            txid,
-            MempoolEntry {
-                tx,
-                fee,
-                weight,
-                fee_rate,
-                // The pool's clock, which follows `setmocktime`, as every
-                // other admission path's does (#981).
-                time: crate::time::now_secs(),
-                height: tip_height,
-                fee_delta: pending_delta,
-                sigop_cost,
-                prev_scripthashes,
-                prev_amounts,
-                prev_scripts,
-                sp_tweak,
-                scope,
-                source: TxSource::Rpc,
-                quarantine_rule: None,
-            },
-        );
-        let seq = inner.account_insert(scope, tx_size);
-
-        Ok((txid, seq))
     }
 
     /// Evict lowest-fee-rate entries **of one class** (acting if
