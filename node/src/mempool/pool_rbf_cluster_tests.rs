@@ -136,3 +136,42 @@ fn a_replacement_is_chunked_with_the_cheap_parent_it_spends() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `tx` padded with an `OP_RETURN` to exactly `vsize` vbytes.
+fn sized(tx: Transaction, vsize: u64) -> Transaction {
+    let base = policy::weight_to_vsize(tx.weight().to_wu());
+    let mut pad = (vsize - base).saturating_sub(40) as usize;
+    loop {
+        let t = padded(tx.clone(), pad);
+        let v = policy::weight_to_vsize(t.weight().to_wu());
+        if v == vsize {
+            return t;
+        }
+        assert!(v < vsize, "cannot pad to {vsize}: {v}");
+        pad += 1;
+    }
+}
+
+/// A fee-only bump of a diamond's last transaction (A parents B and C, D
+/// spends both) is accepted: same inputs, same size, more fee. Laid out as
+/// one block, D's ancestor set chunked worse after the bump than before, and
+/// the replacement was refused.
+#[test]
+fn a_fee_bump_of_a_diamonds_tail_is_accepted() {
+    let (cs, mp, dir) = env(&[1]);
+    let a = sized(spend(&[prev(1)], COIN_VALUE, 600, 2, 1), 400);
+    let a_id = accept(&mp, &cs, &a).expect("a");
+    let b = sized(spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 2_600, 1, 2), 400);
+    let b_id = accept(&mp, &cs, &b).expect("b");
+    let c = sized(spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_400, 1, 3), 200);
+    let c_id = accept(&mp, &cs, &c).expect("c");
+    let d_in = b.output[0].value.to_sat() + c.output[0].value.to_sat();
+    let d = sized(spend(&[out(b_id, 0), out(c_id, 0)], d_in, 1_400, 1, 4), 600);
+    accept(&mp, &cs, &d).expect("d");
+
+    let bump = sized(spend(&[out(b_id, 0), out(c_id, 0)], d_in, 2_400, 1, 5), 600);
+    let r = accept(&mp, &cs, &bump).expect("a fee-only bump improves the diagram");
+    assert_eq!(pool(&mp), HashSet::from([a_id, b_id, c_id, r]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

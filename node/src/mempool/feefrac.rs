@@ -262,32 +262,58 @@ pub fn cluster_chunks(txs: &[(FeeFrac, u64)]) -> Option<Vec<FeeFrac>> {
         total
     };
 
-    let mut remaining: u64 = if n == 64 { u64::MAX } else { bit(n) - 1 };
-    let mut chunks: Vec<FeeFrac> = Vec::new();
-    while remaining != 0 {
-        // The best remaining ancestor set: highest feerate, then the
-        // smaller, then the lower index, so the order is deterministic.
-        let mut best: Option<(u64, FeeFrac)> = None;
-        let mut rest = remaining;
+    // The best ancestor set within `within`: highest feerate, then the
+    // smaller, then the lower index, so the order is deterministic. Returns
+    // the set and the transaction whose ancestors it is.
+    let best_set = |within: u64| -> (u64, usize) {
+        let mut best: Option<(u64, usize, FeeFrac)> = None;
+        let mut rest = within;
         while rest != 0 {
             let i = rest.trailing_zeros() as usize;
             rest &= rest - 1;
-            let set = anc[i] & remaining;
+            let set = anc[i] & within;
             let ff = sum(set);
             let better = match best {
                 None => true,
-                Some((_, b)) => match feerate_compare(ff, b) {
+                Some((_, _, b)) => match feerate_compare(ff, b) {
                     Ordering::Greater => true,
                     Ordering::Equal => ff.size < b.size,
                     Ordering::Less => false,
                 },
             };
             if better {
-                best = Some((set, ff));
+                best = Some((set, i, ff));
             }
         }
-        let (set, mut segment) = best.expect("remaining is not empty");
-        remaining &= !set;
+        let (set, top, _) = best.expect("within is not empty");
+        (set, top)
+    };
+
+    // The linearization, one transaction at a time. Each chosen set is laid
+    // out by the same rule: its own ancestors first, in the order this picks
+    // among them, and the transaction it was chosen for last. Laying a set
+    // out as one block instead folded a cheap tail into the chunk ahead of
+    // it, so a fee-only bump of a diamond's last transaction came out worse
+    // than the transaction it replaced.
+    let all: u64 = if n == 64 { u64::MAX } else { bit(n) - 1 };
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    // (mask still to lay out, the transaction to place once it is empty)
+    let mut stack: Vec<(u64, Option<usize>)> = vec![(all, None)];
+    while let Some((mask, then)) = stack.pop() {
+        if mask == 0 {
+            order.extend(then);
+            continue;
+        }
+        let (set, top) = best_set(mask);
+        // The rest of `mask` after this set, then this set without its top,
+        // then the top: pushed in reverse.
+        stack.push((mask & !set, then));
+        stack.push((set & !bit(top), Some(top)));
+    }
+
+    let mut chunks: Vec<FeeFrac> = Vec::new();
+    for i in order {
+        let mut segment = txs[i].0;
         while let Some(last) = chunks.last()
             && feerate_compare(segment, *last) == Ordering::Greater
         {
@@ -355,6 +381,22 @@ mod tests {
         for pair in chunks.windows(2) {
             assert_ne!(feerate_compare(pair[0], pair[1]), Ordering::Less);
         }
+    }
+
+    /// A diamond: A parents B and C, and D spends both. Bumping only D's fee
+    /// must not chunk worse than before. Laying out D's ancestor set as one
+    /// block made it a single chunk, (7000, 6400), which at 4000 pays 4375
+    /// against the original's 4600.
+    #[test]
+    fn a_fee_bump_of_a_diamonds_tail_chunks_no_worse() {
+        let diamond = |d_fee| {
+            [(ff(600, 1600), 0), (ff(2600, 1600), 0b1), (ff(1400, 800), 0b1), (ff(d_fee, 2400), 0b110)]
+        };
+        let before = cluster_chunks(&diamond(1400)).unwrap();
+        let after = cluster_chunks(&diamond(2400)).unwrap();
+        assert_eq!(before, vec![ff(4600, 4000), ff(1400, 2400)]);
+        assert_eq!(after, vec![ff(4600, 4000), ff(2400, 2400)]);
+        assert_eq!(compare_chunks(&after, &before), DiagramOrdering::Better);
     }
 
     #[test]
