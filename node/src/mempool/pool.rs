@@ -1439,7 +1439,7 @@ pub struct Mempool {
     /// Run between a replacing package's parent and child admissions, so a
     /// test can move the chain there.
     #[cfg(test)]
-    between_package_members: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    between_package_members: Mutex<Option<PackageHook>>,
     /// Bounded ring of recent events for MCP snapshot consumption.
     /// Always maintained (cheap) so MCP tools work whether or not
     /// the broadcast sender is wired.
@@ -1627,6 +1627,8 @@ struct PackageAdmit {
     /// The transactions a `hold_events` admission replaced, kept from the
     /// replaced-transaction sink until the caller commits.
     held_replaced_txs: Vec<Transaction>,
+    /// A `hold_events` admission's quarantine-channel event.
+    held_quarantine: Vec<QuarantineEvent>,
     /// Set when the member was below the floors and let in by
     /// `skip_fee_floor`.
     floor_skipped: bool,
@@ -1637,6 +1639,38 @@ struct PackageAdmit {
     /// any sibling the TRUC rules evicted. Core's `m_replaced_transactions`,
     /// which `submitpackage` reports.
     replaced: Vec<Txid>,
+}
+
+/// A test's look at the mempool between a replacing package's parent and
+/// child.
+#[cfg(test)]
+type PackageHook = Box<dyn Fn(&Mempool) + Send + Sync>;
+
+/// The mempool write lock an admission works under: its own, or one its
+/// caller holds across several admissions (a replacing package's parent and
+/// child, which no reader may see half done).
+enum InnerWrite<'a> {
+    Own(parking_lot::RwLockWriteGuard<'a, MempoolInner>),
+    Held(&'a mut MempoolInner),
+}
+
+impl std::ops::Deref for InnerWrite<'_> {
+    type Target = MempoolInner;
+    fn deref(&self) -> &MempoolInner {
+        match self {
+            InnerWrite::Own(guard) => guard,
+            InnerWrite::Held(inner) => inner,
+        }
+    }
+}
+
+impl std::ops::DerefMut for InnerWrite<'_> {
+    fn deref_mut(&mut self) -> &mut MempoolInner {
+        match self {
+            InnerWrite::Own(guard) => guard,
+            InnerWrite::Held(inner) => inner,
+        }
+    }
 }
 
 /// Why [`Mempool::package_rbf_checks`] refused a package.
@@ -3034,6 +3068,7 @@ impl Mempool {
             allow_quarantined,
             lead,
             None,
+            None,
             pkg,
         )?;
         // Core expires the pool after every acceptance (`LimitMempoolSize` in
@@ -3065,6 +3100,7 @@ impl Mempool {
             false,
             Vec::new(),
             Some(time),
+            None,
             &mut PackageAdmit::default(),
         )?;
         self.remove_expired();
@@ -3084,6 +3120,7 @@ impl Mempool {
         allow_quarantined: bool,
         lead: Vec<MempoolEvent>,
         entry_time: Option<u64>,
+        locked: Option<&mut MempoolInner>,
         pkg: &mut PackageAdmit,
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
@@ -3177,8 +3214,12 @@ impl Mempool {
 
         let tx_size = bitcoin::consensus::serialize(&tx).len();
 
-        // Take write lock for the rest (prevents TOCTOU races)
-        let mut inner = self.inner.write();
+        // Take write lock for the rest (prevents TOCTOU races), unless the
+        // caller already holds it for more than this one admission.
+        let mut inner = match locked {
+            Some(held) => InnerWrite::Held(held),
+            None => InnerWrite::Own(self.inner.write()),
+        };
 
         // Check not already in mempool
         inner.entries.check_not_resident(&txid, &tx)?;
@@ -3797,13 +3838,18 @@ impl Mempool {
         // `Quarantined` on the separate channel instead; acting placements emit
         // `Enter` exactly as before.
         if scope.is_quarantined() {
-            self.emit_quarantine(QuarantineEvent::Quarantined {
+            let event = QuarantineEvent::Quarantined {
                 txid,
                 rule: quarantine_rule.unwrap_or_else(|| "(policy)".to_string()),
                 relay: scope.relay,
                 template: scope.template,
                 time: now,
-            });
+            };
+            if pkg.hold_events {
+                pkg.held_quarantine.push(event);
+            } else {
+                self.emit_quarantine(event);
+            }
         } else {
             let enter = MempoolEvent::Enter {
                 txid,
@@ -7323,91 +7369,107 @@ impl Mempool {
                     failed.insert(eval[i].wtxid, err);
                 }
                 Ok(()) => {
-                    // Parent, then child. Everything the parent's admission
-                    // would announce waits for the child: if the child cannot
-                    // follow (a block can connect in between, which the
-                    // package lock does not hold off), the parent comes back
-                    // out unannounced and what it evicted is restored.
+                    // Parent, then child, under one hold of the mempool lock,
+                    // so no reader sees the parent in and the child not, as
+                    // Core commits a package's changeset at once. A block can
+                    // still commit between the two (the chainstate is not
+                    // under this lock), and then the child fails; the parent
+                    // comes back out and what it evicted is restored, under
+                    // the same hold. Every event waits for the lock's release.
                     let (parent, child) = (eval[0], eval[1]);
-                    let mut parent_admit = PackageAdmit {
-                        skip_fee_floor: true,
+                    let hold = || PackageAdmit {
                         defer_trim: true,
                         no_sibling_eviction: true,
                         package_rbf: true,
                         hold_events: true,
                         ..Default::default()
                     };
-                    let parent_accepted = self.accept_transaction_led(
-                        parent.tx.clone(),
-                        chain_state,
-                        script_verifier,
-                        TxSource::Rpc,
-                        false,
-                        Vec::new(),
-                        &mut parent_admit,
-                    );
-                    match parent_accepted {
-                        Err(e) => {
-                            failed.insert(parent.wtxid, e.state_string());
-                            refuse_deferred(&mut failed, &[child]);
+                    let mut parent_admit = PackageAdmit { skip_fee_floor: true, ..hold() };
+                    let mut child_admit = hold();
+                    let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
+                    let outcome = {
+                        let mut inner = self.inner.write();
+                        match self.accept_transaction_unexpired(
+                            parent.tx.clone(),
+                            chain_state,
+                            script_verifier,
+                            TxSource::Rpc,
+                            false,
+                            Vec::new(),
+                            None,
+                            Some(&mut inner),
+                            &mut parent_admit,
+                        ) {
+                            Err(e) => Err((parent, e.state_string())),
+                            Ok(parent_txid) => {
+                                #[cfg(test)]
+                                if let Some(hook) = self.between_package_members.lock().as_ref() {
+                                    hook(self);
+                                }
+                                match self.accept_transaction_unexpired(
+                                    child.tx.clone(),
+                                    chain_state,
+                                    script_verifier,
+                                    TxSource::Rpc,
+                                    false,
+                                    Vec::new(),
+                                    None,
+                                    Some(&mut inner),
+                                    &mut child_admit,
+                                ) {
+                                    Ok(child_txid) => Ok((parent_txid, child_txid)),
+                                    Err(e) => {
+                                        gone = self.undo_package_parent(
+                                            &mut inner,
+                                            parent_txid,
+                                            std::mem::take(&mut parent_admit.evicted_entries),
+                                            &parent_admit.held,
+                                            chain_state,
+                                        );
+                                        Err((child, e.state_string()))
+                                    }
+                                }
+                            }
                         }
-                        Ok(parent_txid) => {
-                            #[cfg(test)]
-                            if let Some(hook) = self.between_package_members.lock().as_ref() {
-                                hook();
-                            }
-                            let held = std::mem::take(&mut parent_admit.held);
-                            let mut child_admit = PackageAdmit {
-                                defer_trim: true,
-                                no_sibling_eviction: true,
-                                package_rbf: true,
-                                ..Default::default()
-                            };
-                            let child_accepted = self.accept_transaction_led(
-                                child.tx.clone(),
-                                chain_state,
-                                script_verifier,
-                                TxSource::Rpc,
-                                false,
-                                held.clone(),
-                                &mut child_admit,
-                            );
-                            match child_accepted {
-                                Ok(child_txid) => {
-                                    member_replaced.extend(parent_admit.replaced.drain(..));
-                                    member_replaced.extend(child_admit.replaced.drain(..));
-                                    let replaced_txs = std::mem::take(&mut parent_admit.held_replaced_txs);
-                                    if !replaced_txs.is_empty()
-                                        && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
-                                    {
-                                        sink(replaced_txs);
-                                    }
-                                    let inner = self.inner.read();
-                                    for (p, txid) in [(parent, parent_txid), (child, child_txid)] {
-                                        accepted_txids.insert(txid);
-                                        if let Some(entry) = inner.entries.get(&txid) {
-                                            accepted_results.push(AcceptedMember::from_entry(
-                                                p.wtxid,
-                                                txid,
-                                                entry,
-                                                Admission::Subpackage,
-                                            ));
-                                        }
-                                    }
+                    };
+                    match outcome {
+                        Ok((parent_txid, child_txid)) => {
+                            for admit in [&mut parent_admit, &mut child_admit] {
+                                for event in admit.held.drain(..) {
+                                    self.emit(event);
                                 }
-                                Err(e) => {
-                                    failed.insert(child.wtxid, e.state_string());
-                                    self.undo_package_parent(
-                                        parent_txid,
-                                        std::mem::take(&mut parent_admit.evicted_entries),
-                                        &held,
-                                        chain_state,
-                                    );
-                                    refuse_deferred(&mut failed, &[parent]);
+                                for event in admit.held_quarantine.drain(..) {
+                                    self.emit_quarantine(event);
+                                }
+                                let replaced_txs = std::mem::take(&mut admit.held_replaced_txs);
+                                if !replaced_txs.is_empty()
+                                    && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
+                                {
+                                    sink(replaced_txs);
+                                }
+                                member_replaced.extend(admit.replaced.drain(..));
+                            }
+                            let inner = self.inner.read();
+                            for (p, txid) in [(parent, parent_txid), (child, child_txid)] {
+                                accepted_txids.insert(txid);
+                                if let Some(entry) = inner.entries.get(&txid) {
+                                    accepted_results.push(AcceptedMember::from_entry(
+                                        p.wtxid,
+                                        txid,
+                                        entry,
+                                        Admission::Subpackage,
+                                    ));
                                 }
                             }
+                        }
+                        Err((member, err)) => {
+                            self.emit_evicted(&gone, EvictReason::BlockConflict);
+                            failed.insert(member.wtxid, err);
+                            let other = if member.txid == parent.txid { child } else { parent };
+                            refuse_deferred(&mut failed, &[other]);
                         }
                     }
+                    self.remove_expired();
                 }
             }
             package_eval = false;
@@ -8005,8 +8067,16 @@ impl Mempool {
         if txids.is_empty() {
             return Vec::new();
         }
-        let mut removed: Vec<Txid> = Vec::new();
         let mut inner = self.inner.write();
+        let removed = Self::remove_unannounced_locked(&mut inner, txids);
+        self.sync_unbroadcast_len(&inner);
+        removed
+    }
+
+    /// [`Self::remove_unannounced`] under a lock the caller holds; the
+    /// caller syncs the unbroadcast count.
+    fn remove_unannounced_locked(inner: &mut MempoolInner, txids: &[Txid]) -> Vec<Txid> {
+        let mut removed: Vec<Txid> = Vec::new();
         for txid in txids {
             if let Some(entry) = inner.entries.remove(txid) {
                 let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
@@ -8018,7 +8088,6 @@ impl Mempool {
                 removed.push(*txid);
             }
         }
-        self.sync_unbroadcast_len(&inner);
         removed
     }
 
@@ -8026,16 +8095,18 @@ impl Mempool {
     /// and put back what it evicted. Nothing about the parent was announced
     /// (`PackageAdmit::hold_events`), so the mempool is as it was, less what
     /// the chain has since made invalid: an evicted transaction whose input
-    /// is gone or now spent is left out, with its descendants, and announced
-    /// as a block conflict under the sequence number its eviction took.
+    /// is gone or now spent is left out, with its descendants, and returned
+    /// for the caller to announce as a block conflict, under the sequence
+    /// number its eviction took, once it has released the lock.
     fn undo_package_parent(
         &self,
+        inner: &mut MempoolInner,
         parent: Txid,
         evicted: Vec<(Txid, MempoolEntry, Option<HashSet<std::net::IpAddr>>)>,
         held: &[MempoolEvent],
         chain_state: &ChainState,
-    ) {
-        self.remove_unannounced(&[parent]);
+    ) -> Vec<(Txid, QuarantineScope, u64)> {
+        Self::remove_unannounced_locked(inner, &[parent]);
         let left_at: HashMap<Txid, u64> = held
             .iter()
             .filter_map(|event| match event {
@@ -8053,36 +8124,33 @@ impl Mempool {
         }
         let order = Self::topological_order(&entries);
         let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
-        {
-            let mut inner = self.inner.write();
-            for txid in order {
-                let Some(entry) = entries.remove(&txid) else { continue };
-                let valid = !inner.entries.contains_key(&txid)
-                    && entry.tx.input.iter().all(|i| {
-                        !inner.spends.contains_key(&i.previous_output)
-                            && (inner
-                                .entries
-                                .get(&i.previous_output.txid)
-                                .is_some_and(|p| (i.previous_output.vout as usize) < p.tx.output.len())
-                                || chain_state.get_coin(&i.previous_output).is_some())
-                    });
-                if valid {
-                    for input in &entry.tx.input {
-                        inner.spends.insert(input.previous_output, txid);
-                    }
-                    let size = bitcoin::consensus::serialize(&entry.tx).len();
-                    inner.account_insert(entry.scope, size);
-                    inner.entries.insert(txid, entry);
-                    if let Some(record) = unbroadcast.remove(&txid) {
-                        inner.unbroadcast.insert(txid, record);
-                    }
-                } else if entry.scope.is_acting() {
-                    gone.push((txid, entry.scope, left_at.get(&txid).copied().unwrap_or(0)));
+        for txid in order {
+            let Some(entry) = entries.remove(&txid) else { continue };
+            let valid = !inner.entries.contains_key(&txid)
+                && entry.tx.input.iter().all(|i| {
+                    !inner.spends.contains_key(&i.previous_output)
+                        && (inner
+                            .entries
+                            .get(&i.previous_output.txid)
+                            .is_some_and(|p| (i.previous_output.vout as usize) < p.tx.output.len())
+                            || chain_state.get_coin(&i.previous_output).is_some())
+                });
+            if valid {
+                for input in &entry.tx.input {
+                    inner.spends.insert(input.previous_output, txid);
                 }
+                let size = bitcoin::consensus::serialize(&entry.tx).len();
+                inner.account_insert(entry.scope, size);
+                inner.entries.insert(txid, entry);
+                if let Some(record) = unbroadcast.remove(&txid) {
+                    inner.unbroadcast.insert(txid, record);
+                }
+            } else if entry.scope.is_acting() {
+                gone.push((txid, entry.scope, left_at.get(&txid).copied().unwrap_or(0)));
             }
-            self.sync_unbroadcast_len(&inner);
         }
-        self.emit_evicted(&gone, EvictReason::BlockConflict);
+        self.sync_unbroadcast_len(inner);
+        gone
     }
 
     /// Core's `TrimToSize`: evict, lowest descendant score first, until each

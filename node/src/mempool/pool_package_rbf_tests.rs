@@ -518,7 +518,7 @@ fn the_childs_policy_sees_the_mempool_after_its_parent() {
 fn spend_between(mp: &Mempool, cs: &ChainState, coins: Vec<OutPoint>) {
     use crate::storage::Store as _;
     let store = cs.store_ref().clone();
-    *mp.between_package_members.lock() = Some(Box::new(move || {
+    *mp.between_package_members.lock() = Some(Box::new(move |_| {
         let batch = crate::storage::StoreBatch {
             coin_removes: coins.iter().map(|c| (*c, COIN_VALUE, 1)).collect(),
             ..Default::default()
@@ -585,6 +585,27 @@ fn a_replaced_transaction_the_block_invalidated_is_not_restored() {
     assert_eq!(res.package_msg, "transaction failed");
     assert!(pool(&mp).is_empty());
     assert_eq!(stream(&mut rx), vec![format!("evicted {a_id} BlockConflict")]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No reader sees a replacing package half admitted: between the parent and
+/// the child the mempool cannot be read, so a snapshot (`getrawmempool`
+/// with its sequence) holds either neither or both.
+#[test]
+fn no_reader_sees_a_replacing_package_half_admitted() {
+    let (cs, mp, dir) = floor_env(&[1]);
+    let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
+    assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
+    let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
+    let seen: std::sync::Arc<Mutex<Option<bool>>> = Default::default();
+    let record = seen.clone();
+    *mp.between_package_members.lock() = Some(Box::new(move |mp: &Mempool| {
+        *record.lock() = Some(mp.try_with_entries(|_| ()).is_some());
+    }));
+
+    assert_eq!(submit(&mp, &cs, &[&p2, &c2]).package_msg, "success");
+    assert_eq!(*seen.lock(), Some(false), "the mempool was readable between the parent and the child");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
