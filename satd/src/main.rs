@@ -1234,7 +1234,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     //   all          → skip scripts for ALL blocks (trust network)
     let assumevalid = match config.assumevalid.as_deref() {
         None | Some("") => {
-            let av = node::chain::state::default_assumevalid(config.network);
+            let av = node::chain::state::default_assumevalid(
+                config.network,
+                config.signet_challenge.is_some(),
+            );
             match &av {
                 node::chain::state::AssumeValid::Hash(h) => {
                     tracing::info!(%h, "Using default assumevalid hash");

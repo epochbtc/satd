@@ -44,8 +44,13 @@ pub enum AssumeValid {
 /// Per-network default assumevalid hashes.
 /// These are well-known blocks deep in the chain that the community has validated.
 /// Matches Bitcoin Core's approach of shipping a default per release.
-pub fn default_assumevalid(network: Network) -> AssumeValid {
+///
+/// A custom signet (`-signetchallenge`) has none: the default signet's block
+/// is not on its chain. Core's `SigNetParams` clears `defaultAssumeValid` when
+/// a challenge is given.
+pub fn default_assumevalid(network: Network, custom_signet: bool) -> AssumeValid {
     match network {
+        Network::Signet if custom_signet => AssumeValid::Disabled,
         Network::Bitcoin => {
             // Bitcoin Core v28.0 default (height 840,000)
             AssumeValid::Hash(
@@ -1125,7 +1130,18 @@ impl ChainState {
     /// `ChainState` is shared (wrapped in an `Arc`). On signet this
     /// replaces the default challenge for block-solution validation and
     /// derives a custom P2P magic.
+    ///
+    /// A custom signet also drops the built-in checkpoints. They are the
+    /// default signet's blocks, and every signet shares its genesis, so a
+    /// custom signet's block at the first checkpoint height (50,000) failed
+    /// as a checkpoint mismatch and the node stopped following its chain.
+    /// Core never had signet checkpoints.
     pub fn set_signet_challenge(&mut self, challenge: Option<Vec<u8>>) {
+        self.checkpoints = if challenge.is_some() {
+            Vec::new()
+        } else {
+            checkpoints::checkpoints_for_network(self.network)
+        };
         self.signet_challenge = challenge;
     }
 
@@ -21826,6 +21842,43 @@ pub(crate) mod tests {
         cs.flush_coin_cache().expect("flush");
         cs.store.flush().unwrap();
         (cs, dir)
+    }
+
+    #[test]
+    fn a_custom_signet_has_no_default_signet_checkpoints() {
+        // Every signet shares the default signet's genesis, so the built-in
+        // checkpoints (the default signet's blocks) used to apply to a custom
+        // signet too: its block at height 50,000 failed as a checkpoint
+        // mismatch and the node stopped following its chain.
+        let dir = std::env::temp_dir().join(format!(
+            "satd-chain-test-custom-signet-checkpoints-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cs = signet_chain_state_over(&dir);
+        let other: BlockHash =
+            "0000000000000000000000000000000000000000000000000000000000000001".parse().unwrap();
+
+        // The default signet keeps them: a different block at 50,000 fails.
+        assert!(!checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+
+        cs.set_signet_challenge(Some(vec![0x51])); // OP_TRUE
+        assert!(cs.checkpoints.is_empty());
+        assert!(checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+
+        // Back to the default challenge, back to its checkpoints.
+        cs.set_signet_challenge(None);
+        assert!(!checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_custom_signet_has_no_default_assumevalid() {
+        assert!(matches!(default_assumevalid(Network::Signet, false), AssumeValid::Hash(_)));
+        assert!(matches!(default_assumevalid(Network::Signet, true), AssumeValid::Disabled));
+        // Only signet has a challenge to customise.
+        assert!(matches!(default_assumevalid(Network::Bitcoin, true), AssumeValid::Hash(_)));
     }
 
     /// A default-signet `ChainState` with an empty database over `dir`'s
