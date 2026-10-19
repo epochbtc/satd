@@ -111,12 +111,15 @@ pub fn get_tx_spending_prevout(
     }
 
     // The mempool pass first, as one snapshot, then the index. A spender's
-    // hex is encoded once, and a block holding confirmed spenders read
-    // once, however many of the outputs they answer.
+    // hex is encoded once, however many of the outputs it answers. satd
+    // locates a confirmed transaction by its block only, so the block is
+    // read to find it; only the last one read is kept, so consecutive
+    // spenders in one block share a read without the call holding every
+    // block it touches.
     let outpoints: Vec<OutPoint> = prevouts.iter().map(|(op, _)| *op).collect();
     let (in_mempool, mempool_txs) = mempool.spending_transactions_acting(&outpoints, return_spending_tx);
     let mut hex: HashMap<Txid, String> = HashMap::new();
-    let mut blocks: HashMap<BlockHash, Block> = HashMap::new();
+    let mut last_block: Option<(BlockHash, Block)> = None;
     let mut result = Vec::with_capacity(prevouts.len());
     for ((outpoint, mut o), spender) in prevouts.into_iter().zip(in_mempool) {
         if let Some(spending_txid) = spender {
@@ -142,14 +145,13 @@ pub fn get_tx_spending_prevout(
                         let h = match hex.entry(spending_txid) {
                             Entry::Occupied(e) => e.into_mut(),
                             Entry::Vacant(e) => {
-                                let block = match blocks.entry(block_hash) {
-                                    Entry::Occupied(b) => b.into_mut(),
-                                    Entry::Vacant(b) => b.insert(
-                                        chain
-                                            .get_block(&block_hash)
-                                            .ok_or((-1, format!("Block {block_hash} not available")))?,
-                                    ),
-                                };
+                                if last_block.as_ref().is_none_or(|(h, _)| *h != block_hash) {
+                                    let block = chain
+                                        .get_block(&block_hash)
+                                        .ok_or((-1, format!("Block {block_hash} not available")))?;
+                                    last_block = Some((block_hash, block));
+                                }
+                                let (_, block) = last_block.as_ref().expect("read above");
                                 let tx = block
                                     .txdata
                                     .iter()
