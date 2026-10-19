@@ -8,8 +8,11 @@
 //! `disconnect_block` keep in step with the active chain; Core's
 //! `txospenderindex` is a background index of its own.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{OutPoint, Transaction, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, Txid};
 use node_index::{IndexError, SpendIndex};
 use serde_json::{Map, Value};
 
@@ -107,19 +110,21 @@ pub fn get_tx_spending_prevout(
         prevouts.push((OutPoint { txid, vout: vout as u32 }, o));
     }
 
-    let with_tx = |o: &mut Map<String, Value>, tx: &Transaction| {
-        if return_spending_tx {
-            o.insert("spendingtx".into(), Value::String(serialize_hex(tx)));
-        }
-    };
-    // The mempool pass first, as one snapshot, then the index.
+    // The mempool pass first, as one snapshot, then the index. A spender's
+    // hex is encoded once, and a block holding confirmed spenders read
+    // once, however many of the outputs they answer.
     let outpoints: Vec<OutPoint> = prevouts.iter().map(|(op, _)| *op).collect();
-    let in_mempool = mempool.spending_transactions_acting(&outpoints);
+    let (in_mempool, mempool_txs) = mempool.spending_transactions_acting(&outpoints, return_spending_tx);
+    let mut hex: HashMap<Txid, String> = HashMap::new();
+    let mut blocks: HashMap<BlockHash, Block> = HashMap::new();
     let mut result = Vec::with_capacity(prevouts.len());
     for ((outpoint, mut o), spender) in prevouts.into_iter().zip(in_mempool) {
-        if let Some(tx) = spender {
-            o.insert("spendingtxid".into(), Value::String(tx.compute_txid().to_string()));
-            with_tx(&mut o, &tx);
+        if let Some(spending_txid) = spender {
+            o.insert("spendingtxid".into(), Value::String(spending_txid.to_string()));
+            if let Some(tx) = mempool_txs.get(&spending_txid) {
+                let h = hex.entry(spending_txid).or_insert_with(|| serialize_hex(tx));
+                o.insert("spendingtx".into(), Value::String(h.clone()));
+            }
         } else if !mempool_only {
             let unavailable = || {
                 (-1, format!(
@@ -134,11 +139,26 @@ pub fn get_tx_spending_prevout(
                     o.insert("spendingtxid".into(), Value::String(spending_txid.to_string()));
                     o.insert("blockhash".into(), Value::String(block_hash.to_string()));
                     if return_spending_tx {
-                        let tx = chain
-                            .get_block(&block_hash)
-                            .and_then(|b| b.txdata.into_iter().find(|t| t.compute_txid() == spending_txid))
-                            .ok_or((-1, format!("Block {block_hash} not available")))?;
-                        with_tx(&mut o, &tx);
+                        let h = match hex.entry(spending_txid) {
+                            Entry::Occupied(e) => e.into_mut(),
+                            Entry::Vacant(e) => {
+                                let block = match blocks.entry(block_hash) {
+                                    Entry::Occupied(b) => b.into_mut(),
+                                    Entry::Vacant(b) => b.insert(
+                                        chain
+                                            .get_block(&block_hash)
+                                            .ok_or((-1, format!("Block {block_hash} not available")))?,
+                                    ),
+                                };
+                                let tx = block
+                                    .txdata
+                                    .iter()
+                                    .find(|t| t.compute_txid() == spending_txid)
+                                    .ok_or((-1, format!("Transaction {spending_txid} not in block {block_hash}")))?;
+                                e.insert(serialize_hex(tx))
+                            }
+                        };
+                        o.insert("spendingtx".into(), Value::String(h.clone()));
                     }
                 }
                 // Core's `BlockUntilSyncedToCurrentChain` failing: the index

@@ -7,7 +7,7 @@ use crate::storage::coinview::Coin;
 use crate::validation::script::NoopVerifier;
 use bitcoin::hashes::Hash as _;
 use bitcoin::transaction::Version;
-use bitcoin::{Amount, Sequence, TxIn, TxOut, Witness};
+use bitcoin::{Amount, Sequence, Transaction, TxIn, TxOut, Witness};
 use node_index::SpendingRef;
 use serde_json::json;
 
@@ -186,7 +186,11 @@ fn outputs_spent_by_one_transaction_name_it_for_each() {
     let mut tx = spend(prev(1));
     tx.input.push(TxIn { previous_output: prev(2), script_sig: Default::default(), sequence: Sequence::MAX, witness: Witness::new() });
     mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
-    assert_eq!(mp.spending_transactions_acting(&[prev(1), prev(2), prev(3)]), vec![Some(tx.clone()), Some(tx.clone()), None]);
+    let txid = tx.compute_txid();
+    let (spenders, txs) = mp.spending_transactions_acting(&[prev(1), prev(2), prev(3)], true);
+    assert_eq!(spenders, vec![Some(txid), Some(txid), None]);
+    assert_eq!(txs.len(), 1, "one copy of the spender, not one per output");
+    assert!(mp.spending_transactions_acting(&[prev(1)], false).1.is_empty(), "no copy unless asked for");
     let r = call(&cs, &mp, None, vec![arg(prev(1)), arg(prev(2))], Value::Null).unwrap();
     assert_eq!(r[0]["spendingtxid"], r[1]["spendingtxid"]);
 

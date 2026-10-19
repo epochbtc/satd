@@ -4373,15 +4373,33 @@ impl Mempool {
     /// same acting view as [`Self::spending_tx_acting`]. One snapshot, so a
     /// replacement cannot land between two outputs and name spenders that
     /// were never in the mempool together.
-    pub fn spending_transactions_acting(&self, outpoints: &[OutPoint]) -> Vec<Option<Transaction>> {
+    ///
+    /// The spenders come back as txids. With `with_tx`, each distinct
+    /// spender's transaction is cloned once, however many of the outputs
+    /// it spends: a request naming one output many times must not copy a
+    /// large transaction as many times under the lock.
+    pub fn spending_transactions_acting(
+        &self,
+        outpoints: &[OutPoint],
+        with_tx: bool,
+    ) -> (Vec<Option<Txid>>, HashMap<Txid, Transaction>) {
         let inner = self.inner.read();
-        outpoints
+        let mut txs: HashMap<Txid, Transaction> = HashMap::new();
+        let spenders = outpoints
             .iter()
             .map(|outpoint| {
-                let entry = inner.entries.get(inner.spends.get(outpoint)?)?;
-                entry.scope.is_acting().then(|| entry.tx.clone())
+                let txid = *inner.spends.get(outpoint)?;
+                let entry = inner.entries.get(&txid)?;
+                if !entry.scope.is_acting() {
+                    return None;
+                }
+                if with_tx {
+                    txs.entry(txid).or_insert_with(|| entry.tx.clone());
+                }
+                Some(txid)
             })
-            .collect()
+            .collect();
+        (spenders, txs)
     }
 
     /// Remove transactions that have been in the mempool longer than the expiry time.
