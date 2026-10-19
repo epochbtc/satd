@@ -793,6 +793,17 @@ silently returning an empty or wrong answer.
   descendants, which only a reorg can leave past the cluster limits, ranks
   by the parent's own feerate.
 
+- **Transaction download** — satd schedules transaction requests as Core's
+  `TxRequestTracker` does (one request per transaction at a time, Core's
+  delays, expiry and per-peer limits). Three of the checks around it differ:
+  - An `inv` for a transaction held in the orphanage is fetched again.
+    Core instead takes the announcer as another peer to ask for the
+    orphan's parents; satd's orphanage keeps one sender per orphan.
+  - satd keeps no filter of recently confirmed transactions, so one
+    announced after it confirmed is fetched and validated again.
+  - Under `-blocksonly`, no transaction is fetched, also from a peer with
+    the `relay` permission, which Core still fetches from.
+
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
   its number is the block files alone and is smaller than Core's for the same
