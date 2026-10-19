@@ -68,9 +68,9 @@ pub struct CoreIndexFlags {
 ///   the two surfaces cannot disagree about one index.
 /// - `"txospenderindex"` — present when `-txospenderindex` was set;
 ///   synced when `spent_complete()` is true. satd has no separate
-///   spender index, and does not implement `gettxspendingprevout`; the
-///   `spent` column family is what backs Esplora's outspend endpoints,
-///   so that marker is the honest answer. The JSON name is Core's and
+///   spender index: `gettxspendingprevout` and Esplora's outspend
+///   endpoints both read the `spent` column family, so that marker is the
+///   honest answer. The JSON name is Core's and
 ///   stays whatever the family behind it is called.
 /// - `"coinstatsindex"` — present when `-coinstatsindex` was set.
 ///   satd implements no UTXO-set hash index, so this never reports

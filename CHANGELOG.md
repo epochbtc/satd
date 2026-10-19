@@ -44,6 +44,11 @@ item below is (or will be) written up in full in the in-development
   satd counted ancestors only, so a parent took any number of children and
   a chain of 65 passed at 64.
 
+- `gettxspendingprevout`, as in Core v31: the mempool spender of each
+  output, and under `-txospenderindex` the confirmed spender and its block,
+  read from the address index's spend rows. `-txospenderindex` is now
+  refused with pruning, as in Core, and without `-addressindex`.
+
 ### Fixed
 
 - The Rust script engine computes a tapscript signature hash as Core does,

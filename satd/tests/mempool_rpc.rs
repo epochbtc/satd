@@ -159,3 +159,66 @@ fn sendrawtransaction_of_a_spent_confirmed_transaction_is_missing_inputs() {
     assert!(message.contains("bad-txns-inputs-missingorspent"), "{message}");
     node.stop();
 }
+
+/// `gettxspendingprevout` under `-txospenderindex`, through the case Core's
+/// `rpc_gettxspendingprevout.py` ends on: a spender in a block is found with
+/// its block, and once `invalidateblock` disconnects that block and a
+/// replacement evicts the spender, the output reads unspent at once. Core's
+/// index would still name the spender until the next block (CORE_DIFFERENCES.md).
+#[test]
+fn gettxspendingprevout_reads_the_mempool_then_the_chain() {
+    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
+    let mut node = funded_node(&["-txospenderindex"], &wallet);
+    poll_until(
+        || node.rpc_ok("getindexinfo", vec![])["txospenderindex"]["synced"] == json!(true),
+        test_timeout(30),
+        "txospenderindex never synced",
+    );
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (parent_hex, parent, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 10_000);
+    let (child_hex, child) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        spk,
+        50 * 100_000_000 - 10_000,
+        wallet.address.script_pubkey(),
+        10_000,
+    );
+    let coinbase_out = json!({"txid": block1_coinbase_txid(&node), "vout": 0});
+    let parent_out = json!({"txid": parent, "vout": 0});
+    let ask = |node: &TestNode, outputs: Value, options: Value| {
+        node.rpc_ok("gettxspendingprevout", vec![outputs, options])
+    };
+
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
+    assert_eq!(
+        ask(&node, json!([parent_out]), json!({})),
+        json!([{"txid": parent, "vout": 0, "spendingtxid": child}]),
+        "the mempool spender"
+    );
+
+    node.mine_blocks(1, &wallet.address.to_string());
+    let block = node.rpc_ok("getbestblockhash", vec![]);
+    assert_eq!(
+        ask(&node, json!([parent_out]), json!({"return_spending_tx": true})),
+        json!([{"txid": parent, "vout": 0, "spendingtxid": child, "blockhash": block, "spendingtx": child_hex}]),
+        "the confirmed spender, its block and itself"
+    );
+    assert_eq!(ask(&node, json!([parent_out]), json!({"mempool_only": true})), json!([parent_out]));
+
+    node.rpc_ok("invalidateblock", vec![block]);
+    let (_, other_spk) = p2tr_keypath_output(&secp, [0x3d; 32]);
+    let (replacement_hex, replacement) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, other_spk, 30_000);
+    node.rpc_ok("sendrawtransaction", vec![json!(replacement_hex)]);
+    assert_eq!(
+        ask(&node, json!([coinbase_out, parent_out]), json!({})),
+        json!([
+            {"txid": coinbase_out["txid"], "vout": 0, "spendingtxid": replacement},
+            parent_out,
+        ]),
+        "the disconnected spender is gone from the index"
+    );
+}

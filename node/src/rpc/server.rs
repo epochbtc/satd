@@ -83,6 +83,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("gettxout", "Blockchain"),
     ("gettxoutproof", "Blockchain"),
     ("gettxoutsetinfo", "Blockchain"),
+    ("gettxspendingprevout", "Blockchain"),
     ("invalidateblock", "Blockchain"),
     ("listquarantine", "Blockchain"),
     ("loadtxoutset", "Blockchain"),
@@ -2503,6 +2504,29 @@ pub async fn start(
         let mempool = include_mempool.unwrap_or(true).then_some(ctx.mempool.as_ref());
         blockchain::get_tx_out_view(&ctx.chain_state, mempool, &txid, vout)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("gettxspendingprevout", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let outputs: Vec<serde_json::Value> = args.required("outputs")?;
+        let options: Option<serde_json::Map<String, serde_json::Value>> = args.optional("options")?;
+        args.check()?;
+        // `-txospenderindex` is served by the address index's spend rows;
+        // config refuses the flag without that index.
+        let index = (ctx.txospenderindex_enabled && ctx.address_index_enabled).then(|| {
+            crate::index::outpoint_spend::lookups::RocksSpendIndex::new(
+                ctx.chain_state.store_ref().clone(),
+                Arc::new(crate::index::address::AddressIndexConfig { enabled: true, ..Default::default() }),
+            )
+        });
+        crate::rpc::txospender::get_tx_spending_prevout(
+            &ctx.chain_state,
+            &ctx.mempool,
+            index.as_ref().map(|i| i as &dyn node_index::SpendIndex),
+            outputs,
+            options,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {

@@ -453,8 +453,8 @@ note = "measured 2026-09-15: L110 reject-reason 'insufficient fee' where 'bip125
 [[test]]
 file = "mempool_packages.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-10-19 with cluster limits: L87 gettxspendingprevout is Method not found. Follow-up: gettxspendingprevout"
+reason = "feature-missing"
+note = "measured 2026-10-19 with gettxspendingprevout: L219 node1 (-limitclustercount=10) should hold 20 transactions, but after invalidateblock it keeps all 64 of the reorged chain; satd exempts reorged transactions from the cluster limits and has no trim of an oversized cluster afterwards (CORE_DIFFERENCES.md). Follow-up: trim clusters over the limit after a reorg, as Core does"
 
 [[test]]
 file = "mempool_persist.py"
@@ -898,8 +898,8 @@ status = "run"
 [[test]]
 file = "rpc_gettxspendingprevout.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L89 the test uses -txospenderindex (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+reason = "core-internal"
+note = "measured 2026-10-19: every section passes up to L198. L200 expects the index to still name a spender in the block invalidateblock just disconnected, because Core's txospenderindex rewinds only when the next block connects; satd's spend rows follow the active chain and drop it at once (CORE_DIFFERENCES.md)"
 
 [[test]]
 file = "rpc_help.py"

@@ -4367,6 +4367,41 @@ impl Mempool {
         Some((spending_txid, vin))
     }
 
+    /// The acting transaction spending each of `outpoints`, all read under
+    /// one lock: Core's `GetConflictTx` over `gettxspendingprevout`'s
+    /// outputs, which Core answers holding `mempool.cs` throughout, on the
+    /// same acting view as [`Self::spending_tx_acting`]. One snapshot, so a
+    /// replacement cannot land between two outputs and name spenders that
+    /// were never in the mempool together.
+    ///
+    /// The spenders come back as txids. With `with_tx`, each distinct
+    /// spender's transaction is cloned once, however many of the outputs
+    /// it spends: a request naming one output many times must not copy a
+    /// large transaction as many times under the lock.
+    pub fn spending_transactions_acting(
+        &self,
+        outpoints: &[OutPoint],
+        with_tx: bool,
+    ) -> (Vec<Option<Txid>>, HashMap<Txid, Transaction>) {
+        let inner = self.inner.read();
+        let mut txs: HashMap<Txid, Transaction> = HashMap::new();
+        let spenders = outpoints
+            .iter()
+            .map(|outpoint| {
+                let txid = *inner.spends.get(outpoint)?;
+                let entry = inner.entries.get(&txid)?;
+                if !entry.scope.is_acting() {
+                    return None;
+                }
+                if with_tx {
+                    txs.entry(txid).or_insert_with(|| entry.tx.clone());
+                }
+                Some(txid)
+            })
+            .collect();
+        (spenders, txs)
+    }
+
     /// Remove transactions that have been in the mempool longer than the expiry time.
     /// Returns the number of transactions removed.
     pub fn remove_expired(&self) -> usize {
