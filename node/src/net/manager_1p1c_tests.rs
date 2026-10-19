@@ -193,3 +193,21 @@ fn a_child_refused_outright_in_its_package_is_rejected_on_its_own() {
     assert!(pm.recently_rejected(parent.compute_wtxid().as_byte_array()), "the parent only on its fee");
 }
 
+
+/// A child still missing another parent fails its package for missing
+/// inputs and stays in the orphanage, as Core keeps a `TX_MISSING_INPUTS`
+/// member; the failed pairing is not tried again while it waits.
+#[test]
+fn a_child_missing_another_parent_waits_and_its_pairing_is_not_retried() {
+    let (pm, _dir) = pm_with_coins(&[10]);
+    let parent = spend(coin_at(10), COIN, 50, 10);
+    let mut child = spend(OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 50, 5_000, 11);
+    let elsewhere = bitcoin::Txid::from_byte_array([0x7a; 32]);
+    child.input.push(TxIn { previous_output: OutPoint { txid: elsewhere, vout: 0 }, ..child.input[0].clone() });
+    pm.handle_tx(1, child.clone());
+    pm.handle_tx(1, parent.clone());
+    assert!(!in_pool(&pm, &parent) && !in_pool(&pm, &child));
+    assert!(pm.orphanage.contains(&child.compute_txid()), "still missing an input");
+    assert!(!pm.recently_rejected(child.compute_wtxid().as_byte_array()));
+    assert!(pm.find_1p1c_package(&parent, 1).is_none(), "the failed pairing is remembered");
+}
