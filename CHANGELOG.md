@@ -51,6 +51,10 @@ item below is (or will be) written up in full in the in-development
   read from the address index's spend rows. `-txospenderindex` is now
   refused with pruning, as in Core, and without `-addressindex`.
 
+- Core's opportunistic 1-parent-1-child package relay: a parent a peer
+  sends, refused on its fee alone, enters with a child of it the same peer
+  sent, as a package (CPFP, ephemeral dust or package RBF).
+
 - Package RBF in `submitpackage`, as in Core v31: a child may pay for its
   parent's replacement, which the parent could not afford alone. Core's
   `PackageRBFChecks` apply (one parent and one child, no unconfirmed

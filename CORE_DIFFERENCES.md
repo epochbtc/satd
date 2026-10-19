@@ -780,13 +780,15 @@ silently returning an empty or wrong answer.
   parent and child that replace mempool transactions are judged together
   by Core's `PackageRBFChecks`, scripts included, before anything is
   evicted. A multi-transaction `testmempoolaccept` evaluates its
-  transactions together, as Core's does. One piece of Core's package
-  policy is absent:
-  - **Package relay.** A below-floor parent and its child, or a package
-    that replaces only together, reach satd only through `submitpackage`;
-    satd does not do Core's opportunistic 1-parent-1-child relay. Core
-    peers still get such a package from satd, because they request the
-    parent of an orphan child from the peer that sent it.
+  transactions together, as Core's does. Core's opportunistic
+  1-parent-1-child relay pairs a parent refused on its fee alone with a
+  child of it in the orphanage, as in Core, with one difference:
+  - **Which peer's child.** Core pairs a parent with orphans that the same
+    peer sent or announced, because its orphanage records every announcer
+    of an orphan. satd's records only the peer that sent it first, so a
+    child is paired only with a parent from that peer. If two peers send
+    the same parent and child, the second peer's pair is not tried; the
+    first peer's still is.
 
   Eviction ranks by descendant score, which is how Core trimmed before the
   cluster mempool; v31 trims by chunk feerate.
