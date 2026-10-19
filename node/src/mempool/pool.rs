@@ -114,7 +114,7 @@ fn format_btc(sats: u64) -> String {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum MempoolError {
     #[error("txn-already-in-mempool")]
     AlreadyExists,
@@ -1551,7 +1551,15 @@ pub struct PackageResult {
     pub package_msg: String,
     pub tx_results: serde_json::Map<String, serde_json::Value>,
     pub replaced: Vec<Txid>,
+    /// The error behind each refused member's `tx-results` entry, by
+    /// wtxid, for the P2P package relay to record as Core's
+    /// `ProcessPackageResult` records each member's state.
+    pub member_errors: HashMap<Wtxid, MempoolError>,
 }
+
+/// A package member's refusal: the text `submitpackage` reports for it, and
+/// the error it stands for.
+type Refusal = (String, MempoolError);
 
 /// The answer to a multi-transaction `testmempoolaccept`
 /// ([`Mempool::test_accept_package`]).
@@ -1680,7 +1688,7 @@ enum PackageRbfRefusal {
     Package(String),
     /// One member, by its index among those evaluated: Core's `PCKG_TX`,
     /// that member's error.
-    Member(usize, String),
+    Member(usize, MempoolError),
 }
 
 /// How a package member came to be in the mempool — Core's
@@ -6752,7 +6760,7 @@ impl Mempool {
         for (i, tx) in members.iter().enumerate() {
             let checked = self
                 .test_prechecks(tx, chain_state, Some(&members[..i]), true)
-                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+                .map_err(|e| PackageRbfRefusal::Member(i, e))?;
             pre.push(checked);
         }
         let failed = |reason: &str, detail: Option<String>| {
@@ -6782,7 +6790,7 @@ impl Mempool {
         if !cfg.full_rbf {
             for (i, p) in pre.iter().enumerate() {
                 if p.conflicts.iter().any(|c| inner.entries.get(c).is_some_and(|e| !Self::signals_rbf(&e.tx))) {
-                    return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+                    return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend));
                 }
             }
         }
@@ -6850,7 +6858,7 @@ impl Mempool {
         // dust spends whatever `-acceptnonstdtxn` says, and a refusal there
         // would come after the parent had evicted its conflicts.
         if let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, members) {
-            return Err(PackageRbfRefusal::Member(i, e.state_string()));
+            return Err(PackageRbfRefusal::Member(i, e));
         }
 
         // The mempool size the child's policy sees on admission: after the
@@ -6875,13 +6883,13 @@ impl Mempool {
             let own_conflicts = checked.conflicts.clone();
             let (_, _, _, scope) = self
                 .test_finish_scoped(tx, chain_state, script_verifier, checked, inherited, (i > 0).then_some(child_sees))
-                .map_err(|e| PackageRbfRefusal::Member(i, e.state_string()))?;
+                .map_err(|e| PackageRbfRefusal::Member(i, e))?;
             if scope.is_quarantined()
                 && own_conflicts
                     .iter()
                     .any(|c| self.inner.read().entries.get(c).is_some_and(|e| e.scope.is_acting()))
             {
-                return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend.state_string()));
+                return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend));
             }
             inherited.relay |= scope.relay;
             inherited.template |= scope.template;
@@ -7093,6 +7101,7 @@ impl Mempool {
                 package_msg: reason.to_string(),
                 tx_results,
                 replaced: Vec::new(),
+                member_errors: HashMap::new(),
             };
         }
 
@@ -7158,7 +7167,7 @@ impl Mempool {
         // Parents refused only for their feerate, with no dust: Core's
         // `TX_RECONSIDERABLE`, which a child in the package may pay for. Each
         // with the error it got on its own.
-        let mut cpfp_parents: HashMap<Txid, String> = HashMap::new();
+        let mut cpfp_parents: HashMap<Txid, Refusal> = HashMap::new();
         // Members refused on their own only for what their replacement pays:
         // Core's `TX_RECONSIDERABLE` from `ReplacementChecks`, which the
         // package may pay for together (package RBF).
@@ -7166,8 +7175,8 @@ impl Mempool {
         // What each deferred member was refused for on its own, which is what
         // Core reports for it if the package is not evaluated together, or
         // fails as a whole for a reason that belongs to another member.
-        let mut deferred_err: HashMap<Txid, String> = HashMap::new();
-        let mut failed: HashMap<bitcoin::Wtxid, String> = HashMap::new();
+        let mut deferred_err: HashMap<Txid, Refusal> = HashMap::new();
+        let mut failed: HashMap<bitcoin::Wtxid, Refusal> = HashMap::new();
         let mut accepted_results: Vec<AcceptedMember> = Vec::new();
         // Members whose txid is resident under a *different* witness: Core's
         // `DIFFERENT_WITNESS` result type, reported as `other-wtxid`.
@@ -7296,7 +7305,7 @@ impl Mempool {
                     }
 
                     if !inputs_ok {
-                        failed.insert(ptx.wtxid, "bad-txns-inputs-missingorspent".to_string());
+                        failed.insert(ptx.wtxid, ("bad-txns-inputs-missingorspent".to_string(), MempoolError::MissingInputs));
                         continue;
                     }
 
@@ -7310,17 +7319,17 @@ impl Mempool {
                     // cannot drift apart.
                     let fee_delta = self.inner.read().fee_deltas.get(&ptx.txid).copied().unwrap_or(0);
                     if dust_count > policy::MAX_DUST_OUTPUTS_PER_TX {
-                        failed.insert(ptx.wtxid, MempoolError::Dust.to_string());
+                        failed.insert(ptx.wtxid, (MempoolError::Dust.to_string(), MempoolError::Dust));
                     } else if let Err(e) = Self::pre_check_ephemeral(
                         &ptx.tx,
                         base_fee,
                         fee_delta,
                         cfg.dust_relay_fee,
                     ) {
-                        failed.insert(ptx.wtxid, e.to_string());
+                        failed.insert(ptx.wtxid, (e.to_string(), e));
                     } else if dust_count == 1 && base_fee == 0 {
                         // Valid ephemeral dust candidate — defer acceptance.
-                        deferred_err.insert(ptx.txid, orig_err.state_string());
+                        deferred_err.insert(ptx.txid, (orig_err.state_string(), orig_err.clone()));
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                     } else if dust_count == 0
                         && matches!(
@@ -7330,13 +7339,13 @@ impl Mempool {
                     {
                         // Below a floor and nothing else: the child may pay
                         // for it.
-                        cpfp_parents.insert(ptx.txid, orig_err.state_string());
+                        cpfp_parents.insert(ptx.txid, (orig_err.state_string(), orig_err.clone()));
                     } else if matches!(orig_err, MempoolError::MempoolMinFeeNotMet(..)) {
                         // The rolling minimum refused it and it is not a dust
                         // parent: report what refused it, with Core's
                         // `TxValidationState::ToString()` shape, rather than
                         // re-deriving a static-floor reason that did not fire.
-                        failed.insert(ptx.wtxid, orig_err.state_string());
+                        failed.insert(ptx.wtxid, (orig_err.state_string(), orig_err));
                     } else {
                         // Not ephemeral dust — propagate original error.
                         // Re-compute the reason.
@@ -7345,17 +7354,20 @@ impl Mempool {
                         if fee_rate < cfg.min_fee_rate {
                             failed.insert(
                                 ptx.wtxid,
-                                format!("min relay fee not met. {} < {}", fee_rate, cfg.min_fee_rate),
+                                (
+                                    format!("min relay fee not met. {} < {}", fee_rate, cfg.min_fee_rate),
+                                    MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate),
+                                ),
                             );
                         } else {
-                            failed.insert(ptx.wtxid, "dust".to_string());
+                            failed.insert(ptx.wtxid, ("dust".to_string(), MempoolError::Dust));
                         }
                     }
                 }
                 Err(MempoolError::MissingInputs) => {
                     // Might be a child spending from a package parent — defer
                     // and retry after parents are accepted.
-                    deferred_err.insert(ptx.txid, MempoolError::MissingInputs.to_string());
+                    deferred_err.insert(ptx.txid, (MempoolError::MissingInputs.to_string(), MempoolError::MissingInputs));
                     let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     if dust_count == 1 {
                         // Resolve inputs to check fee
@@ -7391,12 +7403,12 @@ impl Mempool {
                         if inputs_ok && base_fee == 0 {
                             ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                         } else if inputs_ok && base_fee > 0 {
-                            failed.insert(ptx.wtxid, "dust, tx with dust output must be 0-fee".to_string());
+                            failed.insert(ptx.wtxid, (MempoolError::EphemeralDustFee.to_string(), MempoolError::EphemeralDustFee));
                         } else {
                             ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                         }
                     } else if dust_count > 1 {
-                        failed.insert(ptx.wtxid, "dust".to_string());
+                        failed.insert(ptx.wtxid, ("dust".to_string(), MempoolError::Dust));
                     } else {
                         // No dust — this is a child needing CPFP from a parent in the package.
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
@@ -7406,11 +7418,11 @@ impl Mempool {
                     e @ (MempoolError::InsufficientReplacementFee(..)
                     | MempoolError::DoesNotImproveFeerateDiagram(..)),
                 ) => {
-                    deferred_err.insert(ptx.txid, e.state_string());
+                    deferred_err.insert(ptx.txid, (e.state_string(), e));
                     rbf_members.insert(ptx.txid);
                 }
                 Err(e) => {
-                    failed.insert(ptx.wtxid, e.state_string());
+                    failed.insert(ptx.wtxid, (e.state_string(), e));
                 }
             }
         }
@@ -7429,7 +7441,7 @@ impl Mempool {
                     || rbf_members.contains(&p.txid)
             })
             .collect();
-        let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, String>, members: &[&PkgTx]| {
+        let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, Refusal>, members: &[&PkgTx]| {
             for p in members {
                 if let Some(err) = cpfp_parents.get(&p.txid).or_else(|| deferred_err.get(&p.txid)) {
                     failed.insert(p.wtxid, err.clone());
@@ -7482,7 +7494,8 @@ impl Mempool {
                 // refused for alone.
                 let rest: Vec<&PkgTx> = eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
                 refuse_deferred(&mut failed, &rest);
-                failed.insert(eval[i].wtxid, MempoolError::TrucViolation(detail).state_string());
+                let e = MempoolError::TrucViolation(detail);
+                failed.insert(eval[i].wtxid, (e.state_string(), e));
                 package_eval = false;
             } else if let Some(detail) = package_failure() {
                 refuse_deferred(&mut failed, &eval);
@@ -7510,7 +7523,7 @@ impl Mempool {
                     // keep what they were refused for alone.
                     let (last, rest) = eval.split_last().expect("eval is not empty");
                     refuse_deferred(&mut failed, rest);
-                    failed.insert(last.wtxid, e.state_string());
+                    failed.insert(last.wtxid, (e.state_string(), e));
                     package_eval = false;
                 }
             }
@@ -7533,7 +7546,7 @@ impl Mempool {
                     let rest: Vec<&PkgTx> =
                         eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
                     refuse_deferred(&mut failed, &rest);
-                    failed.insert(eval[i].wtxid, err);
+                    failed.insert(eval[i].wtxid, (err.state_string(), err));
                 }
                 Ok(()) => {
                     // Parent, then child, under one hold of the mempool lock,
@@ -7567,7 +7580,7 @@ impl Mempool {
                             Some(&mut inner),
                             &mut parent_admit,
                         ) {
-                            Err(e) => Err((parent, e.state_string())),
+                            Err(e) => Err((parent, e)),
                             Ok(parent_txid) => {
                                 #[cfg(test)]
                                 if let Some(hook) = self.between_package_members.lock().as_ref() {
@@ -7593,7 +7606,7 @@ impl Mempool {
                                             &parent_admit.held,
                                             chain_state,
                                         );
-                                        Err((child, e.state_string()))
+                                        Err((child, e))
                                     }
                                 }
                             }
@@ -7631,7 +7644,7 @@ impl Mempool {
                         }
                         Err((member, err)) => {
                             self.emit_evicted(&gone, EvictReason::BlockConflict);
-                            failed.insert(member.wtxid, err);
+                            failed.insert(member.wtxid, (err.state_string(), err));
                             let other = if member.txid == parent.txid { child } else { parent };
                             refuse_deferred(&mut failed, &[other]);
                         }
@@ -7685,7 +7698,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(p.wtxid, e.state_string());
+                    failed.insert(p.wtxid, (e.state_string(), e));
                 }
             }
         }
@@ -7783,13 +7796,11 @@ impl Mempool {
                                     .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
                             });
                             if !spends_all_dust {
-                                failed.insert(
-                                    ptx.wtxid,
-                                    format!(
-                                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
-                                        ptx.txid, ptx.wtxid
-                                    ),
+                                let text = format!(
+                                    "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                                    ptx.txid, ptx.wtxid
                                 );
+                                failed.insert(ptx.wtxid, (text.clone(), MempoolError::MissingEphemeralSpends(text)));
                             }
                         }
                     }
@@ -7822,7 +7833,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(wtxid, e.state_string());
+                    failed.insert(wtxid, (e.state_string(), e));
                 }
             }
         }
@@ -7873,13 +7884,11 @@ impl Mempool {
             }
 
             if ephemeral_violation {
-                failed.insert(
-                    wtxid,
-                    format!(
-                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
-                        child_txid, wtxid
-                    ),
+                let text = format!(
+                    "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                    child_txid, wtxid
                 );
+                failed.insert(wtxid, (text.clone(), MempoolError::MissingEphemeralSpends(text)));
                 continue;
             }
 
@@ -7956,7 +7965,7 @@ impl Mempool {
                     }
                 }
                 Err(e) => {
-                    failed.insert(wtxid, e.state_string());
+                    failed.insert(wtxid, (e.state_string(), e));
                 }
             }
         }
@@ -8057,7 +8066,7 @@ impl Mempool {
                 accepted_results.retain(|m| m.txid != p.txid);
                 accepted_txids.remove(&p.txid);
                 same_txid_other_witness.remove(&p.txid);
-                failed.insert(p.wtxid, MempoolError::MempoolFull.to_string());
+                failed.insert(p.wtxid, (MempoolError::MempoolFull.to_string(), MempoolError::MempoolFull));
                 trimmed_member = true;
             }
         }
@@ -8121,7 +8130,7 @@ impl Mempool {
             .collect();
 
         for ptx in &pkg {
-            if let Some(err) = failed.get(&ptx.wtxid) {
+            if let Some((err, _)) = failed.get(&ptx.wtxid) {
                 tx_results.insert(
                     ptx.wtxid.to_string(),
                     json!({
@@ -8184,7 +8193,8 @@ impl Mempool {
             }
         }
 
-        PackageResult { package_msg, tx_results, replaced }
+        let member_errors = failed.into_iter().map(|(wtxid, (_, e))| (wtxid, e)).collect();
+        PackageResult { package_msg, tx_results, replaced, member_errors }
     }
 
     /// The `Enter` of an ephemeral dust parent, which

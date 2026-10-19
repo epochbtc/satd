@@ -9055,29 +9055,29 @@ impl PeerManager {
     /// is remembered by its hash in the fee filter, so the pairing is not
     /// tried again. Each member that entered is treated as an accepted
     /// transaction: announced, its requests forgotten, its orphans
-    /// reconsidered. A child left out leaves the orphanage, unless it is
-    /// still missing inputs.
+    /// reconsidered. Each refused member is recorded by its own error, as a
+    /// transaction refused on its own is.
     fn submit_1p1c_package(&self, peer: PeerId, parent: bitcoin::Transaction, child: bitcoin::Transaction) {
         let validated_at = self.chain_state.tip_hash();
-        let members: Vec<(bitcoin::Txid, bitcoin::Wtxid)> =
-            [&parent, &child].iter().map(|tx| (tx.compute_txid(), tx.compute_wtxid())).collect();
-        let child_tx = child.clone();
+        let members = [parent, child];
+        let ids: Vec<(bitcoin::Txid, bitcoin::Wtxid)> =
+            members.iter().map(|tx| (tx.compute_txid(), tx.compute_wtxid())).collect();
         let result = self.mempool.accept_package_from(
-            vec![parent, child],
+            members.to_vec(),
             &self.chain_state,
             self.chain_state.script_verifier(),
             None,
             crate::mempool::pool::TxSource::P2p,
         );
         tracing::debug!(
-            parent = %members[0].0,
-            child = %members[1].0,
+            parent = %ids[0].0,
+            child = %ids[1].0,
             peer,
             "package evaluation: {}",
             result.package_msg
         );
         if result.package_msg != "success" {
-            let hash = crate::net::recent_rejects::package_hash(&[members[0].1, members[1].1]);
+            let hash = crate::net::recent_rejects::package_hash(&[ids[0].1, ids[1].1]);
             self.recent_rejects.lock().insert_if_tip(
                 validated_at,
                 self.chain_state.tip_hash(),
@@ -9088,20 +9088,24 @@ impl PeerManager {
         // The child first, as Core walks the package backwards, so it is out
         // of the orphanage before its parent's orphans are reconsidered.
         let mut entered = Vec::new();
-        for (i, (txid, wtxid)) in members.iter().enumerate().rev() {
+        for (tx, (txid, wtxid)) in members.iter().zip(&ids).rev() {
             if self.mempool.get(txid).is_some() {
+                // Core's `ProcessValidTx`.
                 if let Some(h) = self.peers.read().get(&peer) {
                     h.stats.record_transaction();
                 }
                 self.forget_tx_requests(*txid, *wtxid);
                 self.orphanage.remove(txid);
                 entered.push(*txid);
-            } else if i == 1 {
-                // Core keeps a child refused for `TX_MISSING_INPUTS`: one
-                // still missing a parent besides this one.
-                let mut missing = self.collect_missing_parents(&child_tx);
-                missing.remove(&members[0].0);
-                if missing.is_empty() {
+            } else if let Some(e) = result.member_errors.get(wtxid) {
+                // Core's `ProcessInvalidTx` with `first_time_failure` false:
+                // the member's own verdict goes to the rejects filters, and
+                // it leaves the orphanage unless it is still missing inputs.
+                // Nothing new is orphaned and no other package is looked for.
+                tracing::debug!(%txid, %wtxid, peer, "was not accepted in its package: {}", e.state_string());
+                self.record_rejection(tx, e, validated_at);
+                if !matches!(e, MempoolError::MissingInputs) {
+                    self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
                     self.orphanage.remove(txid);
                 }
             }

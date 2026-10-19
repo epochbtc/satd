@@ -168,3 +168,28 @@ fn an_orphan_of_two_fee_refused_parents_is_rejected() {
     pm.handle_tx(1, lone.clone());
     assert!(pm.orphanage.contains(&lone.compute_txid()));
 }
+
+/// A member refused outright inside its package is recorded as one refused
+/// on its own would be (Core's `ProcessInvalidTx` from
+/// `ProcessPackageResult`): such a child goes to the
+/// main filter and leaves the orphanage, so it is not fetched again, while
+/// the parent stays refused on its fee alone. Here the child pays a fee and
+/// carries a dust output, which only a zero-fee transaction may.
+#[test]
+fn a_child_refused_outright_in_its_package_is_rejected_on_its_own() {
+    let (pm, _dir) = pm_with_coins(&[8]);
+    let parent = spend(coin_at(8), COIN, 50, 8);
+    let mut child = spend(OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 50, 5_000, 9);
+    child.output.push(TxOut { value: Amount::from_sat(1), script_pubkey: p2wpkh(9) });
+    child.output[0].value = Amount::from_sat(child.output[0].value.to_sat() - 1);
+    pm.handle_tx(1, child.clone());
+    assert!(pm.orphanage.contains(&child.compute_txid()));
+
+    pm.handle_tx(1, parent.clone());
+    assert!(!in_pool(&pm, &parent) && !in_pool(&pm, &child));
+    assert!(!pm.orphanage.contains(&child.compute_txid()));
+    assert!(pm.recently_rejected_outright(child.compute_wtxid().as_byte_array()), "the child is refused outright");
+    assert!(!pm.recently_rejected_outright(parent.compute_wtxid().as_byte_array()));
+    assert!(pm.recently_rejected(parent.compute_wtxid().as_byte_array()), "the parent only on its fee");
+}
+
