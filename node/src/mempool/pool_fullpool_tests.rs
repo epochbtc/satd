@@ -329,6 +329,7 @@ fn eviction_cost_follows_what_it_evicts() {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee,
                 weight: 4 * size,

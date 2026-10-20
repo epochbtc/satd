@@ -50,6 +50,7 @@ fn add_peer(pm: &PeerManager, id: PeerId, addr: SocketAddr, slots: usize) -> mps
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
             fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         },
@@ -292,13 +293,13 @@ fn a_compact_block_entry_that_cannot_be_queued_is_kept() {
 
     let mut not_found = Vec::new();
     assert!(
-        !pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), &mut not_found),
+        !pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), 0, &mut not_found),
         "nothing could be queued, so the entry is not answered"
     );
     assert!(not_found.is_empty());
 
     assert_eq!(rx.try_recv().unwrap(), NetworkMessage::Verack);
-    assert!(pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), &mut not_found));
+    assert!(pm.serve_getdata_entry(1, &sender, Inventory::CompactBlock(tip), 0, &mut not_found));
     match rx.try_recv() {
         Ok(NetworkMessage::CmpctBlock(c)) => assert_eq!(c.compact_block.header.block_hash(), tip),
         other => panic!("expected the cmpctblock, got {other:?}"),
@@ -371,6 +372,7 @@ async fn version_with_an_oversized_user_agent_is_ignored() {
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
             fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         },
