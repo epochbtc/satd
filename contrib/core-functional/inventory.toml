@@ -721,15 +721,14 @@ note = "measured 2026-09-15: L126 nServices 9 where 1032 (v2: 3080) is expected:
 
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-19 with getorphantxs: every package case passes (parent then child, child then parent, two candidate children, consensus failures, multiple parents, 1p1c on 1p1c); L491 test_orphanage_dos_large waits for a large orphan to be evicted, but satd's orphanage limits by count, not Core's per-peer memory. Follow-up: Core's orphanage limits"
+status = "run"
+note = "flipped 2026-10-20: Core v30's orphanage limits (per-peer latency and weight shares, DoS-score eviction)"
 
 [[test]]
 file = "p2p_orphan_handling.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-10-19 with getorphantxs: L173 test_arrival_timing_orphan finds the parent announced to the spy peer at once; Core delays transaction invs (trickle). Follow-up: Core's inv trickling"
+note = "measured 2026-10-20 with Core v30's orphanage limits: still L173, test_arrival_timing_orphan finds the parent announced to the spy peer at once; Core delays transaction invs (trickle). Follow-up: Core's inv trickling"
 
 [[test]]
 file = "p2p_outbound_eviction.py"

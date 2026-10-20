@@ -9464,7 +9464,8 @@ fn test_p2p_many_orphans_do_not_ban() {
         conn_count
     );
 
-    // Pool is bounded at max_count (default 100).
+    // Pool is bounded: every orphan scores at least 1 against the latency
+    // limit `max_size` reports.
     let info = relay.rpc_call("getorphaninfo").unwrap();
     let size = info["result"]["size"].as_u64().unwrap_or(0);
     let max = info["result"]["max_size"].as_u64().unwrap_or(u64::MAX);
