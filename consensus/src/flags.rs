@@ -90,6 +90,20 @@ pub const MAX_FLAGS_BIT: u32 = 20;
 /// Mask of all recognized flags.
 pub const ALL_FLAGS: u32 = (1u32 << (MAX_FLAGS_BIT + 1)) - 1;
 
+/// satd extension, not a Bitcoin Core flag: apply [`VERIFY_MINIMALIF`]'s rule
+/// to base scripts (bare and P2SH) as well as witness v0. BIP 322 lists
+/// MINIMALIF among its required rules for every script, where Core's
+/// interpreter applies it only to witness v0 (tapscript enforces it by
+/// consensus).
+///
+/// It is deliberately outside [`ALL_FLAGS`], so [`valid_flags`] refuses it and
+/// the libconsensus-shaped entry points (`verify`, `verify_with_flags`,
+/// `verify_transaction`) answer `ErrInvalidFlags` if it is ever passed. Block
+/// and mempool validation go through those, so they cannot set it. Only a
+/// caller of [`crate::verify::verify_script`] can. Core's script-test flag
+/// sets are built from `ALL_FLAGS` and never include it either.
+pub const VERIFY_MINIMALIF_BASE: u32 = 1 << 31;
+
 /// Check if a flags value contains only recognized bits.
 pub fn valid_flags(flags: u32) -> bool {
     flags & !ALL_FLAGS == 0

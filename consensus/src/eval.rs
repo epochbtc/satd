@@ -381,9 +381,12 @@ pub fn eval_script(
                                     return Err(ScriptError::TapscriptMinimalIf);
                                 }
                             }
-                            // Witness v0: policy rule MINIMALIF
-                            if sig_version == SigVersion::WitnessV0
-                                && flags::has_flag(script_flags, flags::VERIFY_MINIMALIF)
+                            // Witness v0: policy rule MINIMALIF. Base scripts:
+                            // only under satd's BIP 322 extension flag.
+                            if (sig_version == SigVersion::WitnessV0
+                                && flags::has_flag(script_flags, flags::VERIFY_MINIMALIF))
+                                || (sig_version == SigVersion::Base
+                                    && flags::has_flag(script_flags, flags::VERIFY_MINIMALIF_BASE))
                             {
                                 if vch.len() > 1 {
                                     return Err(ScriptError::MinimalIf);
