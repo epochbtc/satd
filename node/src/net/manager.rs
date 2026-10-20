@@ -254,6 +254,12 @@ const EVENTS_PER_DRAIN: usize = 64;
 /// busy the event queue is (#909).
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often the transaction announcement flushes run
+/// ([`PeerManager::send_tx_invs`]): Core's message handler runs
+/// `SendMessages` for each peer about every 100 ms, and each peer's own
+/// timer decides whether it is flushed.
+const TX_INV_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// What the manager loop does after one drain of the peer event queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterDrain {
@@ -656,6 +662,9 @@ struct RecentBlock {
     height: u32,
     block: Arc<bitcoin::Block>,
     compact: Arc<bitcoin::bip152::HeaderAndShortIds>,
+    /// Each transaction's position in `block`, by txid and by wtxid: Core's
+    /// `m_most_recent_block_txs`, from which a `getdata` is served.
+    txs: HashMap<[u8; 32], usize>,
 }
 
 /// Handle for sending messages to a specific peer.
@@ -673,6 +682,9 @@ struct PeerHandle {
     /// of queued `inv` allocations, so even a *permissioned* peer must not
     /// be able to spam it in a tight loop. `None` until the first serve.
     last_mempool_served: Option<Instant>,
+    /// Core's `Peer::TxRelay`: the transactions queued to announce to this
+    /// peer, those it is known to have, and when it is next flushed.
+    tx_relay: crate::net::tx_relay::TxRelay,
     /// The BIP 133 `feefilter` value last sent to this peer, sat/kvB. `None`
     /// until one is sent; some peers are never sent one.
     fee_filter_sent: Option<u64>,
@@ -1102,6 +1114,19 @@ pub struct PeerManager {
     /// uses the same nonce, and `getblocktxn` for it needs no disk read.
     /// Core's `m_most_recent_block` / `m_most_recent_compact_block`.
     most_recent_block: RwLock<Option<RecentBlock>>,
+    /// Core's `m_next_inv_to_inbounds_per_network_key`: the next flush of
+    /// announcements to inbound peers, one timer for each network and
+    /// listener they reached the node on, so the timing tells no two
+    /// networks apart.
+    next_inv_to_inbounds: parking_lot::Mutex<HashMap<u64, u64>>,
+    /// `-txannouncedelay=0`, a satd extension: every peer is flushed at
+    /// every tick of the flush loop, as Core flushes a `noban` peer, and a
+    /// transaction queued for a peer wakes the loop at once. Off by default.
+    /// SIGHUP-reloadable.
+    immediate_tx_announce: AtomicBool,
+    /// Wakes the flush loop before its next tick: see
+    /// [`Self::wake_tx_invs`], and each peer's write loop on a `ping`.
+    tx_inv_wake: Arc<tokio::sync::Notify>,
     /// `-cmpctblockprefill`: announce new blocks with the transactions this
     /// node lacked prefilled (Core #35558). Set once at startup.
     compact_prefill: std::sync::atomic::AtomicBool,
@@ -1441,6 +1466,9 @@ impl PeerManager {
             compact_stats: CompactBlockStats::default(),
             hb_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             most_recent_block: RwLock::new(None),
+            next_inv_to_inbounds: parking_lot::Mutex::new(HashMap::new()),
+            immediate_tx_announce: AtomicBool::new(false),
+            tx_inv_wake: Arc::new(tokio::sync::Notify::new()),
             compact_prefill: std::sync::atomic::AtomicBool::new(false),
             compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES),
             highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
@@ -3646,6 +3674,7 @@ impl PeerManager {
                     flow: Arc::new(crate::net::flow::PeerFlow::new()),
                     last_getheaders_sent: None,
                     last_mempool_served: None,
+                    tx_relay: Default::default(),
                     fee_filter_sent: None,
                     stats: PeerStats::new(self.net_totals.clone()),
                 },
@@ -3834,7 +3863,10 @@ impl PeerManager {
                     .as_ref()
                     .map(|s| s.peer_inflight_heights(*id))
                     .unwrap_or_default();
-                h.info.to_rpc_json_with_inflight(&h.stats, inflight)
+                let mut entry = h.info.to_rpc_json_with_inflight(&h.stats, inflight);
+                entry["inv_to_send"] = h.tx_relay.inv_to_send().into();
+                entry["last_inv_sequence"] = h.tx_relay.last_inv_sequence().into();
+                entry
             })
             .collect()
     }
@@ -4948,6 +4980,24 @@ impl PeerManager {
     /// Run the main event loop. Returns when shutdown signal is received.
     pub async fn run(self: &Arc<Self>) {
         let mut event_rx = self.event_rx.lock().await;
+        {
+            let pm = Arc::clone(self);
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(TX_INV_FLUSH_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The flag, read each tick as the main loop reads it: the
+                // sending side of the channel may be gone long before
+                // shutdown, and a closed channel is no signal to stop.
+                while !*shutdown.borrow() {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = pm.tx_inv_wake.notified() => {}
+                    }
+                    pm.send_tx_invs();
+                }
+            });
+        }
         let mut sync_interval = tokio::time::interval(MAINTENANCE_INTERVAL);
         // A busy queue skips the waits that consume ticks. When it quiets,
         // one late tick is enough: a burst of them would run maintenance back
@@ -5792,46 +5842,27 @@ impl PeerManager {
             }
             return;
         }
-        // Snapshot the peer's fee filter; confirm it's still connected,
-        // participates in tx relay (a blocksonly peer asking for a mempool
-        // dump gets nothing — Core has no tx-relay state for it either),
-        // and is past the per-peer cooldown. The cooldown stamp is taken
-        // under the same write lock that reads it, so concurrent requests
-        // can't double-serve.
-        let (fee_filter, wtxid_relay) = {
-            let mut peers = self.peers.write();
-            match peers.get_mut(&id) {
-                Some(h) if h.info.state == PeerState::Connected && h.info.relays_txs() => {
-                    let now = Instant::now();
-                    if let Some(last) = h.last_mempool_served
-                        && now.duration_since(last).as_secs() < MEMPOOL_REQUEST_COOLDOWN_SECS
-                    {
-                        tracing::debug!(id, "mempool request inside cooldown; ignoring");
-                        return;
-                    }
-                    h.last_mempool_served = Some(now);
-                    (h.info.fee_filter, h.info.wtxid_relay)
-                }
-                _ => return,
+        // Confirm the peer is still connected, participates in tx relay (a
+        // blocksonly peer asking for a mempool dump gets nothing — Core has
+        // no tx-relay state for it either), and is past the per-peer
+        // cooldown. The answer goes out with the peer's next flush of
+        // announcements (Core's `m_send_mempool`), so it reveals no more
+        // about when a transaction arrived than the flush itself does.
+        let mut peers = self.peers.write();
+        if let Some(h) = peers.get_mut(&id)
+            && h.info.state == PeerState::Connected
+            && h.info.relays_txs()
+        {
+            let now = Instant::now();
+            if let Some(last) = h.last_mempool_served
+                && now.duration_since(last).as_secs() < MEMPOOL_REQUEST_COOLDOWN_SECS
+            {
+                tracing::debug!(id, "mempool request inside cooldown; ignoring");
+                return;
             }
-        };
-        let ids = self.mempool.relay_ids_above_feerate(fee_filter);
-        if ids.is_empty() {
-            return;
-        }
-        tracing::debug!(id, count = ids.len(), "serving BIP35 mempool request");
-        for chunk in ids.chunks(MAX_INV_PER_MSG) {
-            let inv = chunk
-                .iter()
-                .map(|(txid, wtxid)| tx_announcement(wtxid_relay, *txid, *wtxid))
-                .collect::<Vec<_>>();
-            if !self.send_to_peer(id, NetworkMessage::Inv(inv)) {
-                // Channel full — the peer isn't draining its queue; the rest
-                // of the dump would drop silently anyway (BIP35 makes no
-                // completeness promise, but don't burn the allocations).
-                tracing::debug!(id, "peer queue full mid mempool dump; truncating response");
-                break;
-            }
+            h.last_mempool_served = Some(now);
+            h.tx_relay.request_mempool();
+            tracing::debug!(id, "BIP35 mempool request queued for the next announcement");
         }
     }
 
@@ -5843,6 +5874,9 @@ impl PeerManager {
         // Each orphan is looked at once per message: an `inv` may name the
         // same one thousands of times, and looking at it walks its parents.
         let mut orphans_seen: HashSet<bitcoin::Wtxid> = HashSet::new();
+        // Core's `AddKnownTx` for every transaction announced: the peer has
+        // it, so it is not announced back.
+        let mut known: Vec<[u8; 32]> = Vec::new();
 
         for inv in inventory {
             // BIP 339: a peer that negotiated wtxid relay announces by wtxid,
@@ -5873,6 +5907,11 @@ impl PeerManager {
                     self.disconnect_by_id(id);
                     return;
                 }
+            }
+            match &inv {
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => known.push(txid.to_byte_array()),
+                Inventory::WTx(wtxid) => known.push(wtxid.to_byte_array()),
+                _ => {}
             }
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
@@ -5929,6 +5968,14 @@ impl PeerManager {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        if !known.is_empty()
+            && let Some(h) = self.peers.write().get_mut(&id)
+        {
+            for hash in &known {
+                h.tx_relay.add_known(hash);
             }
         }
 
@@ -8887,6 +8934,12 @@ impl PeerManager {
         let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
         let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
+        // Core's `AddKnownTx`: the sender has it, by the id it relays by, so
+        // it is not announced back.
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            let hash = if h.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            h.tx_relay.add_known(&hash);
+        }
         // Core's `TxDownloadManagerImpl::ReceivedTx`: the peer answered, by
         // txid and by wtxid.
         {
@@ -8957,6 +9010,13 @@ impl PeerManager {
                     tracing::debug!(%txid, %wtxid, "not keeping orphan with rejected parents");
                     self.forget_tx_requests(txid, wtxid);
                     return;
+                }
+                // Core's `ProcessInvalidTx`: the sender has the parents it
+                // spends, by txid, so they are not announced back to it.
+                if let Some(h) = self.peers.write().get_mut(&id) {
+                    for parent in &missing {
+                        h.tx_relay.add_known(&parent.to_byte_array());
+                    }
                 }
                 // Who else announced the orphan, before its announcements
                 // are forgotten below: Core asks each of them for the
@@ -9299,40 +9359,196 @@ impl PeerManager {
         }
     }
 
-    /// Relay a newly-admitted tx to other peers whose fee filter allows it.
-    /// Relay-quarantined txs are never INV'd: the node declines to gossip
-    /// them (design §2.4/§6.1).
-    fn broadcast_inv(&self, from: PeerId, txid: bitcoin::Txid) {
-        self.announce_to_peers(txid, Some(from));
+    /// Relay a newly-admitted tx: Core's `RelayTransaction`. The peer it
+    /// came from is not left out by name: it knows the transaction, which
+    /// keeps it out of that peer's queue.
+    fn broadcast_inv(&self, _from: PeerId, txid: bitcoin::Txid) {
+        self.announce_to_peers(txid);
     }
 
-    /// `inv` `txid` to every connected, tx-relaying peer whose fee filter it
-    /// clears, other than `skip`: by wtxid to a peer that negotiated BIP 339
-    /// wtxid relay, by txid to the rest. Nothing goes out while the tx is
-    /// relay-quarantined.
-    fn announce_to_peers(&self, txid: bitcoin::Txid, skip: Option<PeerId>) {
-        let entry = self.mempool.get(&txid);
-        if entry.as_ref().is_some_and(|e| !e.scope.assists_relay()) {
+    /// Core's `RelayTransaction`: queue `txid` for every peer that has
+    /// finished the handshake and does not know it, by wtxid for a peer that
+    /// relays by wtxid and by txid for the rest. [`Self::send_tx_invs`]
+    /// announces the queues, each peer on its own timer. Nothing is queued
+    /// while the tx is relay-quarantined (design §2.4/§6.1).
+    fn announce_to_peers(&self, txid: bitcoin::Txid) {
+        let Some(entry) = self.mempool.get(&txid) else {
+            return;
+        };
+        if !entry.scope.assists_relay() {
             return;
         }
-        let entry_fee_rate = entry.as_ref().map_or(0, |e| e.fee_rate);
-        let by_txid = NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)]);
-        // A tx that has already left the mempool has no wtxid to give, and
-        // a `getdata` for it would only be answered `notfound`.
-        let by_wtxid = entry.map(|e| NetworkMessage::Inv(vec![Inventory::WTx(e.tx.compute_wtxid())]));
-        let peers = self.peers.read();
-        for (peer_id, handle) in peers.iter() {
-            if Some(*peer_id) == skip
-                || handle.info.state != PeerState::Connected
-                || !handle.info.relays_txs()
-                || entry_fee_rate < handle.info.fee_filter
-            {
+        let wtxid = entry.tx.compute_wtxid();
+        let mut peers = self.peers.write();
+        for handle in peers.values_mut() {
+            let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            handle.tx_relay.queue(wtxid, &hash);
+        }
+        drop(peers);
+        self.wake_tx_invs();
+    }
+
+    /// With `-txannouncedelay=0`, run the flush now rather than at the next
+    /// tick, so a queued transaction is announced without waiting. Without
+    /// it, nothing: each peer's timer decides.
+    fn wake_tx_invs(&self) {
+        if self.immediate_tx_announce.load(Ordering::Relaxed) {
+            self.tx_inv_wake.notify_one();
+        }
+    }
+
+    /// `-txannouncedelay`: false announces each peer's queue at every flush,
+    /// without Core's random timers.
+    pub fn set_tx_announce_delay(&self, delay: bool) {
+        self.immediate_tx_announce.store(!delay, Ordering::Relaxed);
+    }
+
+    /// Core's first `SendMessages` after the version handshake: the peer's
+    /// flush timer starts, and its `last_inv_sequence` is the mempool's now.
+    /// From here on transactions are queued for it. Run once per peer, when
+    /// its handshake completes: a second run would move `last_inv_sequence`
+    /// past transactions still queued, and serve them unannounced.
+    fn start_tx_relay(&self, id: PeerId) {
+        let sequence = self.mempool.mempool_sequence();
+        let now = crate::time::now_micros();
+        let mut peers = self.peers.write();
+        let Some(h) = peers.get_mut(&id) else {
+            return;
+        };
+        let info = &h.info;
+        h.tx_relay.due(now, false, || self.next_inv_send_time(info, now));
+        h.tx_relay.finish(std::iter::empty(), Some(sequence));
+    }
+
+    /// When to flush `info`'s announcements next. An outbound peer draws its
+    /// own time, on average [`tx_relay::OUTBOUND_INVENTORY_BROADCAST_INTERVAL`]
+    /// away. Inbound peers share one timer for each network and listener
+    /// they reached the node on (Core's `NextInvToInbounds` and
+    /// `CNode::m_network_key`), on average
+    /// [`tx_relay::INBOUND_INVENTORY_BROADCAST_INTERVAL`] apart, so a peer
+    /// opening many connections learns no more than one.
+    fn next_inv_send_time(&self, info: &PeerInfo, now: u64) -> u64 {
+        use crate::net::tx_relay;
+        if info.direction != Direction::Inbound {
+            return now + tx_relay::exp_delay(tx_relay::OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (if info.inbound_onion { "onion" } else { info.network() }).hash(&mut h);
+            info.bind_addr.hash(&mut h);
+            h.finish()
+        };
+        let mut timers = self.next_inv_to_inbounds.lock();
+        let timer = timers.entry(key).or_insert(0);
+        if *timer < now {
+            *timer = now + tx_relay::exp_delay(tx_relay::INBOUND_INVENTORY_BROADCAST_INTERVAL);
+        }
+        *timer
+    }
+
+    /// Core's `SendMessages`, its transaction announcements, for every peer
+    /// that is due (see [`crate::net::tx_relay`]). For each: a BIP 35
+    /// `mempool` request waiting is answered with the whole mempool, then up
+    /// to [`tx_relay::broadcast_max`] of its queue is announced, fewest
+    /// ancestors and highest feerate first, passing over what the peer knows
+    /// and what its `feefilter` refuses. The rest stays queued.
+    pub(crate) fn send_tx_invs(&self) {
+        use crate::net::tx_relay;
+        let now = crate::time::now_micros();
+        // `-txannouncedelay=0`: every peer is due, as a `noban` peer is.
+        let immediate = self.immediate_tx_announce.load(Ordering::Relaxed);
+        let mut due = Vec::new();
+        {
+            let mut peers = self.peers.write();
+            for (id, h) in peers.iter_mut() {
+                if h.info.state != PeerState::Connected || !h.tx_relay.started() {
+                    continue;
+                }
+                let info = &h.info;
+                if !h.tx_relay.due(now, info.permissions.noban || immediate, || self.next_inv_send_time(info, now)) {
+                    continue;
+                }
+                let flush = h.tx_relay.take(h.info.relays_txs());
+                due.push((*id, flush, h.info.wtxid_relay, h.info.fee_filter));
+            }
+        }
+        for (id, flush, wtxid_relay, fee_filter) in due {
+            let relay_hash = |txid: bitcoin::Txid, wtxid: bitcoin::Wtxid| {
+                if wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() }
+            };
+            // The BIP 35 answer: the whole mempool, as Core sends it.
+            let mut answered: Vec<(Inventory, bitcoin::Wtxid, [u8; 32])> = Vec::new();
+            if flush.mempool {
+                for (txid, wtxid) in self.mempool.relay_ids_above_feerate(fee_filter) {
+                    answered.push((tx_announcement(wtxid_relay, txid, wtxid), wtxid, relay_hash(txid, wtxid)));
+                }
+            }
+            let answered_ids: HashSet<bitcoin::Wtxid> = answered.iter().map(|(_, w, _)| *w).collect();
+            let max = tx_relay::broadcast_max(flush.queued.len());
+            let mut candidates = self.mempool.relay_candidates(&flush.queued);
+            candidates.retain(|c| !answered_ids.contains(&c.wtxid));
+            candidates.sort_by(tx_relay::announce_order);
+            let sequence = self.mempool.mempool_sequence();
+            // What to announce, chosen under the lock and recorded only once
+            // it is on the peer's queue: an announcement that could not be
+            // queued is not one the peer knows.
+            let mut picked: Vec<(Inventory, bitcoin::Wtxid, [u8; 32])> = Vec::new();
+            let mut unsent = Vec::new();
+            let sender = {
+                let mut peers = self.peers.write();
+                let Some(h) = peers.get_mut(&id) else {
+                    continue;
+                };
+                for (inv, wtxid, hash) in answered {
+                    h.tx_relay.unqueue(&wtxid);
+                    picked.push((inv, wtxid, hash));
+                }
+                let mut sent = 0;
+                for c in candidates {
+                    if sent >= max {
+                        unsent.push(c.wtxid);
+                        continue;
+                    }
+                    let hash = relay_hash(c.txid, c.wtxid);
+                    if h.tx_relay.knows(&hash) || c.fee_rate < fee_filter {
+                        continue;
+                    }
+                    picked.push((tx_announcement(wtxid_relay, c.txid, c.wtxid), c.wtxid, hash));
+                    sent += 1;
+                }
+                h.msg_tx.clone()
+            };
+            // Sent and recorded under one lock: a `getdata` for what went
+            // out finds it recorded, however soon it is read.
+            let mut peers = self.peers.write();
+            let Some(h) = peers.get_mut(&id) else {
                 continue;
+            };
+            // Once one chunk does not fit, neither does the rest.
+            let mut delivered = 0;
+            for chunk in picked.chunks(MAX_INV_PER_MSG) {
+                let inv = chunk.iter().map(|(inv, _, _)| *inv).collect();
+                if sender.try_send(NetworkMessage::Inv(inv)).is_err() {
+                    break;
+                }
+                delivered += chunk.len();
             }
-            let inv = if handle.info.wtxid_relay { by_wtxid.as_ref() } else { Some(&by_txid) };
-            if let Some(inv) = inv {
-                let _ = handle.msg_tx.try_send(inv.clone());
+            let failed = &picked[delivered..];
+            for (_, _, hash) in &picked[..delivered] {
+                h.tx_relay.add_known(hash);
+                if !failed.is_empty() {
+                    h.tx_relay.announced_out_of_sequence(hash);
+                }
             }
+            // What did not fit goes back in the queue, a BIP 35 answer's
+            // remainder included: the next flush sends it, not the whole
+            // answer again.
+            unsent.extend(failed.iter().map(|(_, wtxid, _)| *wtxid));
+            // A peer that was not sent everything chosen keeps its
+            // `last_inv_sequence`, so what it was not announced stays
+            // unservable to it.
+            h.tx_relay.finish(unsent, failed.is_empty().then_some(sequence));
         }
     }
 
@@ -9353,7 +9569,7 @@ impl PeerManager {
     /// outright (design §6.1), but with an `allowquarantined` override the tx
     /// is admitted to the quarantine class and must still not be announced.
     pub fn announce_tx(&self, txid: bitcoin::Txid) {
-        self.announce_to_peers(txid, None);
+        self.announce_to_peers(txid);
     }
 
     /// Broadcast a locally-originated transaction: decode it, accept it
@@ -9496,20 +9712,21 @@ impl PeerManager {
             return;
         }
         tracing::debug!(count = pairs.len(), "rebroadcasting unbroadcast local txs");
-        let peers = self.peers.read();
-        for handle in peers.values() {
+        // Core's `ReattemptInitialBroadcast`: each is queued again, through
+        // `RelayTransaction`, for every peer that has not been announced it;
+        // the peer's next flush announces it and applies its fee filter.
+        let mut peers = self.peers.write();
+        for handle in peers.values_mut() {
             if handle.info.state != PeerState::Connected || !handle.info.relays_txs() {
                 continue;
             }
-            let invs: Vec<Inventory> = pairs
-                .iter()
-                .filter(|(_, _, fee_rate)| *fee_rate >= handle.info.fee_filter)
-                .map(|(txid, wtxid, _)| tx_announcement(handle.info.wtxid_relay, *txid, *wtxid))
-                .collect();
-            for chunk in invs.chunks(MAX_INV_PER_MSG) {
-                let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
+            for (txid, wtxid, _) in &pairs {
+                let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+                handle.tx_relay.queue(*wtxid, &hash);
             }
         }
+        drop(peers);
+        self.wake_tx_invs();
     }
 
     /// Enqueue transactions promoted out of the quarantine class by a policy
@@ -9553,10 +9770,10 @@ impl PeerManager {
         self.promotion_queue.lock().len()
     }
 
-    /// Announce the current unbroadcast local txs to a single freshly-
+    /// Queue the current unbroadcast local txs for a single freshly-
     /// connected peer (so a tx submitted while we had no peers reaches the
-    /// network as soon as one arrives). Honors the peer's fee filter,
-    /// `fRelay`, and Connected state, and batches into one `inv`.
+    /// network as soon as one arrives). Honors `fRelay` and Connected state;
+    /// the peer's first flush applies its fee filter.
     ///
     /// Outbound peers only: an unsolicited just-after-connect inv of
     /// exactly our pending local txs is a wallet fingerprint, and inbound
@@ -9571,22 +9788,21 @@ impl PeerManager {
         if pairs.is_empty() {
             return;
         }
-        let peers = self.peers.read();
-        let Some(handle) = peers.get(&id) else { return };
+        let mut peers = self.peers.write();
+        let Some(handle) = peers.get_mut(&id) else { return };
         if handle.info.state != PeerState::Connected
             || handle.info.direction != Direction::Outbound
             || !handle.info.relays_txs()
         {
             return;
         }
-        let invs: Vec<Inventory> = pairs
-            .iter()
-            .filter(|(_, _, fee_rate)| *fee_rate >= handle.info.fee_filter)
-            .map(|(txid, wtxid, _)| tx_announcement(handle.info.wtxid_relay, *txid, *wtxid))
-            .collect();
-        for chunk in invs.chunks(MAX_INV_PER_MSG) {
-            let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
+        // Queued for the peer's first flush, which applies its fee filter.
+        for (txid, wtxid, _) in pairs {
+            let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            handle.tx_relay.queue(wtxid, &hash);
         }
+        drop(peers);
+        self.wake_tx_invs();
     }
 
     /// Record that peer `id` has demonstrated knowledge of `txid` — either by
@@ -10228,15 +10444,43 @@ impl PeerManager {
                 // Charged for a block that was queued, not one that was read.
                 self.record_upload(size);
             }
-            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                // Relay-quarantined txs are not served via `getdata`:
-                // announce-suppression without serve-suppression would be
-                // incoherent — a peer that learned the txid elsewhere must
-                // not be able to pull it from us (design §6.1). Report it
-                // as not-found, exactly as if we did not hold it.
-                let Some(entry) = self.mempool.get(&txid).filter(|e| e.scope.assists_relay()) else {
-                    not_found.push(inv);
-                    return true;
+            // Core's `FindTxForGetData`: from the mempool if the transaction
+            // entered before the peer's last announcement flush, so a peer
+            // cannot learn of one before it is announced by asking for it;
+            // otherwise from the most recent block. BIP 339: by wtxid, a
+            // resident transaction with the same txid and another witness is
+            // not the one asked for.
+            //
+            // Relay-quarantined txs are not served via `getdata`:
+            // announce-suppression without serve-suppression would be
+            // incoherent — a peer that learned the txid elsewhere must not be
+            // able to pull it from us (design §6.1). Report it as not-found,
+            // exactly as if we did not hold it.
+            Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_) => {
+                let (pooled, hash) = match inv {
+                    Inventory::WTx(wtxid) => (self.mempool.get_by_wtxid(&wtxid), wtxid.to_byte_array()),
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                        (self.mempool.get(&txid).map(|e| (txid, e)), txid.to_byte_array())
+                    }
+                    _ => (None, [0; 32]),
+                };
+                // Announced to the peer (Core's `m_last_inv_sequence`). Both
+                // halves of the test are read under one lock: a flush in
+                // between moves the sequence and clears the exceptions
+                // together.
+                let announced = |e: &crate::mempool::pool::MempoolEntry| {
+                    self.peers.read().get(&id).is_some_and(|h| h.tx_relay.was_announced(e.entry_sequence, &hash))
+                };
+                let pooled = pooled.filter(|(_, e)| e.scope.assists_relay() && announced(e));
+                let (tx, pooled_txid) = match pooled {
+                    Some((txid, entry)) => (entry.tx, Some(txid)),
+                    None => match self.recent_block_tx(&inv) {
+                        Some(tx) => (tx, None),
+                        None => {
+                            not_found.push(inv);
+                            return true;
+                        }
+                    },
                 };
                 // The peer pulled this tx from us. If it's a pending
                 // local broadcast, that's the primary proof it has
@@ -10244,25 +10488,12 @@ impl PeerManager {
                 // rebroadcast. Only once the Tx is actually enqueued:
                 // retiring the tx on a send that did not happen would
                 // defeat the exact failure mode rebroadcast exists to cover.
-                if sender.try_send(NetworkMessage::Tx(entry.tx)).is_err() {
+                if sender.try_send(NetworkMessage::Tx(tx)).is_err() {
                     return false;
                 }
-                self.note_broadcast_witness(id, txid);
-            }
-            // BIP 339: the same, looked up by wtxid. A resident
-            // transaction with the same txid and another witness is not
-            // the one asked for, so the answer is `notfound`.
-            Inventory::WTx(wtxid) => {
-                let Some((txid, entry)) =
-                    self.mempool.get_by_wtxid(&wtxid).filter(|(_, e)| e.scope.assists_relay())
-                else {
-                    not_found.push(inv);
-                    return true;
-                };
-                if sender.try_send(NetworkMessage::Tx(entry.tx)).is_err() {
-                    return false;
+                if let Some(txid) = pooled_txid {
+                    self.note_broadcast_witness(id, txid);
                 }
-                self.note_broadcast_witness(id, txid);
             }
             // An entry of a type that is not served is skipped, as in Core.
             _ => {}
@@ -10453,13 +10684,35 @@ impl PeerManager {
             Some(r) if r.height > height => return Some(compact),
             _ => {}
         }
+        let mut txs = HashMap::with_capacity(block.txdata.len() * 2);
+        for (i, tx) in block.txdata.iter().enumerate() {
+            txs.insert(tx.compute_txid().to_byte_array(), i);
+            txs.insert(tx.compute_wtxid().to_byte_array(), i);
+        }
         *recent = Some(RecentBlock {
             hash,
             height,
             block: Arc::new(block.clone()),
             compact: compact.clone(),
+            txs,
         });
         Some(compact)
+    }
+
+    /// The transaction `inv` names, if the most recent block has it: Core's
+    /// `m_most_recent_block_txs`, from which a transaction that just left
+    /// the mempool for a block is still served (compact block relay asks
+    /// for them).
+    fn recent_block_tx(&self, inv: &Inventory) -> Option<bitcoin::Transaction> {
+        let hash = match inv {
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => txid.to_byte_array(),
+            Inventory::WTx(wtxid) => wtxid.to_byte_array(),
+            _ => return None,
+        };
+        let recent = self.most_recent_block.read();
+        let recent = recent.as_ref()?;
+        let i = *recent.txs.get(&hash)?;
+        recent.block.txdata.get(i).cloned()
     }
 
     /// The cached `cmpctblock` for `hash`, if it is the tip cache's block.
@@ -11462,6 +11715,7 @@ impl PeerManager {
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
                     fee_filter_sent: None,
             stats: PeerStats::new(self.net_totals.clone()),
         };
@@ -11810,6 +12064,10 @@ impl PeerManager {
             handle.info.set_version(version.clone());
             handle.info.state = PeerState::Connected;
         }
+        // Transactions are queued for the peer from here on, as Core starts
+        // a peer's announcement timer in its first `SendMessages` after the
+        // `verack`.
+        self.start_tx_relay(id);
         self.event_tx
             .send(NetEvent::PeerConnected {
                 id,
@@ -12008,6 +12266,7 @@ impl PeerManager {
             Some(self.drain_now.clone()),
             disconnect_signal,
             send_queue,
+            Some(self.tx_inv_wake.clone()),
         )
         .await;
 
@@ -12082,6 +12341,7 @@ impl PeerManager {
         drain_now: Option<Arc<tokio::sync::Notify>>,
         disconnect_signal: Option<Arc<tokio::sync::Notify>>,
         send_queue: Option<Arc<crate::net::send_queue::SendQueue>>,
+        tx_inv_wake: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), String> {
         // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
         // The first tick of a tokio interval fires immediately, which is also
@@ -12276,6 +12536,14 @@ impl PeerManager {
                                         flow.in_flight()
                                     );
                                 }
+                            }
+                            // Core runs `SendMessages` after each message it
+                            // handles, so a ping round trip carries any
+                            // announcements then due: a test that moves
+                            // mocktime and pings sees them. Run the flush now
+                            // rather than at its next tick.
+                            if let Some(wake) = &tx_inv_wake {
+                                wake.notify_one();
                             }
                             Self::send_watched(
                                 id,
@@ -12878,6 +13146,10 @@ mod p1c_tests;
 #[path = "manager_orphan_tests.rs"]
 mod orphan_tests;
 
+#[cfg(test)]
+#[path = "manager_trickle_tests.rs"]
+mod trickle_tests;
+
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
 /// Standalone so the `block_processor` thread — which doesn't have a
@@ -13309,6 +13581,7 @@ mod tests {
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
                     fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         }
@@ -13493,6 +13766,14 @@ mod tests {
     /// Like [`mk_handle`] but retains the channel receiver and lets the
     /// caller set a fee filter, so a test can observe what `announce_tx`
     /// enqueues to the peer.
+    /// Flush every started peer's announcements now, whatever its timer.
+    pub(super) fn flush_invs(pm: &PeerManager) {
+        for h in pm.peers.write().values_mut() {
+            h.tx_relay.make_due();
+        }
+        pm.send_tx_invs();
+    }
+
     fn mk_handle_rx(
         id: PeerId,
         addr: SocketAddr,
@@ -13503,6 +13784,12 @@ mod tests {
         info.state = state;
         info.fee_filter = fee_filter;
         let (tx, rx) = mpsc::channel::<NetworkMessage>(8);
+        // A connected peer has had its first flush, as the handshake gives
+        // it, and is due at the next.
+        let mut tx_relay = crate::net::tx_relay::TxRelay::default();
+        if state == PeerState::Connected {
+            tx_relay.due(0, false, || 0);
+        }
         (
             PeerHandle {
                 info,
@@ -13511,6 +13798,7 @@ mod tests {
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
+                tx_relay,
                     fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
@@ -13530,7 +13818,6 @@ mod tests {
         use crate::storage::db::InMemoryStore;
         use crate::storage::flatfile::FlatFileManager;
         use crate::validation::script::NoopVerifier;
-        use bitcoin::hashes::Hash;
 
         let dir = tempfile::TempDir::new().unwrap();
         let store = Box::new(InMemoryStore::new());
@@ -13557,8 +13844,8 @@ mod tests {
             PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
-        // The tx is absent from the (empty) mempool, so announce_tx treats
-        // its fee rate as 0 — only a peer whose fee_filter is also 0 clears it.
+        // The tx pays a fee rate of 0: only a peer whose fee_filter is also
+        // 0 clears it.
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         let (h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 1000);
         let (h3, mut rx3) = mk_handle_rx(3, addr, PeerState::Connecting, 0);
@@ -13569,9 +13856,9 @@ mod tests {
             peers.insert(3, h3);
         }
 
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        let txid = pm.mempool.insert_scoped_for_test(7, 0, crate::mempool::pool::QuarantineScope::acting());
         pm.announce_tx(txid);
+        flush_invs(&pm);
 
         // Connected + fee-permitting peer gets exactly one tx inv.
         match rx1.try_recv() {
@@ -13736,10 +14023,12 @@ mod tests {
 
         // announce_tx: relay-quarantined → nothing on the wire.
         pm.announce_tx(relay_q);
+        flush_invs(&pm);
         assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be announced");
 
         // broadcast_inv (peer-relay fan-out): same.
         pm.broadcast_inv(99, relay_q);
+        flush_invs(&pm);
         assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be relayed");
 
         // getdata: peer asking for it gets NotFound, never the Tx.
@@ -13753,6 +14042,7 @@ mod tests {
 
         // Contrast: a tx quarantined only `on template` still relays.
         pm.announce_tx(template_q);
+        flush_invs(&pm);
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(template_q)]);
@@ -15579,6 +15869,7 @@ mod tests {
 
         pm.enqueue_promotions([txid]);
         assert_eq!(pm.drain_promotion_queue(), 1);
+        flush_invs(&pm);
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
@@ -15705,6 +15996,7 @@ mod tests {
         pm.mempool.insert_entry_for_test(txid, tx.clone(), 0);
 
         let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false);
+        flush_invs(&pm);
         assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
@@ -15736,6 +16028,7 @@ mod tests {
         pm.mempool.insert_entry_for_test(txid, resident.clone(), 0);
 
         let result = pm.submit_and_announce(other, crate::mempool::pool::TxSource::Rpc, false);
+        flush_invs(&pm);
         assert_eq!(result.ok(), Some(txid), "a resubmit with another witness must succeed");
         expect_inv(&mut rx1, &[Inventory::WTx(resident.compute_wtxid())], "the resident witness");
         assert!(pm.mempool.is_unbroadcast(&txid), "and it is rebroadcast like any resubmit");
@@ -15791,6 +16084,7 @@ mod tests {
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         pm.rebroadcast_unbroadcast_txs();
+        flush_invs(&pm);
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
@@ -15893,6 +16187,7 @@ mod tests {
         }
 
         pm.announce_unbroadcast_to_peer(1);
+        flush_invs(&pm);
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
@@ -15901,6 +16196,7 @@ mod tests {
         }
 
         pm.announce_unbroadcast_to_peer(2);
+        flush_invs(&pm);
         assert!(rx2.try_recv().is_err(), "a not-yet-Connected peer must be skipped");
     }
 
@@ -15929,6 +16225,7 @@ mod tests {
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
+                tx_relay: Default::default(),
                     fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
@@ -15957,6 +16254,7 @@ mod tests {
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         pm.peers.write().insert(1, h1);
         pm.handle_mempool_request(1);
+        flush_invs(&pm);
         assert!(rx1.try_recv().is_err(), "peer without mempool permission gets no dump");
 
         // With the mempool permission → inv of the mempool txid.
@@ -15964,6 +16262,7 @@ mod tests {
         h2.info.permissions.mempool = true;
         pm.peers.write().insert(2, h2);
         pm.handle_mempool_request(2);
+        flush_invs(&pm);
         match rx2.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert!(
@@ -16047,11 +16346,13 @@ mod tests {
         pm.peers.write().insert(1, h);
 
         pm.handle_mempool_request(1);
+        flush_invs(&pm);
         assert!(
             matches!(rx.try_recv(), Ok(NetworkMessage::Inv(_))),
             "first request is served"
         );
         pm.handle_mempool_request(1);
+        flush_invs(&pm);
         assert!(
             rx.try_recv().is_err(),
             "an immediate second request falls inside the cooldown and is ignored"
@@ -16110,38 +16411,54 @@ mod tests {
         let by_wtxid = [Inventory::WTx(tx.compute_wtxid())];
         let by_txid = [Inventory::WitnessTransaction(txid)];
 
-        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
-        h1.info.wtxid_relay = true;
-        h1.info.permissions.mempool = true;
-        let (mut h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
-        h2.info.permissions.mempool = true;
-        {
+        // Each path gets two new peers, a wtxid relay peer (odd id) and
+        // another: a peer that has been announced a transaction knows it and
+        // is not announced it again.
+        let fresh = |a: PeerId| {
+            let (mut h1, rx1) = mk_handle_rx(a, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+            h1.info.wtxid_relay = true;
+            h1.info.permissions.mempool = true;
+            let (mut h2, rx2) = mk_handle_rx(a + 1, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+            h2.info.permissions.mempool = true;
             let mut peers = pm.peers.write();
-            peers.insert(1, h1);
-            peers.insert(2, h2);
-        }
+            peers.clear();
+            peers.insert(a, h1);
+            peers.insert(a + 1, h2);
+            (rx1, rx2)
+        };
 
+        let (mut rx1, mut rx2) = fresh(1);
         pm.announce_tx(txid);
+        flush_invs(&pm);
         expect_inv(&mut rx1, &by_wtxid, "local broadcast to the wtxid relay peer");
         expect_inv(&mut rx2, &by_txid, "local broadcast to the other peer");
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err(), "one announcement");
 
+        let (mut rx1, mut rx2) = fresh(3);
         pm.broadcast_inv(99, txid);
+        flush_invs(&pm);
         expect_inv(&mut rx1, &by_wtxid, "peer relay to the wtxid relay peer");
         expect_inv(&mut rx2, &by_txid, "peer relay to the other peer");
 
+        let (mut rx1, mut rx2) = fresh(5);
         pm.mempool.mark_unbroadcast(txid);
         pm.rebroadcast_unbroadcast_txs();
+        flush_invs(&pm);
         expect_inv(&mut rx1, &by_wtxid, "rebroadcast to the wtxid relay peer");
         expect_inv(&mut rx2, &by_txid, "rebroadcast to the other peer");
 
-        pm.announce_unbroadcast_to_peer(1);
+        let (mut rx1, mut rx2) = fresh(7);
+        pm.announce_unbroadcast_to_peer(7);
+        pm.announce_unbroadcast_to_peer(8);
+        flush_invs(&pm);
         expect_inv(&mut rx1, &by_wtxid, "on-connect announcement to the wtxid relay peer");
-        pm.announce_unbroadcast_to_peer(2);
         expect_inv(&mut rx2, &by_txid, "on-connect announcement to the other peer");
 
-        pm.handle_mempool_request(1);
+        let (mut rx1, mut rx2) = fresh(9);
+        pm.handle_mempool_request(9);
+        pm.handle_mempool_request(10);
+        flush_invs(&pm);
         expect_inv(&mut rx1, &by_wtxid, "mempool reply to the wtxid relay peer");
-        pm.handle_mempool_request(2);
         expect_inv(&mut rx2, &by_txid, "mempool reply to the other peer");
 
         assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err(), "one announcement per path");

@@ -98,7 +98,7 @@ pub(super) fn add_peer_with(
 }
 
 /// [`add_peer_with`] with a send queue of `capacity` messages.
-fn add_peer_cap(
+pub(super) fn add_peer_cap(
     pm: &PeerManager,
     id: PeerId,
     direction: Direction,
@@ -121,6 +121,7 @@ fn add_peer_cap(
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
             fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         },

@@ -767,6 +767,7 @@ mod tests {
     ) -> MempoolEntry {
         let fee_rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight as u64);
         MempoolEntry {
+            entry_sequence: 0,
             tx,
             fee,
             weight,

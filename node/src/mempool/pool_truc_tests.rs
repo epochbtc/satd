@@ -655,3 +655,22 @@ fn a_sibling_a_package_member_evicts_is_reported_replaced() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Core's `bypass_limits` gives a transaction a reorg returns entry
+/// sequence 0: it was in a block, so a peer may fetch it before it is
+/// announced (`mempool_reorg.py`). One accepted the usual way takes the
+/// mempool's sequence.
+#[test]
+fn a_reorged_transaction_enters_at_sequence_zero() {
+    let (cs, mp, dir) = env(&[1, 2]);
+    let relayed = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let before = mp.mempool_sequence();
+    accept(&mp, &cs, &relayed).expect("admitted");
+    assert_eq!(mp.get(&relayed.compute_txid()).unwrap().entry_sequence, before);
+
+    let returned = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2);
+    mp.accept_reorged_transaction(returned.clone(), &cs, &NoopVerifier).expect("returned");
+    assert_eq!(mp.get(&returned.compute_txid()).unwrap().entry_sequence, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

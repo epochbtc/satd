@@ -55,6 +55,12 @@ item below is (or will be) written up in full in the in-development
   sends, refused on its fee alone, enters with a child of it the same peer
   sent, as a package (CPFP, ephemeral dust or package RBF).
 
+- Transaction announcements trickle as Core's do: queued per peer and
+  announced on a Poisson timer (2 s outbound, 5 s inbound), parents first,
+  and a transaction is served only to a peer it has been announced to.
+  `getpeerinfo` reports `inv_to_send` and `last_inv_sequence`.
+  `txannouncedelay=0` (opt-in) announces to every peer at once.
+
 - `getorphantxs`, Core's hidden RPC listing the orphanage. The orphanage
   records every peer that sent or announced an orphan, as Core's does: each
   is asked for the missing parents and may pair the orphan with a parent it

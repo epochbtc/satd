@@ -592,6 +592,10 @@ pub struct MempoolEntry {
     /// observability extension (`listquarantine`/`getquarantineentry`/
     /// `getquarantineinfo`, PR 7b). Never leaks onto a standard surface.
     pub quarantine_rule: Option<String>,
+    /// The mempool sequence number when it entered: Core's
+    /// `CTxMemPoolEntry::m_sequence`. A peer may fetch it only after an
+    /// `inv` sent at a later sequence (`info_for_relay`).
+    pub entry_sequence: u64,
 }
 
 impl MempoolEntry {
@@ -3821,9 +3825,15 @@ impl Mempool {
         let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         // A quarantined admission emits no `Enter`, so it needs no copy.
         let raw_tx = if scope.is_quarantined() { None } else { self.raw_tx_for_event(&tx) };
+        // The number this insert takes (`account_insert` below). A
+        // transaction a reorg returns takes 0, as with Core's
+        // `bypass_limits`: it was in a block, so a peer may fetch it before
+        // it is announced (`mempool_reorg.py`).
+        let entry_sequence = if pkg.skip_truc { 0 } else { inner.sequence };
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence,
                 tx,
                 fee,
                 weight,
@@ -4537,6 +4547,33 @@ impl Mempool {
             .iter_with_wtxid()
             .filter(|(_, _, e)| e.scope.assists_relay() && e.fee_rate >= min_fee_rate)
             .map(|(txid, wtxid, _)| (txid, wtxid))
+            .collect()
+    }
+
+    /// For a flush of transaction announcements: each of `wtxids` that is in
+    /// the pool and may be relayed, with what orders it (Core's
+    /// `CompareDepthAndScore`: ancestor count, then modified feerate) and the
+    /// feerate a peer's `feefilter` is checked against. One read lock. A
+    /// relay-quarantined entry is left out, as one no longer in the pool is.
+    pub fn relay_candidates(&self, wtxids: &[Wtxid]) -> Vec<crate::net::tx_relay::Candidate> {
+        let inner = self.inner.read();
+        let mut ancestors = HashSet::new();
+        let mut queue = Vec::new();
+        wtxids
+            .iter()
+            .filter_map(|wtxid| {
+                let txid = inner.entries.txid_of(wtxid)?;
+                let entry = inner.entries.get(&txid).filter(|e| e.scope.assists_relay())?;
+                Self::collect_ancestors(&inner, &txid, &mut ancestors, &mut queue);
+                Some(crate::net::tx_relay::Candidate {
+                    wtxid: *wtxid,
+                    txid,
+                    ancestors: ancestors.len() as u64 + 1,
+                    modified_fee: signed_modified_fee(entry.fee, entry.fee_delta),
+                    vsize: Self::entry_vsize(entry) as u64,
+                    fee_rate: entry.fee_rate,
+                })
+            })
             .collect()
     }
 
@@ -8947,6 +8984,7 @@ impl Mempool {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: fee_rate,
                 weight: 4,
@@ -8989,6 +9027,7 @@ impl Mempool {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: 0,
                 weight: 4,
@@ -9046,6 +9085,7 @@ impl Mempool {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee,
                 weight,
@@ -9092,6 +9132,7 @@ impl Mempool {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: fee_rate,
                 weight: 4,
@@ -9111,6 +9152,21 @@ impl Mempool {
         );
         inner.account_insert(scope, tx_size);
         txid
+    }
+
+    /// Test-only: stamp every entry with the mempool's current sequence, as
+    /// if each had just entered, and move the sequence past it as an insert
+    /// does.
+    pub(crate) fn resequence_for_test(&self) {
+        let mut inner = self.inner.write();
+        let sequence = inner.sequence;
+        let txids: Vec<Txid> = inner.entries.keys().copied().collect();
+        for txid in txids {
+            if let Some(entry) = inner.entries.get_mut(&txid) {
+                entry.entry_sequence = sequence;
+            }
+        }
+        inner.sequence += 1;
     }
 
     /// Test-only: insert a caller-provided `tx` with an explicit quarantine
@@ -9133,6 +9189,7 @@ impl Mempool {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: 0,
                 weight: 4,
@@ -9377,6 +9434,7 @@ mod tests {
         inner.entries.insert(
             low_txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx: low_fee_tx,
                 fee: 10,
                 weight: 400,
@@ -10774,6 +10832,7 @@ mod tests {
             inner.entries.insert(
                 mempool_txid,
                 MempoolEntry {
+                    entry_sequence: 0,
                     tx: mempool_tx,
                     fee: 500,
                     weight: 400,
@@ -10907,6 +10966,7 @@ mod tests {
             inner.entries.insert(
                 parent_txid,
                 MempoolEntry {
+                    entry_sequence: 0,
                     tx: parent_tx,
                     fee: 1_000,
                     weight: 400,
@@ -10930,6 +10990,7 @@ mod tests {
             inner.entries.insert(
                 child_txid,
                 MempoolEntry {
+                    entry_sequence: 0,
                     tx: child_tx,
                     fee: 2_000,
                     weight: 400,
@@ -11029,6 +11090,7 @@ mod tests {
             inner.entries.insert(
                 parent_txid,
                 MempoolEntry {
+                    entry_sequence: 0,
                     tx: parent_tx,
                     fee: 0,
                     weight: 400,
@@ -11135,6 +11197,7 @@ mod tests {
                 inner.entries.insert(
                     parent_txid,
                     MempoolEntry {
+                        entry_sequence: 0,
                         tx: parent_tx,
                         fee: 0,
                         weight: 400,
@@ -11272,6 +11335,7 @@ mod tests {
                 inner.entries.insert(
                     parent_txid,
                     MempoolEntry {
+                        entry_sequence: 0,
                         tx: parent_tx,
                         fee: 0,
                         weight: 400,
@@ -11535,6 +11599,7 @@ mod tests {
             inner.entries.insert(
                 txid,
                 MempoolEntry {
+                    entry_sequence: 0,
                     tx,
                     fee: 0,
                     weight: 4,
@@ -12438,6 +12503,7 @@ mod tests {
 
     fn entry_of(tx: Transaction) -> MempoolEntry {
         MempoolEntry {
+            entry_sequence: 0,
             tx,
             fee: 0,
             weight: 4,
@@ -13230,6 +13296,7 @@ mod tests {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: 1_000,
                 weight: 400,
@@ -13624,6 +13691,7 @@ mod tests {
         inner.entries.insert(
             txid,
             MempoolEntry {
+                entry_sequence: 0,
                 tx,
                 fee: 1_000,
                 weight: 400,

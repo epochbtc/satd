@@ -63,6 +63,7 @@ fn add_peer(pm: &PeerManager, info: PeerInfo) {
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+            tx_relay: Default::default(),
             fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         },
