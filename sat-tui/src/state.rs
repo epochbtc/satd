@@ -81,8 +81,8 @@ pub struct QuarantineView {
     pub rules_count: u64,
     /// Evaluations that ran out of fuel and were quarantined fail-safe.
     pub fuel_exhausted: u64,
-    /// Rules that withhold relay of Lightning enforcement shapes. Non-zero
-    /// only with `allowdangerousfilters` set.
+    /// Distinct rules that withhold relay of Lightning enforcement shapes.
+    /// Non-zero only with `allowdangerousfilters` set.
     pub relay_withholding: u64,
     pub count: u64,
     pub bytes: u64,
@@ -121,6 +121,26 @@ pub struct QuarantineRuleRow {
     /// in the loaded ruleset: the infectious-ancestor marker, or a rule a
     /// reload removed while its transactions were still held.
     pub matched: Option<u64>,
+}
+
+/// Distinct rule names among the relay-withholding danger findings.
+/// `danger.relay_withholding` counts findings, one per rule and Lightning
+/// shape, so a rule that matches two shapes would count twice.
+fn relay_withholding_rules(v: &serde_json::Value) -> u64 {
+    let mut rules: Vec<&str> = v
+        .pointer("/danger/findings")
+        .and_then(|f| f.as_array())
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|f| f.get("withholds_relay").and_then(|w| w.as_bool()) == Some(true))
+                .filter_map(|f| f.get("rule")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    rules.sort_unstable();
+    rules.dedup();
+    rules.len() as u64
 }
 
 impl QuarantineView {
@@ -1284,10 +1304,7 @@ impl AppState {
             version: u(v, "version"),
             rules_count: u(v, "rules_count"),
             fuel_exhausted: u(v, "fuel_exhausted"),
-            relay_withholding: v
-                .get("danger")
-                .map(|d| u(d, "relay_withholding"))
-                .unwrap_or(0),
+            relay_withholding: relay_withholding_rules(v),
             count: u(&q, "count"),
             bytes: u(&q, "bytes"),
             budget_bytes: u(&q, "budget_bytes"),
@@ -2101,7 +2118,11 @@ mod tests {
             "fuel_exhausted": 2,
             "rules": loaded_rules,
             "quarantine": {"count": 5, "bytes": 1_500, "budget_bytes": 300_000_000},
-            "danger": {"relay_withholding": 1},
+            "danger": {"relay_withholding": 3, "findings": [
+                {"rule": "bulk", "withholds_relay": true},
+                {"rule": "bulk", "withholds_relay": true},
+                {"rule": "mine-only", "withholds_relay": false},
+            ]},
         })
     }
 
@@ -2118,7 +2139,7 @@ mod tests {
         let q = st.quarantine.as_ref().expect("a loaded ruleset shows the panel");
         assert_eq!((q.version, q.rules_count, q.fuel_exhausted), (1, 3, 2));
         assert_eq!((q.count, q.bytes, q.budget_bytes), (5, 1_500, 300_000_000));
-        assert_eq!(q.relay_withholding, 1);
+        assert_eq!(q.relay_withholding, 1, "one rule matching two shapes is one rule");
         assert_eq!(q.rules, vec![("bulk".to_string(), 7)], "allow rules hold nothing and are left out");
         assert!(q.held.is_none());
 
