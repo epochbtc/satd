@@ -247,3 +247,42 @@ fn a_mempool_request_is_answered_at_the_next_flush() {
     pm.send_tx_invs();
     assert_eq!(invs(&mut rx), vec![Inventory::WTx(tx.compute_wtxid())]);
 }
+
+/// Core's `ProcessInvalidTx`: the peer that sent an orphan has its
+/// parents, by txid, so a parent is not announced to it by txid when it
+/// arrives from another peer. (A wtxid relay peer is still announced it
+/// by wtxid, as in Core.)
+#[test]
+fn the_sender_of_an_orphan_is_not_announced_its_parent() {
+    let (pm, _dir) = pm_with_coins(&[13]);
+    let mut clock = MockClock::install();
+    let mut orphan_sender = handshaken(&pm, 10, Direction::Outbound, |i| i.wtxid_relay = false);
+    let mut other = handshaken(&pm, 11, Direction::Outbound, |_| {});
+    let parent = spend(coin_at(13), COIN, 1_000, 13);
+    let child = spend(bitcoin::OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 1_000, 1_000, 14);
+    pm.handle_tx(10, child.clone());
+    assert!(pm.orphanage.contains(&child.compute_txid()));
+    pm.handle_tx(1, parent.clone());
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    let to_sender = invs(&mut orphan_sender);
+    assert!(to_sender.is_empty(), "{to_sender:?}");
+    assert!(invs(&mut other).contains(&Inventory::WTx(parent.compute_wtxid())));
+}
+
+/// A peer that announces a transaction after it was queued for it is not
+/// announced it back: the flush looks at what the peer knows then.
+#[test]
+fn a_transaction_the_peer_announced_since_it_was_queued_is_passed_over() {
+    let (pm, _dir) = pm_with_coins(&[15]);
+    let mut clock = MockClock::install();
+    let mut rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
+    let tx = spend(coin_at(15), COIN, 1_000, 15);
+    pm.handle_tx(1, tx.clone());
+    assert_eq!(relay_state(&pm, 10).0, 1);
+    pm.handle_inv(10, vec![Inventory::WTx(tx.compute_wtxid())]);
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert!(invs(&mut rx).is_empty());
+    assert_eq!(relay_state(&pm, 10).0, 0);
+}

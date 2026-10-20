@@ -3825,8 +3825,11 @@ impl Mempool {
         let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         // A quarantined admission emits no `Enter`, so it needs no copy.
         let raw_tx = if scope.is_quarantined() { None } else { self.raw_tx_for_event(&tx) };
-        // The number this insert takes (`account_insert` below).
-        let entry_sequence = inner.sequence;
+        // The number this insert takes (`account_insert` below). A
+        // transaction a reorg returns takes 0, as with Core's
+        // `bypass_limits`: it was in a block, so a peer may fetch it before
+        // it is announced (`mempool_reorg.py`).
+        let entry_sequence = if pkg.skip_truc { 0 } else { inner.sequence };
         inner.entries.insert(
             txid,
             MempoolEntry {

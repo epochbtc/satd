@@ -461,9 +461,8 @@ reason = "no-wallet"
 
 [[test]]
 file = "mempool_reorg.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-16: the L54 sync timeout is gone (#778); L94 test_reorg_relay asserts no tx announcement inside the trickle window, and satd announces at once. Follow-up: Core's Poisson tx-announcement trickle"
+status = "run"
+note = "flipped 2026-10-20: Core's transaction announcement trickle, announce-gated getdata, and a reorged transaction served before it is announced"
 
 [[test]]
 file = "mempool_resurrect.py"
@@ -689,9 +688,8 @@ note = "measured 2026-10-01: wtxidrelay and sendaddrv2 now go only to a peer at 
 
 [[test]]
 file = "p2p_leak_tx.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-10-01, unchanged by wtxid relay (#714): L47 reads getpeerinfo.last_inv_sequence, Core's announce-gated relay bookkeeping. Follow-up: announce-gated getdata (W19)"
+status = "run"
+note = "flipped 2026-10-20: announce-gated getdata, getpeerinfo inv_to_send and last_inv_sequence, and the most recent block's transactions served"
 
 [[test]]
 file = "p2p_message_capture.py"
@@ -728,7 +726,7 @@ note = "flipped 2026-10-20: Core v30's orphanage limits (per-peer latency and we
 file = "p2p_orphan_handling.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-10-20 with Core v30's orphanage limits: still L173, test_arrival_timing_orphan finds the parent announced to the spy peer at once; Core delays transaction invs (trickle). Follow-up: Core's inv trickling"
+note = "measured 2026-10-20 with the announcement trickle: past L173; L295 test_orphan_multiple_parents expects the node to ask for a parent confirmed long ago (Core asks for every parent it has not seen recently: its recently-confirmed filter, reset by the test's reorg, is all it checks), and satd asks only for parents missing from its UTXO set. Follow-up: Core's recently-confirmed filter and parent selection (see CORE_DIFFERENCES, Transaction download)"
 
 [[test]]
 file = "p2p_outbound_eviction.py"
