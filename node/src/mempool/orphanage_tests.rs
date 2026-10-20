@@ -505,3 +505,22 @@ fn the_dos_score_orders_as_a_feefrac() {
     assert!(!s(2, 2).exceeds(DosScore::ONE));
     assert!(s(2, 2) < DosScore::ONE);
 }
+
+/// Core trims after a removal too: a departing peer takes its reservation
+/// with it, and a peer that was within the larger limit is trimmed to the
+/// smaller one.
+#[test]
+fn a_departing_peer_lowers_the_limit_for_the_rest() {
+    let w = unit();
+    let pool = limited(1_000, w * 10);
+    add(&pool, &orphan(0), 2);
+    for i in 1..=15 {
+        add(&pool, &orphan(i), 1);
+    }
+    assert_eq!(pool.announcements_from_peer(1), 15, "within two peers' reservations");
+
+    pool.erase_for_peer(2);
+    assert_eq!(pool.announcements_from_peer(1), 10, "trimmed to one reservation");
+    assert!(!has(&pool, &orphan(1)) && has(&pool, &orphan(15)), "oldest out first");
+    pool.sanity_check();
+}

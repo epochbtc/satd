@@ -141,3 +141,44 @@ fn a_peer_that_announced_the_orphan_first_becomes_an_announcer() {
     pm.handle_tx(1, child.clone());
     assert_eq!(announcers(&pm, &child), vec![1, 2]);
 }
+
+/// Core's `EraseForBlock`: an orphan spending an output a block's
+/// transaction spends goes when the block connects.
+#[test]
+fn a_block_takes_out_an_orphan_it_conflicts_with() {
+    let (pm, _dir) = pm_with_coins(&[20]);
+    let unknown = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([0xe1; 32]), vout: 0 };
+    let orphan = spend(unknown, COIN, 1_000, 20);
+    let rival = spend(unknown, COIN, 2_000, 21);
+    pm.handle_tx(1, orphan.clone());
+    assert!(pm.orphanage.contains_wtxid(&orphan.compute_wtxid()));
+
+    let tip = pm.chain_state.tip_hash();
+    let mut block = crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32);
+    block.txdata.push(rival);
+    pm.reconsider_orphans_for_block(&block);
+    assert!(pm.orphanage.is_empty(), "the block spent its input");
+}
+
+/// Core keys orphans by wtxid: a copy with another witness, sent first,
+/// does not keep the real one out, and when the parent arrives one of them
+/// enters and the other goes.
+#[test]
+fn an_orphan_with_the_same_txid_and_another_witness_is_kept_beside_it() {
+    let (pm, _dir) = pm_with_coins(&[22]);
+    let parent = spend(coin_at(22), COIN, 1_000, 22);
+    let child = spend(bitcoin::OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 1_000, 1_000, 23);
+    let mut mutated = child.clone();
+    mutated.input[0].witness.push([5u8]);
+    assert_eq!(mutated.compute_txid(), child.compute_txid());
+
+    pm.handle_tx(1, mutated.clone());
+    pm.handle_tx(2, child.clone());
+    assert!(pm.orphanage.contains_wtxid(&mutated.compute_wtxid()));
+    assert!(pm.orphanage.contains_wtxid(&child.compute_wtxid()), "the real one is kept too");
+    assert_eq!(pm.orphanage.len(), 2);
+
+    pm.handle_tx(2, parent.clone());
+    assert!(in_pool(&pm, &parent) && in_pool(&pm, &child));
+    assert!(pm.orphanage.is_empty(), "the other copy went: {:?}", pm.orphanage.orphans());
+}
