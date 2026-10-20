@@ -182,3 +182,28 @@ fn an_orphan_with_the_same_txid_and_another_witness_is_kept_beside_it() {
     assert!(in_pool(&pm, &parent) && in_pool(&pm, &child));
     assert!(pm.orphanage.is_empty(), "the other copy went: {:?}", pm.orphanage.orphans());
 }
+
+/// An orphan reconsidered when one parent arrives, still missing another,
+/// stays with its announcers and enters when the other arrives.
+#[test]
+fn an_orphan_still_missing_a_parent_waits_for_it() {
+    let (pm, _dir) = pm_with_coins(&[30, 31]);
+    let p1 = spend(coin_at(30), COIN, 1_000, 30);
+    let p2 = spend(coin_at(31), COIN, 1_000, 31);
+    let mut child = spend(bitcoin::OutPoint { txid: p1.compute_txid(), vout: 0 }, COIN - 1_000, 1_000, 32);
+    let mut second = child.input[0].clone();
+    second.previous_output = bitcoin::OutPoint { txid: p2.compute_txid(), vout: 0 };
+    child.input.push(second);
+    child.output[0].value = bitcoin::Amount::from_sat(2 * (COIN - 1_000) - 2_000);
+
+    pm.handle_tx(1, child.clone());
+    pm.handle_inv(2, vec![Inventory::WTx(child.compute_wtxid())]);
+    pm.handle_tx(1, p1.clone());
+    assert!(in_pool(&pm, &p1) && !in_pool(&pm, &child));
+    assert_eq!(announcers(&pm, &child), vec![1, 2], "still held, announcers and all");
+    assert_eq!(pm.orphanage.children_of(&p2.compute_txid()), vec![child.compute_wtxid()]);
+
+    pm.handle_tx(2, p2.clone());
+    assert!(in_pool(&pm, &child));
+    assert!(pm.orphanage.is_empty());
+}

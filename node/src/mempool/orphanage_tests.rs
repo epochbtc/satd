@@ -524,3 +524,42 @@ fn a_departing_peer_lowers_the_limit_for_the_rest() {
     assert!(!has(&pool, &orphan(1)) && has(&pool, &orphan(15)), "oldest out first");
     pool.sanity_check();
 }
+
+/// Core's `LimitOrphans` takes the worst peer only until it is no worse
+/// than the next one, then turns to that one: two peers over their share
+/// are trimmed in turn, not the worst alone.
+#[test]
+fn the_peers_over_their_share_are_trimmed_in_turn() {
+    let pool = limited(20, unit() * 1000);
+    for i in 0..12 {
+        add(&pool, &orphan(i), 1);
+    }
+    for i in 100..108 {
+        add(&pool, &orphan(i), 2);
+    }
+    assert_eq!(pool.latency_score(), 20, "within the limit so far");
+    // A third peer's 50-input orphan scores 6: per-peer share 20 / 3 = 6.
+    let wide = spending(&outpoints(9000, 50), 1);
+    add(&pool, &wide, 3);
+    assert_eq!(pool.announcements_from_peer(1), 7);
+    assert_eq!(pool.announcements_from_peer(2), 7);
+    assert!(has(&pool, &wide), "peer 3 is within its share");
+    pool.sanity_check();
+}
+
+/// Between peers with equal scores, Core trims the higher id, the more
+/// recent connection.
+#[test]
+fn between_equal_scores_the_more_recent_peer_is_trimmed() {
+    let pool = limited(12, unit() * 1000);
+    for i in 0..6 {
+        add(&pool, &orphan(i), 1);
+    }
+    for i in 100..106 {
+        add(&pool, &orphan(i), 2);
+    }
+    add(&pool, &orphan(200), 3);
+    assert_eq!(pool.announcements_from_peer(1), 6);
+    assert_eq!(pool.announcements_from_peer(2), 5);
+    pool.sanity_check();
+}
