@@ -77,6 +77,11 @@ item below is (or will be) written up in full in the in-development
   ancestors, the package's fees and feerate, the feerate diagram), and
   both transactions' scripts are checked before anything is evicted.
 
+- `sat-tui` shows the quarantine class while a transaction-filtering policy
+  is loaded: a Quarantine panel in the mempool view (held count and bytes
+  against the budget, confirmed-anyway count, foregone fees, a per-rule
+  table), and the held count beside the Txs line of the steady view.
+
 ### Fixed
 
 - `getrawmempool` lists transactions in Core's mining order: best chunk
