@@ -116,7 +116,9 @@ fn a_txid_announcement_of_a_held_orphan_is_not_fetched() {
 #[test]
 fn a_held_orphan_is_not_validated_again() {
     let (pm, _dir) = pm_with_coins(&[10]);
-    let mut parent = spend(coin_at(10), COIN, 1_000, 10);
+    // Without a witness, so its refusal is remembered by txid, the key an
+    // orphan's parent is looked up by.
+    let mut parent = spend_bare(coin_at(10), COIN, 1_000, 10);
     parent.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
     let child = spend(bitcoin::OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 1_000, 1_000, 11);
     pm.handle_tx(1, child.clone());
@@ -127,4 +129,15 @@ fn a_held_orphan_is_not_validated_again() {
     pm.handle_tx(2, child.clone());
     assert!(!pm.recently_rejected(child.compute_wtxid().as_byte_array()), "not judged again");
     assert!(pm.orphanage.contains(&child.compute_txid()));
+}
+
+/// Core's `MempoolRejectedTx`: every peer that had announced the orphan
+/// before it arrived is asked for its parents and becomes an announcer.
+#[test]
+fn a_peer_that_announced_the_orphan_first_becomes_an_announcer() {
+    let (pm, _dir) = pm_with_coins(&[12]);
+    let (_, child) = cpfp_pair(12);
+    pm.handle_inv(2, vec![Inventory::WTx(child.compute_wtxid())]);
+    pm.handle_tx(1, child.clone());
+    assert_eq!(announcers(&pm, &child), vec![1, 2]);
 }
