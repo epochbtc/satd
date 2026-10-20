@@ -204,10 +204,14 @@ impl TxRelay {
     }
 
     /// Finish a flush: what was not announced goes back in the queue, and
-    /// the mempool sequence becomes the peer's `last_inv_sequence`.
-    pub fn finish(&mut self, unsent: impl IntoIterator<Item = Wtxid>, mempool_sequence: u64) {
+    /// the mempool sequence, if given, becomes the peer's
+    /// `last_inv_sequence`. A flush that could not send everything it chose
+    /// gives none.
+    pub fn finish(&mut self, unsent: impl IntoIterator<Item = Wtxid>, mempool_sequence: Option<u64>) {
         self.to_send.extend(unsent);
-        self.last_inv_sequence = mempool_sequence;
+        if let Some(sequence) = mempool_sequence {
+            self.last_inv_sequence = sequence;
+        }
     }
 
     /// Make the peer due at the next flush, as if its timer had passed.

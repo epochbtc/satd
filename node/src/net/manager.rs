@@ -9387,7 +9387,7 @@ impl PeerManager {
         };
         let info = &h.info;
         h.tx_relay.due(now, false, || self.next_inv_send_time(info, now));
-        h.tx_relay.finish(std::iter::empty(), sequence);
+        h.tx_relay.finish(std::iter::empty(), Some(sequence));
     }
 
     /// When to flush `info`'s announcements next. An outbound peer draws its
@@ -9445,48 +9445,75 @@ impl PeerManager {
             let relay_hash = |txid: bitcoin::Txid, wtxid: bitcoin::Wtxid| {
                 if wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() }
             };
-            let mut invs = Vec::new();
-            let mut answered: HashMap<bitcoin::Wtxid, [u8; 32]> = HashMap::new();
+            // The BIP 35 answer: the whole mempool, as Core sends it.
+            let mut answered: Vec<(Inventory, bitcoin::Wtxid, [u8; 32])> = Vec::new();
             if flush.mempool {
                 for (txid, wtxid) in self.mempool.relay_ids_above_feerate(fee_filter) {
-                    invs.push(tx_announcement(wtxid_relay, txid, wtxid));
-                    answered.insert(wtxid, relay_hash(txid, wtxid));
+                    answered.push((tx_announcement(wtxid_relay, txid, wtxid), wtxid, relay_hash(txid, wtxid)));
                 }
             }
+            let answered_ids: HashSet<bitcoin::Wtxid> = answered.iter().map(|(_, w, _)| *w).collect();
             let max = tx_relay::broadcast_max(flush.queued.len());
             let mut candidates = self.mempool.relay_candidates(&flush.queued);
-            candidates.retain(|c| !answered.contains_key(&c.wtxid));
+            candidates.retain(|c| !answered_ids.contains(&c.wtxid));
             candidates.sort_by(tx_relay::announce_order);
             let sequence = self.mempool.mempool_sequence();
+            // What to announce, chosen under the lock and recorded only once
+            // it is on the peer's queue: an announcement that could not be
+            // queued is not one the peer knows.
+            let mut picked: Vec<(Inventory, Option<bitcoin::Wtxid>, [u8; 32])> = Vec::new();
+            let mut unsent = Vec::new();
+            let sender = {
+                let mut peers = self.peers.write();
+                let Some(h) = peers.get_mut(&id) else {
+                    continue;
+                };
+                for (inv, wtxid, hash) in answered {
+                    h.tx_relay.unqueue(&wtxid);
+                    picked.push((inv, None, hash));
+                }
+                let mut sent = 0;
+                for c in candidates {
+                    if sent >= max {
+                        unsent.push(c.wtxid);
+                        continue;
+                    }
+                    let hash = relay_hash(c.txid, c.wtxid);
+                    if h.tx_relay.knows(&hash) || c.fee_rate < fee_filter {
+                        continue;
+                    }
+                    picked.push((tx_announcement(wtxid_relay, c.txid, c.wtxid), Some(c.wtxid), hash));
+                    sent += 1;
+                }
+                h.msg_tx.clone()
+            };
+            // Once one chunk does not fit, neither does the rest.
+            let mut delivered = 0;
+            for chunk in picked.chunks(MAX_INV_PER_MSG) {
+                let inv = chunk.iter().map(|(inv, _, _)| *inv).collect();
+                if sender.try_send(NetworkMessage::Inv(inv)).is_err() {
+                    break;
+                }
+                delivered += chunk.len();
+            }
             let mut peers = self.peers.write();
             let Some(h) = peers.get_mut(&id) else {
                 continue;
             };
-            for (wtxid, hash) in &answered {
-                h.tx_relay.unqueue(wtxid);
+            for (_, _, hash) in &picked[..delivered] {
                 h.tx_relay.add_known(hash);
             }
-            let mut sent = 0;
-            let mut unsent = Vec::new();
-            for c in candidates {
-                if sent >= max {
-                    unsent.push(c.wtxid);
-                    continue;
+            let failed = &picked[delivered..];
+            for (_, queued, _) in failed {
+                match queued {
+                    Some(wtxid) => unsent.push(*wtxid),
+                    None => h.tx_relay.request_mempool(),
                 }
-                let hash = relay_hash(c.txid, c.wtxid);
-                if h.tx_relay.knows(&hash) || c.fee_rate < fee_filter {
-                    continue;
-                }
-                invs.push(tx_announcement(wtxid_relay, c.txid, c.wtxid));
-                h.tx_relay.add_known(&hash);
-                sent += 1;
             }
-            h.tx_relay.finish(unsent, sequence);
-            let sender = h.msg_tx.clone();
-            drop(peers);
-            for chunk in invs.chunks(MAX_INV_PER_MSG) {
-                let _ = sender.try_send(NetworkMessage::Inv(chunk.to_vec()));
-            }
+            // A peer that was not sent everything chosen keeps its
+            // `last_inv_sequence`, so what it was not announced stays
+            // unservable to it.
+            h.tx_relay.finish(unsent, failed.is_empty().then_some(sequence));
         }
     }
 
@@ -9650,18 +9677,17 @@ impl PeerManager {
             return;
         }
         tracing::debug!(count = pairs.len(), "rebroadcasting unbroadcast local txs");
-        let peers = self.peers.read();
-        for handle in peers.values() {
+        // Core's `ReattemptInitialBroadcast`: each is queued again, through
+        // `RelayTransaction`, for every peer that has not been announced it;
+        // the peer's next flush announces it and applies its fee filter.
+        let mut peers = self.peers.write();
+        for handle in peers.values_mut() {
             if handle.info.state != PeerState::Connected || !handle.info.relays_txs() {
                 continue;
             }
-            let invs: Vec<Inventory> = pairs
-                .iter()
-                .filter(|(_, _, fee_rate)| *fee_rate >= handle.info.fee_filter)
-                .map(|(txid, wtxid, _)| tx_announcement(handle.info.wtxid_relay, *txid, *wtxid))
-                .collect();
-            for chunk in invs.chunks(MAX_INV_PER_MSG) {
-                let _ = handle.msg_tx.try_send(NetworkMessage::Inv(chunk.to_vec()));
+            for (txid, wtxid, _) in &pairs {
+                let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+                handle.tx_relay.queue(*wtxid, &hash);
             }
         }
     }
@@ -16006,6 +16032,7 @@ mod tests {
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         pm.rebroadcast_unbroadcast_txs();
+        flush_invs(&pm);
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);

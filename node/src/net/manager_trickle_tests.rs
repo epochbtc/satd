@@ -286,3 +286,55 @@ fn a_transaction_the_peer_announced_since_it_was_queued_is_passed_over() {
     assert!(invs(&mut rx).is_empty());
     assert_eq!(relay_state(&pm, 10).0, 0);
 }
+
+/// Core's `ReattemptInitialBroadcast` queues through `RelayTransaction`: a
+/// local transaction rebroadcast before the peer's next flush is not
+/// announced early, and is fetchable once it is announced.
+#[test]
+fn a_rebroadcast_waits_for_the_peer_s_flush() {
+    let (pm, _dir) = pm_with_coins(&[16]);
+    let mut clock = MockClock::install();
+    let mut rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
+    let tx = spend(coin_at(16), COIN, 1_000, 16);
+    let txid = pm.submit_and_announce(tx.clone(), crate::mempool::pool::TxSource::Rpc, false).unwrap();
+    pm.rebroadcast_unbroadcast_txs();
+    assert!(invs(&mut rx).is_empty(), "announced outside the flush");
+    let ask = Inventory::WTx(tx.compute_wtxid());
+    pm.handle_getdata(10, vec![ask]);
+    assert!(matches!(rx.try_recv(), Ok(NetworkMessage::NotFound(_))));
+
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert_eq!(invs(&mut rx), vec![ask]);
+    pm.handle_getdata(10, vec![ask]);
+    match rx.try_recv() {
+        Ok(NetworkMessage::Tx(got)) => assert_eq!(got.compute_txid(), txid),
+        other => panic!("expected the tx, got {other:?}"),
+    }
+}
+
+/// An announcement that does not fit on the peer's full queue is not
+/// recorded as made: it stays queued, the peer's `last_inv_sequence` stays,
+/// and the next flush with room announces it.
+#[test]
+fn an_announcement_that_could_not_be_sent_is_kept_for_the_next_flush() {
+    let (pm, _dir) = pm_with_coins(&[17]);
+    let mut clock = MockClock::install();
+    let mut rx = super::txrequest_tests::add_peer_cap(&pm, 10, Direction::Outbound, 1, |_| {});
+    pm.start_tx_relay(10);
+    let before = relay_state(&pm, 10).1;
+    let tx = spend(coin_at(17), COIN, 1_000, 17);
+    pm.handle_tx(1, tx.clone());
+    // Fill the peer's one-message queue.
+    assert!(pm.send_to_peer(10, NetworkMessage::Ping(1)));
+
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert_eq!(relay_state(&pm, 10), (1, before), "kept, and nothing newly servable");
+    assert!(matches!(rx.try_recv(), Ok(NetworkMessage::Ping(1))));
+
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert_eq!(invs(&mut rx), vec![Inventory::WTx(tx.compute_wtxid())]);
+    assert_eq!(relay_state(&pm, 10), (0, pm.mempool.mempool_sequence()));
+}

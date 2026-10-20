@@ -98,7 +98,7 @@ pub(super) fn add_peer_with(
 }
 
 /// [`add_peer_with`] with a send queue of `capacity` messages.
-fn add_peer_cap(
+pub(super) fn add_peer_cap(
     pm: &PeerManager,
     id: PeerId,
     direction: Direction,
