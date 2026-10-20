@@ -9461,7 +9461,7 @@ impl PeerManager {
             // What to announce, chosen under the lock and recorded only once
             // it is on the peer's queue: an announcement that could not be
             // queued is not one the peer knows.
-            let mut picked: Vec<(Inventory, Option<bitcoin::Wtxid>, [u8; 32])> = Vec::new();
+            let mut picked: Vec<(Inventory, bitcoin::Wtxid, [u8; 32])> = Vec::new();
             let mut unsent = Vec::new();
             let sender = {
                 let mut peers = self.peers.write();
@@ -9470,7 +9470,7 @@ impl PeerManager {
                 };
                 for (inv, wtxid, hash) in answered {
                     h.tx_relay.unqueue(&wtxid);
-                    picked.push((inv, None, hash));
+                    picked.push((inv, wtxid, hash));
                 }
                 let mut sent = 0;
                 for c in candidates {
@@ -9482,7 +9482,7 @@ impl PeerManager {
                     if h.tx_relay.knows(&hash) || c.fee_rate < fee_filter {
                         continue;
                     }
-                    picked.push((tx_announcement(wtxid_relay, c.txid, c.wtxid), Some(c.wtxid), hash));
+                    picked.push((tx_announcement(wtxid_relay, c.txid, c.wtxid), c.wtxid, hash));
                     sent += 1;
                 }
                 h.msg_tx.clone()
@@ -9507,12 +9507,10 @@ impl PeerManager {
                     h.tx_relay.announced_out_of_sequence(hash);
                 }
             }
-            for (_, queued, _) in failed {
-                match queued {
-                    Some(wtxid) => unsent.push(*wtxid),
-                    None => h.tx_relay.request_mempool(),
-                }
-            }
+            // What did not fit goes back in the queue, a BIP 35 answer's
+            // remainder included: the next flush sends it, not the whole
+            // answer again.
+            unsent.extend(failed.iter().map(|(_, wtxid, _)| *wtxid));
             // A peer that was not sent everything chosen keeps its
             // `last_inv_sequence`, so what it was not announced stays
             // unservable to it.

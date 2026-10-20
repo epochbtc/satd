@@ -381,4 +381,12 @@ fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
     let unsent = *all.difference(&announced).next().expect("one left out");
     assert!(pm.serve_getdata_entry(10, &sender, Inventory::WTx(unsent), last, &mut not_found));
     assert_eq!(not_found, vec![Inventory::WTx(unsent)], "not announced, not served");
+    let _ = rx.try_recv();
+
+    // The next flush sends what did not fit, not the whole answer again.
+    assert_eq!(relay_state(&pm, 10).0, 1);
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert_eq!(invs(&mut rx), vec![Inventory::WTx(unsent)]);
+    assert_eq!(relay_state(&pm, 10), (0, pm.mempool.mempool_sequence()));
 }
