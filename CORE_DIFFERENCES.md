@@ -796,17 +796,10 @@ silently returning an empty or wrong answer.
   - Under `-blocksonly`, no transaction is fetched, also from a peer with
     the `relay` permission, which Core still fetches from.
 
-- **Orphanage** — satd's orphanage records every peer that sent or
-  announced an orphan, as Core's does, and `getorphantxs` lists it. Two
-  things differ:
-  - Orphans are keyed by txid. A copy with the same txid and another
-    witness is not kept beside the first; Core keys them by wtxid and keeps
-    both, so a malleated copy cannot stand in for the real one.
-  - Its limits count orphans: 100 in all, at most 50 announced by one
-    peer, oldest out first. Core v30 and later give each peer a share
-    of announcements and of memory, and evict from the peer furthest over
-    its share. Core's `p2p_opportunistic_1p1c.py` stops at its large-orphan
-    case on this.
+- **Orphanage** — satd's orphanage has Core v30's limits and records
+  every peer that sent or announced an orphan, as Core's does. satd also
+  reconsiders an orphan when a block confirms one of its parents; Core
+  reconsiders orphans only when a parent enters the mempool.
 
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
