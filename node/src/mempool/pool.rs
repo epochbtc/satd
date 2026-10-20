@@ -9154,6 +9154,19 @@ impl Mempool {
         txid
     }
 
+    /// Test-only: stamp every entry with the mempool's current sequence, as
+    /// if each had just entered.
+    pub(crate) fn resequence_for_test(&self) {
+        let mut inner = self.inner.write();
+        let sequence = inner.sequence;
+        let txids: Vec<Txid> = inner.entries.keys().copied().collect();
+        for txid in txids {
+            if let Some(entry) = inner.entries.get_mut(&txid) {
+                entry.entry_sequence = sequence;
+            }
+        }
+    }
+
     /// Test-only: insert a caller-provided `tx` with an explicit quarantine
     /// `scope`, through the real per-class accounting. Lets the compact-block
     /// reconstruction test place a *specific* (quarantined) transaction in the

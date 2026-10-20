@@ -114,6 +114,11 @@ pub struct TxRelay {
     /// Core's `m_send_mempool`: a BIP 35 `mempool` request to answer at the
     /// next flush.
     send_mempool: bool,
+    /// What a flush that could not send everything it chose did announce,
+    /// by the id announced. `last_inv_sequence` stays where it was then, so
+    /// that what was not sent stays unservable; these may be fetched all
+    /// the same, until the next complete flush moves the sequence past them.
+    announced_out_of_sequence: HashSet<[u8; 32]>,
 }
 
 impl Default for TxRelay {
@@ -125,6 +130,7 @@ impl Default for TxRelay {
             // Core starts it at 1, the mempool's first sequence number.
             last_inv_sequence: 1,
             send_mempool: false,
+            announced_out_of_sequence: HashSet::new(),
         }
     }
 }
@@ -211,7 +217,20 @@ impl TxRelay {
         self.to_send.extend(unsent);
         if let Some(sequence) = mempool_sequence {
             self.last_inv_sequence = sequence;
+            self.announced_out_of_sequence.clear();
         }
+    }
+
+    /// Record an announcement made by a flush that will not move
+    /// `last_inv_sequence`, so the peer may still fetch it.
+    pub fn announced_out_of_sequence(&mut self, hash: &[u8; 32]) {
+        self.announced_out_of_sequence.insert(*hash);
+    }
+
+    /// Whether the peer was announced `hash` by a flush that did not move
+    /// `last_inv_sequence`.
+    pub fn was_announced_out_of_sequence(&self, hash: &[u8; 32]) -> bool {
+        self.announced_out_of_sequence.contains(hash)
     }
 
     /// Make the peer due at the next flush, as if its timer had passed.

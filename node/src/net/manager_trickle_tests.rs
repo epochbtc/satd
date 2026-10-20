@@ -338,3 +338,47 @@ fn an_announcement_that_could_not_be_sent_is_kept_for_the_next_flush() {
     assert_eq!(invs(&mut rx), vec![Inventory::WTx(tx.compute_wtxid())]);
     assert_eq!(relay_state(&pm, 10), (0, pm.mempool.mempool_sequence()));
 }
+
+/// A BIP 35 answer spanning two `inv` messages, of which only the first
+/// fits on the peer's queue: what it announced may be fetched, though the
+/// peer's `last_inv_sequence` stays where it was; what it did not announce
+/// may not.
+#[test]
+fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
+    let (pm, _dir) = pm_with_coins(&[18]);
+    let mut clock = MockClock::install();
+    let mut rx = super::txrequest_tests::add_peer_cap(&pm, 10, Direction::Outbound, 1, |i| i.permissions.mempool = true);
+    pm.start_tx_relay(10);
+    let before = relay_state(&pm, 10).1;
+    for nonce in 0..(MAX_INV_PER_MSG as u64 + 1) {
+        pm.mempool.insert_scoped_for_test(1_000 + nonce, 1_000, crate::mempool::pool::QuarantineScope::acting());
+    }
+    pm.mempool.resequence_for_test();
+    pm.handle_mempool_request(10);
+    clock.advance(60 * SECOND);
+    pm.send_tx_invs();
+    assert_eq!(relay_state(&pm, 10).1, before, "not everything chosen was sent");
+
+    let sent = match rx.try_recv() {
+        Ok(NetworkMessage::Inv(inv)) => inv,
+        other => panic!("expected the first chunk, got {other:?}"),
+    };
+    assert_eq!(sent.len(), MAX_INV_PER_MSG);
+    // Served one entry at a time: the test drained the raw channel, so the
+    // queue still counts the inv's bytes and `handle_getdata` would wait.
+    let sender = pm.peers.read()[&10].msg_tx.clone();
+    let last = relay_state(&pm, 10).1;
+    let mut not_found = Vec::new();
+    assert!(pm.serve_getdata_entry(10, &sender, sent[0], last, &mut not_found));
+    match rx.try_recv() {
+        Ok(NetworkMessage::Tx(_)) => {}
+        other => panic!("an announced transaction must be served, got {other:?}"),
+    }
+    assert!(not_found.is_empty());
+    let all: HashSet<bitcoin::Wtxid> = pm.mempool.relay_ids_above_feerate(0).into_iter().map(|(_, w)| w).collect();
+    let announced: HashSet<bitcoin::Wtxid> =
+        sent.iter().filter_map(|i| if let Inventory::WTx(w) = i { Some(*w) } else { None }).collect();
+    let unsent = *all.difference(&announced).next().expect("one left out");
+    assert!(pm.serve_getdata_entry(10, &sender, Inventory::WTx(unsent), last, &mut not_found));
+    assert_eq!(not_found, vec![Inventory::WTx(unsent)], "not announced, not served");
+}

@@ -9500,10 +9500,13 @@ impl PeerManager {
             let Some(h) = peers.get_mut(&id) else {
                 continue;
             };
+            let failed = &picked[delivered..];
             for (_, _, hash) in &picked[..delivered] {
                 h.tx_relay.add_known(hash);
+                if !failed.is_empty() {
+                    h.tx_relay.announced_out_of_sequence(hash);
+                }
             }
-            let failed = &picked[delivered..];
             for (_, queued, _) in failed {
                 match queued {
                     Some(wtxid) => unsent.push(*wtxid),
@@ -10422,14 +10425,20 @@ impl PeerManager {
             // able to pull it from us (design §6.1). Report it as not-found,
             // exactly as if we did not hold it.
             Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_) => {
-                let pooled = match inv {
-                    Inventory::WTx(wtxid) => self.mempool.get_by_wtxid(&wtxid),
+                let (pooled, hash) = match inv {
+                    Inventory::WTx(wtxid) => (self.mempool.get_by_wtxid(&wtxid), wtxid.to_byte_array()),
                     Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                        self.mempool.get(&txid).map(|e| (txid, e))
+                        (self.mempool.get(&txid).map(|e| (txid, e)), txid.to_byte_array())
                     }
-                    _ => None,
-                }
-                .filter(|(_, e)| e.scope.assists_relay() && e.entry_sequence < last_inv_sequence);
+                    _ => (None, [0; 32]),
+                };
+                // Announced to the peer: entered before its last flush, or
+                // announced by a flush that could not send everything.
+                let announced = |e: &crate::mempool::pool::MempoolEntry| {
+                    e.entry_sequence < last_inv_sequence
+                        || self.peers.read().get(&id).is_some_and(|h| h.tx_relay.was_announced_out_of_sequence(&hash))
+                };
+                let pooled = pooled.filter(|(_, e)| e.scope.assists_relay() && announced(e));
                 let (tx, pooled_txid) = match pooled {
                     Some((txid, entry)) => (entry.tx, Some(txid)),
                     None => match self.recent_block_tx(&inv) {
