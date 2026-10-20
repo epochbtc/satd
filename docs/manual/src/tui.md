@@ -186,7 +186,10 @@ Latest block (right half):
 
 Mempool (left half):
 
-- **Txs**: unconfirmed transactions.
+- **Txs**: unconfirmed transactions. While a transaction-filtering policy
+  is loaded, the quarantined count follows (`12,345  +87 quarantined`): the
+  first number, like **Size**, covers the transactions the node relays and
+  mines, and leaves the quarantined ones out.
 - **Size**: total bytes.
 - **Min Rate**: current mempool minimum fee. `0.0` is the default, the
   min-relay floor of about 1 sat/vB. A non-zero value means the mempool
@@ -297,7 +300,8 @@ Keybindings hint, plus an unclean-shutdown indicator
 
 ### Mempool view (`3`)
 
-Drill-down on unconfirmed transactions. Five panels.
+Drill-down on unconfirmed transactions. Five panels, and a sixth, the
+quarantine panel, while a transaction-filtering policy is loaded.
 
 #### Title bar
 Health dot, uptime.
@@ -307,6 +311,36 @@ Health dot, uptime.
 - **Bytes**: total mempool bytes.
 - **Min / Max fees**: feerate range across mempool entries.
 - **Δ last Ns**: entries added and removed in the last polling window.
+
+#### Quarantine (only with a filtering policy)
+
+Appears under the summary strip while a ruleset is loaded (see
+[Transaction filtering policy](policy.md)). The rest of the view counts
+the acting class only, as `getmempoolinfo` does; this panel is where the
+transactions the policy holds back show up.
+
+- **Held**: quarantined transactions and bytes, against the
+  `quarantinemempool` budget.
+- **Confirmed anyway**: quarantined transactions later seen in a block,
+  since satd started.
+- **Foregone fees**: the fees, above the template floor, of transactions
+  withheld from block templates. Relay-only quarantine is still mined, so
+  it is not counted.
+- **fuel exhausted** (red, only when non-zero): evaluations that ran out
+  of fuel and were quarantined fail-safe.
+- **⚠ rules withhold Lightning enforcement relay** (only when non-zero):
+  see `allowdangerousfilters` in the policy chapter.
+
+| Column | Meaning |
+|---|---|
+| `rule` | The rule holding the transactions. `(infectious: quarantined ancestor)` holds descendants of quarantined transactions that matched no rule themselves. |
+| `held` | Transactions held under the rule. |
+| `bytes` | Their serialized size. |
+| `sat/vB` | Their fee-rate range. |
+| `matched` | Times the rule matched since the ruleset loaded; `-` for a name that is not a rule in the loaded ruleset. |
+
+Rows are ordered by bytes held. Every quarantine rule gets a row, a dimmed
+one when it holds nothing; past five rows, the last line counts the rest.
 
 #### Feerate histogram
 Bars per feerate bucket (`1–2`, `2–5`, `5–10`, `10–20`, `20–50`,
@@ -461,7 +495,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`). |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset. |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

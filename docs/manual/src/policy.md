@@ -195,6 +195,7 @@ response.
 | `listquarantine [rule] [count] [skip]` | The quarantine class as a paged list (txid, rule, scope, time, fee). |
 | `getquarantineentry <txid>` | The `getmempoolentry` analogue for a held transaction. |
 | `policytest <rawtx-hex>` | Dry-runs a transaction against the live ruleset: a per-rule trace (matched, decisive), the verdict, and the placement it would receive. The `testmempoolaccept` analogue for policy. |
+| `sat-tui` | The mempool view (`3`) adds a Quarantine panel: held count and bytes against the budget, confirmed-anyway count, foregone fees, and a per-rule table. The steady view adds the held count to its Txs line. See [sat-tui](tui.md). |
 | MCP tools | `get_policy_info`, `get_quarantine_info`, `list_quarantine`, and `get_quarantine_entry` mirror the JSON-RPC methods. |
 | Prometheus | `satd_policy_evaluations_total`, `satd_policy_quarantined_total{rule,scope}`, `satd_policy_allows_total{rule}`, `satd_policy_fuel_exhausted_total`, `satd_policy_reload_failures_total`, `satd_policy_promoted_total` / `_demoted_total`, `satd_policy_quarantine_confirmed_total`, gauges for quarantine bytes/count/budget, and `satd_policy_foregone_fees_sat`. All silent until a ruleset loads. |
 

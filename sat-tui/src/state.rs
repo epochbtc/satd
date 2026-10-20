@@ -69,6 +69,119 @@ pub struct MempoolTopEntry {
     pub age_secs: u64,
 }
 
+/// The transaction-filtering policy and the quarantine class it holds, from
+/// `getpolicyinfo` and `getquarantineinfo`.
+///
+/// Every other mempool RPC the TUI reads reports the acting class only, so
+/// without this a node holding thousands of quarantined transactions looks no
+/// different on screen from one that never received them.
+#[derive(Debug, Clone, Default)]
+pub struct QuarantineView {
+    pub version: u64,
+    pub rules_count: u64,
+    /// Evaluations that ran out of fuel and were quarantined fail-safe.
+    pub fuel_exhausted: u64,
+    /// Distinct rules that withhold relay of Lightning enforcement shapes.
+    /// Non-zero only with `allowdangerousfilters` set.
+    pub relay_withholding: u64,
+    pub count: u64,
+    pub bytes: u64,
+    pub budget_bytes: u64,
+    /// Quarantine rules from the loaded ruleset with their match counters
+    /// since load. Allow rules hold nothing and are left out.
+    pub rules: Vec<(String, u64)>,
+    /// `None` until the first `getquarantineinfo` answer.
+    pub held: Option<QuarantineHeld>,
+}
+
+/// The `getquarantineinfo` rollup.
+#[derive(Debug, Clone, Default)]
+pub struct QuarantineHeld {
+    pub confirmed_anyway: u64,
+    pub foregone_fees_sat: u64,
+    pub per_rule: Vec<QuarantineRuleStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuarantineRuleStat {
+    pub name: String,
+    pub count: u64,
+    pub bytes: u64,
+    /// sat/kvB.
+    pub min_fee_rate: u64,
+    /// sat/kvB.
+    pub max_fee_rate: u64,
+}
+
+/// One line of the quarantine panel's rule table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuarantineRuleRow {
+    pub stat: QuarantineRuleStat,
+    /// Matches since the ruleset loaded. `None` for a name that is not a rule
+    /// in the loaded ruleset: the infectious-ancestor marker, or a rule a
+    /// reload removed while its transactions were still held.
+    pub matched: Option<u64>,
+}
+
+/// Distinct rule names among the relay-withholding danger findings.
+/// `danger.relay_withholding` counts findings, one per rule and Lightning
+/// shape, so a rule that matches two shapes would count twice.
+fn relay_withholding_rules(v: &serde_json::Value) -> u64 {
+    let mut rules: Vec<&str> = v
+        .pointer("/danger/findings")
+        .and_then(|f| f.as_array())
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|f| f.get("withholds_relay").and_then(|w| w.as_bool()) == Some(true))
+                .filter_map(|f| f.get("rule")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    rules.sort_unstable();
+    rules.dedup();
+    rules.len() as u64
+}
+
+impl QuarantineView {
+    /// Rule rows for the panel: every quarantine rule in the ruleset, plus
+    /// any other name transactions are held under, largest holding first.
+    /// A rule holding nothing still gets a row, with its match count, so a
+    /// rule that never fires is visible as such.
+    pub fn rule_rows(&self) -> Vec<QuarantineRuleRow> {
+        let held: &[QuarantineRuleStat] =
+            self.held.as_ref().map(|h| h.per_rule.as_slice()).unwrap_or(&[]);
+        let mut rows: Vec<QuarantineRuleRow> = self
+            .rules
+            .iter()
+            .map(|(name, matched)| QuarantineRuleRow {
+                stat: held
+                    .iter()
+                    .find(|s| &s.name == name)
+                    .cloned()
+                    .unwrap_or_else(|| QuarantineRuleStat {
+                        name: name.clone(),
+                        ..Default::default()
+                    }),
+                matched: Some(*matched),
+            })
+            .collect();
+        for s in held {
+            if !self.rules.iter().any(|(name, _)| name == &s.name) {
+                rows.push(QuarantineRuleRow { stat: s.clone(), matched: None });
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.stat
+                .bytes
+                .cmp(&a.stat.bytes)
+                .then(b.matched.unwrap_or(0).cmp(&a.matched.unwrap_or(0)))
+                .then(a.stat.name.cmp(&b.stat.name))
+        });
+        rows
+    }
+}
+
 /// One reorg record from getreorghistory.
 #[derive(Debug, Clone)]
 pub struct ReorgEntry {
@@ -483,6 +596,8 @@ pub struct AppState {
     pub mempool_history_available: bool,
     pub mempool_top: Vec<MempoolTopEntry>,
     pub selected_mempool_row: usize,
+    /// `Some` while a filtering policy is loaded; `None` hides the panel.
+    pub quarantine: Option<QuarantineView>,
 
     // Computed deltas
     pub blocks_per_sec: f64,
@@ -720,6 +835,7 @@ impl AppState {
             mempool_history: Vec::new(),
             mempool_history_available: true,
             mempool_top: Vec::new(),
+            quarantine: None,
             selected_mempool_row: 0,
 
             blocks_per_sec: 0.0,
@@ -1159,6 +1275,74 @@ impl AppState {
         if self.selected_mempool_row >= self.mempool_top.len() {
             self.selected_mempool_row = self.mempool_top.len().saturating_sub(1);
         }
+    }
+
+    /// Update from `getpolicyinfo`. `{"loaded": false}` clears the view, so
+    /// the panel disappears when the operator removes the ruleset.
+    pub fn update_policy_info(&mut self, v: &serde_json::Value) {
+        if !v.get("loaded").and_then(|l| l.as_bool()).unwrap_or(false) {
+            self.quarantine = None;
+            return;
+        }
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let q = v.get("quarantine").cloned().unwrap_or_default();
+        let rules = v
+            .get("rules")
+            .and_then(|r| r.as_array())
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter(|r| r.get("action").and_then(|a| a.as_str()) == Some("quarantine"))
+                    .filter_map(|r| Some((r.get("name")?.as_str()?.to_string(), u(r, "matched"))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The held rollup comes from a separate call; keep the last one
+        // rather than blanking the table for a tick on every refresh.
+        let held = self.quarantine.take().and_then(|old| old.held);
+        self.quarantine = Some(QuarantineView {
+            version: u(v, "version"),
+            rules_count: u(v, "rules_count"),
+            fuel_exhausted: u(v, "fuel_exhausted"),
+            relay_withholding: relay_withholding_rules(v),
+            count: u(&q, "count"),
+            bytes: u(&q, "bytes"),
+            budget_bytes: u(&q, "budget_bytes"),
+            rules,
+            held,
+        });
+    }
+
+    /// Update from `getquarantineinfo`. Ignored while no policy is loaded:
+    /// `getpolicyinfo` decides whether the panel exists.
+    pub fn update_quarantine_info(&mut self, v: &serde_json::Value) {
+        let Some(view) = self.quarantine.as_mut() else { return };
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let per_rule = v
+            .get("rules")
+            .and_then(|r| r.as_object())
+            .map(|rules| {
+                rules
+                    .iter()
+                    .map(|(name, s)| QuarantineRuleStat {
+                        name: name.clone(),
+                        count: u(s, "count"),
+                        bytes: u(s, "bytes"),
+                        min_fee_rate: u(s, "min_fee_rate"),
+                        max_fee_rate: u(s, "max_fee_rate"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Both calls report the class totals; the later reading wins.
+        view.count = u(v, "count");
+        view.bytes = u(v, "bytes");
+        view.budget_bytes = u(v, "budget_bytes");
+        view.held = Some(QuarantineHeld {
+            confirmed_anyway: u(v, "confirmed_anyway"),
+            foregone_fees_sat: u(v, "foregone_fees_sat"),
+            per_rule,
+        });
     }
 
     /// Update from getmempoolhistory: { since_secs, available, snapshots: [...] }.
@@ -1924,6 +2108,99 @@ mod tests {
         st.update_mempool_dist(&v);
         assert_eq!(st.mempool_top.len(), 1);
         assert_eq!(st.mempool_top[0].txid, "good");
+    }
+
+    fn policy_info(loaded_rules: serde_json::Value) -> serde_json::Value {
+        json!({
+            "loaded": true,
+            "version": 1,
+            "rules_count": 3,
+            "fuel_exhausted": 2,
+            "rules": loaded_rules,
+            "quarantine": {"count": 5, "bytes": 1_500, "budget_bytes": 300_000_000},
+            "danger": {"relay_withholding": 3, "findings": [
+                {"rule": "bulk", "withholds_relay": true},
+                {"rule": "bulk", "withholds_relay": true},
+                {"rule": "mine-only", "withholds_relay": false},
+            ]},
+        })
+    }
+
+    #[test]
+    fn policy_info_drives_whether_the_quarantine_view_exists() {
+        let mut st = AppState::new();
+        st.update_policy_info(&json!({"loaded": false, "evaluations": 0}));
+        assert!(st.quarantine.is_none(), "no ruleset, no panel");
+
+        st.update_policy_info(&policy_info(json!([
+            {"name": "bulk", "action": "quarantine", "matched": 7, "scope": {"relay": true, "template": true}},
+            {"name": "friends", "action": "allow", "matched": 3},
+        ])));
+        let q = st.quarantine.as_ref().expect("a loaded ruleset shows the panel");
+        assert_eq!((q.version, q.rules_count, q.fuel_exhausted), (1, 3, 2));
+        assert_eq!((q.count, q.bytes, q.budget_bytes), (5, 1_500, 300_000_000));
+        assert_eq!(q.relay_withholding, 1, "one rule matching two shapes is one rule");
+        assert_eq!(q.rules, vec![("bulk".to_string(), 7)], "allow rules hold nothing and are left out");
+        assert!(q.held.is_none());
+
+        // Removing the ruleset takes the panel away again.
+        st.update_policy_info(&json!({"loaded": false}));
+        assert!(st.quarantine.is_none());
+    }
+
+    #[test]
+    fn quarantine_info_is_ignored_without_a_policy_and_survives_a_policy_refresh() {
+        let held = json!({
+            "count": 6, "bytes": 2_000, "budget_bytes": 300_000_000,
+            "confirmed_anyway": 4, "foregone_fees_sat": 12_345,
+            "rules": {"bulk": {"count": 6, "bytes": 2_000, "min_fee_rate": 1_000, "max_fee_rate": 25_500}},
+        });
+        let mut st = AppState::new();
+        st.update_quarantine_info(&held);
+        assert!(st.quarantine.is_none(), "getpolicyinfo, not the rollup, creates the panel");
+
+        st.update_policy_info(&policy_info(json!([{"name": "bulk", "action": "quarantine", "matched": 7}])));
+        st.update_quarantine_info(&held);
+        let q = st.quarantine.as_ref().unwrap();
+        assert_eq!((q.count, q.bytes), (6, 2_000), "the later reading of the totals wins");
+        let h = q.held.as_ref().unwrap();
+        assert_eq!((h.confirmed_anyway, h.foregone_fees_sat), (4, 12_345));
+        assert_eq!(h.per_rule[0].max_fee_rate, 25_500);
+
+        // The next policy poll keeps the rollup rather than blanking the
+        // table until the rollup's own poll lands.
+        st.update_policy_info(&policy_info(json!([{"name": "bulk", "action": "quarantine", "matched": 8}])));
+        assert!(st.quarantine.as_ref().unwrap().held.is_some());
+    }
+
+    #[test]
+    fn rule_rows_join_counters_with_holdings_and_keep_unknown_names() {
+        let mut st = AppState::new();
+        st.update_policy_info(&policy_info(json!([
+            {"name": "idle", "action": "quarantine", "matched": 0},
+            {"name": "busy", "action": "quarantine", "matched": 50},
+            {"name": "small", "action": "quarantine", "matched": 9},
+        ])));
+        st.update_quarantine_info(&json!({
+            "count": 4, "bytes": 1_100,
+            "rules": {
+                "busy": {"count": 2, "bytes": 800, "min_fee_rate": 1_000, "max_fee_rate": 2_000},
+                "small": {"count": 1, "bytes": 100, "min_fee_rate": 3_000, "max_fee_rate": 3_000},
+                "(infectious: quarantined ancestor)":
+                    {"count": 1, "bytes": 200, "min_fee_rate": 5_000, "max_fee_rate": 5_000},
+            },
+        }));
+        let rows = st.quarantine.as_ref().unwrap().rule_rows();
+        let order: Vec<&str> = rows.iter().map(|r| r.stat.name.as_str()).collect();
+        assert_eq!(
+            order,
+            ["busy", "(infectious: quarantined ancestor)", "small", "idle"],
+            "largest holding first; a rule holding nothing still gets a row",
+        );
+        assert_eq!(rows[0].matched, Some(50));
+        assert_eq!(rows[1].matched, None, "not a rule in the ruleset, so no counter");
+        assert_eq!(rows[3].stat.count, 0);
+        assert_eq!(rows[3].matched, Some(0));
     }
 
     #[test]

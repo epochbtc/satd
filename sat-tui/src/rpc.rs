@@ -235,6 +235,20 @@ impl RpcClient {
         self.call("getmempoolsummary", &[serde_json::json!(MEMPOOL_TOP_N)]).await
     }
 
+    /// Ruleset metadata and quarantine totals; `{"loaded": false}` when no
+    /// filtering policy is installed. The standard mempool RPCs report the
+    /// acting class only, so this and [`Self::get_quarantine_info`] are the
+    /// only way to see what the node is holding back.
+    pub async fn get_policy_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getpolicyinfo", &[]).await
+    }
+
+    /// Per-rule rollup of the quarantine class. Walks the mempool node-side,
+    /// so the poller asks only while a policy is loaded.
+    pub async fn get_quarantine_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getquarantineinfo", &[]).await
+    }
+
     pub async fn get_tx_out_set_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("gettxoutsetinfo", &[]).await
     }
