@@ -1125,8 +1125,8 @@ pub struct PeerManager {
     /// SIGHUP-reloadable.
     immediate_tx_announce: AtomicBool,
     /// Wakes the flush loop before its next tick: see
-    /// [`Self::wake_tx_invs`].
-    tx_inv_wake: tokio::sync::Notify,
+    /// [`Self::wake_tx_invs`], and each peer's write loop on a `ping`.
+    tx_inv_wake: Arc<tokio::sync::Notify>,
     /// `-cmpctblockprefill`: announce new blocks with the transactions this
     /// node lacked prefilled (Core #35558). Set once at startup.
     compact_prefill: std::sync::atomic::AtomicBool,
@@ -1468,7 +1468,7 @@ impl PeerManager {
             most_recent_block: RwLock::new(None),
             next_inv_to_inbounds: parking_lot::Mutex::new(HashMap::new()),
             immediate_tx_announce: AtomicBool::new(false),
-            tx_inv_wake: tokio::sync::Notify::new(),
+            tx_inv_wake: Arc::new(tokio::sync::Notify::new()),
             compact_prefill: std::sync::atomic::AtomicBool::new(false),
             compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES),
             highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
@@ -12266,6 +12266,7 @@ impl PeerManager {
             Some(self.drain_now.clone()),
             disconnect_signal,
             send_queue,
+            Some(self.tx_inv_wake.clone()),
         )
         .await;
 
@@ -12340,6 +12341,7 @@ impl PeerManager {
         drain_now: Option<Arc<tokio::sync::Notify>>,
         disconnect_signal: Option<Arc<tokio::sync::Notify>>,
         send_queue: Option<Arc<crate::net::send_queue::SendQueue>>,
+        tx_inv_wake: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), String> {
         // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
         // The first tick of a tokio interval fires immediately, which is also
@@ -12534,6 +12536,14 @@ impl PeerManager {
                                         flow.in_flight()
                                     );
                                 }
+                            }
+                            // Core runs `SendMessages` after each message it
+                            // handles, so a ping round trip carries any
+                            // announcements then due: a test that moves
+                            // mocktime and pings sees them. Run the flush now
+                            // rather than at its next tick.
+                            if let Some(wake) = &tx_inv_wake {
+                                wake.notify_one();
                             }
                             Self::send_watched(
                                 id,

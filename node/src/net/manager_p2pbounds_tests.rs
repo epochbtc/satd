@@ -600,6 +600,8 @@ struct Loop {
     disconnect: Arc<tokio::sync::Notify>,
     /// The manager's drain wake-up.
     drain_now: Arc<tokio::sync::Notify>,
+    /// The announcement flush's wake-up.
+    tx_inv_wake: Arc<tokio::sync::Notify>,
     stats: Arc<PeerStats>,
     far: tokio::net::TcpStream,
     task: tokio::task::JoinHandle<Result<(), String>>,
@@ -614,7 +616,8 @@ async fn run_loop() -> Loop {
     let disconnect = Arc::new(tokio::sync::Notify::new());
     let drain_now = Arc::new(tokio::sync::Notify::new());
     let queue = msg_tx.queue().clone();
-    let (s, d, w) = (stats.clone(), disconnect.clone(), drain_now.clone());
+    let tx_inv_wake = Arc::new(tokio::sync::Notify::new());
+    let (s, d, w, t) = (stats.clone(), disconnect.clone(), drain_now.clone(), tx_inv_wake.clone());
     let task = tokio::spawn(async move {
         let _keep = _reader;
         PeerManager::peer_write_loop(
@@ -628,10 +631,11 @@ async fn run_loop() -> Loop {
             Some(w),
             Some(d),
             Some(queue),
+            Some(t),
         )
         .await
     });
-    Loop { id: 7, event_rx, msg_tx, read_tx, disconnect, drain_now, stats, far, task }
+    Loop { id: 7, event_rx, msg_tx, read_tx, disconnect, drain_now, tx_inv_wake, stats, far, task }
 }
 
 /// Queue big messages until the socket stops taking bytes: the far end is
@@ -650,6 +654,19 @@ async fn park(l: &Loop) {
         }
         last = now;
     }
+}
+
+/// Core runs `SendMessages` after each message it handles, so the answer to
+/// a `ping` comes with the announcements then due. The write loop wakes the
+/// announcement flush when a ping arrives, rather than leaving it to the
+/// flush's next tick.
+#[tokio::test]
+async fn a_ping_wakes_the_announcement_flush() {
+    let l = run_loop().await;
+    let woken = l.tx_inv_wake.notified();
+    l.read_tx.send(NetworkMessage::Ping(42)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), woken).await.expect("the ping wakes the flush");
+    drop(l.far);
 }
 
 /// `disconnectnode`, a ban and the ping timeout all reach the write loop
