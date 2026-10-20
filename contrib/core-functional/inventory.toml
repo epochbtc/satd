@@ -972,9 +972,7 @@ reason = "no-tool"
 
 [[test]]
 file = "rpc_signmessagewithprivkey.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L34 signmessagewithprivkey is Method not found. Follow-up: signmessagewithprivkey and verifymessage"
+status = "run"
 
 [[test]]
 file = "rpc_signrawtransactionwithkey.py"

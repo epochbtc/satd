@@ -17,6 +17,9 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- `verifymessage` and `signmessagewithprivkey`, Bitcoin Core's message-signing
+  RPCs, byte-compatible with Core.
+
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering

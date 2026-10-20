@@ -7,7 +7,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitcoin = { workspace = true }
+bitcoin = { workspace = true, features = ["secp-recovery"] }
 jsonrpsee = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
