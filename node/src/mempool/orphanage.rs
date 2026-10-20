@@ -308,17 +308,19 @@ impl TxOrphanage {
     fn drop_announcer_locked(inner: &mut OrphanageInner, txid: &Txid, peer: PeerId) -> bool {
         let Some(entry) = inner.by_txid.get_mut(txid) else { return false };
         entry.announcers.remove(&peer);
-        if entry.announcers.is_empty() {
-            Self::remove_locked(inner, txid);
-            return true;
-        }
+        let last = entry.announcers.is_empty();
+        // The peer's index is cleaned here, before `remove_locked`, which
+        // cleans only the announcers the orphan still has.
         if let Some(set) = inner.by_peer.get_mut(&peer) {
             set.remove(txid);
             if set.is_empty() {
                 inner.by_peer.remove(&peer);
             }
         }
-        false
+        if last {
+            Self::remove_locked(inner, txid);
+        }
+        last
     }
 
     /// Return child-orphan txids that list `parent_txid` as a missing
@@ -791,5 +793,21 @@ mod tests {
         pool.restore(entry, [rand_txid(1)].into_iter().collect()).unwrap();
         assert_eq!(announcers(&pool, &tx), vec![1, 2]);
         assert_eq!(pool.get_by_wtxid(&tx.compute_wtxid()), Some(tx));
+    }
+
+    /// A peer's index holds only the orphans it still announces: after its
+    /// quota drops its oldest, and after it departs.
+    #[test]
+    fn a_peer_s_index_holds_only_what_it_announces() {
+        let pool = TxOrphanage::new(OrphanageConfig { max_count: 100, max_per_peer: 2, ..Default::default() });
+        for seed in 1..=5 {
+            add_orphan(&pool, seed, 1);
+        }
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.inner.lock().by_peer.get(&1).map(|s| s.len()), Some(2));
+
+        pool.erase_for_peer(1);
+        assert!(pool.is_empty());
+        assert!(pool.inner.lock().by_peer.is_empty(), "no index left for the departed peer");
     }
 }
