@@ -4972,19 +4972,16 @@ impl PeerManager {
         let mut event_rx = self.event_rx.lock().await;
         {
             let pm = Arc::clone(self);
-            let mut shutdown = self.shutdown.clone();
+            let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(TX_INV_FLUSH_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => pm.send_tx_invs(),
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break;
-                            }
-                        }
-                    }
+                // The flag, read each tick as the main loop reads it: the
+                // sending side of the channel may be gone long before
+                // shutdown, and a closed channel is no signal to stop.
+                while !*shutdown.borrow() {
+                    tick.tick().await;
+                    pm.send_tx_invs();
                 }
             });
         }
@@ -5353,7 +5350,6 @@ impl PeerManager {
                 );
             }
         }
-        self.start_tx_relay(id);
         // Assign IBD work to the new peer
         let has_ibd = self.ibd.read().is_some();
         if has_ibd {
@@ -9379,7 +9375,9 @@ impl PeerManager {
 
     /// Core's first `SendMessages` after the version handshake: the peer's
     /// flush timer starts, and its `last_inv_sequence` is the mempool's now.
-    /// From here on transactions are queued for it.
+    /// From here on transactions are queued for it. Run once per peer, when
+    /// its handshake completes: a second run would move `last_inv_sequence`
+    /// past transactions still queued, and serve them unannounced.
     fn start_tx_relay(&self, id: PeerId) {
         let sequence = self.mempool.mempool_sequence();
         let now = crate::time::now_micros();
@@ -11998,6 +11996,10 @@ impl PeerManager {
             handle.info.set_version(version.clone());
             handle.info.state = PeerState::Connected;
         }
+        // Transactions are queued for the peer from here on, as Core starts
+        // a peer's announcement timer in its first `SendMessages` after the
+        // `verack`.
+        self.start_tx_relay(id);
         self.event_tx
             .send(NetEvent::PeerConnected {
                 id,
