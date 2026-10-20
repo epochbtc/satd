@@ -2722,6 +2722,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // count that confirms propagation. Read by the rebroadcast task below
     // and by the getdata/inv witness paths in the peer manager.
     peer_manager.set_rebroadcast_config(config.rebroadcastinterval, config.broadcastconfirmpeers);
+    peer_manager.set_tx_announce_delay(config.txannouncedelay);
 
     // Periodic rebroadcast of unconfirmed local txs. A tx submitted via any
     // broadcast surface is announced once on submit; if we had no

@@ -831,6 +831,10 @@ fn field_specs() -> Vec<FieldSpec> {
             h.peer_manager
                 .set_rebroadcast_config(c.rebroadcastinterval, c.broadcastconfirmpeers)
         }),
+        // Read at every flush, so it applies from the next one.
+        live!("txannouncedelay", txannouncedelay, |c, h| {
+            h.peer_manager.set_tx_announce_delay(c.txannouncedelay)
+        }),
         restart!("onlynet", onlynet),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),

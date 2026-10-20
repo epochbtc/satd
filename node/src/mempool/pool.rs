@@ -9155,7 +9155,8 @@ impl Mempool {
     }
 
     /// Test-only: stamp every entry with the mempool's current sequence, as
-    /// if each had just entered.
+    /// if each had just entered, and move the sequence past it as an insert
+    /// does.
     pub(crate) fn resequence_for_test(&self) {
         let mut inner = self.inner.write();
         let sequence = inner.sequence;
@@ -9165,6 +9166,7 @@ impl Mempool {
                 entry.entry_sequence = sequence;
             }
         }
+        inner.sequence += 1;
     }
 
     /// Test-only: insert a caller-provided `tx` with an explicit quarantine

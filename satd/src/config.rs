@@ -1034,6 +1034,10 @@ pub struct Config {
     /// locally-broadcast transaction back to this node before it is
     /// considered propagated and rebroadcast stops. Default 1.
     pub broadcastconfirmpeers: u64,
+    /// satd extension: announce transactions on Core's random per-peer
+    /// timers (true, the default), or to every peer as soon as each is
+    /// queued (false), as Core announces to a `noban` peer.
+    pub txannouncedelay: bool,
     // Proxy / Tor
     pub proxy: Option<String>,
     /// Bitcoin Core's `-proxyrandomize`: use fresh random SOCKS5 credentials
@@ -4350,6 +4354,7 @@ impl Config {
                 .broadcastconfirmpeers
                 .or_else(|| file_get("broadcastconfirmpeers").and_then(|v| v.parse().ok()))
                 .unwrap_or(1),
+            txannouncedelay: resolve_tx_announce_delay(&cli.tx_announce_args, &file_get),
             proxy,
             proxyrandomize: cli
                 .proxyrandomize
@@ -5968,6 +5973,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub addrindex_args: AddrIndexArgs,
 
+    /// `-txannouncedelay`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
+    #[command(flatten)]
+    pub tx_announce_args: TxAnnounceArgs,
+
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
@@ -7452,6 +7462,58 @@ impl clap::FromArgMatches for PolicySizeArgs {
     }
 }
 
+/// `-txannouncedelay`, a satd extension, out of `CliArgs` for the same
+/// reason as [`resolve_bytes_per_sigop`]. Default true: Core's timers.
+#[inline(never)]
+fn resolve_tx_announce_delay(cli: &TxAnnounceArgs, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
+    cli.txannouncedelay.or_else(|| file_get("txannouncedelay").and_then(|v| parse_bool(&v))).unwrap_or(true)
+}
+
+/// `-txannouncedelay` (see [`CliArgs::tx_announce_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct TxAnnounceArgs {
+    pub txannouncedelay: Option<bool>,
+}
+
+const TX_ANNOUNCE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
+    "txannouncedelay",
+    "BOOL",
+    StratumArgKind::Bool,
+    "Announce transactions to each peer on Bitcoin Core's random timers (every 2 s on average outbound, 5 s inbound). 0 announces them to every peer at once, as Core does to a noban peer, which tells peers when each transaction arrived (default: 1)",
+)];
+
+impl clap::Args for TxAnnounceArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in TX_ANNOUNCE_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for TxAnnounceArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { txannouncedelay: m.remove_one("txannouncedelay") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// The address-index limits (see [`CliArgs::addrindex_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct AddrIndexArgs {
@@ -8088,6 +8150,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "fixedseeds",
     "listenonion",
     "proxyrandomize",
+    "txannouncedelay",
     "txindex",
     "addressindex",
     "silentpaymentindex",
@@ -8407,6 +8470,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "bantime",
         "rebroadcastinterval",
         "broadcastconfirmpeers",
+        "txannouncedelay",
         "proxy",
         "proxyrandomize",
         "onion",
@@ -9079,6 +9143,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bantime",
     "rebroadcastinterval",
     "broadcastconfirmpeers",
+    "txannouncedelay",
     "timeout",
     "onlynet",
     "signetseednode",
@@ -10389,6 +10454,28 @@ blockmintxfee=0.00001
         assert_eq!(load("4").err().as_deref(), Some("-maxmempool must be at least 5 MB"));
         assert_eq!(load("5").expect("Core's floor is allowed").maxmempool, 5);
         assert_eq!(load("0").expect("Core allows 0").maxmempool, 0);
+    }
+
+    /// `-txannouncedelay`, a satd extension: on by default, off from the
+    /// command line in either spelling or from the file.
+    #[test]
+    fn txannouncedelay_is_on_by_default_and_can_be_turned_off() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .expect("loads")
+                .txannouncedelay
+        };
+        assert!(load(&[]));
+        assert!(!load(&["-txannouncedelay=0"]));
+        assert!(!load(&["-notxannouncedelay"]));
+        assert!(load(&["-txannouncedelay"]));
+        std::fs::write(dir.path().join("bitcoin.conf"), "txannouncedelay=0\n").unwrap();
+        assert!(!load(&[]), "from the file");
+        assert!(load(&["-txannouncedelay=1"]), "the command line wins");
     }
 
     /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`
@@ -11727,6 +11814,7 @@ testactivationheight=bip34@2
             chain_work_args: ChainWorkArgs::default(),
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
+            tx_announce_args: TxAnnounceArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -12046,6 +12134,7 @@ testactivationheight=bip34@2
             chain_work_args: ChainWorkArgs::default(),
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
+            tx_announce_args: TxAnnounceArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),

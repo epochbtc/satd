@@ -367,9 +367,8 @@ fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
     // Served one entry at a time: the test drained the raw channel, so the
     // queue still counts the inv's bytes and `handle_getdata` would wait.
     let sender = pm.peers.read()[&10].msg_tx.clone();
-    let last = relay_state(&pm, 10).1;
     let mut not_found = Vec::new();
-    assert!(pm.serve_getdata_entry(10, &sender, sent[0], last, &mut not_found));
+    assert!(pm.serve_getdata_entry(10, &sender, sent[0], &mut not_found));
     match rx.try_recv() {
         Ok(NetworkMessage::Tx(_)) => {}
         other => panic!("an announced transaction must be served, got {other:?}"),
@@ -379,7 +378,7 @@ fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
     let announced: HashSet<bitcoin::Wtxid> =
         sent.iter().filter_map(|i| if let Inventory::WTx(w) = i { Some(*w) } else { None }).collect();
     let unsent = *all.difference(&announced).next().expect("one left out");
-    assert!(pm.serve_getdata_entry(10, &sender, Inventory::WTx(unsent), last, &mut not_found));
+    assert!(pm.serve_getdata_entry(10, &sender, Inventory::WTx(unsent), &mut not_found));
     assert_eq!(not_found, vec![Inventory::WTx(unsent)], "not announced, not served");
     let _ = rx.try_recv();
 
@@ -389,4 +388,59 @@ fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
     pm.send_tx_invs();
     assert_eq!(invs(&mut rx), vec![Inventory::WTx(unsent)]);
     assert_eq!(relay_state(&pm, 10), (0, pm.mempool.mempool_sequence()));
+    // That flush moved the sequence and cleared the exceptions together:
+    // what the first one announced is still served.
+    assert!(pm.serve_getdata_entry(10, &sender, sent[0], &mut not_found));
+    match rx.try_recv() {
+        Ok(NetworkMessage::Tx(_)) => {}
+        other => panic!("still served after the sequence moved, got {other:?}"),
+    }
+    assert_eq!(not_found, vec![Inventory::WTx(unsent)]);
+}
+
+/// `-txannouncedelay=0`: every peer is due at every flush, inbound and
+/// outbound, so a transaction is announced, and may be fetched, without
+/// waiting for a timer. Setting it back restores the timers.
+#[test]
+fn with_no_announce_delay_every_peer_is_announced_at_the_next_flush() {
+    let (pm, _dir) = pm_with_coins(&[20, 21]);
+    let _clock = MockClock::install();
+    let mut out = handshaken(&pm, 10, Direction::Outbound, |_| {});
+    let mut inb = handshaken(&pm, 11, Direction::Inbound, |_| {});
+    pm.set_tx_announce_delay(false);
+    let tx = spend(coin_at(20), COIN, 1_000, 20);
+    pm.handle_tx(1, tx.clone());
+    pm.send_tx_invs();
+    let ask = Inventory::WTx(tx.compute_wtxid());
+    assert_eq!(invs(&mut out), vec![ask]);
+    assert_eq!(invs(&mut inb), vec![ask]);
+
+    pm.handle_getdata(11, vec![ask]);
+    match inb.try_recv() {
+        Ok(NetworkMessage::Tx(got)) => assert_eq!(got.compute_txid(), tx.compute_txid()),
+        other => panic!("an announced transaction must be served, got {other:?}"),
+    }
+
+    pm.set_tx_announce_delay(true);
+    let tx = spend(coin_at(21), COIN, 1_000, 21);
+    pm.handle_tx(1, tx);
+    pm.send_tx_invs();
+    assert!(invs(&mut out).is_empty() && invs(&mut inb).is_empty(), "the timers again");
+}
+
+/// A queued transaction wakes the flush loop only with
+/// `-txannouncedelay=0`; otherwise the peers' timers decide.
+#[tokio::test]
+async fn a_queued_transaction_wakes_the_flush_only_with_no_delay() {
+    let (pm, _dir) = pm_with_coins(&[22, 23]);
+    let _rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
+    async fn woken(pm: &PeerManager) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(20), pm.tx_inv_wake.notified()).await.is_ok()
+    }
+    pm.handle_tx(1, spend(coin_at(22), COIN, 1_000, 22));
+    assert!(!woken(&pm).await, "the timers decide");
+
+    pm.set_tx_announce_delay(false);
+    pm.handle_tx(1, spend(coin_at(23), COIN, 1_000, 23));
+    assert!(woken(&pm).await, "flushed at once");
 }

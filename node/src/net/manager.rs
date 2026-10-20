@@ -1119,6 +1119,14 @@ pub struct PeerManager {
     /// listener they reached the node on, so the timing tells no two
     /// networks apart.
     next_inv_to_inbounds: parking_lot::Mutex<HashMap<u64, u64>>,
+    /// `-txannouncedelay=0`, a satd extension: every peer is flushed at
+    /// every tick of the flush loop, as Core flushes a `noban` peer, and a
+    /// transaction queued for a peer wakes the loop at once. Off by default.
+    /// SIGHUP-reloadable.
+    immediate_tx_announce: AtomicBool,
+    /// Wakes the flush loop before its next tick: see
+    /// [`Self::wake_tx_invs`].
+    tx_inv_wake: tokio::sync::Notify,
     /// `-cmpctblockprefill`: announce new blocks with the transactions this
     /// node lacked prefilled (Core #35558). Set once at startup.
     compact_prefill: std::sync::atomic::AtomicBool,
@@ -1459,6 +1467,8 @@ impl PeerManager {
             hb_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             most_recent_block: RwLock::new(None),
             next_inv_to_inbounds: parking_lot::Mutex::new(HashMap::new()),
+            immediate_tx_announce: AtomicBool::new(false),
+            tx_inv_wake: tokio::sync::Notify::new(),
             compact_prefill: std::sync::atomic::AtomicBool::new(false),
             compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES),
             highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
@@ -4980,7 +4990,10 @@ impl PeerManager {
                 // sending side of the channel may be gone long before
                 // shutdown, and a closed channel is no signal to stop.
                 while !*shutdown.borrow() {
-                    tick.tick().await;
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = pm.tx_inv_wake.notified() => {}
+                    }
                     pm.send_tx_invs();
                 }
             });
@@ -9371,6 +9384,23 @@ impl PeerManager {
             let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
             handle.tx_relay.queue(wtxid, &hash);
         }
+        drop(peers);
+        self.wake_tx_invs();
+    }
+
+    /// With `-txannouncedelay=0`, run the flush now rather than at the next
+    /// tick, so a queued transaction is announced without waiting. Without
+    /// it, nothing: each peer's timer decides.
+    fn wake_tx_invs(&self) {
+        if self.immediate_tx_announce.load(Ordering::Relaxed) {
+            self.tx_inv_wake.notify_one();
+        }
+    }
+
+    /// `-txannouncedelay`: false announces each peer's queue at every flush,
+    /// without Core's random timers.
+    pub fn set_tx_announce_delay(&self, delay: bool) {
+        self.immediate_tx_announce.store(!delay, Ordering::Relaxed);
     }
 
     /// Core's first `SendMessages` after the version handshake: the peer's
@@ -9426,6 +9456,8 @@ impl PeerManager {
     pub(crate) fn send_tx_invs(&self) {
         use crate::net::tx_relay;
         let now = crate::time::now_micros();
+        // `-txannouncedelay=0`: every peer is due, as a `noban` peer is.
+        let immediate = self.immediate_tx_announce.load(Ordering::Relaxed);
         let mut due = Vec::new();
         {
             let mut peers = self.peers.write();
@@ -9434,7 +9466,7 @@ impl PeerManager {
                     continue;
                 }
                 let info = &h.info;
-                if !h.tx_relay.due(now, info.permissions.noban, || self.next_inv_send_time(info, now)) {
+                if !h.tx_relay.due(now, info.permissions.noban || immediate, || self.next_inv_send_time(info, now)) {
                     continue;
                 }
                 let flush = h.tx_relay.take(h.info.relays_txs());
@@ -9691,6 +9723,8 @@ impl PeerManager {
                 handle.tx_relay.queue(*wtxid, &hash);
             }
         }
+        drop(peers);
+        self.wake_tx_invs();
     }
 
     /// Enqueue transactions promoted out of the quarantine class by a policy
@@ -9765,6 +9799,8 @@ impl PeerManager {
             let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
             handle.tx_relay.queue(wtxid, &hash);
         }
+        drop(peers);
+        self.wake_tx_invs();
     }
 
     /// Record that peer `id` has demonstrated knowledge of `txid` — either by
@@ -10291,14 +10327,11 @@ impl PeerManager {
     fn serve_getdata(&self, id: PeerId, sender: &crate::net::send_queue::PeerSender) {
         let queue = sender.queue();
         let mut not_found = Vec::new();
-        // Core's `m_last_inv_sequence`: a transaction is served only if it
-        // entered the mempool before the peer's last announcement flush.
-        let last_inv_sequence = self.peers.read().get(&id).map_or(0, |h| h.tx_relay.last_inv_sequence());
         while !sender.paused() {
             let Some(inv) = queue.front_getdata() else {
                 break;
             };
-            if !self.serve_getdata_entry(id, sender, inv, last_inv_sequence, &mut not_found) {
+            if !self.serve_getdata_entry(id, sender, inv, &mut not_found) {
                 // The queue filled after the check above, or the peer is
                 // gone. The entry stays first; the write loop asks again once
                 // there is room.
@@ -10360,7 +10393,6 @@ impl PeerManager {
         id: PeerId,
         sender: &crate::net::send_queue::PeerSender,
         inv: Inventory,
-        last_inv_sequence: u64,
         not_found: &mut Vec<Inventory>,
     ) -> bool {
         match inv {
@@ -10430,11 +10462,12 @@ impl PeerManager {
                     }
                     _ => (None, [0; 32]),
                 };
-                // Announced to the peer: entered before its last flush, or
-                // announced by a flush that could not send everything.
+                // Announced to the peer (Core's `m_last_inv_sequence`). Both
+                // halves of the test are read under one lock: a flush in
+                // between moves the sequence and clears the exceptions
+                // together.
                 let announced = |e: &crate::mempool::pool::MempoolEntry| {
-                    e.entry_sequence < last_inv_sequence
-                        || self.peers.read().get(&id).is_some_and(|h| h.tx_relay.was_announced_out_of_sequence(&hash))
+                    self.peers.read().get(&id).is_some_and(|h| h.tx_relay.was_announced(e.entry_sequence, &hash))
                 };
                 let pooled = pooled.filter(|(_, e)| e.scope.assists_relay() && announced(e));
                 let (tx, pooled_txid) = match pooled {

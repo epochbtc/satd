@@ -227,10 +227,11 @@ impl TxRelay {
         self.announced_out_of_sequence.insert(*hash);
     }
 
-    /// Whether the peer was announced `hash` by a flush that did not move
-    /// `last_inv_sequence`.
-    pub fn was_announced_out_of_sequence(&self, hash: &[u8; 32]) -> bool {
-        self.announced_out_of_sequence.contains(hash)
+    /// Whether the peer was announced `hash`, which entered the mempool at
+    /// `entry_sequence`: before the peer's last flush, or by a flush that
+    /// could not send everything it chose. Core's `info_for_relay` check.
+    pub fn was_announced(&self, entry_sequence: u64, hash: &[u8; 32]) -> bool {
+        entry_sequence < self.last_inv_sequence || self.announced_out_of_sequence.contains(hash)
     }
 
     /// Make the peer due at the next flush, as if its timer had passed.

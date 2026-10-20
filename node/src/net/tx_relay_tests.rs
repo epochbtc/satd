@@ -142,3 +142,20 @@ fn the_delay_is_exponential_with_the_mean_asked_for() {
     let over = draws.iter().filter(|d| **d > mean).count() as f64 / n as f64;
     assert!((over - (-1f64).exp()).abs() < 0.02, "{over}");
 }
+
+/// A transaction counts as announced if it entered before the last flush,
+/// or was announced by a flush that could not send everything; a complete
+/// flush moves the sequence and clears those exceptions in one step.
+#[test]
+fn announced_is_by_sequence_or_by_a_partial_flush() {
+    let mut relay = started();
+    relay.finish(std::iter::empty(), Some(5));
+    assert!(relay.was_announced(4, &[1; 32]));
+    assert!(!relay.was_announced(5, &[1; 32]));
+    relay.announced_out_of_sequence(&[1; 32]);
+    assert!(relay.was_announced(7, &[1; 32]));
+    assert!(!relay.was_announced(7, &[2; 32]));
+    relay.finish(std::iter::empty(), Some(8));
+    assert!(relay.was_announced(7, &[1; 32]), "by sequence now");
+    assert!(!relay.was_announced(8, &[1; 32]), "the exception is gone");
+}
