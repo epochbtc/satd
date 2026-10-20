@@ -266,6 +266,29 @@ impl Args {
         }
     }
 
+    /// `ParseVerbosity` with `allow_bool = false`: a number only. A bool is
+    /// refused rather than read as 0 or 1, and any integer is returned for
+    /// the caller to range-check, so the error names the value.
+    pub(crate) fn int_verbosity(&mut self, name: &str, default: i64) -> Result<i64, ErrorObjectOwned> {
+        let Some(v) = self.next_value() else { return Ok(default) };
+        match &v {
+            Value::Bool(_) => Err(self.value_error(ErrorObjectOwned::owned(
+                -3,
+                "Verbosity was boolean but only integer allowed",
+                None::<()>,
+            ))),
+            Value::Number(n) => match n.as_i64().filter(|n| i32::try_from(*n).is_ok()) {
+                Some(v) => Ok(v),
+                None => Err(self
+                    .value_error(ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>))),
+            },
+            other => {
+                self.record(name, json_type_name(other), "number");
+                Ok(default)
+            }
+        }
+    }
+
     /// Return `e`, unless a type mismatch is already pending -- in which case
     /// that is the error Core would report.
     ///

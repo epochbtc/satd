@@ -5354,7 +5354,9 @@ impl PeerManager {
         self.hb_peers.lock().retain(|p| *p != id);
         self.in_flight_blocks.write().remove(&id);
         // Core's `TxDownloadManagerImpl::DisconnectedPeer`: its announcements
-        // go, and what it was asked for goes to the next announcer at once.
+        // go, an orphan only it announced goes, and what it was asked for
+        // goes to the next announcer at once.
+        self.orphanage.erase_for_peer(id);
         self.tx_requests.lock().disconnected_peer(id);
         self.send_all_tx_requests();
     }
@@ -5884,7 +5886,10 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if self.recently_rejected(txid.as_byte_array()) {
+                    if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array())) {
+                        // Core's `AlreadyHaveTx`: an orphan without a witness,
+                        // whose wtxid is its txid.
+                    } else if self.recently_rejected(txid.as_byte_array()) {
                         // Core's `AlreadyHaveTx`: refused since the tip moved.
                     } else if self.mempool.get(&txid).is_some() {
                         // We already have it. If it's one of our pending local
@@ -5902,7 +5907,13 @@ impl PeerManager {
                 // Fetched as announced, by wtxid: a resident transaction with
                 // the same txid and another witness is not the one offered.
                 Inventory::WTx(wtxid) => {
-                    if self.recently_rejected(wtxid.as_byte_array()) {
+                    if let Some(orphan) = self.orphanage.get_by_wtxid(&wtxid) {
+                        // Core's `AddTxAnnouncement`: a peer announcing an
+                        // orphan may resolve it.
+                        if !self.is_ibd() && !self.blocksonly() {
+                            self.add_orphan_announcer(id, &orphan, &wtxid);
+                        }
+                    } else if self.recently_rejected(wtxid.as_byte_array()) {
                         // Core's `AlreadyHaveTx`: refused since the tip moved.
                     } else if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
                         self.note_broadcast_witness(id, txid);
@@ -5975,12 +5986,42 @@ impl PeerManager {
         }
     }
 
+    /// Peer `id` announced the orphan `wtxid`: Core's orphan half of
+    /// `AddTxAnnouncement` (`txdownloadman_impl.cpp`). The peer is asked for
+    /// the parents still missing, as if it had announced them, and becomes
+    /// one of the orphan's announcers.
+    fn add_orphan_announcer(&self, id: PeerId, orphan: &bitcoin::Transaction, wtxid: &bitcoin::Wtxid) {
+        let mut parents: Vec<bitcoin::Txid> = orphan.input.iter().map(|i| i.previous_output.txid).collect();
+        parents.sort_unstable();
+        parents.dedup();
+        parents.retain(|p| !self.already_have_tx(&GenTxid::Txid(*p), false));
+        // Its parents may all have been settled since; it may be queued for
+        // another look, so it stays.
+        if parents.is_empty() || self.orphanage.has_announcer(wtxid, id) {
+            return;
+        }
+        let Some((info, wtxid_peers)) = self.tx_announcer(id) else { return };
+        let now = crate::time::now_micros();
+        let candidate =
+            self.tx_requests.lock().add_orphan_resolution_candidate(id, &parents, info, wtxid_peers, now);
+        if candidate {
+            self.orphanage.add_announcer(wtxid, id);
+            self.send_tx_requests(id);
+        }
+    }
+
     /// Whether `gtxid` needs no download: Core's `AlreadyHaveTx` over what
-    /// satd keeps (the recent-rejects filters and the mempool). The `inv`
-    /// path counts a fee-only refusal (`include_reconsiderable`); the request
-    /// path does not, so an orphan's low-fee parent is still fetched for the
-    /// package that may carry it.
+    /// satd keeps (the orphanage, the recent-rejects filters and the
+    /// mempool). The `inv` path counts a fee-only refusal
+    /// (`include_reconsiderable`); the request path does not, so an orphan's
+    /// low-fee parent is still fetched for the package that may carry it.
     fn already_have_tx(&self, gtxid: &GenTxid, include_reconsiderable: bool) -> bool {
+        // An orphan is looked up only by wtxid, as in Core: by txid, a
+        // malleated orphan would stop the real one being fetched. A txid
+        // that is also the wtxid finds an orphan without a witness.
+        if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(gtxid.hash())) {
+            return true;
+        }
         let tip = self.chain_state.tip_hash();
         if self.recent_rejects.lock().contains(tip, &gtxid.hash(), include_reconsiderable) {
             return true;
@@ -8848,6 +8889,12 @@ impl PeerManager {
                 tracker.received_response(id, &wtxid.to_byte_array());
             }
         }
+        // Core's `ReceivedTx` (`AlreadyHaveTx`): an orphan already held is
+        // not validated again, whoever sends it.
+        if self.orphanage.contains_wtxid(&wtxid) {
+            tracing::debug!(%txid, %wtxid, peer = id, "already in the orphanage");
+            return;
+        }
         // Core's `ReceivedTx`: a transaction refused since the tip moved is
         // not validated again, whoever sends it. One refused on its fee
         // alone may still enter with a child of it this peer sent, which
@@ -8933,12 +8980,18 @@ impl PeerManager {
                         // not downloaded twice.
                         let mut parents: Vec<bitcoin::Txid> = missing.into_iter().collect();
                         parents.sort_unstable();
+                        // Each announcer it asks becomes an announcer of the
+                        // orphan (Core's `AddTx` per candidate).
                         for peer in std::iter::once(id).chain(other_announcers) {
                             if let Some((info, wtxid_peers)) = self.tx_announcer(peer) {
                                 let now = crate::time::now_micros();
-                                self.tx_requests
+                                let candidate = self
+                                    .tx_requests
                                     .lock()
                                     .add_orphan_resolution_candidate(peer, &parents, info, wtxid_peers, now);
+                                if candidate && peer != id {
+                                    self.orphanage.add_announcer(&wtxid, peer);
+                                }
                             }
                         }
                         self.send_tx_requests(id);
@@ -9581,7 +9634,8 @@ impl PeerManager {
             );
             match result {
                 Ok(_) => {
-                    self.broadcast_inv(child.from_peer, child_txid);
+                    let origin = child.announcers.first().copied().unwrap_or_default();
+                    self.broadcast_inv(origin, child_txid);
                     for grandchild in self.orphanage.children_of(&child_txid) {
                         queue.push_back(grandchild);
                     }
@@ -9591,7 +9645,7 @@ impl PeerManager {
                     // `collect_missing_parents` now returns empty (race),
                     // `add` returns NoMissingParents and we drop silently.
                     let missing = self.collect_missing_parents(&child.tx);
-                    let _ = self.orphanage.add(child.tx, child.from_peer, missing);
+                    let _ = self.orphanage.restore(child, missing);
                 }
                 Err(e) => {
                     tracing::debug!(%child_txid, "Orphan re-evaluation failed: {}", e);
@@ -12814,6 +12868,10 @@ mod txrequest_tests;
 #[path = "manager_1p1c_tests.rs"]
 mod p1c_tests;
 
+#[cfg(test)]
+#[path = "manager_orphan_tests.rs"]
+mod orphan_tests;
+
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
 /// Standalone so the `block_processor` thread — which doesn't have a
@@ -12869,7 +12927,7 @@ pub fn reconsider_orphans_on_block(
                     }
                     missing.insert(parent);
                 }
-                let _ = orphanage.add(child.tx, child.from_peer, missing);
+                let _ = orphanage.restore(child, missing);
             }
             Err(e) => {
                 tracing::debug!(%child_txid, "Orphan dropped on block-connect re-eval: {}", e);
