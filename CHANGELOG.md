@@ -60,6 +60,11 @@ item below is (or will be) written up in full in the in-development
   is asked for the missing parents and may pair the orphan with a parent it
   sends, and an orphan stays until the last of them disconnects.
 
+- The orphanage has Core v30's limits: a latency score of 3,000 and
+  404,000 WU of orphans per peer with one, evicting from the peer furthest
+  over its share. Orphans are keyed by wtxid, so a malleated copy no longer
+  displaces the real one, and they no longer expire after 20 minutes.
+
 - Package RBF in `submitpackage`, as in Core v31: a child may pay for its
   parent's replacement, which the parent could not afford alone. Core's
   `PackageRBFChecks` apply (one parent and one child, no unconfirmed

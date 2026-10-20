@@ -5240,14 +5240,12 @@ impl PeerManager {
                 self.maybe_send_fee_filters();
             }
 
-            // Every 60 ticks (30 seconds), expire old mempool transactions
-            // and sweep expired orphans.
+            // Every 60 ticks (30 seconds), expire old mempool transactions.
+            // Orphans do not expire: Core v30 dropped the orphan expiry
+            // along with the count limit, and its eviction by DoS score
+            // bounds the orphanage instead.
             if ticks.is_multiple_of(60) {
                 self.mempool.remove_expired();
-                let expired = self.orphanage.expire(Instant::now());
-                if !expired.is_empty() {
-                    tracing::debug!(count = expired.len(), "Expired orphan transactions");
-                }
             }
 
             // Every 20 ticks (10 seconds), redial the peers the operator
@@ -9157,7 +9155,7 @@ impl PeerManager {
                     h.stats.record_transaction();
                 }
                 self.forget_tx_requests(*txid, *wtxid);
-                self.orphanage.remove(txid);
+                self.orphanage.erase(wtxid);
                 entered.push(*txid);
             } else if let Some(e) = result.member_errors.get(wtxid) {
                 // Core's `ProcessInvalidTx` with `first_time_failure` false:
@@ -9168,7 +9166,7 @@ impl PeerManager {
                 self.record_rejection(tx, e, validated_at);
                 if !matches!(e, MempoolError::MissingInputs) {
                     self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
-                    self.orphanage.remove(txid);
+                    self.orphanage.erase(wtxid);
                 }
             }
         }
@@ -9624,14 +9622,14 @@ impl PeerManager {
 
     /// BFS-drain orphans that listed `parent` as a missing parent. Newly
     /// admitted children recursively trigger further drains. Orphans that
-    /// still don't validate (other missing parents, or genuinely invalid)
-    /// are re-orphaned or silently dropped.
+    /// still miss other parents wait for those; the rest are dropped.
     fn drain_orphans_for_parent(&self, parent: bitcoin::Txid) {
         use std::collections::VecDeque;
-        let mut queue: VecDeque<bitcoin::Txid> =
-            self.orphanage.children_of(&parent).into_iter().collect();
-        while let Some(child_txid) = queue.pop_front() {
-            let Some(child) = self.orphanage.remove(&child_txid) else {
+        let mut queue: VecDeque<bitcoin::Wtxid> = self.orphanage.children_of(&parent).into();
+        while let Some(wtxid) = queue.pop_front() {
+            // It stays in the orphanage while it is validated, so one still
+            // missing inputs keeps its announcers and their place in line.
+            let Some(child) = self.orphanage.entry(&wtxid) else {
                 continue;
             };
             let result = self.mempool.accept_transaction(
@@ -9643,21 +9641,20 @@ impl PeerManager {
             );
             match result {
                 Ok(_) => {
-                    let origin = child.announcers.first().copied().unwrap_or_default();
-                    self.broadcast_inv(origin, child_txid);
-                    for grandchild in self.orphanage.children_of(&child_txid) {
-                        queue.push_back(grandchild);
-                    }
+                    self.orphanage.erase(&wtxid);
+                    let origin = child.announcers().first().copied().unwrap_or_default();
+                    self.broadcast_inv(origin, child.txid);
+                    queue.extend(self.orphanage.children_of(&child.txid));
                 }
                 Err(MempoolError::MissingInputs) => {
-                    // Other parents still missing — re-orphan. If
-                    // `collect_missing_parents` now returns empty (race),
-                    // `add` returns NoMissingParents and we drop silently.
+                    // Other parents still missing. If none is left (a race),
+                    // the orphan goes rather than wait for nothing.
                     let missing = self.collect_missing_parents(&child.tx);
-                    let _ = self.orphanage.restore(child, missing);
+                    self.orphanage.set_missing_parents(&wtxid, missing);
                 }
                 Err(e) => {
-                    tracing::debug!(%child_txid, "Orphan re-evaluation failed: {}", e);
+                    self.orphanage.erase(&wtxid);
+                    tracing::debug!(txid = %child.txid, %wtxid, "Orphan re-evaluation failed: {}", e);
                 }
             }
         }
@@ -12894,17 +12891,13 @@ pub fn reconsider_orphans_on_block(
     block: &bitcoin::Block,
 ) {
     use std::collections::VecDeque;
-    let mut queue: VecDeque<bitcoin::Txid> = VecDeque::new();
-    for tx in &block.txdata {
-        let confirmed_txid = tx.compute_txid();
-        // Drop any orphan that is itself the confirmed tx.
-        let _ = orphanage.remove(&confirmed_txid);
-        for child in orphanage.children_of(&confirmed_txid) {
-            queue.push_back(child);
-        }
-    }
-    while let Some(child_txid) = queue.pop_front() {
-        let Some(child) = orphanage.remove(&child_txid) else {
+    // Core's `EraseForBlock`: the orphans the block includes or conflicts
+    // with go.
+    orphanage.erase_for_block(block);
+    let mut queue: VecDeque<bitcoin::Wtxid> =
+        block.txdata.iter().flat_map(|tx| orphanage.children_of(&tx.compute_txid())).collect();
+    while let Some(wtxid) = queue.pop_front() {
+        let Some(child) = orphanage.entry(&wtxid) else {
             continue;
         };
         let result = mempool.accept_transaction(
@@ -12916,15 +12909,13 @@ pub fn reconsider_orphans_on_block(
         );
         match result {
             Ok(_) => {
-                for grandchild in orphanage.children_of(&child_txid) {
-                    queue.push_back(grandchild);
-                }
+                orphanage.erase(&wtxid);
+                queue.extend(orphanage.children_of(&child.txid));
             }
             Err(MempoolError::MissingInputs) => {
-                // Other parents still unresolved — re-orphan with updated
-                // set. If the set is empty (race), `add` returns
-                // NoMissingParents and we drop silently rather than
-                // stranding an unreachable orphan.
+                // Other parents still unresolved: it waits for those. If
+                // none is left (a race), it goes rather than wait for
+                // nothing.
                 let mut missing = std::collections::HashSet::new();
                 for input in &child.tx.input {
                     let parent = input.previous_output.txid;
@@ -12936,10 +12927,11 @@ pub fn reconsider_orphans_on_block(
                     }
                     missing.insert(parent);
                 }
-                let _ = orphanage.restore(child, missing);
+                orphanage.set_missing_parents(&wtxid, missing);
             }
             Err(e) => {
-                tracing::debug!(%child_txid, "Orphan dropped on block-connect re-eval: {}", e);
+                orphanage.erase(&wtxid);
+                tracing::debug!(txid = %child.txid, %wtxid, "Orphan dropped on block-connect re-eval: {}", e);
             }
         }
     }

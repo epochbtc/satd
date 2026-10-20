@@ -1895,12 +1895,20 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(rawtx::get_mempool_info(&ctx.mempool))
     })?;
 
+    // satd's own: the orphanage's size against Core v30's limits. Every
+    // orphan has a latency score of at least 1, so `max_size` (kept from
+    // the count limit it used to report) still bounds `size`.
     module.register_method("getorphaninfo", |_params, ctx, _extensions| {
         let orphanage = ctx.peer_manager.orphanage();
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
             "size": orphanage.len(),
             "bytes": orphanage.bytes(),
-            "max_size": orphanage.config().max_count,
+            "max_size": orphanage.max_latency_score(),
+            "announcements": orphanage.announcements(),
+            "latency_score": orphanage.latency_score(),
+            "max_latency_score": orphanage.max_latency_score(),
+            "weight": orphanage.weight(),
+            "max_weight": orphanage.max_weight(),
         }))
     })?;
 
