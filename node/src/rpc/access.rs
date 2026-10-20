@@ -112,6 +112,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getnetworkhashps"
         | "getnetworkinfo"
         | "getorphaninfo"
+        | "getorphantxs"
         | "getpeerinfo"
         | "getpolicyinfo"
         | "getquarantineentry"

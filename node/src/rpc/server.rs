@@ -188,6 +188,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("unsubscribemempool", "hidden"),
     ("addpeeraddress", "hidden"),
     ("getrawaddrman", "hidden"),
+    ("getorphantxs", "hidden"),
 ];
 
 /// Core's `GetNetworkNames()`: every network `getaddrmaninfo` reports and
@@ -1901,6 +1902,43 @@ pub async fn start(
             "bytes": orphanage.bytes(),
             "max_size": orphanage.config().max_count,
         }))
+    })?;
+
+    // Core's hidden `getorphantxs` (`src/rpc/mempool.cpp`): the orphanage,
+    // oldest first, with the peers that announced each orphan.
+    module.register_method("getorphantxs", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let verbosity = args.int_verbosity("verbosity", 0)?;
+        args.check()?;
+        if !(0..=2).contains(&verbosity) {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!("Invalid verbosity value {verbosity}"),
+                None::<()>,
+            ));
+        }
+        let orphans = ctx.peer_manager.orphanage().orphans();
+        let out: Vec<serde_json::Value> = orphans
+            .into_iter()
+            .map(|(tx, from)| {
+                if verbosity == 0 {
+                    return serde_json::json!(tx.compute_txid().to_string());
+                }
+                let mut o = serde_json::json!({
+                    "txid": tx.compute_txid().to_string(),
+                    "wtxid": tx.compute_wtxid().to_string(),
+                    "bytes": tx.total_size(),
+                    "vsize": tx.vsize(),
+                    "weight": tx.weight().to_wu(),
+                    "from": from,
+                });
+                if verbosity == 2 {
+                    o["hex"] = serde_json::json!(bitcoin::consensus::encode::serialize_hex(&tx));
+                }
+                o
+            })
+            .collect();
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Array(out))
     })?;
 
     module.register_method("getrawmempool", |params, ctx, _extensions| {
@@ -5272,7 +5310,7 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_six() {
+    fn the_hidden_commands_are_the_expected_seven() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
@@ -5287,6 +5325,7 @@ mod help_listing_tests {
                 "unsubscribemempool",
                 "addpeeraddress",
                 "getrawaddrman",
+                "getorphantxs",
             ]
         );
     }

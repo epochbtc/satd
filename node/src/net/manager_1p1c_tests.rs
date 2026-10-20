@@ -18,15 +18,15 @@ fn p2wpkh(tag: u8) -> ScriptBuf {
     ScriptBuf::from_bytes(spk)
 }
 
-fn coin_at(tag: u8) -> OutPoint {
+pub(super) fn coin_at(tag: u8) -> OutPoint {
     OutPoint { txid: bitcoin::Txid::from_byte_array([tag; 32]), vout: 0 }
 }
 
-const COIN: u64 = 100_000;
+pub(super) const COIN: u64 = 100_000;
 
 /// One input, one P2WPKH output paying `fee`, with a witness so its wtxid
 /// differs from its txid.
-fn spend(prev: OutPoint, value: u64, fee: u64, tag: u8) -> Transaction {
+pub(super) fn spend(prev: OutPoint, value: u64, fee: u64, tag: u8) -> Transaction {
     Transaction {
         version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -42,7 +42,7 @@ fn spend(prev: OutPoint, value: u64, fee: u64, tag: u8) -> Transaction {
 
 /// A manager out of IBD over a chain holding one coin per tag, with a relay
 /// floor of 1000 sat/kvB, and two peers.
-fn pm_with_coins(tags: &[u8]) -> (Arc<PeerManager>, std::path::PathBuf) {
+pub(super) fn pm_with_coins(tags: &[u8]) -> (Arc<PeerManager>, std::path::PathBuf) {
     let coins: Vec<(OutPoint, Coin)> = tags
         .iter()
         .map(|t| {
@@ -76,13 +76,13 @@ fn pm_with_coins(tags: &[u8]) -> (Arc<PeerManager>, std::path::PathBuf) {
 }
 
 /// A parent below the relay floor and a child paying for both.
-fn cpfp_pair(tag: u8) -> (Transaction, Transaction) {
+pub(super) fn cpfp_pair(tag: u8) -> (Transaction, Transaction) {
     let parent = spend(coin_at(tag), COIN, 50, tag);
     let child = spend(OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 50, 5_000, tag.wrapping_add(1));
     (parent, child)
 }
 
-fn in_pool(pm: &PeerManager, tx: &Transaction) -> bool {
+pub(super) fn in_pool(pm: &PeerManager, tx: &Transaction) -> bool {
     pm.mempool.get(&tx.compute_txid()).is_some()
 }
 

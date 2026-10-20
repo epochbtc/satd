@@ -782,27 +782,31 @@ silently returning an empty or wrong answer.
   evicted. A multi-transaction `testmempoolaccept` evaluates its
   transactions together, as Core's does. Core's opportunistic
   1-parent-1-child relay pairs a parent refused on its fee alone with a
-  child of it in the orphanage, as in Core, with one difference:
-  - **Which peer's child.** Core pairs a parent with orphans that the same
-    peer sent or announced, because its orphanage records every announcer
-    of an orphan. satd's records only the peer that sent it first, so a
-    child is paired only with a parent from that peer. If two peers send
-    the same parent and child, the second peer's pair is not tried; the
-    first peer's still is.
+  child of it in the orphanage that the same peer sent or announced, as in
+  Core.
 
   Eviction ranks by descendant score, which is how Core trimmed before the
   cluster mempool; v31 trims by chunk feerate.
 
 - **Transaction download** — satd schedules transaction requests as Core's
   `TxRequestTracker` does (one request per transaction at a time, Core's
-  delays, expiry and per-peer limits). Three of the checks around it differ:
-  - An `inv` for a transaction held in the orphanage is fetched again.
-    Core instead takes the announcer as another peer to ask for the
-    orphan's parents; satd's orphanage keeps one sender per orphan.
+  delays, expiry and per-peer limits). Two of the checks around it differ:
   - satd keeps no filter of recently confirmed transactions, so one
     announced after it confirmed is fetched and validated again.
   - Under `-blocksonly`, no transaction is fetched, also from a peer with
     the `relay` permission, which Core still fetches from.
+
+- **Orphanage** — satd's orphanage records every peer that sent or
+  announced an orphan, as Core's does, and `getorphantxs` lists it. Two
+  things differ:
+  - Orphans are keyed by txid. A copy with the same txid and another
+    witness is not kept beside the first; Core keys them by wtxid and keeps
+    both, so a malleated copy cannot stand in for the real one.
+  - Its limits count orphans: 100 in all, at most 50 announced by one
+    peer, oldest out first. Core v30 and later give each peer a share
+    of announcements and of memory, and evict from the peer furthest over
+    its share. Core's `p2p_opportunistic_1p1c.py` stops at its large-orphan
+    case on this.
 
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
