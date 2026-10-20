@@ -9519,6 +9519,12 @@ impl PeerManager {
                 }
                 h.msg_tx.clone()
             };
+            // Sent and recorded under one lock: a `getdata` for what went
+            // out finds it recorded, however soon it is read.
+            let mut peers = self.peers.write();
+            let Some(h) = peers.get_mut(&id) else {
+                continue;
+            };
             // Once one chunk does not fit, neither does the rest.
             let mut delivered = 0;
             for chunk in picked.chunks(MAX_INV_PER_MSG) {
@@ -9528,10 +9534,6 @@ impl PeerManager {
                 }
                 delivered += chunk.len();
             }
-            let mut peers = self.peers.write();
-            let Some(h) = peers.get_mut(&id) else {
-                continue;
-            };
             let failed = &picked[delivered..];
             for (_, _, hash) in &picked[..delivered] {
                 h.tx_relay.add_known(hash);
