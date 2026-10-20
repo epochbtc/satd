@@ -5842,6 +5842,9 @@ impl PeerManager {
         let mut txs_announced = Vec::new();
         let reject_tx_invs = self.rejects_incoming_txs(id);
         let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
+        // Each orphan is looked at once per message: an `inv` may name the
+        // same one thousands of times, and looking at it walks its parents.
+        let mut orphans_seen: HashSet<bitcoin::Wtxid> = HashSet::new();
 
         for inv in inventory {
             // BIP 339: a peer that negotiated wtxid relay announces by wtxid,
@@ -5907,10 +5910,16 @@ impl PeerManager {
                 // Fetched as announced, by wtxid: a resident transaction with
                 // the same txid and another witness is not the one offered.
                 Inventory::WTx(wtxid) => {
-                    if let Some(orphan) = self.orphanage.get_by_wtxid(&wtxid) {
+                    if self.orphanage.contains_wtxid(&wtxid) {
                         // Core's `AddTxAnnouncement`: a peer announcing an
-                        // orphan may resolve it.
-                        if !self.is_ibd() && !self.blocksonly() {
+                        // orphan may resolve it. An announcer already is
+                        // passed over before the orphan is copied out.
+                        if orphans_seen.insert(wtxid)
+                            && !self.is_ibd()
+                            && !self.blocksonly()
+                            && !self.orphanage.has_announcer(&wtxid, id)
+                            && let Some(orphan) = self.orphanage.get_by_wtxid(&wtxid)
+                        {
                             self.add_orphan_announcer(id, &orphan, &wtxid);
                         }
                     } else if self.recently_rejected(wtxid.as_byte_array()) {
@@ -5997,7 +6006,7 @@ impl PeerManager {
         parents.retain(|p| !self.already_have_tx(&GenTxid::Txid(*p), false));
         // Its parents may all have been settled since; it may be queued for
         // another look, so it stays.
-        if parents.is_empty() || self.orphanage.has_announcer(wtxid, id) {
+        if parents.is_empty() {
             return;
         }
         let Some((info, wtxid_peers)) = self.tx_announcer(id) else { return };
