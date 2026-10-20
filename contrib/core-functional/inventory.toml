@@ -521,9 +521,8 @@ status = "run"
 
 [[test]]
 file = "p2p_1p1c_network.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-10-19 with 1p1c relay: L126 getorphantxs is Method not found. Follow-up: getorphantxs"
+status = "run"
+note = "flipped 2026-10-19: 1p1c relay and getorphantxs"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -680,7 +679,7 @@ note = "measured 2026-09-15: L96 getnettotals.totalbytesrecv not advanced by a p
 file = "p2p_invalid_tx.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: the reject line is Core's (<txid> (wtxid=...) from peer=N was not accepted: <reason>); L74 still misses bad-txns-vout-empty because satd resolves inputs before the structural checks, so a malformed transaction is orphaned rather than rejected. Follow-up: Core's CheckTransaction ordering, then getorphantxs (W14)"
+note = "measured 2026-09-15: the reject line is Core's (<txid> (wtxid=...) from peer=N was not accepted: <reason>); L74 still misses bad-txns-vout-empty because satd resolves inputs before the structural checks, so a malformed transaction is orphaned rather than rejected. Follow-up: Core's CheckTransaction ordering (getorphantxs landed 2026-10-19)"
 
 [[test]]
 file = "p2p_leak.py"
@@ -723,14 +722,14 @@ note = "measured 2026-09-15: L126 nServices 9 where 1032 (v2: 3080) is expected:
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-10-19 with 1p1c relay: every package case passes (parent then child, child then parent, two candidate children, consensus failures, multiple parents, 1p1c on 1p1c); L461 test_orphanage_dos_large calls getorphantxs, Method not found. Follow-up: getorphantxs"
+reason = "feature-missing"
+note = "measured 2026-10-19 with getorphantxs: every package case passes (parent then child, child then parent, two candidate children, consensus failures, multiple parents, 1p1c on 1p1c); L491 test_orphanage_dos_large waits for a large orphan to be evicted, but satd's orphanage limits by count, not Core's per-peer memory. Follow-up: Core's orphanage limits"
 
 [[test]]
 file = "p2p_orphan_handling.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L60 getorphantxs is Method not found. Behind it: Core's txrequest scheduling. Follow-up: getorphantxs"
+reason = "feature-missing"
+note = "measured 2026-10-19 with getorphantxs: L173 test_arrival_timing_orphan finds the parent announced to the spy peer at once; Core delays transaction invs (trickle). Follow-up: Core's inv trickling"
 
 [[test]]
 file = "p2p_outbound_eviction.py"
@@ -929,9 +928,8 @@ note = "measured 2026-09-27: L131 help('getpeerinfo') lacks the network list; pa
 
 [[test]]
 file = "rpc_orphans.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L52 getorphantxs is Method not found. Follow-up: getorphantxs"
+status = "run"
+note = "flipped 2026-10-19: getorphantxs, and every announcer of an orphan recorded"
 
 [[test]]
 file = "rpc_packages.py"
