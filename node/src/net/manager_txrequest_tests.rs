@@ -88,7 +88,7 @@ pub(super) fn add_peer(pm: &PeerManager, id: PeerId, direction: Direction) -> mp
     add_peer_with(pm, id, direction, |_| {})
 }
 
-fn add_peer_with(
+pub(super) fn add_peer_with(
     pm: &PeerManager,
     id: PeerId,
     direction: Direction,
