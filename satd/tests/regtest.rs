@@ -20000,6 +20000,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         "addconnection",
         "addpeeraddress",
         "generate",
+        "getorphantxs",
         "getrawaddrman",
         "sendmsgtopeer",
         "unsubscribemempool",
