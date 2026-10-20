@@ -16,6 +16,20 @@ fn mempool_help() -> Vec<Line<'static>> {
         label("Min / Max", "Cheapest / most expensive fee rate admitted (sat/vB)."),
         label("Δ last Ns", "Net change in tx count and bytes since the previous 10-second snapshot."),
         blank(),
+        heading("Quarantine (only while a transaction-filtering policy is loaded)"),
+        Line::from(vec![
+            Span::styled("  Transactions the policy holds without relaying or mining them.", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  They are not in the Txs / Bytes counts above, which cover relayed txs only.", Style::default().fg(Color::Gray)),
+        ]),
+        label("Held", "Quarantined txs and bytes, against the quarantinemempool budget."),
+        label("Confirmed anyway", "Quarantined txs later seen in a block (since satd started)."),
+        label("Foregone fees", "Fees above the template floor of txs withheld from block templates."),
+        label("rule", "Rule holding the txs; rules holding none are dimmed."),
+        label("sat/vB", "Fee-rate range of the txs that rule holds."),
+        label("matched", "Times the rule matched since the ruleset loaded."),
+        blank(),
         heading("Feerate Histogram"),
         Line::from(vec![
             Span::styled("  Distribution of mempool weight across fee-rate bands.", Style::default().fg(Color::White)),

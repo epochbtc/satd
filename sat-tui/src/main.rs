@@ -442,7 +442,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // Heavy steady-state batch — only meaningful at chain tip.
             // Skipped during IBD because most fields would be nullish.
             if is_steady {
-                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, mempool_summary_res, utxo_res, reorgs_res, mhist_res) = tokio::join!(
+                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, mempool_summary_res, utxo_res, reorgs_res, mhist_res, policy_res) = tokio::join!(
                     rpc.estimate_fees(),
                     rpc.get_mining_info(),
                     rpc.get_chain_tx_stats(),
@@ -455,6 +455,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     rpc.get_tx_out_set_info(),
                     rpc.get_reorg_history(),
                     rpc.get_mempool_history(),
+                    rpc.get_policy_info(),
                 );
 
                 {
@@ -468,6 +469,20 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     apply_poll!(st, "gettxoutsetinfo", utxo_res, update_utxo_info);
                     apply_poll!(st, "getreorghistory", reorgs_res, update_reorg_history);
                     apply_poll!(st, "getmempoolhistory", mhist_res, update_mempool_history);
+                    apply_poll!(st, "getpolicyinfo", policy_res, update_policy_info);
+                }
+
+                // The quarantine rollup costs a mempool walk, so it is asked
+                // for only once `getpolicyinfo` says a ruleset is loaded.
+                let policy_loaded = state.lock().quarantine.is_some();
+                if policy_loaded {
+                    let quarantine_res = rpc.get_quarantine_info().await;
+                    let mut st = state.lock();
+                    apply_poll!(st, "getquarantineinfo", quarantine_res, update_quarantine_info);
+                } else {
+                    // A ruleset removed while the rollup was failing must not
+                    // leave that failure in the title bar for good.
+                    state.lock().rpc_failures.remove("getquarantineinfo");
                 }
 
                 // Refresh the difficulty-epoch anchor when the floor advances —

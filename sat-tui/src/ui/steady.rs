@@ -414,8 +414,15 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
         "loading...".into()
     };
 
+    // getmempoolinfo counts the acting class only. With a filtering policy
+    // loaded, the held transactions go on the same line so the row count of
+    // the panel (and the size chart's position under it) does not change.
+    let txs_str = match &state.quarantine {
+        Some(q) => format!("{}  +{} quarantined", format_num(state.mempool_size), format_num(q.count)),
+        None => format_num(state.mempool_size),
+    };
     let mut mempool_lines = vec![
-        info_line("Txs:", &format_num(state.mempool_size)),
+        info_line("Txs:", &txs_str),
         info_line("Size:", &format_bytes(state.mempool_bytes)),
         info_line("Min Rate:", &min_fee_str),
         info_line("Tx Rate:", &tx_rate_str),
@@ -896,6 +903,23 @@ mod tests {
         (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn steady_view_counts_quarantined_txs_beside_the_relayed_ones() {
+        let mut st = histogram_state(Some(true));
+        st.update_mempool_info(&serde_json::json!({"size": 12_345, "bytes": 1}));
+        let txs = |rows: &[String]| rows.iter().find(|r| r.contains("Txs:")).cloned().unwrap();
+        assert!(!txs(&render_steady(120, 40, &st)).contains("quarantined"));
+
+        st.update_policy_info(&serde_json::json!({
+            "loaded": true, "quarantine": {"count": 87, "bytes": 1, "budget_bytes": 1},
+        }));
+        let rows = render_steady(120, 40, &st);
+        assert!(txs(&rows).contains("12,345  +87 quarantined"), "{}", txs(&rows));
+        // Same line, so the size chart keeps its place in the panel.
+        let screen = rows.join("\n");
+        assert!(screen.contains("Size Distribution:"), "{screen}");
     }
 
     #[test]

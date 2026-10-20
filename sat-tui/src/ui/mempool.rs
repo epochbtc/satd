@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 
-use crate::state::{AppState, FeeSummary, MempoolSnapshot, MempoolTopEntry};
+use crate::state::{AppState, FeeSummary, MempoolSnapshot, MempoolTopEntry, QuarantineView};
 use crate::ui::{format_bytes, format_duration, format_hash, format_num};
 
 /// Feerate display buckets (sat/vB): (min_inclusive, max_exclusive, label).
@@ -23,22 +23,170 @@ const FEERATE_BUCKETS: &[(u64, u64, &str)] = &[
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
 
+    // The quarantine panel takes space only while a policy is loaded, so a
+    // node without one keeps the layout it always had.
+    let quarantine_height = state.quarantine.as_ref().map_or(0, quarantine_panel_height);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // title
-            Constraint::Length(4),  // summary strip
-            Constraint::Min(14),    // histogram + tiers
-            Constraint::Length(12), // trend + top-N row
-            Constraint::Length(1),  // footer
+            Constraint::Length(1),                 // title
+            Constraint::Length(4),                 // summary strip
+            Constraint::Length(quarantine_height), // quarantine, when loaded
+            Constraint::Min(14),                   // histogram + tiers
+            Constraint::Length(12),                // trend + top-N row
+            Constraint::Length(1),                 // footer
         ])
         .split(size);
 
     draw_title(f, chunks[0], state);
     draw_summary(f, chunks[1], state);
-    draw_histogram(f, chunks[2], state);
-    draw_trend_and_top(f, chunks[3], state);
-    draw_footer(f, chunks[4]);
+    if let Some(q) = &state.quarantine {
+        draw_quarantine(f, chunks[2], q);
+    }
+    draw_histogram(f, chunks[3], state);
+    draw_trend_and_top(f, chunks[4], state);
+    draw_footer(f, chunks[5]);
+}
+
+/// Rule rows the quarantine panel shows before it summarises the rest.
+const QUARANTINE_MAX_RULE_ROWS: usize = 5;
+
+/// Borders, the totals line, the table header, and one line per rule row up
+/// to the cap (the last of which becomes "N more" when rows are cut).
+fn quarantine_panel_height(q: &QuarantineView) -> u16 {
+    let rows = q.rule_rows().len().clamp(1, QUARANTINE_MAX_RULE_ROWS);
+    2 + 1 + 1 + rows as u16
+}
+
+fn draw_quarantine(f: &mut Frame, area: Rect, q: &QuarantineView) {
+    let title = format!(
+        " Quarantine (policy v{}, {} rules; not counted above) ",
+        q.version, q.rules_count,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let totals = Rect { height: 1, ..inner };
+    f.render_widget(Paragraph::new(Line::from(quarantine_totals_spans(q))), totals);
+
+    let table_area = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    if table_area.height == 0 {
+        return;
+    }
+
+    let header = Row::new(vec!["rule", "held", "bytes", "sat/vB", "matched"])
+        .style(Style::default().fg(Color::Cyan));
+    let widths = vec![
+        Constraint::Min(20),
+        Constraint::Length(9),
+        Constraint::Length(10),
+        Constraint::Length(15),
+        Constraint::Length(9),
+    ];
+    let rule_rows = q.rule_rows();
+    let body_rows = table_area.height.saturating_sub(1) as usize;
+    let rows: Vec<Row> = if rule_rows.is_empty() {
+        vec![Row::new(vec![Cell::from("(the ruleset has no quarantine rules)")])
+            .style(Style::default().fg(Color::DarkGray))]
+    } else {
+        quarantine_table_rows(&rule_rows, body_rows)
+    };
+    f.render_widget(Table::new(rows, widths).header(header), table_area);
+}
+
+fn quarantine_totals_spans(q: &QuarantineView) -> Vec<Span<'static>> {
+    let gray = Style::default().fg(Color::Gray);
+    let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let budget = if q.budget_bytes > 0 {
+        format!(
+            " of {} ({:.1}%)",
+            format_bytes(q.budget_bytes),
+            q.bytes as f64 * 100.0 / q.budget_bytes as f64,
+        )
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
+        Span::styled("  Held ", gray),
+        Span::styled(format_num(q.count), white),
+        Span::styled(" txs, ", gray),
+        Span::styled(format_bytes(q.bytes), white),
+        Span::styled(budget, gray),
+    ];
+    if let Some(h) = &q.held {
+        spans.push(Span::styled("   Confirmed anyway ", gray));
+        spans.push(Span::styled(format_num(h.confirmed_anyway), white));
+        spans.push(Span::styled("   Foregone fees ", gray));
+        spans.push(Span::styled(format!("{} sat", format_num(h.foregone_fees_sat)), white));
+    }
+    if q.fuel_exhausted > 0 {
+        spans.push(Span::styled(
+            format!("   fuel exhausted {}", format_num(q.fuel_exhausted)),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if q.relay_withholding > 0 {
+        spans.push(Span::styled(
+            format!("   ⚠ {} rules withhold Lightning enforcement relay", q.relay_withholding),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    spans
+}
+
+/// Table rows for at most `limit` lines. When the rules do not fit, the last
+/// line counts the rest instead of silently dropping them.
+fn quarantine_table_rows(rows: &[crate::state::QuarantineRuleRow], limit: usize) -> Vec<Row<'static>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let shown = if rows.len() > limit { limit - 1 } else { rows.len() };
+    let mut out: Vec<Row<'static>> = rows[..shown]
+        .iter()
+        .map(|r| {
+            let s = &r.stat;
+            let rates = if s.count == 0 {
+                "-".to_string()
+            } else {
+                format!("{:.1}-{:.1}", s.min_fee_rate as f64 / 1_000.0, s.max_fee_rate as f64 / 1_000.0)
+            };
+            let style = if s.count > 0 {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Row::new(vec![
+                Cell::from(s.name.clone()),
+                Cell::from(format_num(s.count)),
+                Cell::from(format_bytes(s.bytes)),
+                Cell::from(rates),
+                Cell::from(r.matched.map(format_num).unwrap_or_else(|| "-".into())),
+            ])
+            .style(style)
+        })
+        .collect();
+    if shown < rows.len() {
+        out.push(
+            Row::new(vec![Cell::from(format!("... {} more rules", rows.len() - shown))])
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    }
+    out
 }
 
 fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
@@ -500,5 +648,79 @@ fn render_lines(f: &mut Frame, inner: Rect, lines: &[Line<'_>]) {
             };
             f.render_widget(Paragraph::new(line.clone()), row);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn render(width: u16, height: u16, state: &AppState) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn with_policy(rules: usize) -> AppState {
+        let mut st = AppState::new();
+        let names: Vec<String> = (0..rules).map(|i| format!("rule{i}")).collect();
+        st.update_policy_info(&json!({
+            "loaded": true,
+            "version": 1,
+            "rules_count": rules,
+            "rules": names.iter().enumerate().map(|(i, n)| json!({
+                "name": n, "action": "quarantine", "matched": 100 - i,
+            })).collect::<Vec<_>>(),
+            "quarantine": {"count": 0, "bytes": 0, "budget_bytes": 300_000_000},
+        }));
+        st.update_quarantine_info(&json!({
+            "count": 2_345, "bytes": 1_048_576, "budget_bytes": 314_572_800,
+            "confirmed_anyway": 17, "foregone_fees_sat": 98_765,
+            "rules": {"rule0": {"count": 2_345, "bytes": 1_048_576,
+                                "min_fee_rate": 1_000, "max_fee_rate": 12_500}},
+        }));
+        st
+    }
+
+    #[test]
+    fn no_policy_no_quarantine_panel() {
+        let screen = render(120, 40, &AppState::new());
+        assert!(!screen.contains("Quarantine"), "{screen}");
+    }
+
+    #[test]
+    fn a_loaded_policy_shows_what_it_holds() {
+        let screen = render(120, 45, &with_policy(2));
+        assert!(screen.contains("Quarantine (policy v1, 2 rules; not counted above)"), "{screen}");
+        assert!(screen.contains("Held 2,345 txs, 1.00 MB of 300.00 MB (0.3%)"), "{screen}");
+        assert!(screen.contains("Confirmed anyway 17"), "{screen}");
+        assert!(screen.contains("Foregone fees 98,765 sat"), "{screen}");
+        let rule0 = screen.lines().find(|l| l.contains("rule0")).expect(&screen);
+        assert!(rule0.contains("1.0-12.5") && rule0.contains("100"), "{rule0}");
+        let rule1 = screen.lines().find(|l| l.contains("rule1")).expect(&screen);
+        assert!(rule1.contains(" - ") && rule1.contains("99"), "a rule holding nothing: {rule1}");
+        // The rest of the view is still there under it.
+        assert!(screen.contains("Feerate histogram"), "{screen}");
+        assert!(screen.contains("Top by ancestor feerate"), "{screen}");
+    }
+
+    #[test]
+    fn the_panel_on_a_short_terminal_renders_without_panicking() {
+        for (w, h) in [(40, 10), (80, 20), (80, 3), (20, 40)] {
+            render(w, h, &with_policy(QUARANTINE_MAX_RULE_ROWS + 3));
+        }
+    }
+
+    #[test]
+    fn rules_past_the_cap_are_counted_not_dropped() {
+        let screen = render(120, 45, &with_policy(QUARANTINE_MAX_RULE_ROWS + 3));
+        assert!(screen.contains("... 4 more rules"), "{screen}");
+        assert!(screen.contains("rule0"), "the largest holding is shown first: {screen}");
     }
 }
