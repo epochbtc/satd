@@ -152,9 +152,11 @@ pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Reje
 
 /// The age `coin` must have at the anchor on `network`.
 pub fn min_coin_age(network: Network, coin: &Coin) -> u32 {
+    // No wildcard arm: a network rust-bitcoin adds must be placed here,
+    // not given the short age by default.
     let age = match network {
         Network::Bitcoin => MIN_COIN_AGE,
-        _ => TEST_MIN_COIN_AGE,
+        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => TEST_MIN_COIN_AGE,
     };
     if coin.coinbase { age.max(COINBASE_MATURITY) } else { age }
 }
