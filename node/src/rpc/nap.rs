@@ -142,13 +142,17 @@ fn describe(p: &Published) -> Value {
         "message": att.message(),
     });
     match &p.status {
-        Ok(amount) => {
+        Some(Ok(amount)) => {
             out["status"] = json!("valid");
             out["amount"] = format_amount(amount.to_sat(), unit);
         }
-        Err(r) => {
+        Some(Err(r)) => {
             out["status"] = json!(r.rule());
             out["reason"] = json!(r.to_string());
+        }
+        None => {
+            out["status"] = json!("unknown");
+            out["reason"] = json!("not judged yet: the chain tip kept changing; ask again");
         }
     }
     annotate_units(&mut out, unit);

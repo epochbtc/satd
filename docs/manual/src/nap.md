@@ -189,7 +189,8 @@ The node judges every stored attestation again at each new block:
   on a fork without them, keeps everything until it is back on the anchor's
   chain.
 - At startup, an attestation that lost its anchor while the node was
-  stopped is reported the same way.
+  stopped is reported the same way, once the node has reached the anchor's
+  height.
 
 During initial block download the attestations are judged once, when it ends.
 
@@ -213,7 +214,9 @@ sat-cli listnapattestations
 ```
 
 `status` is `valid` or the name of the rule the attestation fails at the
-current tip, with a `reason`. `amount`, the coin's value, is the
+current tip, with a `reason`. It is `unknown` for an attestation the node has
+not been able to judge since it started, because the tip kept changing; ask
+again. `amount`, the coin's value, is the
 attestation's weight while it is valid.
 
 `removenapattestation "<txid>:<vout>" "<key>"` stops publishing an

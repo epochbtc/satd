@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use bitcoin::hashes::{Hash as _, sha256};
 
-use super::publisher::{COLDCARD_MESSAGE_LIMIT, encode_signature};
+use super::publisher::{COLDCARD_MESSAGE_LIMIT, Report, encode_signature, report};
 use super::tests::*;
 use super::validity::{ChainView, Coin};
 use super::*;
@@ -53,7 +53,7 @@ fn a_submitted_attestation_is_stored_and_survives_a_reload() {
     let listed = p.list(&chain);
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].attestation, att);
-    assert_eq!(listed[0].status, Ok(VALUE));
+    assert_eq!(listed[0].status, Some(Ok(VALUE)));
     assert_eq!(listed[1].attestation, legacy_att);
     assert_eq!(p.serving().len(), 2);
 }
@@ -254,11 +254,11 @@ fn a_lost_anchor_or_a_stale_one_is_kept_but_not_served() {
 
     chain.fork_at = ANCHOR;
     // Listing between tips does not hide the change from the next tip.
-    assert_eq!(p.list(&chain)[0].status, Err(Rejection::AnchorNotOnChain));
+    assert_eq!(p.list(&chain)[0].status, Some(Err(Rejection::AnchorNotOnChain)));
     assert_eq!(p.serving(), vec![att.clone()]);
     p.on_tip(&chain);
     assert!(p.serving().is_empty());
-    assert_eq!(p.list(&chain)[0].status, Err(Rejection::AnchorNotOnChain));
+    assert_eq!(p.list(&chain)[0].status, Some(Err(Rejection::AnchorNotOnChain)));
 
     chain.fork_at = u32::MAX;
     p.on_tip(&chain);
@@ -267,7 +267,7 @@ fn a_lost_anchor_or_a_stale_one_is_kept_but_not_served() {
     chain.tip = ANCHOR + FRESHNESS_WINDOW;
     p.on_tip(&chain);
     assert!(p.serving().is_empty());
-    assert!(matches!(p.list(&chain)[0].status, Err(Rejection::Stale { .. })));
+    assert!(matches!(p.list(&chain)[0].status, Some(Err(Rejection::Stale { .. }))));
 }
 
 /// A coin's scriptPubKey never changes, so a signature is verified once.
@@ -282,7 +282,7 @@ fn a_signature_is_verified_once() {
     // again, it would fail.
     chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = p2pkh().spk;
     p.on_tip(&chain);
-    assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
+    assert_eq!(p.list(&chain)[0].status, Some(Ok(VALUE)));
 }
 
 /// An entry loaded from the store has no cached result; listing it verifies
@@ -296,9 +296,9 @@ fn listing_keeps_what_it_learned_about_a_signature() {
     let mut behind = Chain::new();
     behind.tip = ANCHOR - 1;
     let p = Publisher::open(path, &behind).unwrap();
-    assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
+    assert_eq!(p.list(&chain)[0].status, Some(Ok(VALUE)));
     chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = p2pkh().spk;
-    assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
+    assert_eq!(p.list(&chain)[0].status, Some(Ok(VALUE)));
 }
 
 #[test]
@@ -474,4 +474,35 @@ fn a_tip_pass_does_not_judge_an_entry_replaced_during_it() {
     };
     p.on_tip(&Hooked::new(&chain, usize::MAX, Some(Box::new(replace))));
     assert_eq!(p.serving(), vec![old]);
+}
+
+/// What a tip pass reports: a lost anchor once the tip has reached its
+/// height (at startup too), never while the node is behind it, and nothing
+/// for an entry that was already not served.
+#[test]
+fn a_lost_anchor_is_reported_only_when_the_chain_has_reached_it() {
+    let lost = Err(Rejection::AnchorNotOnChain);
+    let stale = Err(Rejection::Stale { age: FRESHNESS_WINDOW });
+    let valid = Ok(VALUE);
+    assert_eq!(report(Some(&valid), &lost, ANCHOR, ANCHOR), Some(Report::LostAnchor));
+    assert_eq!(report(None, &lost, ANCHOR + 1, ANCHOR), Some(Report::LostAnchor), "found at startup");
+    assert_eq!(report(None, &lost, ANCHOR - 1, ANCHOR), None, "behind the anchor: IBD, not a reorg");
+    assert_eq!(report(Some(&valid), &lost, ANCHOR - 1, ANCHOR), None);
+    assert_eq!(report(Some(&lost), &lost, ANCHOR, ANCHOR), None, "reported once");
+    assert_eq!(report(Some(&valid), &stale, TIP, ANCHOR), Some(Report::NoLongerValid(&Rejection::Stale { age: FRESHNESS_WINDOW })));
+    assert_eq!(report(Some(&stale), &stale, TIP, ANCHOR), None);
+    assert_eq!(report(Some(&valid), &valid, TIP, ANCHOR), None);
+}
+
+/// An entry the chain has never held still for is "not judged yet", not a
+/// spent coin.
+#[test]
+fn an_entry_never_judged_lists_as_unknown() {
+    let (_dir, path) = store_path();
+    let (chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
+    store::save(&path, &store::encode([&att].into_iter())).unwrap();
+    let p = Publisher::open(path, &Hooked::new(&chain, 0, None)).unwrap();
+    assert_eq!(p.list(&Hooked::new(&chain, 0, None))[0].status, None);
+    assert!(p.serving().is_empty());
+    assert_eq!(p.list(&chain)[0].status, Some(Ok(VALUE)));
 }

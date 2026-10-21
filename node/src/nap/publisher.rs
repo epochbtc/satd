@@ -108,8 +108,9 @@ pub struct Draft {
 pub struct Published {
     pub attestation: Attestation,
     /// The attestation's validity at the tip it was last judged at, with
-    /// the coin's value when valid.
-    pub status: Result<Amount, Rejection>,
+    /// the coin's value when valid. `None` if it has not been judged yet:
+    /// the chain has not held still long enough since it was loaded.
+    pub status: Option<Result<Amount, Rejection>>,
 }
 
 /// A stored attestation and what has been learned about it.
@@ -263,7 +264,7 @@ impl Publisher {
         };
         let replaced = match current {
             Some((cur, _)) if cur == att => {
-                return Ok((Published { attestation: att, status: Ok(value) }, None));
+                return Ok((Published { attestation: att, status: Some(Ok(value)) }, None));
             }
             Some((cur, cur_locks)) => {
                 let cur_valid = matches!(
@@ -297,7 +298,7 @@ impl Publisher {
             anchor = att.anchor_height(),
             "NAP: publishing attestation"
         );
-        Ok((Published { attestation: att, status: Ok(value) }, replaced))
+        Ok((Published { attestation: att, status: Some(Ok(value)) }, replaced))
     }
 
     /// Every stored attestation, judged at `chain`'s tip, ordered by
@@ -313,11 +314,11 @@ impl Publisher {
                     if new != locks {
                         learned.push((key, att.id(), new));
                     }
-                    status
+                    Some(status)
                 }
                 // Spent, and dropped at the next tip.
-                Some(Assessed::Spent) => Err(Rejection::CoinNotFound),
-                None => status.unwrap_or(Err(Rejection::CoinNotFound)),
+                Some(Assessed::Spent) => Some(Err(Rejection::CoinNotFound)),
+                None => status,
             };
             out.push(Published { attestation: att, status });
         }
@@ -372,17 +373,19 @@ impl Publisher {
     /// Judge every entry at `chain`'s new tip: drop those whose coin was
     /// spent, and warn about each that lost its anchor to a reorg.
     pub fn on_tip(&self, chain: &impl ChainSource) {
-        let judged: Vec<(Key, sha256::Hash, Assessed)> = self
+        let judged: Vec<(Key, sha256::Hash, Assessed, u32)> = self
             .snapshot()
             .into_iter()
             .filter_map(|(key, att, locks, _)| {
-                chain.read(&|v| assess(&att, locks.clone(), v)).map(|a| (key, att.id(), a))
+                chain
+                    .read(&|v| (assess(&att, locks.clone(), v), v.tip_height()))
+                    .map(|(a, tip)| (key, att.id(), a, tip))
             })
             .collect();
         let _writer = self.writer.lock();
         let mut entries = self.entries.lock();
         let mut spent = Vec::new();
-        for (key, id, assessed) in judged {
+        for (key, id, assessed, tip) in judged {
             // An entry submitted or removed while the pass ran was not judged
             // here; the next tip judges it.
             let Some(e) = entries.get_mut(&key).filter(|e| e.att.id() == id) else { continue };
@@ -393,12 +396,8 @@ impl Publisher {
                 }
                 Assessed::Judged { status, locks } => (status, locks),
             };
-            // Report what changed since the last tip. An entry loaded from
-            // the store has no last tip: what happened while the node was
-            // stopped is reported now.
-            let was_served = e.status.as_ref().is_none_or(|s| s.is_ok());
-            match &status {
-                Err(Rejection::AnchorNotOnChain) if was_served => tracing::warn!(
+            match report(e.status.as_ref(), &status, tip, e.att.anchor_height()) {
+                Some(Report::LostAnchor) => tracing::warn!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
                     key = e.att.key(),
@@ -406,14 +405,14 @@ impl Publisher {
                     "NAP: a reorg removed the anchor block of a published attestation; \
                      it is not served until signed again"
                 ),
-                Err(r) if was_served => tracing::info!(
+                Some(Report::NoLongerValid(r)) => tracing::info!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
                     key = e.att.key(),
                     rule = r.rule(),
                     "NAP: attestation is no longer valid and is not served: {r}"
                 ),
-                _ => {}
+                None => {}
             }
             e.status = Some(status);
             e.locks = locks;
@@ -432,6 +431,34 @@ impl Publisher {
 
     fn save(&self, entries: &BTreeMap<Key, Entry>) -> Result<(), String> {
         store::save(&self.path, &store::encode(entries.values().map(|e| &e.att)))
+    }
+}
+
+/// What a tip pass tells the operator about one entry.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Report<'a> {
+    /// A reorg replaced the anchor block.
+    LostAnchor,
+    NoLongerValid(&'a Rejection),
+}
+
+/// Whether going from `before` to `now` at `tip` is worth reporting. An
+/// entry loaded from the store has no `before`: what happened while the
+/// node was stopped is reported at the first tip. Below the anchor's height
+/// the node is behind (IBD, a reindex), not reorganised, and the anchor may
+/// yet arrive, so a missing anchor there is not reported.
+pub(super) fn report<'a>(
+    before: Option<&Result<Amount, Rejection>>,
+    now: &'a Result<Amount, Rejection>,
+    tip: u32,
+    anchor_height: u32,
+) -> Option<Report<'a>> {
+    let was_served = before.is_none_or(|s| s.is_ok());
+    match now {
+        Err(Rejection::AnchorNotOnChain) if tip < anchor_height => None,
+        Err(Rejection::AnchorNotOnChain) if was_served => Some(Report::LostAnchor),
+        Err(r) if was_served => Some(Report::NoLongerValid(r)),
+        _ => None,
     }
 }
 
