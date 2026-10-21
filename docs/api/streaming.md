@@ -1303,7 +1303,8 @@ split into its branches and each branch expanded over the same window, so it
 yields up to `branches × gap_limit` scripts and costs that many watch units; the
 branch count is capped at 2 (`MAX_DESCRIPTOR_BRANCHES`) — more is rejected before
 the split. Expansion is bounded per branch (`MAX_DESCRIPTOR_WINDOW`, a DoS limit,
-so ≤ 2000 scripts for a 2-branch descriptor) and rejects hardened-wildcard and any
+so ≤ 2000 scripts for a 2-branch descriptor) and rejects any descriptor with a
+hardened derivation step (`/*h`, `/0h/*`), which a public key cannot derive, and any
 secret-bearing descriptor at the type level (`Descriptor<DescriptorPublicKey>`),
 so no signing material can be submitted.
 
