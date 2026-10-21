@@ -60,12 +60,15 @@ fn schnorr(sighash: [u8; 32], keypair: &Keypair) -> bitcoin::taproot::Signature 
     bitcoin::taproot::Signature { signature, sighash_type: TapSighashType::Default }
 }
 
+/// Signs a message text, given the node (for `signmessagewithprivkey`).
+type Sign = Box<dyn Fn(&TestNode, &str) -> String>;
+
 /// A coin's owner: its address and how it signs a message.
 struct Holder {
     name: &'static str,
     address: Address,
     formats: Value,
-    sign: Box<dyn Fn(&TestNode, &str) -> String>,
+    sign: Sign,
 }
 
 fn holders() -> Vec<Holder> {
