@@ -65,7 +65,7 @@ fn descriptor_error(e: bip322::psbt::DescriptorError) -> ErrorObjectOwned {
     use bip322::psbt::DescriptorError as E;
     let code = match e {
         E::Parse(_) | E::TooManyBranches(_) | E::HardenedDerivation => -5,
-        E::NoMatch | E::Update(_) => -8,
+        E::NoMatch | E::Update(_) | E::NoUtxo => -8,
     };
     RpcError::new(code, "rpc.input.parse", e.to_string()).into_error_object()
 }

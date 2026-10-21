@@ -96,6 +96,9 @@ pub enum DescriptorError {
     NoMatch,
     #[error("the descriptor could not update the PSBT: {0}")]
     Update(String),
+    /// Not a [`create`]d PSBT: input 0 names no UTXO to match.
+    #[error("the PSBT has no input 0 UTXO to match the descriptor against")]
+    NoUtxo,
 }
 
 /// The `to_sign` PSBT for `message` against `challenge`, as BIP 322's
@@ -143,10 +146,11 @@ pub fn add_descriptor(psbt: &mut Psbt, descriptor: &str) -> Result<(), Descripto
         return Err(DescriptorError::HardenedDerivation);
     }
     let singles = descriptor.into_single_descriptors().map_err(|e| DescriptorError::Parse(e.to_string()))?;
-    let challenge = match (&psbt.inputs[0].witness_utxo, &psbt.inputs[0].non_witness_utxo) {
+    let input = psbt.inputs.first().ok_or(DescriptorError::NoUtxo)?;
+    let challenge = match (&input.witness_utxo, &input.non_witness_utxo) {
         (Some(utxo), _) => utxo.script_pubkey.clone(),
-        (None, Some(tx)) => tx.output[0].script_pubkey.clone(),
-        (None, None) => return Err(DescriptorError::NoMatch),
+        (None, Some(tx)) => tx.output.first().ok_or(DescriptorError::NoUtxo)?.script_pubkey.clone(),
+        (None, None) => return Err(DescriptorError::NoUtxo),
     };
     for single in singles {
         let range = if single.has_wildcard() { DESCRIPTOR_SEARCH_RANGE } else { 1 };

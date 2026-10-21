@@ -535,5 +535,22 @@ mod descriptors {
         assert!(matches!(add_descriptor(&mut psbt, &format!("wpkh({xprv}/0/*)")), Err(DescriptorError::Parse(_))));
         assert!(matches!(add_descriptor(&mut psbt, "wsh(nonsense)"), Err(DescriptorError::Parse(_))));
         assert_eq!(psbt, before, "a refusal changes nothing");
+
+        // Not a created PSBT: no input, or an input with no UTXO.
+        let descriptor = multisig(&signers, "0");
+        let mut empty = Psbt::from_unsigned_tx(bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        })
+        .unwrap();
+        assert_eq!(add_descriptor(&mut empty, &descriptor), Err(DescriptorError::NoUtxo));
+        let mut bare = create(&spk, MESSAGE);
+        bare.inputs[0].witness_utxo = None;
+        bare.inputs[0].non_witness_utxo.as_mut().unwrap().output.clear();
+        assert_eq!(add_descriptor(&mut bare, &descriptor), Err(DescriptorError::NoUtxo));
+        bare.inputs[0].non_witness_utxo = None;
+        assert_eq!(add_descriptor(&mut bare, &descriptor), Err(DescriptorError::NoUtxo));
     }
 }
