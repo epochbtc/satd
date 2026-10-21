@@ -59,6 +59,9 @@ pub enum PublishError {
     /// The outpoint already has the most keys a publisher stores.
     #[error("this node already publishes {MAX_KEYS_PER_OUTPOINT} keys for this outpoint")]
     KeyLimit,
+    /// The store holds the operator's limit (`-napmaxattestations`).
+    #[error("this node already stores {max} attestations, its -napmaxattestations limit")]
+    StoreFull { max: usize },
     #[error("the chain is shorter than the anchor depth ({ANCHOR_DEPTH} blocks)")]
     ChainTooShort,
     /// The chain kept moving during the request.
@@ -79,6 +82,7 @@ impl PublishError {
             PublishError::Rejected(r) => r.rule(),
             PublishError::Superseded { .. } => "superseded",
             PublishError::KeyLimit => "key-limit",
+            PublishError::StoreFull { .. } => "store-full",
             PublishError::ChainTooShort => "chain-too-short",
             PublishError::Busy => "busy",
             PublishError::NotFound => "not-found",
@@ -136,6 +140,9 @@ pub struct Publisher {
     entries: Mutex<BTreeMap<Key, Entry>>,
     /// Held by every change to `entries`, for as long as the change takes.
     writer: Mutex<()>,
+    /// The most attestations the store takes (`-napmaxattestations`); 0 is
+    /// no limit.
+    max_attestations: usize,
 }
 
 impl Publisher {
@@ -150,9 +157,23 @@ impl Publisher {
             }
             entries.insert(key, Entry { att, locks: None, status: None });
         }
-        let publisher = Publisher { path, entries: Mutex::new(entries), writer: Mutex::new(()) };
+        let publisher =
+            Publisher { path, entries: Mutex::new(entries), writer: Mutex::new(()), max_attestations: 0 };
         publisher.on_tip(chain);
         Ok(publisher)
+    }
+
+    /// Refuse submissions that would take the store past `max` attestations
+    /// (`-napmaxattestations`; 0, the default, is no limit). Replacing one
+    /// of the stored attestations is always allowed. A store already larger,
+    /// after the limit was lowered, is kept whole.
+    pub fn with_max_attestations(mut self, max: usize) -> Self {
+        self.max_attestations = max;
+        self
+    }
+
+    fn full(&self, len: usize) -> bool {
+        self.max_attestations != 0 && len >= self.max_attestations
     }
 
     /// [`Self::open`], but a store that does not read back is renamed to
@@ -215,13 +236,20 @@ impl Publisher {
             ));
         }
         let entries = self.entries.lock();
-        if !entries.contains_key(&(outpoint, key.to_owned()))
-            && keys_for(&entries, outpoint) >= MAX_KEYS_PER_OUTPOINT
-        {
-            warnings.push(format!(
-                "this node already publishes {MAX_KEYS_PER_OUTPOINT} keys for this outpoint, \
-                 so it will refuse this one"
-            ));
+        if !entries.contains_key(&(outpoint, key.to_owned())) {
+            if keys_for(&entries, outpoint) >= MAX_KEYS_PER_OUTPOINT {
+                warnings.push(format!(
+                    "this node already publishes {MAX_KEYS_PER_OUTPOINT} keys for this outpoint, \
+                     so it will refuse this one"
+                ));
+            }
+            if self.full(entries.len()) {
+                warnings.push(format!(
+                    "this node already stores {} attestations, its -napmaxattestations limit, \
+                     so it will refuse this one",
+                    self.max_attestations
+                ));
+            }
         }
         Ok(Draft { message: text, anchor_height, anchor_hash, coin, warnings })
     }
@@ -257,10 +285,10 @@ impl Publisher {
 
         let key = (att.outpoint(), att.key().to_owned());
         let _writer = self.writer.lock();
-        let (current, key_count) = {
+        let (current, key_count, total) = {
             let entries = self.entries.lock();
             let current = entries.get(&key).map(|e| (e.att.clone(), e.locks.clone()));
-            (current, keys_for(&entries, att.outpoint()))
+            (current, keys_for(&entries, att.outpoint()), entries.len())
         };
         let replaced = match current {
             Some((cur, _)) if cur == att => {
@@ -278,6 +306,9 @@ impl Publisher {
             }
             None if key_count >= MAX_KEYS_PER_OUTPOINT => {
                 return Err(PublishError::KeyLimit);
+            }
+            None if self.full(total) => {
+                return Err(PublishError::StoreFull { max: self.max_attestations });
             }
             None => None,
         };

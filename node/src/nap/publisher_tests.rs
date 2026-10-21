@@ -517,3 +517,33 @@ fn an_entry_never_judged_lists_as_unknown() {
     assert!(p.serving().is_empty());
     assert_eq!(p.list(&chain)[0].status, Some(Ok(VALUE)));
 }
+
+/// `-napmaxattestations`: new attestations stop at the limit, replacements
+/// do not, and a store already over a lowered limit is kept whole.
+#[test]
+fn the_store_holds_at_most_the_operators_limit() {
+    let (_dir, path) = store_path();
+    let signer = p2wpkh();
+    let (mut chain, a) = setup(&signer, COIN_HEIGHT, ANCHOR - 1);
+    let op2 = coin(&mut chain, &signer, 8);
+    let b = attest(&chain, &signer, op2, "k", "v", ANCHOR);
+    let c = attest(&chain, &signer, a.outpoint(), "another key", "v", ANCHOR);
+    let p = Publisher::open(path.clone(), &chain).unwrap().with_max_attestations(2);
+    submit(&p, &chain, &a).unwrap();
+    submit(&p, &chain, &b).unwrap();
+    assert_eq!(submit(&p, &chain, &c), Err(PublishError::StoreFull { max: 2 }));
+    assert_eq!(rule(submit(&p, &chain, &c)), "store-full");
+    let draft = p.create(&chain, a.outpoint(), "another key", "v").unwrap();
+    assert!(draft.warnings.iter().any(|w| w.contains("-napmaxattestations")), "{:?}", draft.warnings);
+    assert!(p.create(&chain, a.outpoint(), a.key(), "no").unwrap().warnings.is_empty(), "a replacement fits");
+    let newer = attest(&chain, &signer, a.outpoint(), a.key(), "no", ANCHOR);
+    assert_eq!(submit(&p, &chain, &newer), Ok(Some(a.id())), "replacing one is allowed at the limit");
+
+    // Lowered below what is stored: everything is kept, nothing new taken.
+    let p = Publisher::open(path.clone(), &chain).unwrap().with_max_attestations(1);
+    assert_eq!(p.list(&chain).len(), 2);
+    assert_eq!(rule(submit(&p, &chain, &c)), "store-full");
+    // 0 is no limit.
+    let p = Publisher::open(path, &chain).unwrap().with_max_attestations(0);
+    assert_eq!(submit(&p, &chain, &c), Ok(None));
+}

@@ -3337,7 +3337,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::nap::Publisher::open(path, &*chain_state)
         };
         let publisher = match opened {
-            Ok(p) => Arc::new(p),
+            Ok(p) => Arc::new(p.with_max_attestations(config.napmaxattestations)),
             Err(e) => {
                 eprintln!("Error loading the NAP attestation store: {e}");
                 eprintln!(

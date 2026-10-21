@@ -285,8 +285,19 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
 
     // The store survives a restart.
     node.stop();
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1"]);
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", "--napmaxattestations=6"]);
     assert_eq!(list(&node), before);
+
+    // At the -napmaxattestations limit a new key is refused.
+    let draft = node.rpc_ok("createnapattestation", vec![json!(outpoints[1]), json!("another.key"), json!("v")]);
+    let warnings = draft["warnings"].to_string();
+    assert!(warnings.contains("-napmaxattestations"), "{warnings}");
+    let message = draft["message"].as_str().unwrap();
+    let signature = (holders[1].sign)(&node, message);
+    let r = node.rpc_call_with_params("submitnapattestation", vec![json!(message), json!(signature)]).unwrap();
+    let (code, msg) = error_of(r);
+    assert_eq!(code, -26);
+    assert!(msg.contains("store-full"), "{msg}");
 
     // Spending a coin drops its attestation.
     let wallet = DeterministicWallet::from_secret([1; 32]);

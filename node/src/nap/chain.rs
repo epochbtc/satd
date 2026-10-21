@@ -76,11 +76,32 @@ pub async fn follow_tip(
         if tip == judged || chain.is_initial_block_download() {
             continue;
         }
-        judged = tip;
         let (p, c) = (publisher.clone(), chain.clone());
-        if tokio::task::spawn_blocking(move || p.on_tip(&*c)).await.is_err() {
-            tracing::error!(target: "nap", "NAP: judging attestations at the new tip panicked");
-        }
+        judge_at(tip, &mut judged, move || p.on_tip(&*c)).await;
+    }
+}
+
+/// Run `pass` on a blocking thread, and record `tip` as judged only if it
+/// finished: a pass that panicked is tried again at the next poll, not left
+/// until the tip moves.
+async fn judge_at<T: Copy, F: FnOnce() + Send + 'static>(tip: T, judged: &mut T, pass: F) {
+    match tokio::task::spawn_blocking(pass).await {
+        Ok(()) => *judged = tip,
+        Err(_) => tracing::error!(target: "nap", "NAP: judging attestations at the new tip panicked; will retry"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::judge_at;
+
+    #[tokio::test]
+    async fn a_pass_that_panics_is_not_recorded_as_judged() {
+        let mut judged = 1u32;
+        judge_at(2, &mut judged, || panic!("a failed pass")).await;
+        assert_eq!(judged, 1, "retried at the next poll");
+        judge_at(2, &mut judged, || {}).await;
+        assert_eq!(judged, 2);
     }
 }
 

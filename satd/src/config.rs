@@ -739,6 +739,10 @@ pub struct Config {
     /// a warning and the publisher starts empty, instead of startup failing.
     /// Default false. satd-only.
     pub napstorerecover: bool,
+    /// `-napmaxattestations`: with `-nap`, the most attestations the store
+    /// takes; a submission that would add one more is refused. Replacing a
+    /// stored one is always allowed. 0 (default) is no limit. satd-only.
+    pub napmaxattestations: usize,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4191,6 +4195,7 @@ impl Config {
             allowdangerousfilters,
             nap: resolve_nap(&cli.nap_args.nap, "nap", &file_get),
             napstorerecover: resolve_nap(&cli.nap_args.napstorerecover, "napstorerecover", &file_get),
+            napmaxattestations: resolve_nap_max(&cli.nap_args.napmaxattestations, &file_get)?,
             networkactive,
             txindex,
             addressindex,
@@ -4849,6 +4854,7 @@ impl Config {
             "nap": {
                 "enabled": self.nap,
                 "store_recover": self.napstorerecover,
+                "max_attestations": self.napmaxattestations,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -5993,7 +5999,7 @@ pub struct CliArgs {
     #[command(flatten)]
     pub tx_announce_args: TxAnnounceArgs,
 
-    /// `-nap` and `-napstorerecover`, hand-built for the same stack-frame reason as
+    /// `-nap`, `-napstorerecover` and `-napmaxattestations`, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub nap_args: NapArgs,
@@ -7541,11 +7547,27 @@ fn resolve_nap(cli: &Option<bool>, key: &str, file_get: &dyn Fn(&str) -> Option<
     cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v))).unwrap_or(false)
 }
 
-/// `-nap` and `-napstorerecover` (see [`CliArgs::nap_args`]).
+/// `-napmaxattestations`, out of `CliArgs` for the same reason. A config-file
+/// value that is not a count is refused, as the command line refuses one.
+#[inline(never)]
+fn resolve_nap_max(cli: &Option<usize>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<usize, String> {
+    match (cli, file_get("napmaxattestations")) {
+        (Some(n), _) => Ok(*n),
+        (None, Some(v)) => v
+            .trim()
+            .parse()
+            .map_err(|_| format!("-napmaxattestations must be a whole number of attestations, not \"{v}\"")),
+        (None, None) => Ok(0),
+    }
+}
+
+/// `-nap`, `-napstorerecover` and `-napmaxattestations` (see
+/// [`CliArgs::nap_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct NapArgs {
     pub nap: Option<bool>,
     pub napstorerecover: Option<bool>,
+    pub napmaxattestations: Option<usize>,
 }
 
 const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
@@ -7560,6 +7582,12 @@ const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "BOOL",
         StratumArgKind::Bool,
         "With -nap, move an attestation store that does not read back aside and start with an empty one, instead of refusing to start (default: 0)",
+    ),
+    (
+        "napmaxattestations",
+        "N",
+        StratumArgKind::Usize,
+        "With -nap, store at most N attestations; a submission that would add one more is refused (default: 0, no limit)",
     ),
 ];
 
@@ -7582,7 +7610,11 @@ impl clap::FromArgMatches for NapArgs {
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { nap: m.remove_one("nap"), napstorerecover: m.remove_one("napstorerecover") })
+        Ok(Self {
+            nap: m.remove_one("nap"),
+            napstorerecover: m.remove_one("napstorerecover"),
+            napmaxattestations: m.remove_one("napmaxattestations"),
+        })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -9283,6 +9315,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "allowdangerousfilters",
     "nap",
     "napstorerecover",
+    "napmaxattestations",
     "networkactive",
     // Esplora
     "esplora",
@@ -10585,6 +10618,28 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "nap=1\n").unwrap();
         assert!(load(&[]), "from the file");
         assert!(!load(&["-nap=0"]), "the command line wins");
+    }
+
+    /// `-napmaxattestations`: 0 (no limit) by default, from either source,
+    /// the command line winning, and a file value that is not a count refused.
+    #[test]
+    fn napmaxattestations_defaults_to_no_limit() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .map(|c| c.napmaxattestations)
+        };
+        assert_eq!(load(&[]), Ok(0));
+        assert_eq!(load(&["-napmaxattestations=500"]), Ok(500));
+        std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=40\n").unwrap();
+        assert_eq!(load(&[]), Ok(40), "from the file");
+        assert_eq!(load(&["--napmaxattestations=7"]), Ok(7), "the command line wins");
+        std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=lots\n").unwrap();
+        assert!(load(&[]).unwrap_err().contains("-napmaxattestations"));
+        assert!(CliArgs::try_parse_from(["satd", "--napmaxattestations=-1"]).is_err());
     }
 
     /// `-napstorerecover`: off by default, on from the command line in either

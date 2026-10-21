@@ -77,7 +77,10 @@ An attestation is valid at a tip when:
 For each outpoint and key, the attestation with the higher anchor counts.
 Signing again with a newer anchor replaces or withdraws a statement. A node
 stores one attestation per outpoint and key, and at most 32 keys per
-outpoint.
+outpoint. There is no limit on the number of outpoints unless the operator
+sets one: `napmaxattestations=<n>` refuses a submission that would take the
+store past `n` attestations, while still taking replacements of stored
+ones.
 
 ## Publishing
 
@@ -233,7 +236,7 @@ and `removenapattestation` decide what the node publishes and need
 
 | Error | Meaning |
 |---|---|
-| `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys. The message names the rule. |
+| `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
 | `-8` | The message, signature, key, value or outpoint is malformed, or `removenapattestation` found nothing to remove. |
 | `-1` | NAP is disabled, or the chain moved during the call (try again). |
 

@@ -936,6 +936,7 @@ fn field_specs() -> Vec<FieldSpec> {
         // The publisher, its store and its RPCs exist from startup or not at all.
         restart!("nap", nap),
         restart!("napstorerecover", napstorerecover),
+        restart!("napmaxattestations", napmaxattestations),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the
         // `authfile` token store, its external file's *contents* are re-read on
         // every SIGHUP — even when the path is unchanged — by a dedicated handler

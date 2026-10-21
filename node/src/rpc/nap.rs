@@ -42,7 +42,10 @@ pub fn error(e: PublishError) -> ErrorObjectOwned {
         PublishError::NotFound => (-8, "storage.not_found"),
         PublishError::ChainTooShort | PublishError::Busy => (-1, "node.initializing"),
         PublishError::Io(_) => (-1, "storage.io"),
-        PublishError::Rejected(_) | PublishError::Superseded { .. } | PublishError::KeyLimit => {
+        PublishError::Rejected(_)
+        | PublishError::Superseded { .. }
+        | PublishError::KeyLimit
+        | PublishError::StoreFull { .. } => {
             (-26, "nap.rejected")
         }
     };
