@@ -517,8 +517,18 @@ mod descriptors {
         let mut far_psbt = create(&far, MESSAGE);
         assert_eq!(add_descriptor(&mut far_psbt, &multisig(&signers, "0")), Err(DescriptorError::NoMatch));
 
-        let hardened = format!("wpkh({}/0/*h)", signers[0].origin_xpub(ACCOUNT));
-        assert_eq!(add_descriptor(&mut psbt, &hardened), Err(DescriptorError::HardenedWildcard));
+        // A public key cannot derive a hardened child, wherever the step is;
+        // miniscript panics deriving one, so each is refused first.
+        let xpub = signers[0].origin_xpub(ACCOUNT);
+        for hardened in [
+            format!("wpkh({xpub}/0/*h)"),
+            format!("wpkh({xpub}/0h/*)"),
+            format!("wpkh({xpub}/1h)"),
+            format!("wpkh({xpub}/<0h;1>/*)"),
+            format!("wsh(multi(1,{}/0/*,{xpub}/2h/*))", signers[1].origin_xpub(ACCOUNT)),
+        ] {
+            assert_eq!(add_descriptor(&mut psbt, &hardened), Err(DescriptorError::HardenedDerivation), "{hardened}");
+        }
 
         // The node takes public descriptors only.
         let xprv = HwSigner::new(65).master.to_string();

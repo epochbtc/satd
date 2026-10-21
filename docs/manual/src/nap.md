@@ -188,7 +188,8 @@ sat-cli createnapattestation "<txid>:<vout>" "bip_xyz.support" "yes" \
 ```
 
 The descriptor is the one your wallet exports, with key origins. It must
-hold public keys only; one with private keys is refused. A ranged
+hold public keys only; one with private keys is refused, as is one with a
+hardened step after an xpub, which a public key cannot derive. A ranged
 descriptor is searched at indices 0 to 999, each branch of a `<0;1>`
 multipath one in turn, for the coin's address. A descriptor that does not
 parse is refused with `-5`, and one that does not derive the coin with

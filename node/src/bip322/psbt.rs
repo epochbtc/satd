@@ -87,8 +87,8 @@ pub enum DescriptorError {
     Parse(String),
     #[error("a multipath descriptor may have at most {MAX_DESCRIPTOR_BRANCHES} branches, not {0}")]
     TooManyBranches(usize),
-    #[error("a hardened wildcard cannot be derived from a public key")]
-    HardenedWildcard,
+    #[error("a hardened derivation step cannot be derived from a public key")]
+    HardenedDerivation,
     #[error(
         "the descriptor does not derive the coin's scriptPubKey (ranged descriptors are searched at indices 0 to {})",
         DESCRIPTOR_SEARCH_RANGE - 1
@@ -130,13 +130,17 @@ pub fn add_descriptor(psbt: &mut Psbt, descriptor: &str) -> Result<(), Descripto
     if branches > MAX_DESCRIPTOR_BRANCHES {
         return Err(DescriptorError::TooManyBranches(branches));
     }
-    // `at_derivation_index` panics on a hardened wildcard.
-    if descriptor.for_any_key(|k| match k {
-        DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
-        DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
-        DescriptorPublicKey::Single(_) => false,
+    // A public key cannot derive a hardened child, and `at_derivation_index`
+    // panics on one: a hardened wildcard, or a hardened step in the path.
+    if descriptor.for_any_key(|k| {
+        k.has_hardened_step()
+            || match k {
+                DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
+                DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
+                DescriptorPublicKey::Single(_) => false,
+            }
     }) {
-        return Err(DescriptorError::HardenedWildcard);
+        return Err(DescriptorError::HardenedDerivation);
     }
     let singles = descriptor.into_single_descriptors().map_err(|e| DescriptorError::Parse(e.to_string()))?;
     let challenge = match (&psbt.inputs[0].witness_utxo, &psbt.inputs[0].non_witness_utxo) {
