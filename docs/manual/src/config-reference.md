@@ -387,6 +387,12 @@ startup error.
 | `blockmintxfee` | 1 sat/kvB | restart | core | Minimum fee rate for a transaction (judged with its package) to enter the block template. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `par` | unset | restart | core | Script-verification threads (Core name). When `shadowworkers` is unset, a positive value sets the shadow-verification worker count. It does not size the connect path. |
 
+## Node attestation (NAP)
+
+| Key | Default | Reload | Compat | Description |
+|---|---|---|---|---|
+| `nap` | off | restart | satd | Publish Node Attestation Protocol attestations: enables `createnapattestation`, `submitnapattestation`, `listnapattestations` and `removenapattestation`, and keeps the attestations submitted in `<datadir>/nap/attestations.dat`. See [Node Attestation (NAP)](nap.md). |
+
 ## Events
 
 (satd-specific event bus. The `eventszmq*` keys configure satd's own ZMQ

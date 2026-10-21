@@ -16,6 +16,7 @@
 - [API Scaling & Runtimes](api-scaling.md)
 - [Authentication & Authorization](authentication.md)
 - [JSON-RPC Extensions](json-rpc-extensions.md)
+- [Node Attestation (NAP)](nap.md)
 - [Terminal UI (`sat-tui`)](tui.md)
 
 # Protocol Surfaces

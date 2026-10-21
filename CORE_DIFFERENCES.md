@@ -665,6 +665,13 @@ preserved; the satd extension is opt-in per request or per flag.
   point, extends it to base scripts for this RPC alone. Core's own
   `verifymessage` is unchanged and stays P2PKH-only, as in Core.
 
+- **`createnapattestation`, `submitnapattestation`, `listnapattestations`,
+  `removenapattestation`** publish Node Attestation Protocol attestations,
+  holders' signed statements weighted by their coins, with `-nap=1` (off by
+  default). Core has no equivalent. Without the flag they answer -1. See the
+  manual's [Node Attestation](https://epochbtc.github.io/satd/nap.html)
+  chapter.
+
 ---
 
 ## Intentional exclusions

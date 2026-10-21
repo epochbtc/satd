@@ -3157,11 +3157,6 @@ impl Config {
             .or_else(|| file_get("allowdangerousfilters").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
-        let nap = cli
-            .nap
-            .or_else(|| file_get("nap").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
-
         let networkactive = cli
             .networkactive
             .or_else(|| file_get("networkactive").and_then(|v| parse_bool(&v)))
@@ -4189,7 +4184,7 @@ impl Config {
             permitbaremultisig,
             acceptnonstdtxn,
             allowdangerousfilters,
-            nap,
+            nap: resolve_nap(&cli.nap_args, &file_get),
             networkactive,
             txindex,
             addressindex,
@@ -5663,16 +5658,6 @@ pub struct CliArgs {
     pub allowdangerousfilters: Option<bool>,
 
     #[arg(
-        long = "nap",
-        value_name = "BOOL",
-        value_parser = parse_bool_arg,
-        num_args = 0..=1,
-        default_missing_value = "1",
-        help = "Publish Node Attestation Protocol attestations submitted over RPC (default: false)"
-    )]
-    pub nap: Option<bool>,
-
-    #[arg(
         long = "networkactive",
         value_name = "BOOL",
         value_parser = parse_bool_arg,
@@ -6000,6 +5985,11 @@ pub struct CliArgs {
     /// [`StratumArgs`].
     #[command(flatten)]
     pub tx_announce_args: TxAnnounceArgs,
+
+    /// `-nap`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
+    #[command(flatten)]
+    pub nap_args: NapArgs,
 
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
@@ -7525,6 +7515,58 @@ impl clap::FromArgMatches for TxAnnounceArgs {
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { txannouncedelay: m.remove_one("txannouncedelay") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// `-nap`, a satd extension, out of `CliArgs` for the same reason as
+/// [`resolve_bytes_per_sigop`]. Default false.
+#[inline(never)]
+fn resolve_nap(cli: &NapArgs, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
+    cli.nap.or_else(|| file_get("nap").and_then(|v| parse_bool(&v))).unwrap_or(false)
+}
+
+/// `-nap` (see [`CliArgs::nap_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct NapArgs {
+    pub nap: Option<bool>,
+}
+
+const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
+    "nap",
+    "BOOL",
+    StratumArgKind::Bool,
+    "Publish Node Attestation Protocol attestations submitted over RPC (default: 0)",
+)];
+
+impl clap::Args for NapArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in NAP_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for NapArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { nap: m.remove_one("nap") })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -10504,6 +10546,28 @@ blockmintxfee=0.00001
         assert!(load(&["-txannouncedelay=1"]), "the command line wins");
     }
 
+    /// `-nap`, a satd extension: off by default, on from the command line in
+    /// either spelling or from the file.
+    #[test]
+    fn nap_is_off_by_default_and_can_be_turned_on() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .expect("loads")
+                .nap
+        };
+        assert!(!load(&[]));
+        assert!(load(&["-nap"]));
+        assert!(load(&["--nap=1"]));
+        assert!(!load(&["-nonap"]));
+        std::fs::write(dir.path().join("bitcoin.conf"), "nap=1\n").unwrap();
+        assert!(load(&[]), "from the file");
+        assert!(!load(&["-nap=0"]), "the command line wins");
+    }
+
     /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`
     /// floor with it: room for 40 of the largest cluster. It used to be an
     /// unknown option, so Core's own tests could not start satd with it.
@@ -11841,6 +11905,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
+            nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -11914,7 +11979,6 @@ testactivationheight=bip34@2
             permitbaremultisig: None,
             acceptnonstdtxn: None,
             allowdangerousfilters: None,
-            nap: None,
             networkactive: None,
             txindex: None,
             addressindex: None,
@@ -12162,6 +12226,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
+            nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -12235,7 +12300,6 @@ testactivationheight=bip34@2
             permitbaremultisig: None,
             acceptnonstdtxn: None,
             allowdangerousfilters: None,
-            nap: None,
             networkactive: None,
             txindex: None,
             addressindex: None,

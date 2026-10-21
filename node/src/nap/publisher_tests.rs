@@ -241,6 +241,9 @@ fn a_lost_anchor_or_a_stale_one_is_kept_but_not_served() {
     assert_eq!(p.serving(), vec![att.clone()]);
 
     chain.fork_at = ANCHOR;
+    // Listing between tips does not hide the change from the next tip.
+    assert_eq!(p.list(&chain)[0].status, Err(Rejection::AnchorNotOnChain));
+    assert_eq!(p.serving(), vec![att.clone()]);
     p.on_tip(&chain);
     assert!(p.serving().is_empty());
     assert_eq!(p.list(&chain)[0].status, Err(Rejection::AnchorNotOnChain));

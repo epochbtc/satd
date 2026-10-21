@@ -262,19 +262,22 @@ impl Publisher {
     }
 
     /// Every stored attestation, judged at `chain`'s tip, ordered by
-    /// outpoint and key.
+    /// outpoint and key. The serving status is left to [`Self::on_tip`],
+    /// which reports what changed between tips.
     pub fn list(&self, chain: &impl ChainSource) -> Vec<Published> {
         let mut entries = self.entries.lock();
         entries
             .values_mut()
             .map(|e| {
-                if let Some(Assessed::Judged { status, locks }) =
-                    chain.read(&|v| assess(&e.att, e.locks.clone(), v))
-                {
-                    e.status = Some(status);
-                    e.locks = locks;
-                }
-                let status = e.status.clone().unwrap_or(Err(Rejection::CoinNotFound));
+                let status = match chain.read(&|v| assess(&e.att, e.locks.clone(), v)) {
+                    Some(Assessed::Judged { status, locks }) => {
+                        e.locks = locks;
+                        status
+                    }
+                    // Spent, and dropped at the next tip.
+                    Some(Assessed::Spent) => Err(Rejection::CoinNotFound),
+                    None => e.status.clone().unwrap_or(Err(Rejection::CoinNotFound)),
+                };
                 Published { attestation: e.att.clone(), status }
             })
             .collect()
