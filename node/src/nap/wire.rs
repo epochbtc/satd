@@ -88,6 +88,9 @@ impl NapSignature {
             })?),
             f => return Err(FormatError::SignatureFormat(f)),
         };
+        // rust-bitcoin already refuses the non-canonical forms known to us
+        // (non-minimal compact sizes, a segwit marker with no witness); this
+        // keeps the one-encoding guarantee if a decoder ever relaxes.
         if sig.to_bytes() != bytes {
             return Err(FormatError::Signature("non-canonical encoding".into()));
         }

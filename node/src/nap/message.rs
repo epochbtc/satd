@@ -66,12 +66,10 @@ pub fn parse(text: &str) -> Result<Message, FormatError> {
     let (height, hash) = field("anchor: ")?.split_once(' ').ok_or(bad("anchor: "))?;
     let anchor_height = height.parse().map_err(|_| bad("anchor: "))?;
     let anchor_hash = hash.parse().map_err(|_| bad("anchor: "))?;
-    if lines.next().is_some() {
-        return Err(bad("end of message"));
-    }
     check_key(key.as_bytes())?;
     check_value(value.as_bytes())?;
     let m = Message { outpoint, key, value, anchor_height, anchor_hash };
+    // Also refuses anything after the anchor line.
     if render(&m.outpoint, &m.key, &m.value, m.anchor_height, &m.anchor_hash) != text {
         return Err(FormatError::Message("non-canonical text"));
     }
