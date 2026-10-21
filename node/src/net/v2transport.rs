@@ -41,6 +41,9 @@ use bip324::{
 const ELLSWIFT_KEY_LEN: usize = 64;
 /// Length of the BIP 324 garbage terminator in bytes.
 const GARBAGE_TERMINATOR_LEN: usize = 16;
+/// Most garbage BIP 324 lets a side send before its terminator (Core's
+/// `MAX_GARBAGE_LEN`).
+const MAX_GARBAGE_LEN: usize = 4095;
 /// Length of the encrypted packet-length prefix in bytes.
 const LENGTH_FIELD_LEN: usize = 3;
 /// Minimum decryptable packet: 1 header byte + 16-byte Poly1305 tag.
@@ -143,6 +146,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
+}
+
+/// Random garbage to send after our ElligatorSwift key, as Core's
+/// `GenerateRandomGarbage` does: a uniform length in `0..=MAX_GARBAGE_LEN`
+/// filled with random bytes. Without it every v2 handshake opens with exactly
+/// 64 bytes, a fixed length a passive observer can match on.
+fn handshake_garbage() -> Vec<u8> {
+    use rand::{Rng, RngCore};
+    let mut rng = rand::thread_rng();
+    let mut garbage = vec![0u8; rng.gen_range(0..=MAX_GARBAGE_LEN)];
+    rng.fill_bytes(&mut garbage);
+    garbage
 }
 
 fn handshake_io_err(e: bip324::Error) -> io::Error {
@@ -263,7 +278,7 @@ async fn send_v2<S: AsyncWrite + Unpin>(
 /// handshake begins. Pass an empty slice for the initiator.
 ///
 /// Mirrors the reference driver in `bip324::io::handshake_with_initialized`
-/// with no local garbage or decoy packets.
+/// with random local garbage and no decoy packets.
 async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     network: Network,
@@ -273,10 +288,12 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> io::Result<(CipherSession, Vec<u8>)> {
     let handshake = Handshake::new(network, role).map_err(handshake_io_err)?;
 
-    // Send our ElligatorSwift public key (no garbage).
-    let mut key_buf = vec![0u8; Handshake::<Initialized>::send_key_len(None)];
+    // Send our ElligatorSwift public key and garbage. The garbage is
+    // authenticated as the version packet's AAD, so it lives until then.
+    let garbage = handshake_garbage();
+    let mut key_buf = vec![0u8; Handshake::<Initialized>::send_key_len(Some(&garbage))];
     let handshake = handshake
-        .send_key(None, &mut key_buf)
+        .send_key(Some(&garbage), &mut key_buf)
         .map_err(handshake_io_err)?;
     tracing::debug!("start sending v2 handshake to peer={peer}");
     stream.write_all(&key_buf).await?;
@@ -298,7 +315,7 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream.flush().await?;
 
     // Find the remote's garbage terminator, extending the buffer until it
-    // appears (we send no garbage, but the peer may).
+    // appears.
     let mut garbage_buf = vec![0u8; GARBAGE_TERMINATOR_LEN];
     stream.read_exact(&mut garbage_buf).await?;
     let mut sent_version = handshake;
@@ -660,6 +677,31 @@ mod tests {
         assert!(client_stats.bytes_sent() > 64, "at least the key went out");
         assert_eq!(server_stats.bytes_recv(), client_stats.bytes_sent());
         assert_eq!(client_stats.bytes_recv(), server_stats.bytes_sent());
+    }
+
+    /// Each side sends 0..=4095 random garbage bytes after its key, so the
+    /// handshake has no fixed length. With no garbage both sides send exactly
+    /// 100 bytes: key 64, terminator 16, empty version packet 20. The chance
+    /// that 16 random lengths all match is about 4096^-15.
+    #[tokio::test]
+    async fn handshake_sends_random_length_garbage() {
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            let (_server, _client, server_stats, client_stats) =
+                counted_pair(Network::Regtest).await;
+            sent.push(server_stats.bytes_sent());
+            sent.push(client_stats.bytes_sent());
+        }
+        assert!(
+            sent.iter().all(|n| (100..=100 + MAX_GARBAGE_LEN as u64).contains(n)),
+            "handshake sizes out of range: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|&n| n != sent[0]),
+            "{} handshakes all sent {:?} bytes: no random garbage",
+            sent.len(),
+            sent[0]
+        );
     }
 
     /// Core's `MAX_CONTENTS_LEN` admits a 4 MB payload under a 12-byte
