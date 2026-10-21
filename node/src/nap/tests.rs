@@ -25,6 +25,7 @@ pub(super) const VALUE: Amount = Amount::from_sat(150_000);
 /// Blocks `0..=tip`, each with a hash derived from its height and, from
 /// `fork_at` up, a fork byte: the same chain reorganised from `fork_at`.
 pub(super) struct Chain {
+    pub(super) network: Network,
     pub(super) tip: u32,
     pub(super) fork_at: u32,
     pub(super) coins: HashMap<OutPoint, Coin>,
@@ -32,7 +33,7 @@ pub(super) struct Chain {
 
 impl Chain {
     pub(super) fn new() -> Self {
-        Chain { tip: TIP, fork_at: u32::MAX, coins: HashMap::new() }
+        Chain { network: Network::Bitcoin, tip: TIP, fork_at: u32::MAX, coins: HashMap::new() }
     }
 }
 
@@ -50,6 +51,9 @@ pub(super) fn mtp(height: u32) -> u32 {
 }
 
 impl ChainView for Chain {
+    fn network(&self) -> Network {
+        self.network
+    }
     fn tip_height(&self) -> u32 {
         self.tip
     }
@@ -162,7 +166,10 @@ pub(super) fn attest(chain: &Chain, signer: &Signer, op: OutPoint, key: &str, va
 pub(super) fn setup(signer: &Signer, coin_height: u32, anchor: u32) -> (Chain, Attestation) {
     let mut chain = Chain::new();
     let op = outpoint(7);
-    chain.coins.insert(op, Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: coin_height });
+    chain.coins.insert(
+        op,
+        Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: coin_height, coinbase: false },
+    );
     let att = attest(&chain, signer, op, "bip_xyz.support", "yes", anchor);
     (chain, att)
 }
@@ -402,7 +409,11 @@ fn coin_age_boundary_at_the_anchor() {
     let (chain, att) = setup(&signer, ANCHOR - MIN_COIN_AGE + 1, ANCHOR);
     assert_eq!(
         evaluate(&att, &chain),
-        Err(Rejection::CoinTooYoung { coin_height: ANCHOR - MIN_COIN_AGE + 1, anchor_height: ANCHOR })
+        Err(Rejection::CoinTooYoung {
+            coin_height: ANCHOR - MIN_COIN_AGE + 1,
+            anchor_height: ANCHOR,
+            min_age: MIN_COIN_AGE
+        })
     );
     // An anchor too low for any coin to be old enough.
     let (chain, att) = setup(&signer, 0, MIN_COIN_AGE - 1);
@@ -415,8 +426,60 @@ fn coin_age_boundary_at_the_anchor() {
 /// after it matures: the age rule covers coinbase maturity.
 #[test]
 fn coin_age_covers_coinbase_maturity() {
-    const { assert!(MIN_COIN_AGE >= bitcoin::constants::COINBASE_MATURITY) };
-    let (chain, att) = setup(&p2wpkh(), ANCHOR - MIN_COIN_AGE, ANCHOR);
+    const { assert!(MIN_COIN_AGE >= COINBASE_MATURITY) };
+    let (mut chain, att) = setup(&p2wpkh(), ANCHOR - MIN_COIN_AGE, ANCHOR);
+    chain.coins.get_mut(&att.outpoint()).unwrap().coinbase = true;
+    assert!(evaluate(&att, &chain).is_ok());
+}
+
+/// Every network but mainnet takes TEST_MIN_COIN_AGE, at its exact boundary.
+#[test]
+fn test_networks_take_the_short_coin_age() {
+    let signer = p2wpkh();
+    for network in [Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+        let (mut chain, att) = setup(&signer, ANCHOR - TEST_MIN_COIN_AGE, ANCHOR);
+        chain.network = network;
+        assert!(evaluate(&att, &chain).is_ok(), "{network}");
+        let (mut chain, att) = setup(&signer, ANCHOR - TEST_MIN_COIN_AGE + 1, ANCHOR);
+        chain.network = network;
+        assert_eq!(
+            evaluate(&att, &chain),
+            Err(Rejection::CoinTooYoung {
+                coin_height: ANCHOR - TEST_MIN_COIN_AGE + 1,
+                anchor_height: ANCHOR,
+                min_age: TEST_MIN_COIN_AGE
+            }),
+            "{network}"
+        );
+    }
+    // Mainnet keeps the long age.
+    let (chain, att) = setup(&signer, ANCHOR - TEST_MIN_COIN_AGE, ANCHOR);
+    assert!(matches!(evaluate(&att, &chain), Err(Rejection::CoinTooYoung { min_age: MIN_COIN_AGE, .. })));
+}
+
+/// On a test network a coinbase coin still waits for coinbase maturity: it
+/// cannot attest before it can be spent.
+#[test]
+fn a_test_network_coinbase_waits_for_maturity() {
+    let signer = p2wpkh();
+    let (mut chain, att) = setup(&signer, ANCHOR - COINBASE_MATURITY + 1, ANCHOR);
+    chain.network = Network::Signet;
+    chain.coins.get_mut(&att.outpoint()).unwrap().coinbase = true;
+    assert_eq!(
+        evaluate(&att, &chain),
+        Err(Rejection::CoinTooYoung {
+            coin_height: ANCHOR - COINBASE_MATURITY + 1,
+            anchor_height: ANCHOR,
+            min_age: COINBASE_MATURITY
+        })
+    );
+    // The same coin, not a coinbase, is old enough.
+    chain.coins.get_mut(&att.outpoint()).unwrap().coinbase = false;
+    assert!(evaluate(&att, &chain).is_ok());
+    // A coinbase at maturity attests.
+    let (mut chain, att) = setup(&signer, ANCHOR - COINBASE_MATURITY, ANCHOR);
+    chain.network = Network::Signet;
+    chain.coins.get_mut(&att.outpoint()).unwrap().coinbase = true;
     assert!(evaluate(&att, &chain).is_ok());
 }
 
@@ -491,7 +554,7 @@ fn chain_state_rejections_are_distinguished_from_bad_signatures() {
         Rejection::AnchorNotOnChain,
         Rejection::Stale { age: FRESHNESS_WINDOW },
         Rejection::CoinNotFound,
-        Rejection::CoinTooYoung { coin_height: 2, anchor_height: 1 },
+        Rejection::CoinTooYoung { coin_height: 2, anchor_height: 1, min_age: 6 },
         Rejection::NotYetValid("x"),
     ];
     assert!(chain_state.iter().all(Rejection::is_chain_state));

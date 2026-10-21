@@ -5,7 +5,9 @@
 //! 1. The anchor is the active chain's block at its height.
 //! 2. Fresh: `tip_height - anchor_height < FRESHNESS_WINDOW`.
 //! 3. The coin is in the UTXO set at the tip.
-//! 4. The coin confirmed at or below `anchor_height - MIN_COIN_AGE`.
+//! 4. The coin confirmed at or below `anchor_height - min_coin_age`:
+//!    [`MIN_COIN_AGE`] on mainnet, [`TEST_MIN_COIN_AGE`] on the test
+//!    networks, and at least [`COINBASE_MATURITY`] for a coinbase coin.
 //! 5. The signature verifies over the message text against the coin's
 //!    scriptPubKey: BIP 322 for formats 0 and 1, Bitcoin Core's
 //!    `verifymessage` for format 2 (P2PKH only). BIP 322 *inconclusive* is
@@ -24,9 +26,11 @@
 use std::collections::BTreeMap;
 
 use bitcoin::hashes::Hash as _;
-use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Sequence};
+use bitcoin::{Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence};
 
-use super::{Attestation, FRESHNESS_WINDOW, MIN_COIN_AGE, NapSignature};
+use super::{
+    Attestation, COINBASE_MATURITY, FRESHNESS_WINDOW, MIN_COIN_AGE, NapSignature, TEST_MIN_COIN_AGE,
+};
 use crate::bip322::{self, Proof, Verification};
 use crate::rpc::signmessage;
 
@@ -37,11 +41,15 @@ pub struct Coin {
     pub script_pubkey: ScriptBuf,
     /// The height of the block that confirmed it.
     pub height: u32,
+    /// Whether it is a coinbase output.
+    pub coinbase: bool,
 }
 
 /// The chain state an evaluation reads. All of it is the active chain at
 /// one tip; a pruned node has all of it.
 pub trait ChainView {
+    /// The network, which sets the minimum coin age.
+    fn network(&self) -> Network;
     fn tip_height(&self) -> u32;
     /// The active chain's block at `height`, if the chain reaches it.
     fn block_hash(&self, height: u32) -> Option<BlockHash>;
@@ -64,9 +72,9 @@ pub enum Rejection {
     #[error("coin is not in the UTXO set")]
     CoinNotFound,
     #[error(
-        "coin confirmed at height {coin_height}, less than {MIN_COIN_AGE} blocks before the anchor at {anchor_height}"
+        "coin confirmed at height {coin_height}, less than {min_age} blocks before the anchor at {anchor_height}"
     )]
-    CoinTooYoung { coin_height: u32, anchor_height: u32 },
+    CoinTooYoung { coin_height: u32, anchor_height: u32, min_age: u32 },
     #[error("signature format does not apply to this output: {0}")]
     WrongFormat(&'static str),
     #[error("signature is invalid: {0}")]
@@ -138,13 +146,29 @@ pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Reje
         return Err(Rejection::Stale { age });
     }
     let coin = view.coin(&att.outpoint()).ok_or(Rejection::CoinNotFound)?;
-    if u64::from(coin.height) + u64::from(MIN_COIN_AGE) > u64::from(att.anchor_height()) {
-        return Err(Rejection::CoinTooYoung {
-            coin_height: coin.height,
-            anchor_height: att.anchor_height(),
-        });
-    }
+    check_coin_age(view.network(), &coin, att.anchor_height())?;
     Ok(coin)
+}
+
+/// The age `coin` must have at the anchor on `network`.
+pub fn min_coin_age(network: Network, coin: &Coin) -> u32 {
+    // No wildcard arm: a network rust-bitcoin adds must be placed here,
+    // not given the short age by default.
+    let age = match network {
+        Network::Bitcoin => MIN_COIN_AGE,
+        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => TEST_MIN_COIN_AGE,
+    };
+    if coin.coinbase { age.max(COINBASE_MATURITY) } else { age }
+}
+
+/// Rule 4 alone: `coin` confirmed at least [`min_coin_age`] blocks below
+/// `anchor_height`.
+pub fn check_coin_age(network: Network, coin: &Coin, anchor_height: u32) -> Result<(), Rejection> {
+    let min_age = min_coin_age(network, coin);
+    if u64::from(coin.height) + u64::from(min_age) > u64::from(anchor_height) {
+        return Err(Rejection::CoinTooYoung { coin_height: coin.height, anchor_height, min_age });
+    }
+    Ok(())
 }
 
 /// Rule 5: the signature over the message text against `script`, the coin's

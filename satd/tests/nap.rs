@@ -1,8 +1,9 @@
 //! The NAP publisher over JSON-RPC on regtest: every signer class the
 //! design names, a restart, a spent coin and a reorganised anchor.
 //!
-//! Six coinbases pay six script types. Once they are `MIN_COIN_AGE` blocks
-//! below the anchor, each is attested: P2WPKH (unprefixed simple), P2TR key
+//! Six coinbases pay six script types. Once they are `COINBASE_MATURITY`
+//! blocks below the anchor (regtest's coin age for a coinbase), each is
+//! attested: P2WPKH (unprefixed simple), P2TR key
 //! path and script path, P2WSH 2-of-2 (`smp`), P2SH-P2WPKH (`ful`) and P2PKH
 //! (legacy, signed by the node's own `signmessagewithprivkey`), plus a
 //! P2WSH 2-of-3 signed through the draft's PSBT: two signers sign copies,
@@ -34,9 +35,9 @@ use common::{
 use serde_json::{Value, json};
 
 const BURN: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-/// `nap::MIN_COIN_AGE` + `nap::ANCHOR_DEPTH`: a coin is attestable this many
-/// blocks after it confirms.
-const ATTESTABLE_AFTER: u64 = 4_032 + 6;
+/// `nap::COINBASE_MATURITY` + `nap::ANCHOR_DEPTH`: on regtest a coinbase coin
+/// is attestable this many blocks after it confirms.
+const ATTESTABLE_AFTER: u64 = 100 + 6;
 
 fn secret(n: u8) -> SecretKey {
     SecretKey::from_slice(&[n; 32]).unwrap()

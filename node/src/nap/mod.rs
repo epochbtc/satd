@@ -25,7 +25,7 @@ use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{BlockHash, OutPoint, Transaction, Witness};
 
 pub use publisher::{ChainSource, Publisher, PublishError};
-pub use validity::{ChainView, Coin, Rejection, Timelocks, evaluate, select, supersedes};
+pub use validity::{ChainView, Coin, Rejection, Timelocks, evaluate, min_coin_age, select, supersedes};
 pub use wire::FormatError;
 
 /// The attestation format version, the first byte of the wire form.
@@ -33,10 +33,17 @@ pub const VERSION: u8 = 1;
 /// How long a signature stands without re-signing: valid while
 /// `tip_height - anchor_height < FRESHNESS_WINDOW` (~6 months).
 pub const FRESHNESS_WINDOW: u32 = 26_208;
-/// How old a coin must be at the anchor: its confirmation height is at most
-/// `anchor_height - MIN_COIN_AGE` (~4 weeks). Larger than coinbase maturity,
-/// so it covers that too.
+/// How old a coin must be at the anchor on mainnet: its confirmation height
+/// is at most `anchor_height - MIN_COIN_AGE` (~4 weeks). Larger than
+/// coinbase maturity, so it covers that too.
 pub const MIN_COIN_AGE: u32 = 4_032;
+/// [`MIN_COIN_AGE`] on the test networks (testnet, testnet4, signet,
+/// regtest), so a test coin attests within an hour rather than four weeks.
+/// A coinbase coin there must also be [`COINBASE_MATURITY`] blocks old.
+pub const TEST_MIN_COIN_AGE: u32 = 6;
+/// How old a coinbase coin must be at the anchor on every network: it cannot
+/// attest before it can be spent.
+pub const COINBASE_MATURITY: u32 = bitcoin::constants::COINBASE_MATURITY;
 /// How far below the tip `createnapattestation` anchors.
 pub const ANCHOR_DEPTH: u32 = 6;
 /// The largest serialized attestation, in bytes.

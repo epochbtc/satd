@@ -23,7 +23,10 @@ fn store_path() -> (tempfile::TempDir, PathBuf) {
 /// A chain holding coin `n` for `signer`, and an attestation for it.
 fn coin(chain: &mut Chain, signer: &Signer, n: u8) -> OutPoint {
     let op = outpoint(n);
-    chain.coins.insert(op, Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: COIN_HEIGHT });
+    chain.coins.insert(
+        op,
+        Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: COIN_HEIGHT, coinbase: false },
+    );
     op
 }
 
@@ -195,6 +198,13 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
     assert_eq!(rule(p.create(&chain, op, "k", "v")), "coin-too-young");
     chain.coins.get_mut(&op).unwrap().height = TIP - ANCHOR_DEPTH - MIN_COIN_AGE;
     assert!(p.create(&chain, op, "k", "v").is_ok());
+    // A test network takes the short age, at the anchor too.
+    chain.network = bitcoin::Network::Signet;
+    chain.coins.get_mut(&op).unwrap().height = TIP - ANCHOR_DEPTH - TEST_MIN_COIN_AGE + 1;
+    assert_eq!(rule(p.create(&chain, op, "k", "v")), "coin-too-young");
+    chain.coins.get_mut(&op).unwrap().height = TIP - ANCHOR_DEPTH - TEST_MIN_COIN_AGE;
+    assert!(p.create(&chain, op, "k", "v").is_ok());
+    chain.network = bitcoin::Network::Bitcoin;
 
     assert_eq!(rule(p.create(&chain, outpoint(99), "k", "v")), "coin-not-found");
     assert_eq!(rule(p.create(&chain, op, "", "v")), "format");

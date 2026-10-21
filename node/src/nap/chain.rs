@@ -12,6 +12,10 @@ use crate::chain::state::ChainState;
 struct View<'a>(&'a ChainState);
 
 impl ChainView for View<'_> {
+    fn network(&self) -> bitcoin::Network {
+        self.0.network
+    }
+
     fn tip_height(&self) -> u32 {
         self.0.tip_height()
     }
@@ -29,6 +33,7 @@ impl ChainView for View<'_> {
             value: Amount::from_sat(c.amount),
             script_pubkey: c.script_pubkey,
             height: c.height,
+            coinbase: c.coinbase,
         })
     }
 }
