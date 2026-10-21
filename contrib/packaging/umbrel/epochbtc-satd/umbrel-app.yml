@@ -72,8 +72,16 @@ releaseNotes: >-
   files already on disk; the status page shows its progress.
 
 
+  Updating from 0.6.0 also brings the 0.6.1 fixes. Since 0.6.1, Electrum and
+  Esplora requests time out after 30 seconds. A wallet that reads a very long
+  address history may need `electrumrequesttimeout` raised in the app's
+  bitcoin.conf.
+
+
   Full notes:
   https://github.com/epochbtc/satd/blob/v0.6.2/docs/release-notes/0.6.2.md
+  and, for 0.6.1,
+  https://github.com/epochbtc/satd/blob/v0.6.2/docs/release-notes/0.6.1.md
 # Regenerable, and hundreds of gigabytes. What stays in the backup is what
 # cannot be re-derived: tls/ (the CA clients have imported), secrets/ (the MCP
 # token), authfile.toml and bitcoin.conf. `data/` is the directory mounted at
