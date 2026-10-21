@@ -20,6 +20,9 @@ item below is (or will be) written up in full in the in-development
 - `verifymessage` and `signmessagewithprivkey`, Bitcoin Core's message-signing
   RPCs, byte-compatible with Core.
 
+- `verifybip322`: BIP 322 message verification for every address type
+  (`smp`, `ful`, or unprefixed), on satd's own script interpreter.
+
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering

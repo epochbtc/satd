@@ -176,6 +176,45 @@ reaches the node; for the streaming firehose with cursor replay, and the
 integrator guide to every silent-payment consumption mode, see
 [Silent Payments (BIP 352)](silent-payments.md).
 
+## BIP 322 message verification
+
+`verifybip322 "address" "signature" "message"` verifies a
+[BIP 322](https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki)
+generic signed message: a proof that whoever can spend `address` signed
+`message`. Unlike `verifymessage`, which is Core's and covers P2PKH only, it
+works for any address type, multisig and Taproot script paths included.
+
+```text
+sat-cli verifybip322 "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l" "smpAkcwRAIgZRfIY…" "Hello World"
+{ "result": "valid", "format": "simple", "version": 0, "locktime": 0, "sequence": 0 }
+```
+
+*   **Signature formats.** `smp…` (simple: a witness stack) and `ful…`
+    (full: the signed `to_sign` transaction) as the BIP defines them.
+    An unprefixed string, which most wallets made before the BIP was
+    finalized in 2026 still emit, is read as Core's legacy format for a
+    P2PKH address and as simple for anything else. Proof-of-funds (`pof…`)
+    is refused with `-8`.
+*   **`result`** is `valid`, `invalid`, or `inconclusive`: the proof is
+    valid only under rules BIP 322 treats as upgradeable, such as an
+    unknown witness version, an `OP_SUCCESS` leaf or a reserved NOP. Not
+    `valid` comes with a `reason`. A signature that does not decode is
+    `invalid`, not an error.
+*   **`version`, `locktime`, `sequence`** are the BIP's "valid at time T and
+    age S": a full proof for a timelocked script sets `to_sign`'s locktime
+    or input sequence, and the proof holds only from that time or age.
+    `verifybip322` reports them and does not judge them against the chain.
+    A legacy result has none.
+*   **Rules.** Verification runs satd's script interpreter under the BIP's
+    required rules (SIGHASH_ALL only, or SIGHASH_DEFAULT for Taproot; no
+    `OP_CODESEPARATOR`; LOW_S, STRICTENC, NULLFAIL, MINIMALDATA, CLEANSTACK
+    and MINIMALIF, all for every script type), then its upgradeable ones.
+    It is checked against the BIP's published test vectors and btcd's
+    negative vectors.
+
+Errors: `-5` for an address that is not valid on this network. The method
+is read-only and needs no chain state.
+
 ## Stratum
 
 `getstratuminfo` reports the [Stratum mining server](stratum.md). It takes no

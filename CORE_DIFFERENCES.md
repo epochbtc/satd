@@ -650,6 +650,21 @@ preserved; the satd extension is opt-in per request or per flag.
   satd is refereed against the BIP's published vectors, but a draft can
   change.
 
+- **`verifybip322 "address" "signature" "message"`** verifies a BIP 322
+  generic signed message: Core has no BIP 322 support (its PR #24058 was
+  closed). It takes the `smp` (simple) and `ful` (full) encodings and, as
+  the BIP allows for signatures made before it was finalized, an unprefixed
+  string: legacy for a P2PKH address, simple otherwise. It answers
+  `valid`, `inconclusive` or `invalid`, and for a valid proof `to_sign`'s
+  version, locktime and sequence ("valid at time T and age S"). Proof of
+  funds (`pof`) is refused with -8. Verification runs satd's own script
+  interpreter, under the BIP's required rules and then its upgradeable
+  ones. Core's interpreter applies MINIMALIF to witness v0 only; the BIP
+  requires it for every script, so a satd-only interpreter flag
+  (`VERIFY_MINIMALIF_BASE`), refused by every block and mempool entry
+  point, extends it to base scripts for this RPC alone. Core's own
+  `verifymessage` is unchanged and stays P2PKH-only, as in Core.
+
 ---
 
 ## Intentional exclusions

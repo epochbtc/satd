@@ -59,6 +59,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "bip322_verify"
+path = "fuzz_targets/bip322_verify.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 # Keep line tables for readable artifact backtraces.
 debug = 1

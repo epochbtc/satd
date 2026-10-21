@@ -845,6 +845,20 @@ mod naming_tests;
 mod tests {
     use super::*;
 
+    /// satd's BIP 322 extension flag is never part of a block or policy flag
+    /// set. The consensus crate's entry points refuse it anyway; this pins the
+    /// node side, so the flag cannot drift into validation.
+    #[test]
+    fn block_and_policy_flags_never_set_the_bip322_extension() {
+        let ext = consensus::flags::VERIFY_MINIMALIF_BASE;
+        assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS & ext, 0);
+        for network in [Network::Bitcoin, Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+            for height in [0, 1, 227_931, 481_824, 709_632, u32::MAX] {
+                assert_eq!(script_verify_flags(network, height) & ext, 0, "{network} {height}");
+            }
+        }
+    }
+
     /// The cpp engine refuses a `prev_outputs` that does not have one entry
     /// per input, as the Rust engine does. It used to verify only the inputs
     /// the slice covered, so an empty one passed every input unchecked.
