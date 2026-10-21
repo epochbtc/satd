@@ -58,8 +58,8 @@ pub enum DescriptorError {
     WindowTooLarge { requested: u32, max: u32 },
     #[error("multipath descriptor has too many branches: {branches}, max {max}")]
     TooManyBranches { branches: usize, max: usize },
-    #[error("hardened-wildcard descriptors cannot be derived from a public key")]
-    HardenedWildcard,
+    #[error("descriptors with a hardened derivation step cannot be derived from a public key")]
+    HardenedDerivation,
     #[error("descriptor derivation failed at index {0}: {1}")]
     Derive(u32, String),
 }
@@ -159,12 +159,12 @@ fn expand_single(
     count: u32,
     out: &mut Vec<(u32, u32, Scripthash)>,
 ) -> Result<(), DescriptorError> {
-    // Reject a hardened wildcard up front: such a descriptor parses, but
+    // Reject hardened derivation up front: such a descriptor parses, but
     // `at_derivation_index` PANICS on it (a hardened child cannot be derived
-    // from an xpub), so a hardened-wildcard descriptor over the wire would be
-    // a remotely reachable panic unless caught here.
-    if has_hardened_wildcard(descriptor) {
-        return Err(DescriptorError::HardenedWildcard);
+    // from an xpub), so one over the wire would be a remotely reachable panic
+    // unless caught here.
+    if has_hardened_derivation(descriptor) {
+        return Err(DescriptorError::HardenedDerivation);
     }
     let ranged = descriptor.has_wildcard();
     // Bound the derivation window BEFORE allocating or deriving: `count`
@@ -193,14 +193,19 @@ fn expand_single(
 }
 
 /// True if any key in the descriptor is an xpub with a HARDENED wildcard
-/// (`/*h` or `/*'`). Such a descriptor parses but cannot be derived from a
-/// public key, and `at_derivation_index` panics on it, so it must be rejected
-/// before derivation.
-fn has_hardened_wildcard(desc: &Descriptor<DescriptorPublicKey>) -> bool {
-    desc.for_any_key(|k| match k {
-        DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
-        DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
-        _ => false,
+/// (`/*h` or `/*'`) or a hardened step in its derivation path (`/0h/*`).
+/// Such a descriptor parses but cannot be derived from a public key, and
+/// `at_derivation_index` panics on it (`DefiniteDescriptorKey::new` refuses
+/// the key and the caller expects it), so it must be rejected before
+/// derivation.
+fn has_hardened_derivation(desc: &Descriptor<DescriptorPublicKey>) -> bool {
+    desc.for_any_key(|k| {
+        k.has_hardened_step()
+            || match k {
+                DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
+                DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
+                _ => false,
+            }
     })
 }
 
@@ -418,14 +423,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hardened_wildcard_without_panicking() {
-        // `/*h` parses but cannot be derived from an xpub; `at_derivation_index`
+    fn rejects_hardened_derivation_without_panicking() {
+        // A hardened child cannot be derived from an xpub, wherever the step
+        // is: the wildcard (`/*h`), the path (`/0h/*`, `/1h`), or one branch
+        // of a multipath step (`/<0h;1>/*`). All parse; `at_derivation_index`
         // would panic. expand_descriptor must return an error, not panic.
-        let hardened = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*h)";
-        assert!(matches!(
-            expand_descriptor(hardened, 0, 4),
-            Err(DescriptorError::HardenedWildcard)
-        ));
+        let xpub = "xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj";
+        for path in ["0/*h", "0h/*", "1h", "<0h;1>/*", "<0;1h>/*"] {
+            let hardened = format!("wpkh({xpub}/{path})");
+            assert!(
+                matches!(expand_descriptor(&hardened, 0, 4), Err(DescriptorError::HardenedDerivation)),
+                "{hardened}"
+            );
+        }
     }
 
     #[test]
