@@ -96,6 +96,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- BIP 324 (v2 transport) handshakes send 0 to 4095 random garbage bytes after
+  the key, as Core's do. satd sent none, so its v2 connections were a fixed
+  size that a network observer could recognise.
+
 - `sat-cli` and `sat-tui` with `-rpccacert` trust only the certificates in
   that file. The public CA roots used to apply as well, so any public CA that
   issued a certificate for the node's hostname, such as one signing with the
