@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use bitcoin::hashes::sha256;
+use bitcoin::psbt::Psbt;
 use bitcoin::{Amount, BlockHash, OutPoint};
 use parking_lot::Mutex;
 
@@ -104,6 +105,8 @@ pub struct Draft {
     pub anchor_height: u32,
     pub anchor_hash: BlockHash,
     pub coin: Coin,
+    /// BIP 322's `to_sign` PSBT for the message, for PSBT signers (D15).
+    pub psbt: Psbt,
     pub warnings: Vec<String>,
 }
 
@@ -251,7 +254,8 @@ impl Publisher {
                 ));
             }
         }
-        Ok(Draft { message: text, anchor_height, anchor_hash, coin, warnings })
+        let psbt = bip322::psbt::create(&coin.script_pubkey, text.as_bytes());
+        Ok(Draft { message: text, anchor_height, anchor_hash, coin, psbt, warnings })
     }
 
     /// Check a signed message and store it. Returns the stored attestation
@@ -268,7 +272,7 @@ impl Publisher {
             .read(&|v| v.coin(&msg.outpoint))
             .ok_or(PublishError::Busy)?
             .ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
-        let signature = decode_signature(signature, &coin)?;
+        let signature = decode_signature(signature, &coin, text)?;
         let att = Attestation::new(
             msg.outpoint,
             msg.key,
@@ -537,8 +541,29 @@ fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &d
 }
 
 /// A signature string as the RPCs take it (D14), for `coin`: `smp`, `ful`,
-/// or unprefixed (legacy for P2PKH, simple otherwise).
-fn decode_signature(signature: &str, coin: &Coin) -> Result<NapSignature, PublishError> {
+/// or unprefixed (legacy for P2PKH, simple otherwise); or a signed BIP 322
+/// PSBT of `text` (D15), which is finalized into a simple or full proof.
+fn decode_signature(signature: &str, coin: &Coin, text: &str) -> Result<NapSignature, PublishError> {
+    if let Some(bytes) = crate::rpc::signmessage::decode_base64(signature)
+        && bip322::psbt::is_psbt(&bytes)
+    {
+        let format = |e: bip322::psbt::PsbtError| PublishError::Format(e.to_string());
+        let signed = bip322::psbt::parse(&bytes).map_err(format)?;
+        if signed.message != text.as_bytes() {
+            return Err(PublishError::Format(
+                "the PSBT signs a different message from the one submitted".into(),
+            ));
+        }
+        if signed.challenge != coin.script_pubkey {
+            return Err(PublishError::Format(
+                "the PSBT signs for a different scriptPubKey from the outpoint's".into(),
+            ));
+        }
+        return Ok(match signed.finalize().map_err(format)? {
+            Proof::Simple(w) => NapSignature::Simple(w),
+            Proof::Full(tx) => NapSignature::Full(tx),
+        });
+    }
     match bip322::decode(signature, &coin.script_pubkey) {
         Ok(Signature::Legacy(bytes)) => {
             let bytes: [u8; LEGACY_SIGNATURE_LEN] = bytes.try_into().map_err(|b: Vec<u8>| {

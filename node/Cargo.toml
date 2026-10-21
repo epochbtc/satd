@@ -66,6 +66,8 @@ satd-policy = { path = "../satd-policy" }
 # `bitcoin` crate rejects any PSBT above version 0, so the PSBT RPCs reach
 # this crate for anything a silent payment sender produces.
 satd-psbt = { path = "../satd-psbt" }
+# BIP 322 PSBT finalization for multisig and tapscript proofs (NAP).
+miniscript = "12"
 
 [features]
 default = ["block-filter-index", "stratum-v2"]

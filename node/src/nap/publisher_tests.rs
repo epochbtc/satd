@@ -562,3 +562,49 @@ fn resubmitting_a_stored_attestation_updates_its_status() {
     assert_eq!(submit(&p, &chain, &att), Ok(None));
     assert_eq!(p.serving(), vec![att]);
 }
+
+/// D15: the draft carries BIP 322's `to_sign` PSBT, and a signed copy of it
+/// is finalized into the same simple proof a message signer makes.
+#[test]
+fn a_signed_draft_psbt_is_finalized_and_stored() {
+    use base64::Engine as _;
+    use bitcoin::secp256k1::{Message as SecpMessage, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+
+    let (_dir, path) = store_path();
+    let signer = p2wpkh();
+    let (mut chain, _) = setup(&signer, COIN_HEIGHT, ANCHOR);
+    let op = coin(&mut chain, &signer, 7);
+    let p = Publisher::open(path, &chain).unwrap();
+    let b64 = |psbt: &bitcoin::psbt::Psbt| base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let sign = |mut psbt: bitcoin::psbt::Psbt| {
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .p2wpkh_signature_hash(0, &signer.spk, bitcoin::Amount::ZERO, EcdsaSighashType::All)
+            .unwrap();
+        let sk = super::tests::secret(1);
+        let signature = Secp256k1::new().sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
+        let pk = bitcoin::PublicKey::new(sk.public_key(&Secp256k1::new()));
+        psbt.inputs[0]
+            .partial_sigs
+            .insert(pk, bitcoin::ecdsa::Signature { signature, sighash_type: EcdsaSighashType::All });
+        psbt
+    };
+
+    let draft = p.create(&chain, op, "bip_xyz.support", "yes").unwrap();
+    let other = p.create(&chain, op, "bip_xyz.support", "no").unwrap();
+
+    let unsigned = p.submit(&chain, &draft.message, &b64(&draft.psbt)).unwrap_err();
+    assert_eq!(unsigned.rule(), "format");
+    assert!(unsigned.to_string().contains("not fully signed"), "{unsigned}");
+
+    let mismatch = p.submit(&chain, &draft.message, &b64(&sign(other.psbt.clone()))).unwrap_err();
+    assert!(mismatch.to_string().contains("different message"), "{mismatch}");
+
+    let foreign = crate::bip322::psbt::create(&p2pkh().spk, draft.message.as_bytes());
+    let foreign = p.submit(&chain, &draft.message, &b64(&foreign)).unwrap_err();
+    assert!(foreign.to_string().contains("different scriptPubKey"), "{foreign}");
+
+    let (stored, _) = p.submit(&chain, &draft.message, &b64(&sign(draft.psbt.clone()))).unwrap();
+    assert_eq!(stored.status, Some(Ok(VALUE)));
+    assert_eq!(*stored.attestation.signature(), (signer.sign)(&draft.message), "the same simple proof");
+}

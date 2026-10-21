@@ -5,6 +5,8 @@
 
 use std::str::FromStr as _;
 
+use base64::Engine as _;
+
 use bitcoin::{OutPoint, ScriptBuf};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::{Value, json};
@@ -95,6 +97,7 @@ pub fn create(
         "anchor_hash": draft.anchor_hash.to_string(),
         "amount": format_amount(draft.coin.value.to_sat(), unit),
         "formats": formats_for(&draft.coin.script_pubkey),
+        "psbt": base64::engine::general_purpose::STANDARD.encode(draft.psbt.serialize()),
         "warnings": draft.warnings,
     });
     if let Ok(address) = bitcoin::Address::from_script(&draft.coin.script_pubkey, chain.network) {
@@ -104,7 +107,8 @@ pub fn create(
     Ok(out)
 }
 
-/// `submitnapattestation "message" "signature"`.
+/// `submitnapattestation "message" "signature"`. The signature may be a
+/// signed BIP 322 PSBT of the message, which is finalized.
 pub fn submit(
     nap: &Publisher,
     chain: &ChainState,
