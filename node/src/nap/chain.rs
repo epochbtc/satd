@@ -91,6 +91,19 @@ async fn judge_at<T: Copy, F: FnOnce() + Send + 'static>(tip: T, judged: &mut T,
     }
 }
 
+async fn next_event(
+    events: &mut Option<tokio::sync::broadcast::Receiver<crate::chain::events::ChainEvent>>,
+) -> Option<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(rx) = events.as_mut() else {
+        return std::future::pending().await;
+    };
+    match rx.recv().await {
+        Ok(_) | Err(RecvError::Lagged(_)) => Some(()),
+        Err(RecvError::Closed) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::judge_at;
@@ -102,18 +115,5 @@ mod tests {
         assert_eq!(judged, 1, "retried at the next poll");
         judge_at(2, &mut judged, || {}).await;
         assert_eq!(judged, 2);
-    }
-}
-
-async fn next_event(
-    events: &mut Option<tokio::sync::broadcast::Receiver<crate::chain::events::ChainEvent>>,
-) -> Option<()> {
-    use tokio::sync::broadcast::error::RecvError;
-    let Some(rx) = events.as_mut() else {
-        return std::future::pending().await;
-    };
-    match rx.recv().await {
-        Ok(_) | Err(RecvError::Lagged(_)) => Some(()),
-        Err(RecvError::Closed) => None,
     }
 }
