@@ -78,6 +78,8 @@ fn message_of(draft: &Value) -> &str {
 struct Holder {
     name: &'static str,
     address: Address,
+    /// Passed to `createnapattestation`, for the PSBT.
+    descriptor: Option<String>,
     formats: Value,
     sign: Sign,
 }
@@ -95,6 +97,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2wpkh",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
@@ -114,6 +117,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2tr key path",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
@@ -142,6 +146,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2tr script path",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
@@ -177,6 +182,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2wsh 2-of-2",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
@@ -203,6 +209,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2sh-p2wpkh",
         address,
+        descriptor: None,
         formats: json!(["full"]),
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
@@ -223,6 +230,7 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2pkh",
         address,
+        descriptor: None,
         formats: json!(["legacy", "full"]),
         sign: Box::new(move |node, draft| {
             let message = message_of(draft);
@@ -233,9 +241,10 @@ fn holders() -> Vec<Holder> {
         }),
     });
 
-    // P2WSH 2-of-3 through the PSBT: each signer signs its own copy of the
-    // draft's PSBT with the witness script its coordinator adds, as a
-    // hardware signer would, and the node combines and finalizes them.
+    // P2WSH 2-of-3 through the PSBT: the draft is asked for with the coin's
+    // descriptor, so the PSBT carries the witness script; each signer signs
+    // its own copy, as a hardware signer would, and the node combines and
+    // finalizes them.
     let keys = [secret(9), secret(10), secret(11)];
     let mut ws = Builder::new().push_opcode(OP_PUSHNUM_2);
     for sk in &keys {
@@ -243,13 +252,16 @@ fn holders() -> Vec<Holder> {
     }
     let ws = ws.push_opcode(OP_PUSHNUM_3).push_opcode(OP_CHECKMULTISIG).into_script();
     let address = Address::p2wsh(&ws, net);
+    let pks: Vec<String> = keys.iter().map(|sk| compressed(sk).to_string()).collect();
     out.push(Holder {
         name: "p2wsh 2-of-3 psbt",
         address,
+        descriptor: Some(format!("wsh(multi(2,{}))", pks.join(","))),
         formats: json!(["simple", "full"]),
         sign: Box::new(move |node, draft| {
             let psbt = base64::engine::general_purpose::STANDARD.decode(draft["psbt"].as_str().unwrap()).unwrap();
             let psbt = Psbt::deserialize(&psbt).unwrap();
+            assert_eq!(psbt.inputs[0].witness_script.as_ref(), Some(&ws), "the descriptor added it");
             let copies: Vec<Value> = [&keys[0], &keys[2]]
                 .iter()
                 .map(|sk| {
@@ -257,7 +269,6 @@ fn holders() -> Vec<Holder> {
                     let sighash = SighashCache::new(&copy.unsigned_tx)
                         .p2wsh_signature_hash(0, &ws, Amount::ZERO, EcdsaSighashType::All)
                         .unwrap();
-                    copy.inputs[0].witness_script = Some(ws.clone());
                     copy.inputs[0]
                         .partial_sigs
                         .insert(compressed(sk).into(), ecdsa(sighash.to_byte_array(), sk));
@@ -304,7 +315,19 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     assert!(msg.contains("coin-too-young"), "{msg}");
 
     for (h, op) in holders.iter().zip(&outpoints) {
-        let draft = node.rpc_ok("createnapattestation", vec![json!(op), json!("bip_xyz.support"), json!("yes")]);
+        let mut params = vec![json!(op), json!("bip_xyz.support"), json!("yes")];
+        if let Some(d) = &h.descriptor {
+            params.push(json!(d));
+            // A descriptor that does not parse is -5; one for another coin, -8.
+            let mut bad = params.clone();
+            bad[3] = json!("wsh(nonsense)");
+            assert_eq!(error_of(node.rpc_call_with_params("createnapattestation", bad.clone()).unwrap()).0, -5);
+            bad[3] = json!(d.replace("multi(2,", "multi(1,"));
+            let (code, msg) = error_of(node.rpc_call_with_params("createnapattestation", bad).unwrap());
+            assert_eq!(code, -8, "{msg}");
+            assert!(msg.contains("does not derive"), "{msg}");
+        }
+        let draft = node.rpc_ok("createnapattestation", params);
         assert_eq!(draft["address"], json!(h.address.to_string()), "{}", h.name);
         assert_eq!(draft["formats"], h.formats, "{}", h.name);
         assert_eq!(draft["warnings"], json!([]), "{}", h.name);

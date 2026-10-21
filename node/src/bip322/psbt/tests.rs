@@ -303,6 +303,14 @@ fn input_fields_must_be_to_spends() {
     psbt.inputs[0].non_witness_utxo.as_mut().unwrap().lock_time = bitcoin::absolute::LockTime::from_consensus(1);
     assert!(matches!(finalize(&serialize(&psbt)), Err(PsbtError::NotToSpend(_))));
 
+    // The right UTXO fields, but the input spends another output.
+    let mut tx = template.unsigned_tx.clone();
+    tx.input[0].previous_output.vout = 1;
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs = template.inputs.clone();
+    psbt.unknown = template.unknown.clone();
+    assert_eq!(finalize(&serialize(&psbt)), Err(PsbtError::NotToSpend("its prevout is not to_spend:0")));
+
     let mut psbt = template.clone();
     psbt.inputs[0].witness_utxo = None;
     psbt.inputs[0].non_witness_utxo = None;
@@ -324,4 +332,198 @@ fn non_witness_utxo_alone_names_the_challenge() {
 fn garbage_is_not_a_psbt() {
     assert!(!is_psbt(b"\x02\x47\x30"));
     assert!(matches!(finalize(b"psbt\xff\x00"), Err(PsbtError::Decode(_))));
+}
+
+mod descriptors {
+    use std::str::FromStr as _;
+
+    use bitcoin::NetworkKind;
+    use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv, Xpub};
+
+    use super::*;
+
+    /// A test signer holding a master key, as a hardware signer does: it
+    /// finds its keys through the PSBT's BIP 32 origins and nothing else.
+    struct HwSigner {
+        master: Xpriv,
+    }
+
+    impl HwSigner {
+        fn new(seed: u8) -> Self {
+            HwSigner { master: Xpriv::new_master(NetworkKind::Test, &[seed; 32]).unwrap() }
+        }
+
+        fn fingerprint(&self) -> Fingerprint {
+            self.master.fingerprint(&Secp256k1::new())
+        }
+
+        /// `[fp/path]tpub` for the account at `path`.
+        fn origin_xpub(&self, path: &str) -> String {
+            let secp = Secp256k1::new();
+            let account = self.master.derive_priv(&secp, &DerivationPath::from_str(path).unwrap()).unwrap();
+            let xpub = Xpub::from_priv(&secp, &account);
+            format!("[{}/{}]{xpub}", self.fingerprint(), path.trim_start_matches("m/"))
+        }
+
+        /// Sign every P2WSH key of ours the origins name.
+        fn sign_p2wsh(&self, psbt: &mut Psbt) -> usize {
+            let secp = Secp256k1::new();
+            let ws = psbt.inputs[0].witness_script.clone().expect("the descriptor added the witness script");
+            let sighash = SighashCache::new(&psbt.unsigned_tx)
+                .p2wsh_signature_hash(0, &ws, Amount::ZERO, EcdsaSighashType::All)
+                .unwrap()
+                .to_byte_array();
+            let mine: Vec<_> = psbt.inputs[0]
+                .bip32_derivation
+                .iter()
+                .filter(|(_, (fp, _))| *fp == self.fingerprint())
+                .map(|(pk, (_, path))| (*pk, path.clone()))
+                .collect();
+            for (pk, path) in &mine {
+                let sk = self.master.derive_priv(&secp, path).unwrap().private_key;
+                assert_eq!(sk.public_key(&secp), *pk);
+                let signature = secp.sign_ecdsa(&Message::from_digest(sighash), &sk);
+                psbt.inputs[0].partial_sigs.insert(
+                    PublicKey::new(*pk),
+                    bitcoin::ecdsa::Signature { signature, sighash_type: EcdsaSighashType::All },
+                );
+            }
+            mine.len()
+        }
+
+        /// Sign every tapscript key of ours the origins name.
+        fn sign_tapscript(&self, psbt: &mut Psbt) -> usize {
+            let secp = Secp256k1::new();
+            let prevouts = [psbt.inputs[0].witness_utxo.clone().unwrap()];
+            let mine: Vec<_> = psbt.inputs[0]
+                .tap_key_origins
+                .iter()
+                .filter(|(_, (_, (fp, _)))| *fp == self.fingerprint())
+                .flat_map(|(xonly, (leaves, (_, path)))| leaves.iter().map(move |l| (*xonly, *l, path.clone())))
+                .collect();
+            for (xonly, leaf, path) in &mine {
+                let sk = self.master.derive_priv(&secp, path).unwrap().private_key;
+                let key = Keypair::from_secret_key(&secp, &sk);
+                assert_eq!(key.x_only_public_key().0, *xonly);
+                let sighash = SighashCache::new(&psbt.unsigned_tx)
+                    .taproot_script_spend_signature_hash(0, &Prevouts::All(&prevouts), *leaf, TapSighashType::Default)
+                    .unwrap()
+                    .to_byte_array();
+                psbt.inputs[0].tap_script_sigs.insert((*xonly, *leaf), schnorr(sighash, &key));
+            }
+            mine.len()
+        }
+    }
+
+    fn spk_of(descriptor: &str, index: u32) -> ScriptBuf {
+        miniscript::Descriptor::<miniscript::DescriptorPublicKey>::from_str(descriptor)
+            .unwrap()
+            .at_derivation_index(index)
+            .unwrap()
+            .script_pubkey()
+    }
+
+    const ACCOUNT: &str = "m/48h/1h/0h/2h";
+
+    fn multisig(signers: &[HwSigner], branch: &str) -> String {
+        let keys: Vec<String> =
+            signers.iter().map(|s| format!("{}/{branch}/*", s.origin_xpub(ACCOUNT))).collect();
+        format!("wsh(sortedmulti(2,{}))", keys.join(","))
+    }
+
+    /// The case the hints are for: a 2-of-3 whose signers know nothing but
+    /// their master keys. The coin is at index 3 of the receive branch.
+    #[test]
+    fn a_ranged_multisig_descriptor_lets_hardware_signers_sign() {
+        let signers = [HwSigner::new(31), HwSigner::new(32), HwSigner::new(33)];
+        let descriptor = multisig(&signers, "0");
+        let spk = spk_of(&descriptor, 3);
+        let mut psbt = create(&spk, MESSAGE);
+        assert!(psbt.inputs[0].bip32_derivation.is_empty() && psbt.inputs[0].witness_script.is_none());
+
+        add_descriptor(&mut psbt, &descriptor).unwrap();
+        assert_eq!(psbt.inputs[0].bip32_derivation.len(), 3);
+        let mut a = psbt.clone();
+        let mut c = psbt.clone();
+        assert_eq!(signers[0].sign_p2wsh(&mut a), 1);
+        assert_eq!(signers[2].sign_p2wsh(&mut c), 1);
+        a.combine(c).unwrap();
+        assert!(matches!(finalize_valid(&a, &spk), Proof::Simple(_)));
+    }
+
+    /// A BIP 389 multipath descriptor, as wallets export it: the coin is on
+    /// the change branch.
+    #[test]
+    fn each_branch_of_a_multipath_descriptor_is_searched() {
+        let signers = [HwSigner::new(41), HwSigner::new(42)];
+        let descriptor = multisig(&signers, "<0;1>");
+        let change = multisig(&signers, "1");
+        let spk = spk_of(&change, 7);
+        let mut psbt = create(&spk, MESSAGE);
+        add_descriptor(&mut psbt, &descriptor).unwrap();
+        let mut a = psbt.clone();
+        let mut b = psbt.clone();
+        assert_eq!(signers[0].sign_p2wsh(&mut a) + signers[1].sign_p2wsh(&mut b), 2);
+        a.combine(b).unwrap();
+        finalize_valid(&a, &spk);
+
+        let three = multisig(&signers, "<0;1;2>");
+        assert_eq!(add_descriptor(&mut psbt, &three), Err(DescriptorError::TooManyBranches(3)));
+    }
+
+    #[test]
+    fn a_taproot_descriptor_adds_the_leaves_and_origins() {
+        let signers = [HwSigner::new(51), HwSigner::new(52)];
+        let internal = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+        let descriptor = format!(
+            "tr({internal},multi_a(2,{}/0/*,{}/0/*))",
+            signers[0].origin_xpub(ACCOUNT),
+            signers[1].origin_xpub(ACCOUNT)
+        );
+        let spk = spk_of(&descriptor, 0);
+        let mut psbt = create(&spk, MESSAGE);
+        add_descriptor(&mut psbt, &descriptor).unwrap();
+        assert_eq!(psbt.inputs[0].tap_scripts.len(), 1);
+        let mut a = psbt.clone();
+        let mut b = psbt.clone();
+        assert_eq!(signers[0].sign_tapscript(&mut a) + signers[1].sign_tapscript(&mut b), 2);
+        a.combine(b).unwrap();
+        assert!(matches!(finalize_valid(&a, &spk), Proof::Simple(_)));
+    }
+
+    #[test]
+    fn a_fixed_single_key_descriptor_adds_its_origin() {
+        let pk = public(1);
+        let spk = ScriptBuf::new_p2wpkh(&CompressedPublicKey(pk.inner).wpubkey_hash());
+        let mut psbt = create(&spk, MESSAGE);
+        add_descriptor(&mut psbt, &format!("wpkh([deadbeef/84h/1h/0h/0/5]{pk})")).unwrap();
+        let (fp, path) = &psbt.inputs[0].bip32_derivation[&pk.inner];
+        assert_eq!(fp.to_string(), "deadbeef");
+        assert_eq!(path.to_string(), "84'/1'/0'/0/5");
+    }
+
+    #[test]
+    fn unusable_descriptors_are_refused() {
+        let signers = [HwSigner::new(61), HwSigner::new(62)];
+        let spk = spk_of(&multisig(&signers, "0"), 0);
+        let mut psbt = create(&spk, MESSAGE);
+        let before = psbt.clone();
+
+        // Another wallet's: nothing in range derives the coin.
+        let other = multisig(&[HwSigner::new(63), HwSigner::new(64)], "0");
+        assert_eq!(add_descriptor(&mut psbt, &other), Err(DescriptorError::NoMatch));
+        // Beyond the search range.
+        let far = spk_of(&multisig(&signers, "0"), DESCRIPTOR_SEARCH_RANGE);
+        let mut far_psbt = create(&far, MESSAGE);
+        assert_eq!(add_descriptor(&mut far_psbt, &multisig(&signers, "0")), Err(DescriptorError::NoMatch));
+
+        let hardened = format!("wpkh({}/0/*h)", signers[0].origin_xpub(ACCOUNT));
+        assert_eq!(add_descriptor(&mut psbt, &hardened), Err(DescriptorError::HardenedWildcard));
+
+        // The node takes public descriptors only.
+        let xprv = HwSigner::new(65).master.to_string();
+        assert!(matches!(add_descriptor(&mut psbt, &format!("wpkh({xprv}/0/*)")), Err(DescriptorError::Parse(_))));
+        assert!(matches!(add_descriptor(&mut psbt, "wsh(nonsense)"), Err(DescriptorError::Parse(_))));
+        assert_eq!(psbt, before, "a refusal changes nothing");
+    }
 }

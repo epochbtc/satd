@@ -12,20 +12,38 @@
 //! `to_sign` is the default one and the challenge is native segwit, full
 //! otherwise.
 //!
+//! The node holds no keys and knows no wallet, so [`create`] cannot add the
+//! fields a signer uses to find its key (BIP 32 origins) or the script a
+//! multisig coin needs. [`add_descriptor`] adds them from the holder's
+//! public output descriptor, when one is given.
+//!
 //! Single-key inputs finalize through satd's own PSBT finalizer, the one
 //! `finalizepsbt` uses. Everything else (multisig, tapscript leaves, other
 //! scripts miniscript can satisfy) goes through rust-miniscript's. A script
 //! neither satisfies needs a `ful` signature built by the holder's own tools.
 
+use std::str::FromStr as _;
+
 use bitcoin::psbt::{Psbt, raw};
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Script, ScriptBuf, Witness};
+use miniscript::descriptor::Wildcard;
 use miniscript::psbt::PsbtExt as _;
+use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey as _};
 
 use super::{Proof, to_sign, to_spend};
 
 /// BIP 322's global PSBT field: no key data, the UTF-8 message as the value.
 pub const PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE: u8 = 0x09;
+
+/// The derivation indices of a ranged descriptor [`add_descriptor`]
+/// searches for the challenge, from 0: Bitcoin Core's default range for
+/// `utxoupdatepsbt` and `scantxoutset`.
+pub const DESCRIPTOR_SEARCH_RANGE: u32 = 1000;
+
+/// The most branches a BIP 389 multipath descriptor (`<0;1>`) may have:
+/// receive and change, as wallets export them.
+const MAX_DESCRIPTOR_BRANCHES: usize = 2;
 
 /// The magic bytes every serialized PSBT starts with.
 const PSBT_MAGIC: &[u8] = b"psbt\xff";
@@ -61,6 +79,25 @@ pub enum PsbtError {
     Incomplete(String),
 }
 
+/// Why [`add_descriptor`] added nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DescriptorError {
+    /// Not a public descriptor; one with private keys does not parse.
+    #[error("invalid descriptor: {0}")]
+    Parse(String),
+    #[error("a multipath descriptor may have at most {MAX_DESCRIPTOR_BRANCHES} branches, not {0}")]
+    TooManyBranches(usize),
+    #[error("a hardened wildcard cannot be derived from a public key")]
+    HardenedWildcard,
+    #[error(
+        "the descriptor does not derive the coin's scriptPubKey (ranged descriptors are searched at indices 0 to {})",
+        DESCRIPTOR_SEARCH_RANGE - 1
+    )]
+    NoMatch,
+    #[error("the descriptor could not update the PSBT: {0}")]
+    Update(String),
+}
+
 /// The `to_sign` PSBT for `message` against `challenge`, as BIP 322's
 /// creator builds it: version 0, input 0 carrying both `to_spend` and its
 /// output, and the message in field 0x09.
@@ -72,6 +109,54 @@ pub fn create(challenge: &Script, message: &[u8]) -> Psbt {
     psbt.inputs[0].non_witness_utxo = Some(spend);
     psbt.unknown.insert(message_key(), message.to_vec());
     psbt
+}
+
+/// Add what signers need from `descriptor`, the public output descriptor
+/// of the challenge, to input 0 of a [`create`]d PSBT: BIP 32 key origins,
+/// and the witness or redeem script, or the Taproot internal key and
+/// leaves. A ranged descriptor is searched for the index that derives the
+/// challenge, each branch of a multipath one in turn.
+pub fn add_descriptor(psbt: &mut Psbt, descriptor: &str) -> Result<(), DescriptorError> {
+    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor)
+        .map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    // Bounded before splitting, which clones the descriptor per branch.
+    let mut branches = 1;
+    descriptor.for_each_key(|k| {
+        if let DescriptorPublicKey::MultiXPub(x) = k {
+            branches = branches.max(x.derivation_paths.paths().len());
+        }
+        true
+    });
+    if branches > MAX_DESCRIPTOR_BRANCHES {
+        return Err(DescriptorError::TooManyBranches(branches));
+    }
+    // `at_derivation_index` panics on a hardened wildcard.
+    if descriptor.for_any_key(|k| match k {
+        DescriptorPublicKey::XPub(x) => x.wildcard == Wildcard::Hardened,
+        DescriptorPublicKey::MultiXPub(x) => x.wildcard == Wildcard::Hardened,
+        DescriptorPublicKey::Single(_) => false,
+    }) {
+        return Err(DescriptorError::HardenedWildcard);
+    }
+    let singles = descriptor.into_single_descriptors().map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    let challenge = match (&psbt.inputs[0].witness_utxo, &psbt.inputs[0].non_witness_utxo) {
+        (Some(utxo), _) => utxo.script_pubkey.clone(),
+        (None, Some(tx)) => tx.output[0].script_pubkey.clone(),
+        (None, None) => return Err(DescriptorError::NoMatch),
+    };
+    for single in singles {
+        let range = if single.has_wildcard() { DESCRIPTOR_SEARCH_RANGE } else { 1 };
+        for index in 0..range {
+            let definite =
+                single.at_derivation_index(index).map_err(|e| DescriptorError::Parse(e.to_string()))?;
+            if definite.script_pubkey() == challenge {
+                return psbt
+                    .update_input_with_descriptor(0, &definite)
+                    .map_err(|e| DescriptorError::Update(e.to_string()));
+            }
+        }
+    }
+    Err(DescriptorError::NoMatch)
 }
 
 fn message_key() -> raw::Key {

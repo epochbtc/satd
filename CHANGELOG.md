@@ -29,7 +29,8 @@ item below is (or will be) written up in full in the in-development
   judge them at every block. `-napstorerecover=1` starts with an empty store
   when the saved one does not read back; `-napmaxattestations` caps the store.
   Hardware and multisig signers sign the BIP 322 `to_sign` PSBT that
-  `createnapattestation` returns, and `submitnapattestation` finalizes it.
+  `createnapattestation` returns (with key origins and scripts filled in from
+  an optional descriptor), and `submitnapattestation` finalizes it.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,

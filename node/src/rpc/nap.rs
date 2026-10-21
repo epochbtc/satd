@@ -11,6 +11,7 @@ use bitcoin::{OutPoint, ScriptBuf};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::{Value, json};
 
+use crate::bip322;
 use crate::chain::state::ChainState;
 use crate::nap::publisher::{Published, encode_signature};
 use crate::nap::{NapSignature, PublishError, Publisher};
@@ -58,6 +59,17 @@ pub fn error(e: PublishError) -> ErrorObjectOwned {
     RpcError::new(code, category, message).with_debug(json!({ "rule": e.rule() })).into_error_object()
 }
 
+/// An unusable descriptor is -5, as Core reports one; one that does not
+/// derive the coin is -8.
+fn descriptor_error(e: bip322::psbt::DescriptorError) -> ErrorObjectOwned {
+    use bip322::psbt::DescriptorError as E;
+    let code = match e {
+        E::Parse(_) | E::TooManyBranches(_) | E::HardenedWildcard => -5,
+        E::NoMatch | E::Update(_) => -8,
+    };
+    RpcError::new(code, "rpc.input.parse", e.to_string()).into_error_object()
+}
+
 fn format_name(signature: &NapSignature) -> &'static str {
     match signature {
         NapSignature::Simple(_) => "simple",
@@ -77,16 +89,21 @@ fn formats_for(script: &ScriptBuf) -> Vec<&'static str> {
     }
 }
 
-/// `createnapattestation "outpoint" "key" "value"`.
+/// `createnapattestation "outpoint" "key" "value" ( "descriptor" )`. A
+/// descriptor adds key origins and scripts to the PSBT for signers.
 pub fn create(
     nap: &Publisher,
     chain: &ChainState,
     outpoint: &str,
     key: &str,
     value: &str,
+    descriptor: Option<&str>,
 ) -> Result<Value, ErrorObjectOwned> {
     let outpoint = parse_outpoint(outpoint)?;
-    let draft = nap.create(chain, outpoint, key, value).map_err(error)?;
+    let mut draft = nap.create(chain, outpoint, key, value).map_err(error)?;
+    if let Some(descriptor) = descriptor {
+        bip322::psbt::add_descriptor(&mut draft.psbt, descriptor).map_err(descriptor_error)?;
+    }
     let unit = default_unit();
     let mut out = json!({
         "message": draft.message,

@@ -106,7 +106,9 @@ ones.
    It checks that the coin exists and is old enough at the anchor. `formats`
    lists the signature formats the coin's script takes, and `address` is the
    address to sign with. `psbt` is the same request as a PSBT, for signers
-   that sign BIP 322 through one (see [Signing through a PSBT](#signing-through-a-psbt)). `warnings` names anything that will get in the way,
+   that sign BIP 322 through one; an optional fourth argument, the coin's
+   descriptor, fills in what they need (see
+   [Signing through a PSBT](#signing-through-a-psbt)). `warnings` names anything that will get in the way,
    such as a message too long for a Coldcard (330 characters) or an outpoint
    that already has 32 keys on this node.
 
@@ -175,7 +177,26 @@ the signed PSBT in place of a signature:
 sat-cli submitnapattestation "$MESSAGE" "cHNidP8BAD0AAAAAAf…"
 ```
 
-The node finalizes it, building the input's witness from the signatures, and
+A hardware signer finds the key to sign with through the PSBT's BIP 32 key
+origins, and a script coin also needs its script in the PSBT. satd holds no
+wallet and knows neither, so pass the coin's public output descriptor as
+`createnapattestation`'s fourth argument and the node adds them:
+
+```text
+sat-cli createnapattestation "<txid>:<vout>" "bip_xyz.support" "yes" \
+  "wsh(sortedmulti(2,[a1b2c3d4/48h/0h/0h/2h]xpub6E…/<0;1>/*,[e5f6a7b8/48h/0h/0h/2h]xpub6F…/<0;1>/*))"
+```
+
+The descriptor is the one your wallet exports, with key origins. It must
+hold public keys only; one with private keys is refused. A ranged
+descriptor is searched at indices 0 to 999, each branch of a `<0;1>`
+multipath one in turn, for the coin's address. A descriptor that does not
+parse is refused with `-5`, and one that does not derive the coin with
+`-8`. Without a descriptor the PSBT carries neither, and the wallet or
+coordinator that holds the coin's descriptor has to add them before the
+signer signs.
+
+The node finalizes the signed PSBT, building the input's witness from the signatures, and
 stores the proof: simple for a native segwit coin, full for P2SH-wrapped,
 P2PKH and bare scripts, or when the signer changed `to_sign`'s version,
 locktime or sequence. The PSBT must carry the message the node was given,
@@ -185,8 +206,7 @@ for the outpoint's own script.
   signature is enough.
 - **Multisig and other scripts**: the PSBT must also carry the script: the
   witness script for P2WSH, the redeem script for P2SH, or the leaf and its
-  control block for a Taproot script path. satd does not know a coin's
-  script, so the wallet or coordinator that holds the descriptor adds it.
+  control block for a Taproot script path, as the descriptor adds them.
   Each cosigner signs; merge their PSBTs with `combinepsbt`, or submit the
   coordinator's combined PSBT. The node finalizes any script that
   [miniscript](https://bitcoin.sipa.be/miniscript/) can satisfy with the
