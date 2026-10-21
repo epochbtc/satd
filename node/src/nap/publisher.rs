@@ -292,6 +292,13 @@ impl Publisher {
         };
         let replaced = match current {
             Some((cur, _)) if cur == att => {
+                // Already stored: nothing to write, but the verdict just
+                // reached is the current one, and decides serving. The
+                // writer lock is held, so the entry is still this one.
+                if let Some(e) = self.entries.lock().get_mut(&key) {
+                    e.status = Some(Ok(value));
+                    e.locks = locks;
+                }
                 return Ok((Published { attestation: att, status: Some(Ok(value)) }, None));
             }
             Some((cur, cur_locks)) => {

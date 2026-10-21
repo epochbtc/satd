@@ -547,3 +547,18 @@ fn the_store_holds_at_most_the_operators_limit() {
     let p = Publisher::open(path, &chain).unwrap().with_max_attestations(0);
     assert_eq!(submit(&p, &chain, &c), Ok(None));
 }
+
+/// Resubmitting a stored attestation that has just been judged valid serves
+/// it now, not at the next tip pass (which IBD can hold off).
+#[test]
+fn resubmitting_a_stored_attestation_updates_its_status() {
+    let (_dir, path) = store_path();
+    let (mut chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
+    store::save(&path, &store::encode([&att].into_iter())).unwrap();
+    chain.fork_at = ANCHOR;
+    let p = Publisher::open(path, &chain).unwrap();
+    assert!(p.serving().is_empty(), "judged without its anchor at open");
+    chain.fork_at = u32::MAX;
+    assert_eq!(submit(&p, &chain, &att), Ok(None));
+    assert_eq!(p.serving(), vec![att]);
+}
