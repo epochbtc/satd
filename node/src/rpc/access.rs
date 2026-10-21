@@ -154,6 +154,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getdescriptorinfo"
         | "verifymessage"
         | "verifybip322"
+        // NAP: building a message to sign and listing what is published
+        // read the chain and the publisher's store, and change neither.
+        | "createnapattestation"
+        | "listnapattestations"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---
@@ -215,7 +219,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "setmocktime"
         // blocks until the event bridges catch up; a settle barrier for
         // test harnesses, not a consumer read
-        | "syncwithvalidationinterfacequeue" => Control,
+        | "syncwithvalidationinterfacequeue"
+        // NAP: what this node publishes to its peers is the operator's call.
+        | "submitnapattestation"
+        | "removenapattestation" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,

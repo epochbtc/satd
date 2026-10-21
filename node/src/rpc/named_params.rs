@@ -124,6 +124,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "converttopsbt" => &[("hexstring", false), ("permitsigdata", false), ("iswitness", false)],
         // SATD_ONLY trailing argument: `psbt_version`. It sits after Core's
         // own, so a positional call written against Core is unaffected.
+        // SATD_ONLY: createnapattestation
+        "createnapattestation" => &[("outpoint", false), ("key", false), ("value", false)],
         "createpsbt" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false), ("psbt_version", false)],
         "createrawtransaction" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false)],
         "decodepsbt" => &[("psbt", false)],
@@ -210,6 +212,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "invalidateblock" => &[("blockhash", false)],
         "joinpsbts" => &[("txs", false)],
         "listbanned" => &[],
+        // SATD_ONLY: listnapattestations
+        "listnapattestations" => &[],
         "listquarantine" => &[("rule", false), ("count", false), ("skip", false)],
         "loadtxoutset" => &[("path", false)],
         "logging" => &[("include", false), ("exclude", false)],
@@ -220,6 +224,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "prioritisetransaction" => &[("txid", false), ("dummy", false), ("fee_delta", false)],
         "pruneblockchain" => &[("height", false)],
         "reconsiderblock" => &[("blockhash", false)],
+        // SATD_ONLY: removenapattestation
+        "removenapattestation" => &[("outpoint", false), ("key", false)],
         "resumeindex" => &[("index_name", false)],
         "savemempool" => &[],
         "scantxoutset" => &[("action", false), ("scanobjects", false)],
@@ -233,6 +239,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "stop" => &[("wait", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
         "submitheader" => &[("hexdata", false)],
+        // SATD_ONLY: submitnapattestation
+        "submitnapattestation" => &[("message", false), ("signature", false)],
         "submitpackage" => &[("package", false), ("maxfeerate", false), ("maxburnamount", false)],
         "subscribemempool" => &[],
         "syncwithvalidationinterfacequeue" => &[],
@@ -327,7 +335,7 @@ fn count_slots(body: &str) -> Option<usize> {
 /// to build the conversion table that Core's `rpc_help.py` test validates.
 pub(crate) const ALL_METHODS: &[&str] = &[
     "addconnection", "addnode", "addpeeraddress", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
-    "combinepsbt", "combinerawtransaction", "converttopsbt", "createpsbt",
+    "combinepsbt", "combinerawtransaction", "converttopsbt", "createnapattestation", "createpsbt",
     "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
     "deriveaddresses", "disconnectnode", "dumptxoutset",
     "echo", "echoipc", "echojson",
@@ -353,14 +361,14 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "getsysteminfo", "gettxout",
     "gettxoutproof", "gettxoutsetinfo", "gettxspendingprevout",
     "getwarnings", "getzmqnotifications",
-    "help", "invalidateblock", "joinpsbts", "listbanned",
+    "help", "invalidateblock", "joinpsbts", "listbanned", "listnapattestations",
     "listquarantine", "loadtxoutset", "logging",
     "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
     "pruneblockchain",
-    "reconsiderblock", "resumeindex", "savemempool", "scantxoutset",
+    "reconsiderblock", "removenapattestation", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
     "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
-    "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
+    "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
     "testmempoolaccept", "unsubscribemempool", "uptime",
     "utxoupdatepsbt", "validateaddress", "verifybip322", "verifychain", "verifymessage", "verifytxoutproof",
     "waitforblock", "waitforblockheight", "waitfornewblock",

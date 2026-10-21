@@ -176,6 +176,13 @@ reaches the node; for the streaming firehose with cursor replay, and the
 integrator guide to every silent-payment consumption mode, see
 [Silent Payments (BIP 352)](silent-payments.md).
 
+## Node attestation (NAP)
+
+`createnapattestation`, `submitnapattestation`, `listnapattestations` and
+`removenapattestation` publish coin-weighted statements signed by holders,
+with `-nap=1`. They have a chapter of their own:
+[Node Attestation (NAP)](nap.md).
+
 ## BIP 322 message verification
 
 `verifybip322 "address" "signature" "message"` verifies a

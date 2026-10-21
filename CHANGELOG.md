@@ -23,6 +23,12 @@ item below is (or will be) written up in full in the in-development
 - `verifybip322`: BIP 322 message verification for every address type
   (`smp`, `ful`, or unprefixed), on satd's own script interpreter.
 
+- Node Attestation Protocol publisher (`-nap=1`, off by default):
+  `createnapattestation`, `submitnapattestation`, `listnapattestations` and
+  `removenapattestation` store holders' signed, coin-weighted statements and
+  judge them at every block. `-napstorerecover=1` starts with an empty store
+  when the saved one does not read back; `-napmaxattestations` caps the store.
+
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering

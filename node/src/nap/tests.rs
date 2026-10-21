@@ -17,26 +17,26 @@ use crate::rpc::signmessage;
 
 // --- A chain to evaluate against ------------------------------------------
 
-const TIP: u32 = 40_000;
-const ANCHOR: u32 = TIP - ANCHOR_DEPTH;
-const COIN_HEIGHT: u32 = 1_000;
-const VALUE: Amount = Amount::from_sat(150_000);
+pub(super) const TIP: u32 = 40_000;
+pub(super) const ANCHOR: u32 = TIP - ANCHOR_DEPTH;
+pub(super) const COIN_HEIGHT: u32 = 1_000;
+pub(super) const VALUE: Amount = Amount::from_sat(150_000);
 
 /// Blocks `0..=tip`, each with a hash derived from its height and, from
 /// `fork_at` up, a fork byte: the same chain reorganised from `fork_at`.
-struct Chain {
-    tip: u32,
-    fork_at: u32,
-    coins: HashMap<OutPoint, Coin>,
+pub(super) struct Chain {
+    pub(super) tip: u32,
+    pub(super) fork_at: u32,
+    pub(super) coins: HashMap<OutPoint, Coin>,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Chain { tip: TIP, fork_at: u32::MAX, coins: HashMap::new() }
     }
 }
 
-fn hash_at(height: u32, fork: bool) -> BlockHash {
+pub(super) fn hash_at(height: u32, fork: bool) -> BlockHash {
     let mut b = [0u8; 32];
     b[..4].copy_from_slice(&height.to_le_bytes());
     b[4] = u8::from(fork);
@@ -45,7 +45,7 @@ fn hash_at(height: u32, fork: bool) -> BlockHash {
 }
 
 /// MTP grows 600 s a block.
-fn mtp(height: u32) -> u32 {
+pub(super) fn mtp(height: u32) -> u32 {
     1_600_000_000 + height * 600
 }
 
@@ -65,29 +65,29 @@ impl ChainView for Chain {
     }
 }
 
-fn outpoint(n: u8) -> OutPoint {
+pub(super) fn outpoint(n: u8) -> OutPoint {
     OutPoint { txid: Txid::from_byte_array([n; 32]), vout: u32::from(n) }
 }
 
 // --- Signers ----------------------------------------------------------------
 
-fn secret(byte: u8) -> SecretKey {
+pub(super) fn secret(byte: u8) -> SecretKey {
     SecretKey::from_slice(&[byte; 32]).unwrap()
 }
 
-fn compressed(sk: &SecretKey) -> CompressedPublicKey {
+pub(super) fn compressed(sk: &SecretKey) -> CompressedPublicKey {
     CompressedPublicKey(sk.public_key(&Secp256k1::new()))
 }
 
 /// How a test attestation is signed: the scriptPubKey it signs for, and a
 /// signer from the message text.
-struct Signer {
-    spk: ScriptBuf,
-    sign: Box<dyn Fn(&str) -> NapSignature>,
+pub(super) struct Signer {
+    pub(super) spk: ScriptBuf,
+    pub(super) sign: Box<dyn Fn(&str) -> NapSignature>,
 }
 
 /// BIP 322 simple, P2WPKH.
-fn p2wpkh() -> Signer {
+pub(super) fn p2wpkh() -> Signer {
     let sk = secret(1);
     let pk = compressed(&sk);
     let spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
@@ -108,7 +108,7 @@ fn p2wpkh() -> Signer {
 }
 
 /// Legacy, P2PKH.
-fn p2pkh() -> Signer {
+pub(super) fn p2pkh() -> Signer {
     let key = PrivateKey::new(secret(3), Network::Regtest);
     let spk = ScriptBuf::new_p2pkh(&key.public_key(&Secp256k1::new()).pubkey_hash());
     Signer {
@@ -122,7 +122,7 @@ fn p2pkh() -> Signer {
 
 /// BIP 322 full, P2WSH over `<prefix> <key> OP_CHECKSIG`, with `to_sign`'s
 /// version, locktime and sequence set.
-fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence: u32) -> Signer {
+pub(super) fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence: u32) -> Signer {
     let sk = secret(4);
     let pk = compressed(&sk);
     let ws = prefix.push_key(&pk.into()).push_opcode(OP_CHECKSIG).into_script();
@@ -151,7 +151,7 @@ fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence: u32) -> S
 }
 
 /// An attestation by `signer` for `op`, anchored at `anchor` on `chain`.
-fn attest(chain: &Chain, signer: &Signer, op: OutPoint, key: &str, value: &str, anchor: u32) -> Attestation {
+pub(super) fn attest(chain: &Chain, signer: &Signer, op: OutPoint, key: &str, value: &str, anchor: u32) -> Attestation {
     let hash = chain.block_hash(anchor).unwrap();
     let text = message::render(&op, key, value, anchor, &hash);
     Attestation::new(op, key.into(), value.into(), anchor, hash, (signer.sign)(&text)).unwrap()
@@ -159,7 +159,7 @@ fn attest(chain: &Chain, signer: &Signer, op: OutPoint, key: &str, value: &str, 
 
 /// A chain holding one coin for `signer` at `coin_height`, and an attestation
 /// for it anchored at `anchor`.
-fn setup(signer: &Signer, coin_height: u32, anchor: u32) -> (Chain, Attestation) {
+pub(super) fn setup(signer: &Signer, coin_height: u32, anchor: u32) -> (Chain, Attestation) {
     let mut chain = Chain::new();
     let op = outpoint(7);
     chain.coins.insert(op, Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: coin_height });
@@ -473,7 +473,7 @@ fn signature_rules() {
     // Simple is for native segwit only (D13).
     let (mut chain, att) = setup(&signer, COIN_HEIGHT, ANCHOR);
     chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = legacy.spk.clone();
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::SignatureInvalid(_))));
+    assert!(matches!(evaluate(&att, &chain), Err(Rejection::WrongFormat(_))));
 
     // An unknown witness version is inconclusive, and that is not valid.
     let future = Signer {
@@ -505,12 +505,12 @@ fn chain_state_rejections_are_distinguished_from_bad_signatures() {
 
 // --- D11 timelocks ------------------------------------------------------------
 
-fn cltv(lock: u32) -> Signer {
+pub(super) fn cltv(lock: u32) -> Signer {
     let prefix = Builder::new().push_int(i64::from(lock)).push_opcode(OP_CLTV).push_opcode(OP_DROP);
     p2wsh_full(prefix, 0, lock, Sequence::ENABLE_LOCKTIME_NO_RBF.0)
 }
 
-fn csv(sequence: u32) -> Signer {
+pub(super) fn csv(sequence: u32) -> Signer {
     let prefix = Builder::new().push_int(i64::from(sequence)).push_opcode(OP_CSV).push_opcode(OP_DROP);
     p2wsh_full(prefix, 2, 0, sequence)
 }
