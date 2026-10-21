@@ -4,8 +4,11 @@
 //! Six coinbases pay six script types. Once they are `MIN_COIN_AGE` blocks
 //! below the anchor, each is attested: P2WPKH (unprefixed simple), P2TR key
 //! path and script path, P2WSH 2-of-2 (`smp`), P2SH-P2WPKH (`ful`) and P2PKH
-//! (legacy, signed by the node's own `signmessagewithprivkey`). The test
-//! signs BIP 322 itself, over `node::bip322`'s virtual transactions.
+//! (legacy, signed by the node's own `signmessagewithprivkey`), plus a
+//! P2WSH 2-of-3 signed through the draft's PSBT: two signers sign copies,
+//! the node's `combinepsbt` merges them and `submitnapattestation`
+//! finalizes the result. The test signs BIP 322 itself, over
+//! `node::bip322`'s virtual transactions.
 
 mod common;
 
@@ -18,7 +21,7 @@ use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
 use bitcoin::{
-    Address, Amount, CompressedPublicKey, Network, PrivateKey, ScriptBuf, Transaction, TxOut,
+    Address, Amount, CompressedPublicKey, Network, PrivateKey, Psbt, ScriptBuf, Transaction, TxOut,
     Witness,
 };
 use std::process::Command;
@@ -63,13 +66,20 @@ fn schnorr(sighash: [u8; 32], keypair: &Keypair) -> bitcoin::taproot::Signature 
     bitcoin::taproot::Signature { signature, sighash_type: TapSighashType::Default }
 }
 
-/// Signs a message text, given the node (for `signmessagewithprivkey`).
-type Sign = Box<dyn Fn(&TestNode, &str) -> String>;
+/// Signs a `createnapattestation` draft, given the node (for
+/// `signmessagewithprivkey` and `combinepsbt`).
+type Sign = Box<dyn Fn(&TestNode, &Value) -> String>;
+
+fn message_of(draft: &Value) -> &str {
+    draft["message"].as_str().unwrap()
+}
 
 /// A coin's owner: its address and how it signs a message.
 struct Holder {
     name: &'static str,
     address: Address,
+    /// Passed to `createnapattestation`, for the PSBT.
+    descriptor: Option<String>,
     formats: Value,
     sign: Sign,
 }
@@ -87,8 +97,10 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2wpkh",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
-        sign: Box::new(move |_, message| {
+        sign: Box::new(move |_, draft| {
+            let message = message_of(draft);
             let tx = to_sign(&spk, message);
             let sighash = SighashCache::new(&tx)
                 .p2wpkh_signature_hash(0, &spk, Amount::ZERO, EcdsaSighashType::All)
@@ -105,8 +117,10 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2tr key path",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
-        sign: Box::new(move |_, message| {
+        sign: Box::new(move |_, draft| {
+            let message = message_of(draft);
             let tx = to_sign(&spk, message);
             let prevout = [TxOut { value: Amount::ZERO, script_pubkey: spk.clone() }];
             let sighash = SighashCache::new(&tx)
@@ -132,8 +146,10 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2tr script path",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
-        sign: Box::new(move |_, message| {
+        sign: Box::new(move |_, draft| {
+            let message = message_of(draft);
             let tx = to_sign(&spk, message);
             let prevout = [TxOut { value: Amount::ZERO, script_pubkey: spk.clone() }];
             let sighash = SighashCache::new(&tx)
@@ -166,8 +182,10 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2wsh 2-of-2",
         address,
+        descriptor: None,
         formats: json!(["simple", "full"]),
-        sign: Box::new(move |_, message| {
+        sign: Box::new(move |_, draft| {
+            let message = message_of(draft);
             let tx = to_sign(&spk, message);
             let sighash = SighashCache::new(&tx)
                 .p2wsh_signature_hash(0, &ws, Amount::ZERO, EcdsaSighashType::All)
@@ -191,8 +209,10 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2sh-p2wpkh",
         address,
+        descriptor: None,
         formats: json!(["full"]),
-        sign: Box::new(move |_, message| {
+        sign: Box::new(move |_, draft| {
+            let message = message_of(draft);
             let mut tx = to_sign(&spk, message);
             let push = PushBytesBuf::try_from(redeem.to_bytes()).unwrap();
             tx.input[0].script_sig = Builder::new().push_slice(push).into_script();
@@ -210,12 +230,52 @@ fn holders() -> Vec<Holder> {
     out.push(Holder {
         name: "p2pkh",
         address,
+        descriptor: None,
         formats: json!(["legacy", "full"]),
-        sign: Box::new(move |node, message| {
+        sign: Box::new(move |node, draft| {
+            let message = message_of(draft);
             node.rpc_ok("signmessagewithprivkey", vec![json!(key.to_wif()), json!(message)])
                 .as_str()
                 .unwrap()
                 .to_string()
+        }),
+    });
+
+    // P2WSH 2-of-3 through the PSBT: the draft is asked for with the coin's
+    // descriptor, so the PSBT carries the witness script; each signer signs
+    // its own copy, as a hardware signer would, and the node combines and
+    // finalizes them.
+    let keys = [secret(9), secret(10), secret(11)];
+    let mut ws = Builder::new().push_opcode(OP_PUSHNUM_2);
+    for sk in &keys {
+        ws = ws.push_key(&compressed(sk).into());
+    }
+    let ws = ws.push_opcode(OP_PUSHNUM_3).push_opcode(OP_CHECKMULTISIG).into_script();
+    let address = Address::p2wsh(&ws, net);
+    let pks: Vec<String> = keys.iter().map(|sk| compressed(sk).to_string()).collect();
+    out.push(Holder {
+        name: "p2wsh 2-of-3 psbt",
+        address,
+        descriptor: Some(format!("wsh(multi(2,{}))", pks.join(","))),
+        formats: json!(["simple", "full"]),
+        sign: Box::new(move |node, draft| {
+            let psbt = base64::engine::general_purpose::STANDARD.decode(draft["psbt"].as_str().unwrap()).unwrap();
+            let psbt = Psbt::deserialize(&psbt).unwrap();
+            assert_eq!(psbt.inputs[0].witness_script.as_ref(), Some(&ws), "the descriptor added it");
+            let copies: Vec<Value> = [&keys[0], &keys[2]]
+                .iter()
+                .map(|sk| {
+                    let mut copy = psbt.clone();
+                    let sighash = SighashCache::new(&copy.unsigned_tx)
+                        .p2wsh_signature_hash(0, &ws, Amount::ZERO, EcdsaSighashType::All)
+                        .unwrap();
+                    copy.inputs[0]
+                        .partial_sigs
+                        .insert(compressed(sk).into(), ecdsa(sighash.to_byte_array(), sk));
+                    json!(b64(&copy.serialize()))
+                })
+                .collect();
+            node.rpc_ok("combinepsbt", vec![json!(copies)]).as_str().unwrap().to_string()
         }),
     });
     out
@@ -248,32 +308,53 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     // Not yet old enough: one block short, at the anchor.
     let young = node.rpc_call_with_params(
         "createnapattestation",
-        vec![json!(format!("{}:0", coinbase_txid_at(&node, 7))), json!("k"), json!("v")],
+        vec![json!(format!("{}:0", coinbase_txid_at(&node, holders.len() as u64 + 1))), json!("k"), json!("v")],
     );
     let (code, msg) = error_of(young.unwrap());
     assert_eq!(code, -26);
     assert!(msg.contains("coin-too-young"), "{msg}");
 
     for (h, op) in holders.iter().zip(&outpoints) {
-        let draft = node.rpc_ok("createnapattestation", vec![json!(op), json!("bip_xyz.support"), json!("yes")]);
+        let mut params = vec![json!(op), json!("bip_xyz.support"), json!("yes")];
+        if let Some(d) = &h.descriptor {
+            params.push(json!(d));
+            // A descriptor that does not parse is -5; one for another coin, -8.
+            let mut bad = params.clone();
+            bad[3] = json!("wsh(nonsense)");
+            assert_eq!(error_of(node.rpc_call_with_params("createnapattestation", bad.clone()).unwrap()).0, -5);
+            bad[3] = json!(d.replace("multi(2,", "multi(1,"));
+            let (code, msg) = error_of(node.rpc_call_with_params("createnapattestation", bad).unwrap());
+            assert_eq!(code, -8, "{msg}");
+            assert!(msg.contains("does not derive"), "{msg}");
+        }
+        let draft = node.rpc_ok("createnapattestation", params);
         assert_eq!(draft["address"], json!(h.address.to_string()), "{}", h.name);
         assert_eq!(draft["formats"], h.formats, "{}", h.name);
         assert_eq!(draft["warnings"], json!([]), "{}", h.name);
-        let message = draft["message"].as_str().unwrap();
-        let signature = (h.sign)(&node, message);
+        let message = message_of(&draft);
+        let signature = (h.sign)(&node, &draft);
 
         // A signature over other text is refused, naming the rule.
         let other = message.replace("value: yes", "value: no");
         let r = node.rpc_call_with_params("submitnapattestation", vec![json!(other), json!(signature)]).unwrap();
         let (code, msg) = error_of(r);
-        assert_eq!(code, -26, "{}", h.name);
-        assert!(msg.contains("signature-invalid"), "{}: {msg}", h.name);
+        if h.name.ends_with("psbt") {
+            // A PSBT carries its message, so the mismatch is caught first.
+            assert_eq!(code, -8, "{}", h.name);
+            assert!(msg.contains("different message"), "{}: {msg}", h.name);
+        } else {
+            assert_eq!(code, -26, "{}", h.name);
+            assert!(msg.contains("signature-invalid"), "{}: {msg}", h.name);
+        }
 
         let stored = node.rpc_ok("submitnapattestation", vec![json!(message), json!(signature)]);
         assert_eq!(stored["status"], "valid", "{}: {stored}", h.name);
         assert_eq!(stored["outpoint"], json!(op));
         assert_eq!(stored["amount"].as_f64(), Some(50.0), "{}", h.name);
         assert_eq!(stored["replaced"], Value::Null);
+        if h.name.ends_with("psbt") {
+            assert_eq!(stored["format"], "simple", "a default to_sign finalizes to simple");
+        }
     }
     let before = list(&node);
     assert_eq!(before.len(), holders.len());
@@ -285,15 +366,16 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
 
     // The store survives a restart.
     node.stop();
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", "--napmaxattestations=6"]);
+    let max = format!("--napmaxattestations={}", holders.len());
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", &max]);
     assert_eq!(list(&node), before);
 
     // At the -napmaxattestations limit a new key is refused.
     let draft = node.rpc_ok("createnapattestation", vec![json!(outpoints[1]), json!("another.key"), json!("v")]);
     let warnings = draft["warnings"].to_string();
     assert!(warnings.contains("-napmaxattestations"), "{warnings}");
-    let message = draft["message"].as_str().unwrap();
-    let signature = (holders[1].sign)(&node, message);
+    let message = message_of(&draft);
+    let signature = (holders[1].sign)(&node, &draft);
     let r = node.rpc_call_with_params("submitnapattestation", vec![json!(message), json!(signature)]).unwrap();
     let (code, msg) = error_of(r);
     assert_eq!(code, -26);

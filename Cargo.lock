@@ -2982,6 +2982,7 @@ dependencies = [
  "jsonrpsee",
  "libc",
  "lru",
+ "miniscript",
  "node-filter-index",
  "node-index",
  "node-sp-index",

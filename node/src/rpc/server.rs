@@ -4249,9 +4249,10 @@ pub async fn start(
         let outpoint: String = args.required("outpoint")?;
         let key: String = args.required("key")?;
         let value: String = args.required("value")?;
+        let descriptor: Option<String> = args.optional("descriptor")?;
         args.check()?;
         let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
-        crate::rpc::nap::create(nap, &ctx.chain_state, &outpoint, &key, &value)
+        crate::rpc::nap::create(nap, &ctx.chain_state, &outpoint, &key, &value, descriptor.as_deref())
     })?;
 
     module.register_method("submitnapattestation", |params, ctx, _extensions| {

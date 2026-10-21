@@ -26,6 +26,8 @@
 //! Proof-of-funds (`pof`) signatures are not supported: they prove other
 //! UTXOs through a PSBT, which needs a UTXO view this module does not have.
 
+pub mod psbt;
+
 use std::cell::Cell;
 
 use bitcoin::hashes::{Hash as _, HashEngine as _, sha256};

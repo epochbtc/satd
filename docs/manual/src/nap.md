@@ -98,19 +98,23 @@ ones.
      "amount": 0.25000000,
      "address": "bc1q…",
      "formats": ["simple", "full"],
+     "psbt": "cHNidP8BAD0AAAAAAf…",
      "warnings": []
    }
    ```
 
    It checks that the coin exists and is old enough at the anchor. `formats`
    lists the signature formats the coin's script takes, and `address` is the
-   address to sign with. `warnings` names anything that will get in the way,
+   address to sign with. `psbt` is the same request as a PSBT, for signers
+   that sign BIP 322 through one; an optional fourth argument, the coin's
+   descriptor, fills in what they need (see
+   [Signing through a PSBT](#signing-through-a-psbt)). `warnings` names anything that will get in the way,
    such as a message too long for a Coldcard (330 characters) or an outpoint
    that already has 32 keys on this node.
 
 2. Sign the message in the wallet that holds the coin (see the next section).
 
-3. Submit the message and the signature:
+3. Submit the message and the signature, or the signed PSBT:
 
    ```text
    sat-cli submitnapattestation "$MESSAGE" "smpAkcwRAIg…"
@@ -152,14 +156,72 @@ signatures in the prefixed form.
 |---|---|---|
 | P2WPKH, P2TR key path | simple | BIP 322 message signing in Sparrow (`smp`), Unisat, Xverse and Leather (unprefixed) |
 | P2PKH | legacy | Bitcoin Core's `signmessage`, Electrum, Trezor, Jade, or `signmessagewithprivkey` |
-| P2WSH and P2TR script paths, multisig | simple or full | A BIP 322 tool that builds the witness for the script, such as the Rust `bip322` crate or btcd |
+| P2WSH and P2TR script paths, multisig | simple or full | The PSBT, signed by each cosigner, or a BIP 322 tool that builds the witness for the script, such as the Rust `bip322` crate or btcd |
 | P2SH-wrapped segwit, P2SH, bare scripts | full | As above. BIP 322's simple format covers native segwit only |
 | Timelocked scripts | full | As above, with `to_sign`'s locktime and sequence set |
 
 Wallet support changes quickly. Check your wallet's documentation for BIP 322
 before relying on a row above. Hardware signers and multisig coordinators
-mostly sign BIP 322 through a PSBT of the `to_sign` transaction; satd does
-not build or finalize that PSBT in this build.
+mostly sign BIP 322 through a PSBT, described next.
+
+### Signing through a PSBT
+
+`createnapattestation` returns `psbt`: BIP 322's `to_sign` transaction as a
+version 0 PSBT. Its input spends the virtual `to_spend` transaction, which
+the PSBT carries as the input's UTXO, and the message is in BIP 322's global
+field `0x09`. A signer signs it the way it signs a transaction; one that
+knows the field shows it as a message to sign rather than a payment. Submit
+the signed PSBT in place of a signature:
+
+```text
+sat-cli submitnapattestation "$MESSAGE" "cHNidP8BAD0AAAAAAf…"
+```
+
+A hardware signer finds the key to sign with through the PSBT's BIP 32 key
+origins, and a script coin also needs its script in the PSBT. satd holds no
+wallet and knows neither, so pass the coin's public output descriptor as
+`createnapattestation`'s fourth argument and the node adds them:
+
+```text
+sat-cli createnapattestation "<txid>:<vout>" "bip_xyz.support" "yes" \
+  "wsh(sortedmulti(2,[a1b2c3d4/48h/0h/0h/2h]xpub6E…/<0;1>/*,[e5f6a7b8/48h/0h/0h/2h]xpub6F…/<0;1>/*))"
+```
+
+The descriptor is the one your wallet exports, with key origins. It must
+hold public keys only; one with private keys is refused, as is one with a
+hardened step after an xpub, which a public key cannot derive. A ranged
+descriptor is searched at indices 0 to 999, each branch of a `<0;1>`
+multipath one in turn, for the coin's address. A descriptor that does not
+parse is refused with `-5`, and one that does not derive the coin with
+`-8`. Without a descriptor the PSBT carries neither, and the wallet or
+coordinator that holds the coin's descriptor has to add them before the
+signer signs.
+
+The node finalizes the signed PSBT, building the input's witness from the signatures, and
+stores the proof: simple for a native segwit coin, full for P2SH-wrapped,
+P2PKH and bare scripts, or when the signer changed `to_sign`'s version,
+locktime or sequence. The PSBT must carry the message the node was given,
+for the outpoint's own script.
+
+- **Single key** (P2WPKH, P2TR key path, P2SH-P2WPKH, P2PKH): the signer's
+  signature is enough.
+- **Multisig and other scripts**: the PSBT must also carry the script: the
+  witness script for P2WSH, the redeem script for P2SH, or the leaf and its
+  control block for a Taproot script path, as the descriptor adds them.
+  Each cosigner signs; merge their PSBTs with `combinepsbt`, or submit the
+  coordinator's combined PSBT. The node finalizes any script that
+  [miniscript](https://bitcoin.sipa.be/miniscript/) can satisfy with the
+  signatures given, which covers `multi`, `sortedmulti` and `multi_a`. For
+  a script outside miniscript, or a timelocked one, build a `ful` signature
+  with your own tools.
+- **Coldcard** signs these PSBTs (from firmware 5.5.1, and 1.4.1 on the Q),
+  shows them as messages, and returns the signed PSBT without finalizing
+  it, which is what the node expects.
+
+A PSBT is refused with `-8` when it lacks the message field, has more than
+one input (proof of funds), has any output but the zero-value `OP_RETURN`,
+signs another message or another coin, or is not fully signed; the message
+says which.
 
 **Coldcard** signs messages of up to 330 characters. Everything in a NAP
 message but the key and value comes to about 195 characters (more for a
@@ -237,7 +299,7 @@ and `removenapattestation` decide what the node publishes and need
 | Error | Meaning |
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
-| `-8` | The message, signature, key, value or outpoint is malformed, or `removenapattestation` found nothing to remove. |
+| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, or `removenapattestation` found nothing to remove. |
 | `-1` | NAP is disabled, or the chain moved during the call (try again). |
 
 ## Privacy and key exposure

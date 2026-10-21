@@ -125,7 +125,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         // SATD_ONLY trailing argument: `psbt_version`. It sits after Core's
         // own, so a positional call written against Core is unaffected.
         // SATD_ONLY: createnapattestation
-        "createnapattestation" => &[("outpoint", false), ("key", false), ("value", false)],
+        "createnapattestation" => &[("outpoint", false), ("key", false), ("value", false), ("descriptor", false)],
         "createpsbt" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false), ("psbt_version", false)],
         "createrawtransaction" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false)],
         "decodepsbt" => &[("psbt", false)],

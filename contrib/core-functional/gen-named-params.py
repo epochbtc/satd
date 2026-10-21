@@ -311,7 +311,7 @@ SATD_ONLY = {
     "policytest": [["rawtx", False]],
     "verifybip322": [["address", False], ["signature", False], ["message", False]],
     # NAP publisher RPCs (docs/manual/src/nap.md).
-    "createnapattestation": [["outpoint", False], ["key", False], ["value", False]],
+    "createnapattestation": [["outpoint", False], ["key", False], ["value", False], ["descriptor", False]],
     "listnapattestations": [],
     "removenapattestation": [["outpoint", False], ["key", False]],
     "submitnapattestation": [["message", False], ["signature", False]],
