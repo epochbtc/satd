@@ -18,10 +18,15 @@
 //! | `-rpcclientcert=<pem>` | client certificate, for an mTLS listener |
 //! | `-rpcclientkey=<pem>` | its private key |
 //!
-//! `-rpccacert` is *additive*: the platform trust store still applies, so
-//! a node behind a publicly-trusted certificate needs no CA flag at all. A
-//! private CA — which is what `contrib/stack/tls/mkca.sh` issues, and what
-//! the appliance image installs — is named explicitly.
+//! Without `-rpccacert` the client trusts the public CA roots compiled into
+//! the binary (the Mozilla set from `webpki-roots`), so a node behind a
+//! publicly-trusted certificate needs no CA flag at all. With it, the client
+//! trusts **only** the certificates in that file. A private CA — which is
+//! what `contrib/stack/tls/mkca.sh` issues, and what the appliance image
+//! installs — is named explicitly, and naming it also takes every public CA
+//! out of the connection: a public CA that issues a certificate for the
+//! node's hostname, whether by mistake or because its key leaked, cannot
+//! stand in for the node and collect the RPC credential.
 //!
 //! Point `-rpccacert` at the certificate that **issued** the one the server
 //! presents. For a node using a genuinely self-signed certificate, which is
@@ -36,8 +41,10 @@
 //! plain-HTTP loopback listener it would replace.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, pki_types::CertificateDer};
 
 #[derive(Debug, Error)]
 pub enum ClientTlsError {
@@ -47,18 +54,15 @@ pub enum ClientTlsError {
         path: String,
         source: std::io::Error,
     },
-    #[error("{path} is not a usable CA certificate: {source}")]
-    BadCa {
-        path: String,
-        source: reqwest::Error,
-    },
+    #[error("{path} is not a usable CA certificate: {reason}")]
+    BadCa { path: String, reason: String },
     #[error("{path} contains no PEM certificates")]
     EmptyCa { path: String },
-    #[error("client certificate/key pair in {cert} + {key} is unusable: {source}")]
+    #[error("client certificate/key pair in {cert} + {key} is unusable: {reason}")]
     BadIdentity {
         cert: String,
         key: String,
-        source: reqwest::Error,
+        reason: String,
     },
     #[error("--rpcclientcert requires --rpcclientkey (and vice versa)")]
     IncompleteIdentity,
@@ -68,7 +72,7 @@ pub enum ClientTlsError {
     )]
     TlsMaterialWithoutTls,
     #[error("cannot build the HTTPS client: {0}")]
-    Build(reqwest::Error),
+    Build(String),
 }
 
 /// The client-side TLS flags, as parsed from the command line.
@@ -80,7 +84,7 @@ pub enum ClientTlsError {
 pub struct ClientTlsOptions {
     /// `-rpctls`: use `https://` for the RPC endpoint.
     pub enabled: bool,
-    /// `-rpccacert`: extra trust anchor, in addition to the platform roots.
+    /// `-rpccacert`: the only trust anchors; replaces the public roots.
     pub ca_cert: Option<PathBuf>,
     /// `-rpcclientcert`: client certificate for an mTLS listener.
     pub client_cert: Option<PathBuf>,
@@ -127,7 +131,10 @@ impl ClientTlsOptions {
     /// Apply these options to a `reqwest` client builder.
     ///
     /// Callers keep ownership of the builder so they can set their own
-    /// timeouts and headers; this only layers on the TLS material.
+    /// timeouts and headers; this only layers on the TLS material. With
+    /// `-rpctls` the builder gets a complete rustls configuration, so any
+    /// root certificate or identity already added to `builder` is replaced,
+    /// not merged.
     pub fn apply(
         &self,
         builder: reqwest::ClientBuilder,
@@ -136,54 +143,50 @@ impl ClientTlsOptions {
         if !self.enabled {
             return Ok(builder);
         }
+        let config = self.client_config(public_roots)?;
+        Ok(builder.use_preconfigured_tls(config))
+    }
 
-        let mut builder = builder;
-
-        if let Some(path) = &self.ca_cert {
-            let pem = read_file(path, "CA certificate")?;
-            // A PEM bundle may hold an intermediate as well as the root, and
-            // an operator handed a chain file should not have to split it.
-            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|source| {
-                ClientTlsError::BadCa {
-                    path: path.display().to_string(),
-                    source,
-                }
-            })?;
-            // A file with no PEM blocks parses "successfully" into an empty
-            // list. Accepting that would add no trust anchor at all and then
-            // fail the handshake with an opaque TLS error — the operator who
-            // pointed this at a private key, a DER file, or the wrong path
-            // would have no way to tell that from an unrelated network
-            // problem. Refuse by name instead.
-            if certs.is_empty() {
-                return Err(ClientTlsError::EmptyCa {
-                    path: path.display().to_string(),
-                });
-            }
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
-            }
+    /// The rustls configuration behind [`apply`](Self::apply).
+    /// `public_roots` supplies the trust anchors used when no `-rpccacert`
+    /// is given; tests pass a stand-in for the compiled-in set.
+    fn client_config(
+        &self,
+        public_roots: impl FnOnce() -> RootCertStore,
+    ) -> Result<ClientConfig, ClientTlsError> {
+        let roots = match &self.ca_cert {
+            // Only the named file. The public roots are deliberately not
+            // added: an operator who names the CA that issued the node's
+            // certificate has said which authority may vouch for the node,
+            // and any other CA that signs for the same hostname is the
+            // attacker this flag exists to keep out.
+            Some(path) => ca_roots(path)?,
+            None => public_roots(),
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ClientTlsError::Build(e.to_string()))?
+            .with_root_certificates(roots);
+        let (Some(cert_path), Some(key_path)) = (&self.client_cert, &self.client_key) else {
+            return Ok(builder.with_no_client_auth());
+        };
+        let bad_identity = |reason: String| ClientTlsError::BadIdentity {
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+            reason,
+        };
+        let chain = pem_certs(&read_file(cert_path, "client certificate")?)
+            .map_err(|e| bad_identity(e.to_string()))?;
+        if chain.is_empty() {
+            return Err(bad_identity("no certificate in the certificate file".into()));
         }
-
-        if let (Some(cert_path), Some(key_path)) = (&self.client_cert, &self.client_key) {
-            let mut pem = read_file(cert_path, "client certificate")?;
-            let key = read_file(key_path, "client key")?;
-            // reqwest's rustls `Identity::from_pem` wants one buffer holding
-            // both the certificate chain and the key, in either order.
-            if !pem.ends_with(b"\n") {
-                pem.push(b'\n');
-            }
-            pem.extend_from_slice(&key);
-            let identity =
-                reqwest::Identity::from_pem(&pem).map_err(|source| ClientTlsError::BadIdentity {
-                    cert: cert_path.display().to_string(),
-                    key: key_path.display().to_string(),
-                    source,
-                })?;
-            builder = builder.identity(identity);
-        }
-
-        Ok(builder)
+        let key = rustls_pemfile::private_key(&mut read_file(key_path, "client key")?.as_slice())
+            .map_err(|e| bad_identity(e.to_string()))?
+            .ok_or_else(|| bad_identity("no private key in the key file".into()))?;
+        builder
+            .with_client_auth_cert(chain, key)
+            .map_err(|e| bad_identity(e.to_string()))
     }
 
     /// Build a client with these options applied to `builder`.
@@ -191,8 +194,47 @@ impl ClientTlsOptions {
         &self,
         builder: reqwest::ClientBuilder,
     ) -> Result<reqwest::Client, ClientTlsError> {
-        self.apply(builder)?.build().map_err(ClientTlsError::Build)
+        self.apply(builder)?
+            .build()
+            .map_err(|e| ClientTlsError::Build(e.to_string()))
     }
+}
+
+/// The public CA roots compiled into the binary.
+fn public_roots() -> RootCertStore {
+    RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    }
+}
+
+/// Every certificate in a `-rpccacert` file, as the only trust anchors.
+fn ca_roots(path: &Path) -> Result<RootCertStore, ClientTlsError> {
+    let bad_ca = |reason: String| ClientTlsError::BadCa {
+        path: path.display().to_string(),
+        reason,
+    };
+    // A PEM bundle may hold an intermediate as well as the root, and an
+    // operator handed a chain file should not have to split it.
+    let certs = pem_certs(&read_file(path, "CA certificate")?).map_err(|e| bad_ca(e.to_string()))?;
+    // A file with no PEM blocks parses "successfully" into an empty list.
+    // Accepting that would add no trust anchor at all and then fail the
+    // handshake with an opaque TLS error — the operator who pointed this at
+    // a private key, a DER file, or the wrong path would have no way to tell
+    // that from an unrelated network problem. Refuse by name instead.
+    if certs.is_empty() {
+        return Err(ClientTlsError::EmptyCa {
+            path: path.display().to_string(),
+        });
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(|e| bad_ca(e.to_string()))?;
+    }
+    Ok(roots)
+}
+
+fn pem_certs(pem: &[u8]) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    rustls_pemfile::certs(&mut &pem[..]).collect()
 }
 
 fn read_file(path: &Path, what: &'static str) -> Result<Vec<u8>, ClientTlsError> {
@@ -335,14 +377,30 @@ mod tests {
         cert_pem: &str,
         key_pem: &str,
     ) -> (u16, tokio::task::JoinHandle<()>) {
+        spawn_tls_server_requiring(cert_pem, key_pem, None).await
+    }
+
+    /// As `spawn_tls_server`, and with `client_ca` set the server requires
+    /// a client certificate issued by it (an mTLS listener).
+    async fn spawn_tls_server_requiring(
+        cert_pem: &str,
+        key_pem: &str,
+        client_ca: Option<&str>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, cert_pem).unwrap();
         std::fs::write(&key_path, key_pem).unwrap();
-        let acceptor =
-            crate::build_acceptor(&cert_path, &key_path, &crate::ClientAuthPolicy::Disabled)
-                .expect("acceptor");
+        let policy = match client_ca {
+            Some(pem) => {
+                let ca_path = dir.path().join("client-ca.pem");
+                std::fs::write(&ca_path, pem).unwrap();
+                crate::ClientAuthPolicy::Required { ca_path }
+            }
+            None => crate::ClientAuthPolicy::Disabled,
+        };
+        let acceptor = crate::build_acceptor(&cert_path, &key_path, &policy).expect("acceptor");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -406,8 +464,8 @@ mod tests {
         server.abort();
     }
 
-    /// The same server, with no `-rpccacert`: the platform trust store does
-    /// not know this certificate, so the handshake must fail. Without this
+    /// The same server, with no `-rpccacert`: the public roots do not know
+    /// this certificate, so the handshake must fail. Without this
     /// the test above would pass even if the CA argument were ignored
     /// entirely.
     #[tokio::test]
@@ -457,6 +515,56 @@ mod tests {
         server.abort();
     }
 
+    /// The point of `-rpccacert`: once a CA is named, no other authority the
+    /// client would trust can vouch for the server. A public CA that signs
+    /// for the node's hostname, by mistake or with a leaked key, is exactly
+    /// that other authority. `public` stands in for the compiled-in roots.
+    /// The first request proves the server verifies through them, so the
+    /// refusal that follows comes from naming the CA and nothing else.
+    #[tokio::test]
+    async fn rpccacert_replaces_the_public_roots() {
+        let server_cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let (port, server) =
+            spawn_tls_server(&server_cert.cert.pem(), &server_cert.key_pair.serialize_pem()).await;
+        let public = || {
+            let mut roots = RootCertStore::empty();
+            roots.add(server_cert.cert.der().clone()).unwrap();
+            roots
+        };
+        let client = |opts: ClientTlsOptions| {
+            let config = opts.client_config(public).unwrap();
+            reqwest::Client::builder()
+                .use_preconfigured_tls(config)
+                .build()
+                .unwrap()
+        };
+
+        let no_ca = ClientTlsOptions {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            get(&client(no_ca), port).await.unwrap(),
+            200,
+            "without -rpccacert the public roots must verify the server"
+        );
+
+        let operator_ca = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("operator-ca.pem");
+        std::fs::write(&ca_path, operator_ca.cert.pem()).unwrap();
+        let named_ca = ClientTlsOptions {
+            enabled: true,
+            ca_cert: Some(ca_path),
+            ..Default::default()
+        };
+        assert!(
+            get(&client(named_ca), port).await.is_err(),
+            "with -rpccacert, a certificate only a public root vouches for must not verify"
+        );
+        server.abort();
+    }
+
     /// The name on the certificate still has to match. A private CA is a
     /// trust anchor, not a licence to ignore the SAN — an appliance issues
     /// its leaf for `<host>.local` precisely so this check passes.
@@ -480,6 +588,52 @@ mod tests {
         assert!(
             get(&client, port).await.is_err(),
             "a certificate issued for another name must not verify"
+        );
+        server.abort();
+    }
+
+    /// An mTLS listener accepts the client certificate given with
+    /// `-rpcclientcert` / `-rpcclientkey`, and refuses the same client
+    /// without it, so the identity really is presented in the handshake.
+    #[tokio::test]
+    async fn the_client_certificate_is_presented_to_an_mtls_listener() {
+        let server_cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+        let client_cert = rcgen::generate_simple_self_signed(["client".to_string()]).unwrap();
+        let (port, server) = spawn_tls_server_requiring(
+            &server_cert.cert.pem(),
+            &server_cert.key_pair.serialize_pem(),
+            Some(&client_cert.cert.pem()),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&ca_path, server_cert.cert.pem()).unwrap();
+        std::fs::write(&cert_path, client_cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, client_cert.key_pair.serialize_pem()).unwrap();
+
+        let with_identity = ClientTlsOptions {
+            enabled: true,
+            ca_cert: Some(ca_path.clone()),
+            client_cert: Some(cert_path),
+            client_key: Some(key_path),
+        }
+        .build(reqwest::Client::builder())
+        .unwrap();
+        assert_eq!(get(&with_identity, port).await.unwrap(), 200);
+
+        let without = ClientTlsOptions {
+            enabled: true,
+            ca_cert: Some(ca_path),
+            ..Default::default()
+        }
+        .build(reqwest::Client::builder())
+        .unwrap();
+        assert!(
+            get(&without, port).await.is_err(),
+            "an mTLS listener must refuse a client that presents no certificate"
         );
         server.abort();
     }
