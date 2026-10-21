@@ -309,6 +309,7 @@ SATD_ONLY = {
     ],
     "listquarantine": [["rule", False], ["count", False], ["skip", False]],
     "policytest": [["rawtx", False]],
+    "verifybip322": [["address", False], ["signature", False], ["message", False]],
     "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "echoipc": [["arg", False]],

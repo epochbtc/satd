@@ -153,6 +153,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "deriveaddresses"
         | "getdescriptorinfo"
         | "verifymessage"
+        | "verifybip322"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---

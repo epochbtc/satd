@@ -241,6 +241,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "uptime" => &[],
         "utxoupdatepsbt" => &[("psbt", false), ("descriptors", false)],
         "validateaddress" => &[("address", false)],
+        // SATD_ONLY: verifybip322
+        "verifybip322" => &[("address", false), ("signature", false), ("message", false)],
         "verifychain" => &[("checklevel", false), ("nblocks", false)],
         "verifymessage" => &[("address", false), ("signature", false), ("message", false)],
         "verifytxoutproof" => &[("proof", false)],
@@ -360,7 +362,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
     "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
     "testmempoolaccept", "unsubscribemempool", "uptime",
-    "utxoupdatepsbt", "validateaddress", "verifychain", "verifymessage", "verifytxoutproof",
+    "utxoupdatepsbt", "validateaddress", "verifybip322", "verifychain", "verifymessage", "verifytxoutproof",
     "waitforblock", "waitforblockheight", "waitfornewblock",
 ];
 

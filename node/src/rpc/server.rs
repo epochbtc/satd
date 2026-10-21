@@ -176,6 +176,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("resumeindex", "Util"),
     ("signmessagewithprivkey", "Util"),
     ("validateaddress", "Util"),
+    ("verifybip322", "Util"),
     ("verifymessage", "Util"),
     // == Zmq ==
     ("getzmqnotifications", "Zmq"),
@@ -4219,6 +4220,16 @@ pub async fn start(
             R::PubkeyNotRecovered | R::NotSigned => Ok(false),
             R::Ok => Ok(true),
         }
+    })?;
+
+    module.register_method("verifybip322", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let address: String = args.required("address")?;
+        let signature: String = args.required("signature")?;
+        let message: String = args.required("message")?;
+        args.check()?;
+        crate::rpc::signmessage::verify_bip322(&address, &signature, &message, ctx.chain_state.network)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("signmessagewithprivkey", |params, ctx, _extensions| {

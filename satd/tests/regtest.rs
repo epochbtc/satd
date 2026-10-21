@@ -5312,6 +5312,31 @@ fn test_signmessagewithprivkey_and_verifymessage() {
     node.stop();
 }
 
+/// `verifybip322` over JSON-RPC: the legacy path with Core's regtest
+/// vector, and the error and invalid shapes. The BIP 322 formats are tested
+/// against the BIP's vectors in `node::bip322`.
+#[test]
+fn test_verifybip322() {
+    let mut node = TestNode::start(&[]);
+    let j = |v: &str| serde_json::json!(v);
+    let addr = "mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB";
+    let sig = "INbVnW4e6PeRmsv2Qgu8NuopvrVjkcxob+sX8OcZG0SALhWybUjzMLPdAsXI46YZGb0KQTRii+wWIQzRpG/U+S0=";
+    let msg = "This is just a test message";
+    let call = |a: &str, s: &str, m: &str| node.rpc_call_with_params("verifybip322", vec![j(a), j(s), j(m)]).unwrap();
+
+    assert_eq!(call(addr, sig, msg)["result"], serde_json::json!({"result": "valid", "format": "legacy"}));
+    let r = call(addr, sig, "other message");
+    assert_eq!(r["result"]["result"], "invalid");
+    assert_eq!(r["result"]["format"], "legacy");
+    // A mainnet address is not a regtest address.
+    assert_eq!(call("bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l", sig, msg)["error"]["code"], -5);
+    assert_eq!(call(addr, "pofAAAA", msg)["error"]["code"], -8);
+    // Three arguments, no more.
+    let r = node.rpc_call_with_params("verifybip322", vec![j(addr), j(sig), j(msg), j("x")]).unwrap();
+    assert_eq!(r["error"]["code"], -1);
+    node.stop();
+}
+
 #[test]
 fn test_waitforblockheight() {
     let mut node = TestNode::start(&[]);

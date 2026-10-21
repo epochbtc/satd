@@ -1,4 +1,5 @@
 pub mod adaptive_cache;
+pub mod bip322;
 pub mod chain;
 pub mod diskspace;
 pub mod events;
