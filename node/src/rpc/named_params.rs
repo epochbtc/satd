@@ -228,6 +228,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "setban" => &[("subnet", false), ("command", false), ("bantime", false), ("absolute", false)],
         "setmocktime" => &[("timestamp", false)],
         "setnetworkactive" => &[("state", false)],
+        "signmessagewithprivkey" => &[("privkey", false), ("message", false)],
         "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
         "stop" => &[("wait", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
@@ -241,6 +242,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "utxoupdatepsbt" => &[("psbt", false), ("descriptors", false)],
         "validateaddress" => &[("address", false)],
         "verifychain" => &[("checklevel", false), ("nblocks", false)],
+        "verifymessage" => &[("address", false), ("signature", false), ("message", false)],
         "verifytxoutproof" => &[("proof", false)],
         "waitforblock" => &[("blockhash", false), ("timeout", false)],
         "waitforblockheight" => &[("height", false), ("timeout", false)],
@@ -355,10 +357,10 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "pruneblockchain",
     "reconsiderblock", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
-    "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
+    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
     "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
     "testmempoolaccept", "unsubscribemempool", "uptime",
-    "utxoupdatepsbt", "validateaddress", "verifychain", "verifytxoutproof",
+    "utxoupdatepsbt", "validateaddress", "verifychain", "verifymessage", "verifytxoutproof",
     "waitforblock", "waitforblockheight", "waitfornewblock",
 ];
 

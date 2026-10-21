@@ -5233,6 +5233,85 @@ fn test_validateaddress() {
     node.stop();
 }
 
+/// Core's `rpc_signmessagewithprivkey.py` (v31.1), assertion for assertion.
+#[test]
+fn test_signmessagewithprivkey_and_verifymessage() {
+    let mut node = TestNode::start(&[]);
+    let j = |v: &str| serde_json::json!(v);
+    let message = "This is just a test message";
+    let priv_key = "cUeKHd5orzT3mz8P9pxyREHfsWtVfgsfDjiZZBcjUBAaGk1BTj7N";
+    let expected =
+        "INbVnW4e6PeRmsv2Qgu8NuopvrVjkcxob+sX8OcZG0SALhWybUjzMLPdAsXI46YZGb0KQTRii+wWIQzRpG/U+S0=";
+    let error_of = |r: serde_json::Value| -> (i64, String) {
+        let e = &r["error"];
+        (e["code"].as_i64().unwrap(), e["message"].as_str().unwrap().to_string())
+    };
+
+    let r = node
+        .rpc_call_with_params("signmessagewithprivkey", vec![j(priv_key), j(message)])
+        .unwrap();
+    assert_eq!(r["result"], expected);
+
+    // pkh(), sh(wpkh()) and wpkh() of the same key.
+    let p2pkh = "mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB";
+    let r = node
+        .rpc_call_with_params("verifymessage", vec![j(p2pkh), j(expected), j(message)])
+        .unwrap();
+    assert_eq!(r["result"], true);
+    let r = node
+        .rpc_call_with_params("verifymessage", vec![j(p2pkh), j(expected), j("other message")])
+        .unwrap();
+    assert_eq!(r["result"], false);
+    for desc in [format!("sh(wpkh({priv_key}))"), format!("wpkh({priv_key})")] {
+        let info = node.rpc_call_with_params("getdescriptorinfo", vec![j(&desc)]).unwrap();
+        let desc = format!("{desc}#{}", info["result"]["checksum"].as_str().unwrap());
+        let addr = node.rpc_call_with_params("deriveaddresses", vec![j(&desc)]).unwrap();
+        let addr = addr["result"][0].as_str().unwrap().to_string();
+        let r = node
+            .rpc_call_with_params("verifymessage", vec![j(&addr), j(expected), j(message)])
+            .unwrap();
+        assert_eq!(error_of(r), (-3, "Address does not refer to key".to_string()), "{addr}");
+    }
+
+    // Wrong argument counts: -1, naming the method.
+    for n in [0, 1, 3, 4, 5] {
+        let r = node
+            .rpc_call_with_params("signmessagewithprivkey", vec![j("dummy"); n])
+            .unwrap();
+        let (code, msg) = error_of(r);
+        assert_eq!(code, -1, "{n} params");
+        assert!(msg.contains("signmessagewithprivkey"), "{n} params: {msg}");
+    }
+    for n in [0, 1, 2, 4, 5] {
+        let r = node.rpc_call_with_params("verifymessage", vec![j("dummy"); n]).unwrap();
+        let (code, msg) = error_of(r);
+        assert_eq!(code, -1, "{n} params");
+        assert!(msg.contains("verifymessage"), "{n} params: {msg}");
+    }
+
+    let r = node
+        .rpc_call_with_params("signmessagewithprivkey", vec![j("invalid_key"), j(message)])
+        .unwrap();
+    assert_eq!(error_of(r), (-5, "Invalid private key".to_string()));
+    // A mainnet key is not a regtest key.
+    let r = node
+        .rpc_call_with_params(
+            "signmessagewithprivkey",
+            vec![j("L3VFeEujGtevx9w18HD1fhRbCH67Az2dpCymeRE1SoPK6XQtaN2k"), j(message)],
+        )
+        .unwrap();
+    assert_eq!(error_of(r), (-5, "Invalid private key".to_string()));
+    let r = node
+        .rpc_call_with_params("verifymessage", vec![j("invalid_addr"), j(expected), j(message)])
+        .unwrap();
+    assert_eq!(error_of(r), (-5, "Invalid address".to_string()));
+    let r = node
+        .rpc_call_with_params("verifymessage", vec![j(p2pkh), j("invalid_sig"), j(message)])
+        .unwrap();
+    assert_eq!(error_of(r), (-3, "Malformed base64 encoding".to_string()));
+    node.stop();
+}
+
 #[test]
 fn test_waitforblockheight() {
     let mut node = TestNode::start(&[]);

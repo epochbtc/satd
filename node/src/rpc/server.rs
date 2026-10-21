@@ -174,7 +174,9 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getsatdindexinfo", "Util"),
     ("pauseindex", "Util"),
     ("resumeindex", "Util"),
+    ("signmessagewithprivkey", "Util"),
     ("validateaddress", "Util"),
+    ("verifymessage", "Util"),
     // == Zmq ==
     ("getzmqnotifications", "Zmq"),
     // == hidden ==
@@ -4183,6 +4185,67 @@ pub async fn start(
             ctx.chain_state.network,
         )
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("verifymessage", |params, ctx, _extensions| {
+        use crate::rpc::signmessage::{MessageVerificationResult as R, message_verify};
+        let mut args = Args::new(&params);
+        let help = |e: ErrorObjectOwned| {
+            if e.code() == -1 {
+                // Core answers a missing required argument with the help text.
+                ErrorObjectOwned::owned(
+                    -1,
+                    "verifymessage \"address\" \"signature\" \"message\"\n\n\
+                     Verify a signed message.\n\n\
+                     Arguments:\n\
+                     1. address      (string, required) The bitcoin address to use for the signature.\n\
+                     2. signature    (string, required) The signature provided by the signer in base 64 encoding (see signmessage).\n\
+                     3. message      (string, required) The message that was signed.\n",
+                    None::<()>,
+                )
+            } else {
+                e
+            }
+        };
+        let address: String = args.required("address").map_err(help)?;
+        let signature: String = args.required("signature").map_err(help)?;
+        let message: String = args.required("message").map_err(help)?;
+        args.check()?;
+        let err = |code: i32, msg: &str| Err(ErrorObjectOwned::owned(code, msg.to_string(), None::<()>));
+        match message_verify(&address, &signature, &message, ctx.chain_state.network) {
+            R::InvalidAddress => err(-5, "Invalid address"),
+            R::AddressNoKey => err(-3, "Address does not refer to key"),
+            R::MalformedSignature => err(-3, "Malformed base64 encoding"),
+            R::PubkeyNotRecovered | R::NotSigned => Ok(false),
+            R::Ok => Ok(true),
+        }
+    })?;
+
+    module.register_method("signmessagewithprivkey", |params, ctx, _extensions| {
+        use crate::rpc::signmessage::{decode_secret, message_sign};
+        let mut args = Args::new(&params);
+        let help = |e: ErrorObjectOwned| {
+            if e.code() == -1 {
+                ErrorObjectOwned::owned(
+                    -1,
+                    "signmessagewithprivkey \"privkey\" \"message\"\n\n\
+                     Sign a message with the private key of an address\n\n\
+                     Arguments:\n\
+                     1. privkey    (string, required) The private key to sign the message with.\n\
+                     2. message    (string, required) The message to create a signature of.\n",
+                    None::<()>,
+                )
+            } else {
+                e
+            }
+        };
+        let privkey: String = args.required("privkey").map_err(help)?;
+        let message: String = args.required("message").map_err(help)?;
+        args.check()?;
+        let Some(key) = decode_secret(&privkey, ctx.chain_state.network) else {
+            return Err(ErrorObjectOwned::owned(-5, "Invalid private key", None::<()>));
+        };
+        Ok::<_, ErrorObjectOwned>(message_sign(&key, &message))
     })?;
 
     // --- Long-polling RPCs ---

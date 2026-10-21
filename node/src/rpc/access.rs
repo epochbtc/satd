@@ -152,6 +152,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "validateaddress"
         | "deriveaddresses"
         | "getdescriptorinfo"
+        | "verifymessage"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---
@@ -166,6 +167,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "decodescript"
         | "finalizepsbt"
         | "joinpsbts"
+        | "signmessagewithprivkey"
         | "signrawtransactionwithkey"
         | "utxoupdatepsbt"
         // Dry-run mempool acceptance check: validates against current state
