@@ -19,8 +19,8 @@ export const manifest = setupManifest({
         // the reference stack and the appliance perform and cannot drift from
         // them.
         //
-        // This pins the 0.6.0 release, the image release.yml built and
-        // cosign-signed for the v0.6.0 tag. Between releases it may pin a
+        // This pins the 0.6.2 release, the image release.yml built and
+        // cosign-signed for the v0.6.2 tag. Between releases it may pin a
         // master commit's `sha-` image instead, which docker.yml publishes
         // unsigned for that purpose; sync-store.sh refuses a `sha-` pin, so
         // such a pin cannot be published. The digest pins the OCI index,
@@ -32,7 +32,7 @@ export const manifest = setupManifest({
         //
         // Moving the pin to the next release, with versions/current.ts, is a
         // step in the release checklist.
-        dockerTag: 'ghcr.io/epochbtc/satd:0.6.0@sha256:4d963e3cdfd094be26f306d85c6da68f193864ca1f91f0dd31e2df1825bed3d2',
+        dockerTag: 'ghcr.io/epochbtc/satd:0.6.2@sha256:8a7a1e0a224015c15416a0f533fb0f7293a4045959e730d3e9f7704ba7c975c3',
       },
       // The image publishes linux/amd64 and linux/arm64 and nothing else, so
       // there is no riscv64 here and nothing to emulate it from.

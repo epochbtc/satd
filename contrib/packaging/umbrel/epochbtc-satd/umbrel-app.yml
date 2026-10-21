@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: epochbtc-satd
 category: bitcoin
 name: satd
-version: "0.6.1"
+version: "0.6.2"
 tagline: A Bitcoin full node in Rust, with Electrum and Esplora built in
 description: >-
   satd is a Bitcoin Core-compatible full node written in Rust. It speaks
@@ -58,27 +58,30 @@ path: "/status"
 # A community store may host its own icon; the official store hosts its own
 # and wants this unset. Pinned to the release tag so a later change on master
 # cannot alter an already-published listing.
-icon: https://raw.githubusercontent.com/epochbtc/satd/v0.6.1/contrib/packaging/startos/icon.png
+icon: https://raw.githubusercontent.com/epochbtc/satd/v0.6.2/contrib/packaging/startos/icon.png
 releaseNotes: >-
-  Updates satd to 0.6.1, a bug-fix release. Block validation, header sync
-  and peer handling now match Bitcoin Core in more places, initial sync no
-  longer stalls on a slow peer, a restart keeps the whole mempool, and
-  Electrum wallets no longer reconnect in a loop when an address has
-  unconfirmed transactions.
+  Updates satd to 0.6.2, a security release. satd now refuses TLS
+  certificates that chain through the eMudhra (emSign) intermediate
+  certificate authorities, whose private keys were disclosed on 2026-10-20.
+  Before this, anyone holding those keys could impersonate a webhook
+  receiver or a remote node to satd's TLS clients.
 
 
-  Updating from 0.6.0 needs no rebuild. Updating straight from 0.5.2
-  rebuilds the chainstate once on the first start, as 0.6.0 does, from the
-  block files already on disk; the status page shows its progress.
+  No rebuild is needed when updating from 0.6.0 or 0.6.1. Updating straight
+  from 0.5.2 rebuilds the chainstate once on the first start, from the block
+  files already on disk; the status page shows its progress.
 
 
-  Electrum and Esplora requests now time out after 30 seconds. A wallet that
-  reads a very long address history may need `electrumrequesttimeout`
-  raised in the app's bitcoin.conf.
+  Updating from 0.6.0 also brings the 0.6.1 fixes. Since 0.6.1, Electrum and
+  Esplora requests time out after 30 seconds. A wallet that reads a very long
+  address history may need `electrumrequesttimeout` raised in the app's
+  bitcoin.conf.
 
 
   Full notes:
-  https://github.com/epochbtc/satd/blob/v0.6.1/docs/release-notes/0.6.1.md
+  https://github.com/epochbtc/satd/blob/v0.6.2/docs/release-notes/0.6.2.md
+  and, for 0.6.1,
+  https://github.com/epochbtc/satd/blob/v0.6.2/docs/release-notes/0.6.1.md
 # Regenerable, and hundreds of gigabytes. What stays in the backup is what
 # cannot be re-derived: tls/ (the CA clients have imported), secrets/ (the MCP
 # token), authfile.toml and bitcoin.conf. `data/` is the directory mounted at
