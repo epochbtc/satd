@@ -166,15 +166,19 @@ const HELP_METHODS: &[(&str, &str)] = &[
     // == Util ==
     ("backfillindex", "Util"),
     ("cancelindex", "Util"),
+    ("createnapattestation", "Util"),
     ("deriveaddresses", "Util"),
     ("estimaterawfee", "Util"),
     ("estimatesmartfee", "Util"),
     ("getdescriptorinfo", "Util"),
     ("getindexinfo", "Util"),
     ("getsatdindexinfo", "Util"),
+    ("listnapattestations", "Util"),
     ("pauseindex", "Util"),
+    ("removenapattestation", "Util"),
     ("resumeindex", "Util"),
     ("signmessagewithprivkey", "Util"),
+    ("submitnapattestation", "Util"),
     ("validateaddress", "Util"),
     ("verifybip322", "Util"),
     ("verifymessage", "Util"),
@@ -741,6 +745,9 @@ pub struct RpcContext {
     /// workers. Set to `true` while an audit is in flight; released by
     /// the RAII guard `AuditInflightGuard`.
     pub blockfile_audit_running: Arc<std::sync::atomic::AtomicBool>,
+    /// The NAP publisher, `Some` with `-nap=1`. The NAP RPCs answer an
+    /// error without it.
+    pub nap: Option<Arc<crate::nap::Publisher>>,
 }
 
 /// RAII guard that releases the [`RpcContext::blockfile_audit_running`]
@@ -895,6 +902,8 @@ pub async fn start(
     // means only the full read/write listener on the consensus runtime is
     // served — the Core-compatible single-listener behavior.
     readonly: Option<ReadOnlyListener>,
+    // The NAP publisher (`-nap=1`), or `None`.
+    nap: Option<Arc<crate::nap::Publisher>>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Listener-status + shutdown_tx are needed both inside the RPC
     // context (so the `stop` RPC + `getserverstatus` can use them) AND
@@ -935,6 +944,7 @@ pub async fn start(
         #[cfg(feature = "block-filter-index")]
         filter_backfill_cmd_tx,
         blockfile_audit_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        nap,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -4230,6 +4240,42 @@ pub async fn start(
         args.check()?;
         crate::rpc::signmessage::verify_bip322(&address, &signature, &message, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    // --- NAP publisher (satd's own; `-nap=1`) ---
+
+    module.register_method("createnapattestation", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let outpoint: String = args.required("outpoint")?;
+        let key: String = args.required("key")?;
+        let value: String = args.required("value")?;
+        args.check()?;
+        let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
+        crate::rpc::nap::create(nap, &ctx.chain_state, &outpoint, &key, &value)
+    })?;
+
+    module.register_method("submitnapattestation", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let message: String = args.required("message")?;
+        let signature: String = args.required("signature")?;
+        args.check()?;
+        let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
+        crate::rpc::nap::submit(nap, &ctx.chain_state, &message, &signature)
+    })?;
+
+    module.register_method("listnapattestations", |params, ctx, _extensions| {
+        Args::new(&params).check()?;
+        let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
+        Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list(nap, &ctx.chain_state))
+    })?;
+
+    module.register_method("removenapattestation", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let outpoint: String = args.required("outpoint")?;
+        let key: String = args.required("key")?;
+        args.check()?;
+        let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
+        crate::rpc::nap::remove(nap, &outpoint, &key)
     })?;
 
     module.register_method("signmessagewithprivkey", |params, ctx, _extensions| {

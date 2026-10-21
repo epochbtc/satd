@@ -3,23 +3,29 @@
 //! An attestation is a holder's signed statement of one key-value pair for
 //! one outpoint, anchored to a recent block. It is valid at an evaluation tip
 //! while its anchor is on the active chain and fresh, and its coin is unspent
-//! and old enough; it counts with the coin's value. Nothing here touches the
-//! network or the store: [`validity`] reads chain state through
-//! [`validity::ChainView`].
+//! and old enough; it counts with the coin's value. [`validity`] reads chain
+//! state through [`validity::ChainView`], so the rules need no node.
 //!
 //! - [`message`]: the text the holder signs, rendered and parsed strictly.
 //! - [`wire`]: the serialized form, which peers exchange and which
 //!   [`Attestation::id`] hashes.
 //! - [`validity`]: the validity rules at a tip, and supersession.
+//! - [`publisher`]: the attestations this node publishes, kept in
+//!   [`store`] and judged at each tip; [`chain`] reads the node's chain
+//!   state for it.
 
+pub mod chain;
 pub mod message;
+pub mod publisher;
+pub mod store;
 pub mod validity;
 pub mod wire;
 
 use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{BlockHash, OutPoint, Transaction, Witness};
 
-pub use validity::{ChainView, Coin, Rejection, evaluate, select, supersedes};
+pub use publisher::{ChainSource, Publisher, PublishError};
+pub use validity::{ChainView, Coin, Rejection, Timelocks, evaluate, select, supersedes};
 pub use wire::FormatError;
 
 /// The attestation format version, the first byte of the wire form.
@@ -142,5 +148,7 @@ impl Attestation {
     }
 }
 
+#[cfg(test)]
+mod publisher_tests;
 #[cfg(test)]
 mod tests;

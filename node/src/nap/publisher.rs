@@ -1,0 +1,421 @@
+//! The publisher: the attestations this node stores and will serve.
+//!
+//! Holders submit signed attestations through the RPCs; the publisher
+//! checks each against the chain, keeps at most one per `(outpoint, key)`
+//! and at most [`MAX_KEYS_PER_OUTPOINT`] keys per outpoint (D3), and writes
+//! them to [`store`](super::store) on every change. At each new tip
+//! ([`Publisher::on_tip`]) it drops the attestations whose coin was spent
+//! and re-judges the rest; it serves only those valid at its own tip.
+//!
+//! A signature's result depends only on the coin's scriptPubKey, so each is
+//! verified once and cached; a tip costs the chain checks and the timelocks.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use bitcoin::hashes::sha256;
+use bitcoin::{Amount, BlockHash, OutPoint};
+use parking_lot::Mutex;
+
+use super::validity::{Timelocks, check_chain, check_timelocks, verify_signature};
+use super::{
+    ANCHOR_DEPTH, Attestation, ChainView, Coin, FormatError, LEGACY_SIGNATURE_LEN,
+    MAX_KEYS_PER_OUTPOINT, NapSignature, Rejection, message, store, supersedes,
+};
+use crate::bip322::{self, DecodeError, Proof, Signature};
+
+/// The longest message a Coldcard signs (D16).
+pub const COLDCARD_MESSAGE_LIMIT: usize = 330;
+
+/// Chain state for the publisher to read.
+pub trait ChainSource {
+    /// Run `read` against one chain state that does not change during it.
+    /// `read` may run more than once. `None` when the chain would not hold
+    /// still, which callers report as "try again".
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T>;
+}
+
+/// Why the publisher refused a request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PublishError {
+    /// The request itself is malformed: the message text, the signature
+    /// string, or a key or value.
+    #[error("{0}")]
+    Format(String),
+    /// The attestation is not valid at this node's tip.
+    #[error("{0}")]
+    Rejected(Rejection),
+    /// A valid attestation for the same `(outpoint, key)` already counts
+    /// over this one.
+    #[error("the attestation published for this key (anchor {anchor_height}) supersedes this one")]
+    Superseded { anchor_height: u32 },
+    /// The outpoint already has the most keys a publisher stores.
+    #[error("this node already publishes {MAX_KEYS_PER_OUTPOINT} keys for this outpoint")]
+    KeyLimit,
+    #[error("the chain is shorter than the anchor depth ({ANCHOR_DEPTH} blocks)")]
+    ChainTooShort,
+    /// The chain kept moving during the request.
+    #[error("the chain tip kept changing; try again")]
+    Busy,
+    #[error("no attestation is published for this outpoint and key")]
+    NotFound,
+    /// The store could not be written; nothing changed.
+    #[error("{0}")]
+    Io(String),
+}
+
+impl PublishError {
+    /// The rule's stable name, as RPCs report it.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            PublishError::Format(_) => "format",
+            PublishError::Rejected(r) => r.rule(),
+            PublishError::Superseded { .. } => "superseded",
+            PublishError::KeyLimit => "key-limit",
+            PublishError::ChainTooShort => "chain-too-short",
+            PublishError::Busy => "busy",
+            PublishError::NotFound => "not-found",
+            PublishError::Io(_) => "io",
+        }
+    }
+}
+
+impl From<FormatError> for PublishError {
+    fn from(e: FormatError) -> Self {
+        PublishError::Format(e.to_string())
+    }
+}
+
+/// What `createnapattestation` hands the holder to sign.
+#[derive(Debug, Clone)]
+pub struct Draft {
+    pub message: String,
+    pub anchor_height: u32,
+    pub anchor_hash: BlockHash,
+    pub coin: Coin,
+    pub warnings: Vec<String>,
+}
+
+/// A stored attestation.
+#[derive(Debug, Clone)]
+pub struct Published {
+    pub attestation: Attestation,
+    /// The attestation's validity at the tip it was last judged at, with
+    /// the coin's value when valid.
+    pub status: Result<Amount, Rejection>,
+}
+
+/// A stored attestation and what has been learned about it.
+struct Entry {
+    att: Attestation,
+    /// The signature's result, once the coin has been seen.
+    locks: Option<Result<Timelocks, Rejection>>,
+    /// Validity at the last tip it was judged at; `None` before the first.
+    status: Option<Result<Amount, Rejection>>,
+}
+
+/// One entry judged at one tip.
+enum Assessed {
+    /// The chain has reached the anchor and the coin is gone.
+    Spent,
+    Judged { status: Result<Amount, Rejection>, locks: Option<Result<Timelocks, Rejection>> },
+}
+
+type Key = (OutPoint, String);
+
+pub struct Publisher {
+    path: PathBuf,
+    entries: Mutex<BTreeMap<Key, Entry>>,
+}
+
+impl Publisher {
+    /// Load the store at `path` (a missing file is an empty store) and judge
+    /// every entry at `chain`'s tip.
+    pub fn open(path: PathBuf, chain: &impl ChainSource) -> Result<Self, String> {
+        let mut entries: BTreeMap<Key, Entry> = BTreeMap::new();
+        for att in store::load(&path)? {
+            let key = (att.outpoint(), att.key().to_owned());
+            if entries.get(&key).is_some_and(|e| !supersedes(&att, &e.att)) {
+                continue;
+            }
+            entries.insert(key, Entry { att, locks: None, status: None });
+        }
+        let publisher = Publisher { path, entries: Mutex::new(entries) };
+        publisher.on_tip(chain);
+        Ok(publisher)
+    }
+
+    /// The message for `outpoint`, `key` and `value`, anchored
+    /// [`ANCHOR_DEPTH`] blocks below the tip, after checking that the coin
+    /// exists and is old enough at that anchor.
+    pub fn create(
+        &self,
+        chain: &impl ChainSource,
+        outpoint: OutPoint,
+        key: &str,
+        value: &str,
+    ) -> Result<Draft, PublishError> {
+        message::check_key(key.as_bytes())?;
+        message::check_value(value.as_bytes())?;
+        let read = chain
+            .read(&|v| {
+                let anchor_height = v.tip_height().checked_sub(ANCHOR_DEPTH)?;
+                Some((anchor_height, v.block_hash(anchor_height), v.coin(&outpoint)))
+            })
+            .ok_or(PublishError::Busy)?;
+        let (anchor_height, anchor_hash, coin) = read.ok_or(PublishError::ChainTooShort)?;
+        let anchor_hash = anchor_hash.ok_or(PublishError::Busy)?;
+        let coin = coin.ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
+        if u64::from(coin.height) + u64::from(super::MIN_COIN_AGE) > u64::from(anchor_height) {
+            return Err(PublishError::Rejected(Rejection::CoinTooYoung {
+                coin_height: coin.height,
+                anchor_height,
+            }));
+        }
+
+        let text = message::render(&outpoint, key, value, anchor_height, &anchor_hash);
+        let mut warnings = Vec::new();
+        if text.len() > COLDCARD_MESSAGE_LIMIT {
+            warnings.push(format!(
+                "the message is {} characters; a Coldcard signs at most {COLDCARD_MESSAGE_LIMIT}",
+                text.len()
+            ));
+        }
+        let entries = self.entries.lock();
+        if !entries.contains_key(&(outpoint, key.to_owned()))
+            && keys_for(&entries, outpoint) >= MAX_KEYS_PER_OUTPOINT
+        {
+            warnings.push(format!(
+                "this node already publishes {MAX_KEYS_PER_OUTPOINT} keys for this outpoint, \
+                 so it will refuse this one"
+            ));
+        }
+        Ok(Draft { message: text, anchor_height, anchor_hash, coin, warnings })
+    }
+
+    /// Check a signed message and store it. Returns the stored attestation
+    /// and the id of the one it replaced, if any. Submitting an attestation
+    /// that is already stored changes nothing.
+    pub fn submit(
+        &self,
+        chain: &impl ChainSource,
+        text: &str,
+        signature: &str,
+    ) -> Result<(Published, Option<sha256::Hash>), PublishError> {
+        let msg = message::parse(text)?;
+        let coin = chain
+            .read(&|v| v.coin(&msg.outpoint))
+            .ok_or(PublishError::Busy)?
+            .ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
+        let signature = decode_signature(signature, &coin)?;
+        let att = Attestation::new(
+            msg.outpoint,
+            msg.key,
+            msg.value,
+            msg.anchor_height,
+            msg.anchor_hash,
+            signature,
+        )?;
+        let (status, locks) = match chain.read(&|v| assess(&att, None, v)).ok_or(PublishError::Busy)? {
+            Assessed::Judged { status, locks } => (status, locks),
+            Assessed::Spent => (Err(Rejection::CoinNotFound), None),
+        };
+        let value = status.map_err(PublishError::Rejected)?;
+
+        let key = (att.outpoint(), att.key().to_owned());
+        let mut entries = self.entries.lock();
+        let replaced = match entries.get(&key) {
+            Some(cur) if cur.att == att => {
+                return Ok((Published { attestation: att, status: Ok(value) }, None));
+            }
+            Some(cur) => {
+                let cur_valid = chain
+                    .read(&|v| assess(&cur.att, cur.locks.clone(), v))
+                    .is_none_or(|a| matches!(a, Assessed::Judged { status: Ok(_), .. }));
+                if cur_valid && !supersedes(&att, &cur.att) {
+                    return Err(PublishError::Superseded { anchor_height: cur.att.anchor_height() });
+                }
+                Some(cur.att.id())
+            }
+            None if keys_for(&entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT => {
+                return Err(PublishError::KeyLimit);
+            }
+            None => None,
+        };
+        let entry = Entry { att: att.clone(), locks, status: Some(Ok(value)) };
+        let previous = entries.insert(key.clone(), entry);
+        if let Err(e) = self.save(&entries) {
+            match previous {
+                Some(p) => entries.insert(key, p),
+                None => entries.remove(&key),
+            };
+            return Err(PublishError::Io(e));
+        }
+        tracing::info!(
+            target: "nap",
+            outpoint = %att.outpoint(),
+            key = att.key(),
+            anchor = att.anchor_height(),
+            "NAP: publishing attestation"
+        );
+        Ok((Published { attestation: att, status: Ok(value) }, replaced))
+    }
+
+    /// Every stored attestation, judged at `chain`'s tip, ordered by
+    /// outpoint and key.
+    pub fn list(&self, chain: &impl ChainSource) -> Vec<Published> {
+        let mut entries = self.entries.lock();
+        entries
+            .values_mut()
+            .map(|e| {
+                if let Some(Assessed::Judged { status, locks }) =
+                    chain.read(&|v| assess(&e.att, e.locks.clone(), v))
+                {
+                    e.status = Some(status);
+                    e.locks = locks;
+                }
+                let status = e.status.clone().unwrap_or(Err(Rejection::CoinNotFound));
+                Published { attestation: e.att.clone(), status }
+            })
+            .collect()
+    }
+
+    /// Stop publishing the attestation for `outpoint` and `key`. Copies
+    /// already collected stay valid; only signing an empty value withdraws.
+    pub fn remove(&self, outpoint: OutPoint, key: &str) -> Result<Attestation, PublishError> {
+        let k = (outpoint, key.to_owned());
+        let mut entries = self.entries.lock();
+        let entry = entries.remove(&k).ok_or(PublishError::NotFound)?;
+        if let Err(e) = self.save(&entries) {
+            entries.insert(k, entry);
+            return Err(PublishError::Io(e));
+        }
+        Ok(entry.att)
+    }
+
+    /// The attestations valid at the tip last judged, which are the ones
+    /// this node serves.
+    pub fn serving(&self) -> Vec<Attestation> {
+        self.entries
+            .lock()
+            .values()
+            .filter(|e| matches!(e.status, Some(Ok(_))))
+            .map(|e| e.att.clone())
+            .collect()
+    }
+
+    /// Judge every entry at `chain`'s new tip: drop those whose coin was
+    /// spent, and warn about each that lost its anchor to a reorg.
+    pub fn on_tip(&self, chain: &impl ChainSource) {
+        let mut entries = self.entries.lock();
+        let mut spent = Vec::new();
+        for (key, e) in entries.iter_mut() {
+            let Some(assessed) = chain.read(&|v| assess(&e.att, e.locks.clone(), v)) else {
+                continue;
+            };
+            let (status, locks) = match assessed {
+                Assessed::Spent => {
+                    spent.push(key.clone());
+                    continue;
+                }
+                Assessed::Judged { status, locks } => (status, locks),
+            };
+            let was_valid = matches!(e.status, Some(Ok(_)));
+            match &status {
+                Err(Rejection::AnchorNotOnChain) if was_valid => tracing::warn!(
+                    target: "nap",
+                    outpoint = %e.att.outpoint(),
+                    key = e.att.key(),
+                    anchor = e.att.anchor_height(),
+                    "NAP: a reorg removed the anchor block of a published attestation; \
+                     it is not served until signed again"
+                ),
+                Err(r) if was_valid => tracing::info!(
+                    target: "nap",
+                    outpoint = %e.att.outpoint(),
+                    key = e.att.key(),
+                    rule = r.rule(),
+                    "NAP: attestation is no longer valid and is not served: {r}"
+                ),
+                _ => {}
+            }
+            e.status = Some(status);
+            e.locks = locks;
+        }
+        if spent.is_empty() {
+            return;
+        }
+        for key in &spent {
+            entries.remove(key);
+            tracing::info!(target: "nap", outpoint = %key.0, key = key.1, "NAP: coin spent; attestation dropped");
+        }
+        if let Err(e) = self.save(&entries) {
+            tracing::error!(target: "nap", "NAP: could not write the attestation store: {e}");
+        }
+    }
+
+    fn save(&self, entries: &BTreeMap<Key, Entry>) -> Result<(), String> {
+        store::save(&self.path, &store::encode(entries.values().map(|e| &e.att)))
+    }
+}
+
+/// How many keys `outpoint` has in `entries`.
+fn keys_for(entries: &BTreeMap<Key, Entry>, outpoint: OutPoint) -> usize {
+    entries.range((outpoint, String::new())..).take_while(|((op, _), _)| *op == outpoint).count()
+}
+
+/// Judge `att` at `view`'s tip, verifying its signature unless `cached`
+/// already holds the result.
+fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &dyn ChainView) -> Assessed {
+    // Below the anchor the node is behind (a reindex, say) and a missing coin
+    // proves nothing. At or above it, the coin, which confirmed at least
+    // `MIN_COIN_AGE` blocks below the anchor, can only be missing because it
+    // was spent.
+    if v.tip_height() >= att.anchor_height() && v.coin(&att.outpoint()).is_none() {
+        return Assessed::Spent;
+    }
+    let coin = match check_chain(att, v) {
+        Ok(coin) => coin,
+        Err(r) => return Assessed::Judged { status: Err(r), locks: cached },
+    };
+    let locks = cached.unwrap_or_else(|| verify_signature(att, &coin.script_pubkey));
+    let status = match &locks {
+        Ok(l) => check_timelocks(v, &coin, l).map(|()| coin.value),
+        Err(r) => Err(r.clone()),
+    };
+    Assessed::Judged { status, locks: Some(locks) }
+}
+
+/// A signature string as the RPCs take it (D14), for `coin`: `smp`, `ful`,
+/// or unprefixed (legacy for P2PKH, simple otherwise).
+fn decode_signature(signature: &str, coin: &Coin) -> Result<NapSignature, PublishError> {
+    match bip322::decode(signature, &coin.script_pubkey) {
+        Ok(Signature::Legacy(bytes)) => {
+            let bytes: [u8; LEGACY_SIGNATURE_LEN] = bytes.try_into().map_err(|b: Vec<u8>| {
+                PublishError::Format(format!(
+                    "a legacy signature is {LEGACY_SIGNATURE_LEN} bytes, not {}",
+                    b.len()
+                ))
+            })?;
+            Ok(NapSignature::Legacy(bytes))
+        }
+        Ok(Signature::Bip322(Proof::Simple(w))) => Ok(NapSignature::Simple(w)),
+        Ok(Signature::Bip322(Proof::Full(tx))) => Ok(NapSignature::Full(tx)),
+        Err(DecodeError::ProofOfFunds) => Err(PublishError::Format(
+            "proof-of-funds (pof) signatures are not accepted; sign without extra inputs".into(),
+        )),
+        Err(e) => Err(PublishError::Format(e.to_string())),
+    }
+}
+
+/// A signature in the string form RPCs return: prefixed for BIP 322, as
+/// Core's `signmessage` emits it for legacy.
+pub fn encode_signature(signature: &NapSignature) -> String {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    match signature {
+        NapSignature::Simple(w) => format!("smp{}", b64(&bitcoin::consensus::serialize(w))),
+        NapSignature::Full(tx) => format!("ful{}", b64(&bitcoin::consensus::serialize(tx))),
+        NapSignature::Legacy(sig) => b64(sig),
+    }
+}

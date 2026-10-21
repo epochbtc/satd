@@ -3315,6 +3315,31 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // (below).
     let addnode_dials = peer_manager.register_config_addnodes(&config.addnode);
 
+    // -nap: load the publisher's store and judge it at the tip before RPC
+    // serves. A store that does not read back is fatal rather than started
+    // empty: it holds the operator's signed attestations.
+    let nap = if config.nap {
+        let path = net_datadir.join("nap").join("attestations.dat");
+        let publisher = match node::nap::Publisher::open(path, &*chain_state) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("Error loading the NAP attestation store: {e}");
+                eprintln!("Move the file aside to start without it.");
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+        };
+        tracing::info!(target: "nap", count = publisher.serving().len(), "NAP publisher enabled");
+        tokio::spawn(node::nap::chain::follow_tip(
+            publisher.clone(),
+            chain_state.clone(),
+            shutdown_rx.clone(),
+        ));
+        Some(publisher)
+    } else {
+        None
+    };
+
     // JSON-RPC stays on the consensus (core) runtime — it is the control
     // plane and carries the chain-mutating methods (generate*/submitblock/
     // invalidateblock/reconsiderblock). Keeping it here both avoids
@@ -3392,6 +3417,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 api_handle: api_handle.clone(),
             })
         },
+        nap,
     )
     .await
     {

@@ -730,6 +730,10 @@ pub struct Config {
     /// (fatal at startup; last-good kept on SIGHUP). When true, such rules load
     /// with a loud warning. `on template` matches always warn-only. satd-only.
     pub allowdangerousfilters: bool,
+    /// `-nap`: publish Node Attestation Protocol attestations. Stores the
+    /// attestations submitted over RPC in `<datadir>/nap/attestations.dat`
+    /// and enables the NAP RPCs. Default false. satd-only.
+    pub nap: bool,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -3153,6 +3157,11 @@ impl Config {
             .or_else(|| file_get("allowdangerousfilters").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
+        let nap = cli
+            .nap
+            .or_else(|| file_get("nap").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         let networkactive = cli
             .networkactive
             .or_else(|| file_get("networkactive").and_then(|v| parse_bool(&v)))
@@ -4180,6 +4189,7 @@ impl Config {
             permitbaremultisig,
             acceptnonstdtxn,
             allowdangerousfilters,
+            nap,
             networkactive,
             txindex,
             addressindex,
@@ -4834,6 +4844,9 @@ impl Config {
                 "quarantine_max_bytes_mb": self.quarantinemempool,
                 "policyfile": self.policyfile.as_ref().map(|p| p.display().to_string()),
                 "allow_dangerous_filters": self.allowdangerousfilters,
+            },
+            "nap": {
+                "enabled": self.nap,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -5648,6 +5661,16 @@ pub struct CliArgs {
         help = "Allow policy rules that withhold relay for Lightning enforcement txns (default: false; refused at load otherwise)"
     )]
     pub allowdangerousfilters: Option<bool>,
+
+    #[arg(
+        long = "nap",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Publish Node Attestation Protocol attestations submitted over RPC (default: false)"
+    )]
+    pub nap: Option<bool>,
 
     #[arg(
         long = "networkactive",
@@ -8163,6 +8186,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "persistmempool",
     "acceptnonstdtxn",
     "allowdangerousfilters",
+    "nap",
     "networkactive",
     "esplora",
     "esploramtls",
@@ -8366,6 +8390,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "quarantinemempool",
         "policyfile",
         "allowdangerousfilters",
+        "nap",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -9196,6 +9221,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "quarantinemempool",
     "policyfile",
     "allowdangerousfilters",
+    "nap",
     "networkactive",
     // Esplora
     "esplora",
@@ -11888,6 +11914,7 @@ testactivationheight=bip34@2
             permitbaremultisig: None,
             acceptnonstdtxn: None,
             allowdangerousfilters: None,
+            nap: None,
             networkactive: None,
             txindex: None,
             addressindex: None,
@@ -12208,6 +12235,7 @@ testactivationheight=bip34@2
             permitbaremultisig: None,
             acceptnonstdtxn: None,
             allowdangerousfilters: None,
+            nap: None,
             networkactive: None,
             txindex: None,
             addressindex: None,

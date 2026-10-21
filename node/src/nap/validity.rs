@@ -15,6 +15,11 @@
 //!    height and the tip's median time past, the BIP 68 relative lock
 //!    against the coin's confirmation. A proof that fails only here is not
 //!    yet valid, and becomes valid when the chain reaches it.
+//!
+//! [`check_chain`], [`verify_signature`] and [`check_timelocks`] are those
+//! steps apart. A signature's result depends only on the coin's
+//! scriptPubKey, which never changes for an outpoint, so a publisher that
+//! re-evaluates at every tip verifies each signature once.
 
 use std::collections::BTreeMap;
 
@@ -73,6 +78,20 @@ pub enum Rejection {
 }
 
 impl Rejection {
+    /// The rule's stable name, as RPCs report it.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            Rejection::AnchorNotOnChain => "anchor-not-on-chain",
+            Rejection::Stale { .. } => "stale",
+            Rejection::CoinNotFound => "coin-not-found",
+            Rejection::CoinTooYoung { .. } => "coin-too-young",
+            Rejection::WrongFormat(_) => "wrong-format",
+            Rejection::SignatureInvalid(_) => "signature-invalid",
+            Rejection::SignatureInconclusive(_) => "signature-inconclusive",
+            Rejection::NotYetValid(_) => "not-yet-valid",
+        }
+    }
+
     /// Whether the attestation may become valid, or was valid, at another
     /// tip: a peer whose tip differs can serve it honestly. Every other
     /// rejection is wrong at every tip.
@@ -88,9 +107,28 @@ impl Rejection {
     }
 }
 
+/// What a verified signature leaves for the chain to judge: `to_sign`'s
+/// version, locktime and input sequence. All zero for simple and legacy
+/// signatures, which no timelock can hold back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Timelocks {
+    pub version: i32,
+    pub lock_time: u32,
+    pub sequence: u32,
+}
+
 /// Evaluate `att` at `view`'s tip. A valid attestation's weight is the
 /// returned coin's value.
 pub fn evaluate(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Rejection> {
+    let coin = check_chain(att, view)?;
+    let locks = verify_signature(att, &coin.script_pubkey)?;
+    check_timelocks(view, &coin, &locks)?;
+    Ok(coin)
+}
+
+/// Rules 1–4: the anchor, freshness, and the coin and its age. Returns the
+/// coin.
+pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Rejection> {
     let tip = view.tip_height();
     if view.block_hash(att.anchor_height()) != Some(att.anchor_hash()) {
         return Err(Rejection::AnchorNotOnChain);
@@ -106,20 +144,29 @@ pub fn evaluate(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Rejecti
             anchor_height: att.anchor_height(),
         });
     }
+    Ok(coin)
+}
 
+/// Rule 5: the signature over the message text against `script`, the coin's
+/// scriptPubKey. The result holds at every tip.
+pub fn verify_signature(att: &Attestation, script: &ScriptBuf) -> Result<Timelocks, Rejection> {
     let message = att.message();
     let proof = match att.signature() {
         NapSignature::Legacy(sig) => {
-            verify_legacy(&coin.script_pubkey, &message, sig)?;
-            return Ok(coin);
+            verify_legacy(script, &message, sig)?;
+            return Ok(Timelocks::default());
+        }
+        NapSignature::Simple(_) if !script.is_witness_program() => {
+            return Err(Rejection::WrongFormat(
+                "a simple signature is for a native segwit output only; sign a full proof",
+            ));
         }
         NapSignature::Simple(w) => Proof::Simple(w.clone()),
         NapSignature::Full(tx) => Proof::Full(tx.clone()),
     };
-    match bip322::verify(&coin.script_pubkey, message.as_bytes(), &proof) {
+    match bip322::verify(script, message.as_bytes(), &proof) {
         Verification::Valid { version, lock_time, sequence } => {
-            check_timelocks(view, tip, &coin, version, lock_time, sequence)?;
-            Ok(coin)
+            Ok(Timelocks { version, lock_time, sequence })
         }
         Verification::Inconclusive(reason) => Err(Rejection::SignatureInconclusive(reason)),
         Verification::Invalid(reason) => Err(Rejection::SignatureInvalid(reason)),
@@ -139,18 +186,13 @@ fn verify_legacy(script: &ScriptBuf, message: &str, sig: &[u8]) -> Result<(), Re
     Ok(())
 }
 
-/// D11: `to_sign`'s locktime and input sequence, as if it were in the block
-/// after `tip`. The arithmetic is consensus's (`IsFinalTx`,
-/// `SequenceLocks`), with the coin standing for `to_sign`'s prevout.
-fn check_timelocks(
-    view: &dyn ChainView,
-    tip: u32,
-    coin: &Coin,
-    version: i32,
-    lock_time: u32,
-    sequence: u32,
-) -> Result<(), Rejection> {
-    let next = tip + 1;
+/// Rule 6 (D11): `to_sign`'s locktime and input sequence, as if it were in
+/// the block after `view`'s tip. The arithmetic is consensus's
+/// (`IsFinalTx`, `SequenceLocks`), with `coin` standing for `to_sign`'s
+/// prevout.
+pub fn check_timelocks(view: &dyn ChainView, coin: &Coin, locks: &Timelocks) -> Result<(), Rejection> {
+    let Timelocks { version, lock_time, sequence } = *locks;
+    let next = view.tip_height() + 1;
     let tip_mtp = view.median_time_past(next);
 
     // IsFinalTx: a locktime is met when strictly below the cutoff, and

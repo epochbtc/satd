@@ -55,6 +55,7 @@ pub mod indexes;
 pub mod logging;
 pub mod mining;
 pub mod named_params;
+pub mod nap;
 pub mod network;
 pub mod params;
 pub mod policy;
