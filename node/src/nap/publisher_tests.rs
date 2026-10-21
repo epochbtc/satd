@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use bitcoin::hashes::{Hash as _, sha256};
 
-use super::publisher::{COLDCARD_MESSAGE_LIMIT, Report, encode_signature, report};
+use super::publisher::{COLDCARD_MESSAGE_LIMIT, Report, encode_signature, transition};
 use super::tests::*;
 use super::validity::{ChainView, Coin};
 use super::*;
@@ -481,17 +481,28 @@ fn a_tip_pass_does_not_judge_an_entry_replaced_during_it() {
 /// for an entry that was already not served.
 #[test]
 fn a_lost_anchor_is_reported_only_when_the_chain_has_reached_it() {
-    let lost = Err(Rejection::AnchorNotOnChain);
-    let stale = Err(Rejection::Stale { age: FRESHNESS_WINDOW });
+    let lost = || Err(Rejection::AnchorNotOnChain);
+    let stale = || Err(Rejection::Stale { age: FRESHNESS_WINDOW });
     let valid = Ok(VALUE);
-    assert_eq!(report(Some(&valid), &lost, ANCHOR, ANCHOR), Some(Report::LostAnchor));
-    assert_eq!(report(None, &lost, ANCHOR + 1, ANCHOR), Some(Report::LostAnchor), "found at startup");
-    assert_eq!(report(None, &lost, ANCHOR - 1, ANCHOR), None, "behind the anchor: IBD, not a reorg");
-    assert_eq!(report(Some(&valid), &lost, ANCHOR - 1, ANCHOR), None);
-    assert_eq!(report(Some(&lost), &lost, ANCHOR, ANCHOR), None, "reported once");
-    assert_eq!(report(Some(&valid), &stale, TIP, ANCHOR), Some(Report::NoLongerValid(&Rejection::Stale { age: FRESHNESS_WINDOW })));
-    assert_eq!(report(Some(&stale), &stale, TIP, ANCHOR), None);
-    assert_eq!(report(Some(&valid), &valid, TIP, ANCHOR), None);
+    let said = |before: Option<&Result<bitcoin::Amount, Rejection>>, now, tip| transition(before, now, tip, ANCHOR).1;
+    assert_eq!(said(Some(&valid), lost(), ANCHOR), Some(Report::LostAnchor));
+    assert_eq!(said(None, lost(), ANCHOR + 1), Some(Report::LostAnchor), "found at startup");
+    assert_eq!(said(None, lost(), ANCHOR - 1), None, "behind the anchor: IBD, not a reorg");
+    assert_eq!(said(Some(&valid), lost(), ANCHOR - 1), None);
+    assert_eq!(said(Some(&lost()), lost(), ANCHOR), None, "reported once");
+    assert_eq!(said(Some(&valid), stale(), TIP), Some(Report::NoLongerValid(stale().unwrap_err())));
+    assert_eq!(said(Some(&stale()), stale(), TIP), None);
+    assert_eq!(said(Some(&valid), Ok(VALUE), TIP), None);
+
+    // A reorg in two passes: the tip drops below the anchor (not served, not
+    // yet reported), then the new branch passes its height without it.
+    let (mid, said_mid) = transition(Some(&valid), lost(), ANCHOR - 1, ANCHOR);
+    assert_eq!((mid.clone(), said_mid), (None, None));
+    assert_eq!(transition(mid.as_ref(), lost(), ANCHOR + 5, ANCHOR).1, Some(Report::LostAnchor));
+    // The same blocks coming back: valid again, nothing to report.
+    assert_eq!(transition(mid.as_ref(), Ok(VALUE), ANCHOR + 5, ANCHOR), (Some(Ok(VALUE)), None));
+    // Already reported, then behind: stays reported.
+    assert_eq!(transition(Some(&lost()), lost(), ANCHOR - 1, ANCHOR), (Some(lost()), None));
 }
 
 /// An entry the chain has never held still for is "not judged yet", not a

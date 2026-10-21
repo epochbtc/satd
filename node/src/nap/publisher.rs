@@ -396,7 +396,8 @@ impl Publisher {
                 }
                 Assessed::Judged { status, locks } => (status, locks),
             };
-            match report(e.status.as_ref(), &status, tip, e.att.anchor_height()) {
+            let (next, said) = transition(e.status.as_ref(), status, tip, e.att.anchor_height());
+            match said {
                 Some(Report::LostAnchor) => tracing::warn!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
@@ -405,7 +406,7 @@ impl Publisher {
                     "NAP: a reorg removed the anchor block of a published attestation; \
                      it is not served until signed again"
                 ),
-                Some(Report::NoLongerValid(r)) => tracing::info!(
+                Some(Report::NoLongerValid(ref r)) => tracing::info!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
                     key = e.att.key(),
@@ -414,7 +415,7 @@ impl Publisher {
                 ),
                 None => {}
             }
-            e.status = Some(status);
+            e.status = next;
             e.locks = locks;
         }
         if spent.is_empty() {
@@ -436,30 +437,37 @@ impl Publisher {
 
 /// What a tip pass tells the operator about one entry.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Report<'a> {
+pub(super) enum Report {
     /// A reorg replaced the anchor block.
     LostAnchor,
-    NoLongerValid(&'a Rejection),
+    NoLongerValid(Rejection),
 }
 
-/// Whether going from `before` to `now` at `tip` is worth reporting. An
-/// entry loaded from the store has no `before`: what happened while the
-/// node was stopped is reported at the first tip. Below the anchor's height
-/// the node is behind (IBD, a reindex), not reorganised, and the anchor may
-/// yet arrive, so a missing anchor there is not reported.
-pub(super) fn report<'a>(
-    before: Option<&Result<Amount, Rejection>>,
-    now: &'a Result<Amount, Rejection>,
-    tip: u32,
-    anchor_height: u32,
-) -> Option<Report<'a>> {
-    let was_served = before.is_none_or(|s| s.is_ok());
-    match now {
-        Err(Rejection::AnchorNotOnChain) if tip < anchor_height => None,
-        Err(Rejection::AnchorNotOnChain) if was_served => Some(Report::LostAnchor),
-        Err(r) if was_served => Some(Report::NoLongerValid(r)),
-        _ => None,
+type Status = Result<Amount, Rejection>;
+
+/// One entry's status after a tip pass judged it `now` at `tip`, and what,
+/// if anything, to tell the operator.
+///
+/// - An entry with no status (just loaded from the store) reports what
+///   happened while the node was stopped.
+/// - Below the anchor's height the node is behind (IBD, a reindex, or the
+///   first half of a reorg), and a missing anchor proves nothing yet: the
+///   entry is not served and goes back to having no status, so the first
+///   pass at or above the anchor's height decides. There, a missing anchor
+///   is one a reorg replaced.
+pub(super) fn transition(before: Option<&Status>, now: Status, tip: u32, anchor_height: u32) -> (Option<Status>, Option<Report>) {
+    if now == Err(Rejection::AnchorNotOnChain) && tip < anchor_height {
+        let unjudged = before.is_none_or(|s| s.is_ok());
+        let keep = if unjudged { None } else { before.cloned() };
+        return (keep, None);
     }
+    let was_served = before.is_none_or(|s| s.is_ok());
+    let said = match &now {
+        Err(Rejection::AnchorNotOnChain) if was_served => Some(Report::LostAnchor),
+        Err(r) if was_served => Some(Report::NoLongerValid(r.clone())),
+        _ => None,
+    };
+    (Some(now), said)
 }
 
 /// How many keys `outpoint` has in `entries`.
