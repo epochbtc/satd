@@ -172,7 +172,8 @@ Then:
 | Sparrow, Electrum, Liana | these pin the server certificate on first use; accept it once |
 
 `-rpccacert` wants the certificate that **issued** the one the server
-presents. For a self-signed node certificate that is the certificate itself;
+presents, and it is then the only authority `sat-cli` and `sat-tui` trust:
+no public CA can vouch for the node in its place. For a self-signed node certificate that is the certificate itself;
 it is not the leaf of a chain, which cannot anchor its own path.
 
 ### What TLS does not cover
