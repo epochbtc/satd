@@ -12,6 +12,7 @@ pub mod mempool;
 pub mod metrics;
 pub mod status;
 pub mod mining;
+pub mod nap;
 pub mod net;
 pub mod perf;
 pub mod rebuild_marker;

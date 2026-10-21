@@ -66,6 +66,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "nap_attestation_decode"
+path = "fuzz_targets/nap_attestation_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nap_message_parse"
+path = "fuzz_targets/nap_message_parse.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 # Keep line tables for readable artifact backtraces.
 debug = 1
