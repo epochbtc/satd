@@ -50,6 +50,22 @@ ignore = [
     # has not yet released a version pinning quick-xml >= 0.41.
     { id = "RUSTSEC-2026-0194", reason = "dev-only via pprof/inferno flamegraph rendering; not shipped, no untrusted XML input; upstream fix not yet released" },
     { id = "RUSTSEC-2026-0195", reason = "dev-only via pprof/inferno flamegraph rendering; not shipped, no untrusted XML input; upstream fix not yet released" },
+
+    # webpki-roots 0.26.11 and webpki-root-certs 0.26.11 -- RUSTSEC-2026-0381 /
+    # RUSTSEC-2026-0383 (bundled emSign root lets distrusted intermediates
+    # chain). Both 0.26.11 releases are semver-trick shims: their only
+    # dependency is the same crate at "1" (`parent`), and `pub use
+    # parent::...` is their whole API, so they carry no certificates of their
+    # own. The lock resolves that `parent` to 1.0.10, the fixed release, so the
+    # trust store compiled in is the fixed one. No 0.26 release postdates the
+    # fix; the shims are pulled in by tonic 0.12 (webpki-roots) and
+    # rustls-platform-verifier 0.5 via jsonrpsee 0.26 (webpki-root-certs).
+    # An advisory ignore cannot be scoped to one version: these would also
+    # hide a regression to a vulnerable 1.x, so the lock's 1.0.10 is what
+    # carries the fix. Remove both once tonic and jsonrpsee depend on 1.x
+    # directly and the shims leave the lock.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
+    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
 ]
 
 # ---------------------------------------------------------------------------
