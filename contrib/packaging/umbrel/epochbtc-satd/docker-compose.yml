@@ -18,13 +18,13 @@ version: "3.7"
 #
 # The tag is bare. The registry has never published a `v`-prefixed tag.
 #
-# This pins the 0.6.2 release, the image release.yml built and cosign-signed
-# for the v0.6.2 tag. Between releases it may pin a master commit's `sha-`
+# This pins the 0.6.3 release, the image release.yml built and cosign-signed
+# for the v0.6.3 tag. Between releases it may pin a master commit's `sha-`
 # image instead, which docker.yml publishes unsigned for that purpose;
 # `contrib/packaging/sync-store.sh` refuses a `sha-` pin, so such a pin cannot
 # reach the store. Moving the pin to the next release, with `version`, is a
 # step in the release checklist.
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.6.2@sha256:8a7a1e0a224015c15416a0f533fb0f7293a4045959e730d3e9f7704ba7c975c3
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.6.3@sha256:a3c36fb460a01cafa56d091f771b4b2f91604f99771eb67b04aadb2c1ad73e8e
 
 services:
   app_proxy:
