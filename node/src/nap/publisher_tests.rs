@@ -228,7 +228,7 @@ fn a_new_tip_drops_spent_coins_and_keeps_the_rest() {
     let listed = p.list(&chain);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].attestation, kept);
-    assert_eq!(Publisher::open(path, &chain).unwrap().list(&chain).len(), 1, "the drop was written");
+    assert_eq!(store::load(&path).unwrap(), vec![kept], "the drop was written");
 }
 
 #[test]
@@ -287,13 +287,22 @@ fn removal_stops_publishing() {
 
 #[test]
 fn a_failed_write_changes_nothing() {
-    let (dir, path) = store_path();
-    let (chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
-    let p = Publisher::open(path, &chain).unwrap();
-    // The store's directory is a file, so every write fails.
-    std::fs::write(dir.path().join("nap"), b"").unwrap();
-    assert_eq!(rule(submit(&p, &chain, &att)), "io");
-    assert!(p.list(&chain).is_empty());
+    let (_dir, path) = store_path();
+    let signer = p2wpkh();
+    let (mut chain, att) = setup(&signer, COIN_HEIGHT, ANCHOR);
+    let op = coin(&mut chain, &signer, 8);
+    let other = attest(&chain, &signer, op, "k", "v", ANCHOR);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &att).unwrap();
+    // The store's path is a directory, so every write fails at the rename.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(rule(submit(&p, &chain, &other)), "io");
+    assert_eq!(rule(p.remove(att.outpoint(), att.key())), "io");
+    let listed = p.list(&chain);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].attestation, att);
+    assert!(!path.with_extension("dat.tmp").exists(), "no temporary file left behind");
 }
 
 #[test]
@@ -328,6 +337,16 @@ fn the_store_file_refuses_anything_it_did_not_write() {
     assert!(store::decode(&reseal(&count)).unwrap_err().contains("entry 2"));
     count[8] = 1;
     assert!(store::decode(&reseal(&count)).unwrap_err().contains("follow the last entry"));
+
+    // Two for one key (not something the publisher writes): the newer wins.
+    let (_dir, path) = store_path();
+    let newer = attest(&chain, &p2wpkh(), att.outpoint(), att.key(), "no", ANCHOR + 1);
+    for order in [[&att, &newer], [&newer, &att]] {
+        store::save(&path, &store::encode(order.into_iter())).unwrap();
+        let listed = Publisher::open(path.clone(), &chain).unwrap().list(&chain);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].attestation, newer);
+    }
 
     // Opening a damaged store fails rather than starting empty.
     let (_dir, path) = store_path();
