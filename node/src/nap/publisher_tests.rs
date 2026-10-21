@@ -222,7 +222,19 @@ fn a_new_tip_drops_spent_coins_and_keeps_the_rest() {
     let reopened = Publisher::open(path.clone(), &behind).unwrap();
     assert_eq!(reopened.list(&chain).len(), 2, "a reload behind the anchor keeps everything");
 
-    // At or above it, the coin was spent.
+    // On a fork without the anchor, a missing coin may be back on the
+    // anchor's branch: kept, not served.
+    let spent_coin = chain.coins.remove(&att.outpoint()).unwrap();
+    chain.fork_at = ANCHOR;
+    p.on_tip(&chain);
+    assert_eq!(p.list(&chain).len(), 2);
+    assert!(p.serving().is_empty(), "both anchors are off this fork");
+    chain.fork_at = u32::MAX;
+    chain.coins.insert(att.outpoint(), spent_coin);
+    p.on_tip(&chain);
+    assert_eq!(p.serving().len(), 2, "back on the anchor's branch, both are valid again");
+
+    // On a chain holding the anchor, the coin was spent.
     chain.coins.remove(&att.outpoint());
     p.on_tip(&chain);
     let listed = p.list(&chain);
@@ -352,4 +364,32 @@ fn the_store_file_refuses_anything_it_did_not_write() {
     let (_dir, path) = store_path();
     store::save(&path, &flipped).unwrap();
     assert!(Publisher::open(path, &chain).is_err());
+}
+
+/// `-napstorerecover`: a damaged store is moved aside, intact, and the
+/// publisher starts empty and keeps working. A good store opens as usual.
+#[test]
+fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
+    let (_dir, path) = store_path();
+    let (chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
+
+    let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
+    assert!(aside.is_none(), "a missing store is an empty one, not a damaged one");
+    submit(&p, &chain, &att).unwrap();
+    let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
+    assert!(aside.is_none());
+    assert_eq!(p.list(&chain).len(), 1, "a good store is kept");
+
+    let damaged = b"not a store".to_vec();
+    std::fs::write(&path, &damaged).unwrap();
+    assert!(Publisher::open(path.clone(), &chain).is_err(), "without recovery, still an error");
+    let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
+    let (aside, why) = aside.expect("the damaged file was set aside");
+    assert!(why.contains("truncated"), "{why}");
+    assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("attestations.dat.bad-"), "{aside:?}");
+    assert_eq!(std::fs::read(&aside).unwrap(), damaged, "the damaged file is kept as it was");
+    assert!(!path.exists());
+    assert!(p.list(&chain).is_empty());
+    submit(&p, &chain, &att).unwrap();
+    assert_eq!(store::load(&path).unwrap(), vec![att]);
 }

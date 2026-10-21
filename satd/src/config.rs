@@ -734,6 +734,11 @@ pub struct Config {
     /// attestations submitted over RPC in `<datadir>/nap/attestations.dat`
     /// and enables the NAP RPCs. Default false. satd-only.
     pub nap: bool,
+    /// `-napstorerecover`: with `-nap`, a store that does not read back at
+    /// startup is moved aside to `attestations.dat.bad-<unix seconds>` with
+    /// a warning and the publisher starts empty, instead of startup failing.
+    /// Default false. satd-only.
+    pub napstorerecover: bool,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4184,7 +4189,8 @@ impl Config {
             permitbaremultisig,
             acceptnonstdtxn,
             allowdangerousfilters,
-            nap: resolve_nap(&cli.nap_args, &file_get),
+            nap: resolve_nap(&cli.nap_args.nap, "nap", &file_get),
+            napstorerecover: resolve_nap(&cli.nap_args.napstorerecover, "napstorerecover", &file_get),
             networkactive,
             txindex,
             addressindex,
@@ -4842,6 +4848,7 @@ impl Config {
             },
             "nap": {
                 "enabled": self.nap,
+                "store_recover": self.napstorerecover,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -5986,7 +5993,7 @@ pub struct CliArgs {
     #[command(flatten)]
     pub tx_announce_args: TxAnnounceArgs,
 
-    /// `-nap`, hand-built for the same stack-frame reason as
+    /// `-nap` and `-napstorerecover`, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub nap_args: NapArgs,
@@ -7527,25 +7534,34 @@ impl clap::FromArgMatches for TxAnnounceArgs {
     }
 }
 
-/// `-nap`, a satd extension, out of `CliArgs` for the same reason as
-/// [`resolve_bytes_per_sigop`]. Default false.
+/// `-nap` and `-napstorerecover`, satd extensions, out of `CliArgs` for the
+/// same reason as [`resolve_bytes_per_sigop`]. Both default false.
 #[inline(never)]
-fn resolve_nap(cli: &NapArgs, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
-    cli.nap.or_else(|| file_get("nap").and_then(|v| parse_bool(&v))).unwrap_or(false)
+fn resolve_nap(cli: &Option<bool>, key: &str, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
+    cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v))).unwrap_or(false)
 }
 
-/// `-nap` (see [`CliArgs::nap_args`]).
+/// `-nap` and `-napstorerecover` (see [`CliArgs::nap_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct NapArgs {
     pub nap: Option<bool>,
+    pub napstorerecover: Option<bool>,
 }
 
-const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[(
-    "nap",
-    "BOOL",
-    StratumArgKind::Bool,
-    "Publish Node Attestation Protocol attestations submitted over RPC (default: 0)",
-)];
+const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "nap",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Publish Node Attestation Protocol attestations submitted over RPC (default: 0)",
+    ),
+    (
+        "napstorerecover",
+        "BOOL",
+        StratumArgKind::Bool,
+        "With -nap, move an attestation store that does not read back aside and start with an empty one, instead of refusing to start (default: 0)",
+    ),
+];
 
 impl clap::Args for NapArgs {
     fn augment_args(mut cmd: clap::Command) -> clap::Command {
@@ -7566,7 +7582,7 @@ impl clap::FromArgMatches for NapArgs {
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { nap: m.remove_one("nap") })
+        Ok(Self { nap: m.remove_one("nap"), napstorerecover: m.remove_one("napstorerecover") })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -8229,6 +8245,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "acceptnonstdtxn",
     "allowdangerousfilters",
     "nap",
+    "napstorerecover",
     "networkactive",
     "esplora",
     "esploramtls",
@@ -8433,6 +8450,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "policyfile",
         "allowdangerousfilters",
         "nap",
+        "napstorerecover",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -9264,6 +9282,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "policyfile",
     "allowdangerousfilters",
     "nap",
+    "napstorerecover",
     "networkactive",
     // Esplora
     "esplora",
@@ -10566,6 +10585,28 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "nap=1\n").unwrap();
         assert!(load(&[]), "from the file");
         assert!(!load(&["-nap=0"]), "the command line wins");
+    }
+
+    /// `-napstorerecover`: off by default, on from the command line in either
+    /// spelling or from the file, and independent of `-nap`.
+    #[test]
+    fn napstorerecover_is_off_by_default_and_can_be_turned_on() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            let c = Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .expect("loads");
+            (c.nap, c.napstorerecover)
+        };
+        assert_eq!(load(&[]), (false, false));
+        assert_eq!(load(&["-nap", "-napstorerecover"]), (true, true));
+        assert_eq!(load(&["--napstorerecover=1"]), (false, true));
+        assert_eq!(load(&["-nonapstorerecover"]), (false, false));
+        std::fs::write(dir.path().join("bitcoin.conf"), "napstorerecover=1\n").unwrap();
+        assert_eq!(load(&[]), (false, true), "from the file");
+        assert_eq!(load(&["-napstorerecover=0"]), (false, false), "the command line wins");
     }
 
     /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`

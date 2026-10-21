@@ -3317,14 +3317,33 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // -nap: load the publisher's store and judge it at the tip before RPC
     // serves. A store that does not read back is fatal rather than started
-    // empty: it holds the operator's signed attestations.
+    // empty, since it holds the operator's signed attestations, unless
+    // -napstorerecover asks for it to be moved aside.
     let nap = if config.nap {
         let path = net_datadir.join("nap").join("attestations.dat");
-        let publisher = match node::nap::Publisher::open(path, &*chain_state) {
+        let opened = if config.napstorerecover {
+            node::nap::Publisher::open_recovering(path, &*chain_state).map(|(p, aside)| {
+                if let Some((aside, why)) = aside {
+                    tracing::warn!(
+                        target: "nap",
+                        "NAP: the attestation store did not read back ({why}); moved it to {} \
+                         and started with an empty one",
+                        aside.display()
+                    );
+                }
+                p
+            })
+        } else {
+            node::nap::Publisher::open(path, &*chain_state)
+        };
+        let publisher = match opened {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 eprintln!("Error loading the NAP attestation store: {e}");
-                eprintln!("Move the file aside to start without it.");
+                eprintln!(
+                    "Move the file aside to start without it, or start with -napstorerecover=1 to \
+                     have satd do that."
+                );
                 auth.cleanup();
                 node::shutdown::exit_now(1);
             }

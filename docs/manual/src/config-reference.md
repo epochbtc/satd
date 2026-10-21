@@ -392,6 +392,7 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `nap` | off | restart | satd | Publish Node Attestation Protocol attestations: enables `createnapattestation`, `submitnapattestation`, `listnapattestations` and `removenapattestation`, and keeps the attestations submitted in `<datadir>/nap/attestations.dat`. See [Node Attestation (NAP)](nap.md). |
+| `napstorerecover` | off | restart | satd | With `nap`, an attestation store that does not read back at startup is renamed to `attestations.dat.bad-<unix time>` with a warning and the node starts with an empty one. Off: startup fails, naming the file. |
 
 ## Events
 

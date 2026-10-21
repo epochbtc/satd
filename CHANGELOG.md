@@ -26,7 +26,8 @@ item below is (or will be) written up in full in the in-development
 - Node Attestation Protocol publisher (`-nap=1`, off by default):
   `createnapattestation`, `submitnapattestation`, `listnapattestations` and
   `removenapattestation` store holders' signed, coin-weighted statements and
-  judge them at every block.
+  judge them at every block. `-napstorerecover=1` starts with an empty store
+  when the saved one does not read back.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,

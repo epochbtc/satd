@@ -21,6 +21,9 @@ use bitcoin::{
     Address, Amount, CompressedPublicKey, Network, PrivateKey, ScriptBuf, Transaction, TxOut,
     Witness,
 };
+use std::process::Command;
+use std::time::{Duration, Instant};
+
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_of_coinbase, coinbase_txid_at,
     find_available_port, fresh_test_datadir, poll_until, test_timeout,
@@ -322,6 +325,20 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
         test_timeout(60),
         "the operator is warned about the lost anchor",
     );
+
+    // A lost anchor found at startup is reported too: the restarted node has
+    // no earlier tip to compare against.
+    node.stop();
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1"]);
+    assert_eq!(list(&node).len(), holders.len() - 2);
+    poll_until(
+        || {
+            std::fs::read_to_string(&node.stderr_log)
+                .is_ok_and(|log| log.contains("a reorg removed the anchor block of a published attestation"))
+        },
+        test_timeout(60),
+        "the restarted node warns about the lost anchors",
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -336,4 +353,64 @@ fn nap_rpcs_need_the_flag() {
     assert!(msg.contains("NAP is disabled"), "{msg}");
     assert!(!node.datadir.join("regtest").join("nap").exists());
     node.stop();
+}
+
+/// A store that does not read back stops startup, naming the file and the
+/// way out; with `-napstorerecover=1` it is moved aside, intact, with a
+/// warning, and the node starts with an empty store.
+#[test]
+fn a_damaged_store_stops_startup_unless_recovery_is_on() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-nap-damaged-store");
+    let store_dir = datadir.join("regtest").join("nap");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store = store_dir.join("attestations.dat");
+    let damaged = b"SNAP but not really".to_vec();
+    std::fs::write(&store, &damaged).unwrap();
+
+    // Spawned directly: `TestNode` waits for RPC, and this node never serves.
+    let log_path = datadir.join("satd-refused.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={rpcport}"))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--esplora=0")
+        .arg("--nap=1")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + test_timeout(120);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("satd started with a damaged NAP store:\n{}", std::fs::read_to_string(&log_path).unwrap_or_default());
+            }
+        }
+    };
+    let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!status.success(), "{text}");
+    assert!(text.contains("Error loading the NAP attestation store"), "{text}");
+    assert!(text.contains("-napstorerecover=1"), "{text}");
+    assert_eq!(std::fs::read(&store).unwrap(), damaged, "a refused start leaves the file alone");
+
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", "--napstorerecover=1"]);
+    assert_eq!(list(&node), Vec::<Value>::new());
+    let set_aside: Vec<_> = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("attestations.dat.bad-"))
+        .collect();
+    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+    assert_eq!(std::fs::read(&set_aside[0]).unwrap(), damaged, "the damaged file is kept as it was");
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    assert!(log.contains("the attestation store did not read back"), "{log}");
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }

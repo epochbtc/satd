@@ -9,6 +9,12 @@
 //!
 //! A signature's result depends only on the coin's scriptPubKey, so each is
 //! verified once and cached; a tip costs the chain checks and the timelocks.
+//!
+//! Chain reads can wait out a block commit, so none is made while holding the
+//! entries' lock: readers (`list`, `serving`) take it only to copy or update.
+//! A separate writer lock serializes `submit`, `remove` and `on_tip`, so an
+//! entry judged without the entries' lock is still the one stored when the
+//! result is applied.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -126,6 +132,8 @@ type Key = (OutPoint, String);
 pub struct Publisher {
     path: PathBuf,
     entries: Mutex<BTreeMap<Key, Entry>>,
+    /// Held by every change to `entries`, for as long as the change takes.
+    writer: Mutex<()>,
 }
 
 impl Publisher {
@@ -140,9 +148,32 @@ impl Publisher {
             }
             entries.insert(key, Entry { att, locks: None, status: None });
         }
-        let publisher = Publisher { path, entries: Mutex::new(entries) };
+        let publisher = Publisher { path, entries: Mutex::new(entries), writer: Mutex::new(()) };
         publisher.on_tip(chain);
         Ok(publisher)
+    }
+
+    /// [`Self::open`], but a store that does not read back is renamed to
+    /// `<name>.bad-<unix seconds>` and the publisher starts empty
+    /// (`-napstorerecover`). Returns the path the file was moved to, for the
+    /// caller to report. Fails only if the file cannot be moved aside.
+    pub fn open_recovering(
+        path: PathBuf,
+        chain: &impl ChainSource,
+    ) -> Result<(Self, Option<(PathBuf, String)>), String> {
+        let why = match store::load(&path) {
+            Ok(_) => return Self::open(path, chain).map(|p| (p, None)),
+            Err(why) => why,
+        };
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut aside = path.clone().into_os_string();
+        aside.push(format!(".bad-{secs}"));
+        let aside = PathBuf::from(aside);
+        std::fs::rename(&path, &aside)
+            .map_err(|e| format!("{why}; moving it to {} failed: {e}", aside.display()))?;
+        Ok((Self::open(path, chain)?, Some((aside, why))))
     }
 
     /// The message for `outpoint`, `key` and `value`, anchored
@@ -223,25 +254,31 @@ impl Publisher {
         let value = status.map_err(PublishError::Rejected)?;
 
         let key = (att.outpoint(), att.key().to_owned());
-        let mut entries = self.entries.lock();
-        let replaced = match entries.get(&key) {
-            Some(cur) if cur.att == att => {
+        let _writer = self.writer.lock();
+        let (current, key_count) = {
+            let entries = self.entries.lock();
+            let current = entries.get(&key).map(|e| (e.att.clone(), e.locks.clone()));
+            (current, keys_for(&entries, att.outpoint()))
+        };
+        let replaced = match current {
+            Some((cur, _)) if cur == att => {
                 return Ok((Published { attestation: att, status: Ok(value) }, None));
             }
-            Some(cur) => {
+            Some((cur, cur_locks)) => {
                 let cur_valid = chain
-                    .read(&|v| assess(&cur.att, cur.locks.clone(), v))
+                    .read(&|v| assess(&cur, cur_locks.clone(), v))
                     .is_none_or(|a| matches!(a, Assessed::Judged { status: Ok(_), .. }));
-                if cur_valid && !supersedes(&att, &cur.att) {
-                    return Err(PublishError::Superseded { anchor_height: cur.att.anchor_height() });
+                if cur_valid && !supersedes(&att, &cur) {
+                    return Err(PublishError::Superseded { anchor_height: cur.anchor_height() });
                 }
-                Some(cur.att.id())
+                Some(cur.id())
             }
-            None if keys_for(&entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT => {
+            None if key_count >= MAX_KEYS_PER_OUTPOINT => {
                 return Err(PublishError::KeyLimit);
             }
             None => None,
         };
+        let mut entries = self.entries.lock();
         let entry = Entry { att: att.clone(), locks, status: Some(Ok(value)) };
         let previous = entries.insert(key.clone(), entry);
         if let Err(e) = self.save(&entries) {
@@ -265,21 +302,43 @@ impl Publisher {
     /// outpoint and key. The serving status is left to [`Self::on_tip`],
     /// which reports what changed between tips.
     pub fn list(&self, chain: &impl ChainSource) -> Vec<Published> {
-        let mut entries = self.entries.lock();
-        entries
-            .values_mut()
-            .map(|e| {
-                let status = match chain.read(&|v| assess(&e.att, e.locks.clone(), v)) {
-                    Some(Assessed::Judged { status, locks }) => {
-                        e.locks = locks;
-                        status
+        let snapshot = self.snapshot();
+        let mut out = Vec::with_capacity(snapshot.len());
+        let mut learned = Vec::new();
+        for (key, att, locks, status) in snapshot {
+            let status = match chain.read(&|v| assess(&att, locks.clone(), v)) {
+                Some(Assessed::Judged { status, locks: new }) => {
+                    if new != locks {
+                        learned.push((key, att.id(), new));
                     }
-                    // Spent, and dropped at the next tip.
-                    Some(Assessed::Spent) => Err(Rejection::CoinNotFound),
-                    None => e.status.clone().unwrap_or(Err(Rejection::CoinNotFound)),
-                };
-                Published { attestation: e.att.clone(), status }
-            })
+                    status
+                }
+                // Spent, and dropped at the next tip.
+                Some(Assessed::Spent) => Err(Rejection::CoinNotFound),
+                None => status.unwrap_or(Err(Rejection::CoinNotFound)),
+            };
+            out.push(Published { attestation: att, status });
+        }
+        // Keep what was learned about signatures, for entries not replaced
+        // in the meantime.
+        let mut entries = self.entries.lock();
+        for (key, id, locks) in learned {
+            if let Some(e) = entries.get_mut(&key).filter(|e| e.att.id() == id) {
+                e.locks = locks;
+            }
+        }
+        out
+    }
+
+    /// Each entry's key, attestation, cached signature result and status.
+    #[allow(clippy::type_complexity)]
+    fn snapshot(
+        &self,
+    ) -> Vec<(Key, Attestation, Option<Result<Timelocks, Rejection>>, Option<Result<Amount, Rejection>>)> {
+        self.entries
+            .lock()
+            .iter()
+            .map(|(k, e)| (k.clone(), e.att.clone(), e.locks.clone(), e.status.clone()))
             .collect()
     }
 
@@ -287,6 +346,7 @@ impl Publisher {
     /// already collected stay valid; only signing an empty value withdraws.
     pub fn remove(&self, outpoint: OutPoint, key: &str) -> Result<Attestation, PublishError> {
         let k = (outpoint, key.to_owned());
+        let _writer = self.writer.lock();
         let mut entries = self.entries.lock();
         let entry = entries.remove(&k).ok_or(PublishError::NotFound)?;
         if let Err(e) = self.save(&entries) {
@@ -310,22 +370,30 @@ impl Publisher {
     /// Judge every entry at `chain`'s new tip: drop those whose coin was
     /// spent, and warn about each that lost its anchor to a reorg.
     pub fn on_tip(&self, chain: &impl ChainSource) {
+        let _writer = self.writer.lock();
+        let judged: Vec<(Key, Assessed)> = self
+            .snapshot()
+            .into_iter()
+            .filter_map(|(key, att, locks, _)| chain.read(&|v| assess(&att, locks.clone(), v)).map(|a| (key, a)))
+            .collect();
         let mut entries = self.entries.lock();
         let mut spent = Vec::new();
-        for (key, e) in entries.iter_mut() {
-            let Some(assessed) = chain.read(&|v| assess(&e.att, e.locks.clone(), v)) else {
-                continue;
-            };
+        for (key, assessed) in judged {
+            // The writer lock is held, so the entry is still the one judged.
+            let Some(e) = entries.get_mut(&key) else { continue };
             let (status, locks) = match assessed {
                 Assessed::Spent => {
-                    spent.push(key.clone());
+                    spent.push(key);
                     continue;
                 }
                 Assessed::Judged { status, locks } => (status, locks),
             };
-            let was_valid = matches!(e.status, Some(Ok(_)));
+            // Report what changed since the last tip. An entry loaded from
+            // the store has no last tip: what happened while the node was
+            // stopped is reported now.
+            let was_served = e.status.as_ref().is_none_or(|s| s.is_ok());
             match &status {
-                Err(Rejection::AnchorNotOnChain) if was_valid => tracing::warn!(
+                Err(Rejection::AnchorNotOnChain) if was_served => tracing::warn!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
                     key = e.att.key(),
@@ -333,7 +401,7 @@ impl Publisher {
                     "NAP: a reorg removed the anchor block of a published attestation; \
                      it is not served until signed again"
                 ),
-                Err(r) if was_valid => tracing::info!(
+                Err(r) if was_served => tracing::info!(
                     target: "nap",
                     outpoint = %e.att.outpoint(),
                     key = e.att.key(),
@@ -370,11 +438,12 @@ fn keys_for(entries: &BTreeMap<Key, Entry>, outpoint: OutPoint) -> usize {
 /// Judge `att` at `view`'s tip, verifying its signature unless `cached`
 /// already holds the result.
 fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &dyn ChainView) -> Assessed {
-    // Below the anchor the node is behind (a reindex, say) and a missing coin
-    // proves nothing. At or above it, the coin, which confirmed at least
-    // `MIN_COIN_AGE` blocks below the anchor, can only be missing because it
-    // was spent.
-    if v.tip_height() >= att.anchor_height() && v.coin(&att.outpoint()).is_none() {
+    // A missing coin means a spent one only on a chain that holds the anchor:
+    // the coin confirmed at least `MIN_COIN_AGE` blocks below it, so on that
+    // chain nothing else removes it. A node behind the anchor (a reindex,
+    // say), or on a fork without it, may see the coin again; the attestation
+    // is kept and judged `AnchorNotOnChain` meanwhile.
+    if v.block_hash(att.anchor_height()) == Some(att.anchor_hash()) && v.coin(&att.outpoint()).is_none() {
         return Assessed::Spent;
     }
     let coin = match check_chain(att, v) {

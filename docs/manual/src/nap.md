@@ -32,7 +32,10 @@ directory (`~/.bitcoin/signet/nap/attestations.dat` on signet, for example).
 Every change is written through a temporary file and a rename. If the file
 cannot be read back at startup, satd refuses to start rather than start with
 none of them: it holds signatures that may be hard to make again. Move the
-file aside to start without it.
+file aside to start without it, or set `napstorerecover=1`, and satd does
+that itself: it renames the file to `attestations.dat.bad-<unix time>`, logs
+a warning naming it, and starts with an empty store. Either way the damaged
+file's signatures are still on disk.
 
 ## What gets signed
 
@@ -181,8 +184,12 @@ The node judges every stored attestation again at each new block:
   but is not served. A lost anchor is logged as a warning naming the outpoint
   and key: sign again to keep publishing it. An anchor 6 blocks deep makes
   this rare.
-- A node that is behind its stored anchors, during a reindex for example,
-  keeps everything until it catches up.
+- A missing coin counts as spent only on a chain that holds the anchor. A
+  node that is behind its stored anchors, during a reindex for example, or
+  on a fork without them, keeps everything until it is back on the anchor's
+  chain.
+- At startup, an attestation that lost its anchor while the node was
+  stopped is reported the same way.
 
 During initial block download the attestations are judged once, when it ends.
 
