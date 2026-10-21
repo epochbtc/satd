@@ -285,6 +285,22 @@ fn a_signature_is_verified_once() {
     assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
 }
 
+/// An entry loaded from the store has no cached result; listing it verifies
+/// the signature and keeps the result.
+#[test]
+fn listing_keeps_what_it_learned_about_a_signature() {
+    let (_dir, path) = store_path();
+    let (mut chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
+    store::save(&path, &store::encode([&att].into_iter())).unwrap();
+    // Opened behind the anchor, so nothing is verified at open.
+    let mut behind = Chain::new();
+    behind.tip = ANCHOR - 1;
+    let p = Publisher::open(path, &behind).unwrap();
+    assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
+    chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = p2pkh().spk;
+    assert_eq!(p.list(&chain)[0].status, Ok(VALUE));
+}
+
 #[test]
 fn removal_stops_publishing() {
     let (_dir, path) = store_path();
