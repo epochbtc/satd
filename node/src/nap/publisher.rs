@@ -12,9 +12,10 @@
 //!
 //! Chain reads can wait out a block commit, so none is made while holding the
 //! entries' lock: readers (`list`, `serving`) take it only to copy or update.
-//! A separate writer lock serializes `submit`, `remove` and `on_tip`, so an
-//! entry judged without the entries' lock is still the one stored when the
-//! result is applied.
+//! A separate writer lock serializes the changes `submit`, `remove` and
+//! `on_tip` make. `submit` holds it across its re-check of the stored entry;
+//! `on_tip` judges without it and applies each result only to the entry it
+//! judged, so a long pass never holds up the RPCs.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -265,9 +266,10 @@ impl Publisher {
                 return Ok((Published { attestation: att, status: Ok(value) }, None));
             }
             Some((cur, cur_locks)) => {
-                let cur_valid = chain
-                    .read(&|v| assess(&cur, cur_locks.clone(), v))
-                    .is_none_or(|a| matches!(a, Assessed::Judged { status: Ok(_), .. }));
+                let cur_valid = matches!(
+                    chain.read(&|v| assess(&cur, cur_locks.clone(), v)).ok_or(PublishError::Busy)?,
+                    Assessed::Judged { status: Ok(_), .. }
+                );
                 if cur_valid && !supersedes(&att, &cur) {
                     return Err(PublishError::Superseded { anchor_height: cur.anchor_height() });
                 }
@@ -370,17 +372,20 @@ impl Publisher {
     /// Judge every entry at `chain`'s new tip: drop those whose coin was
     /// spent, and warn about each that lost its anchor to a reorg.
     pub fn on_tip(&self, chain: &impl ChainSource) {
-        let _writer = self.writer.lock();
-        let judged: Vec<(Key, Assessed)> = self
+        let judged: Vec<(Key, sha256::Hash, Assessed)> = self
             .snapshot()
             .into_iter()
-            .filter_map(|(key, att, locks, _)| chain.read(&|v| assess(&att, locks.clone(), v)).map(|a| (key, a)))
+            .filter_map(|(key, att, locks, _)| {
+                chain.read(&|v| assess(&att, locks.clone(), v)).map(|a| (key, att.id(), a))
+            })
             .collect();
+        let _writer = self.writer.lock();
         let mut entries = self.entries.lock();
         let mut spent = Vec::new();
-        for (key, assessed) in judged {
-            // The writer lock is held, so the entry is still the one judged.
-            let Some(e) = entries.get_mut(&key) else { continue };
+        for (key, id, assessed) in judged {
+            // An entry submitted or removed while the pass ran was not judged
+            // here; the next tip judges it.
+            let Some(e) = entries.get_mut(&key).filter(|e| e.att.id() == id) else { continue };
             let (status, locks) = match assessed {
                 Assessed::Spent => {
                     spent.push(key);

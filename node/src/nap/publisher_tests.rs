@@ -409,3 +409,69 @@ fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
     submit(&p, &chain, &att).unwrap();
     assert_eq!(store::load(&path).unwrap(), vec![att]);
 }
+
+/// A chain source that runs `hook` before its first read and gives up after
+/// `reads` reads: a submission landing mid-pass, or a chain that will not
+/// hold still.
+struct Hooked<'a> {
+    chain: &'a Chain,
+    hook: std::cell::Cell<Option<Box<dyn FnOnce() + 'a>>>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl<'a> Hooked<'a> {
+    fn new(chain: &'a Chain, reads: usize, hook: Option<Box<dyn FnOnce() + 'a>>) -> Self {
+        Hooked { chain, hook: std::cell::Cell::new(hook), reads: std::cell::Cell::new(reads) }
+    }
+}
+
+impl ChainSource for Hooked<'_> {
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        if let Some(hook) = self.hook.take() {
+            hook();
+        }
+        let left = self.reads.get();
+        if left == 0 {
+            return None;
+        }
+        self.reads.set(left - 1);
+        Some(read(self.chain))
+    }
+}
+
+/// A re-check of the stored attestation that cannot read the chain is
+/// "try again", not a verdict.
+#[test]
+fn a_recheck_that_cannot_read_the_chain_is_busy() {
+    let (_dir, path) = store_path();
+    let signer = p2wpkh();
+    let (chain, old) = setup(&signer, COIN_HEIGHT, ANCHOR);
+    let older = attest(&chain, &signer, old.outpoint(), old.key(), "no", ANCHOR - 100);
+    let p = Publisher::open(path, &chain).unwrap();
+    submit(&p, &chain, &old).unwrap();
+    // Two reads for the submission itself; the re-check gets none.
+    let stuck = Hooked::new(&chain, 2, None);
+    let r = p.submit(&stuck, &older.message(), &encode_signature(older.signature()));
+    assert_eq!(r.unwrap_err(), PublishError::Busy);
+}
+
+/// A tip pass judges without the writer lock, so a submission can replace an
+/// entry mid-pass; the pass's verdict on the old entry must not land on the
+/// new one.
+#[test]
+fn a_tip_pass_does_not_judge_an_entry_replaced_during_it() {
+    let (_dir, path) = store_path();
+    let signer = p2wpkh();
+    let (mut chain, old) = setup(&signer, COIN_HEIGHT, ANCHOR - 100);
+    let new = attest(&chain, &signer, old.outpoint(), old.key(), "no", ANCHOR);
+    let p = Publisher::open(path, &chain).unwrap();
+    submit(&p, &chain, &new).unwrap();
+    // The newer one loses its anchor; the older one, submitted mid-pass,
+    // replaces it and is valid.
+    chain.fork_at = ANCHOR - 10;
+    let replace = || {
+        assert_eq!(submit(&p, &chain, &old), Ok(Some(new.id())));
+    };
+    p.on_tip(&Hooked::new(&chain, usize::MAX, Some(Box::new(replace))));
+    assert_eq!(p.serving(), vec![old]);
+}
