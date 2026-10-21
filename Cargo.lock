@@ -5434,6 +5434,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "webpki-roots 1.0.10",
  "x509-parser",
 ]
 
