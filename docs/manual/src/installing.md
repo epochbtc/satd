@@ -104,7 +104,7 @@ Images are attached to the [GitHub release](https://github.com/epochbtc/satd/rel
 alongside the tarballs, from 0.6.0 on, and signed with the same minisign key:
 
 ```sh
-ver=0.6.2
+ver=0.6.3
 flavor=core    # or desktop
 arch=amd64     # or arm64, for Apple Silicon and arm64 servers
 base="https://github.com/epochbtc/satd/releases/download/v$ver"
