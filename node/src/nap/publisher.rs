@@ -25,7 +25,7 @@ use bitcoin::psbt::Psbt;
 use bitcoin::{Amount, BlockHash, OutPoint};
 use parking_lot::Mutex;
 
-use super::validity::{Timelocks, check_chain, check_timelocks, verify_signature};
+use super::validity::{Timelocks, check_chain, check_coin_age, check_timelocks, verify_signature};
 use super::{
     ANCHOR_DEPTH, Attestation, ChainView, Coin, FormatError, LEGACY_SIGNATURE_LEN,
     MAX_KEYS_PER_OUTPOINT, NapSignature, Rejection, message, store, supersedes,
@@ -217,18 +217,13 @@ impl Publisher {
         let read = chain
             .read(&|v| {
                 let anchor_height = v.tip_height().checked_sub(ANCHOR_DEPTH)?;
-                Some((anchor_height, v.block_hash(anchor_height), v.coin(&outpoint)))
+                Some((anchor_height, v.block_hash(anchor_height), v.coin(&outpoint), v.network()))
             })
             .ok_or(PublishError::Busy)?;
-        let (anchor_height, anchor_hash, coin) = read.ok_or(PublishError::ChainTooShort)?;
+        let (anchor_height, anchor_hash, coin, network) = read.ok_or(PublishError::ChainTooShort)?;
         let anchor_hash = anchor_hash.ok_or(PublishError::Busy)?;
         let coin = coin.ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
-        if u64::from(coin.height) + u64::from(super::MIN_COIN_AGE) > u64::from(anchor_height) {
-            return Err(PublishError::Rejected(Rejection::CoinTooYoung {
-                coin_height: coin.height,
-                anchor_height,
-            }));
-        }
+        check_coin_age(network, &coin, anchor_height).map_err(PublishError::Rejected)?;
 
         let text = message::render(&outpoint, key, value, anchor_height, &anchor_hash);
         let mut warnings = Vec::new();
@@ -521,7 +516,7 @@ fn keys_for(entries: &BTreeMap<Key, Entry>, outpoint: OutPoint) -> usize {
 /// already holds the result.
 fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &dyn ChainView) -> Assessed {
     // A missing coin means a spent one only on a chain that holds the anchor:
-    // the coin confirmed at least `MIN_COIN_AGE` blocks below it, so on that
+    // the coin confirmed below the anchor, so on that
     // chain nothing else removes it. A node behind the anchor (a reindex,
     // say), or on a fork without it, may see the coin again; the attestation
     // is kept and judged `AnchorNotOnChain` meanwhile.
