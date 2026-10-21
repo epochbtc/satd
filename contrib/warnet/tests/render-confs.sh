@@ -14,7 +14,7 @@ CHART="${WARNET_CHART:-$(python3 -c 'from warnet.constants import BITCOIN_CHART_
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
 render() { # <release> [addnode]
-    printf 'image: {repository: satd-warnet, tag: "0.6.1-warnet0"}\n' > "$tmp/values.yaml"
+    printf 'image: {repository: satd-warnet, tag: "0.6.2-warnet0"}\n' > "$tmp/values.yaml"
     [ -z "${2:-}" ] || printf 'addnode: [%s]\n' "$2" >> "$tmp/values.yaml"
     helm template "$1" "$CHART" -f "$tmp/values.yaml" | python3 -c '
 import sys, yaml
