@@ -52,7 +52,7 @@ struct CliArgs {
     #[arg(long, help = "Connect to the RPC server over TLS")]
     rpctls: bool,
 
-    /// Trust this CA in addition to the platform trust store. A
+    /// Trust only this CA; the public roots no longer apply. A
     /// self-signed server certificate works here too, as its own anchor.
     #[arg(long, value_name = "FILE", help = "PEM CA certificate to trust for -rpctls")]
     rpccacert: Option<PathBuf>,

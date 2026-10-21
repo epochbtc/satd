@@ -80,7 +80,7 @@ struct Cli {
     #[arg(long, help = "Connect to the RPC server over TLS", global = true)]
     rpctls: bool,
 
-    /// Trust this CA in addition to the platform trust store. Point it at
+    /// Trust only this CA; the public roots no longer apply. Point it at
     /// the CA that issued the node's certificate — `contrib/stack/tls/mkca.sh`
     /// writes one per install — or at a self-signed server certificate,
     /// which is accepted as its own trust anchor.

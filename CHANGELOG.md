@@ -84,6 +84,11 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `sat-cli` and `sat-tui` with `-rpccacert` trust only the certificates in
+  that file. The public CA roots used to apply as well, so any public CA that
+  issued a certificate for the node's hostname, such as one signing with the
+  leaked emSign intermediate keys, could intercept the RPC credential.
+
 - `rustls-webpki` 0.103.16 and `webpki-roots` / `webpki-root-certs` 1.0.10
   (RUSTSEC-2026-0381, -0382, -0383: distrusted emSign intermediates).
 

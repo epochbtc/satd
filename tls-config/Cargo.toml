@@ -19,10 +19,15 @@ x509-parser = "0.16"
 # client through this crate so the two ends of a satd TLS connection are
 # configured from one place. satd itself does not enable the feature.
 reqwest = { workspace = true, optional = true }
+# The public roots the client trusts when no `-rpccacert` is given. The client
+# builds its own rustls configuration (so that `-rpccacert` can replace the
+# public roots rather than add to them), which means it supplies the root set
+# itself; this is the same crate and set reqwest's `rustls-tls` bundles.
+webpki-roots = { version = "1", optional = true }
 
 [features]
 default = []
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:webpki-roots"]
 
 [dev-dependencies]
 rcgen = { workspace = true }
