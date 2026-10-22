@@ -125,7 +125,8 @@ pub fn create(
 }
 
 /// `submitnapattestation "message" "signature"`. The signature may be a
-/// signed BIP 322 PSBT of the message, which is finalized.
+/// signed BIP 322 PSBT of the message, which is finalized, or the signed
+/// `to_sign` transaction in hex.
 pub fn submit(
     nap: &Publisher,
     chain: &ChainState,

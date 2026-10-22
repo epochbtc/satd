@@ -114,7 +114,8 @@ ones.
 
 2. Sign the message in the wallet that holds the coin (see the next section).
 
-3. Submit the message and the signature, or the signed PSBT:
+3. Submit the message and the signature, the signed PSBT, or the signed
+   transaction in hex:
 
    ```text
    sat-cli submitnapattestation "$MESSAGE" "smpAkcwRAIg…"
@@ -151,6 +152,13 @@ as Core's legacy format for a P2PKH coin, because most wallets made before
 BIP 322 was finalized emit unprefixed signatures. Proof-of-funds (`pof…`)
 signatures are refused: sign without extra inputs. The RPCs return
 signatures in the prefixed form.
+
+`submitnapattestation` also takes the signed `to_sign` transaction as raw
+hex, with no prefix, and reads it as a full proof. This is what a wallet
+exports when it finalizes the PSBT itself (see
+[Signing through a PSBT](#signing-through-a-psbt)). A string of hex digits
+that decodes as a transaction is read as one; `verifybip322` takes BIP 322's
+own forms only.
 
 | Coin | Format | Signers (as surveyed in 2026) |
 |---|---|---|
@@ -217,6 +225,17 @@ for the outpoint's own script.
 - **Coldcard** signs these PSBTs (from firmware 5.5.1, and 1.4.1 on the Q),
   shows them as messages, and returns the signed PSBT without finalizing
   it, which is what the node expects.
+- **Sparrow** signs the PSBT with a connected hardware wallet (a Ledger on
+  the Bitcoin app 2.5.1, for one), finalizes it and exports the signed
+  transaction in hex. Submit that hex as the signature, without a prefix:
+
+  ```text
+  sat-cli submitnapattestation "$MESSAGE" "00000000000101c144…"
+  ```
+
+  On the device the request looks like a transaction with one input, a
+  zero-value `OP_RETURN` output and no fee. It spends nothing on chain; do
+  not broadcast it.
 
 A PSBT is refused with `-8` when it lacks the message field, has more than
 one input (proof of funds), has any output but the zero-value `OP_RETURN`,

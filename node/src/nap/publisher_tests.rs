@@ -61,8 +61,8 @@ fn a_submitted_attestation_is_stored_and_survives_a_reload() {
     assert_eq!(p.serving().len(), 2);
 }
 
-/// D14: `smp`, `ful`, unprefixed (simple for segwit, legacy for P2PKH); not
-/// `pof`.
+/// D14: `smp`, `ful`, unprefixed (simple for segwit, legacy for P2PKH), the
+/// full proof as a raw transaction in hex; not `pof`.
 #[test]
 fn signature_strings_by_prefix() {
     let (_dir, path) = store_path();
@@ -77,6 +77,16 @@ fn signature_strings_by_prefix() {
     let full_att = attest(&chain, &full, op, "k", "v", ANCHOR);
     assert!(encode_signature(full_att.signature()).starts_with("ful"));
     assert_eq!(submit(&p, &chain, &full_att), Ok(None));
+
+    // The signed `to_sign` in hex, as Sparrow exports it, is the full proof.
+    let hex_att = attest(&chain, &full, op, "k2", "v", ANCHOR);
+    let NapSignature::Full(tx) = hex_att.signature() else { panic!("a full proof") };
+    let hex = bitcoin::consensus::encode::serialize_hex(tx);
+    let (stored, _) = p.submit(&chain, &hex_att.message(), &hex.to_uppercase()).unwrap();
+    assert_eq!(stored.attestation, hex_att, "the same full proof");
+    let bad = p.submit(&chain, &hex_att.message(), &hex[..hex.len() - 2]).unwrap_err();
+    assert_eq!(bad.rule(), "format");
+    assert!(bad.to_string().contains("neither a transaction in hex"), "{bad}");
 
     let legacy = p2pkh();
     let op = coin(&mut chain, &legacy, 9);
