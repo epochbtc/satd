@@ -272,8 +272,11 @@ jobs:
           key: ${{ runner.os }}-canary-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-canary-cargo-
 
+      # Restored on every run but saved only off pull requests (see the save
+      # step below).
       - name: Cache target directory
-        uses: actions/cache@v6
+        id: canary_target
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: ${{ runner.os }}-canary-target-${{ hashFiles('**/Cargo.lock') }}
@@ -281,6 +284,18 @@ jobs:
 
       - name: Build satd + sat-cli (release)
         run: cargo build --release --locked --bin satd --bin sat-cli
+
+      # A pull request's cache is visible to that pull request alone, and at
+      # ~1.4 GB a target directory it pushed the repository past its 10 GB
+      # Actions cache limit, evicting the master caches every PR restores.
+      # Master's copy comes from ci.yml's seed-canary-cache and the weekly
+      # scheduled run.
+      - name: Save target directory
+        if: github.event_name != 'pull_request' && steps.canary_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-canary-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Upload binaries
         uses: actions/upload-artifact@v7
@@ -649,8 +664,11 @@ jobs:
           key: ${{ runner.os }}-canary-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-canary-cargo-
 
+      # Restored on every run but saved only off pull requests (see the save
+      # step below).
       - name: Cache target directory
-        uses: actions/cache@v6
+        id: core_block_diff_target
+        uses: actions/cache/restore@v6
         with:
           path: target
           # Separate key from the release `build` job — this is a debug test build.
@@ -668,6 +686,18 @@ jobs:
           # Absorb hosted-runner load on satd startup, as ci.yml does.
           SATD_TEST_TIMEOUT_MULT: '2'
         run: cargo test -p satd --test core_block_differential --features core-block-differential -- --nocapture
+
+      # A pull request's cache is visible to that pull request alone, and at
+      # ~1.4 GB a target directory it pushed the repository past its 10 GB
+      # Actions cache limit, evicting the master caches every PR restores.
+      # Master's copy comes from ci.yml's seed-canary-cache and the weekly
+      # scheduled run.
+      - name: Save target directory
+        if: github.event_name != 'pull_request' && steps.core_block_diff_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-core-block-diff-target-${{ hashFiles('**/Cargo.lock') }}
 
   # LND Neutrino canary — runs a real LND node as a BIP 157/158 light
   # client (Neutrino) backed by satd over P2P. The dominant Lightning

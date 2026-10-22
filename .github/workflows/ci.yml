@@ -129,13 +129,15 @@ jobs:
       # instead of recompiled every run. Keyed automatically on the rustc
       # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
       # which left target/ uncached — so every run rebuilt rocksdb from scratch
-      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
-      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
-      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      # (~8 min of an ~9 min job). A pull request restores master's copy and
+      # saves nothing: its cache would be visible to that PR alone, and PR
+      # saves kept the repository over its 10 GB Actions cache limit, evicting
+      # master's. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
           # Match the `seed-cache` job's `tests` key so a fresh branch's first
           # run restores master's seeded dependency cache (key = shared-key +
           # rustc + Cargo.lock hash, independent of job/event), not a cold one.
@@ -251,9 +253,10 @@ jobs:
       # instead of recompiled every run. Keyed automatically on the rustc
       # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
       # which left target/ uncached — so every run rebuilt rocksdb from scratch
-      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
-      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
-      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      # (~8 min of an ~9 min job). A pull request restores master's copy and
+      # saves nothing: its cache would be visible to that PR alone, and PR
+      # saves kept the repository over its 10 GB Actions cache limit, evicting
+      # master's. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -391,9 +394,10 @@ jobs:
       # instead of recompiled every run. Keyed automatically on the rustc
       # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
       # which left target/ uncached — so every run rebuilt rocksdb from scratch
-      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
-      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
-      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      # (~8 min of an ~9 min job). A pull request restores master's copy and
+      # saves nothing: its cache would be visible to that PR alone, and PR
+      # saves kept the repository over its 10 GB Actions cache limit, evicting
+      # master's. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -502,13 +506,15 @@ jobs:
       # instead of recompiled every run. Keyed automatically on the rustc
       # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
       # which left target/ uncached — so every run rebuilt rocksdb from scratch
-      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
-      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
-      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      # (~8 min of an ~9 min job). A pull request restores master's copy and
+      # saves nothing: its cache would be visible to that PR alone, and PR
+      # saves kept the repository over its 10 GB Actions cache limit, evicting
+      # master's. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
           # Match the `seed-cache` job's `lint` key (see the test job). The
           # lint cache is separate from `tests` because clippy compiles a
           # different feature set (`--all-features`).

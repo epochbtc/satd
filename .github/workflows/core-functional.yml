@@ -166,8 +166,11 @@ jobs:
           key: ${{ runner.os }}-corefunc-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-corefunc-cargo-
 
+      # Restored on every run but saved only off pull requests (see the save
+      # step below).
       - name: Cache target directory
-        uses: actions/cache@v6
+        id: corefunc_target
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: ${{ runner.os }}-corefunc-target-${{ hashFiles('**/Cargo.lock') }}
@@ -175,6 +178,17 @@ jobs:
 
       - name: Build satd and sat-cli
         run: cargo build --release --locked --bin satd --bin sat-cli
+
+      # A pull request's cache is visible to that pull request alone, and at
+      # ~1.4 GB a target directory it pushed the repository past its 10 GB
+      # Actions cache limit, evicting the master caches every PR restores.
+      # Master's copy comes from the nightly scheduled run.
+      - name: Save target directory
+        if: github.event_name != 'pull_request' && steps.corefunc_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-corefunc-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Fetch the pinned Core tree
         run: contrib/core-functional/fetch-core.sh

@@ -445,8 +445,11 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      # Restored on every run but saved only off pull requests (see the save
+      # step below).
       - name: Cache target directory
-        uses: actions/cache@v6
+        id: target_cache
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
@@ -483,6 +486,17 @@ jobs:
           cargo zigbuild --release --locked \
             --bin satd --bin sat-cli --bin sat-tui \
             --target ${{ matrix.target }}
+
+      # A pull request's cache is visible to that pull request alone, and at
+      # ~1.4 GB a target directory it pushed the repository past its 10 GB
+      # Actions cache limit, evicting the master caches every PR restores.
+      # Only tag builds and dispatches save; PR dry-runs build without a cache.
+      - name: Save target directory
+        if: github.event_name != 'pull_request' && steps.target_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Determine version string
         id: version
