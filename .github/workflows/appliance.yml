@@ -382,7 +382,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # Saved off pull requests only: a PR's cache is visible to that PR
+      # alone, and a release target directory is over 1 GB.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Build the binaries the image installs
         # Skipped when building around a published release: that path
         # installs the signed tarball, so compiling the checkout would cost
