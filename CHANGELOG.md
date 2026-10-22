@@ -30,7 +30,8 @@ item below is (or will be) written up in full in the in-development
   when the saved one does not read back; `-napmaxattestations` caps the store.
   Hardware and multisig signers sign the BIP 322 `to_sign` PSBT that
   `createnapattestation` returns (with key origins and scripts filled in from
-  an optional descriptor), and `submitnapattestation` finalizes it. A coin
+  an optional descriptor), and `submitnapattestation` finalizes it, or takes
+  the signed transaction in hex as a wallet that finalizes it exports. A coin
   attests 4,032 blocks after it confirms on mainnet, 6 on the test networks.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,

@@ -536,8 +536,9 @@ fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &d
 }
 
 /// A signature string as the RPCs take it (D14), for `coin`: `smp`, `ful`,
-/// or unprefixed (legacy for P2PKH, simple otherwise); or a signed BIP 322
-/// PSBT of `text` (D15), which is finalized into a simple or full proof.
+/// or unprefixed (legacy for P2PKH, simple otherwise); a signed BIP 322
+/// PSBT of `text` (D15), which is finalized into a simple or full proof; or
+/// the signed `to_sign` transaction in hex, a full proof.
 fn decode_signature(signature: &str, coin: &Coin, text: &str) -> Result<NapSignature, PublishError> {
     if let Some(bytes) = crate::rpc::signmessage::decode_base64(signature)
         && bip322::psbt::is_psbt(&bytes)
@@ -559,6 +560,12 @@ fn decode_signature(signature: &str, coin: &Coin, text: &str) -> Result<NapSigna
             Proof::Full(tx) => NapSignature::Full(tx),
         });
     }
+    // A wallet that finalizes the PSBT itself (Sparrow) exports the signed
+    // `to_sign` as a raw transaction in hex: the full proof, unencoded.
+    let hex = raw_transaction(signature);
+    if let Some(Ok(tx)) = hex {
+        return Ok(NapSignature::Full(tx));
+    }
     match bip322::decode(signature, &coin.script_pubkey) {
         Ok(Signature::Legacy(bytes)) => {
             let bytes: [u8; LEGACY_SIGNATURE_LEN] = bytes.try_into().map_err(|b: Vec<u8>| {
@@ -574,8 +581,17 @@ fn decode_signature(signature: &str, coin: &Coin, text: &str) -> Result<NapSigna
         Err(DecodeError::ProofOfFunds) => Err(PublishError::Format(
             "proof-of-funds (pof) signatures are not accepted; sign without extra inputs".into(),
         )),
-        Err(e) => Err(PublishError::Format(e.to_string())),
+        Err(e) => Err(PublishError::Format(match hex {
+            Some(Err(h)) => format!("neither a transaction in hex ({h}) nor a signature ({e})"),
+            _ => e.to_string(),
+        })),
     }
+}
+
+/// `s` as a transaction in hex, if it is written in hex digits at all.
+fn raw_transaction(s: &str) -> Option<Result<bitcoin::Transaction, String>> {
+    (!s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| bitcoin::consensus::encode::deserialize_hex(s).map_err(|e| e.to_string()))
 }
 
 /// A signature in the string form RPCs return: prefixed for BIP 322, as
