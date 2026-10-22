@@ -717,7 +717,11 @@ jobs:
           load: false
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.slug }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          # Saved off pull requests only, as in docker.yml. A PR dry-run's
+          # layers (~2 GB across the two arches) are visible to that PR alone
+          # and pushed the repository past its 10 GB Actions cache limit,
+          # evicting the master caches every PR restores.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', matrix.slug) || '' }}
           # provenance=false skips buildkit's auto-generated SLSA
           # attestation. We do our own provenance via cosign keyless
           # in merge-docker (the Sigstore cert ties the image to a
