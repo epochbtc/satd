@@ -512,8 +512,11 @@ jobs:
           key: ${{ runner.os }}-canary-bdk-cargo-${{ hashFiles('scripts/canary/bdk-canary/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-canary-bdk-cargo-
 
+      # Restored on every run but saved only off pull requests (see the save
+      # step after the canary run).
       - name: Cache BDK canary target
-        uses: actions/cache@v6
+        id: bdk_target
+        uses: actions/cache/restore@v6
         with:
           path: scripts/canary/bdk-canary/target
           key: ${{ runner.os }}-canary-bdk-target-${{ hashFiles('scripts/canary/bdk-canary/Cargo.lock') }}
@@ -530,6 +533,16 @@ jobs:
 
       - name: Run BDK descriptor-wallet canary
         run: bash scripts/canary/bdk-smoke.sh
+
+      # bdk-smoke.sh builds the canary, so this follows it. A pull request's
+      # cache is visible to that pull request alone; master's copy comes from
+      # the weekly scheduled run.
+      - name: Save BDK canary target
+        if: github.event_name != 'pull_request' && steps.bdk_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: scripts/canary/bdk-canary/target
+          key: ${{ runner.os }}-canary-bdk-target-${{ hashFiles('scripts/canary/bdk-canary/Cargo.lock') }}
 
       - name: Upload satd log on failure
         if: failure()
