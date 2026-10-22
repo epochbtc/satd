@@ -71,11 +71,12 @@ once the workspace has built.
 
 ## CI
 
-The per-PR job runs the full E2E suite once as a step in the existing
-`Tests` job (`.github/workflows/ci.yml`). The step's wall-clock is
-~30s because the workspace has already been built by the previous
-`cargo test --all` step; promoting it to its own job would pay the
-toolchain-install cost twice and slow CI for no benefit.
+The E2E suite runs once per PR in its own job, `Tests (E2E)`
+(`.github/workflows/ci.yml`), in parallel with `Tests (unit +
+integration)` and `Tests (Go SDK)`. Run one after another in a single
+job, the three took ~28 minutes. Each restores the dependency cache that
+master keeps warm, so a job compiles only the crates the PR changed. The
+required `Tests` check passes only when all three do.
 
 The manual flake-gate workflow (`.github/workflows/e2e_flake_gate.yml`)
 loops the E2E suite 10 consecutive times — fail-fast on the first

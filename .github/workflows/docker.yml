@@ -80,7 +80,11 @@ jobs:
           # Dedicated cache scope so this never races / pollutes the
           # per-arch scopes release.yml uses (docker-ci-* vs amd64/arm64).
           cache-from: type=gha,scope=docker-ci-${{ matrix.slug }}
-          cache-to: type=gha,mode=max,scope=docker-ci-${{ matrix.slug }}
+          # Saved from master only. A pull request reads master's layers, but
+          # the ones it writes are visible to that PR alone, and at ~0.6 GB a
+          # run they pushed the repository past its 10 GB Actions cache limit,
+          # evicting the Rust caches every PR restores.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope=docker-ci-{0}', matrix.slug) || '' }}
           # We sign + attest provenance in release.yml's merge-docker via
           # cosign keyless; a partial buildkit attestation here would be
           # noise. The sha- tag pushed below is a development reference, not

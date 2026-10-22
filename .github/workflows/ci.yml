@@ -43,10 +43,30 @@ permissions:
 
 jobs:
 
+  # The test suite runs as three jobs in parallel: run one after another in a
+  # single job they took ~28 min, about 11 of it the unit and integration
+  # tests, 8 the Rust E2E suite and 6 the Go SDK. Each job restores the
+  # `tests` cache that `seed-cache` keeps on master and compiles only what
+  # changed. `Tests` itself is the required status check, and it passes only
+  # when all three do.
   test:
     name: "Tests"
+    needs: [test-unit, test-e2e, test-go]
+    if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 5
+    steps:
+      - name: All test jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "unit, e2e, go: $RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+
+  test-unit:
+    name: "Tests (unit + integration)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
       - name: Checkout sources
@@ -164,6 +184,99 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: cargo test --all --locked
 
+
+  test-e2e:
+    name: "Tests (E2E)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
+      # use (Android, .NET, Haskell, CodeQL). The workspace target/
+      # directory plus cargo registry routinely exceed the remaining
+      # ~14 GB of free disk and SIGBUS the linker mid-link of debug-mode
+      # test binaries. Reclaim ~20 GB before the build.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
+      # native build wants cmake. Hosted ubuntu-24.04 ships clang +
+      # cmake binaries but NOT libclang-dev — install explicitly.
+      # libssl-dev is needed by the openssl-sys path in reqwest's
+      # native-tls backend.
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          # The runner image ships third-party apt sources (Google Chrome,
+          # Microsoft) that none of the packages below come from. A hash-sum
+          # mismatch on one of them fails the whole `apt-get update` under
+          # `set -euo pipefail`, and it does: that is what took every canary
+          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
+          # archives and nothing else.
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      # Caches ~/.cargo/{registry,git,bin} AND target/, pruning the
+      # fast-changing first-party crate artifacts so the expensive dependency
+      # builds (rocksdb-sys + its C++ tree, bindgen, proc-macros) are restored
+      # instead of recompiled every run. Keyed automatically on the rustc
+      # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
+      # which left target/ uncached — so every run rebuilt rocksdb from scratch
+      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
+      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
+      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only `Tests (unit)` saves: the three jobs share the key, so one
+          # writer is enough and the others never race it.
+          save-if: false
+          # Match the `seed-cache` job's `tests` key so a fresh branch's first
+          # run restores master's seeded dependency cache (key = shared-key +
+          # rustc + Cargo.lock hash, independent of job/event), not a cold one.
+          shared-key: tests
+
+      # Pre-build sat-cli. The satd integration tests reach `sat-cli` by
+      # path lookup (`Path::new(CARGO_BIN_EXE_satd).parent().join("sat-cli")`)
+      # rather than via the `CARGO_BIN_EXE_*` mechanism, because the
+      # binary lives in a sibling crate. `cargo test` only auto-builds
+      # bin targets for the same crate as the test, so without this
+      # explicit step the path lookup finds nothing and every sat-cli
+      # test fails with ENOENT. The narrow `-p sat-cli` build (vs. the
+      # old `cargo build --all`) is targeted at the actual dependency
+      # and avoids the ~5-7min cost of building every workspace bin.
+      - name: Pre-build sat-cli (test fixture)
+        run: cargo build -p sat-cli --locked
+
       # The Go SDK (clients/go) is an independent module in this repo. It is
       # tested here, on satd's own PRs, rather than in a downstream repo, so a
       # node or proto change that breaks the SDK fails the PR that made it —
@@ -211,6 +324,107 @@ jobs:
           PARITYDUMP_BIN: ${{ runner.temp }}/paritydump
         run: cargo test --test e2e --locked --features e2e
 
+
+  test-go:
+    name: "Tests (Go SDK)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
+      # use (Android, .NET, Haskell, CodeQL). The workspace target/
+      # directory plus cargo registry routinely exceed the remaining
+      # ~14 GB of free disk and SIGBUS the linker mid-link of debug-mode
+      # test binaries. Reclaim ~20 GB before the build.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/PyPy
+          sudo rm -rf /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # rocksdb-sys needs libclang (bindgen headers) and the rocksdb
+      # native build wants cmake. Hosted ubuntu-24.04 ships clang +
+      # cmake binaries but NOT libclang-dev — install explicitly.
+      # libssl-dev is needed by the openssl-sys path in reqwest's
+      # native-tls backend.
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          # The runner image ships third-party apt sources (Google Chrome,
+          # Microsoft) that none of the packages below come from. A hash-sum
+          # mismatch on one of them fails the whole `apt-get update` under
+          # `set -euo pipefail`, and it does: that is what took every canary
+          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
+          # archives and nothing else.
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      # Caches ~/.cargo/{registry,git,bin} AND target/, pruning the
+      # fast-changing first-party crate artifacts so the expensive dependency
+      # builds (rocksdb-sys + its C++ tree, bindgen, proc-macros) are restored
+      # instead of recompiled every run. Keyed automatically on the rustc
+      # version + Cargo.lock. Replaces the old registry-only actions/cache@v3,
+      # which left target/ uncached — so every run rebuilt rocksdb from scratch
+      # (~8 min of an ~9 min job). cache-on-failure keeps the warm cache even
+      # when tests fail, so iterating on a red PR doesn't pay the full rebuild
+      # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only `Tests (unit)` saves: the three jobs share the key, so one
+          # writer is enough and the others never race it.
+          save-if: false
+          # Match the `seed-cache` job's `tests` key so a fresh branch's first
+          # run restores master's seeded dependency cache (key = shared-key +
+          # rustc + Cargo.lock hash, independent of job/event), not a cold one.
+          shared-key: tests
+
+      # The Go E2E suite runs against target/debug/satd. Build it with the
+      # command the Rust E2E job uses, so this is the same binary: a plain
+      # `cargo build -p satd` resolves features without satd's
+      # dev-dependencies and can differ.
+      - name: Build satd (as the E2E job builds it)
+        run: cargo test --test e2e --no-run --locked --features e2e
+
+      # The Go SDK (clients/go) is an independent module in this repo. It is
+      # tested here, on satd's own PRs, rather than in a downstream repo, so a
+      # node or proto change that breaks the SDK fails the PR that made it —
+      # the same reason the third-party canary fleet is PR-gating. The SDK is
+      # not exercised by day-to-day node operation, so CI is the only thing
+      # between a
+      # green badge and a rotted client.
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+
       - name: Run Go SDK unit tests
         working-directory: clients/go
         run: go test ./... -count=1
@@ -227,8 +441,7 @@ jobs:
           go build ./...
           go test ./... -count=1
 
-      # The Go E2E suite drives the SAME satd binary the Rust E2E step above
-      # just built, over a real gRPC socket. It is an independent module (so its
+      # The Go E2E suite drives satd over a real gRPC socket. It is an independent module (so its
       # test-only dependencies never reach the published SDK's graph) behind the
       # `e2e` build tag, and it boots its own regtest node per test.
       #
@@ -481,7 +694,7 @@ jobs:
         with:
           shared-key: ${{ matrix.leg }}
 
-      # Compile (don't run) exactly what the Tests job builds: the workspace
+      # Compile (don't run) exactly what the test jobs build: the workspace
       # test binaries, the sat-cli path fixture, and the e2e target. `--no-run`
       # links the test binaries but executes nothing.
       - name: Warm the tests cache
@@ -501,3 +714,80 @@ jobs:
       - name: Warm the lint cache
         if: matrix.leg == 'lint'
         run: cargo clippy --all-targets --all-features --locked
+
+  # The canary workflow's two builds keep their own caches (canary.yml: the
+  # release `build` job and the block-acceptance differential's debug build).
+  # The canary does not run on master pushes, so those caches were only ever
+  # saved from pull requests, which other pull requests cannot read: every new
+  # PR compiled both from scratch (the release build alone took ~14 min instead
+  # of ~3). This job saves them on master, with the canary jobs' own toolchain,
+  # cache keys and build commands, so a PR restores them from its base branch.
+  # A key changes only with Cargo.lock; while master's entry exists the build
+  # is skipped.
+  seed-canary-cache:
+    name: "Seed canary cache (${{ matrix.leg }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: release
+            key: canary-target
+            build: cargo build --release --locked --bin satd --bin sat-cli
+          - leg: core-block-diff
+            key: core-block-diff-target
+            build: cargo test -p satd --test core_block_differential --features core-block-differential --no-run --locked
+    env:
+      # canary.yml's RUST_TOOLCHAIN: the same compiler, or the restored target
+      # directory is rebuilt from scratch.
+      RUST_TOOLCHAIN: '1.93.0'
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master as of 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-canary-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-cargo-
+
+      - name: Cache target directory
+        id: target-cache
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.key }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.key }}-
+
+      - name: Build
+        if: steps.target-cache.outputs.cache-hit != 'true'
+        run: ${{ matrix.build }}
