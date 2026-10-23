@@ -72,6 +72,10 @@ report() {
     local listed note
     listed=$(sed -n 1p "$SCOPE_FILE")
     note=$(sed -n '2,$p' "$SCOPE_FILE")
+    if [ "$listed" -eq 0 ]; then
+        printf '### Mutation testing\n\n%s\n\nNo mutants in scope: nothing to test.\n' "$note" | emit
+        return 0
+    fi
     local outcomes="$MUTANTS_OUT/mutants.out/outcomes.json"
     if [ ! -f "$outcomes" ]; then
         # The budget can run out before the first mutant finishes building.
@@ -126,11 +130,13 @@ echo "$note $listed mutant(s) in scope; budget ${BUDGET_MINUTES} min."
 
 rm -rf "$MUTANTS_OUT"
 mkdir -p "$MUTANTS_OUT"
+# Written before anything can stop the run, so `report` always has a scope,
+# including the common case of a diff with no Rust in it.
+printf '%s\n%s\n' "$listed" "$note" > "$SCOPE_FILE"
 if [ "$listed" -eq 0 ]; then
-    printf '### Mutation testing\n\n%s\n\nNo mutants in scope: nothing to test.\n' "$note" | emit
+    [ "${MUTANTS_SKIP_REPORT:-0}" = 1 ] || report
     exit 0
 fi
-printf '%s\n%s\n' "$listed" "$note" > "$SCOPE_FILE"
 
 set +e
 # SIGINT, not the default TERM: cargo-mutants stops at the interrupt and keeps
