@@ -269,6 +269,11 @@ item below is (or will be) written up in full in the in-development
   and -10 during initial block download, as Core does. It handed out
   templates on a stale tip.
 - `gettxout`'s `scriptPubKey` has Core's `desc`, `address` and `type`.
+- The scriptPubKey `type` that `getrawtransaction`, `decoderawtransaction`,
+  `decodescript` and `gettxout` report names bare P2PK (`pubkey`), bare
+  multisig (`multisig`), P2A (`anchor`) and witness v2+ (`witness_unknown`)
+  outputs as Core does, and calls an `OP_RETURN` script `nulldata` only when
+  the rest of it is pushes. They were `nonstandard`.
 - An unroutable `-externalip` address (private, loopback, documentation
   space) is no longer advertised to peers or listed in `localaddresses`, as
   Core's `AddLocal` refuses it.

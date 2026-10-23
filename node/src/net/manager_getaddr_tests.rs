@@ -186,7 +186,7 @@ fn externals_are_advertised_to_outbound_peers_on_their_family() {
 /// An `-externalip` address Core calls unroutable is never claimed: not
 /// self-advertised, not the version message's sender, not in
 /// `localaddresses` (Core's `AddLocal` refuses it). An `fc00::/8` address is
-/// kept once `-cjdnsreachable` makes it a CJDNS address.
+/// left out even under `-cjdnsreachable`: satd cannot encode it as CJDNS.
 /// Perturbation: read `external_addrs` unfiltered and the private address
 /// goes out.
 #[test]
@@ -211,7 +211,7 @@ fn an_unroutable_externalip_is_never_advertised() {
 
     pm.set_reachable(crate::net::reachable::ReachableNets { cjdns: true, cjdns_flip: true, ..Default::default() });
     let local: Vec<String> = pm.local_addresses().into_iter().map(|(h, _, _)| h).collect();
-    assert_eq!(local, vec!["44.33.22.11".to_string(), "fc32::1".to_string()]);
+    assert_eq!(local, vec!["44.33.22.11".to_string()], "no CJDNS encoding, so no CJDNS self-advertisement");
 
     pm.set_external_addrs(vec![SocketAddr::from(([10, 1, 2, 3], 8333)), public]);
     let version = pm.build_version_message(SocketAddr::from(([198, 51, 100, 7], 8333)), ConnType::OutboundFullRelay);

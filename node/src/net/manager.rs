@@ -1813,17 +1813,16 @@ impl PeerManager {
     /// `AddLocal` refuses an address that is not routable (`net.cpp`), so a
     /// private, loopback or documentation address is never advertised to
     /// peers, sent as the version message's sender, or listed in
-    /// `localaddresses`. Under `-cjdnsreachable` an `fc00::/8` address is a
-    /// CJDNS address, which Core counts as routable.
+    /// `localaddresses`. Core keeps an `fc00::/8` address under
+    /// `-cjdnsreachable`, where it is a CJDNS address and goes out as BIP 155
+    /// network 6; satd has no CJDNS encoding and would send it as IPv6, which
+    /// peers drop as unique-local, so it is left out like any unroutable
+    /// address.
     fn advertisable_external_addrs(&self) -> Vec<SocketAddr> {
-        let reachable = self.reachable.read();
         self.external_addrs
             .read()
             .iter()
-            .filter(|a| {
-                crate::net::is_routable(a.ip())
-                    || reachable.network_of(a) == crate::net::reachable::Network::Cjdns
-            })
+            .filter(|a| crate::net::is_routable(a.ip()))
             .copied()
             .collect()
     }

@@ -1557,22 +1557,67 @@ pub fn sign_raw_transaction_with_key(
     Ok(result)
 }
 
-/// Classify a script's type.
+/// Classify a script's type: the `TxoutType` name Core's `Solver`
+/// (`script/solver.cpp`) gives it, in Core's order.
 fn script_type(script: &bitcoin::Script) -> &'static str {
+    use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_RETURN};
+    let b = script.as_bytes();
+    if script.is_p2sh() {
+        return "scripthash";
+    }
+    // `CScript::IsWitnessProgram`: a version opcode, then one direct push of
+    // 2 to 40 bytes that ends the script.
+    let version = match b.first() {
+        Some(0) => Some(0),
+        Some(&op) if (OP_PUSHNUM_1.to_u8()..=OP_PUSHNUM_16.to_u8()).contains(&op) => {
+            Some(op - OP_PUSHNUM_1.to_u8() + 1)
+        }
+        _ => None,
+    };
+    if let Some(version) = version
+        && (4..=42).contains(&b.len())
+        && b[1] as usize + 2 == b.len()
+    {
+        let program = &b[2..];
+        return match (version, program.len()) {
+            (0, 20) => "witness_v0_keyhash",
+            (0, 32) => "witness_v0_scripthash",
+            (1, 32) => "witness_v1_taproot",
+            (1, _) if program == [0x4e, 0x73] => "anchor",
+            (0, _) => "nonstandard",
+            _ => "witness_unknown",
+        };
+    }
+    // Data carrier: OP_RETURN followed only by pushes (`IsPushOnly`, which
+    // counts OP_RESERVED and OP_1NEGATE..OP_16 as pushes).
+    if b.first() == Some(&OP_RETURN.to_u8())
+        && bitcoin::Script::from_bytes(&b[1..]).instructions().all(|insn| match insn {
+            Ok(bitcoin::script::Instruction::PushBytes(_)) => true,
+            Ok(bitcoin::script::Instruction::Op(op)) => op.to_u8() <= OP_PUSHNUM_16.to_u8(),
+            Err(_) => false,
+        })
+    {
+        return "nulldata";
+    }
+    if crate::rpc::descriptor::p2pk_key(script).is_some_and(pubkey_valid_size) {
+        return "pubkey";
+    }
     if script.is_p2pkh() {
-        "pubkeyhash"
-    } else if script.is_p2sh() {
-        "scripthash"
-    } else if script.is_p2wpkh() {
-        "witness_v0_keyhash"
-    } else if script.is_p2wsh() {
-        "witness_v0_scripthash"
-    } else if script.is_p2tr() {
-        "witness_v1_taproot"
-    } else if script.is_op_return() {
-        "nulldata"
-    } else {
-        "nonstandard"
+        return "pubkeyhash";
+    }
+    if crate::rpc::descriptor::bare_multisig(script).is_some_and(|(_, keys)| keys.into_iter().all(pubkey_valid_size)) {
+        return "multisig";
+    }
+    "nonstandard"
+}
+
+/// Core's `CPubKey::ValidSize`: the length the prefix byte calls for, 33 for
+/// 0x02/0x03 and 65 for 0x04/0x06/0x07. The key need not be on the curve.
+fn pubkey_valid_size(key: &[u8]) -> bool {
+    match key.first() {
+        Some(0x02 | 0x03) => key.len() == 33,
+        Some(0x04 | 0x06 | 0x07) => key.len() == 65,
+        _ => false,
     }
 }
 

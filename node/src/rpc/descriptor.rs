@@ -1561,7 +1561,7 @@ pub fn infer_descriptor(script: &bitcoin::Script, network: Network) -> String {
 }
 
 /// The pubkey of a bare P2PK output (`<key> OP_CHECKSIG`), by length.
-fn p2pk_key(script: &bitcoin::Script) -> Option<&[u8]> {
+pub(crate) fn p2pk_key(script: &bitcoin::Script) -> Option<&[u8]> {
     let b = script.as_bytes();
     match b.len() {
         35 if b[0] == 33 && b[34] == opcodes::OP_CHECKSIG.to_u8() => Some(&b[1..34]),
@@ -1572,7 +1572,7 @@ fn p2pk_key(script: &bitcoin::Script) -> Option<&[u8]> {
 
 /// Core's `MatchMultisig`: `<m> <key>... <n> OP_CHECKMULTISIG` with
 /// minimal pushes and `1 <= m <= n`.
-fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)> {
+pub(crate) fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)> {
     use bitcoin::script::Instruction;
 
     if script.as_bytes().last() != Some(&opcodes::OP_CHECKMULTISIG.to_u8()) {

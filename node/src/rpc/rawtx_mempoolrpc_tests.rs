@@ -207,6 +207,40 @@ fn gettxout_names_the_script_type_address_and_descriptor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `script_type` names every script as Core's `Solver` does. Before, bare
+/// P2PK, bare multisig, anchors and witness v2+ were all "nonstandard", and
+/// any OP_RETURN script was "nulldata".
+#[test]
+fn script_type_follows_core_solver() {
+    let k33 = format!("02{}", "11".repeat(32));
+    let k65 = format!("04{}", "22".repeat(64));
+    let cases: &[(String, &str)] = &[
+        (format!("21{k33}ac"), "pubkey"),
+        (format!("41{k65}ac"), "pubkey"),
+        // A 33-byte push whose prefix calls for 65 bytes fails `ValidSize`.
+        (format!("2104{}ac", "11".repeat(32)), "nonstandard"),
+        (format!("5121{k33}41{k65}52ae"), "multisig"),
+        (format!("5221{k33}51ae"), "nonstandard"), // m > n
+        ("51024e73".to_string(), "anchor"),
+        (format!("5220{}", "33".repeat(32)), "witness_unknown"),
+        (format!("5102{}", "4e74"), "witness_unknown"),
+        (format!("0019{}", "44".repeat(25)), "nonstandard"), // v0, wrong length
+        ("6a0548656c6c6f".to_string(), "nulldata"),
+        ("6a".to_string(), "nulldata"),
+        ("6aac".to_string(), "nonstandard"), // not push-only after OP_RETURN
+        (format!("76a914{}88ac", "55".repeat(20)), "pubkeyhash"),
+        (format!("a914{}87", "66".repeat(20)), "scripthash"),
+        (format!("0014{}", "77".repeat(20)), "witness_v0_keyhash"),
+        (format!("0020{}", "88".repeat(32)), "witness_v0_scripthash"),
+        (format!("5120{}", "99".repeat(32)), "witness_v1_taproot"),
+        ("ac".to_string(), "nonstandard"),
+    ];
+    for (hex_spk, want) in cases {
+        let spk = bitcoin::ScriptBuf::from_bytes(hex::decode(hex_spk).unwrap());
+        assert_eq!(script_type(&spk), *want, "{hex_spk}");
+    }
+}
+
 #[test]
 fn a_negative_amount_formats_as_core_does() {
     use crate::rpc::amounts::{AmountUnit, format_signed_amount};
