@@ -401,11 +401,13 @@ differ from the aggregator's.
 
 ### Reorganisations
 
-An aggregator SHOULD keep, besides the attestation that counts for each
-`(outpoint, key)`, the one it superseded, until the newer one's anchor is
+An aggregator SHOULD keep each attestation that is superseded for an
+`(outpoint, key)` until the anchor of the attestation that superseded it is
 deep enough that a reorganisation is no longer a practical concern. The
-reference aggregator keeps it until the newer anchor is 144 blocks deep. If
-the newer anchor is reorganised out first, the predecessor counts again, as
+reference aggregator keeps it until that anchor is 144 blocks deep. Every
+generation is kept this way, so after several re-signs within the window
+each one still has its predecessor. If the newer anchors are reorganised
+out, the newest predecessor still valid counts again, as
 [Supersession](#supersession) requires. Publishers serve only the newest
 attestation, so an aggregator that discarded the predecessor could not
 recover it.
