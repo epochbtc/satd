@@ -363,29 +363,15 @@ jobs:
       # and bindgen (a build-script-time tool) needs libclang from
       # the host regardless of which target it's generating bindings
       # for. zig only owns the cross-target C/C++ side.
+      #
+      # `llvm` provides llvm-objcopy, used by the staging step to split
+      # debug info. It's multi-arch, so it can split the cross-built
+      # aarch64 ELF that a host x86 GNU objcopy would reject.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            llvm
-          # `llvm` provides llvm-objcopy, used by the staging step to split
-          # debug info. It's multi-arch, so it can split the cross-built
-          # aarch64 ELF that a host x86 GNU objcopy would reject.
+        uses: ./.github/actions/build-deps
+        with:
+          packages: clang cmake libclang-dev pkg-config llvm
 
       # macOS: librocksdb-sys's build-script binary is linked against
       # libclang.dylib at @rpath. dyld's search list includes
