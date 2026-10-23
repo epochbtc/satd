@@ -684,7 +684,7 @@ fn real_wallet_signatures_are_accepted() {
             coin: Coin {
                 value: VALUE,
                 script_pubkey: bitcoin::ScriptBuf::from_hex(field("script_pubkey")).unwrap(),
-                height: msg.anchor_height - MIN_COIN_AGE,
+                height: msg.anchor_height - TEST_MIN_COIN_AGE,
                 coinbase: false,
             },
         };
