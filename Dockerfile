@@ -155,6 +155,14 @@ COPY . .
 # tarball's: release.yml builds with `-Cforce-frame-pointers=yes` and a
 # `--remap-path-prefix`, so those binaries are not these binaries. To debug
 # the container image itself, rebuild it with `--build-arg STRIP_BINARIES=0`.
+#
+# target/ is deleted once the binaries are in /out. Nothing after this step
+# reads it (the runtime stage copies /out only), and leaving it made this
+# layer ~1.4 GB of first-party artifacts and unstripped binaries. The layer
+# changes on every commit, so CI's layer cache stored a new 1.4 GB copy per
+# arch per master push that no later build could reuse. Deleting it here
+# leaves the cooked dependency layer below untouched: that one is still
+# cached and reused.
 ARG STRIP_BINARIES=1
 RUN cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui \
     && install -Dm755 target/release/satd /out/satd \
@@ -162,7 +170,8 @@ RUN cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui \
     && install -Dm755 target/release/sat-tui /out/sat-tui \
     && if [ "${STRIP_BINARIES}" = "1" ]; then \
         strip /out/satd /out/sat-cli /out/sat-tui; \
-    fi
+    fi \
+    && rm -rf target
 
 
 FROM docker.io/library/debian:${DEBIAN_VERSION}-slim AS runtime
