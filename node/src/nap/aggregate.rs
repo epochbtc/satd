@@ -167,25 +167,41 @@ impl Aggregate {
         let mut dropped = false;
         let mut waiting = Vec::new();
         for (att, source) in pending {
+            // The coin first, the signature outside the read (a read may run
+            // more than once), then the chain rules at the tip.
             let read = chain.read(&|v| {
                 let anchored = v.block_hash(att.anchor_height()) == Some(att.anchor_hash());
                 match v.coin(&att.outpoint()) {
-                    Some(coin) => match verify_signature(&att, &coin.script_pubkey) {
-                        Ok(locks) => Pending::Verified(locks, judge(&att, &locks, v)),
-                        Err(r) => Pending::Bad(r),
-                    },
+                    Some(coin) => Ok(coin.script_pubkey),
                     // Spent while the node was stopped.
-                    None if anchored => Pending::Spent,
-                    // Off the chain for good: past any reorg, or stale.
-                    None if v.tip_height() >= att.anchor_height().saturating_add(REORG_DEPTH) => Pending::Spent,
-                    None => Pending::Wait,
+                    None if anchored => Err(Pending::Spent),
+                    // Off the chain for good: past any reorg.
+                    None if v.tip_height() >= att.anchor_height().saturating_add(REORG_DEPTH) => {
+                        Err(Pending::Spent)
+                    }
+                    None => Err(Pending::Wait),
                 }
             });
-            match read.unwrap_or(Pending::Wait) {
+            let outcome = match read.unwrap_or(Err(Pending::Wait)) {
+                Err(p) => p,
+                Ok(script) => match verify_signature(&att, &script) {
+                    Err(r) => Pending::Bad(r),
+                    Ok(locks) => match chain.read(&|v| judge(&att, &locks, v)) {
+                        Some(status) => Pending::Verified(locks, status),
+                        None => Pending::Wait,
+                    },
+                },
+            };
+            match outcome {
                 Pending::Wait => waiting.push((att, source)),
                 Pending::Spent => dropped = true,
                 Pending::Verified(locks, status) => {
-                    self.insert(att, locks, source, status);
+                    // A refusal (already held, too old, or a full outpoint, as
+                    // a file written under other limits can hold) leaves it
+                    // out of the file too.
+                    if self.insert(att, locks, source, status) != Inserted::Added {
+                        dropped = true;
+                    }
                 }
                 Pending::Bad(r) => {
                     dropped = true;
@@ -337,7 +353,9 @@ impl Aggregate {
             }
             st.dirty = false;
             let held = st.entries.values().flatten().map(|h| (&h.attestation, h.source.as_str()));
-            encode(held.chain(st.pending.iter().map(|(a, s)| (a, s.as_str()))))
+            // A pending entry collected again meanwhile is saved once.
+            let pending = st.pending.iter().filter(|(a, _)| !st.ids.contains_key(&a.id()));
+            encode(held.chain(pending.map(|(a, s)| (a, s.as_str()))))
         };
         if let Err(e) = store::save(&self.path, &bytes) {
             self.state.lock().dirty = true;

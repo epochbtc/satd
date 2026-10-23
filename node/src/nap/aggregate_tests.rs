@@ -525,3 +525,44 @@ fn an_attestation_spent_while_stopped_is_dropped_on_load() {
     assert_eq!((agg.len(), pending_len(&agg)), (0, 0));
     assert_eq!(agg.save_if_dirty(), Ok(true), "the file loses it too");
 }
+
+// --- Round 2 fixes ------------------------------------------------------------
+
+#[test]
+fn a_loaded_attestation_that_is_refused_leaves_the_file() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, path) = agg_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    // The same attestation twice, as a file written while one copy was
+    // pending could hold it.
+    std::fs::write(&path, encode_for_test(&[(att.clone(), "a".into()), (att, "b".into())])).unwrap();
+    let agg = Aggregate::open(path.clone(), &chain).unwrap();
+    assert_eq!(agg.len(), 1);
+    assert_eq!(agg.save_if_dirty(), Ok(true), "the duplicate is written out");
+    let agg = Aggregate::open(path, &chain).unwrap();
+    assert_eq!(agg.save_if_dirty(), Ok(false), "and the file now holds one");
+}
+
+#[test]
+fn a_pending_attestation_collected_again_is_saved_once() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, path) = agg_path();
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        take(&c, &chain, "a", vec![att.clone()]);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    let mut behind = chain_with(&s, 0);
+    behind.tip = COIN_HEIGHT - 1;
+    let c = Collector::new(Aggregate::open(path.clone(), &behind).unwrap());
+    assert_eq!(pending_len(c.aggregate()), 1);
+    // Collected again (against the full chain) while still pending here.
+    take(&c, &chain, "b", vec![att]);
+    c.aggregate().save_if_dirty().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1, "one entry in the file");
+}
