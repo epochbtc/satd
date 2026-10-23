@@ -628,3 +628,79 @@ fn a_signed_draft_psbt_is_finalized_and_stored() {
     assert_eq!(stored.status, Some(Ok(VALUE)));
     assert_eq!(*stored.attestation.signature(), (signer.sign)(&draft.message), "the same simple proof");
 }
+
+/// The chain a real-wallet vector was signed against: the anchor block and
+/// the coin its message names, as they were on signet.
+struct Signed {
+    anchor_height: u32,
+    anchor_hash: bitcoin::BlockHash,
+    outpoint: OutPoint,
+    coin: Coin,
+}
+
+impl ChainView for Signed {
+    fn network(&self) -> bitcoin::Network {
+        bitcoin::Network::Signet
+    }
+    fn tip_height(&self) -> u32 {
+        self.anchor_height + ANCHOR_DEPTH
+    }
+    fn block_hash(&self, height: u32) -> Option<bitcoin::BlockHash> {
+        (height <= self.tip_height())
+            .then(|| if height == self.anchor_height { self.anchor_hash } else { hash_at(height, false) })
+    }
+    fn median_time_past(&self, height: u32) -> u32 {
+        mtp(height)
+    }
+    fn coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        (*outpoint == self.outpoint).then(|| self.coin.clone())
+    }
+}
+
+impl ChainSource for Signed {
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        Some(read(self))
+    }
+}
+
+/// G1: signatures real wallets made on signet, submitted exactly as each
+/// wallet emitted them (a PSBT, a raw transaction, prefixed or not), so
+/// later changes are tested against what wallets actually produce. Each
+/// vector's `wallet` field says what made it.
+#[test]
+fn real_wallet_signatures_are_accepted() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
+    let vectors = vectors.as_array().unwrap();
+    assert_eq!(vectors.len(), 7);
+    for v in vectors {
+        let field = |k: &str| v[k].as_str().unwrap();
+        let (wallet, text, signature) = (field("wallet"), field("message"), field("signature"));
+        let msg = message::parse(text).unwrap();
+        let chain = Signed {
+            anchor_height: msg.anchor_height,
+            anchor_hash: msg.anchor_hash,
+            outpoint: msg.outpoint,
+            coin: Coin {
+                value: VALUE,
+                script_pubkey: bitcoin::ScriptBuf::from_hex(field("script_pubkey")).unwrap(),
+                height: msg.anchor_height - MIN_COIN_AGE,
+                coinbase: false,
+            },
+        };
+        let (_dir, path) = store_path();
+        let p = Publisher::open(path, &chain).unwrap();
+        let (stored, _) = p.submit(&chain, text, signature).unwrap_or_else(|e| panic!("{wallet}: {e}"));
+        assert_eq!(stored.status, Some(Ok(VALUE)), "{wallet}");
+        let format = match stored.attestation.signature() {
+            NapSignature::Simple(_) => "simple",
+            NapSignature::Full(_) => "full",
+            NapSignature::Legacy(_) => "legacy",
+        };
+        assert_eq!(format, field("format"), "{wallet}");
+        // The signature commits to the text: another value fails.
+        let other = text.replace("\nvalue: yes\n", "\nvalue: no\n");
+        assert_ne!(other, text);
+        assert!(p.submit(&chain, &other, signature).is_err(), "{wallet}: signs any value");
+    }
+}

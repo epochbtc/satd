@@ -1,0 +1,58 @@
+[
+  {
+    "wallet": "Bitcoin Core 29.3 signmessage (P2PKH)",
+    "address": "mfaqKiBtFT3FtinKBTWgNTJrNSYAVxV4rJ",
+    "script_pubkey": "76a91400bbd829d91f63cf5433af8d2c330f7ece69e51e88ac",
+    "message": "satd NAP attestation v1\noutpoint: 91b6ac3b411725a16dbc4ef2e5bd50098b919731e1a1b4e3aad2f865c42a9793:1\nkey: g1.core.signmessage\nvalue: yes\nanchor: 327643 00000000a1d0aac203eaeb384a3486826e0b78288ea41f038c44bb57d52857ec",
+    "signature": "IDqZu5L4XcK5sQLgD1TauqTBdaAJni592r8Hpsih25b7aS2L3G4+QWYP+hznk8Xxt7ZnSxuHKQVBsjixZJfMHdg=",
+    "format": "legacy"
+  },
+  {
+    "wallet": "Bitcoin Core 29.3 walletprocesspsbt x2 + combinepsbt (P2WSH 2-of-3 sortedmulti), draft without descriptor",
+    "address": "tb1qxc3w42akqy9tn5k594fjld7mtsewtzwz02h7dys5exjhmpxk2vas92mj9n",
+    "script_pubkey": "00203622eaabb6010ab9d2d42d532fb7db5c32e589c27aafe69214c9a57d84d6533b",
+    "message": "satd NAP attestation v1\noutpoint: 3afb564f95275e58e50a52315e744be5ba74b639779876bf0e1ae185a8d6dfdc:0\nkey: g1.core.ms.bare\nvalue: yes\nanchor: 327643 00000000a1d0aac203eaeb384a3486826e0b78288ea41f038c44bb57d52857ec",
+    "signature": "cHNidP8BAD0AAAAAARutz0yHvPFmpiafWt3iinuQg4pbrKoLgBU9RDtnO9LuAAAAAAAAAAAAAQAAAAAAAAAAAWoAAAAAAQnUc2F0ZCBOQVAgYXR0ZXN0YXRpb24gdjEKb3V0cG9pbnQ6IDNhZmI1NjRmOTUyNzVlNThlNTBhNTIzMTVlNzQ0YmU1YmE3NGI2Mzk3Nzk4NzZiZjBlMWFlMTg1YThkNmRmZGM6MAprZXk6IGcxLmNvcmUubXMuYmFyZQp2YWx1ZTogeWVzCmFuY2hvcjogMzI3NjQzIDAwMDAwMDAwYTFkMGFhYzIwM2VhZWIzODRhMzQ4NjgyNmUwYjc4Mjg4ZWE0MWYwMzhjNDRiYjU3ZDUyODU3ZWMAAQCAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP////8iACDNIjyneDWyX7Yn1QrVB/kJPh510X/BgEUj373aV0gAIAAAAAABAAAAAAAAAAAiACA2IuqrtgEKudLULVMvt9tcMuWJwnqv5pIUyaV9hNZTOwAAAAABASsAAAAAAAAAACIAIDYi6qu2AQq50tQtUy+321wy5YnCeq/mkhTJpX2E1lM7IgIDgtWl6SI6++ky9KwttZhB4Ps6Rgt4yWHAOsYnrRObuadHMEQCIH1u8u0BBjK+UAVD6S/hpjDI1Y51jo5AUrD7yl0807cxAiA7GC4oH5l8bYeR9SplXzuPXi6MdWul0D4s0VjWMbNMhwEiAgMk8tfnYfJMssPpwanAU6BcmK9wbvr6D3pYwUPwyNHCKEcwRAIgFBIyT2+5vqh1YltOHTt1pR8Ee9lQkZdmP5tkBkFY+nICIFgt74Iyhs9NFLlfNwK5OruIlfBe/B/kW1mrx5bTMhl2AQEFaVIhAyTy1+dh8kyyw+nBqcBToFyYr3Bu+voPeljBQ/DI0cIoIQNvf3mVP36yqQJzcqbtmSTwpalmxYxLGCrX81LynbpXbCEDgtWl6SI6++ky9KwttZhB4Ps6Rgt4yWHAOsYnrRObuadTriIGAyTy1+dh8kyyw+nBqcBToFyYr3Bu+voPeljBQ/DI0cIoGHDZOXtUAACAAQAAgAAAAIAAAAAAAAAAACIGA29/eZU/frKpAnNypu2ZJPClqWbFjEsYKtfzUvKduldsGEwwG9hUAACAAQAAgAAAAIAAAAAAAAAAACIGA4LVpekiOvvpMvSsLbWYQeD7OkYLeMlhwDrGJ60Tm7mnGFQQ9bhUAACAAQAAgAAAAIAAAAAAAAAAAAAA",
+    "format": "simple"
+  },
+  {
+    "wallet": "Bitcoin Core 29.3 walletprocesspsbt x2 + combinepsbt (P2WSH 2-of-3 sortedmulti), draft with descriptor",
+    "address": "tb1qxc3w42akqy9tn5k594fjld7mtsewtzwz02h7dys5exjhmpxk2vas92mj9n",
+    "script_pubkey": "00203622eaabb6010ab9d2d42d532fb7db5c32e589c27aafe69214c9a57d84d6533b",
+    "message": "satd NAP attestation v1\noutpoint: 3afb564f95275e58e50a52315e744be5ba74b639779876bf0e1ae185a8d6dfdc:0\nkey: g1.core.ms.desc\nvalue: yes\nanchor: 327643 00000000a1d0aac203eaeb384a3486826e0b78288ea41f038c44bb57d52857ec",
+    "signature": "cHNidP8BAD0AAAAAAR4q01ICaPa2KHMHVoiPwlPrSv08rhhOUZSJPZBs8xk2AAAAAAAAAAAAAQAAAAAAAAAAAWoAAAAAAQnUc2F0ZCBOQVAgYXR0ZXN0YXRpb24gdjEKb3V0cG9pbnQ6IDNhZmI1NjRmOTUyNzVlNThlNTBhNTIzMTVlNzQ0YmU1YmE3NGI2Mzk3Nzk4NzZiZjBlMWFlMTg1YThkNmRmZGM6MAprZXk6IGcxLmNvcmUubXMuZGVzYwp2YWx1ZTogeWVzCmFuY2hvcjogMzI3NjQzIDAwMDAwMDAwYTFkMGFhYzIwM2VhZWIzODRhMzQ4NjgyNmUwYjc4Mjg4ZWE0MWYwMzhjNDRiYjU3ZDUyODU3ZWMAAQCAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP////8iACB9uXQprFKeVctWnr5f+BunPAgop5uBBaACodNAFt7PggAAAAABAAAAAAAAAAAiACA2IuqrtgEKudLULVMvt9tcMuWJwnqv5pIUyaV9hNZTOwAAAAABASsAAAAAAAAAACIAIDYi6qu2AQq50tQtUy+321wy5YnCeq/mkhTJpX2E1lM7IgIDgtWl6SI6++ky9KwttZhB4Ps6Rgt4yWHAOsYnrRObuadHMEQCIAX53ZxGAz9XUA2ggtZudJuhG8hOU5WO07OQlpUBmnEFAiBEw+Hqxg2m+ZA7s9zZn1LdWGavJb8oclB/yu0Z45TSjQEiAgMk8tfnYfJMssPpwanAU6BcmK9wbvr6D3pYwUPwyNHCKEcwRAIgNOCrDTYHa3AOnSLxd/9dJzURs1HtBiA2/BQl+yW9Qw0CIFalBCrtLxPmbf3s89bWzrQOOgt/lBMcuIJ+5G/RKm2mAQEFaVIhAyTy1+dh8kyyw+nBqcBToFyYr3Bu+voPeljBQ/DI0cIoIQNvf3mVP36yqQJzcqbtmSTwpalmxYxLGCrX81LynbpXbCEDgtWl6SI6++ky9KwttZhB4Ps6Rgt4yWHAOsYnrRObuadTriIGAyTy1+dh8kyyw+nBqcBToFyYr3Bu+voPeljBQ/DI0cIoGHDZOXtUAACAAQAAgAAAAIAAAAAAAAAAACIGA29/eZU/frKpAnNypu2ZJPClqWbFjEsYKtfzUvKduldsGEwwG9hUAACAAQAAgAAAAIAAAAAAAAAAACIGA4LVpekiOvvpMvSsLbWYQeD7OkYLeMlhwDrGJ60Tm7mnGFQQ9bhUAACAAQAAgAAAAIAAAAAAAAAAAAAA",
+    "format": "simple"
+  },
+  {
+    "wallet": "Ledger Bitcoin app 2.5.1 via Sparrow 2.2.3, finalized to_sign exported as hex (P2WPKH)",
+    "address": "tb1qcktwa3mlafn2nwjac8t6q0n2236yzxa6wqjyyu",
+    "script_pubkey": "0014c596eec77fea66a9ba5dc1d7a03e6a5474411bba",
+    "message": "satd NAP attestation v1\noutpoint: 37f17f1a4e9b1253103ab412c17ce6b12a4ce9c237fd94c29345e5ab4358de7f:0\nkey: g1.ledger.2.5.1\nvalue: yes\nanchor: 327496 0000000aea37704b9ec26e10e1d5f7a5d326bae161c6f34995d67e5d9eb33179",
+    "signature": "00000000000101c14421c7be7eff61dca38b841f2d64cbf271a4c65089be3c075cd21026c288c0000000000000000000010000000000000000016a02483045022100d358398131b58336b25f36fbf03a31ba4f0cf67f3f5b90d8ac10da9b2d82c396022056e80f923ac6cd5595cc51eeb21ca7d6c72bb0730b24b767437acc65b653fd83012102b213148f2fad86ab4e6d23650986dae5eb61b2ba7fa98f2ec662685362fe1d4100000000",
+    "format": "full"
+  },
+  {
+    "wallet": "Sparrow 2.2.3 Sign Message, BIP322 (P2WPKH)",
+    "address": "tb1qjs83xm8n7lfxkap4eeds3g58sqetr07gpdj47u",
+    "script_pubkey": "0014940f136cf3f7d26b7435ce5b08a2878032b1bfc8",
+    "message": "satd NAP attestation v1\noutpoint: 37f17f1a4e9b1253103ab412c17ce6b12a4ce9c237fd94c29345e5ab4358de7f:1\nkey: g1.sparrow.smp.p2wpkh\nvalue: yes\nanchor: 327520 0000001430b5b8f35a363e4dba9bbbebacb695ac001a18a5fdcda79b03c0b28e",
+    "signature": "AkcwRAIgN58SaP5aAdPugL6KXH9mm2pryzln4zMEiUh3ponSdxoCIB6Q4ZxgSbVQ6Pt5dPZcjjm8ufPbPG6bF1t8TXeA0fxXASECuSiBFhPikyC6TWx4ugsyBEkCZbJgjUZC2nE32wldAG4=",
+    "format": "simple"
+  },
+  {
+    "wallet": "Sparrow 2.5.5 Sign Message, BIP322 (P2WPKH)",
+    "address": "tb1qjs83xm8n7lfxkap4eeds3g58sqetr07gpdj47u",
+    "script_pubkey": "0014940f136cf3f7d26b7435ce5b08a2878032b1bfc8",
+    "message": "satd NAP attestation v1\noutpoint: 37f17f1a4e9b1253103ab412c17ce6b12a4ce9c237fd94c29345e5ab4358de7f:1\nkey: g1.sparrow-2.5.5.p2wpkh\nvalue: yes\nanchor: 327522 00000002037bdc24f71de9e03edd0aa53103501a8fa4aa5f720cd9c8e051887a",
+    "signature": "smpAkcwRAIgOO9XWN2c0zvdiACRmAZ/uEjUO40xzyjVyF3ho7xkjcUCIGM2cORGuvMmoNC/w8buG147e3Gp1ymJyk1XgBPxafptASECuSiBFhPikyC6TWx4ugsyBEkCZbJgjUZC2nE32wldAG4=",
+    "format": "simple"
+  },
+  {
+    "wallet": "Sparrow 2.5.5 Sign Message, BIP322 (P2TR key path)",
+    "address": "tb1p3pnfq644s8g62ku6gwmy9d0ddyhplan03s62p3l0hq2ndaqhslwsfqymxn",
+    "script_pubkey": "51208866906ab581d1a55b9a43b642b5ed692e1ff66f8c34a0c7efb81536f41787dd",
+    "message": "satd NAP attestation v1\noutpoint: b030d57c6f9ce185960199ed1693d7ec884c1eee88b044c822992e9080a3a46f:0\nkey: g1.sparrow-2.5.5.p2tr\nvalue: yes\nanchor: 327535 000000111748b4ab0eefe3de1f81d554b7cff3e94772cf68491ca6fa2a83cbdf",
+    "signature": "smpAUF4fXt5wHJUxzgA0tXG2JksWeV08HTlonqBopfD8VnphI84Sni8gr3qm9ECOge8LUS++g66PshifN7AYgB+kurFAQ==",
+    "format": "simple"
+  }
+]
