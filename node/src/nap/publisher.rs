@@ -408,9 +408,11 @@ impl Publisher {
     }
 
     /// The page of the attestations this node serves that answers `req`
-    /// (see [`super::p2p::page`]).
-    pub fn page(&self, req: &super::p2p::GetNapAtt, max_size: usize) -> super::p2p::NapAtt {
-        let entries = self.entries.lock();
+    /// (see [`super::p2p::page`]), or `None` while a change holds the store.
+    /// Changes hold it across the store's rewrite on disk, and pages are
+    /// built on the P2P event loop, which must not wait for that.
+    pub fn page(&self, req: &super::p2p::GetNapAtt, max_size: usize) -> Option<super::p2p::NapAtt> {
+        let entries = self.entries.try_lock()?;
         // Keys sort after the empty string, so a cursor starts the range at
         // its own outpoint, which `page` skips.
         let range = match req.cursor {
@@ -418,7 +420,15 @@ impl Publisher {
             None => entries.range(..),
         };
         let serving = range.filter(|(_, e)| matches!(e.status, Some(Ok(_)))).map(|(_, e)| &e.att);
-        super::p2p::page(serving, req, max_size)
+        Some(super::p2p::page(serving, req, max_size))
+    }
+
+    /// Run `f` holding the store as a change does, for tests of
+    /// [`Self::page`].
+    #[cfg(test)]
+    pub(crate) fn with_store_held<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _held = self.entries.lock();
+        f()
     }
 
     /// Judge every entry at `chain`'s new tip: drop those whose coin was

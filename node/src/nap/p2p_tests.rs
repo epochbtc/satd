@@ -117,7 +117,7 @@ fn pages_follow_outpoint_order_and_never_split_an_outpoint() {
     let mut got = Vec::new();
     let mut pages = 0;
     loop {
-        let page = p.page(&req(cursor), max);
+        let page = p.page(&req(cursor), max).unwrap();
         assert!(page.to_bytes().len() <= max);
         assert!(page.attestations.len() % 3 == 0, "a page holds whole outpoints");
         got.extend(page.attestations);
@@ -134,7 +134,7 @@ fn pages_follow_outpoint_order_and_never_split_an_outpoint() {
 #[test]
 fn the_first_outpoint_is_always_served() {
     let (_dir, p, atts) = serving_publisher(2, 3);
-    let page = p.page(&req(None), 1);
+    let page = p.page(&req(None), 1).unwrap();
     assert_eq!(page.attestations, atts[..3]);
     assert_eq!(page.next_cursor, Some(outpoint(1)));
 }
@@ -142,18 +142,18 @@ fn the_first_outpoint_is_always_served() {
 #[test]
 fn a_cursor_past_the_end_is_an_empty_last_page() {
     let (_dir, p, _atts) = serving_publisher(2, 1);
-    let page = p.page(&req(Some(OutPoint { txid: bitcoin::Txid::from_byte_array([0xff; 32]), vout: u32::MAX })), MAX_NAPATT_SIZE);
+    let page = p.page(&req(Some(OutPoint { txid: bitcoin::Txid::from_byte_array([0xff; 32]), vout: u32::MAX })), MAX_NAPATT_SIZE).unwrap();
     assert_eq!(page, NapAtt { attestations: vec![], next_cursor: None });
 }
 
 #[test]
 fn requests_filter_by_key_and_anchor_height() {
     let (_dir, p, atts) = serving_publisher(2, 3);
-    let by_key = p.page(&GetNapAtt { anchor_height_min: 0, keys: vec!["key1".into()], cursor: None }, MAX_NAPATT_SIZE);
+    let by_key = p.page(&GetNapAtt { anchor_height_min: 0, keys: vec!["key1".into()], cursor: None }, MAX_NAPATT_SIZE).unwrap();
     assert_eq!(by_key.attestations, atts.iter().filter(|a| a.key() == "key1").cloned().collect::<Vec<_>>());
-    let above = p.page(&GetNapAtt { anchor_height_min: ANCHOR + 1, keys: vec![], cursor: None }, MAX_NAPATT_SIZE);
+    let above = p.page(&GetNapAtt { anchor_height_min: ANCHOR + 1, keys: vec![], cursor: None }, MAX_NAPATT_SIZE).unwrap();
     assert!(above.attestations.is_empty());
-    let at = p.page(&GetNapAtt { anchor_height_min: ANCHOR, keys: vec![], cursor: None }, MAX_NAPATT_SIZE);
+    let at = p.page(&GetNapAtt { anchor_height_min: ANCHOR, keys: vec![], cursor: None }, MAX_NAPATT_SIZE).unwrap();
     assert_eq!(at.attestations, atts);
 }
 
@@ -167,7 +167,7 @@ fn only_attestations_valid_at_the_tip_are_served() {
     );
     // Coin 1 is spent.
     p.on_tip(&chain);
-    assert_eq!(p.page(&req(None), MAX_NAPATT_SIZE).attestations, atts[1..]);
+    assert_eq!(p.page(&req(None), MAX_NAPATT_SIZE).unwrap().attestations, atts[1..]);
 }
 
 // --- Serving limits -----------------------------------------------------------
@@ -227,11 +227,15 @@ fn a_connection_byte_budget_is_spent_and_resets() {
             .unwrap_or_else(|e| panic!("page {i}: {e:?}"));
     }
     assert_eq!(serve(&mut l, 1, G, Some(outpoint(0)), size, Some(outpoint(0)), t), Err(Refused::ConnBytes));
-    // A page the rest of the budget cannot cover is refused too.
+    // Less than a whole page left is spent: refused before a page is built,
+    // since a page that fits the remainder may not exist.
     let mut l2 = ServeLimits::default();
-    serve(&mut l2, 1, G, None, (CONN_BUDGET_BYTES - 10) as usize, Some(outpoint(0)), t).unwrap();
-    assert_eq!(serve(&mut l2, 1, G, Some(outpoint(0)), 11, None, t), Err(Refused::ConnBytes));
-    assert_eq!(serve(&mut l2, 1, G, Some(outpoint(0)), 10, None, t), Ok(()));
+    let left = MAX_NAPATT_SIZE as u64 - 1;
+    serve(&mut l2, 1, G, None, (CONN_BUDGET_BYTES - left) as usize, Some(outpoint(0)), t).unwrap();
+    assert_eq!(l2.admit(1, G, Some(outpoint(0)), t), Err(Refused::ConnBytes));
+    let mut l3 = ServeLimits::default();
+    serve(&mut l3, 1, G, None, (CONN_BUDGET_BYTES - left - 1) as usize, Some(outpoint(0)), t).unwrap();
+    assert!(l3.admit(1, G, Some(outpoint(0)), t).is_ok(), "a whole page left");
     // The window resets an hour after it opened.
     assert_eq!(serve(&mut l, 1, G, Some(outpoint(0)), size, None, t + BUDGET_WINDOW), Ok(()));
 }
@@ -241,7 +245,7 @@ fn one_connection_does_not_starve_another_in_its_group() {
     let mut l = ServeLimits::default();
     let t = Instant::now();
     serve(&mut l, 1, G, None, CONN_BUDGET_BYTES as usize, Some(outpoint(0)), t).unwrap();
-    assert_eq!(serve(&mut l, 1, G, Some(outpoint(0)), 1, None, t), Err(Refused::ConnBytes));
+    assert_eq!(l.admit(1, G, Some(outpoint(0)), t), Err(Refused::ConnBytes));
     assert_eq!(serve(&mut l, 2, G, None, CONN_BUDGET_BYTES as usize, None, t), Ok(()));
 }
 
@@ -283,4 +287,25 @@ fn idle_groups_are_dropped() {
     assert_eq!(l.group_count(), 100);
     let _ = l.admit(1_000, &[200], None, t + BUDGET_WINDOW);
     assert_eq!(l.group_count(), 1, "only the requesting connection's group is left");
+}
+
+#[test]
+fn a_group_with_less_than_a_page_left_admits_no_one() {
+    let mut l = ServeLimits::default();
+    let t = Instant::now();
+    let group_budget = CONN_BUDGET_BYTES * GROUP_MULTIPLE;
+    // Leaves the group a few bytes short of a whole page.
+    let each = (group_budget - MAX_NAPATT_SIZE as u64) / GROUP_MULTIPLE + 1;
+    for peer in 0..GROUP_MULTIPLE {
+        serve(&mut l, peer, G, None, each as usize, None, t).unwrap();
+    }
+    // A fresh connection, its own budget untouched, is refused at once.
+    assert_eq!(l.admit(50, G, None, t + PULL_INTERVAL), Err(Refused::GroupBytes));
+}
+
+#[test]
+fn a_busy_store_serves_no_page() {
+    let (_dir, p, atts) = serving_publisher(1, 1);
+    assert_eq!(p.with_store_held(|| p.page(&req(None), MAX_NAPATT_SIZE)), None);
+    assert_eq!(p.page(&req(None), MAX_NAPATT_SIZE).unwrap().attestations, atts);
 }

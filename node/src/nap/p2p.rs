@@ -305,8 +305,11 @@ pub struct Admitted {
 
 impl ServeLimits {
     /// Whether `peer`, in network group `group`, may be served a request
-    /// with `cursor` at `now`. Checks everything but the page's size, so a
-    /// refused request costs no page.
+    /// with `cursor` at `now`, before its page is built, so a refused
+    /// request costs no page. A budget with less than a whole page
+    /// ([`MAX_NAPATT_SIZE`]) left is treated as spent: pages never split an
+    /// outpoint, so a smaller remainder would otherwise admit request after
+    /// request whose page [`Self::commit`] then refuses.
     pub fn admit(
         &mut self,
         peer: u64,
@@ -334,17 +337,20 @@ impl ServeLimits {
                 return Err(Refused::GroupPull);
             }
         }
-        if conn.bytes.is_some_and(|w| w.used(now) >= CONN_BUDGET_BYTES) {
+        let page = MAX_NAPATT_SIZE as u64;
+        if conn.bytes.map_or(0, |w| w.used(now)) + page > CONN_BUDGET_BYTES {
             return Err(Refused::ConnBytes);
         }
-        if grp.bytes.is_some_and(|w| w.used(now) >= CONN_BUDGET_BYTES * GROUP_MULTIPLE) {
+        if grp.bytes.map_or(0, |w| w.used(now)) + page > CONN_BUDGET_BYTES * GROUP_MULTIPLE {
             return Err(Refused::GroupBytes);
         }
         Ok(Admitted { pull })
     }
 
     /// Charge a page of `size` bytes, ending at `next_cursor`, to an
-    /// admitted request, or refuse it if either byte budget cannot cover it.
+    /// admitted request, or refuse it if either byte budget cannot cover it
+    /// (which [`Self::admit`] already rules out for a page within
+    /// [`MAX_NAPATT_SIZE`]).
     pub fn commit(
         &mut self,
         peer: u64,

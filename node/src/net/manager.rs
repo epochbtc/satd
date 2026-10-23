@@ -5877,7 +5877,12 @@ impl PeerManager {
                 return;
             }
         };
-        let page = publisher.page(&req, crate::nap::p2p::MAX_NAPATT_SIZE);
+        // A store being rewritten is busy, not misbehaviour: nothing is
+        // charged, and the peer asks again.
+        let Some(page) = publisher.page(&req, crate::nap::p2p::MAX_NAPATT_SIZE) else {
+            tracing::debug!(target: "nap", "getnapatt from peer={id} not served: the store is busy");
+            return;
+        };
         let bytes = page.to_bytes();
         if let Err(why) = limits.commit(id, admitted, bytes.len(), page.next_cursor, now) {
             tracing::debug!(target: "nap", "getnapatt from peer={id} not served: {why:?}");
