@@ -203,8 +203,9 @@ listed cheapest first.
    conditions are evaluated as if `to_sign` were in the block after the tip:
    the locktime against height `tip_height + 1` and the tip's median time
    past (Bitcoin Core's `IsFinalTx`), and the BIP 68 relative lock against the
-   coin's confirmation height and the median time past at it (Bitcoin Core's
-   `SequenceLocks`). A proof that fails only this rule is *not yet valid*,
+   coin's confirmation height, or for a time lock against the median time
+   past of the block before the coin's confirming block, as Bitcoin Core's
+   `SequenceLocks` takes it. A proof that fails only this rule is *not yet valid*,
    and becomes valid when the chain reaches its conditions.
 
 A valid attestation's **weight** is the value of its coin in satoshis,
@@ -247,8 +248,9 @@ specified; satd accepts them over RPC.
 - A publisher MUST serve only attestations valid at its tip. It SHOULD stop
   serving an attestation as soon as it stops being valid, and MAY drop
   attestations whose coin has been spent.
-- A publisher SHOULD keep at most one attestation per `(outpoint, key)`, the
-  one that would count at its tip.
+- A publisher MUST serve at most one attestation per `(outpoint, key)`, the
+  one that counts at its tip. With the keys limit, this bounds what one
+  outpoint can put in a page.
 
 An attestation verifies on its own; nothing binds it to the node serving it.
 Any implementation can serve valid attestations. It can add reach, but not
@@ -396,6 +398,17 @@ or uses a format that does not apply to its output, is misbehaving and
 SHOULD be disconnected. An attestation that fails only because of chain
 state (rules 1 to 4, or 6) is not misbehaviour: the publisher's tip may
 differ from the aggregator's.
+
+### Reorganisations
+
+An aggregator SHOULD keep, besides the attestation that counts for each
+`(outpoint, key)`, the one it superseded, until the newer one's anchor is
+deep enough that a reorganisation is no longer a practical concern. The
+reference aggregator keeps it until the newer anchor is 144 blocks deep. If
+the newer anchor is reorganised out first, the predecessor counts again, as
+[Supersession](#supersession) requires. Publishers serve only the newest
+attestation, so an aggregator that discarded the predecessor could not
+recover it.
 
 ### Weight
 
