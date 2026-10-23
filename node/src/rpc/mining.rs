@@ -232,6 +232,29 @@ pub fn generate_block(
     }
 }
 
+/// Core's gate before `getblocktemplate` builds a template
+/// (`rpc/mining.cpp`): on mainnet a node with no peers is
+/// `RPC_CLIENT_NOT_CONNECTED` (-9), and one in initial block download is
+/// `RPC_CLIENT_IN_INITIAL_DOWNLOAD` (-10), so a pool never mines on a tip it
+/// cannot know is current. Test chains skip both (`IsTestChain`), which keeps
+/// a lone regtest or signet miner working.
+pub fn template_gate(
+    network: bitcoin::Network,
+    connections: usize,
+    initial_block_download: bool,
+) -> Result<(), (i32, String)> {
+    if network != bitcoin::Network::Bitcoin {
+        return Ok(());
+    }
+    if connections == 0 {
+        return Err((-9, "satd is not connected!".to_string()));
+    }
+    if initial_block_download {
+        return Err((-10, "satd is in initial sync and waiting for blocks...".to_string()));
+    }
+    Ok(())
+}
+
 /// Handle the `getblocktemplate` RPC call.
 ///
 /// The template is checked before it is returned, as Core's `CreateNewBlock`

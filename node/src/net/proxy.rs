@@ -1,5 +1,8 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio_socks::IntoTargetAddr;
+use tokio_socks::tcp::Socks5Stream;
 
 /// Per-connection SOCKS5 username/password. Tor treats the auth pair as a
 /// stream-isolation token (`IsolateSOCKSAuth`, on by default): connections that
@@ -10,23 +13,33 @@ use tokio::net::TcpStream;
 /// may share circuits).
 pub type SocksCred<'a> = Option<(&'a str, &'a str)>;
 
+/// How long a SOCKS5 dial may take, split the way Bitcoin Core splits it.
+///
+/// Core's `ConnectThroughProxy` bounds the TCP connect to the proxy by
+/// `-timeout` (`nConnectTimeout`), then gives each read of the SOCKS5
+/// exchange its own `SOCKS5_RECV_TIMEOUT` of 20 s (netbase.cpp). The proxy is
+/// usually local, so the first leg is fast; the second carries the proxy's own
+/// connect to the target — for Tor, a circuit build per isolated stream — and
+/// routinely runs past a 5 s `-timeout`.
+#[derive(Clone, Copy, Debug)]
+pub struct DialTimeouts {
+    /// Bound on the TCP connect to the proxy itself.
+    pub proxy_connect: Duration,
+    /// Bound on the SOCKS5 greeting, authentication and CONNECT reply.
+    pub exchange: Duration,
+}
+
 /// Connect to a target address through a SOCKS5 proxy.
 /// Returns a TcpStream tunneled through the proxy.
 pub async fn connect_socks5(
     proxy_addr: &str,
     target: SocketAddr,
     cred: SocksCred<'_>,
+    timeouts: DialTimeouts,
 ) -> Result<TcpStream, String> {
-    let stream = match cred {
-        Some((user, pass)) => {
-            tokio_socks::tcp::Socks5Stream::connect_with_password(proxy_addr, target, user, pass)
-                .await
-        }
-        None => tokio_socks::tcp::Socks5Stream::connect(proxy_addr, target).await,
-    }
-    .map_err(|e| format!("SOCKS5 connect to {} failed: {}", target, e))?;
-
-    Ok(stream.into_inner())
+    socks5_connect(proxy_addr, target, cred, timeouts)
+        .await
+        .map_err(|e| format!("SOCKS5 connect to {} failed: {}", target, e))
 }
 
 /// Connect to a .onion address through a SOCKS5 proxy.
@@ -36,17 +49,45 @@ pub async fn connect_socks5_onion(
     onion_host: &str,
     port: u16,
     cred: SocksCred<'_>,
+    timeouts: DialTimeouts,
 ) -> Result<TcpStream, String> {
-    let target = (onion_host, port);
-    let stream = match cred {
-        Some((user, pass)) => {
-            tokio_socks::tcp::Socks5Stream::connect_with_password(proxy_addr, target, user, pass)
-                .await
-        }
-        None => tokio_socks::tcp::Socks5Stream::connect(proxy_addr, target).await,
-    }
-    .map_err(|e| format!("SOCKS5 onion connect to {} failed: {}", onion_host, e))?;
+    socks5_connect(proxy_addr, (onion_host, port), cred, timeouts)
+        .await
+        .map_err(|e| format!("SOCKS5 onion connect to {} failed: {}", onion_host, e))
+}
 
+async fn socks5_connect<'t>(
+    proxy_addr: &str,
+    target: impl IntoTargetAddr<'t>,
+    cred: SocksCred<'_>,
+    timeouts: DialTimeouts,
+) -> Result<TcpStream, String> {
+    let socket = tokio::time::timeout(timeouts.proxy_connect, TcpStream::connect(proxy_addr))
+        .await
+        .map_err(|_| {
+            format!(
+                "proxy {proxy_addr} did not accept within {}ms",
+                timeouts.proxy_connect.as_millis()
+            )
+        })?
+        .map_err(|e| format!("proxy {proxy_addr} unreachable: {e}"))?;
+    let exchange = async {
+        match cred {
+            Some((user, pass)) => {
+                Socks5Stream::connect_with_password_and_socket(socket, target, user, pass).await
+            }
+            None => Socks5Stream::connect_with_socket(socket, target).await,
+        }
+    };
+    let stream = tokio::time::timeout(timeouts.exchange, exchange)
+        .await
+        .map_err(|_| {
+            format!(
+                "proxy exchange timed out after {}ms",
+                timeouts.exchange.as_millis()
+            )
+        })?
+        .map_err(|e| e.to_string())?;
     Ok(stream.into_inner())
 }
 
@@ -56,6 +97,73 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn roomy() -> DialTimeouts {
+        DialTimeouts {
+            proxy_connect: Duration::from_secs(5),
+            exchange: Duration::from_secs(5),
+        }
+    }
+
+    /// A no-auth SOCKS5 server that answers the CONNECT only after `delay`,
+    /// as Tor does while it builds a circuit to the target.
+    async fn fake_socks5_slow_connect(listener: TcpListener, delay: Duration) {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let mut head = [0u8; 2];
+        sock.read_exact(&mut head).await.expect("greeting head");
+        let mut methods = vec![0u8; head[1] as usize];
+        sock.read_exact(&mut methods).await.expect("methods");
+        sock.write_all(&[0x05, 0x00]).await.expect("select no-auth");
+        // VER CMD RSV ATYP=IPv4, 4 address bytes, 2 port bytes.
+        let mut req = [0u8; 10];
+        sock.read_exact(&mut req).await.expect("request");
+        tokio::time::sleep(delay).await;
+        let _ = sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = sock.flush().await;
+        // Hold the socket so the client sees the reply, not an EOF.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    /// The proxy's CONNECT reply is bounded by the exchange budget, not by
+    /// the proxy-connect one: a reply slower than `-timeout` but inside the
+    /// exchange budget completes the dial, as it does under Core's
+    /// `SOCKS5_RECV_TIMEOUT`.
+    #[tokio::test]
+    async fn slow_connect_reply_within_exchange_budget_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_addr = listener.local_addr().expect("addr").to_string();
+        let server = tokio::spawn(fake_socks5_slow_connect(listener, Duration::from_millis(600)));
+
+        let target: SocketAddr = "203.0.113.7:8333".parse().unwrap();
+        let timeouts = DialTimeouts {
+            proxy_connect: Duration::from_millis(200),
+            exchange: Duration::from_secs(5),
+        };
+        let dial = connect_socks5(&proxy_addr, target, None, timeouts).await;
+        assert!(dial.is_ok(), "a CONNECT reply inside the exchange budget must succeed: {dial:?}");
+        server.abort();
+    }
+
+    /// A proxy that never answers the CONNECT fails the dial once the
+    /// exchange budget runs out.
+    #[tokio::test]
+    async fn connect_reply_past_exchange_budget_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_addr = listener.local_addr().expect("addr").to_string();
+        let server = tokio::spawn(fake_socks5_slow_connect(listener, Duration::from_secs(5)));
+
+        let target: SocketAddr = "203.0.113.7:8333".parse().unwrap();
+        let timeouts = DialTimeouts {
+            proxy_connect: Duration::from_secs(5),
+            exchange: Duration::from_millis(300),
+        };
+        let started = std::time::Instant::now();
+        let dial = connect_socks5(&proxy_addr, target, None, timeouts).await;
+        let err = dial.expect_err("a CONNECT reply past the exchange budget must fail");
+        assert!(err.contains("exchange timed out"), "unexpected error: {err}");
+        assert!(started.elapsed() < Duration::from_secs(3), "the dial must not wait for the reply");
+        server.abort();
+    }
 
     #[test]
     fn test_target_addr_format() {
@@ -135,7 +243,7 @@ mod tests {
         let server = tokio::spawn(fake_socks5_capture(listener));
 
         let onion = "g4bnddmokrstxrbjusq32lucfhffqrygqm3rm33w2qwftqvhxo3enoad.onion";
-        let dial = connect_socks5_onion(&proxy_addr, onion, 8333, None).await;
+        let dial = connect_socks5_onion(&proxy_addr, onion, 8333, None, roomy()).await;
         assert!(dial.is_ok(), "onion dial should succeed: {dial:?}");
 
         let (atyp, host_bytes, port) =
@@ -225,7 +333,7 @@ mod tests {
         let server = tokio::spawn(fake_socks5_userpass(listener));
 
         let target: SocketAddr = "203.0.113.7:8333".parse().unwrap();
-        let dial = connect_socks5(&proxy_addr, target, Some(("iso-tok-42", "iso-tok-42"))).await;
+        let dial = connect_socks5(&proxy_addr, target, Some(("iso-tok-42", "iso-tok-42")), roomy()).await;
         assert!(dial.is_ok(), "credentialed dial should succeed: {dial:?}");
 
         let (user, pass) = tokio::time::timeout(std::time::Duration::from_secs(5), server)

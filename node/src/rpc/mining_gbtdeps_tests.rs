@@ -93,3 +93,19 @@ fn template_transactions_carry_cores_hash_and_depends() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Core's `getblocktemplate` gate: on mainnet, no peers is -9 and initial
+/// block download is -10, checked in that order; test chains are never
+/// gated. Perturbation: drop either check and its assertion fails.
+#[test]
+fn template_gate_refuses_mainnet_without_peers_or_in_ibd() {
+    use super::template_gate;
+    use bitcoin::Network;
+    assert_eq!(template_gate(Network::Bitcoin, 0, false).unwrap_err().0, -9);
+    assert_eq!(template_gate(Network::Bitcoin, 0, true).unwrap_err().0, -9, "no peers is reported first");
+    assert_eq!(template_gate(Network::Bitcoin, 3, true).unwrap_err().0, -10);
+    assert!(template_gate(Network::Bitcoin, 3, false).is_ok());
+    for net in [Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+        assert!(template_gate(net, 0, true).is_ok(), "{net:?} is a test chain");
+    }
+}

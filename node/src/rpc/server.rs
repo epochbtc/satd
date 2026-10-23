@@ -1770,6 +1770,12 @@ pub async fn start(
         if mode != "template" {
             return Err(ErrorObjectOwned::owned(-8, "Invalid mode", None::<()>));
         }
+        mining::template_gate(
+            ctx.chain_state.network,
+            ctx.peer_manager.connection_count(),
+            ctx.chain_state.is_initial_block_download(),
+        )
+        .map_err(|(code, message)| ErrorObjectOwned::owned(code, message, None::<()>))?;
         if let Some(lpval) = request.as_ref().and_then(|r| r.get("longpollid")) {
             wait_for_longpoll(&ctx, lpval).await?;
         }

@@ -100,7 +100,7 @@ fn answered(rx: &mut mpsc::Receiver<NetworkMessage>) -> Option<Vec<SocketAddr>> 
 fn an_inbound_peer_gets_one_sample_of_the_address_book() {
     let (pm, _dir) = mk_pm();
     fill_book(&pm, 200);
-    let external = SocketAddr::from(([203, 0, 113, 50], 8333));
+    let external = SocketAddr::from(([44, 33, 22, 11], 8333));
     pm.external_addrs.write().push(external);
     let connected = SocketAddr::from(([44, 44, 44, 44], 8333));
     let _c = add_peer(&pm, peer(9, connected, Direction::Outbound));
@@ -170,8 +170,8 @@ fn the_sample_is_cached_per_listener() {
 #[test]
 fn externals_are_advertised_to_outbound_peers_on_their_family() {
     let (pm, _dir) = mk_pm();
-    let v4 = SocketAddr::from(([203, 0, 113, 50], 8333));
-    let v6: SocketAddr = "[2001:db8::50]:8333".parse().unwrap();
+    let v4 = SocketAddr::from(([44, 33, 22, 11], 8333));
+    let v6: SocketAddr = "[2a01:4f8::50]:8333".parse().unwrap();
     pm.external_addrs.write().extend([v4, v6]);
     let _r = add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
     let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
@@ -183,13 +183,48 @@ fn externals_are_advertised_to_outbound_peers_on_their_family() {
     assert!(pm.self_advertise_externals(2).is_none(), "nothing clearnet to an onion peer");
 }
 
+/// An `-externalip` address Core calls unroutable is never claimed: not
+/// self-advertised, not the version message's sender, not in
+/// `localaddresses` (Core's `AddLocal` refuses it). An `fc00::/8` address is
+/// left out even under `-cjdnsreachable`: satd cannot encode it as CJDNS.
+/// Perturbation: read `external_addrs` unfiltered and the private address
+/// goes out.
+#[test]
+fn an_unroutable_externalip_is_never_advertised() {
+    let (pm, _dir) = mk_pm();
+    let public = SocketAddr::from(([44, 33, 22, 11], 8333));
+    let cjdns: SocketAddr = "[fc32::1]:8333".parse().unwrap();
+    pm.set_external_addrs(vec![
+        SocketAddr::from(([10, 1, 2, 3], 8333)),
+        SocketAddr::from(([127, 0, 0, 1], 8333)),
+        SocketAddr::from(([100, 64, 0, 1], 8333)),
+        SocketAddr::from(([192, 0, 2, 1], 8333)),
+        public,
+        cjdns,
+    ]);
+    let _r = add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
+    let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
+    assert_eq!(got, vec![public], "only the routable address is advertised");
+    let local: Vec<String> = pm.local_addresses().into_iter().map(|(h, _, _)| h).collect();
+    assert_eq!(local, vec!["44.33.22.11".to_string()]);
+
+    pm.set_reachable(crate::net::reachable::ReachableNets { cjdns: true, cjdns_flip: true, ..Default::default() });
+    let local: Vec<String> = pm.local_addresses().into_iter().map(|(h, _, _)| h).collect();
+    assert_eq!(local, vec!["44.33.22.11".to_string()], "no CJDNS encoding, so no CJDNS self-advertisement");
+
+    pm.set_external_addrs(vec![SocketAddr::from(([10, 1, 2, 3], 8333)), public]);
+    let version = pm.build_version_message(SocketAddr::from(([198, 51, 100, 7], 8333)), ConnType::OutboundFullRelay);
+    assert_eq!(version.sender.socket_addr().ok(), Some(public), "the sender is the first routable address");
+}
+
 /// A block-relay-only link carries no address traffic, so neither our
 /// `-externalip` addresses nor our onion go out on one (Core's
 /// `SetupAddressRelay`).
 #[test]
 fn nothing_is_self_advertised_to_a_block_relay_only_peer() {
     let (pm, _dir) = mk_pm();
-    pm.external_addrs.write().push(SocketAddr::from(([203, 0, 113, 50], 8333)));
+    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
     *pm.advertised_onion.write() = Some(PeerAddr::Onion { host: "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion".to_string(), port: 8333 });
     let mut full = peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound);
     full.wants_addrv2 = true;

@@ -177,6 +177,78 @@ fn gettxout_trusts_the_pool_only_while_the_coins_it_spends_remain() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `gettxout` writes the scriptPubKey as Core's `ScriptToUniv` with the
+/// address included: `asm`, `desc`, `hex`, `address`, `type`, from the pool
+/// and from the chain alike. Perturbation: go back to `asm`/`hex` only in
+/// either branch and that half fails.
+#[test]
+fn gettxout_names_the_script_type_address_and_descriptor() {
+    let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
+    let tx = spend(prev(1), &[(COIN_VALUE - 1_000, 2)]);
+    let txid = admit(&mp, &cs, tx.clone()).to_string();
+    let addr = bitcoin::Address::from_script(&p2wpkh(2), bitcoin::Network::Regtest).unwrap().to_string();
+    let check = |spk: &Value, from: &str| {
+        assert_eq!(spk["type"], "witness_v0_keyhash", "{from}: {spk}");
+        assert_eq!(spk["address"], addr.as_str(), "{from}: {spk}");
+        let desc = spk["desc"].as_str().unwrap_or_else(|| panic!("{from}: no desc in {spk}"));
+        assert!(desc.starts_with(&format!("addr({addr})#")), "{from}: {desc}");
+        assert_eq!(spk["hex"], hex::encode(p2wpkh(2).as_bytes()), "{from}");
+        assert!(spk["asm"].is_string(), "{from}");
+    };
+    check(&get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["scriptPubKey"], "pool");
+    let funding = get_tx_out_view(&cs, None, &prev(1).txid.to_string(), 0).unwrap();
+    assert_eq!(funding["scriptPubKey"]["type"], "witness_v0_keyhash", "chain: {funding}");
+    assert_eq!(
+        funding["scriptPubKey"]["address"],
+        bitcoin::Address::from_script(&p2wpkh(0x11), bitcoin::Network::Regtest).unwrap().to_string(),
+        "chain: {funding}"
+    );
+    assert!(funding["scriptPubKey"]["desc"].as_str().is_some_and(|d| d.starts_with("addr(")), "chain: {funding}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `script_type` names every script as Core's `Solver` does. Before, bare
+/// P2PK, bare multisig, anchors and witness v2+ were all "nonstandard", and
+/// any OP_RETURN script was "nulldata".
+#[test]
+fn script_type_follows_core_solver() {
+    let k33 = format!("02{}", "11".repeat(32));
+    let k65 = format!("04{}", "22".repeat(64));
+    // `<m> 17 keys <17> OP_CHECKMULTISIG`, with the leading `01` of `m`
+    // left to the caller so it can push `m` minimally or with OP_PUSHDATA1.
+    let seventeen_of_seventeen = |n: &str| format!("11{}{n}ae", format!("21{k33}").repeat(17));
+    let cases: &[(String, &str)] = &[
+        (format!("21{k33}ac"), "pubkey"),
+        (format!("41{k65}ac"), "pubkey"),
+        // A 33-byte push whose prefix calls for 65 bytes fails `ValidSize`.
+        (format!("2104{}ac", "11".repeat(32)), "nonstandard"),
+        (format!("5121{k33}41{k65}52ae"), "multisig"),
+        (format!("5221{k33}51ae"), "nonstandard"), // m > n
+        // A key pushed with OP_PUSHDATA1 is still a key (Core checks only
+        // `ValidSize`); m pushed non-minimally is not a number.
+        (format!("514c21{k33}51ae"), "multisig"),
+        (format!("01{}", seventeen_of_seventeen("0111")), "multisig"),
+        (format!("4c01{}", seventeen_of_seventeen("0111")), "nonstandard"),
+        ("51024e73".to_string(), "anchor"),
+        (format!("5220{}", "33".repeat(32)), "witness_unknown"),
+        (format!("5102{}", "4e74"), "witness_unknown"),
+        (format!("0019{}", "44".repeat(25)), "nonstandard"), // v0, wrong length
+        ("6a0548656c6c6f".to_string(), "nulldata"),
+        ("6a".to_string(), "nulldata"),
+        ("6aac".to_string(), "nonstandard"), // not push-only after OP_RETURN
+        (format!("76a914{}88ac", "55".repeat(20)), "pubkeyhash"),
+        (format!("a914{}87", "66".repeat(20)), "scripthash"),
+        (format!("0014{}", "77".repeat(20)), "witness_v0_keyhash"),
+        (format!("0020{}", "88".repeat(32)), "witness_v0_scripthash"),
+        (format!("5120{}", "99".repeat(32)), "witness_v1_taproot"),
+        ("ac".to_string(), "nonstandard"),
+    ];
+    for (hex_spk, want) in cases {
+        let spk = bitcoin::ScriptBuf::from_bytes(hex::decode(hex_spk).unwrap());
+        assert_eq!(script_type(&spk), *want, "{hex_spk}");
+    }
+}
+
 #[test]
 fn a_negative_amount_formats_as_core_does() {
     use crate::rpc::amounts::{AmountUnit, format_signed_amount};
