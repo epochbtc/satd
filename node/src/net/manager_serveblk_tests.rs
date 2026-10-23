@@ -110,7 +110,7 @@ fn a_pruned_node_advertises_network_limited_and_not_network() {
     assert!(pruned.has(ServiceFlags::NETWORK_LIMITED) && pruned.has(ServiceFlags::WITNESS), "{pruned}");
 
     // Our own address goes out with the same flags.
-    pm.external_addrs.write().push(SocketAddr::from(([203, 0, 113, 50], 8333)));
+    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
     let _r = add_peer(&pm, 9, false);
     let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(9) else { panic!("a legacy addr") };
     assert_eq!(a[0].1.services, pruned);

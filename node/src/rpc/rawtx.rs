@@ -568,6 +568,22 @@ fn confirmed_tx_verbose(
     Ok(decode_transaction_verbose_net(tx, Some(ctx), spent, true, true, chain_state.network))
 }
 
+/// A scriptPubKey as Core's `ScriptToUniv(include_hex, include_address)`
+/// writes it for `gettxout`: `asm`, `desc`, `hex`, `address` (when the script
+/// has one) and `type`.
+pub(crate) fn script_pubkey_json(script: &bitcoin::Script, network: bitcoin::Network) -> Value {
+    let mut spk = json!({
+        "asm": format!("{}", script),
+        "desc": crate::rpc::descriptor::infer_descriptor(script, network),
+        "hex": hex::encode(script.as_bytes()),
+        "type": script_type(script),
+    });
+    if let Some(addr) = script_to_address(script, network) {
+        spk["address"] = json!(addr);
+    }
+    spk
+}
+
 /// Derive a Bitcoin address from a scriptPubKey if possible.
 ///
 /// The network is not cosmetic and there is no "unqualified" address form:

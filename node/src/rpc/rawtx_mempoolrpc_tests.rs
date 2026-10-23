@@ -177,6 +177,36 @@ fn gettxout_trusts_the_pool_only_while_the_coins_it_spends_remain() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `gettxout` writes the scriptPubKey as Core's `ScriptToUniv` with the
+/// address included: `asm`, `desc`, `hex`, `address`, `type`, from the pool
+/// and from the chain alike. Perturbation: go back to `asm`/`hex` only in
+/// either branch and that half fails.
+#[test]
+fn gettxout_names_the_script_type_address_and_descriptor() {
+    let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
+    let tx = spend(prev(1), &[(COIN_VALUE - 1_000, 2)]);
+    let txid = admit(&mp, &cs, tx.clone()).to_string();
+    let addr = bitcoin::Address::from_script(&p2wpkh(2), bitcoin::Network::Regtest).unwrap().to_string();
+    let check = |spk: &Value, from: &str| {
+        assert_eq!(spk["type"], "witness_v0_keyhash", "{from}: {spk}");
+        assert_eq!(spk["address"], addr.as_str(), "{from}: {spk}");
+        let desc = spk["desc"].as_str().unwrap_or_else(|| panic!("{from}: no desc in {spk}"));
+        assert!(desc.starts_with(&format!("addr({addr})#")), "{from}: {desc}");
+        assert_eq!(spk["hex"], hex::encode(p2wpkh(2).as_bytes()), "{from}");
+        assert!(spk["asm"].is_string(), "{from}");
+    };
+    check(&get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["scriptPubKey"], "pool");
+    let funding = get_tx_out_view(&cs, None, &prev(1).txid.to_string(), 0).unwrap();
+    assert_eq!(funding["scriptPubKey"]["type"], "witness_v0_keyhash", "chain: {funding}");
+    assert_eq!(
+        funding["scriptPubKey"]["address"],
+        bitcoin::Address::from_script(&p2wpkh(0x11), bitcoin::Network::Regtest).unwrap().to_string(),
+        "chain: {funding}"
+    );
+    assert!(funding["scriptPubKey"]["desc"].as_str().is_some_and(|d| d.starts_with("addr(")), "chain: {funding}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_negative_amount_formats_as_core_does() {
     use crate::rpc::amounts::{AmountUnit, format_signed_amount};

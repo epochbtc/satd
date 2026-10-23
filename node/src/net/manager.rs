@@ -342,16 +342,24 @@ pub const PROMOTION_DRAIN_INTERVAL_SECS: u64 = 2;
 /// permissioned-but-misbehaving peer must not be able to request it in a
 /// tight loop ("whitelisted subnet" ≠ "trusted to behave for months").
 const MEMPOOL_REQUEST_COOLDOWN_SECS: u64 = 30;
-/// Minimum timeout for a SOCKS5 `.onion` dial, in milliseconds. A `.onion`
-/// connect tunnels the proxy socket connect, the SOCKS5 handshake, and the
-/// Tor rendezvous (HS descriptor fetch + intro/rendezvous circuit build) — the
-/// last of which routinely takes well over the 5s clearnet socket-connect
-/// budget, especially on the first connection to a freshly-published service.
-/// Bitcoin Core gives the SOCKS5 exchange its own 20s `SOCKS5_RECV_TIMEOUT`
-/// (netbase.cpp) for exactly this reason; we mirror that as a floor so a small
-/// `-timeout` doesn't make onion peers effectively undialable. A larger
-/// `-timeout` still wins (operators can extend, not shorten, the onion budget).
-const ONION_DIAL_TIMEOUT_FLOOR_MS: u64 = 20_000;
+/// Minimum bound, in milliseconds, on the SOCKS5 exchange of a proxied dial:
+/// the greeting, authentication and CONNECT reply, after the TCP connect to
+/// the proxy (which `-timeout` bounds). The CONNECT reply carries the proxy's
+/// own connect to the target — for Tor, a fresh circuit per isolated stream,
+/// plus the HS descriptor fetch and rendezvous for a `.onion` — and routinely
+/// takes well over the 5s `-timeout` default. Bitcoin Core gives each SOCKS5
+/// read its own 20s `SOCKS5_RECV_TIMEOUT` (netbase.cpp) for exactly this
+/// reason; we mirror that as a floor on the whole exchange, so a small
+/// `-timeout` doesn't make proxied peers effectively undialable. A larger
+/// `-timeout` still wins.
+const SOCKS5_EXCHANGE_TIMEOUT_FLOOR_MS: u64 = 20_000;
+
+fn socks_dial_timeouts(connect_timeout_ms: u64) -> proxy::DialTimeouts {
+    proxy::DialTimeouts {
+        proxy_connect: Duration::from_millis(connect_timeout_ms),
+        exchange: Duration::from_millis(connect_timeout_ms.max(SOCKS5_EXCHANGE_TIMEOUT_FLOOR_MS)),
+    }
+}
 /// How far above the background connect cursor the AssumeUTXO catch-up
 /// downloader keeps historical blocks requested/on-disk. Bounds disk
 /// read-ahead and outstanding `getdata` for the background range.
@@ -1801,6 +1809,25 @@ impl PeerManager {
         *self.external_addrs.write() = addrs;
     }
 
+    /// The `-externalip` addresses this node may claim as its own. Core's
+    /// `AddLocal` refuses an address that is not routable (`net.cpp`), so a
+    /// private, loopback or documentation address is never advertised to
+    /// peers, sent as the version message's sender, or listed in
+    /// `localaddresses`. Under `-cjdnsreachable` an `fc00::/8` address is a
+    /// CJDNS address, which Core counts as routable.
+    fn advertisable_external_addrs(&self) -> Vec<SocketAddr> {
+        let reachable = self.reachable.read();
+        self.external_addrs
+            .read()
+            .iter()
+            .filter(|a| {
+                crate::net::is_routable(a.ip())
+                    || reachable.network_of(a) == crate::net::reachable::Network::Cjdns
+            })
+            .copied()
+            .collect()
+    }
+
     /// Register our own `-listenonion` v3 hidden-service address so it is
     /// advertised to peers. Validates that `host` is a well-formed v3 onion
     /// (the pubkey must be recoverable for the addrv2 encoding); a malformed
@@ -1827,8 +1854,7 @@ impl PeerManager {
     /// (operator-intent, manually configured) ranks above bare externals.
     pub fn local_addresses(&self) -> Vec<(String, u16, u32)> {
         let mut out: Vec<(String, u16, u32)> = self
-            .external_addrs
-            .read()
+            .advertisable_external_addrs()
             .iter()
             .map(|a| (a.ip().to_string(), a.port(), 1))
             .collect();
@@ -1968,10 +1994,8 @@ impl PeerManager {
         let services = self.local_services();
         let time = u32::try_from(now_unix_secs()).unwrap_or(u32::MAX);
         let mine: Vec<GetAddrEntry> = self
-            .external_addrs
-            .read()
+            .advertisable_external_addrs()
             .iter()
-            .filter(|a| !a.ip().is_unspecified())
             .filter(|a| {
                 let v4 = match a.ip() {
                     IpAddr::V4(_) => true,
@@ -11845,7 +11869,8 @@ impl PeerManager {
     }
 
     /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
-    /// configured), bounded by Core's `-timeout`.
+    /// configured), bounded by Core's `-timeout`; a proxied dial's SOCKS5
+    /// exchange is bounded as in [`socks_dial_timeouts`].
     ///
     /// An address Core calls unroutable — loopback, RFC 1918 private space,
     /// link-local and the rest of `IsRoutable`'s list — connects directly,
@@ -11868,15 +11893,9 @@ impl PeerManager {
                 // circuit (see `socks_cred`).
                 let cred = self.socks_cred();
                 let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-                return tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
+                return proxy::connect_socks5(proxy_addr, addr, cred_ref, self.socks_dial_timeouts())
                     .await
-                    .map_err(|_| {
-                        format!(
-                            "connect to {addr} via proxy timed out after {}ms",
-                            connect_timeout.as_millis()
-                        )
-                    })?
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| format!("connect to {addr} via proxy: {e}"));
             }
             let _ = proxy_addr; // suppress unused warning on the direct path
         }
@@ -11892,7 +11911,7 @@ impl PeerManager {
     }
 
     /// Dial a .onion outbound peer through the configured SOCKS5 proxy,
-    /// bounded by Core's `-timeout`.
+    /// bounded as in [`socks_dial_timeouts`].
     async fn dial_onion(&self, host: &str, port: u16) -> Result<TcpStream, String> {
         // `-onion=0` leaves Core with no proxy for `NET_ONION`, so even a
         // manual `.onion` peer is not dialled through `-proxy`.
@@ -11904,28 +11923,19 @@ impl PeerManager {
             .as_deref()
             .or(self.proxy.as_deref())
             .ok_or("no proxy configured for .onion connections")?;
-        // Floor the onion dial timeout at ONION_DIAL_TIMEOUT_FLOOR_MS so the Tor
-        // rendezvous has time to complete even when `-timeout` is at its 5s
-        // default; a larger `-timeout` still extends it.
-        let configured = self.connect_timeout_ms.load(Ordering::Relaxed);
-        let connect_timeout =
-            Duration::from_millis(configured.max(ONION_DIAL_TIMEOUT_FLOOR_MS));
         // Per-dial random SOCKS credentials isolate this onion peer on its own
         // Tor circuit (see `socks_cred`).
         let cred = self.socks_cred();
         let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        tokio::time::timeout(
-            connect_timeout,
-            proxy::connect_socks5_onion(proxy_addr, host, port, cred_ref),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "connect to onion {host}:{port} via proxy timed out after {}ms",
-                connect_timeout.as_millis()
-            )
-        })?
-        .map_err(|e| e.to_string())
+        proxy::connect_socks5_onion(proxy_addr, host, port, cred_ref, self.socks_dial_timeouts())
+            .await
+            .map_err(|e| format!("connect to onion {host}:{port} via proxy: {e}"))
+    }
+
+    /// Bounds for a SOCKS5 dial: `-timeout` reaches the proxy, and the SOCKS5
+    /// exchange gets at least [`SOCKS5_EXCHANGE_TIMEOUT_FLOOR_MS`].
+    fn socks_dial_timeouts(&self) -> proxy::DialTimeouts {
+        socks_dial_timeouts(self.connect_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// (Re-)dial an outbound destination.
@@ -13068,8 +13078,7 @@ impl PeerManager {
         // Advertise our first declared external address (`-externalip`)
         // as addr_from; fall back to the unspecified address otherwise.
         let sender = self
-            .external_addrs
-            .read()
+            .advertisable_external_addrs()
             .first()
             .copied()
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -13668,6 +13677,19 @@ mod tests {
         let (total_b, same_b) = PeerManager::count_inbound(&peers, ip_b);
         assert_eq!(total_b, 4);
         assert_eq!(same_b, 1);
+    }
+
+    /// `-timeout` bounds only the connect to the proxy; the SOCKS5 exchange
+    /// (where Tor builds the circuit) gets Core's 20s, or more if `-timeout`
+    /// is larger. Clearnet and onion dials share the split.
+    #[test]
+    fn socks_dial_timeouts_split_like_core() {
+        let t = socks_dial_timeouts(DEFAULT_CONNECT_TIMEOUT_MS);
+        assert_eq!(t.proxy_connect, Duration::from_millis(5_000));
+        assert_eq!(t.exchange, Duration::from_millis(20_000));
+        let t = socks_dial_timeouts(30_000);
+        assert_eq!(t.proxy_connect, Duration::from_millis(30_000));
+        assert_eq!(t.exchange, Duration::from_millis(30_000));
     }
 
     #[test]

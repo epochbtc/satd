@@ -931,10 +931,7 @@ pub fn get_tx_out_view(
                 "bestblock": tip_hash.to_string(),
                 "confirmations": 0,
                 "value": format_amount(output.value.to_sat(), unit),
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                },
+                "scriptPubKey": crate::rpc::rawtx::script_pubkey_json(&output.script_pubkey, chain_state.network),
                 "coinbase": false,
             });
             annotate_units(&mut response, unit);
@@ -965,10 +962,7 @@ pub fn get_tx_out_view(
         "bestblock": tip_hash.to_string(),
         "confirmations": confirmations,
         "value": value,
-        "scriptPubKey": {
-            "asm": format!("{}", coin.script_pubkey),
-            "hex": hex::encode(coin.script_pubkey.as_bytes()),
-        },
+        "scriptPubKey": crate::rpc::rawtx::script_pubkey_json(&coin.script_pubkey, chain_state.network),
         "coinbase": coin.coinbase,
     });
     annotate_units(&mut response, unit);
