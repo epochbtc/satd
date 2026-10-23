@@ -307,6 +307,10 @@ impl AddrMan {
         }
         if let Some(e) = self.entries.get_mut(&addr) {
             e.last_seen = now;
+            // Core's `AddSingle`: gossiped services are only ever added, never
+            // replace what is known. Without it an address first heard of
+            // without a service never gained it.
+            e.services |= services;
             return (false, None);
         }
         let group = self.group_of(&addr);
@@ -389,6 +393,16 @@ impl AddrMan {
         entry.last_success = now;
         entry.last_seen = now;
         entry.attempts = 0;
+    }
+
+    /// Core's `SetServices`: replace the services of `addr`, if the book
+    /// holds it, with those it stated in its `version`. Only for addresses
+    /// we dialled, whose `version` speaks for the address; gossip only adds
+    /// ([`Self::add_from_replacing`]).
+    pub fn set_services(&mut self, addr: &SocketAddr, services: u64) {
+        if let Some(e) = self.entries.get_mut(addr) {
+            e.services = services;
+        }
     }
 
     /// Whether the book holds `addr`, in either table.
@@ -881,6 +895,26 @@ mod tests {
         let e6 = &b.entries[&sa("[2001:470::5]:18444")];
         assert_eq!(e6.services, 1);
         assert_eq!(e6.source, "2001:470::9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn gossip_adds_services_and_a_version_replaces_them() {
+        let mut a = AddrMan::new();
+        let addr = sa("1.2.3.4:8333");
+        let source: IpAddr = "198.51.100.7".parse().unwrap();
+        a.add_from(addr, 5, 1 | 8, source);
+        // Gossip only adds: a later announcement with a new bit gains it,
+        // and one without a known bit does not take it away.
+        a.add_from(addr, 6, 1 << 30, source);
+        assert_eq!(a.entries[&addr].services, 1 | 8 | 1 << 30);
+        a.add_from(addr, 7, 1, source);
+        assert_eq!(a.entries[&addr].services, 1 | 8 | 1 << 30);
+        // The address's own `version` is authoritative.
+        a.set_services(&addr, 8);
+        assert_eq!(a.entries[&addr].services, 8);
+        // An address the book does not hold is not added.
+        a.set_services(&sa("5.6.7.8:8333"), 1);
+        assert!(!a.contains(&sa("5.6.7.8:8333")));
     }
 
     /// A `peers.dat` written by the version 1 writer (no services, no

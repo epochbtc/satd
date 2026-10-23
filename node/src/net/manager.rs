@@ -12914,6 +12914,17 @@ impl PeerManager {
             }
         }
 
+        // Core's `SetServices`, before the services check below so that a
+        // peer dropped for lacking them is recorded as lacking them: an
+        // outbound peer's `version` states what its address offers now,
+        // over what gossip said. Onion peers have no entry in the book.
+        if direction == Direction::Outbound {
+            let dialled = self.peers.read().get(&id).filter(|h| h.info.onion_host.is_none()).map(|h| h.info.addr);
+            if let Some(addr) = dialled {
+                self.addrman.write().set_services(&addr, their_version.services.to_u64());
+            }
+        }
+
         if direction == Direction::Outbound
             && matches!(conn_type, ConnType::OutboundFullRelay | ConnType::BlockRelay | ConnType::AddrFetch)
             && let Some(wanted) = self.missing_desirable_services(their_version.services)
