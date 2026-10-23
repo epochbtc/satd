@@ -62,7 +62,16 @@ jobs:
   block-differential:
     name: block-differential fuzz
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Setup takes ~4 min, the two cold builds below ~30 (up from ~20 in
+    # mid-October), and fuzzing MAX_TOTAL_TIME (30 min by default). 60 minutes
+    # stopped being enough on 2026-10-19 and every nightly after it was
+    # cancelled mid-fuzz. 100 leaves ~35 minutes for the build to keep growing.
+    #
+    # Caching the build would be the better fix, but not while the repository
+    # sits at GitHub's 10 GB cache limit: PR CI touches every entry many times a
+    # day, so an entry this job saves once a night is the least recently used
+    # by the next night and gets evicted first, after pushing a PR-CI cache out.
+    timeout-minutes: 100
 
     steps:
       - name: Checkout
@@ -149,8 +158,8 @@ jobs:
       # a job that exceeds `timeout-minutes`, and `failure()` is false for a
       # cancelled job. This job has no dependency cache, so a cold run builds
       # cargo-fuzz, then node+rocksdb+bitcoinconsensus for gen_corpus, then the
-      # whole tree again under ASan, before fuzzing for 30 minutes — the 60
-      # minute ceiling is not far away. `cancel-in-progress` can cancel it too
+      # whole tree again under ASan, before fuzzing for 30 minutes — see the
+      # `timeout-minutes` note above for how close that is to the ceiling. `cancel-in-progress` can cancel it too
       # (a workflow_dispatch on master supersedes the running nightly). A
       # cancelled run's conclusion is not `failure` either, so the (c) streak
       # counter never counted it: the job could time out every single night and
@@ -303,16 +312,17 @@ jobs:
           The job has no dependency cache, so every run cold-builds
           \`cargo-fuzz\`, then \`node\` + rocksdb + bitcoinconsensus for
           \`gen_corpus\`, then the whole tree again under ASan, and only then
-          fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). The 60-minute ceiling
-          leaves little headroom, so this trips when the runner is slow or a
-          dependency graph grows.
+          fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). If the build has
+          grown past the headroom \`timeout-minutes\` leaves, this trips every
+          night; compare the build's \`Finished ... in\` lines in this run
+          with an earlier green run.
 
-          Options, roughly in order of preference:
+          Options:
 
-          - Cache the build (\`Swatinem/rust-cache\`, keyed separately from the
-            PR-CI legs since this uses a nightly toolchain).
+          - Raise \`timeout-minutes\` (see the note on it in the workflow).
           - Lower \`MAX_TOTAL_TIME\` so build time and fuzz time fit.
-          - Raise \`timeout-minutes\`.
+          - Cache the build, once the repository has room under GitHub's
+            10 GB cache limit for an entry that is used only once a night.
 
           Note that a cancelled run is invisible to this workflow's own
           consecutive-failure counter, which matches on \`failure\` — so
