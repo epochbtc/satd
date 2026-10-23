@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       shard:
-        description: "Nightly shard to run, as k/n (default: tonight's)"
+        description: "Nightly shard to run, as k/n, 0-based: 0/41 to 40/41 (default: tonight's)"
         required: false
         default: ""
   schedule:
@@ -53,7 +53,8 @@ jobs:
     name: mutants (PR diff)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # 90 minutes of mutating plus ~45 of setup, build and report.
+    timeout-minutes: 150
 
     steps:
       # The PR head, not the merge commit, so the diff's line numbers match the
@@ -99,21 +100,33 @@ jobs:
           shared-key: tests
           save-if: false
 
+      # A prebuilt binary, as deny.yml installs cargo-deny: building
+      # cargo-mutants from source would take minutes of the budget every run.
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked --version ${{ env.MUTANTS_VERSION }}
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
 
       # satd's integration tests find sat-cli by path; see ci.yml.
       - name: Pre-build sat-cli (test fixture)
         run: cargo build -p sat-cli --locked
 
       - name: Mutate the changed lines
+        id: mutate
         env:
+          MUTANTS_SKIP_REPORT: "1"
           BUDGET_MINUTES: "90"
           # As ci.yml's test jobs; see there for why each is set.
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: bash scripts/mutants/run.sh diff "$RUNNER_TEMP/pr.diff"
+
+      # A step of its own, so the annotations and summary are still written
+      # when the job timeout kills the step above.
+      - name: Report
+        if: always() && steps.mutate.outcome != 'skipped'
+        run: bash scripts/mutants/run.sh report
 
       - name: Upload the results
         if: always()
@@ -162,21 +175,31 @@ jobs:
           shared-key: tests
           save-if: false
 
+      # A prebuilt binary, as deny.yml installs cargo-deny: building
+      # cargo-mutants from source would take minutes of the budget every run.
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked --version ${{ env.MUTANTS_VERSION }}
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
 
       - name: Pre-build sat-cli (test fixture)
         run: cargo build -p sat-cli --locked
 
-      # 320 of the job's 350 minutes, leaving room to write the report.
+      # 290 of the job's 350 minutes; the rest is setup, build and report.
       - name: Mutate tonight's shard
+        id: mutate
         env:
-          BUDGET_MINUTES: "320"
+          MUTANTS_SKIP_REPORT: "1"
+          BUDGET_MINUTES: "290"
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
           SHARD: ${{ github.event.inputs.shard }}
         run: bash scripts/mutants/run.sh nightly ${SHARD:+"$SHARD"}
+
+      - name: Report
+        if: always() && steps.mutate.outcome != 'skipped'
+        run: bash scripts/mutants/run.sh report
 
       - name: Upload the results
         if: always()
