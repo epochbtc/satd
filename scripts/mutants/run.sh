@@ -10,7 +10,8 @@
 # crate it is in; a mutant those tests still pass is "missed". See
 # scripts/mutants/report.py for how to read the result.
 #
-# `diff` is for a pull request: it tests only mutants on lines the diff touches,
+# `diff` is for checking a change locally, before opening a pull request (CI
+# does not run it): it tests only mutants on lines the diff touches,
 # which asks whether the tests a change came with notice the change breaking.
 #
 # `nightly` walks NIGHTLY_GLOBS, too large for one night, in shards: tonight's
