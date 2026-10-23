@@ -244,7 +244,8 @@ specified; satd accepts them over RPC.
 
 - A publisher MUST store at most `MAX_KEYS_PER_OUTPOINT` keys per outpoint.
   This bounds storage and page size. It is not a counting rule: a holder can
-  split a coin to sign more keys, and aggregators count every valid key.
+  split a coin to sign more keys, and aggregators count every valid key they
+  keep (see [Keys per outpoint](#keys-per-outpoint)).
 - A publisher MUST serve only attestations valid at its tip. It SHOULD stop
   serving an attestation as soon as it stops being valid, and MAY drop
   attestations whose coin has been spent.
@@ -399,6 +400,18 @@ SHOULD be disconnected. An attestation that fails only because of chain
 state (rules 1 to 4, or 6) is not misbehaviour: the publisher's tip may
 differ from the aggregator's.
 
+### Keys per outpoint
+
+An aggregator MAY bound the keys it keeps per outpoint, so that one old coin
+signing unlimited keys through a modified publisher cannot grow its set
+without limit. The bound SHOULD be well above `MAX_KEYS_PER_OUTPOINT`, so that
+a holder publishing through several publishers is not cut short. The
+reference aggregator keeps at most 256 keys per outpoint, in the order first
+seen: a key new to an outpoint that already has 256 is refused, while a key
+already held still takes newer attestations. Two aggregators that saw an
+outpoint's keys in different orders may then keep different sets for it;
+their snapshots show the difference.
+
 ### Reorganisations
 
 An aggregator SHOULD keep each attestation that is superseded for an
@@ -464,7 +477,8 @@ toward nothing.
 **The keys-per-outpoint limit is a resource bound.** It bounds what a
 publisher stores and what a page holds. A holder can split coins to sign more
 keys, so the limit cannot be a scarcity rule, and aggregators do not apply
-it.
+it. An aggregator's own, larger bound protects it from a modified publisher
+that ignores the limit.
 
 **Pull, not gossip.** Gossiping attestations would make every node carry
 every attestation. Pulling puts the cost on aggregators, who choose to bear
