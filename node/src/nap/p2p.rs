@@ -6,8 +6,10 @@
 //! ```
 //!
 //! An optional outpoint is a `u8` (0 absent, 1 present) followed, when
-//! present, by the outpoint. Decoding is strict, as for the attestation
-//! itself: only the bytes encoding produces are accepted.
+//! present, by the outpoint. The fields decode strictly, as the attestation
+//! does, but bytes after the last field are ignored, so a later version can
+//! append fields without this one treating its messages as malformed. A
+//! change older nodes cannot skip takes a new command.
 //!
 //! A publisher answers a `getnapatt` from any peer, whether or not it
 //! advertises [`NODE_NAP`]; it never sends a `napatt` unasked. Results are
@@ -86,10 +88,6 @@ fn decode_cursor(r: &mut &[u8]) -> Result<Option<OutPoint>, FormatError> {
     }
 }
 
-fn no_trailing(r: &[u8]) -> Result<(), FormatError> {
-    if r.is_empty() { Ok(()) } else { Err(FormatError::Decode(format!("{} trailing bytes", r.len()))) }
-}
-
 /// A compact size, refused if it is over `max`.
 fn count(r: &mut &[u8], max: usize, what: &str) -> Result<usize, FormatError> {
     let n = encode::VarInt::consensus_decode(r)?.0;
@@ -119,8 +117,8 @@ impl GetNapAtt {
         encode::serialize(self)
     }
 
-    /// Decode a whole `getnapatt` payload. Each key must be one an
-    /// attestation could carry.
+    /// Decode a `getnapatt` payload, ignoring bytes after its fields. Each
+    /// key must be one an attestation could carry.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FormatError> {
         let mut r = bytes;
         let anchor_height_min = u32::consensus_decode(&mut r)?;
@@ -137,7 +135,6 @@ impl GetNapAtt {
             keys.push(String::from_utf8(key.to_vec()).expect("checked printable"));
         }
         let cursor = decode_cursor(&mut r)?;
-        no_trailing(r)?;
         Ok(GetNapAtt { anchor_height_min, keys, cursor })
     }
 
@@ -166,8 +163,8 @@ impl NapAtt {
         encode::serialize(self)
     }
 
-    /// Decode a whole `napatt` payload, refusing one over
-    /// [`MAX_NAPATT_SIZE`] before reading it.
+    /// Decode a `napatt` payload, ignoring bytes after its fields, and
+    /// refusing one over [`MAX_NAPATT_SIZE`] before reading it.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FormatError> {
         if bytes.len() > MAX_NAPATT_SIZE {
             return Err(FormatError::Decode(format!(
@@ -184,7 +181,6 @@ impl NapAtt {
             attestations.push(Attestation::decode_from(&mut r)?);
         }
         let next_cursor = decode_cursor(&mut r)?;
-        no_trailing(r)?;
         Ok(NapAtt { attestations, next_cursor })
     }
 }

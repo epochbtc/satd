@@ -61,9 +61,9 @@ fn messages_round_trip() {
 fn getnapatt_refuses_malformed_bytes() {
     let good = GetNapAtt { anchor_height_min: 1, keys: vec!["k".into()], cursor: None }.to_bytes();
     assert!(GetNapAtt::from_bytes(&good).is_ok());
-    // Truncated, and trailing bytes.
+    // Truncated. Trailing bytes are a later version's fields, and ignored.
     assert!(GetNapAtt::from_bytes(&good[..good.len() - 1]).is_err());
-    assert!(GetNapAtt::from_bytes(&[good.clone(), vec![0]].concat()).is_err());
+    assert_eq!(GetNapAtt::from_bytes(&[good.clone(), vec![0, 9]].concat()), GetNapAtt::from_bytes(&good));
     // A cursor flag other than 0 or 1.
     let mut bad = good.clone();
     *bad.last_mut().unwrap() = 2;
@@ -97,7 +97,7 @@ fn napatt_refuses_oversize_and_malformed_bytes() {
     let (_dir, _p, atts) = serving_publisher(1, 1);
     let good = NapAtt { attestations: atts, next_cursor: None }.to_bytes();
     assert!(NapAtt::from_bytes(&good[..good.len() - 1]).is_err());
-    assert!(NapAtt::from_bytes(&[good.clone(), vec![0]].concat()).is_err());
+    assert_eq!(NapAtt::from_bytes(&[good.clone(), vec![0, 9]].concat()), NapAtt::from_bytes(&good));
     // A count larger than the payload could hold, refused before reading.
     let mut b = vec![0xfe];
     b.extend(u32::MAX.to_le_bytes());
