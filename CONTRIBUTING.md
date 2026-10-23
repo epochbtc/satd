@@ -98,6 +98,14 @@ are not required to. Verification details are in `SECURITY.md`.
   `fuzz/`). If your change touches block acceptance (PoW, commitments,
   sigops, BIP 34, value conservation, maturity, timestamps, locktime),
   add or extend a case there.
+- Mutation testing — the `Mutation testing` workflow breaks the lines a PR
+  changed, one small edit at a time, and runs the crate's tests against each.
+  A mutant no test catches is a warning annotation on that line: add a test
+  that fails on it, or say in review why the mutant cannot change behaviour.
+  The same check locally:
+  `git diff master... > /tmp/pr.diff && scripts/mutants/run.sh diff /tmp/pr.diff`
+  (needs `cargo install cargo-mutants`; it edits and restores the working tree,
+  so commit first).
 
 ## AI-assisted contributions
 

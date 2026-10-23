@@ -1,0 +1,188 @@
+# Mutation testing (cargo-mutants). A mutant is a small deliberate break in the
+# code; a mutant every test still passes is "missed", which points at behaviour
+# no test checks. Line coverage says a test ran the code; this says whether a
+# test would notice the code being wrong.
+#
+# Two jobs, both advisory. Neither should be a required check: a missed mutant
+# is a finding for a person to judge (some mutants are equivalent to the
+# original and cannot be caught), not a failure.
+#
+#   pull-request — mutants on the lines the PR changed only. Each missed one is
+#                  a warning annotation on that line of the diff, and the run
+#                  summary lists them all. The job is red only when the run
+#                  itself breaks.
+#   nightly      — one shard of the consensus-critical code a night (consensus/,
+#                  node's validation, chain and mempool modules), rotating so
+#                  every shard comes round. The shard and scope are in
+#                  scripts/mutants/run.sh.
+#
+# cargo-mutants runs the tests of the mutated crate only. A `node` mutant that
+# only satd's regtest suite would catch is reported as missed; check that suite
+# before writing a new test.
+
+name: Mutation testing
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "Nightly shard to run, as k/n (default: tonight's)"
+        required: false
+        default: ""
+  schedule:
+    # Nightly 00:30 UTC: the run takes most of the six hours a hosted job may.
+    - cron: '30 0 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+# Not named CARGO_* or RUST*: rust-cache folds those into its key, and the
+# restores below must match the key the test jobs use. The test settings are
+# on the steps that run the tests, as in ci.yml.
+env:
+  MUTANTS_VERSION: '27.1.0'
+
+jobs:
+  pull-request:
+    name: mutants (PR diff)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      # The PR head, not the merge commit, so the diff's line numbers match the
+      # tree cargo-mutants mutates. Full history for the merge base.
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Write the PR diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff "$BASE_SHA...HEAD" > "$RUNNER_TEMP/pr.diff"
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      # The same toolchain step as ci.yml's test jobs, not dtolnay/rust-toolchain:
+      # that one exports CARGO_* variables, which rust-cache hashes into its key,
+      # so the `tests` cache restore below would miss.
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      # Restores the dependency build `seed-cache` keeps on master for the test
+      # jobs; cargo-mutants runs `cargo test`, so it is the same build.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version ${{ env.MUTANTS_VERSION }}
+
+      # satd's integration tests find sat-cli by path; see ci.yml.
+      - name: Pre-build sat-cli (test fixture)
+        run: cargo build -p sat-cli --locked
+
+      - name: Mutate the changed lines
+        env:
+          BUDGET_MINUTES: "90"
+          # As ci.yml's test jobs; see there for why each is set.
+          RUST_TEST_THREADS: "4"
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+        run: bash scripts/mutants/run.sh diff "$RUNNER_TEMP/pr.diff"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-pr
+          path: target/mutants-run/mutants.out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  nightly:
+    name: mutants (nightly shard)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      # The same toolchain step as ci.yml's test jobs, not dtolnay/rust-toolchain:
+      # that one exports CARGO_* variables, which rust-cache hashes into its key,
+      # so the `tests` cache restore below would miss.
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version ${{ env.MUTANTS_VERSION }}
+
+      - name: Pre-build sat-cli (test fixture)
+        run: cargo build -p sat-cli --locked
+
+      # 320 of the job's 350 minutes, leaving room to write the report.
+      - name: Mutate tonight's shard
+        env:
+          BUDGET_MINUTES: "320"
+          RUST_TEST_THREADS: "4"
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+          SHARD: ${{ github.event.inputs.shard }}
+        run: bash scripts/mutants/run.sh nightly ${SHARD:+"$SHARD"}
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-nightly
+          path: target/mutants-run/mutants.out/
+          if-no-files-found: ignore
+          retention-days: 30
