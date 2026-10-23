@@ -1092,6 +1092,11 @@ pub struct PeerManager {
     /// bucketed by network group. Fed by addr gossip and successful
     /// connects; persisted across restarts.
     addrman: RwLock<crate::net::addrman::AddrMan>,
+    /// `-nap`: the attestations this node publishes, served to peers that
+    /// ask with `getnapatt`. While set, the node advertises `NODE_NAP`.
+    nap: RwLock<Option<Arc<crate::nap::Publisher>>>,
+    /// The NAP serving limits, per connection and per network group.
+    nap_limits: parking_lot::Mutex<crate::nap::p2p::ServeLimits>,
     /// Wakes the manager loop's event drain before its next 500 ms tick.
     ///
     /// The drain cadence is deliberate everywhere else, but a peer whose
@@ -1465,6 +1470,8 @@ impl PeerManager {
                 book.set_admit_private(network == Network::Regtest);
                 book
             }),
+            nap: RwLock::new(None),
+            nap_limits: parking_lot::Mutex::new(Default::default()),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
@@ -2108,6 +2115,12 @@ impl PeerManager {
     }
 
     /// Install `-whitelist` permission entries. Set once at startup.
+    /// `-nap`: serve `publisher`'s attestations and advertise `NODE_NAP`
+    /// on handshakes from now on.
+    pub fn set_nap_publisher(&self, publisher: Arc<crate::nap::Publisher>) {
+        *self.nap.write() = Some(publisher);
+    }
+
     pub fn set_whitelist(&self, entries: Vec<crate::net::permissions::WhitelistEntry>) {
         *self.whitelist.write() = entries;
     }
@@ -5410,6 +5423,7 @@ impl PeerManager {
             tracing::debug!("Cleared nodestate for peer={id}");
         }
         drop(peers);
+        self.nap_limits.lock().forget(id);
         // Notify IBD scheduler so in-flight blocks get reassigned
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
@@ -5828,7 +5842,56 @@ impl PeerManager {
                 tracing::debug!("peer requested unsupported block filter type, disconnecting peer={id}");
                 self.disconnect_by_id(id);
             }
+            NetworkMessage::Unknown { command, payload } if command.as_ref() == crate::nap::p2p::GETNAPATT => {
+                self.handle_getnapatt(id, &payload)
+            }
             _ => {}
+        }
+    }
+
+    /// NAP `getnapatt`: answer with one page of the attestations this node
+    /// publishes, within the serving limits. A node not publishing ignores
+    /// it as any unknown message. A malformed request is misbehaviour; one
+    /// over a limit is ignored, since an honest aggregator can hit one.
+    fn handle_getnapatt(&self, id: PeerId, payload: &[u8]) {
+        let Some(publisher) = self.nap.read().clone() else {
+            return;
+        };
+        let req = match crate::nap::p2p::GetNapAtt::from_bytes(payload) {
+            Ok(req) => req,
+            Err(e) => {
+                self.add_ban_score(id, 100, &format!("malformed getnapatt: {e}"));
+                return;
+            }
+        };
+        let Some(ip) = self.peers.read().get(&id).map(|h| h.info.addr.ip()) else {
+            return;
+        };
+        let group = self.addrman.read().group_key(ip);
+        let now = Instant::now();
+        let mut limits = self.nap_limits.lock();
+        let admitted = match limits.admit(id, &group, req.cursor, now) {
+            Ok(a) => a,
+            Err(why) => {
+                tracing::debug!(target: "nap", "getnapatt from peer={id} not served: {why:?}");
+                return;
+            }
+        };
+        // A store being rewritten is busy, not misbehaviour: nothing is
+        // charged, and the peer asks again.
+        let Some(page) = publisher.page(&req, crate::nap::p2p::MAX_NAPATT_SIZE) else {
+            tracing::debug!(target: "nap", "getnapatt from peer={id} not served: the store is busy");
+            return;
+        };
+        let bytes = page.to_bytes();
+        if let Err(why) = limits.commit(id, admitted, bytes.len(), page.next_cursor, now) {
+            tracing::debug!(target: "nap", "getnapatt from peer={id} not served: {why:?}");
+            return;
+        }
+        drop(limits);
+        let count = page.attestations.len();
+        if self.send_raw_message(id, crate::nap::p2p::NAPATT, bytes) {
+            tracing::debug!(target: "nap", "sent napatt ({count} attestations) to peer={id}");
         }
     }
 
@@ -13054,6 +13117,10 @@ impl PeerManager {
         // BIP 324 NODE_P2P_V2 (bit 11), which Core sets with -v2transport.
         if self.v2_transport_enabled() {
             services |= ServiceFlags::P2P_V2;
+        }
+        // NODE_NAP (experimental bit 30) while publishing attestations.
+        if self.nap.read().is_some() {
+            services |= crate::nap::p2p::node_nap();
         }
         // BIP 157 NODE_COMPACT_FILTERS (bit 6) — advertised at version
         // time when the runtime predicate is true. Re-evaluated per

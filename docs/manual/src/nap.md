@@ -15,8 +15,9 @@ attestation.
 
 satd is a publisher. satd has no wallet, so the holder signs in their own
 wallet and hands the signature to their node, which checks it, stores it and
-judges it again at every new block. This chapter covers publishing. Serving
-attestations to peers and collecting them from peers are not in this build.
+judges it again at every new block, and serves the valid ones to peers that
+ask. This chapter covers publishing and serving. Collecting attestations
+from other nodes is not in this build.
 
 ## Enabling
 
@@ -307,6 +308,30 @@ attestation's weight while it is valid.
 attestation and returns its `id`. That is not a withdrawal: copies already
 collected stay valid until they go stale or the coin is spent. To withdraw,
 sign an empty value.
+
+## Serving to peers
+
+With `nap=1` the node advertises the `NODE_NAP` service bit, bit 30 from the
+range Bitcoin Core leaves for experiments (`getnetworkinfo` lists it as
+`NAP`), and answers the `getnapatt` P2P message with the attestations valid
+at its tip, in `napatt` pages of up to 1,000,000 bytes ordered by outpoint.
+It answers any peer that asks, but never sends a NAP message unasked, so a
+Bitcoin Core peer, which never asks, never receives one. There is no gossip:
+a node serves only what was submitted to it.
+
+Serving is limited so that a peer cannot make the node serve without bound:
+
+| Limit | Per connection | Per network group |
+|---|---|---|
+| New pulls (a request without a continuation cursor) | 1 per 10 minutes | 8 per 10 minutes |
+| Bytes served | 200 MB per hour | 1.6 GB per hour |
+
+A network group is an IPv4 /16, an IPv6 /32, or the AS under `-asmap`. A
+connection's limits end with it; a group's do not, so reconnecting does not
+reset them. Requests over a limit are ignored, not punished. Peers that
+reach the node over Tor all arrive from the loopback address and share one
+group, so many Tor connections from one source can use up that group's
+limits. A malformed `getnapatt` counts as misbehaviour.
 
 ## Access
 

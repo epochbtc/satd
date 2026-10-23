@@ -503,6 +503,7 @@ impl PeerInfo {
                 6 => "COMPACT_FILTERS".to_string(),
                 10 => "NETWORK_LIMITED".to_string(),
                 11 => "P2P_V2".to_string(),
+                30 => "NAP".to_string(),
                 other => format!("UNKNOWN[2^{other}]"),
             });
         }

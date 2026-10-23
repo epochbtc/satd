@@ -779,3 +779,171 @@ async fn the_loop_asks_for_more_once_the_queue_drains() {
     let _ = l.task.await;
     reader.abort();
 }
+
+// ---- NAP serving ----
+
+mod nap {
+    use super::*;
+    use crate::nap::p2p::{GETNAPATT, GetNapAtt, MAX_GETNAPATT_KEYS, NAPATT, NapAtt, node_nap};
+
+    /// A node publishing two coins' attestations, two keys each.
+    fn publishing_pm() -> (Arc<PeerManager>, Vec<tempfile::TempDir>, Vec<crate::nap::Attestation>) {
+        let (pm, dir) = mk_pm();
+        let (store, publisher, atts) = crate::nap::p2p_tests::serving_publisher(2, 2);
+        pm.set_nap_publisher(Arc::new(publisher));
+        (pm, vec![dir, store], atts)
+    }
+
+    fn unknown(command: &str, payload: Vec<u8>) -> NetworkMessage {
+        NetworkMessage::Unknown { command: command.to_string().try_into().unwrap(), payload }
+    }
+
+    fn getnapatt(req: &GetNapAtt) -> NetworkMessage {
+        unknown(GETNAPATT, req.to_bytes())
+    }
+
+    fn pull() -> NetworkMessage {
+        getnapatt(&GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None })
+    }
+
+    fn napatts(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<NapAtt> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                NetworkMessage::Unknown { command, payload } if command.as_ref() == NAPATT => {
+                    Some(NapAtt::from_bytes(&payload).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nap_messages(rx: &mut mpsc::Receiver<NetworkMessage>) -> usize {
+        drain(rx)
+            .iter()
+            .filter(|m| matches!(m, NetworkMessage::Unknown { command, .. }
+                if [GETNAPATT, NAPATT].contains(&command.as_ref())))
+            .count()
+    }
+
+    /// The must-succeed half of every refusal below.
+    #[test]
+    fn a_pull_is_answered_and_node_nap_advertised() {
+        let (pm, _dirs, atts) = publishing_pm();
+        assert!(pm.local_services().has(node_nap()));
+        let mut rx = add_peer(&pm, 1, addr(1), 8);
+        deliver(&pm, 1, pull());
+        assert_eq!(napatts(&mut rx), vec![NapAtt { attestations: atts, next_cursor: None }]);
+        assert!(connected(&pm, 1));
+    }
+
+    #[test]
+    fn a_node_not_publishing_ignores_nap_messages() {
+        let (pm, _dir) = mk_pm();
+        assert!(!pm.local_services().has(node_nap()));
+        let mut rx = add_peer(&pm, 1, addr(1), 8);
+        deliver(&pm, 1, pull());
+        deliver(&pm, 1, unknown(GETNAPATT, vec![0xff]));
+        assert_eq!(nap_messages(&mut rx), 0);
+        assert!(connected(&pm, 1), "an unknown message is not misbehaviour");
+    }
+
+    #[test]
+    fn a_malformed_getnapatt_is_misbehaviour() {
+        let keys = (0..=MAX_GETNAPATT_KEYS).map(|i| format!("k{i}")).collect();
+        let over = GetNapAtt { anchor_height_min: 0, keys, cursor: None }.to_bytes();
+        let oversize = vec![0x01; 100_000];
+        for (i, payload) in [over, oversize, vec![]].into_iter().enumerate() {
+            let (pm, _dirs, _) = publishing_pm();
+            let mut rx = add_peer(&pm, 1, addr(1), 8);
+            deliver(&pm, 1, unknown(GETNAPATT, payload));
+            assert_eq!(nap_messages(&mut rx), 0, "case {i}");
+            assert!(!connected(&pm, 1), "case {i}");
+        }
+    }
+
+    /// Bytes after the fields this version knows are ignored, so a later
+    /// version can append a field without older publishers punishing it.
+    #[test]
+    fn trailing_bytes_are_ignored() {
+        let (pm, _dirs, atts) = publishing_pm();
+        let mut rx = add_peer(&pm, 1, addr(1), 8);
+        let req = GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None };
+        deliver(&pm, 1, unknown(GETNAPATT, [req.to_bytes(), vec![1, 2, 3]].concat()));
+        assert_eq!(napatts(&mut rx), vec![NapAtt { attestations: atts, next_cursor: None }]);
+        assert!(connected(&pm, 1));
+    }
+
+    #[test]
+    fn an_unsolicited_napatt_is_ignored() {
+        let (pm, _dirs, atts) = publishing_pm();
+        let mut rx = add_peer(&pm, 1, addr(1), 8);
+        deliver(&pm, 1, unknown(NAPATT, NapAtt { attestations: atts, next_cursor: None }.to_bytes()));
+        assert_eq!(nap_messages(&mut rx), 0);
+        assert!(connected(&pm, 1));
+    }
+
+    #[test]
+    fn a_connection_gets_one_pull_per_interval() {
+        let (pm, _dirs, _) = publishing_pm();
+        let mut rx = add_peer(&pm, 1, addr(1), 8);
+        deliver(&pm, 1, pull());
+        assert_eq!(napatts(&mut rx).len(), 1);
+        deliver(&pm, 1, pull());
+        // A cursor it was never sent starts a pull too.
+        deliver(&pm, 1, getnapatt(&GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: Some(Default::default()) }));
+        assert_eq!(nap_messages(&mut rx), 0);
+        assert!(connected(&pm, 1), "an honest aggregator can hit a limit");
+        // Another connection in the same group is served.
+        let mut rx2 = add_peer(&pm, 2, addr(2), 8);
+        deliver(&pm, 2, pull());
+        assert_eq!(napatts(&mut rx2).len(), 1);
+    }
+
+    #[test]
+    fn reconnecting_does_not_reset_the_group_limit() {
+        let (pm, _dirs, _) = publishing_pm();
+        let n = crate::nap::p2p::GROUP_MULTIPLE as PeerId;
+        for id in 1..=n {
+            let mut rx = add_peer(&pm, id, addr(id as u8), 8);
+            deliver(&pm, id, pull());
+            assert_eq!(napatts(&mut rx).len(), 1, "peer {id}");
+            pm.disconnect_by_id(id);
+            pm.handle_peer_disconnected(id);
+        }
+        // A new connection from the same group: over the group's pulls.
+        let mut rx = add_peer(&pm, 100, addr(100), 8);
+        deliver(&pm, 100, pull());
+        assert_eq!(nap_messages(&mut rx), 0);
+        // Another group is served.
+        let mut rx = add_peer(&pm, 101, SocketAddr::from(([10, 62, 0, 1], 8333)), 8);
+        deliver(&pm, 101, pull());
+        assert_eq!(napatts(&mut rx).len(), 1);
+    }
+
+    /// A Core peer never asks, so with NAP on it is never sent a NAP message.
+    #[test]
+    fn a_peer_that_never_asks_is_never_sent_a_nap_message() {
+        let (pm, _dirs, _) = publishing_pm();
+        let chain = mine_big(&pm, 3, 10);
+        let mut rx = add_peer(&pm, 1, addr(1), 64);
+        deliver(&pm, 1, NetworkMessage::SendHeaders);
+        deliver(
+            &pm,
+            1,
+            NetworkMessage::GetHeaders(bitcoin::p2p::message_blockdata::GetHeadersMessage {
+                version: 70016,
+                locator_hashes: vec![pm.chain_state.get_block_hash_by_height(0).unwrap()],
+                stop_hash: bitcoin::BlockHash::all_zeros(),
+            }),
+        );
+        deliver(&pm, 1, NetworkMessage::GetData(vec![Inventory::WitnessBlock(chain[2])]));
+        deliver(&pm, 1, NetworkMessage::GetAddr);
+        let sent = drain(&mut rx);
+        assert!(!sent.is_empty(), "the peer was served");
+        assert!(
+            !sent.iter().any(|m| matches!(m, NetworkMessage::Unknown { .. })),
+            "no NAP message: {sent:?}"
+        );
+    }
+}

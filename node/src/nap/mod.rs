@@ -13,9 +13,12 @@
 //! - [`publisher`]: the attestations this node publishes, kept in
 //!   [`store`] and judged at each tip; [`chain`] reads the node's chain
 //!   state for it.
+//! - [`p2p`]: the `getnapatt` and `napatt` messages, paging, and the
+//!   serving limits.
 
 pub mod chain;
 pub mod message;
+pub mod p2p;
 pub mod publisher;
 pub mod store;
 pub mod validity;
@@ -155,6 +158,8 @@ impl Attestation {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod p2p_tests;
 #[cfg(test)]
 mod publisher_tests;
 #[cfg(test)]

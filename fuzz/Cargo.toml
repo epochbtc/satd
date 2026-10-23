@@ -80,6 +80,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "nap_p2p_decode"
+path = "fuzz_targets/nap_p2p_decode.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 # Keep line tables for readable artifact backtraces.
 debug = 1

@@ -132,6 +132,7 @@ pub fn get_network_info(
         (bitcoin::p2p::ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
         (bitcoin::p2p::ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
         (bitcoin::p2p::ServiceFlags::P2P_V2, "P2P_V2"),
+        (crate::nap::p2p::node_nap(), "NAP"),
     ]
     .into_iter()
     .filter(|(flag, _)| local_services.has(*flag))
