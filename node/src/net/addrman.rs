@@ -280,7 +280,8 @@ impl AddrMan {
 
     /// [`add`](Self::add) with the announced service bits and the address
     /// of the peer that announced it. A refresh of a known address updates
-    /// its last-seen time only, as before.
+    /// its last-seen time and adds the announced services; the source stays
+    /// the first.
     pub fn add_from(&mut self, addr: SocketAddr, now: u64, services: u64, source: IpAddr) -> bool {
         self.add_from_replacing(addr, now, services, source).0
     }

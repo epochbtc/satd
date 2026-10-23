@@ -835,3 +835,33 @@ async fn a_peer_dropped_for_lacking_services_is_recorded_as_lacking_them() {
     assert!(result.is_err(), "an automatic peer without NODE_NETWORK is dropped");
     assert_eq!(book, ServiceFlags::WITNESS.to_u64());
 }
+
+#[test]
+fn a_peer_the_book_first_learns_by_connecting_keeps_its_stated_services() {
+    use bitcoin::p2p::address::Address;
+    // A manual or seed peer: dialled without a book entry, which
+    // `mark_good` creates once it connects.
+    let (pm, _dir) = mk_pm();
+    let target: SocketAddr = "203.0.113.9:18444".parse().unwrap();
+    let mut info = peer(1, target, Direction::Outbound);
+    info.conn_type = ConnType::Manual;
+    add_peer(&pm, info);
+    let stated = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    pm.handle_peer_connected(
+        1,
+        VersionMessage {
+            version: 70016,
+            services: stated,
+            timestamp: crate::time::now_secs() as i64,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, stated),
+            nonce: 0x5eed,
+            user_agent: "/remote/".into(),
+            start_height: 0,
+            relay: true,
+        },
+    );
+    let book = pm.addrman.read().iter().find(|e| e.addr == target).map(|e| e.services);
+    assert_eq!(book, Some(stated.to_u64()));
+}
