@@ -448,3 +448,80 @@ fn a_deferred_bad_signature_names_its_source() {
     assert_eq!(bad[0].0, "bad");
     assert_eq!(c.aggregate().len(), 1);
 }
+
+// --- Round 1 fixes ------------------------------------------------------------
+
+#[test]
+fn a_long_source_name_is_cut_on_a_character_boundary() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, c) = open(&chain);
+    // 255 ASCII bytes then a 3-byte character across the 256-byte limit.
+    let source = format!("{}€tail", "a".repeat(255));
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    assert_eq!(take(&c, &chain, &source, vec![att]).added, 1);
+    let held = &c.aggregate().all()[0].source;
+    assert_eq!(held, &"a".repeat(255));
+}
+
+#[test]
+fn an_outpoint_holds_at_most_256_keys_first_seen() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, c) = open(&chain);
+    let page: Vec<_> = (0..aggregate::MAX_KEYS_PER_OUTPOINT)
+        .map(|k| attest(&chain, &s, outpoint(1), &format!("key{k:03}"), "yes", ANCHOR - 10))
+        .collect();
+    assert_eq!(take(&c, &chain, "a", page).added, aggregate::MAX_KEYS_PER_OUTPOINT);
+    // A key new to the outpoint is refused, even one that sorts first.
+    let new_key = attest(&chain, &s, outpoint(1), "a-new-key", "yes", ANCHOR);
+    let i = take(&c, &chain, "a", vec![new_key]);
+    assert_eq!((i.added, i.key_limit), (0, 1));
+    // A key already held still takes a newer attestation.
+    let newer = attest(&chain, &s, outpoint(1), "key000", "no", ANCHOR);
+    assert_eq!(take(&c, &chain, "a", vec![newer]).added, 1);
+    assert_eq!(c.aggregate().counting().len(), aggregate::MAX_KEYS_PER_OUTPOINT);
+}
+
+#[test]
+fn an_attestation_the_chain_cannot_judge_yet_waits_and_survives() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, path) = agg_path();
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        take(&c, &chain, "a", vec![att.clone()]);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    // Restarted in IBD, below the coin: neither the anchor nor the coin is
+    // there yet.
+    let mut behind = chain_with(&s, 0);
+    behind.tip = COIN_HEIGHT - 1;
+    let agg = Aggregate::open(path.clone(), &behind).unwrap();
+    assert_eq!((agg.len(), pending_len(&agg)), (0, 1), "it waits rather than being dropped");
+    // It stays in the file meanwhile, across another restart.
+    assert_eq!(agg.save_if_dirty(), Ok(false));
+    let agg = Aggregate::open(path, &behind).unwrap();
+    assert_eq!(pending_len(&agg), 1);
+    // The chain catches up: it is judged and counts.
+    agg.on_tip(&chain);
+    assert_eq!((agg.len(), pending_len(&agg)), (1, 0));
+    assert_eq!(agg.counting()[0].attestation, att);
+}
+
+#[test]
+fn an_attestation_spent_while_stopped_is_dropped_on_load() {
+    let s = p2wpkh();
+    let mut chain = chain_with(&s, 1);
+    let (_d, path) = agg_path();
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        take(&c, &chain, "a", vec![attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR)]);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    chain.coins.clear();
+    let agg = Aggregate::open(path, &chain).unwrap();
+    assert_eq!((agg.len(), pending_len(&agg)), (0, 0));
+    assert_eq!(agg.save_if_dirty(), Ok(true), "the file loses it too");
+}

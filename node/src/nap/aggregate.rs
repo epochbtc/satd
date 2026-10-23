@@ -6,7 +6,15 @@
 //! superseded attestation is kept until the attestation that superseded it
 //! is valid and its anchor [`REORG_DEPTH`] blocks deep, so that if a reorg
 //! takes the newer anchor first, the older one counts again (Supersession).
-//! Every generation is kept this way, up to [`MAX_GENERATIONS`].
+//! Every generation is kept this way, up to [`MAX_GENERATIONS`]. An
+//! outpoint holds at most [`MAX_KEYS_PER_OUTPOINT`] keys, the first seen
+//! (design D3, amended 2026-10-23): a key new to a full outpoint is refused,
+//! while the keys already held keep taking newer attestations.
+//!
+//! An attestation loaded from the file is judged once the chain can judge
+//! it: while the node is behind its anchor (initial block download, a
+//! reindex) its coin may not be in the UTXO set yet, so it waits, and is
+//! saved again, until the chain reaches the anchor.
 //!
 //! [`Aggregate::on_tip`] judges every attestation at a new tip, with the
 //! signature results already known, and drops those that can no longer
@@ -43,6 +51,11 @@ pub const REORG_DEPTH: u32 = 144;
 /// The most attestations kept for one `(outpoint, key)`. A holder can sign
 /// any number within [`REORG_DEPTH`] blocks; this bounds what they cost.
 pub const MAX_GENERATIONS: usize = 8;
+/// The most keys kept for one outpoint: eight times what a publisher
+/// serves ([`super::MAX_KEYS_PER_OUTPOINT`]), so that a holder publishing
+/// through several publishers is not cut short, while one old coin cannot
+/// make the set grow without bound (D3, amended 2026-10-23).
+pub const MAX_KEYS_PER_OUTPOINT: usize = 256;
 
 const MAGIC: &[u8; 4] = b"SNAG";
 /// The file format version.
@@ -78,6 +91,9 @@ pub enum Inserted {
     /// [`MAX_GENERATIONS`] newer attestations for its `(outpoint, key)` are
     /// held, so it would be dropped at once.
     TooOld,
+    /// Its key is new to an outpoint that already has
+    /// [`MAX_KEYS_PER_OUTPOINT`].
+    KeyLimit,
 }
 
 #[derive(Default)]
@@ -85,13 +101,16 @@ struct State {
     /// Each key's generations, newest first.
     entries: BTreeMap<Key, Vec<Held>>,
     ids: HashMap<sha256::Hash, Key>,
+    /// Loaded from the file but not yet judged: the chain did not reach the
+    /// coin when they were read.
+    pending: Vec<(Attestation, String)>,
     /// Changed since the last save.
     dirty: bool,
 }
 
 impl State {
     fn remove_where(&mut self, key: &Key, drop: impl Fn(usize, &Held) -> bool) -> usize {
-        let State { entries, ids, dirty } = self;
+        let State { entries, ids, dirty, .. } = self;
         let Some(gens) = entries.get_mut(key) else { return 0 };
         let before = gens.len();
         let mut i = 0;
@@ -127,33 +146,63 @@ impl Aggregate {
     pub fn open(path: PathBuf, chain: &impl ChainSource) -> Result<Self, String> {
         let loaded = load(&path)?;
         let agg = Aggregate { path, state: Mutex::new(State::default()) };
-        for (att, source) in loaded {
-            let verified = chain.read(&|v| {
-                let coin = v.coin(&att.outpoint())?;
-                Some(verify_signature(&att, &coin.script_pubkey))
-            });
-            match verified {
-                Some(Some(Ok(locks))) => {
-                    let status = chain
-                        .read(&|v| judge(&att, &locks, v))
-                        .unwrap_or(Err(Rejection::AnchorNotOnChain));
-                    agg.insert(att, locks, source, status);
-                }
-                // The coin is gone, or the chain would not hold still: the
-                // set is rebuilt by collection, so the entry is not worth a
-                // retry here.
-                Some(None) | None => {}
-                Some(Some(Err(r))) => tracing::warn!(
-                    target: "nap",
-                    outpoint = %att.outpoint(),
-                    key = att.key(),
-                    "NAP: dropping an aggregated attestation whose signature no longer verifies: {r}"
-                ),
-            }
-        }
-        agg.state.lock().dirty = false;
+        agg.state.lock().pending = loaded;
+        // What loaded is what the file holds, unless some was dropped.
+        let dropped = agg.judge_pending(chain);
+        agg.state.lock().dirty = dropped;
         agg.on_tip(chain);
         Ok(agg)
+    }
+
+    /// Verify and insert the attestations loaded but not yet judged, those
+    /// the chain can judge now. One whose coin is gone on a chain that holds
+    /// its anchor was spent while the node was stopped, and is dropped, as
+    /// is one whose signature no longer verifies. The rest wait. Returns
+    /// whether any was dropped.
+    fn judge_pending(&self, chain: &impl ChainSource) -> bool {
+        let pending = std::mem::take(&mut self.state.lock().pending);
+        if pending.is_empty() {
+            return false;
+        }
+        let mut dropped = false;
+        let mut waiting = Vec::new();
+        for (att, source) in pending {
+            let read = chain.read(&|v| {
+                let anchored = v.block_hash(att.anchor_height()) == Some(att.anchor_hash());
+                match v.coin(&att.outpoint()) {
+                    Some(coin) => match verify_signature(&att, &coin.script_pubkey) {
+                        Ok(locks) => Pending::Verified(locks, judge(&att, &locks, v)),
+                        Err(r) => Pending::Bad(r),
+                    },
+                    // Spent while the node was stopped.
+                    None if anchored => Pending::Spent,
+                    // Off the chain for good: past any reorg, or stale.
+                    None if v.tip_height() >= att.anchor_height().saturating_add(REORG_DEPTH) => Pending::Spent,
+                    None => Pending::Wait,
+                }
+            });
+            match read.unwrap_or(Pending::Wait) {
+                Pending::Wait => waiting.push((att, source)),
+                Pending::Spent => dropped = true,
+                Pending::Verified(locks, status) => {
+                    self.insert(att, locks, source, status);
+                }
+                Pending::Bad(r) => {
+                    dropped = true;
+                    tracing::warn!(
+                        target: "nap",
+                        outpoint = %att.outpoint(),
+                        key = att.key(),
+                        "NAP: dropping an aggregated attestation whose signature no longer verifies: {r}"
+                    );
+                }
+            }
+        }
+        // A pending entry still waiting is in the file already.
+        let mut st = self.state.lock();
+        st.pending.extend(waiting);
+        st.dirty |= dropped;
+        dropped
     }
 
     /// Whether the set holds the attestation with this id.
@@ -164,13 +213,15 @@ impl Aggregate {
     /// Add an attestation whose signature verified, with its status at the
     /// tip it was judged at.
     pub fn insert(&self, att: Attestation, locks: Timelocks, source: String, status: Status) -> Inserted {
-        let mut source = source;
-        source.truncate(MAX_SOURCE_LEN);
+        let source = truncated(source, MAX_SOURCE_LEN);
         let key = (att.outpoint(), att.key().to_owned());
         let id = att.id();
         let mut st = self.state.lock();
         if st.ids.contains_key(&id) {
             return Inserted::Duplicate;
+        }
+        if !st.entries.contains_key(&key) && keys_for(&st.entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT {
+            return Inserted::KeyLimit;
         }
         let gens = st.entries.entry(key.clone()).or_default();
         let at = gens.iter().position(|h| supersedes(&att, &h.attestation)).unwrap_or(gens.len());
@@ -194,6 +245,7 @@ impl Aggregate {
     /// Judge every attestation at `chain`'s tip and drop those that can no
     /// longer count (see the module docs). Returns how many were dropped.
     pub fn on_tip(&self, chain: &impl ChainSource) -> usize {
+        let _ = self.judge_pending(chain);
         let snapshot: Vec<(Key, sha256::Hash, Attestation, Timelocks)> = {
             let st = self.state.lock();
             st.entries
@@ -284,7 +336,8 @@ impl Aggregate {
                 return Ok(false);
             }
             st.dirty = false;
-            encode(st.entries.values().flatten().map(|h| (&h.attestation, h.source.as_str())))
+            let held = st.entries.values().flatten().map(|h| (&h.attestation, h.source.as_str()));
+            encode(held.chain(st.pending.iter().map(|(a, s)| (a, s.as_str()))))
         };
         if let Err(e) = store::save(&self.path, &bytes) {
             self.state.lock().dirty = true;
@@ -292,6 +345,41 @@ impl Aggregate {
         }
         Ok(true)
     }
+}
+
+/// How many keys `outpoint` has in `entries`.
+fn keys_for(entries: &BTreeMap<Key, Vec<Held>>, outpoint: OutPoint) -> usize {
+    entries.range((outpoint, String::new())..).take_while(|((op, _), _)| *op == outpoint).count()
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn truncated(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut at = max;
+        while !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        s.truncate(at);
+    }
+    s
+}
+
+/// Attestations loaded but waiting for the chain to judge them.
+#[cfg(test)]
+pub(super) fn pending_len(agg: &Aggregate) -> usize {
+    agg.state.lock().pending.len()
+}
+
+/// What the chain makes of an attestation loaded from the file.
+enum Pending {
+    /// The chain cannot judge it yet.
+    Wait,
+    /// Its coin is gone for good.
+    Spent,
+    /// Its signature verified; with its status at the tip.
+    Verified(Timelocks, Status),
+    /// Its signature does not verify.
+    Bad(Rejection),
 }
 
 /// One attestation judged at one tip.
