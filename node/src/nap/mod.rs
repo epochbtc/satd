@@ -15,8 +15,13 @@
 //!   state for it.
 //! - [`p2p`]: the `getnapatt` and `napatt` messages, paging, and the
 //!   serving limits.
+//! - [`collect`]: the aggregator's intake, cheapest check first, with the
+//!   verification budgets; it feeds the [`aggregate`], the set an
+//!   aggregator keeps and judges at each tip.
 
+pub mod aggregate;
 pub mod chain;
+pub mod collect;
 pub mod message;
 pub mod p2p;
 pub mod publisher;
@@ -158,6 +163,8 @@ impl Attestation {
     }
 }
 
+#[cfg(test)]
+mod aggregate_tests;
 #[cfg(test)]
 pub(crate) mod p2p_tests;
 #[cfg(test)]
