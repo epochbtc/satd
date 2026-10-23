@@ -96,24 +96,7 @@ jobs:
       # libssl-dev is needed by the openssl-sys path in reqwest's
       # native-tls backend.
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -220,24 +203,7 @@ jobs:
       # libssl-dev is needed by the openssl-sys path in reqwest's
       # native-tls backend.
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -361,24 +327,7 @@ jobs:
       # libssl-dev is needed by the openssl-sys path in reqwest's
       # native-tls backend.
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -473,24 +422,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -666,24 +598,7 @@ jobs:
           df -h /
 
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          # The runner image ships third-party apt sources (Google Chrome,
-          # Microsoft) that none of the packages below come from. A hash-sum
-          # mismatch on one of them fails the whole `apt-get update` under
-          # `set -euo pipefail`, and it does: that is what took every canary
-          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
-          # archives and nothing else.
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -762,14 +677,7 @@ jobs:
           df -h /
 
       - name: Install Linux build deps
-        run: |
-          set -euo pipefail
-          sudo rm -f /etc/apt/sources.list.d/*google* \
-                     /etc/apt/sources.list.d/*microsoft* \
-                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang cmake libclang-dev libssl-dev pkg-config
+        uses: ./.github/actions/build-deps
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master as of 2026-09-12

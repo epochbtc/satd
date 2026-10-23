@@ -364,21 +364,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
-      - name: Install build dependencies
-        # rocksdb-sys runs bindgen, which needs libclang; the native deps
-        # (rocksdb, zstd, lz4) need cmake and a compiler, and reqwest's TLS
-        # backend needs libssl. Every other Rust job in this repository
-        # installs the same set — without it the build dies in under a
-        # minute, long before anything interesting compiles.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

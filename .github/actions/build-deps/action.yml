@@ -1,0 +1,81 @@
+name: Install Linux build deps
+description: >
+  Install the apt packages a satd build needs (rocksdb-sys wants libclang for
+  bindgen and cmake for its C++ build; openssl-sys wants libssl-dev), from a
+  cache of the downloaded .deb files when one exists.
+
+# Why the .deb files are cached: the runners' Ubuntu mirror has served these
+# packages at ~50 KB/s, so a cold install of libclang-18-dev (29 MB) and cmake
+# (11 MB) took 15 minutes in every job that installs them. The index refresh
+# (`apt-get update`) stays live and is fast; only the package downloads come
+# from the cache. A package whose version moved since the cache was saved is
+# downloaded as usual.
+#
+# The key names the runner image and its version, so the cache refreshes when
+# GitHub rolls the image, and hashes the package list, so callers with
+# different lists keep separate caches. Like the repository's other caches it
+# is saved off pull requests only: a pull request's cache is visible to that
+# pull request alone.
+
+inputs:
+  packages:
+    description: Space-separated apt packages to install.
+    required: false
+    default: clang cmake libclang-dev libssl-dev pkg-config
+
+runs:
+  using: composite
+  steps:
+    - name: Compute the cache key
+      id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        list=$(printf '%s\n' $PACKAGES | sort -u | tr '\n' ' ')
+        hash=$(printf '%s' "$list" | sha256sum | cut -c1-16)
+        echo "key=apt-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-$(uname -m)-$hash" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/apt-debs" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached .deb files
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Install
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        DEBS: ${{ steps.key.outputs.dir }}
+      run: |
+        set -euo pipefail
+        # The runner image ships third-party apt sources (Google Chrome,
+        # Microsoft) that none of these packages come from. A hash-sum
+        # mismatch on one of them fails the whole `apt-get update` under
+        # `set -euo pipefail`, and it does: that is what took every canary
+        # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
+        # archives and nothing else.
+        sudo rm -f /etc/apt/sources.list.d/*google* \
+                   /etc/apt/sources.list.d/*microsoft* \
+                   /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+        sudo apt-get update
+        mkdir -p "$DEBS/partial"
+        # shellcheck disable=SC2086 # PACKAGES is a word list
+        sudo apt-get install -y --no-install-recommends \
+          -o Dir::Cache::Archives="$DEBS" $PACKAGES
+        # apt leaves its lock and a root-owned partial/ behind; the cache
+        # holds the .deb files only.
+        sudo rm -f "$DEBS/lock"
+        sudo rm -rf "$DEBS/partial"
+        sudo chown -R "$(id -u):$(id -g)" "$DEBS"
+        ls "$DEBS" | wc -l | xargs echo ".deb files:"
+
+    - name: Save .deb files
+      if: github.event_name != 'pull_request' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
