@@ -407,6 +407,20 @@ impl Publisher {
             .collect()
     }
 
+    /// The page of the attestations this node serves that answers `req`
+    /// (see [`super::p2p::page`]).
+    pub fn page(&self, req: &super::p2p::GetNapAtt, max_size: usize) -> super::p2p::NapAtt {
+        let entries = self.entries.lock();
+        // Keys sort after the empty string, so a cursor starts the range at
+        // its own outpoint, which `page` skips.
+        let range = match req.cursor {
+            Some(cursor) => entries.range((cursor, String::new())..),
+            None => entries.range(..),
+        };
+        let serving = range.filter(|(_, e)| matches!(e.status, Some(Ok(_)))).map(|(_, e)| &e.att);
+        super::p2p::page(serving, req, max_size)
+    }
+
     /// Judge every entry at `chain`'s new tip: drop those whose coin was
     /// spent, and warn about each that lost its anchor to a reorg.
     pub fn on_tip(&self, chain: &impl ChainSource) {

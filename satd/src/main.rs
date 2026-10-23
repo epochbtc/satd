@@ -3354,6 +3354,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             chain_state.clone(),
             shutdown_rx.clone(),
         ));
+        // Serve it over P2P and advertise NODE_NAP, before P2P starts.
+        peer_manager.set_nap_publisher(publisher.clone());
         Some(publisher)
     } else {
         None
