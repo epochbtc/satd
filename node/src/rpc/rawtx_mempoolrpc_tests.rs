@@ -214,6 +214,9 @@ fn gettxout_names_the_script_type_address_and_descriptor() {
 fn script_type_follows_core_solver() {
     let k33 = format!("02{}", "11".repeat(32));
     let k65 = format!("04{}", "22".repeat(64));
+    // `<m> 17 keys <17> OP_CHECKMULTISIG`, with the leading `01` of `m`
+    // left to the caller so it can push `m` minimally or with OP_PUSHDATA1.
+    let seventeen_of_seventeen = |n: &str| format!("11{}{n}ae", format!("21{k33}").repeat(17));
     let cases: &[(String, &str)] = &[
         (format!("21{k33}ac"), "pubkey"),
         (format!("41{k65}ac"), "pubkey"),
@@ -221,6 +224,11 @@ fn script_type_follows_core_solver() {
         (format!("2104{}ac", "11".repeat(32)), "nonstandard"),
         (format!("5121{k33}41{k65}52ae"), "multisig"),
         (format!("5221{k33}51ae"), "nonstandard"), // m > n
+        // A key pushed with OP_PUSHDATA1 is still a key (Core checks only
+        // `ValidSize`); m pushed non-minimally is not a number.
+        (format!("514c21{k33}51ae"), "multisig"),
+        (format!("01{}", seventeen_of_seventeen("0111")), "multisig"),
+        (format!("4c01{}", seventeen_of_seventeen("0111")), "nonstandard"),
         ("51024e73".to_string(), "anchor"),
         (format!("5220{}", "33".repeat(32)), "witness_unknown"),
         (format!("5102{}", "4e74"), "witness_unknown"),

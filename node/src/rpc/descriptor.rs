@@ -1571,23 +1571,28 @@ pub(crate) fn p2pk_key(script: &bitcoin::Script) -> Option<&[u8]> {
 }
 
 /// Core's `MatchMultisig`: `<m> <key>... <n> OP_CHECKMULTISIG` with
-/// minimal pushes and `1 <= m <= n`.
+/// `1 <= m <= n`. Only `m` and `n` must be minimal pushes
+/// (`GetScriptNumber`'s `CheckMinimalPush`); a key may be pushed any way
+/// `GetOp` reads, as long as it is 33 or 65 bytes.
 pub(crate) fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)> {
     use bitcoin::script::Instruction;
 
-    if script.as_bytes().last() != Some(&opcodes::OP_CHECKMULTISIG.to_u8()) {
+    let bytes = script.as_bytes();
+    if bytes.last() != Some(&opcodes::OP_CHECKMULTISIG.to_u8()) {
         return None;
     }
-    // `instructions_minimal` errors on a non-minimal push, which is where
-    // Core's `CheckMinimalPush` breaks the key loop and then fails the
-    // small-integer check.
-    let mut it = script.instructions_minimal();
+    let mut it = script.instruction_indices();
+    let mut next = || -> Option<(Instruction<'_>, u8)> {
+        let (at, insn) = it.next()?.ok()?;
+        Some((insn, bytes[at]))
+    };
 
-    let threshold = small_int(it.next()?.ok()?)?;
+    let (insn, op) = next()?;
+    let threshold = small_int(insn, op)?;
     let mut keys: Vec<&[u8]> = Vec::new();
     let n = loop {
-        let insn = it.next()?.ok()?;
-        if let Some(n) = small_int(insn) {
+        let (insn, op) = next()?;
+        if let Some(n) = small_int(insn, op) {
             break n;
         }
         match insn {
@@ -1598,11 +1603,11 @@ pub(crate) fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)
     };
 
     // The small integer must be followed by OP_CHECKMULTISIG and nothing else.
-    match it.next()? {
-        Ok(Instruction::Op(op)) if op == opcodes::OP_CHECKMULTISIG => {}
+    match next()? {
+        (Instruction::Op(op), _) if op == opcodes::OP_CHECKMULTISIG => {}
         _ => return None,
     }
-    if it.next().is_some() {
+    if next().is_some() {
         return None;
     }
     if keys.len() != n as usize || n < threshold || threshold == 0 {
@@ -1617,8 +1622,9 @@ pub(crate) fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)
 /// Consensus allows up to `MAX_PUBKEYS_PER_MULTISIG` = 20 keys, and 17..20
 /// cannot be spelled as a push-number opcode, so Core accepts
 /// `OP_PUSHBYTES_1 0x11` there. Reading only the opcode form named those
-/// outputs `raw()` instead of `multi()`.
-fn small_int(insn: bitcoin::script::Instruction<'_>) -> Option<u8> {
+/// outputs `raw()` instead of `multi()`. `opcode` is the instruction's first
+/// byte: the push is minimal only as `OP_PUSHBYTES_1`, not `OP_PUSHDATA1`.
+fn small_int(insn: bitcoin::script::Instruction<'_>, opcode: u8) -> Option<u8> {
     const MAX_PUBKEYS_PER_MULTISIG: u8 = 20;
     match insn {
         bitcoin::script::Instruction::Op(op) => {
@@ -1627,10 +1633,8 @@ fn small_int(insn: bitcoin::script::Instruction<'_>) -> Option<u8> {
                 .contains(&v)
                 .then(|| v - opcodes::OP_PUSHNUM_1.to_u8() + 1)
         }
-        // `instructions_minimal` has already rejected a non-minimal push, so a
-        // one-byte push reaching here is minimal by construction.
         bitcoin::script::Instruction::PushBytes(p) => match p.as_bytes() {
-            [n] if *n > 16 && *n <= MAX_PUBKEYS_PER_MULTISIG => Some(*n),
+            [n] if opcode == 0x01 && *n > 16 && *n <= MAX_PUBKEYS_PER_MULTISIG => Some(*n),
             _ => None,
         },
     }
