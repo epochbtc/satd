@@ -33,6 +33,9 @@ item below is (or will be) written up in full in the in-development
   an optional descriptor), and `submitnapattestation` finalizes it, or takes
   the signed transaction in hex as a wallet that finalizes it exports. A coin
   attests 4,032 blocks after it confirms on mainnet, 6 on the test networks.
+  The publisher advertises the experimental `NODE_NAP` service bit (bit 30)
+  and serves its valid attestations to peers that ask with `getnapatt`,
+  within per-connection and per-network-group limits.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
