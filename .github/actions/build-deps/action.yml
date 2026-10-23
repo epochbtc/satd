@@ -11,11 +11,15 @@ description: >
 # from the cache. A package whose version moved since the cache was saved is
 # downloaded as usual.
 #
-# The key names the runner image and its version, so the cache refreshes when
-# GitHub rolls the image, and hashes the package list, so callers with
-# different lists keep separate caches. Like the repository's other caches it
-# is saved off pull requests only: a pull request's cache is visible to that
-# pull request alone.
+# The key names the runner image, the architecture and a hash of the package
+# list (callers with different lists keep separate caches), and ends with the
+# image version, so the cache is saved afresh when GitHub rolls the image. A
+# new image restores the previous image's files through the prefix, and apt
+# downloads only what changed; `autoclean` then drops any .deb the archive no
+# longer offers, so superseded versions do not pile up across rolls.
+#
+# Like the repository's other caches it is saved off pull requests only: a
+# pull request's cache is visible to that pull request alone.
 
 inputs:
   packages:
@@ -35,7 +39,9 @@ runs:
         set -euo pipefail
         list=$(printf '%s\n' $PACKAGES | sort -u | tr '\n' ' ')
         hash=$(printf '%s' "$list" | sha256sum | cut -c1-16)
-        echo "key=apt-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-$(uname -m)-$hash" >> "$GITHUB_OUTPUT"
+        prefix="apt-debs-${ImageOS:-unknown}-$(uname -m)-$hash-"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "key=$prefix${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
         echo "dir=$RUNNER_TEMP/apt-debs" >> "$GITHUB_OUTPUT"
 
     - name: Restore cached .deb files
@@ -44,6 +50,7 @@ runs:
       with:
         path: ${{ steps.key.outputs.dir }}
         key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
 
     - name: Install
       shell: bash
@@ -63,9 +70,14 @@ runs:
                    /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
         sudo apt-get update
         mkdir -p "$DEBS/partial"
+        # Keep-Downloaded-Packages is apt's default, set explicitly: an image
+        # whose apt config turned it off would delete the .deb files after
+        # installing, and the cache would silently save nothing.
         # shellcheck disable=SC2086 # PACKAGES is a word list
         sudo apt-get install -y --no-install-recommends \
-          -o Dir::Cache::Archives="$DEBS" $PACKAGES
+          -o Dir::Cache::Archives="$DEBS" \
+          -o APT::Keep-Downloaded-Packages=true $PACKAGES
+        sudo apt-get -o Dir::Cache::Archives="$DEBS" autoclean
         # apt leaves its lock and a root-owned partial/ behind; the cache
         # holds the .deb files only.
         sudo rm -f "$DEBS/lock"
