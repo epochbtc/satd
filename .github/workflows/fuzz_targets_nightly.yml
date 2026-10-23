@@ -91,26 +91,32 @@ jobs:
       # Each run saves a new corpus entry and restores the newest by prefix, so
       # the corpus grows across nights instead of restarting from empty.
       - name: Restore the corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: fuzz/corpus
-          key: fuzz-targets-corpus-${{ github.run_id }}
+          key: fuzz-targets-corpus-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-targets-corpus-
 
       - name: Run the fuzz targets
         id: fuzz
         env:
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds_per_target || '600' }}
+          # 80 minutes of fuzzing in all, whatever the target count or the
+          # requested time per target: the rest of the 150-minute job is the
+          # uncached ASan build and setup. The script splits it between targets.
+          TOTAL_SECONDS: "4800"
         run: bash scripts/fuzz/run-standalone-targets.sh
 
       # Saved even when a target failed: the inputs that reached new coverage
       # before the failure are still worth keeping.
       - name: Save the corpus
         if: always() && steps.fuzz.outcome != 'skipped'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: fuzz/corpus
-          key: fuzz-targets-corpus-${{ github.run_id }}
+          # The attempt too: a re-run keeps its run_id, and saving to a key
+          # that already exists fails.
+          key: fuzz-targets-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload crash artifacts
         # `cancelled()` too: a job that hits `timeout-minutes` is cancelled,

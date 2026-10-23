@@ -5,6 +5,12 @@
 #   SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh
 #   SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh psbt_raw
 #
+# TOTAL_SECONDS, when set, caps the fuzzing time of the whole run: each target
+# gets the smaller of SECONDS_PER_TARGET and TOTAL_SECONDS divided by the
+# number of targets. CI sets it so that a growing target list, or a large
+# SECONDS_PER_TARGET on a manual run, shortens each target's turn instead of
+# running into the job timeout.
+#
 # With no arguments the targets come from `cargo fuzz list`, minus the ones in
 # ORACLE_TARGETS, which need a live bitcoind and have a job of their own
 # (.github/workflows/core_block_differential_fuzz.yml). Listing rather than
@@ -58,6 +64,17 @@ else
 fi
 if [ "${#targets[@]}" -eq 0 ]; then
     echo "error: no fuzz targets to run" >&2
+    exit 1
+fi
+if [ -n "${TOTAL_SECONDS:-}" ]; then
+    share=$(( TOTAL_SECONDS / ${#targets[@]} ))
+    if [ "$share" -lt "$SECONDS_PER_TARGET" ]; then
+        echo "TOTAL_SECONDS=$TOTAL_SECONDS over ${#targets[@]} targets: ${share}s each, not ${SECONDS_PER_TARGET}s"
+        SECONDS_PER_TARGET="$share"
+    fi
+fi
+if [ "$SECONDS_PER_TARGET" -lt 1 ]; then
+    echo "error: less than a second per target" >&2
     exit 1
 fi
 echo "Fuzzing ${#targets[@]} target(s) for ${SECONDS_PER_TARGET}s each on $FUZZ_NIGHTLY: ${targets[*]}"
