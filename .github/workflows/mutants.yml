@@ -1,0 +1,119 @@
+# Mutation testing (cargo-mutants). A mutant is a small deliberate break in the
+# code; a mutant every test still passes is "missed", which points at behaviour
+# no test checks. Line coverage says a test ran the code; this says whether a
+# test would notice the code being wrong.
+#
+# Nightly only, and advisory: it should never be a required check, and it does
+# not run on pull requests (a run takes hours). A missed mutant is a finding
+# for a person to judge (some mutants are equivalent to the original and
+# cannot be caught), not a failure; the job is red only when the run itself
+# breaks. Each night tests one shard of the consensus-critical code
+# (consensus/, node's validation, chain and mempool modules), rotating so every
+# shard comes round. The shard and scope are in scripts/mutants/run.sh. Missed
+# mutants are listed in the run summary and as warning annotations.
+#
+# To check your own change the same way, run `scripts/mutants/run.sh diff`
+# locally (see CONTRIBUTING.md).
+#
+# cargo-mutants runs the tests of the mutated crate only. A `node` mutant that
+# only satd's regtest suite would catch is reported as missed; check that suite
+# before writing a new test.
+
+name: Mutation testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "Nightly shard to run, as k/n, 0-based: 0/41 to 40/41 (default: tonight's)"
+        required: false
+        default: ""
+  schedule:
+    # Nightly 00:30 UTC: the run takes most of the six hours a hosted job may.
+    - cron: '30 0 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+# Not named CARGO_* or RUST*: rust-cache folds those into its key, and the
+# restores below must match the key the test jobs use. The test settings are
+# on the steps that run the tests, as in ci.yml.
+env:
+  MUTANTS_VERSION: '27.1.0'
+
+jobs:
+  nightly:
+    name: mutants (nightly shard)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      # The same toolchain step as ci.yml's test jobs, not dtolnay/rust-toolchain:
+      # that one exports CARGO_* variables, which rust-cache hashes into its key,
+      # so the `tests` cache restore below would miss.
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: clippy
+          override: true
+
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      # A prebuilt binary, as deny.yml installs cargo-deny: building
+      # cargo-mutants from source would take minutes of the budget every run.
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
+
+      - name: Pre-build sat-cli (test fixture)
+        run: cargo build -p sat-cli --locked
+
+      # 290 of the job's 350 minutes; the rest is setup, build and report.
+      - name: Mutate tonight's shard
+        id: mutate
+        env:
+          MUTANTS_SKIP_REPORT: "1"
+          BUDGET_MINUTES: "290"
+          RUST_TEST_THREADS: "4"
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+          SHARD: ${{ github.event.inputs.shard }}
+        run: bash scripts/mutants/run.sh nightly ${SHARD:+"$SHARD"}
+
+      - name: Report
+        if: always() && steps.mutate.outcome != 'skipped'
+        run: bash scripts/mutants/run.sh report
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-nightly
+          path: target/mutants-run/mutants.out/
+          if-no-files-found: ignore
+          retention-days: 30

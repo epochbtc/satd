@@ -98,6 +98,15 @@ are not required to. Verification details are in `SECURITY.md`.
   `fuzz/`). If your change touches block acceptance (PoW, commitments,
   sigops, BIP 34, value conservation, maturity, timestamps, locktime),
   add or extend a case there.
+- Mutation testing — the nightly `Mutation testing` workflow breaks the
+  consensus-critical code one small edit at a time (a rotating slice each
+  night) and runs the crate's tests against each, listing the mutants no test
+  caught in its run summary. It does not run on pull requests. To check your
+  own change the same way before opening one:
+  `git diff master... > /tmp/pr.diff && scripts/mutants/run.sh diff /tmp/pr.diff`
+  (needs `cargo install cargo-mutants`; it edits and restores the working tree,
+  so commit first). For each missed mutant, add a test that fails on it, or
+  say in review why it cannot change behaviour.
 
 ## AI-assisted contributions
 
