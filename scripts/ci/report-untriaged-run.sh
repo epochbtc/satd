@@ -62,7 +62,8 @@ retry() {
 # (it usually exists already) only costs the label: the issue is filed
 # without it rather than not at all.
 labelled=(--label "$LABEL")
-if ! gh label list --search "$LABEL" --json name --jq '.[].name' | grep -qx "$LABEL" &&
+names=$(retry gh label list --search "$LABEL" --json name --jq '.[].name') || names=""
+if ! grep -qx -- "$LABEL" <<<"$names" &&
    ! retry gh label create "$LABEL" --color "$LABEL_COLOR" --description "$LABEL_DESC"; then
     echo "warning: could not create label $LABEL; filing without it" >&2
     labelled=()
