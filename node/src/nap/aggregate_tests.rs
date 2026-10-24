@@ -665,3 +665,33 @@ fn a_full_set_refuses_new_pairs_and_still_takes_newer_attestations() {
     assert_eq!(agg.counting().len(), 1);
     assert_eq!(agg.save_if_dirty(), Ok(true), "and is rewritten without the rest");
 }
+
+#[test]
+fn a_cap_of_zero_is_no_limit() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 3);
+    let (_d, path) = agg_path();
+    let c = Collector::new(Aggregate::open_with_max(path, &chain, 0).unwrap());
+    let page: Vec<_> = (1..=3).map(|n| attest(&chain, &s, outpoint(n), "k", "yes", ANCHOR)).collect();
+    assert_eq!(take(&c, &chain, "a", page).added, 3);
+}
+
+#[test]
+fn under_a_lowered_cap_a_dead_entry_takes_no_place() {
+    let s = p2wpkh();
+    let mut chain = chain_with(&s, 2);
+    let (_d, path) = agg_path();
+    // Coin 1's anchor will be stale at the later tip, coin 2's live; coin 1
+    // comes first in the file.
+    let stale = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR - FRESHNESS_WINDOW + 10);
+    let live = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        assert_eq!(take(&c, &chain, "a", vec![stale, live.clone()]).added, 2);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    chain.tip += 20;
+    let agg = Aggregate::open_with_max(path, &chain, 1).unwrap();
+    let held: Vec<_> = agg.all().into_iter().map(|h| h.attestation).collect();
+    assert_eq!(held, vec![live], "the live entry keeps the one place");
+}

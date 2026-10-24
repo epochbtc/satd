@@ -159,8 +159,9 @@ impl Aggregate {
     }
 
     /// [`Self::open`], holding at most `max_attestations` (see
-    /// [`Inserted::Full`]). A file holding more, from a higher limit, keeps
-    /// what fits and is rewritten without the rest.
+    /// [`Inserted::Full`]); 0 is no limit, as for the publisher. A file
+    /// holding more, from a higher limit, keeps what fits and is rewritten
+    /// without the rest.
     pub fn open_with_max(path: PathBuf, chain: &impl ChainSource, max_attestations: usize) -> Result<Self, String> {
         let loaded = load(&path)?;
         let agg = Aggregate { path, state: Mutex::new(State::default()), max_attestations };
@@ -207,12 +208,13 @@ impl Aggregate {
                     Err(r) => Pending::Bad(r),
                     // Verified; if the tip will not hold still for the
                     // judging, it is held unjudged and the tip pass judges it.
-                    Ok(locks) => Pending::Verified(
-                        locks,
-                        chain
-                            .read(&|v| judge(&att, &locks, v))
-                            .unwrap_or(Err(Rejection::NotYetValid("not judged yet"))),
-                    ),
+                    Ok(locks) => match chain.read(&|v| (judge(&att, &locks, v), v.tip_height())) {
+                        // One the tip pass would drop at once takes no place
+                        // in the set, which a cap may have to share.
+                        Some((status, tip)) if doomed(&status, att.anchor_height(), tip) => Pending::Spent,
+                        Some((status, _)) => Pending::Verified(locks, status),
+                        None => Pending::Verified(locks, Err(Rejection::NotYetValid("not judged yet"))),
+                    },
                 },
             };
             if !matches!(outcome, Pending::Wait) {
@@ -265,7 +267,7 @@ impl Aggregate {
         if !st.entries.contains_key(&key) && keys_for(&st.entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT {
             return Inserted::KeyLimit;
         }
-        if !st.entries.contains_key(&key) && st.ids.len() >= self.max_attestations {
+        if self.max_attestations != 0 && !st.entries.contains_key(&key) && st.ids.len() >= self.max_attestations {
             return Inserted::Full;
         }
         let gens = st.entries.entry(key.clone()).or_default();
@@ -325,14 +327,7 @@ impl Aggregate {
                         Judged::Spent => drops[i] = true,
                         Judged::Status(status) => {
                             h.status = status.clone();
-                            drops[i] = newer_settled
-                                || match status {
-                                    Ok(_) => false,
-                                    Err(Rejection::Stale { .. }) => true,
-                                    // May yet become valid without a reorg.
-                                    Err(Rejection::NotYetValid(_)) => false,
-                                    Err(_) => deep,
-                                };
+                            drops[i] = newer_settled || doomed(status, h.attestation.anchor_height(), *tip);
                             // A valid attestation this deep will not be
                             // reorganised out: those it superseded are done.
                             if status.is_ok() && deep {
@@ -391,6 +386,18 @@ impl Aggregate {
             return Err(e);
         }
         Ok(true)
+    }
+}
+
+/// Whether an attestation with `status` at `tip` can no longer count: stale,
+/// or failing on chain state with its anchor too deep for a reorg to undo.
+/// One not yet valid may become valid without a reorg, and is kept.
+fn doomed(status: &Status, anchor_height: u32, tip: u32) -> bool {
+    let deep = tip >= anchor_height && tip - anchor_height >= REORG_DEPTH;
+    match status {
+        Ok(_) | Err(Rejection::NotYetValid(_)) => false,
+        Err(Rejection::Stale { .. }) => true,
+        Err(_) => deep,
     }
 }
 
