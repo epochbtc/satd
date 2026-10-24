@@ -5377,6 +5377,7 @@ impl PeerManager {
         {
             let mut peers = self.peers.write();
             if let Some(handle) = peers.get_mut(&id) {
+                let stated = version.services.to_u64();
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
                 // Promote to the tried table in the persistent address book,
@@ -5388,7 +5389,12 @@ impl PeerManager {
                 // re-dialable clearnet addr — marking it good would pollute the
                 // addrman (and conflate every onion peer). Skip them.
                 if handle.info.direction == Direction::Outbound && handle.info.onion_host.is_none() {
-                    self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
+                    let mut book = self.addrman.write();
+                    book.mark_good(handle.info.addr, now_unix_secs());
+                    // A seed or manual peer enters the book only here, after
+                    // the handshake's `SetServices` found no entry; record
+                    // what it stated rather than the default.
+                    book.set_services(&handle.info.addr, stated);
                 }
                 tracing::info!(
                     id,
@@ -12911,6 +12917,17 @@ impl PeerManager {
                 let addr = conn.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
                 tracing::info!("connected to self at {addr}, disconnecting");
                 return Err("connected to self".to_string());
+            }
+        }
+
+        // Core's `SetServices`, before the services check below so that a
+        // peer dropped for lacking them is recorded as lacking them: an
+        // outbound peer's `version` states what its address offers now,
+        // over what gossip said. Onion peers have no entry in the book.
+        if direction == Direction::Outbound {
+            let dialled = self.peers.read().get(&id).filter(|h| h.info.onion_host.is_none()).map(|h| h.info.addr);
+            if let Some(addr) = dialled {
+                self.addrman.write().set_services(&addr, their_version.services.to_u64());
             }
         }
 

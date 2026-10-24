@@ -104,6 +104,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- The address book's service bits follow an outbound peer's `version` and
+  add up over later announcements, as Core's do; they used to stay as first
+  heard.
+
 - BIP 324 (v2 transport) handshakes send 0 to 4095 random garbage bytes after
   the key, as Core's do. satd sent none, so its v2 connections were a fixed
   size that a network observer could recognise.

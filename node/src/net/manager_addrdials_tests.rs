@@ -764,3 +764,104 @@ fn an_address_book_of_unreachable_addresses_does_not_count() {
     assert!(!pm.addrman_is_empty(), "the clearnet entry is still in the book");
     assert!(!pm.addrman_has_reachable(), "but it is not on a reachable network");
 }
+
+// ---- Services an outbound peer states (Core's `SetServices`) ----
+
+/// Dial a listener as an outbound full-relay peer and run our side of the
+/// handshake against a remote that states `services`. Returns the
+/// handshake's result and the book's services for the address afterwards.
+async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, String>, u64) {
+    use bitcoin::p2p::Magic;
+    use bitcoin::p2p::address::Address;
+
+    let (pm, _dir) = mk_pm();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    pm.addrman.write().add_from(target, now_unix_secs(), 1 | 8, "198.51.100.7".parse().unwrap());
+    let (dialed, accepted) = tokio::join!(tokio::net::TcpStream::connect(target), listener.accept());
+    let (dialed, (accepted, _)) = (dialed.unwrap(), accepted.unwrap());
+    let mut info = peer(1, target, Direction::Outbound);
+    info.state = PeerState::Connecting;
+    info.conn_type = ConnType::OutboundFullRelay;
+    add_peer(&pm, info);
+    let mut ours = Connection::with_magic(dialed, Magic::REGTEST);
+    let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
+
+    let handshake = pm.perform_handshake(1, &mut ours, Direction::Outbound, crate::time::now_secs());
+    let remote = async {
+        loop {
+            if matches!(theirs.recv().await, Ok(NetworkMessage::Version(_)) | Err(_)) {
+                break;
+            }
+        }
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let _ = theirs
+            .send(NetworkMessage::Version(VersionMessage {
+                version: 70016,
+                services,
+                timestamp: crate::time::now_secs() as i64,
+                receiver: Address::new(&zero, ServiceFlags::NONE),
+                sender: Address::new(&zero, services),
+                nonce: 0x5eed,
+                user_agent: "/remote/".into(),
+                start_height: 0,
+                relay: true,
+            }))
+            .await;
+        let _ = theirs.send(NetworkMessage::Verack).await;
+        // Read until our side verack's or hangs up.
+        while let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_secs(2), theirs.recv()).await {
+            if matches!(msg, NetworkMessage::Verack) {
+                break;
+            }
+        }
+    };
+    let (result, ()) = tokio::join!(handshake, remote);
+    let book = pm.addrman.read().iter().find(|e| e.addr == target).map(|e| e.services).unwrap();
+    (result, book)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outbound_peers_version_sets_its_addresss_services() {
+    let stated = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let (result, book) = handshake_stating(stated).await;
+    result.expect("the handshake completes");
+    assert_eq!(book, stated.to_u64(), "the book holds what the peer stated, not what gossip said");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_dropped_for_lacking_services_is_recorded_as_lacking_them() {
+    let (result, book) = handshake_stating(ServiceFlags::WITNESS).await;
+    assert!(result.is_err(), "an automatic peer without NODE_NETWORK is dropped");
+    assert_eq!(book, ServiceFlags::WITNESS.to_u64());
+}
+
+#[test]
+fn a_peer_the_book_first_learns_by_connecting_keeps_its_stated_services() {
+    use bitcoin::p2p::address::Address;
+    // A manual or seed peer: dialled without a book entry, which
+    // `mark_good` creates once it connects.
+    let (pm, _dir) = mk_pm();
+    let target: SocketAddr = "203.0.113.9:18444".parse().unwrap();
+    let mut info = peer(1, target, Direction::Outbound);
+    info.conn_type = ConnType::Manual;
+    add_peer(&pm, info);
+    let stated = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    pm.handle_peer_connected(
+        1,
+        VersionMessage {
+            version: 70016,
+            services: stated,
+            timestamp: crate::time::now_secs() as i64,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, stated),
+            nonce: 0x5eed,
+            user_agent: "/remote/".into(),
+            start_height: 0,
+            relay: true,
+        },
+    );
+    let book = pm.addrman.read().iter().find(|e| e.addr == target).map(|e| e.services);
+    assert_eq!(book, Some(stated.to_u64()));
+}
