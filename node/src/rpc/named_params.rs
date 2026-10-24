@@ -212,6 +212,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "invalidateblock" => &[("blockhash", false)],
         "joinpsbts" => &[("txs", false)],
         "listbanned" => &[],
+        // SATD_ONLY: listnapaggregate
+        "listnapaggregate" => &[],
         // SATD_ONLY: listnapattestations
         "listnapattestations" => &[],
         "listquarantine" => &[("rule", false), ("count", false), ("skip", false)],
@@ -361,7 +363,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "getsysteminfo", "gettxout",
     "gettxoutproof", "gettxoutsetinfo", "gettxspendingprevout",
     "getwarnings", "getzmqnotifications",
-    "help", "invalidateblock", "joinpsbts", "listbanned", "listnapattestations",
+    "help", "invalidateblock", "joinpsbts", "listbanned", "listnapaggregate", "listnapattestations",
     "listquarantine", "loadtxoutset", "logging",
     "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
     "pruneblockchain",

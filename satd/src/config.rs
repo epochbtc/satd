@@ -743,6 +743,10 @@ pub struct Config {
     /// takes; a submission that would add one more is refused. Replacing a
     /// stored one is always allowed. 0 (default) is no limit. satd-only.
     pub napmaxattestations: usize,
+    /// `-napaggregator`: collect NAP attestations from publishers over P2P
+    /// into `<datadir>/nap/aggregate/aggregate.dat`, and enable
+    /// `listnapaggregate`. Independent of `-nap`. Default false. satd-only.
+    pub napaggregator: bool,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4196,6 +4200,7 @@ impl Config {
             nap: resolve_nap(&cli.nap_args.nap, "nap", &file_get),
             napstorerecover: resolve_nap(&cli.nap_args.napstorerecover, "napstorerecover", &file_get),
             napmaxattestations: resolve_nap_max(&cli.nap_args.napmaxattestations, &file_get)?,
+            napaggregator: resolve_nap(&cli.nap_args.napaggregator, "napaggregator", &file_get),
             networkactive,
             txindex,
             addressindex,
@@ -4855,6 +4860,7 @@ impl Config {
                 "enabled": self.nap,
                 "store_recover": self.napstorerecover,
                 "max_attestations": self.napmaxattestations,
+                "aggregator": self.napaggregator,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -5999,7 +6005,7 @@ pub struct CliArgs {
     #[command(flatten)]
     pub tx_announce_args: TxAnnounceArgs,
 
-    /// `-nap`, `-napstorerecover` and `-napmaxattestations`, hand-built for the same stack-frame reason as
+    /// `-nap`, `-napstorerecover`, `-napmaxattestations` and `-napaggregator`, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub nap_args: NapArgs,
@@ -7540,8 +7546,9 @@ impl clap::FromArgMatches for TxAnnounceArgs {
     }
 }
 
-/// `-nap` and `-napstorerecover`, satd extensions, out of `CliArgs` for the
-/// same reason as [`resolve_bytes_per_sigop`]. Both default false.
+/// `-nap`, `-napstorerecover` and `-napaggregator`, satd extensions, out of
+/// `CliArgs` for the same reason as [`resolve_bytes_per_sigop`]. All default
+/// false.
 #[inline(never)]
 fn resolve_nap(cli: &Option<bool>, key: &str, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
     cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v))).unwrap_or(false)
@@ -7561,13 +7568,14 @@ fn resolve_nap_max(cli: &Option<usize>, file_get: &dyn Fn(&str) -> Option<String
     }
 }
 
-/// `-nap`, `-napstorerecover` and `-napmaxattestations` (see
-/// [`CliArgs::nap_args`]).
+/// `-nap`, `-napstorerecover`, `-napmaxattestations` and `-napaggregator`
+/// (see [`CliArgs::nap_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct NapArgs {
     pub nap: Option<bool>,
     pub napstorerecover: Option<bool>,
     pub napmaxattestations: Option<usize>,
+    pub napaggregator: Option<bool>,
 }
 
 const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
@@ -7588,6 +7596,12 @@ const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "N",
         StratumArgKind::Usize,
         "With -nap, store at most N attestations; a submission that would add one more is refused (default: 0, no limit)",
+    ),
+    (
+        "napaggregator",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Collect Node Attestation Protocol attestations from publishers over P2P and enable listnapaggregate (default: 0)",
     ),
 ];
 
@@ -7614,6 +7628,7 @@ impl clap::FromArgMatches for NapArgs {
             nap: m.remove_one("nap"),
             napstorerecover: m.remove_one("napstorerecover"),
             napmaxattestations: m.remove_one("napmaxattestations"),
+            napaggregator: m.remove_one("napaggregator"),
         })
     }
 
@@ -8278,6 +8293,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "allowdangerousfilters",
     "nap",
     "napstorerecover",
+    "napaggregator",
     "networkactive",
     "esplora",
     "esploramtls",
@@ -8483,6 +8499,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "allowdangerousfilters",
         "nap",
         "napstorerecover",
+        "napaggregator",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -9316,6 +9333,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "nap",
     "napstorerecover",
     "napmaxattestations",
+    "napaggregator",
     "networkactive",
     // Esplora
     "esplora",
@@ -10618,6 +10636,25 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "nap=1\n").unwrap();
         assert!(load(&[]), "from the file");
         assert!(!load(&["-nap=0"]), "the command line wins");
+    }
+
+    /// `-napaggregator`: off by default, independent of `-nap`, from either
+    /// source, the command line winning.
+    #[test]
+    fn napaggregator_defaults_off_and_reads_both_sources() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .map(|c| (c.napaggregator, c.nap))
+        };
+        assert_eq!(load(&[]), Ok((false, false)));
+        assert_eq!(load(&["-napaggregator=1"]), Ok((true, false)), "independent of -nap");
+        std::fs::write(dir.path().join("bitcoin.conf"), "napaggregator=1\n").unwrap();
+        assert_eq!(load(&[]), Ok((true, false)), "from the file");
+        assert_eq!(load(&["--napaggregator=0"]), Ok((false, false)), "the command line wins");
     }
 
     /// `-napmaxattestations`: 0 (no limit) by default, from either source,

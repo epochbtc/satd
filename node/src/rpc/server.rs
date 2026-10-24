@@ -173,6 +173,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getdescriptorinfo", "Util"),
     ("getindexinfo", "Util"),
     ("getsatdindexinfo", "Util"),
+    ("listnapaggregate", "Util"),
     ("listnapattestations", "Util"),
     ("pauseindex", "Util"),
     ("removenapattestation", "Util"),
@@ -748,6 +749,8 @@ pub struct RpcContext {
     /// The NAP publisher, `Some` with `-nap=1`. The NAP RPCs answer an
     /// error without it.
     pub nap: Option<Arc<crate::nap::Publisher>>,
+    /// The NAP aggregator's pulls and set, `Some` with `-napaggregator=1`.
+    pub nap_aggregator: Option<Arc<crate::nap::pull::Puller>>,
 }
 
 /// RAII guard that releases the [`RpcContext::blockfile_audit_running`]
@@ -904,6 +907,7 @@ pub async fn start(
     readonly: Option<ReadOnlyListener>,
     // The NAP publisher (`-nap=1`), or `None`.
     nap: Option<Arc<crate::nap::Publisher>>,
+    nap_aggregator: Option<Arc<crate::nap::pull::Puller>>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Listener-status + shutdown_tx are needed both inside the RPC
     // context (so the `stop` RPC + `getserverstatus` can use them) AND
@@ -945,6 +949,7 @@ pub async fn start(
         filter_backfill_cmd_tx,
         blockfile_audit_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         nap,
+        nap_aggregator,
     });
 
     let mut module = RpcModule::new(ctx);
@@ -4274,6 +4279,12 @@ pub async fn start(
         Args::new(&params).check()?;
         let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
         Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list(nap, &ctx.chain_state))
+    })?;
+
+    module.register_method("listnapaggregate", |params, ctx, _extensions| {
+        Args::new(&params).check()?;
+        let aggregator = crate::rpc::nap::aggregator_enabled(ctx.nap_aggregator.as_deref())?;
+        Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(aggregator, &ctx.chain_state))
     })?;
 
     module.register_method("removenapattestation", |params, ctx, _extensions| {

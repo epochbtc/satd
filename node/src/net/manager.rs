@@ -1097,6 +1097,8 @@ pub struct PeerManager {
     nap: RwLock<Option<Arc<crate::nap::Publisher>>>,
     /// The NAP serving limits, per connection and per network group.
     nap_limits: parking_lot::Mutex<crate::nap::p2p::ServeLimits>,
+    /// `-napaggregator`: the pulls that collect publishers' attestations.
+    nap_puller: RwLock<Option<Arc<crate::nap::pull::Puller>>>,
     /// Wakes the manager loop's event drain before its next 500 ms tick.
     ///
     /// The drain cadence is deliberate everywhere else, but a peer whose
@@ -1472,6 +1474,7 @@ impl PeerManager {
             }),
             nap: RwLock::new(None),
             nap_limits: parking_lot::Mutex::new(Default::default()),
+            nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
@@ -2114,13 +2117,21 @@ impl PeerManager {
         out
     }
 
-    /// Install `-whitelist` permission entries. Set once at startup.
     /// `-nap`: serve `publisher`'s attestations and advertise `NODE_NAP`
     /// on handshakes from now on.
     pub fn set_nap_publisher(&self, publisher: Arc<crate::nap::Publisher>) {
         *self.nap.write() = Some(publisher);
     }
 
+    /// `-napaggregator`: pull publishers' attestations into `puller`'s
+    /// collector, over the connections to `NODE_NAP` peers and over pull
+    /// connections ([`ConnType::NapPull`]) to the ones the address book
+    /// knows. [`Self::run_nap_collection`] drives it.
+    pub fn set_nap_aggregator(&self, puller: Arc<crate::nap::pull::Puller>) {
+        *self.nap_puller.write() = Some(puller);
+    }
+
+    /// Install `-whitelist` permission entries. Set once at startup.
     pub fn set_whitelist(&self, entries: Vec<crate::net::permissions::WhitelistEntry>) {
         *self.whitelist.write() = entries;
     }
@@ -3002,8 +3013,9 @@ impl PeerManager {
             }
             ConnType::BlockRelay => Some(MAX_OUTBOUND_BLOCK_RELAY),
             ConnType::AddrFetch | ConnType::Feeler => None,
-            // Core returns false rather than opening one of these.
-            ConnType::Inbound | ConnType::Manual => {
+            // Core returns false rather than opening one of these. A NAP pull
+            // is satd's own, and opened only by the aggregator.
+            ConnType::Inbound | ConnType::Manual | ConnType::NapPull => {
                 return Err(format!(
                     "cannot open a {} connection this way",
                     conn_type.as_str()
@@ -3043,8 +3055,9 @@ impl PeerManager {
             .values()
             .filter(|h| h.info.conn_type != ConnType::Inbound)
             // Core exempts MANUAL: `-addnode` peers have their own semaphore
-            // (`semAddnode`) and do not consume an automatic slot.
-            .filter(|h| h.info.conn_type != ConnType::Manual)
+            // (`semAddnode`) and do not consume an automatic slot. Nor does a
+            // NAP pull, which the aggregator bounds itself.
+            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull))
             .count()
             + pending.len();
         if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
@@ -3079,14 +3092,15 @@ impl PeerManager {
 
     /// Outbound peers that count against the automatic target: every one
     /// but the manual connections, which Core counts apart (`semAddnode`,
-    /// or no limit at all), connected or still in the handshake.
+    /// or no limit at all), and NAP pulls, which take no outbound slot;
+    /// connected or still in the handshake.
     fn automatic_outbound_peers(&self) -> usize {
         self.peers
             .read()
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && h.info.conn_type != ConnType::Manual
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
                     && h.info.state != PeerState::Disconnected
             })
             .count()
@@ -5070,12 +5084,22 @@ impl PeerManager {
                 match event_rx.try_recv() {
                     Ok(NetEvent::PeerConnected { id, addr: _, version }) => {
                         self.handle_peer_connected(id, version);
+                        self.nap_peer_connected(id);
                     }
                     Ok(NetEvent::PeerDisconnected { id }) => {
                         self.handle_peer_disconnected(id);
                     }
                     Ok(NetEvent::GetDataResume { id }) => {
                         self.resume_getdata(id);
+                    }
+                    Ok(NetEvent::MessageReceived {
+                        id,
+                        msg: NetworkMessage::Unknown { command, payload },
+                    }) if command.as_ref() == crate::nap::p2p::NAPATT => {
+                        // A page verifies signatures; it is taken off this
+                        // loop. The guard counts it out once it is taken.
+                        let guard = crate::net::flow::InFlight::adopt(self.peer_flow(id));
+                        self.handle_napatt(id, payload, guard);
                     }
                     Ok(NetEvent::MessageReceived { id, msg }) => {
                         // The socket task counted this message in as it was
@@ -5424,12 +5448,23 @@ impl PeerManager {
 
     fn handle_peer_disconnected(&self, id: PeerId) {
         let mut peers = self.peers.write();
+        let mut nap_pull = None;
         if let Some(handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
             tracing::debug!("Cleared nodestate for peer={id}");
+            if handle.info.conn_type == ConnType::NapPull {
+                nap_pull = Some(handle.info.addr_string());
+            }
         }
         drop(peers);
         self.nap_limits.lock().forget(id);
+        if let Some(puller) = self.nap_puller.read().as_ref() {
+            puller.forget(id);
+            // A pull connection that closed before connecting.
+            if let Some(source) = nap_pull {
+                puller.dial_ended(&source);
+            }
+        }
         // Notify IBD scheduler so in-flight blocks get reassigned
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
@@ -5463,6 +5498,11 @@ impl PeerManager {
         msg: NetworkMessage,
         in_flight: crate::net::flow::InFlight,
     ) {
+        // A NAP pull connection carries the pull and nothing else: what the
+        // publisher announces or asks for over it is not taken up.
+        if self.conn_type_of(id) == ConnType::NapPull {
+            return;
+        }
         match msg {
             // Neither `Ping` nor `Pong` reaches here: the peer's write loop
             // answers the one and matches the other against that peer's
@@ -5852,6 +5892,212 @@ impl PeerManager {
                 self.handle_getnapatt(id, &payload)
             }
             _ => {}
+        }
+    }
+
+    /// A peer just connected: with `-napaggregator`, start a pull from it at
+    /// once if it publishes. A new connection is pulled whenever it opens,
+    /// since the publisher's own limits are per connection; a long-lived one
+    /// is pulled again by the collection tick, which also pulls one that
+    /// connected during initial block download. A pull connection to a peer
+    /// that turns out not to publish is closed.
+    fn nap_peer_connected(self: &Arc<Self>, id: PeerId) {
+        let Some(puller) = self.nap_puller.read().clone() else {
+            return;
+        };
+        let Some((publishes, conn_type, source)) = self.peers.read().get(&id).map(|h| {
+            (h.info.services.has(crate::nap::p2p::node_nap()), h.info.conn_type, h.info.addr_string())
+        }) else {
+            return;
+        };
+        let pull_connection = conn_type == ConnType::NapPull;
+        if pull_connection {
+            puller.dial_ended(&source);
+        }
+        // Behind the publishers' tips, every anchor would fail on chain
+        // state; the collection tick pulls the publisher once synced.
+        if !pull_connection && self.is_ibd() {
+            return;
+        }
+        if !publishes {
+            if pull_connection {
+                tracing::debug!(target: "nap", "nap-pull peer={id} does not publish; disconnecting");
+                self.disconnect_by_id(id);
+            }
+            return;
+        }
+        match puller.start(id, &source, pull_connection, Instant::now()) {
+            Some(req) => {
+                tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+            None if pull_connection => {
+                self.disconnect_by_id(id);
+            }
+            None => {}
+        }
+    }
+
+    /// NAP `napatt`: take a page of a pull in progress, off the network
+    /// thread, then continue, end or punish as the pull says. Without
+    /// `-napaggregator` it is ignored, as any unknown message.
+    fn handle_napatt(self: &Arc<Self>, id: PeerId, payload: Vec<u8>, in_flight: crate::net::flow::InFlight) {
+        let Some(puller) = self.nap_puller.read().clone() else {
+            return;
+        };
+        let pm = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
+            let next = puller.on_napatt(&*pm.chain_state, id, &payload, Instant::now());
+            pm.act_on_pull(id, next);
+        });
+    }
+
+    fn act_on_pull(&self, id: PeerId, next: crate::nap::pull::Next) {
+        use crate::nap::pull::Next;
+        match next {
+            Next::Unsolicited => tracing::debug!(target: "nap", "ignoring unsolicited napatt from peer={id}"),
+            Next::Continue(req) => {
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+            Next::Done { close } => {
+                tracing::debug!(target: "nap", "NAP: pull from peer={id} done");
+                if close {
+                    self.disconnect_by_id(id);
+                }
+            }
+            Next::Misbehaved(reason) => {
+                let pull_connection = self.conn_type_of(id) == ConnType::NapPull;
+                self.add_ban_score(id, 100, &reason);
+                // A manual peer is not punished, but a pull connection ends
+                // with its pull whatever the peer is.
+                if pull_connection {
+                    self.disconnect_by_id(id);
+                }
+            }
+        }
+    }
+
+    /// `-napaggregator`'s periodic work, every
+    /// [`crate::nap::pull::TICK_INTERVAL`] until shutdown: end pulls whose
+    /// publisher went quiet, verify deferred attestations as the budget
+    /// allows, save the set, pull connected publishers that are due, and
+    /// open pull connections to due publishers the address book knows.
+    pub async fn run_nap_collection(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut tick = tokio::time::interval(crate::nap::pull::TICK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if let Some(puller) = self.nap_puller.read().clone()
+                        && let Err(e) = puller.collector().aggregate().save_if_dirty()
+                    {
+                        tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
+                    }
+                    return;
+                }
+                _ = tick.tick() => {}
+            }
+            let Some(puller) = self.nap_puller.read().clone() else { continue };
+            self.nap_collection_tick(&puller).await;
+        }
+    }
+
+    async fn nap_collection_tick(self: &Arc<Self>, puller: &Arc<crate::nap::pull::Puller>) {
+        let now = Instant::now();
+        for (id, close) in puller.expire(now) {
+            tracing::debug!(target: "nap", "NAP: pull from peer={id} timed out");
+            if close {
+                self.disconnect_by_id(id);
+            }
+        }
+        let (p, pm) = (puller.clone(), Arc::clone(self));
+        let drained = tokio::task::spawn_blocking(move || {
+            let collector = p.collector();
+            let bad = collector.drain_deferred(&*pm.chain_state, Instant::now());
+            if let Err(e) = collector.aggregate().save_if_dirty() {
+                tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
+            }
+            bad
+        })
+        .await
+        .unwrap_or_default();
+        for (source, why) in drained {
+            puller.note_misbehaving();
+            let peer = self.peers.read().values().find(|h| h.info.addr_string() == source).map(|h| h.info.id);
+            if let Some(id) = peer {
+                self.act_on_pull(id, crate::nap::pull::Next::Misbehaved(crate::nap::pull::misbehaviour(&why)));
+            } else {
+                tracing::info!(
+                    target: "nap",
+                    %source,
+                    "NAP: a deferred attestation from a peer no longer connected fails {}: {why}",
+                    why.rule()
+                );
+            }
+        }
+        if self.is_ibd() || !self.is_network_active() {
+            return;
+        }
+        // Connected publishers that are due.
+        let connected: Vec<(PeerId, String)> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| {
+                h.info.state == PeerState::Connected
+                    && h.info.conn_type != ConnType::NapPull
+                    && h.info.services.has(crate::nap::p2p::node_nap())
+            })
+            .map(|h| (h.info.id, h.info.addr_string()))
+            .collect();
+        for (id, source) in connected {
+            if puller.due(&source, now)
+                && let Some(req) = puller.start(id, &source, false, now)
+            {
+                tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+        }
+        // Publishers the address book knows, over pull connections: an
+        // automatic dial, so not under `-connect`, as Core opens no feeler
+        // there either.
+        let free = crate::nap::pull::MAX_PULL_CONNECTIONS.saturating_sub(puller.pull_connections());
+        if free == 0 || !puller.collector().has_room() || !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut candidates: Vec<SocketAddr> = self
+            .addrman
+            .read()
+            .iter()
+            .filter(|e| e.services & crate::nap::p2p::NODE_NAP_BIT != 0)
+            .map(|e| e.addr)
+            .collect();
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        let mut opened = 0;
+        for addr in candidates {
+            if opened == free {
+                break;
+            }
+            let source = addr.to_string();
+            if !puller.due(&source, now)
+                || self.is_addr_connected(&addr)
+                || self.is_addr_banned(&addr)
+                || !self.reachable.read().contains_socket(&addr)
+            {
+                continue;
+            }
+            puller.dial_started(&source, now);
+            opened += 1;
+            let (pm, p) = (Arc::clone(self), puller.clone());
+            tokio::spawn(async move {
+                if let Err(e) = pm.connect_outbound_inner(addr, Some(ConnType::NapPull), None, false).await {
+                    tracing::debug!(target: "nap", %addr, "NAP: pull connection failed: {e}");
+                    p.dial_ended(&addr.to_string());
+                }
+            });
         }
     }
 
@@ -12190,6 +12436,10 @@ impl PeerManager {
         // (`fPreferredDownload`/`CanServeBlocks` both exclude it), because the
         // connection is about to be dropped.
         let conn_type = self.conn_type_of(id);
+        // A NAP pull connection carries only the pull, which the aggregator
+        // starts once the peer is connected: none of the session setup
+        // below goes out on it.
+        let quiet = conn_type == ConnType::NapPull;
         if conn_type == ConnType::AddrFetch {
             // Room for the answer, before it can arrive.
             self.note_getaddr_sent(id);
@@ -12197,7 +12447,7 @@ impl PeerManager {
                 .send(NetworkMessage::GetAddr)
                 .await
                 .map_err(|e| format!("send getaddr: {}", e))?;
-        } else {
+        } else if !quiet {
             // Request headers to start sync, from one below our best so an
             // up-to-date peer answers with a header rather than nothing.
             let getheaders = sync::make_initial_getheaders(&self.chain_state);
@@ -12210,17 +12460,18 @@ impl PeerManager {
         // in low-bandwidth mode, as Core does. A peer is asked for
         // high-bandwidth announcements only once it has delivered a block
         // that became our tip (`maybe_set_peer_as_hb`).
-        writer.send(NetworkMessage::SendCmpct(
-            bitcoin::p2p::message_compact_blocks::SendCmpct {
-                send_compact: false,
-                version: 2,
-            },
-        ))
-        .await
-        .map_err(|e| format!("send sendcmpct: {}", e))?;
+        if !quiet {
+            writer
+                .send(NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                    send_compact: false,
+                    version: 2,
+                }))
+                .await
+                .map_err(|e| format!("send sendcmpct: {}", e))?;
+        }
 
         // Send our fee filter (BIP 133) so peer doesn't relay low-fee txs to us
-        if let Some(rate) = self.fee_filter_for(id) {
+        if !quiet && let Some(rate) = self.fee_filter_for(id) {
             writer
                 .send(NetworkMessage::FeeFilter(rate as i64))
                 .await
@@ -12234,7 +12485,7 @@ impl PeerManager {
         // completes — that is when it sends its one-shot `getaddr` — and
         // skips block-relay-only peers. Inbound links latch lazily instead,
         // in the addr handlers.
-        if direction == Direction::Outbound {
+        if direction == Direction::Outbound && !quiet {
             self.setup_address_relay(id);
         }
 
@@ -12247,6 +12498,7 @@ impl PeerManager {
         // address handling unchanged in this fix.
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
+            && !quiet
             && (self.proxy.is_some() || self.onion_proxy.is_some())
         {
             self.note_getaddr_sent(id);
@@ -12270,13 +12522,14 @@ impl PeerManager {
         // Neither goes to a block-relay-only peer.
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
+            && !quiet
             && let Some(msg) = self.self_advertise_externals(id)
             && let Err(e) = writer.send(msg).await
         {
             tracing::debug!(id, "self-advertise addr send failed: {}", e);
         }
 
-        if let Some(addr_msg) = self.self_advertise_addrv2(id) {
+        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2(id) {
             // Best-effort gossip: a failed advertisement must NOT tear down an
             // otherwise-healthy peer we just spent a full Tor rendezvous
             // establishing. Log and continue (unlike the session-setup sends
@@ -13016,8 +13269,10 @@ impl PeerManager {
         // before it has the header, so a peer that mines while this node
         // syncs would hand it an out-of-order chain; header announcements
         // from the start keep that sync in order. Marked sent, so the
-        // condition never sends a second one.
+        // condition never sends a second one. A NAP pull connection syncs
+        // nothing.
         if direction == Direction::Outbound
+            && conn_type != ConnType::NapPull
             && their_version.version.min(PROTOCOL_VERSION) >= SENDHEADERS_VERSION
         {
             conn.send(NetworkMessage::SendHeaders)

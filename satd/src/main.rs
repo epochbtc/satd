@@ -3361,6 +3361,54 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         None
     };
 
+    // -napaggregator: load the collected set, judge it at the tip, and start
+    // collecting. The set is rebuilt by collection, so a file that does not
+    // read back is moved aside rather than refusing to start.
+    let nap_aggregator = if config.napaggregator {
+        let path = net_datadir.join("nap").join("aggregate").join("aggregate.dat");
+        let aggregate = match node::nap::aggregate::Aggregate::open(path.clone(), &*chain_state) {
+            Ok(a) => a,
+            Err(why) => {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut aside = path.clone().into_os_string();
+                aside.push(format!(".bad-{secs}"));
+                if let Err(e) = std::fs::rename(&path, &aside) {
+                    eprintln!("Error loading the NAP aggregate ({why}); moving it aside failed: {e}");
+                    auth.cleanup();
+                    node::shutdown::exit_now(1);
+                }
+                tracing::warn!(
+                    target: "nap",
+                    "NAP: the aggregate did not read back ({why}); moved it to {} and started empty",
+                    std::path::PathBuf::from(&aside).display()
+                );
+                match node::nap::aggregate::Aggregate::open(path, &*chain_state) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("Error opening an empty NAP aggregate: {e}");
+                        auth.cleanup();
+                        node::shutdown::exit_now(1);
+                    }
+                }
+            }
+        };
+        let collector = Arc::new(node::nap::collect::Collector::new(aggregate));
+        tracing::info!(target: "nap", held = collector.aggregate().len(), "NAP aggregator enabled");
+        let puller = Arc::new(node::nap::pull::Puller::new(collector.clone()));
+        tokio::spawn(node::nap::chain::follow_tip_aggregate(
+            collector,
+            chain_state.clone(),
+            shutdown_rx.clone(),
+        ));
+        peer_manager.set_nap_aggregator(puller.clone());
+        tokio::spawn(peer_manager.clone().run_nap_collection(shutdown_rx.clone()));
+        Some(puller)
+    } else {
+        None
+    };
+
     // JSON-RPC stays on the consensus (core) runtime — it is the control
     // plane and carries the chain-mutating methods (generate*/submitblock/
     // invalidateblock/reconsiderblock). Keeping it here both avoids
@@ -3439,6 +3487,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             })
         },
         nap,
+        nap_aggregator,
     )
     .await
     {

@@ -18,6 +18,8 @@
 //! - [`collect`]: the aggregator's intake, cheapest check first, with the
 //!   verification budgets; it feeds the [`aggregate`], the set an
 //!   aggregator keeps and judges at each tip.
+//! - [`pull`]: which publishers the aggregator pulls, and when; the peer
+//!   manager sends and dials for it.
 
 pub mod aggregate;
 pub mod chain;
@@ -25,6 +27,7 @@ pub mod collect;
 pub mod message;
 pub mod p2p;
 pub mod publisher;
+pub mod pull;
 pub mod store;
 pub mod validity;
 pub mod wire;
@@ -169,5 +172,7 @@ mod aggregate_tests;
 pub(crate) mod p2p_tests;
 #[cfg(test)]
 mod publisher_tests;
+#[cfg(test)]
+mod pull_tests;
 #[cfg(test)]
 mod tests;

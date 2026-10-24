@@ -1,0 +1,164 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::aggregate::Aggregate;
+use super::collect::{Collector, Limits};
+use super::p2p::{GetNapAtt, NapAtt};
+use super::pull::*;
+use super::tests::*;
+use super::validity::Coin;
+use super::*;
+
+fn chain_with(signer: &Signer, coins: u8) -> Chain {
+    let mut chain = Chain::new();
+    for n in 1..=coins {
+        chain.coins.insert(
+            outpoint(n),
+            Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: COIN_HEIGHT, coinbase: false },
+        );
+    }
+    chain
+}
+
+fn puller(chain: &Chain, limits: Limits) -> (tempfile::TempDir, Puller) {
+    let dir = tempfile::tempdir().unwrap();
+    let agg = Aggregate::open(dir.path().join("aggregate.dat"), chain).unwrap();
+    (dir, Puller::new(Arc::new(Collector::with_limits(agg, limits))))
+}
+
+fn page(atts: Vec<Attestation>, next: Option<bitcoin::OutPoint>) -> Vec<u8> {
+    NapAtt { attestations: atts, next_cursor: next }.to_bytes()
+}
+
+#[test]
+fn a_pull_asks_for_everything_and_one_runs_per_peer() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    assert!(p.due("1.2.3.4:8333", now));
+    let req = p.start(7, "1.2.3.4:8333", false, now).expect("started");
+    assert_eq!(GetNapAtt::from_bytes(&req), Ok(GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None }));
+    assert_eq!(p.start(7, "1.2.3.4:8333", false, now), None, "one pull at a time per peer");
+    assert!(!p.due("1.2.3.4:8333", now), "not due again until the interval passes");
+    assert!(p.due("1.2.3.4:8333", now + REPULL_INTERVAL));
+}
+
+#[test]
+fn pages_continue_from_the_cursor_until_the_last() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 2);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    p.start(7, "a", true, now).unwrap();
+    let one = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let two = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
+    match p.on_napatt(&chain, 7, &page(vec![one], Some(outpoint(1))), now) {
+        Next::Continue(req) => assert_eq!(GetNapAtt::from_bytes(&req).unwrap().cursor, Some(outpoint(1))),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.on_napatt(&chain, 7, &page(vec![two], None), now), Next::Done { close: true });
+    assert_eq!(p.stats().pulls_completed, 1);
+    assert_eq!(p.stats().pages, 2);
+    assert_eq!(p.collector().aggregate().len(), 2);
+    assert_eq!(p.active(), 0);
+}
+
+#[test]
+fn an_unasked_page_is_ignored() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    assert_eq!(p.on_napatt(&chain, 7, &page(vec![att], None), Instant::now()), Next::Unsolicited);
+    assert!(p.collector().aggregate().is_empty());
+    assert_eq!(p.stats().unsolicited, 1);
+}
+
+#[test]
+fn a_malformed_page_or_a_bad_signature_is_misbehaviour() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 2);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    p.start(7, "a", false, now).unwrap();
+    assert!(matches!(p.on_napatt(&chain, 7, &[0xff], now), Next::Misbehaved(_)));
+    let one = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let two = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
+    let forged = Attestation::new(
+        two.outpoint(),
+        two.key().into(),
+        two.value().into(),
+        two.anchor_height(),
+        two.anchor_hash(),
+        one.signature().clone(),
+    )
+    .unwrap();
+    p.start(8, "b", false, now).unwrap();
+    match p.on_napatt(&chain, 8, &page(vec![forged], None), now) {
+        Next::Misbehaved(why) => assert!(why.contains("signature-invalid"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.stats().misbehaving, 2);
+    assert_eq!(p.active(), 0, "both pulls are over");
+}
+
+#[test]
+fn a_full_deferred_queue_ends_the_pull_and_starts_none() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits { max_deferred_bytes: 0, ..Limits::default() });
+    assert_eq!(p.start(7, "a", false, Instant::now()), None);
+    let (_d, p) = puller(&chain, Limits { hourly_verifications: 0, max_deferred_bytes: super::p2p::MAX_NAPATT_SIZE, ..Limits::default() });
+    let now = Instant::now();
+    p.start(7, "a", true, now).unwrap();
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    // The page is deferred, which leaves less than a page of room.
+    assert_eq!(p.on_napatt(&chain, 7, &page(vec![att], Some(outpoint(1))), now), Next::Done { close: true });
+    assert_eq!(p.collector().deferred_len(), 1);
+}
+
+#[test]
+fn a_silent_publisher_times_out() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let t0 = Instant::now();
+    p.start(7, "a", true, t0).unwrap();
+    p.start(8, "b", false, t0).unwrap();
+    assert!(p.expire(t0 + PULL_TIMEOUT / 2).is_empty());
+    let mut late = p.expire(t0 + PULL_TIMEOUT);
+    late.sort();
+    assert_eq!(late, vec![(7, true), (8, false)]);
+    assert_eq!(p.stats().pulls_timed_out, 2);
+    assert_eq!(p.active(), 0);
+}
+
+#[test]
+fn dials_count_against_the_pull_connections_until_they_end() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let t0 = Instant::now();
+    p.dial_started("1.2.3.4:8333", t0);
+    assert_eq!(p.pull_connections(), 1);
+    assert!(!p.due("1.2.3.4:8333", t0), "a dial counts as a pull for the interval");
+    p.dial_ended("1.2.3.4:8333");
+    assert_eq!(p.pull_connections(), 0);
+    // One that never ends is forgotten after the timeout.
+    p.dial_started("5.6.7.8:8333", t0);
+    p.expire(t0 + PULL_TIMEOUT);
+    assert_eq!(p.pull_connections(), 0);
+}
+
+#[test]
+fn a_disconnected_peers_pull_is_forgotten() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    p.start(7, "a", false, Instant::now()).unwrap();
+    p.forget(7);
+    assert_eq!(p.active(), 0);
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    assert_eq!(p.on_napatt(&chain, 7, &page(vec![att], None), Instant::now()), Next::Unsolicited);
+}
