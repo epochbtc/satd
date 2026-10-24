@@ -46,7 +46,7 @@ The holder signs this text exactly, with LF line endings and no newline at
 the end:
 
 ```text
-satd NAP attestation v1
+NAP attestation v1
 outpoint: <txid>:<vout>
 key: <key>
 value: <value>
@@ -93,7 +93,7 @@ ones.
    ```text
    sat-cli createnapattestation "<txid>:<vout>" "bip_xyz.support" "yes"
    {
-     "message": "satd NAP attestation v1\noutpoint: …\nkey: bip_xyz.support\nvalue: yes\nanchor: 912340 00000000…",
+     "message": "NAP attestation v1\noutpoint: …\nkey: bip_xyz.support\nvalue: yes\nanchor: 912340 00000000…",
      "outpoint": "<txid>:<vout>",
      "key": "bip_xyz.support",
      "value": "yes",
@@ -248,8 +248,8 @@ signs another message or another coin, or is not fully signed; the message
 says which.
 
 **Coldcard** signs messages of up to 330 characters. Everything in a NAP
-message but the key and value comes to about 195 characters (more for a
-large output index), so a key and value that add up to more than about 135
+message but the key and value comes to about 190 characters (more for a
+large output index), so a key and value that add up to more than about 140
 characters do not fit. `createnapattestation` warns when a message is longer
 than 330.
 
@@ -295,7 +295,7 @@ sat-cli listnapattestations
     "anchor_hash": "00000000…",
     "format": "simple",
     "signature": "smpAkcwRAIg…",
-    "message": "satd NAP attestation v1\n…",
+    "message": "NAP attestation v1\n…",
     "status": "valid",
     "amount": 0.25000000
   }

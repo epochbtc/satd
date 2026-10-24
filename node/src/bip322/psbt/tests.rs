@@ -18,7 +18,7 @@ use bitcoin::{
 use super::*;
 use crate::bip322::{Proof, Verification, verify};
 
-const MESSAGE: &[u8] = b"satd NAP attestation v1\nkey: k\nvalue: v";
+const MESSAGE: &[u8] = b"NAP attestation v1\nkey: k\nvalue: v";
 
 fn secret(n: u8) -> SecretKey {
     SecretKey::from_slice(&[n; 32]).unwrap()

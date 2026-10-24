@@ -184,7 +184,7 @@ fn message_renders_the_designs_text() {
     assert_eq!(
         text,
         format!(
-            "satd NAP attestation v1\noutpoint: {}:3\nkey: bip_xyz.support\nvalue: yes\nanchor: 39994 {}",
+            "NAP attestation v1\noutpoint: {}:3\nkey: bip_xyz.support\nvalue: yes\nanchor: 39994 {}",
             "11".repeat(32),
             hash
         )
