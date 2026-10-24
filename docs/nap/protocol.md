@@ -66,6 +66,7 @@ output index, as in a transaction input.
 | `FRESHNESS_WINDOW` | 26,208 blocks (~6 months) | How long a signature stands without re-signing |
 | `MIN_COIN_AGE` | 4,032 blocks (~4 weeks) on mainnet; 6 on testnet3, testnet4, signet and regtest | How old a coin must be at the anchor |
 | `COINBASE_MATURITY` | 100 blocks | The least age of a coinbase coin at the anchor, on every network |
+| `MIN_COIN_VALUE` | 10,000 satoshis | The smallest coin that attests, on every network |
 | `MAX_ATTESTATION_SIZE` | 4,000 bytes | The largest serialized attestation |
 | `MAX_KEY_LEN` | 128 bytes | The longest key; keys are at least 1 byte |
 | `MAX_VALUE_LEN` | 128 bytes | The longest value; a value may be empty |
@@ -191,8 +192,9 @@ listed cheapest first.
 1. **Anchor.** `anchor_hash` is the hash of the active chain's block at
    `anchor_height`.
 2. **Fresh.** `tip_height - anchor_height < FRESHNESS_WINDOW`.
-3. **Unspent.** The outpoint is in the UTXO set at the tip. Unconfirmed
-   outputs are never counted.
+3. **Unspent, and large enough.** The outpoint is in the UTXO set at the
+   tip, and its coin holds at least `MIN_COIN_VALUE`. Unconfirmed outputs are
+   never counted.
 4. **Old enough.** The coin's confirmation height is at most
    `anchor_height - age`, where `age` is `MIN_COIN_AGE` for the network, or
    `max(MIN_COIN_AGE, COINBASE_MATURITY)` for a coinbase coin.
@@ -469,6 +471,14 @@ a shorter window.
 **Coin age at the anchor, not at the tip.** Measuring age at the anchor makes
 validity stable as the chain grows: an attestation valid when made does not
 become invalid later on age grounds.
+
+**A minimum coin value.** Weight follows value, so dust cannot sway a count,
+but without a floor anyone could fill an aggregator's bounds with dust coins
+for almost no capital. At 10,000 satoshis, filling a bound of a million
+attestations at 256 keys per coin ties up about 0.39 BTC. The floor is far
+above the dust limits of every standard output type, and low enough that
+any holding worth stating a view with clears it. Unlike `MIN_COIN_AGE`, it
+is the same on every network.
 
 **Withdrawal by empty value.** A holder may want to retract a statement
 without spending the coin. An empty value supersedes the old one and counts
