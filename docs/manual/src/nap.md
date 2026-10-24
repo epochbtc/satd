@@ -341,9 +341,12 @@ With `napaggregator=1` the node collects attestations from publishers over
 P2P and keeps, for each coin and key, the one that counts at its tip. It does
 not need `nap=1`, and does not advertise `NODE_NAP` unless it also publishes.
 
-*   **Where it looks.** Every peer the node is connected to that advertises
-    `NODE_NAP` is asked as soon as the connection opens, and again every
-    hour while it stays up. Publishers the address book knows but the node
+*   **Where it looks.** Every full-relay, manual or inbound peer the node is
+    connected to that advertises `NODE_NAP` is asked as soon as the
+    connection opens, and again every hour while it stays up; block-relay,
+    address-fetch and feeler connections are never asked. At most eight
+    pulls run at once, and at most four of them over inbound connections.
+    Publishers the address book knows but the node
     is not connected to are reached over short `nap-pull` connections, at
     most two at a time and each address at most once an hour. A `nap-pull`
     connection (`getpeerinfo` lists it with that `connection_type`) takes no
