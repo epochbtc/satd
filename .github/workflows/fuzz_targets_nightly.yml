@@ -54,6 +54,10 @@ env:
 jobs:
   fuzz:
     name: fuzz targets
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
 
@@ -130,6 +134,7 @@ jobs:
           retention-days: 30
 
       - name: Triage failure and notify
+        id: triage
         if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -243,3 +248,42 @@ jobs:
             "Nightly fuzz targets broken: 3 failed runs in a row ($today)" \
             "$body" \
             "Still failing before the fuzz step on $today: $RUN_URL"
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed or cancelled run whose triage step did
+  # not finish. Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: fuzz
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && (needs.fuzz.result == 'failure' || needs.fuzz.result == 'cancelled')
+      && needs.fuzz.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: fuzz-targets-broken
+          LABEL_COLOR: D93F0B
+          LABEL_DESC: "the nightly fuzz-target job is broken (not a finding)"
+          TITLE: "Nightly fuzz targets broken: run ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.fuzz.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh

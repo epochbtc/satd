@@ -42,6 +42,10 @@ permissions:
 jobs:
   three-impl:
     name: Warnet (Bitcoin Core + satd + rbitcoin)
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -136,6 +140,7 @@ jobs:
           retention-days: 14
 
       - name: File or update the tracking issue
+        id: triage
         if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,3 +174,42 @@ jobs:
             notify warnet-3impl-broken FBCA04 "three-implementation Warnet rig is failing" \
               "Warnet three-implementation rig is failing ($today)" "$body"
           fi
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed or cancelled run whose triage step did
+  # not finish. Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: three-impl
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && (needs.three-impl.result == 'failure' || needs.three-impl.result == 'cancelled')
+      && needs.three-impl.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: warnet-3impl-broken
+          LABEL_COLOR: FBCA04
+          LABEL_DESC: "three-implementation Warnet rig is failing"
+          TITLE: "Warnet three-implementation rig ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.three-impl.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh

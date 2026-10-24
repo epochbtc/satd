@@ -61,6 +61,10 @@ env:
 jobs:
   block-differential:
     name: block-differential fuzz
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
     runs-on: ubuntu-24.04
     # Setup takes ~4 min, the two cold builds below ~30 (up from ~20 in
     # mid-October), and fuzzing MAX_TOTAL_TIME (30 min by default). 60 minutes
@@ -171,6 +175,7 @@ jobs:
       # Manual workflow_dispatch runs never notify — whoever dispatched is
       # watching. Never weaken the accept/reject assertion for any of these.
       - name: Triage failure and notify
+        id: triage
         if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -384,3 +389,42 @@ jobs:
             "Fuzz job broken: 3+ consecutive scheduled failures ($today)" \
             "$body" \
             "Still failing before the fuzz step as of $today: $RUN_URL"
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed or cancelled run whose triage step did
+  # not finish. Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: block-differential
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && (needs.block-differential.result == 'failure' || needs.block-differential.result == 'cancelled')
+      && needs.block-differential.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: fuzz-broken
+          LABEL_COLOR: D93F0B
+          LABEL_DESC: "block-differential fuzz job is broken (not a divergence)"
+          TITLE: "Fuzz job broken: block-differential run ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.block-differential.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh
