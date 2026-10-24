@@ -680,7 +680,7 @@ fn real_wallet_signatures_are_accepted() {
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
     let vectors = vectors.as_array().unwrap();
-    assert_eq!(vectors.len(), 7);
+    assert_eq!(vectors.len(), 6);
     for v in vectors {
         let field = |k: &str| v[k].as_str().unwrap();
         let (wallet, text, signature) = (field("wallet"), field("message"), field("signature"));

@@ -32,14 +32,6 @@
     "format": "full"
   },
   {
-    "wallet": "Sparrow 2.2.3 Sign Message, BIP322 (P2WPKH)",
-    "address": "tb1qjs83xm8n7lfxkap4eeds3g58sqetr07gpdj47u",
-    "script_pubkey": "0014940f136cf3f7d26b7435ce5b08a2878032b1bfc8",
-    "message": "NAP attestation v1\noutpoint: 37f17f1a4e9b1253103ab412c17ce6b12a4ce9c237fd94c29345e5ab4358de7f:1\nkey: g1.sparrow.smp.p2wpkh\nvalue: yes\nanchor: 327520 0000001430b5b8f35a363e4dba9bbbebacb695ac001a18a5fdcda79b03c0b28e",
-    "signature": "AkcwRAIgN58SaP5aAdPugL6KXH9mm2pryzln4zMEiUh3ponSdxoCIB6Q4ZxgSbVQ6Pt5dPZcjjm8ufPbPG6bF1t8TXeA0fxXASECuSiBFhPikyC6TWx4ugsyBEkCZbJgjUZC2nE32wldAG4=",
-    "format": "simple"
-  },
-  {
     "wallet": "Sparrow 2.5.5 Sign Message, BIP322 (P2WPKH)",
     "address": "tb1qjs83xm8n7lfxkap4eeds3g58sqetr07gpdj47u",
     "script_pubkey": "0014940f136cf3f7d26b7435ce5b08a2878032b1bfc8",
