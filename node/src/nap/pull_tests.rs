@@ -1,12 +1,13 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::aggregate::Aggregate;
 use super::collect::{Collector, Limits};
 use super::p2p::{GetNapAtt, NapAtt};
 use super::pull::*;
 use super::tests::*;
-use super::validity::Coin;
+use super::validity::{ChainView, Coin};
+use super::publisher::ChainSource;
 use super::*;
 
 fn chain_with(signer: &Signer, coins: u8) -> Chain {
@@ -145,9 +146,12 @@ fn dials_count_against_the_pull_connections_until_they_end() {
     assert!(!p.due("1.2.3.4:8333", t0), "a dial counts as a pull for the interval");
     p.dial_ended("1.2.3.4:8333");
     assert_eq!(p.pull_connections(), 0);
-    // One that never ends is forgotten after the timeout.
+    // One that never ends is counted while its dial and handshake could
+    // still be running, then forgotten.
     p.dial_started("5.6.7.8:8333", t0);
-    p.expire(t0 + PULL_TIMEOUT);
+    p.expire(t0 + DIAL_TIMEOUT);
+    assert_eq!(p.pull_connections(), 1, "still within the dial and handshake timeouts");
+    p.expire(t0 + Duration::from_secs(3 * 60));
     assert_eq!(p.pull_connections(), 0);
 }
 
@@ -161,4 +165,66 @@ fn a_disconnected_peers_pull_is_forgotten() {
     assert_eq!(p.active(), 0);
     let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     assert_eq!(p.on_napatt(&chain, 7, &page(vec![att], None), Instant::now()), Next::Unsolicited);
+}
+
+#[test]
+fn a_pull_ends_after_its_page_limit() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    p.start(7, "a", true, now).unwrap();
+    // Pages that cost nothing to pass over, each promising another.
+    let empty = page(vec![], Some(outpoint(1)));
+    for n in 1..MAX_PULL_PAGES {
+        assert!(matches!(p.on_napatt(&chain, 7, &empty, now), Next::Continue(_)), "page {n}");
+    }
+    assert_eq!(p.on_napatt(&chain, 7, &empty, now), Next::Done { close: true });
+    assert_eq!(p.active(), 0);
+}
+
+#[test]
+fn at_most_eight_pulls_run_at_once() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    for peer in 0..MAX_ACTIVE_PULLS as u64 {
+        assert!(p.start(peer, &format!("p{peer}"), false, now).is_some());
+    }
+    assert_eq!(p.start(99, "p99", false, now), None);
+    p.forget(0);
+    assert!(p.start(99, "p99", false, now).is_some(), "a slot freed is taken");
+}
+
+/// A chain that runs a hook during the first read: what another thread
+/// does while a page is taken.
+struct Hooked<'a> {
+    chain: &'a Chain,
+    hook: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+
+impl ChainSource for Hooked<'_> {
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        if let Some(hook) = self.hook.borrow_mut().take() {
+            hook();
+        }
+        Some(read(self.chain))
+    }
+}
+
+#[test]
+fn a_peer_that_goes_while_its_page_is_taken_ends_its_pull() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    p.start(7, "a", true, now).unwrap();
+    let hooked = Hooked { chain: &chain, hook: std::cell::RefCell::new(Some(Box::new(|| p.forget(7)))) };
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    // A page promising more, from a peer that disconnects meanwhile: the
+    // pull is not taken up again.
+    assert_eq!(p.on_napatt(&hooked, 7, &page(vec![att], Some(outpoint(1))), now), Next::Done { close: false });
+    assert_eq!(p.active(), 0);
+    assert_eq!(p.pull_connections(), 0);
 }

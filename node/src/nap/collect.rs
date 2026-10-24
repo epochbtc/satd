@@ -74,6 +74,11 @@ impl PullBudget {
     pub fn remaining(&self) -> u32 {
         self.0
     }
+
+    /// A budget with nothing left.
+    pub fn empty() -> Self {
+        PullBudget(0)
+    }
 }
 
 /// What one page did.

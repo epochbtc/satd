@@ -5412,7 +5412,15 @@ impl PeerManager {
                 // Onion peers carry the 0.0.0.0 placeholder socket, not a
                 // re-dialable clearnet addr — marking it good would pollute the
                 // addrman (and conflate every onion peer). Skip them.
-                if handle.info.direction == Direction::Outbound && handle.info.onion_host.is_none() {
+                // Nor a NAP pull: a pull connection is opened to addresses
+                // learned only from a gossiped service bit, faster than the
+                // automatic dials, and proves nothing about the peer as one
+                // to sync or relay with. Promoting them would let gossip
+                // fill the tried table.
+                if handle.info.direction == Direction::Outbound
+                    && handle.info.onion_host.is_none()
+                    && handle.info.conn_type != ConnType::NapPull
+                {
                     let mut book = self.addrman.write();
                     book.mark_good(handle.info.addr, now_unix_secs());
                     // A seed or manual peer enters the book only here, after
@@ -6093,7 +6101,13 @@ impl PeerManager {
             opened += 1;
             let (pm, p) = (Arc::clone(self), puller.clone());
             tokio::spawn(async move {
-                if let Err(e) = pm.connect_outbound_inner(addr, Some(ConnType::NapPull), None, false).await {
+                let dial = pm.connect_outbound_inner(addr, Some(ConnType::NapPull), None, false);
+                let failed = match tokio::time::timeout(crate::nap::pull::DIAL_TIMEOUT, dial).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some("timed out".to_owned()),
+                };
+                if let Some(e) = failed {
                     tracing::debug!(target: "nap", %addr, "NAP: pull connection failed: {e}");
                     p.dial_ended(&addr.to_string());
                 }

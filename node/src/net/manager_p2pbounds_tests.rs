@@ -1073,6 +1073,31 @@ mod nap_aggregator {
     }
 
     #[test]
+    fn a_pull_connection_does_not_promote_its_address() {
+        use bitcoin::p2p::address::Address;
+        let (pm, _dirs, _puller) = aggregating_pm();
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let version = |services| VersionMessage {
+            version: 70016,
+            services,
+            timestamp: crate::time::now_secs() as i64,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, services),
+            nonce: 1,
+            user_agent: "/p/".into(),
+            start_height: 0,
+            relay: false,
+        };
+        let _pull = peer_of(&pm, 1, ConnType::NapPull, publisher_services());
+        let _full = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
+        pm.handle_peer_connected(1, version(publisher_services()));
+        pm.handle_peer_connected(2, version(publisher_services()));
+        let tried = |a: SocketAddr| pm.addrman.read().iter().any(|e| e.addr == a && e.tried);
+        assert!(!tried(addr(1)), "a pull connection proves nothing about the address");
+        assert!(tried(addr(2)), "an ordinary outbound connection still promotes it");
+    }
+
+    #[test]
     fn a_pull_connection_cannot_be_opened_through_addconnection() {
         let (pm, _dir) = mk_pm();
         assert!(pm.check_outbound_limit_for(ConnType::NapPull, &[]).is_err());

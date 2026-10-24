@@ -40,7 +40,21 @@ pub const PULL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const REPULL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The most pull connections open at once.
 pub const MAX_PULL_CONNECTIONS: usize = 2;
-/// How often the manager runs [`Puller::tick`].
+/// The most pulls in progress at once, over every kind of connection. Each
+/// may add a page to the deferred queue past its room check, so this also
+/// bounds how far the queue can run over.
+pub const MAX_ACTIVE_PULLS: usize = 8;
+/// The most pages one pull takes. A publisher serves one connection at most
+/// 200 MB an hour, which is 200 full pages; a pull that runs longer is a
+/// publisher streaming pages that cost nothing to pass over, and ends.
+pub const MAX_PULL_PAGES: u32 = 200;
+/// How long a pull connection's dial may take before it is given up.
+pub const DIAL_TIMEOUT: Duration = PULL_TIMEOUT;
+/// How long a dial is counted against [`MAX_PULL_CONNECTIONS`] at most: its
+/// own timeout, the handshake's, and margin.
+const DIALING_EXPIRY: Duration = Duration::from_secs(3 * 60);
+
+/// How often the peer manager's collection tick runs.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A peer's id, as the peer manager numbers connections.
@@ -55,6 +69,10 @@ struct Active {
     /// When the request now outstanding was sent.
     sent_at: Instant,
     budget: PullBudget,
+    /// Pages taken so far.
+    pages: u32,
+    /// A page is being taken; the budget is out with it.
+    taking: bool,
 }
 
 /// Collection counters, for `listnapaggregate`.
@@ -98,8 +116,10 @@ struct State {
     active: HashMap<PeerId, Active>,
     /// When each publisher address was last pulled, or dialled for a pull.
     last_pull: HashMap<String, Instant>,
-    /// Pull connections being opened, by address, since when. One that
-    /// never completes its handshake is forgotten after [`PULL_TIMEOUT`].
+    /// Pull connections being opened, by address, since when. The dial is
+    /// bounded by [`DIAL_TIMEOUT`] and the handshake by the node's peer
+    /// timeout; one that ends neither way is forgotten after
+    /// [`DIALING_EXPIRY`].
     dialing: HashMap<String, Instant>,
     stats: Stats,
 }
@@ -159,13 +179,20 @@ impl Puller {
             return None;
         }
         let mut st = self.state.lock();
-        if st.active.contains_key(&peer) {
+        if st.active.contains_key(&peer) || st.active.len() >= MAX_ACTIVE_PULLS {
             return None;
         }
         st.last_pull.insert(source.to_owned(), now);
         st.active.insert(
             peer,
-            Active { source: source.to_owned(), pull_connection, sent_at: now, budget: self.collector.pull_budget() },
+            Active {
+                source: source.to_owned(),
+                pull_connection,
+                sent_at: now,
+                budget: self.collector.pull_budget(),
+                pages: 0,
+                taking: false,
+            },
         );
         Some(request(None))
     }
@@ -173,36 +200,64 @@ impl Puller {
     /// Take a `napatt` from `peer`. The intake runs here, verifying
     /// signatures, so the caller runs this off the network thread.
     pub fn on_napatt(&self, chain: &impl ChainSource, peer: PeerId, payload: &[u8], now: Instant) -> Next {
-        let Some(mut active) = self.state.lock().active.remove(&peer) else {
-            self.state.lock().stats.unsolicited += 1;
-            return Next::Unsolicited;
+        // The pull stays in place, marked, while its page is taken, so that
+        // a disconnect meanwhile ends it rather than being missed.
+        let (source, mut budget) = {
+            let mut st = self.state.lock();
+            match st.active.get_mut(&peer) {
+                Some(a) if !a.taking => {
+                    a.taking = true;
+                    (a.source.clone(), std::mem::replace(&mut a.budget, PullBudget::empty()))
+                }
+                _ => {
+                    st.stats.unsolicited += 1;
+                    return Next::Unsolicited;
+                }
+            }
         };
+        let end = |st: &mut State| st.active.remove(&peer);
         let page = match NapAtt::from_bytes(payload) {
             Ok(page) => page,
             Err(e) => {
-                self.state.lock().stats.misbehaving += 1;
+                let mut st = self.state.lock();
+                end(&mut st);
+                st.stats.misbehaving += 1;
                 return Next::Misbehaved(format!("malformed napatt: {e}"));
             }
         };
         let Intake { misbehaved, key_limit, .. } =
-            self.collector.intake(chain, &active.source, page.attestations, &mut active.budget, now);
+            self.collector.intake(chain, &source, page.attestations, &mut budget, now);
         let mut st = self.state.lock();
         st.stats.pages += 1;
         st.stats.key_limit += key_limit as u64;
         if let Some(r) = misbehaved {
+            end(&mut st);
             st.stats.misbehaving += 1;
             return Next::Misbehaved(misbehaviour(&r));
         }
+        let room = self.collector.has_room();
+        let Some(active) = st.active.get_mut(&peer) else {
+            // The peer went while its page was taken.
+            return Next::Done { close: false };
+        };
+        active.pages += 1;
         match page.next_cursor {
-            Some(cursor) if self.collector.has_room() => {
+            Some(cursor) if room && active.pages < MAX_PULL_PAGES => {
+                active.taking = false;
+                active.budget = budget;
                 active.sent_at = now;
-                st.active.insert(peer, active);
                 Next::Continue(request(Some(cursor)))
             }
-            Some(_) => Next::Done { close: active.pull_connection },
+            Some(_) => {
+                let close = active.pull_connection;
+                end(&mut st);
+                Next::Done { close }
+            }
             None => {
+                let close = active.pull_connection;
+                end(&mut st);
                 st.stats.pulls_completed += 1;
-                Next::Done { close: active.pull_connection }
+                Next::Done { close }
             }
         }
     }
@@ -214,14 +269,15 @@ impl Puller {
         let late: Vec<(PeerId, bool)> = st
             .active
             .iter()
-            .filter(|(_, a)| now.saturating_duration_since(a.sent_at) >= PULL_TIMEOUT)
+            // A page being taken has arrived; only its intake is running.
+            .filter(|(_, a)| !a.taking && now.saturating_duration_since(a.sent_at) >= PULL_TIMEOUT)
             .map(|(id, a)| (*id, a.pull_connection))
             .collect();
         for (id, _) in &late {
             st.active.remove(id);
             st.stats.pulls_timed_out += 1;
         }
-        st.dialing.retain(|_, since| now.saturating_duration_since(*since) < PULL_TIMEOUT);
+        st.dialing.retain(|_, since| now.saturating_duration_since(*since) < DIALING_EXPIRY);
         late
     }
 
