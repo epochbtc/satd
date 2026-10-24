@@ -107,6 +107,12 @@ are not required to. Verification details are in `SECURITY.md`.
   (needs `cargo install cargo-mutants`; it edits and restores the working tree,
   so commit first). For each missed mutant, add a test that fails on it, or
   say in review why it cannot change behaviour.
+- Fuzz targets — a target added to `fuzz/Cargo.toml` is run every night by
+  the `Fuzz targets (nightly)` workflow without further wiring (targets that
+  need a live `bitcoind` are listed in `ORACLE_TARGETS` in
+  `scripts/fuzz/run-standalone-targets.sh` and need a job of their own).
+  Run one locally with
+  `SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh <target>`.
 
 ## AI-assisted contributions
 
