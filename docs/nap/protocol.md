@@ -95,7 +95,7 @@ The holder signs the following text, with LF (0x0A) line endings and no
 trailing newline:
 
 ```
-satd NAP attestation v1
+NAP attestation v1
 outpoint: <txid>:<vout>
 key: <key>
 value: <value>
@@ -562,23 +562,23 @@ The first of them, a legacy signature on signet:
 
 ```
 message:
-satd NAP attestation v1
+NAP attestation v1
 outpoint: 91b6ac3b411725a16dbc4ef2e5bd50098b919731e1a1b4e3aad2f865c42a9793:1
 key: g1.core.signmessage
 value: yes
 anchor: 327643 00000000a1d0aac203eaeb384a3486826e0b78288ea41f038c44bb57d52857ec
 
 scriptPubKey: 76a91400bbd829d91f63cf5433af8d2c330f7ece69e51e88ac
-signature (base64): IDqZu5L4XcK5sQLgD1TauqTBdaAJni592r8Hpsih25b7aS2L3G4+QWYP+hznk8Xxt7ZnSxuHKQVBsjixZJfMHdg=
+signature (base64): H7xw2kNB5RUYHB7BRtL7aimQjn0HivJb3+ji0i2jQBzwOl9KNRFhLZhHAh29WTZOrfugKaWm0IlELou8MsrIYAg=
 
 attestation (164 bytes):
 0193972ac465f8d2aae3b4a1e13197918b0950bde5f24ebc6da12517413bacb6910100
 00001367312e636f72652e7369676e6d65737361676503796573dbff0400ec5728d557
-bb448c031fa48e28780b6e8286344a38ebea03c2aad0a1000000000241203a99bb92f8
-5dc2b9b102e00f54dabaa4c175a0099e2e7ddabf07a6c8a1db96fb692d8bdc6e3e4166
-0ffa1ce793c5f1b7b6674b1b87290541b238b16497cc1dd8
+bb448c031fa48e28780b6e8286344a38ebea03c2aad0a10000000002411fbc70da4341
+e515181c1ec146d2fb6a29908e7d078af25bdfe8e2d22da3401cf03a5f4a3511612d98
+47021dbd59364eadfba029a5a6d089442e8bbc32cac86008
 
-id: 8f509c08438d2b0b897d0c9473eff739d6259c9b03b951984196a80dc2cf3c3c
+id: 196a69fcb0efc23124e0d7ef92323eb7d091df1e3d5f345d7316c397537cbac5
 ```
 
 A `getnapatt` starting a pull for every attestation: `000000000000`.
@@ -596,9 +596,9 @@ A `napatt` carrying the attestation above as the last page:
 ```
 010193972ac465f8d2aae3b4a1e13197918b0950bde5f24ebc6da12517413bacb69101
 0000001367312e636f72652e7369676e6d65737361676503796573dbff0400ec5728d5
-57bb448c031fa48e28780b6e8286344a38ebea03c2aad0a1000000000241203a99bb92
-f85dc2b9b102e00f54dabaa4c175a0099e2e7ddabf07a6c8a1db96fb692d8bdc6e3e41
-660ffa1ce793c5f1b7b6674b1b87290541b238b16497cc1dd800
+57bb448c031fa48e28780b6e8286344a38ebea03c2aad0a10000000002411fbc70da43
+41e515181c1ec146d2fb6a29908e7d078af25bdfe8e2d22da3401cf03a5f4a3511612d
+9847021dbd59364eadfba029a5a6d089442e8bbc32cac8600800
 ```
 
 ## Open questions
