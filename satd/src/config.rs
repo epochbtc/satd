@@ -747,6 +747,10 @@ pub struct Config {
     /// into `<datadir>/nap/aggregate/aggregate.dat`, and enable
     /// `listnapaggregate`. Independent of `-nap`. Default false. satd-only.
     pub napaggregator: bool,
+    /// `-napaggregatormax`: with `-napaggregator`, the most attestations the
+    /// collected set holds; past it new `(outpoint, key)` pairs are refused
+    /// and counted. Default 1,000,000. satd-only.
+    pub napaggregatormax: usize,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4199,8 +4203,14 @@ impl Config {
             allowdangerousfilters,
             nap: resolve_nap(&cli.nap_args.nap, "nap", &file_get),
             napstorerecover: resolve_nap(&cli.nap_args.napstorerecover, "napstorerecover", &file_get),
-            napmaxattestations: resolve_nap_max(&cli.nap_args.napmaxattestations, &file_get)?,
+            napmaxattestations: resolve_nap_count(&cli.nap_args.napmaxattestations, "napmaxattestations", 0, &file_get)?,
             napaggregator: resolve_nap(&cli.nap_args.napaggregator, "napaggregator", &file_get),
+            napaggregatormax: resolve_nap_count(
+                &cli.nap_args.napaggregatormax,
+                "napaggregatormax",
+                node::nap::aggregate::DEFAULT_MAX_ATTESTATIONS,
+                &file_get,
+            )?,
             networkactive,
             txindex,
             addressindex,
@@ -4861,6 +4871,7 @@ impl Config {
                 "store_recover": self.napstorerecover,
                 "max_attestations": self.napmaxattestations,
                 "aggregator": self.napaggregator,
+                "aggregator_max": self.napaggregatormax,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -7554,17 +7565,23 @@ fn resolve_nap(cli: &Option<bool>, key: &str, file_get: &dyn Fn(&str) -> Option<
     cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v))).unwrap_or(false)
 }
 
-/// `-napmaxattestations`, out of `CliArgs` for the same reason. A config-file
-/// value that is not a count is refused, as the command line refuses one.
+/// `-napmaxattestations` and `-napaggregatormax`, out of `CliArgs` for the
+/// same reason. A config-file value that is not a count is refused, as the
+/// command line refuses one.
 #[inline(never)]
-fn resolve_nap_max(cli: &Option<usize>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<usize, String> {
-    match (cli, file_get("napmaxattestations")) {
+fn resolve_nap_count(
+    cli: &Option<usize>,
+    key: &str,
+    default: usize,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<usize, String> {
+    match (cli, file_get(key)) {
         (Some(n), _) => Ok(*n),
         (None, Some(v)) => v
             .trim()
             .parse()
-            .map_err(|_| format!("-napmaxattestations must be a whole number of attestations, not \"{v}\"")),
-        (None, None) => Ok(0),
+            .map_err(|_| format!("-{key} must be a whole number of attestations, not \"{v}\"")),
+        (None, None) => Ok(default),
     }
 }
 
@@ -7576,6 +7593,7 @@ pub struct NapArgs {
     pub napstorerecover: Option<bool>,
     pub napmaxattestations: Option<usize>,
     pub napaggregator: Option<bool>,
+    pub napaggregatormax: Option<usize>,
 }
 
 const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
@@ -7603,6 +7621,12 @@ const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         StratumArgKind::Bool,
         "Collect Node Attestation Protocol attestations from publishers over P2P and enable listnapaggregate (default: 0)",
     ),
+    (
+        "napaggregatormax",
+        "N",
+        StratumArgKind::Usize,
+        "With -napaggregator, hold at most N attestations; past it new coin-and-key pairs are refused (default: 1000000)",
+    ),
 ];
 
 impl clap::Args for NapArgs {
@@ -7629,6 +7653,7 @@ impl clap::FromArgMatches for NapArgs {
             napstorerecover: m.remove_one("napstorerecover"),
             napmaxattestations: m.remove_one("napmaxattestations"),
             napaggregator: m.remove_one("napaggregator"),
+            napaggregatormax: m.remove_one("napaggregatormax"),
         })
     }
 
@@ -9334,6 +9359,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "napstorerecover",
     "napmaxattestations",
     "napaggregator",
+    "napaggregatormax",
     "networkactive",
     // Esplora
     "esplora",
@@ -10655,6 +10681,27 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "napaggregator=1\n").unwrap();
         assert_eq!(load(&[]), Ok((true, false)), "from the file");
         assert_eq!(load(&["--napaggregator=0"]), Ok((false, false)), "the command line wins");
+    }
+
+    /// `-napaggregatormax`: 1,000,000 by default, from either source, the
+    /// command line winning, and a file value that is not a count refused.
+    #[test]
+    fn napaggregatormax_defaults_to_a_million() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .map(|c| c.napaggregatormax)
+        };
+        assert_eq!(load(&[]), Ok(1_000_000));
+        assert_eq!(load(&["-napaggregatormax=5"]), Ok(5));
+        std::fs::write(dir.path().join("bitcoin.conf"), "napaggregatormax=40\n").unwrap();
+        assert_eq!(load(&[]), Ok(40), "from the file");
+        assert_eq!(load(&["--napaggregatormax=7"]), Ok(7), "the command line wins");
+        std::fs::write(dir.path().join("bitcoin.conf"), "napaggregatormax=lots\n").unwrap();
+        assert!(load(&[]).unwrap_err().contains("-napaggregatormax"));
     }
 
     /// `-napmaxattestations`: 0 (no limit) by default, from either source,

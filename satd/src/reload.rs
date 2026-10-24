@@ -939,6 +939,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("napmaxattestations", napmaxattestations),
         // The aggregator likewise.
         restart!("napaggregator", napaggregator),
+        restart!("napaggregatormax", napaggregatormax),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the
         // `authfile` token store, its external file's *contents* are re-read on
         // every SIGHUP — even when the path is unchanged — by a dedicated handler

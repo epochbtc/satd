@@ -3366,7 +3366,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // read back is moved aside rather than refusing to start.
     let nap_aggregator = if config.napaggregator {
         let path = net_datadir.join("nap").join("aggregate").join("aggregate.dat");
-        let aggregate = match node::nap::aggregate::Aggregate::open(path.clone(), &*chain_state) {
+        let max = config.napaggregatormax;
+        let aggregate = match node::nap::aggregate::Aggregate::open_with_max(path.clone(), &*chain_state, max) {
             Ok(a) => a,
             Err(why) => {
                 let secs = std::time::SystemTime::now()
@@ -3384,7 +3385,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     "NAP: the aggregate did not read back ({why}); moved it to {} and started empty",
                     std::path::PathBuf::from(&aside).display()
                 );
-                match node::nap::aggregate::Aggregate::open(path, &*chain_state) {
+                match node::nap::aggregate::Aggregate::open_with_max(path, &*chain_state, max) {
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("Error opening an empty NAP aggregate: {e}");

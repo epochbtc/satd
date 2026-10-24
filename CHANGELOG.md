@@ -42,7 +42,8 @@ item below is (or will be) written up in full in the in-development
   `getpeerinfo` connection type) from publishers the address book knows;
   verifies them cheapest check first within budgets; keeps for each coin and
   key the one that counts, and its predecessors while a reorg could bring
-  them back, in `<datadir>/nap/aggregate/aggregate.dat`; and lists them with
+  them back, in `<datadir>/nap/aggregate/aggregate.dat`, up to
+  `-napaggregatormax` (default 1,000,000); and lists them with
   `listnapaggregate`.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,

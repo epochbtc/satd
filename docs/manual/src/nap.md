@@ -367,7 +367,10 @@ not need `nap=1`, and does not advertise `NODE_NAP` unless it also publishes.
     until the attestation that superseded it is valid and its anchor 144
     blocks deep, so that if a reorg takes the newer anchor, the older one
     counts again. At most 8 are kept per coin and key, and at most 256 keys
-    per coin, the first seen; a key new to a full coin is refused. At every
+    per coin, the first seen; a key new to a full coin is refused. The whole
+    set holds at most `napaggregatormax` attestations (default 1,000,000);
+    when full, pairs new to it are refused, while pairs already held still
+    take newer attestations. At every
     new block the set is judged again: a spent coin drops out at once, and
     a stale one, or one whose anchor is lost for good, goes too.
 *   **On disk.** `<datadir>/nap/aggregate/aggregate.dat`, written every 30
@@ -392,6 +395,7 @@ sat-cli listnapaggregate
   "misbehaving": 0,
   "unsolicited": 0,
   "key_limit": 0,
+  "full": 0,
   "attestations": [
     { "id": "…", "outpoint": "…:0", "key": "bip_xyz.support", "value": "yes",
       "anchor_height": 869994, "anchor_hash": "…", "amount": 0.5, "source": "203.0.113.5:8333" }

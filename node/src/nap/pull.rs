@@ -91,6 +91,8 @@ pub struct Stats {
     pub unsolicited: u64,
     /// Attestations refused because their outpoint had all its keys.
     pub key_limit: u64,
+    /// Attestations refused because the set was at `-napaggregatormax`.
+    pub full: u64,
 }
 
 /// What to do after a `napatt`.
@@ -216,6 +218,9 @@ impl Puller {
             }
         };
         let end = |st: &mut State| st.active.remove(&peer);
+        // If the intake panics, the pull ends rather than holding its slot
+        // marked as being taken for good.
+        let _ends_on_panic = EndOnPanic { state: &self.state, peer };
         let page = match NapAtt::from_bytes(payload) {
             Ok(page) => page,
             Err(e) => {
@@ -225,11 +230,12 @@ impl Puller {
                 return Next::Misbehaved(format!("malformed napatt: {e}"));
             }
         };
-        let Intake { misbehaved, key_limit, .. } =
+        let Intake { misbehaved, key_limit, full, .. } =
             self.collector.intake(chain, &source, page.attestations, &mut budget, now);
         let mut st = self.state.lock();
         st.stats.pages += 1;
         st.stats.key_limit += key_limit as u64;
+        st.stats.full += full as u64;
         if let Some(r) = misbehaved {
             end(&mut st);
             st.stats.misbehaving += 1;
@@ -290,6 +296,20 @@ impl Puller {
     /// work.
     pub fn note_misbehaving(&self) {
         self.state.lock().stats.misbehaving += 1;
+    }
+}
+
+/// Ends `peer`'s pull if dropped while unwinding.
+struct EndOnPanic<'a> {
+    state: &'a Mutex<State>,
+    peer: PeerId,
+}
+
+impl Drop for EndOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.state.lock().active.remove(&self.peer);
+        }
     }
 }
 

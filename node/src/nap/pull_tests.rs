@@ -228,3 +228,18 @@ fn a_peer_that_goes_while_its_page_is_taken_ends_its_pull() {
     assert_eq!(p.active(), 0);
     assert_eq!(p.pull_connections(), 0);
 }
+
+#[test]
+fn a_page_whose_intake_panics_ends_its_pull() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    p.start(7, "a", true, now).unwrap();
+    let hooked = Hooked { chain: &chain, hook: std::cell::RefCell::new(Some(Box::new(|| panic!("intake failed")))) };
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let bytes = page(vec![att], Some(outpoint(1)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.on_napatt(&hooked, 7, &bytes, now)));
+    assert!(r.is_err());
+    assert_eq!((p.active(), p.pull_connections()), (0, 0), "the slot is free again");
+}

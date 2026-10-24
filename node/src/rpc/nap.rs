@@ -79,6 +79,7 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
         "misbehaving": stats.misbehaving,
         "unsolicited": stats.unsolicited,
         "key_limit": stats.key_limit,
+        "full": stats.full,
         "attestations": attestations,
     });
     annotate_units(&mut out, unit);
