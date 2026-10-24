@@ -117,6 +117,12 @@ pub enum ConnType {
     /// Opened only to see whether the address is still alive; closed as soon
     /// as the peer's `version` arrives.
     Feeler,
+    /// A satd aggregator's pull from a NAP publisher (`-napaggregator`):
+    /// opened to ask for its attestations with `getnapatt`, and closed when
+    /// the pull ends. It takes no outbound slot, and carries no blocks,
+    /// transactions or addresses. Not a Bitcoin Core type, so `addconnection`
+    /// cannot open one.
+    NapPull,
 }
 
 impl ConnType {
@@ -130,6 +136,7 @@ impl ConnType {
             ConnType::BlockRelay => "block-relay-only",
             ConnType::AddrFetch => "addr-fetch",
             ConnType::Feeler => "feeler",
+            ConnType::NapPull => "nap-pull",
         }
     }
 
@@ -150,13 +157,13 @@ impl ConnType {
     /// flag in the `version` we send. Core clears it for block-relay-only and
     /// feeler connections (`CNode::IsBlockOnlyConn() || IsFeelerConn()`).
     pub fn wants_tx_relay(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::Feeler)
+        !matches!(self, ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull)
     }
 
     /// Whether we relay addresses over this connection. Core sets up a peer's
     /// address-relay state for everything except block-relay-only.
     pub fn relays_addrs(self) -> bool {
-        !matches!(self, ConnType::BlockRelay)
+        !matches!(self, ConnType::BlockRelay | ConnType::NapPull)
     }
 }
 
@@ -399,9 +406,10 @@ impl PeerInfo {
     /// Whether we sync headers and request blocks from this peer. Core
     /// excludes addr-fetch connections from both (`fPreferredDownload` and
     /// `CanServeBlocks` are false for them): the connection is opened to
-    /// collect addresses and dropped straight afterwards.
+    /// collect addresses and dropped straight afterwards. Nor does satd use
+    /// a NAP pull connection for them.
     pub fn serves_blocks(&self) -> bool {
-        self.conn_type != ConnType::AddrFetch
+        !matches!(self.conn_type, ConnType::AddrFetch | ConnType::NapPull)
     }
 
     /// Whether the peer's services say it can serve blocks at all: Core's

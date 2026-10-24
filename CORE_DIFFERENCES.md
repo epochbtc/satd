@@ -668,9 +668,12 @@ preserved; the satd extension is opt-in per request or per flag.
 - **`createnapattestation`, `submitnapattestation`, `listnapattestations`,
   `removenapattestation`** publish Node Attestation Protocol attestations,
   holders' signed statements weighted by their coins, with `-nap=1` (off by
-  default). Core has no equivalent. Without the flag they answer -1. See the
-  manual's [Node Attestation](https://epochbtc.github.io/satd/nap.html)
-  chapter.
+  default), and **`listnapaggregate`** lists those an aggregator collected,
+  with `-napaggregator=1`. Core has no equivalent. Without the flag they
+  answer -1. An aggregator's pulls from publishers it is not connected to
+  run over connections `getpeerinfo` lists as `connection_type`
+  `nap-pull`, a type Core does not have. See the manual's
+  [Node Attestation](https://epochbtc.github.io/satd/nap.html) chapter.
 
 ---
 

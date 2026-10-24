@@ -180,7 +180,8 @@ integrator guide to every silent-payment consumption mode, see
 
 `createnapattestation`, `submitnapattestation`, `listnapattestations` and
 `removenapattestation` publish coin-weighted statements signed by holders,
-with `-nap=1`. They have a chapter of their own:
+with `-nap=1`, and `listnapaggregate` lists those collected from publishers,
+with `-napaggregator=1`. They have a chapter of their own:
 [Node Attestation (NAP)](nap.md).
 
 ## BIP 322 message verification

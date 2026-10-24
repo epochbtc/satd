@@ -158,6 +158,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // read the chain and the publisher's store, and change neither.
         | "createnapattestation"
         | "listnapattestations"
+        // The aggregator's set, which collection alone changes.
+        | "listnapaggregate"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---

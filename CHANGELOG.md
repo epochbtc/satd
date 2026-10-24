@@ -37,6 +37,15 @@ item below is (or will be) written up in full in the in-development
   and serves its valid attestations to peers that ask with `getnapatt`,
   within per-connection and per-network-group limits.
 
+- NAP aggregator (`-napaggregator=1`, off by default): collects attestations
+  from `NODE_NAP` peers, and over short `nap-pull` connections (a new
+  `getpeerinfo` connection type) from publishers the address book knows;
+  verifies them cheapest check first within budgets; keeps for each coin and
+  key the one that counts, and its predecessors while a reorg could bring
+  them back, in `<datadir>/nap/aggregate/aggregate.dat`, up to
+  `-napaggregatormax` (default 1,000,000); and lists them with
+  `listnapaggregate`.
+
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering

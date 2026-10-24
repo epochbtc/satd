@@ -1,7 +1,8 @@
-//! The NAP publisher RPCs, satd's own: `createnapattestation`,
+//! The NAP RPCs, satd's own. The publisher's, `createnapattestation`,
 //! `submitnapattestation`, `listnapattestations` and
-//! `removenapattestation`. All four answer an error unless the node runs
-//! with `-nap=1`.
+//! `removenapattestation`, answer an error unless the node runs with
+//! `-nap=1`; the aggregator's, `listnapaggregate`, unless it runs with
+//! `-napaggregator=1`.
 
 use std::str::FromStr as _;
 
@@ -25,6 +26,64 @@ pub fn enabled(nap: Option<&Publisher>) -> Result<&Publisher, ErrorObjectOwned> 
             .with_suggestion("Start satd with -nap=1 to publish attestations.")
             .into_error_object()
     })
+}
+
+/// The aggregator, or the error `listnapaggregate` answers without
+/// `-napaggregator=1`.
+pub fn aggregator_enabled(
+    aggregator: Option<&crate::nap::pull::Puller>,
+) -> Result<&crate::nap::pull::Puller, ErrorObjectOwned> {
+    aggregator.ok_or_else(|| {
+        RpcError::new(-1, "network.disabled", "the NAP aggregator is disabled")
+            .with_suggestion("Start satd with -napaggregator=1 to collect attestations.")
+            .into_error_object()
+    })
+}
+
+/// `listnapaggregate`: the attestations that count at the tip the set was
+/// last judged at, one per `(outpoint, key)`, ordered by outpoint and key,
+/// with the collection's statistics.
+pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value {
+    let unit = default_unit();
+    let collector = p.collector();
+    let aggregate = collector.aggregate();
+    let counting = aggregate.counting();
+    let stats = p.stats();
+    let attestations: Vec<Value> = counting
+        .iter()
+        .map(|h| {
+            let att = &h.attestation;
+            json!({
+                "id": att.id().to_string(),
+                "outpoint": att.outpoint().to_string(),
+                "key": att.key(),
+                "value": att.value(),
+                "anchor_height": att.anchor_height(),
+                "anchor_hash": att.anchor_hash().to_string(),
+                "amount": format_amount(h.status.as_ref().map_or(0, |a| a.to_sat()), unit),
+                "source": h.source,
+            })
+        })
+        .collect();
+    let mut out = json!({
+        "height": chain.tip_height(),
+        "held": aggregate.len(),
+        "counting": counting.len(),
+        "deferred": collector.deferred_len(),
+        "pulls": {
+            "active": p.active(),
+            "completed": stats.pulls_completed,
+            "timed_out": stats.pulls_timed_out,
+            "pages": stats.pages,
+        },
+        "misbehaving": stats.misbehaving,
+        "unsolicited": stats.unsolicited,
+        "key_limit": stats.key_limit,
+        "full": stats.full,
+        "attestations": attestations,
+    });
+    annotate_units(&mut out, unit);
+    out
 }
 
 /// `"<txid>:<vout>"`, as `createnapattestation` and `removenapattestation`

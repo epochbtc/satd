@@ -190,7 +190,8 @@ without restarting the relevant socket, engine, or process:
 *   Tor (`proxy`/`onion`/`torcontrol`/`listenonion`)
 *   `consensus`
 *   `assumevalid` and `stopatheight`
-*   `nap`, `napstorerecover` and `napmaxattestations`, the attestation publisher
+*   `nap`, `napstorerecover` and `napmaxattestations`, the attestation publisher,
+    and `napaggregator`, the aggregator
 *   `uacomment` — the user agent is sent once per connection, in the version
     message, so a change reaches a peer only on a new connection
 

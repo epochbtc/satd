@@ -16,8 +16,10 @@ attestation.
 satd is a publisher. satd has no wallet, so the holder signs in their own
 wallet and hands the signature to their node, which checks it, stores it and
 judges it again at every new block, and serves the valid ones to peers that
-ask. This chapter covers publishing and serving. Collecting attestations
-from other nodes is not in this build.
+ask. satd is also an aggregator: with `napaggregator=1` it collects the
+attestations publishers serve and keeps the ones that count (see
+[Aggregating](#aggregating)). Reports on the collected set are not in this
+build.
 
 ## Enabling
 
@@ -333,10 +335,84 @@ reach the node over Tor all arrive from the loopback address and share one
 group, so many Tor connections from one source can use up that group's
 limits. A malformed `getnapatt` counts as misbehaviour.
 
+## Aggregating
+
+With `napaggregator=1` the node collects attestations from publishers over
+P2P and keeps, for each coin and key, the one that counts at its tip. It does
+not need `nap=1`, and does not advertise `NODE_NAP` unless it also publishes.
+
+*   **Where it looks.** Every full-relay, manual or inbound peer the node is
+    connected to that advertises `NODE_NAP` is asked as soon as the
+    connection opens, and again every hour while it stays up; block-relay,
+    address-fetch and feeler connections are never asked. At most eight
+    pulls run at once, and at most four of them over inbound connections.
+    Publishers the address book knows but the node
+    is not connected to are reached over short `nap-pull` connections, at
+    most two at a time and each address at most once an hour. A `nap-pull`
+    connection (`getpeerinfo` lists it with that `connection_type`) takes no
+    outbound slot and carries the pull and nothing else: no blocks,
+    transactions or addresses. It closes when the pull ends.
+*   **What it checks.** Cheapest first: whether it already holds the
+    attestation, then the anchor, freshness, the coin and its age, and only
+    then the signature. Signature results are cached, so an attestation
+    served by many publishers is verified once. At most 5,000 signatures are
+    verified per pull and 50,000 an hour; the rest wait, and pulling pauses
+    while 16 MB of them are waiting. Nothing received is dropped for lack of
+    budget.
+*   **Misbehaviour.** A malformed `napatt`, or an attestation whose
+    signature fails or does not fit its coin, is misbehaviour, and the peer
+    is disconnected and punished as for any other (a manually added peer is
+    not). An attestation that fails only on chain state, such as a spent
+    coin or an anchor the node does not have, is not: the publisher's tip
+    may differ.
+*   **What it keeps.** For each coin and key the attestations that verified,
+    newest first. The newest valid one counts. One that is superseded is kept
+    until the attestation that superseded it is valid and its anchor 144
+    blocks deep, so that if a reorg takes the newer anchor, the older one
+    counts again. At most 8 are kept per coin and key, and at most 256 keys
+    per coin, the first seen; a key new to a full coin is refused. The whole
+    set holds at most `napaggregatormax` attestations (default 1,000,000);
+    when full, pairs new to it are refused, while pairs already held still
+    take newer attestations. At every
+    new block the set is judged again: a spent coin drops out at once, and
+    a stale one, or one whose anchor is lost for good, goes too.
+*   **On disk.** `<datadir>/nap/aggregate/aggregate.dat`, written every 30
+    seconds when it changed and at shutdown. Every signature is verified again
+    when it is loaded; an attestation the chain cannot judge yet (during
+    initial block download, say) waits for it. A file that does not read back
+    is renamed to `aggregate.dat.bad-<unix time>` with a warning, and the node
+    starts with an empty set: collection rebuilds it.
+
+`listnapaggregate` lists the attestations that count, each with its coin's
+value (`amount`) and the peer it was first collected from (`source`), and the
+collection's counters:
+
+```text
+sat-cli listnapaggregate
+{
+  "height": 870000,
+  "held": 3,
+  "counting": 2,
+  "deferred": 0,
+  "pulls": { "active": 0, "completed": 4, "timed_out": 0, "pages": 4 },
+  "misbehaving": 0,
+  "unsolicited": 0,
+  "key_limit": 0,
+  "full": 0,
+  "attestations": [
+    { "id": "…", "outpoint": "…:0", "key": "bip_xyz.support", "value": "yes",
+      "anchor_height": 869994, "anchor_hash": "…", "amount": 0.5, "source": "203.0.113.5:8333" }
+  ]
+}
+```
+
+`held` counts the superseded attestations kept for reorgs too; `counting`
+is one per coin and key.
+
 ## Access
 
-`createnapattestation` and `listnapattestations` change nothing and need
-`rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
+`createnapattestation`, `listnapattestations` and `listnapaggregate` change
+nothing and need `rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
 and `removenapattestation` decide what the node publishes and need
 `rpc:write`. See [Authentication & Authorization](authentication.md).
 
@@ -344,7 +420,7 @@ and `removenapattestation` decide what the node publishes and need
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
 | `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, or `removenapattestation` found nothing to remove. |
-| `-1` | NAP is disabled, or the chain moved during the call (try again). |
+| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`), or the chain moved during the call (try again). |
 
 ## Privacy and key exposure
 
