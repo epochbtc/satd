@@ -5919,9 +5919,23 @@ impl PeerManager {
             return;
         };
         let pull_connection = conn_type == ConnType::NapPull;
+        self.nap_start_pull(&puller, id, publishes, conn_type, &source);
+        // Only after the pull is counted, so that a pull connection always
+        // counts against the limit, as dialing or as pulling.
         if pull_connection {
             puller.dial_ended(&source);
         }
+    }
+
+    fn nap_start_pull(
+        self: &Arc<Self>,
+        puller: &crate::nap::pull::Puller,
+        id: PeerId,
+        publishes: bool,
+        conn_type: ConnType,
+        source: &str,
+    ) {
+        let pull_connection = conn_type == ConnType::NapPull;
         let Some(via) = nap_pull_via(conn_type) else {
             return;
         };
@@ -5937,7 +5951,7 @@ impl PeerManager {
             }
             return;
         }
-        match puller.start(id, &source, via, Instant::now()) {
+        match puller.start(id, source, via, Instant::now()) {
             Some(req) => {
                 tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
                 self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
