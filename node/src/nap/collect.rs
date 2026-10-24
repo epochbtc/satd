@@ -90,6 +90,9 @@ pub struct Intake {
     /// Refused: a key new to an outpoint that already has
     /// [`super::aggregate::MAX_KEYS_PER_OUTPOINT`].
     pub key_limit: usize,
+    /// Refused: a new `(outpoint, key)` for a set already at its most
+    /// attestations.
+    pub full: usize,
     /// The signature that failed, if one did. The rest of the page was not
     /// looked at: the peer that served it is misbehaving.
     pub misbehaved: Option<Rejection>,
@@ -196,6 +199,7 @@ impl Collector {
                 Taken::ChainState => out.chain_state += 1,
                 Taken::Deferred => out.deferred += 1,
                 Taken::KeyLimit => out.key_limit += 1,
+                Taken::Full => out.full += 1,
                 Taken::Misbehaved(r) => {
                     out.misbehaved = Some(r);
                     break;
@@ -268,6 +272,7 @@ impl Collector {
             Inserted::Added => Taken::Added,
             Inserted::Duplicate | Inserted::TooOld => Taken::Known,
             Inserted::KeyLimit => Taken::KeyLimit,
+            Inserted::Full => Taken::Full,
         }
     }
 
@@ -311,5 +316,6 @@ enum Taken {
     ChainState,
     Deferred,
     KeyLimit,
+    Full,
     Misbehaved(Rejection),
 }

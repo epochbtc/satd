@@ -56,6 +56,10 @@ pub const MAX_GENERATIONS: usize = 8;
 /// through several publishers is not cut short, while one old coin cannot
 /// make the set grow without bound (D3, amended 2026-10-23).
 pub const MAX_KEYS_PER_OUTPOINT: usize = 256;
+/// The most attestations the set holds by default (`-napaggregatormax`).
+/// The per-outpoint bound does not bound the total, which many small old
+/// coins would multiply; this does.
+pub const DEFAULT_MAX_ATTESTATIONS: usize = 1_000_000;
 
 const MAGIC: &[u8; 4] = b"SNAG";
 /// The file format version.
@@ -94,6 +98,9 @@ pub enum Inserted {
     /// Its key is new to an outpoint that already has
     /// [`MAX_KEYS_PER_OUTPOINT`].
     KeyLimit,
+    /// It would add an `(outpoint, key)` to a set that already holds its
+    /// most attestations.
+    Full,
 }
 
 #[derive(Default)]
@@ -136,6 +143,10 @@ impl State {
 pub struct Aggregate {
     path: PathBuf,
     state: Mutex<State>,
+    /// The most attestations held before new `(outpoint, key)` pairs are
+    /// refused. Pairs already held still take newer attestations, at most
+    /// [`MAX_GENERATIONS`] each.
+    max_attestations: usize,
 }
 
 impl Aggregate {
@@ -144,8 +155,15 @@ impl Aggregate {
     /// node's own, but a signature that no longer verifies is dropped rather
     /// than trusted.
     pub fn open(path: PathBuf, chain: &impl ChainSource) -> Result<Self, String> {
+        Self::open_with_max(path, chain, DEFAULT_MAX_ATTESTATIONS)
+    }
+
+    /// [`Self::open`], holding at most `max_attestations` (see
+    /// [`Inserted::Full`]). A file holding more, from a higher limit, keeps
+    /// what fits and is rewritten without the rest.
+    pub fn open_with_max(path: PathBuf, chain: &impl ChainSource, max_attestations: usize) -> Result<Self, String> {
         let loaded = load(&path)?;
-        let agg = Aggregate { path, state: Mutex::new(State::default()) };
+        let agg = Aggregate { path, state: Mutex::new(State::default()), max_attestations };
         agg.state.lock().pending = loaded;
         // What loaded is what the file holds, unless some was dropped.
         let dropped = agg.judge_pending(chain);
@@ -246,6 +264,9 @@ impl Aggregate {
         }
         if !st.entries.contains_key(&key) && keys_for(&st.entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT {
             return Inserted::KeyLimit;
+        }
+        if !st.entries.contains_key(&key) && st.ids.len() >= self.max_attestations {
+            return Inserted::Full;
         }
         let gens = st.entries.entry(key.clone()).or_default();
         let at = gens.iter().position(|h| supersedes(&att, &h.attestation)).unwrap_or(gens.len());

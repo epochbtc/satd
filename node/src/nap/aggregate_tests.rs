@@ -640,3 +640,28 @@ fn a_verified_entry_the_tip_will_not_judge_is_held_unjudged() {
     agg.on_tip(&chain);
     assert_eq!(agg.counting().len(), 1);
 }
+
+// --- The overall cap ------------------------------------------------------------
+
+#[test]
+fn a_full_set_refuses_new_pairs_and_still_takes_newer_attestations() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 3);
+    let (_d, path) = agg_path();
+    let c = Collector::new(Aggregate::open_with_max(path.clone(), &chain, 2).unwrap());
+    let page = vec![
+        attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR - 10),
+        attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR - 10),
+        attest(&chain, &s, outpoint(3), "k", "yes", ANCHOR - 10),
+    ];
+    let i = take(&c, &chain, "a", page);
+    assert_eq!((i.added, i.full), (2, 1), "the third pair does not fit");
+    // A newer attestation for a pair already held is still taken.
+    assert_eq!(take(&c, &chain, "a", vec![attest(&chain, &s, outpoint(1), "k", "no", ANCHOR)]).added, 1);
+    assert_eq!(counting(&c).len(), 2);
+    c.aggregate().save_if_dirty().unwrap();
+    // Reopened under a lower limit, the file keeps what fits.
+    let agg = Aggregate::open_with_max(path, &chain, 1).unwrap();
+    assert_eq!(agg.counting().len(), 1);
+    assert_eq!(agg.save_if_dirty(), Ok(true), "and is rewritten without the rest");
+}
