@@ -332,12 +332,12 @@ fn the_specification_test_vectors_hold() {
     let att_hex = "0193972ac465f8d2aae3b4a1e13197918b0950bde5f24ebc6da12517413bacb69101\
                    000000\
                    1367312e636f72652e7369676e6d65737361676503796573dbff0400ec5728d557\
-                   bb448c031fa48e28780b6e8286344a38ebea03c2aad0a1000000000241203a99bb92f8\
-                   5dc2b9b102e00f54dabaa4c175a0099e2e7ddabf07a6c8a1db96fb692d8bdc6e3e4166\
-                   0ffa1ce793c5f1b7b6674b1b87290541b238b16497cc1dd8";
+                   bb448c031fa48e28780b6e8286344a38ebea03c2aad0a10000000002411fbc70da4341\
+                   e515181c1ec146d2fb6a29908e7d078af25bdfe8e2d22da3401cf03a5f4a3511612d98\
+                   47021dbd59364eadfba029a5a6d089442e8bbc32cac86008";
     assert_eq!(hex::encode(att.to_bytes()), att_hex);
     assert_eq!(att.to_bytes().len(), 164);
-    assert_eq!(att.id().to_string(), "8f509c08438d2b0b897d0c9473eff739d6259c9b03b951984196a80dc2cf3c3c");
+    assert_eq!(att.id().to_string(), "196a69fcb0efc23124e0d7ef92323eb7d091df1e3d5f345d7316c397537cbac5");
 
     assert_eq!(hex::encode(req(None).to_bytes()), "000000000000");
     let cont = GetNapAtt {

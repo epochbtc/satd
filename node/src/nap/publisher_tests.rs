@@ -199,7 +199,7 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
 
     // D16: over 330 characters, a Coldcard cannot sign it.
     let long = "v".repeat(MAX_VALUE_LEN);
-    let draft = p.create(&chain, op, "a.long.key", &long).unwrap();
+    let draft = p.create(&chain, op, "a.much.longer.key", &long).unwrap();
     assert!(draft.message.len() > COLDCARD_MESSAGE_LIMIT);
     assert!(draft.warnings.iter().any(|w| w.contains("Coldcard")), "{:?}", draft.warnings);
 
