@@ -4,7 +4,8 @@
 //!
 //! 1. The anchor is the active chain's block at its height.
 //! 2. Fresh: `tip_height - anchor_height < FRESHNESS_WINDOW`.
-//! 3. The coin is in the UTXO set at the tip.
+//! 3. The coin is in the UTXO set at the tip, and holds at least
+//!    [`MIN_COIN_VALUE`].
 //! 4. The coin confirmed at or below `anchor_height - min_coin_age`:
 //!    [`MIN_COIN_AGE`] on mainnet, [`TEST_MIN_COIN_AGE`] on the test
 //!    networks, and at least [`COINBASE_MATURITY`] for a coinbase coin.
@@ -29,7 +30,8 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence};
 
 use super::{
-    Attestation, COINBASE_MATURITY, FRESHNESS_WINDOW, MIN_COIN_AGE, NapSignature, TEST_MIN_COIN_AGE,
+    Attestation, COINBASE_MATURITY, FRESHNESS_WINDOW, MIN_COIN_AGE, MIN_COIN_VALUE, NapSignature,
+    TEST_MIN_COIN_AGE,
 };
 use crate::bip322::{self, Proof, Verification};
 use crate::rpc::signmessage;
@@ -71,6 +73,8 @@ pub enum Rejection {
     Stale { age: u32 },
     #[error("coin is not in the UTXO set")]
     CoinNotFound,
+    #[error("coin holds {value} sats, less than the {min} an attesting coin needs")]
+    CoinTooSmall { value: u64, min: u64 },
     #[error(
         "coin confirmed at height {coin_height}, less than {min_age} blocks before the anchor at {anchor_height}"
     )]
@@ -92,6 +96,7 @@ impl Rejection {
             Rejection::AnchorNotOnChain => "anchor-not-on-chain",
             Rejection::Stale { .. } => "stale",
             Rejection::CoinNotFound => "coin-not-found",
+            Rejection::CoinTooSmall { .. } => "coin-too-small",
             Rejection::CoinTooYoung { .. } => "coin-too-young",
             Rejection::WrongFormat(_) => "wrong-format",
             Rejection::SignatureInvalid(_) => "signature-invalid",
@@ -134,8 +139,8 @@ pub fn evaluate(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Rejecti
     Ok(coin)
 }
 
-/// Rules 1–4: the anchor, freshness, and the coin and its age. Returns the
-/// coin.
+/// Rules 1–4: the anchor, freshness, and the coin, its value and its age.
+/// Returns the coin.
 pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Rejection> {
     let tip = view.tip_height();
     if view.block_hash(att.anchor_height()) != Some(att.anchor_hash()) {
@@ -146,8 +151,18 @@ pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Reje
         return Err(Rejection::Stale { age });
     }
     let coin = view.coin(&att.outpoint()).ok_or(Rejection::CoinNotFound)?;
+    check_coin_value(&coin)?;
     check_coin_age(view.network(), &coin, att.anchor_height())?;
     Ok(coin)
+}
+
+/// Rule 3's floor alone: `coin` holds at least [`MIN_COIN_VALUE`]. An
+/// outpoint's value never changes, so this holds or fails at every tip.
+pub fn check_coin_value(coin: &Coin) -> Result<(), Rejection> {
+    if coin.value < MIN_COIN_VALUE {
+        return Err(Rejection::CoinTooSmall { value: coin.value.to_sat(), min: MIN_COIN_VALUE.to_sat() });
+    }
+    Ok(())
 }
 
 /// The age `coin` must have at the anchor on `network`.

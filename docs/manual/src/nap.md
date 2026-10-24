@@ -73,6 +73,7 @@ An attestation is valid at a tip when:
 | The anchor is the active chain's block at that height | `anchor-not-on-chain` | A reorg replaced the anchor block. Sign again. |
 | `tip - anchor < 26,208` (about six months) | `stale` | Sign again with a new anchor. |
 | The coin is unspent | `coin-not-found` | A spent coin's attestation is dropped. |
+| The coin holds at least 10,000 sats, on every network | `coin-too-small` | A smaller coin cannot attest. Weight follows value, so a dust coin could not sway a count, but the floor keeps dust from filling an aggregator's set. |
 | The coin confirmed at least 4,032 blocks (about four weeks) before the anchor; 6 blocks on testnet, testnet4, signet and regtest | `coin-too-young` | A coin moved recently cannot attest yet. A coinbase coin also waits for coinbase maturity, 100 blocks. |
 | The signature verifies against the coin's scriptPubKey | `signature-invalid`, `signature-inconclusive`, `wrong-format` | |
 | A timelocked proof's locktime and relative lock are met at the next block | `not-yet-valid` | See below. |
@@ -106,7 +107,8 @@ ones.
    }
    ```
 
-   It checks that the coin exists and is old enough at the anchor. `formats`
+   It checks that the coin exists, holds at least 10,000 sats, and is old
+   enough at the anchor. `formats`
    lists the signature formats the coin's script takes, and `address` is the
    address to sign with. `psbt` is the same request as a PSBT, for signers
    that sign BIP 322 through one; an optional fourth argument, the coin's
