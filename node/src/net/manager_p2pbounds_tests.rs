@@ -1033,6 +1033,36 @@ mod nap_aggregator {
         assert!(puller.due(&addr(1).to_string(), Instant::now()), "still due, for the tick");
     }
 
+    #[tokio::test]
+    async fn only_connections_that_last_are_pulled() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        let brief = [(1, ConnType::AddrFetch), (2, ConnType::Feeler), (3, ConnType::BlockRelay)];
+        let lasting = [(4, ConnType::OutboundFullRelay), (5, ConnType::Manual), (6, ConnType::Inbound)];
+        let mut rxs: Vec<_> = brief.iter().chain(&lasting).map(|&(id, kind)| (id, peer_of(&pm, id, kind, publisher_services()))).collect();
+        for &(id, _) in brief.iter().chain(&lasting) {
+            pm.nap_peer_connected(id);
+        }
+        pm.nap_collection_tick(&puller).await;
+        for (id, rx) in &mut rxs {
+            let asked = !getnapatts(rx).is_empty();
+            assert_eq!(asked, *id >= 4, "peer {id}");
+            assert_eq!(puller.due(&addr(*id as u8).to_string(), Instant::now()), !asked, "peer {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_attestation_waits_out_ibd() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        crate::nap::pull_tests::defer_one(puller.collector());
+        pm.headers_tip.store(10_000, Ordering::Relaxed);
+        assert!(pm.is_ibd());
+        pm.nap_collection_tick(&puller).await;
+        assert_eq!(puller.collector().deferred_len(), 1, "behind the publishers, its anchor may not be on the chain yet");
+        pm.headers_tip.store(1, Ordering::Relaxed);
+        pm.nap_collection_tick(&puller).await;
+        assert_eq!(puller.collector().deferred_len(), 0, "synced, it is judged, and this chain does not hold its anchor");
+    }
+
     #[test]
     fn a_node_not_aggregating_asks_nobody() {
         let (pm, _dir) = mk_pm();

@@ -44,6 +44,10 @@ pub const MAX_PULL_CONNECTIONS: usize = 2;
 /// may add a page to the deferred queue past its room check, so this also
 /// bounds how far the queue can run over.
 pub const MAX_ACTIVE_PULLS: usize = 8;
+/// The most of those over inbound connections, whose peers chose to connect
+/// and state their own services: the rest are kept for publishers this node
+/// chose.
+pub const MAX_INBOUND_PULLS: usize = 4;
 /// The most pages one pull takes. A publisher serves one connection at most
 /// 200 MB an hour, which is 200 full pages; a pull that runs longer is a
 /// publisher streaming pages that cost nothing to pass over, and ends.
@@ -60,12 +64,22 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// A peer's id, as the peer manager numbers connections.
 pub type PeerId = u64;
 
+/// The connection a pull runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// Opened for the pull, and closed when it ends.
+    Pull,
+    /// An outbound connection this node keeps anyway.
+    Outbound,
+    /// A connection the peer opened.
+    Inbound,
+}
+
 /// One pull in progress.
 struct Active {
     /// The publisher's address, which deferred work and the statistics name.
     source: String,
-    /// Opened for this pull, and closed when it ends.
-    pull_connection: bool,
+    via: Via,
     /// When the request now outstanding was sent.
     sent_at: Instant,
     budget: PullBudget,
@@ -147,7 +161,7 @@ impl Puller {
     /// Pull connections open, or being opened, for pulls in progress.
     pub fn pull_connections(&self) -> usize {
         let st = self.state.lock();
-        st.active.values().filter(|a| a.pull_connection).count() + st.dialing.len()
+        st.active.values().filter(|a| a.via == Via::Pull).count() + st.dialing.len()
     }
 
     /// A pull connection to `source` is being opened. It counts as one of
@@ -175,8 +189,9 @@ impl Puller {
 
     /// Start a pull from `peer`, at `source`, if none is in progress with it
     /// and the deferred queue has room for a page: the `getnapatt` to send.
-    /// `pull_connection` says the connection was opened for it.
-    pub fn start(&self, peer: PeerId, source: &str, pull_connection: bool, now: Instant) -> Option<Vec<u8>> {
+    /// `via` says which connection it runs over; at most
+    /// [`MAX_INBOUND_PULLS`] run over inbound ones.
+    pub fn start(&self, peer: PeerId, source: &str, via: Via, now: Instant) -> Option<Vec<u8>> {
         if !self.collector.has_room() {
             return None;
         }
@@ -184,12 +199,15 @@ impl Puller {
         if st.active.contains_key(&peer) || st.active.len() >= MAX_ACTIVE_PULLS {
             return None;
         }
+        if via == Via::Inbound && st.active.values().filter(|a| a.via == Via::Inbound).count() >= MAX_INBOUND_PULLS {
+            return None;
+        }
         st.last_pull.insert(source.to_owned(), now);
         st.active.insert(
             peer,
             Active {
                 source: source.to_owned(),
-                pull_connection,
+                via,
                 sent_at: now,
                 budget: self.collector.pull_budget(),
                 pages: 0,
@@ -255,12 +273,12 @@ impl Puller {
                 Next::Continue(request(Some(cursor)))
             }
             Some(_) => {
-                let close = active.pull_connection;
+                let close = active.via == Via::Pull;
                 end(&mut st);
                 Next::Done { close }
             }
             None => {
-                let close = active.pull_connection;
+                let close = active.via == Via::Pull;
                 end(&mut st);
                 st.stats.pulls_completed += 1;
                 Next::Done { close }
@@ -277,7 +295,7 @@ impl Puller {
             .iter()
             // A page being taken has arrived; only its intake is running.
             .filter(|(_, a)| !a.taking && now.saturating_duration_since(a.sent_at) >= PULL_TIMEOUT)
-            .map(|(id, a)| (*id, a.pull_connection))
+            .map(|(id, a)| (*id, a.via == Via::Pull))
             .collect();
         for (id, _) in &late {
             st.active.remove(id);

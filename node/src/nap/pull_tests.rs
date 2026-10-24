@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::aggregate::Aggregate;
-use super::collect::{Collector, Limits};
+use super::collect::{Collector, Limits, PullBudget};
 use super::p2p::{GetNapAtt, NapAtt};
 use super::pull::*;
 use super::tests::*;
@@ -27,6 +27,16 @@ fn puller(chain: &Chain, limits: Limits) -> (tempfile::TempDir, Puller) {
     (dir, Puller::new(Arc::new(Collector::with_limits(agg, limits))))
 }
 
+/// Defer one attestation in `collector`, valid against a chain of its own
+/// that the peer manager's tests' chain does not hold.
+pub(crate) fn defer_one(collector: &Collector) {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let got = collector.intake(&chain, "a", vec![att], &mut PullBudget::empty(), Instant::now());
+    assert_eq!(got.deferred, 1);
+}
+
 fn page(atts: Vec<Attestation>, next: Option<bitcoin::OutPoint>) -> Vec<u8> {
     NapAtt { attestations: atts, next_cursor: next }.to_bytes()
 }
@@ -38,9 +48,9 @@ fn a_pull_asks_for_everything_and_one_runs_per_peer() {
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
     assert!(p.due("1.2.3.4:8333", now));
-    let req = p.start(7, "1.2.3.4:8333", false, now).expect("started");
+    let req = p.start(7, "1.2.3.4:8333", Via::Outbound, now).expect("started");
     assert_eq!(GetNapAtt::from_bytes(&req), Ok(GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None }));
-    assert_eq!(p.start(7, "1.2.3.4:8333", false, now), None, "one pull at a time per peer");
+    assert_eq!(p.start(7, "1.2.3.4:8333", Via::Outbound, now), None, "one pull at a time per peer");
     assert!(!p.due("1.2.3.4:8333", now), "not due again until the interval passes");
     assert!(p.due("1.2.3.4:8333", now + REPULL_INTERVAL));
 }
@@ -51,7 +61,7 @@ fn pages_continue_from_the_cursor_until_the_last() {
     let chain = chain_with(&s, 2);
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
-    p.start(7, "a", true, now).unwrap();
+    p.start(7, "a", Via::Pull, now).unwrap();
     let one = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     let two = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
     match p.on_napatt(&chain, 7, &page(vec![one], Some(outpoint(1))), now) {
@@ -82,7 +92,7 @@ fn a_malformed_page_or_a_bad_signature_is_misbehaviour() {
     let chain = chain_with(&s, 2);
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
-    p.start(7, "a", false, now).unwrap();
+    p.start(7, "a", Via::Outbound, now).unwrap();
     assert!(matches!(p.on_napatt(&chain, 7, &[0xff], now), Next::Misbehaved(_)));
     let one = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     let two = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
@@ -95,7 +105,7 @@ fn a_malformed_page_or_a_bad_signature_is_misbehaviour() {
         one.signature().clone(),
     )
     .unwrap();
-    p.start(8, "b", false, now).unwrap();
+    p.start(8, "b", Via::Outbound, now).unwrap();
     match p.on_napatt(&chain, 8, &page(vec![forged], None), now) {
         Next::Misbehaved(why) => assert!(why.contains("signature-invalid"), "{why}"),
         other => panic!("{other:?}"),
@@ -109,10 +119,10 @@ fn a_full_deferred_queue_ends_the_pull_and_starts_none() {
     let s = p2wpkh();
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits { max_deferred_bytes: 0, ..Limits::default() });
-    assert_eq!(p.start(7, "a", false, Instant::now()), None);
+    assert_eq!(p.start(7, "a", Via::Outbound, Instant::now()), None);
     let (_d, p) = puller(&chain, Limits { hourly_verifications: 0, max_deferred_bytes: super::p2p::MAX_NAPATT_SIZE, ..Limits::default() });
     let now = Instant::now();
-    p.start(7, "a", true, now).unwrap();
+    p.start(7, "a", Via::Pull, now).unwrap();
     let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     // The page is deferred, which leaves less than a page of room.
     assert_eq!(p.on_napatt(&chain, 7, &page(vec![att], Some(outpoint(1))), now), Next::Done { close: true });
@@ -125,8 +135,8 @@ fn a_silent_publisher_times_out() {
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits::default());
     let t0 = Instant::now();
-    p.start(7, "a", true, t0).unwrap();
-    p.start(8, "b", false, t0).unwrap();
+    p.start(7, "a", Via::Pull, t0).unwrap();
+    p.start(8, "b", Via::Outbound, t0).unwrap();
     assert!(p.expire(t0 + PULL_TIMEOUT / 2).is_empty());
     let mut late = p.expire(t0 + PULL_TIMEOUT);
     late.sort();
@@ -160,7 +170,7 @@ fn a_disconnected_peers_pull_is_forgotten() {
     let s = p2wpkh();
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits::default());
-    p.start(7, "a", false, Instant::now()).unwrap();
+    p.start(7, "a", Via::Outbound, Instant::now()).unwrap();
     p.forget(7);
     assert_eq!(p.active(), 0);
     let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
@@ -173,7 +183,7 @@ fn a_pull_ends_after_its_page_limit() {
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
-    p.start(7, "a", true, now).unwrap();
+    p.start(7, "a", Via::Pull, now).unwrap();
     // Pages that cost nothing to pass over, each promising another.
     let empty = page(vec![], Some(outpoint(1)));
     for n in 1..MAX_PULL_PAGES {
@@ -190,11 +200,11 @@ fn at_most_eight_pulls_run_at_once() {
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
     for peer in 0..MAX_ACTIVE_PULLS as u64 {
-        assert!(p.start(peer, &format!("p{peer}"), false, now).is_some());
+        assert!(p.start(peer, &format!("p{peer}"), Via::Outbound, now).is_some());
     }
-    assert_eq!(p.start(99, "p99", false, now), None);
+    assert_eq!(p.start(99, "p99", Via::Outbound, now), None);
     p.forget(0);
-    assert!(p.start(99, "p99", false, now).is_some(), "a slot freed is taken");
+    assert!(p.start(99, "p99", Via::Outbound, now).is_some(), "a slot freed is taken");
 }
 
 /// A chain that runs a hook during the first read: what another thread
@@ -219,7 +229,7 @@ fn a_peer_that_goes_while_its_page_is_taken_ends_its_pull() {
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
-    p.start(7, "a", true, now).unwrap();
+    p.start(7, "a", Via::Pull, now).unwrap();
     let hooked = Hooked { chain: &chain, hook: std::cell::RefCell::new(Some(Box::new(|| p.forget(7)))) };
     let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     // A page promising more, from a peer that disconnects meanwhile: the
@@ -235,11 +245,26 @@ fn a_page_whose_intake_panics_ends_its_pull() {
     let chain = chain_with(&s, 1);
     let (_d, p) = puller(&chain, Limits::default());
     let now = Instant::now();
-    p.start(7, "a", true, now).unwrap();
+    p.start(7, "a", Via::Pull, now).unwrap();
     let hooked = Hooked { chain: &chain, hook: std::cell::RefCell::new(Some(Box::new(|| panic!("intake failed")))) };
     let att = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
     let bytes = page(vec![att], Some(outpoint(1)));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.on_napatt(&hooked, 7, &bytes, now)));
     assert!(r.is_err());
     assert_eq!((p.active(), p.pull_connections()), (0, 0), "the slot is free again");
+}
+
+#[test]
+fn at_most_four_pulls_run_over_inbound_connections() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, p) = puller(&chain, Limits::default());
+    let now = Instant::now();
+    for peer in 0..MAX_INBOUND_PULLS as u64 {
+        assert!(p.start(peer, &format!("p{peer}"), Via::Inbound, now).is_some());
+    }
+    assert_eq!(p.start(50, "p50", Via::Inbound, now), None, "inbound peers choose to connect, and state their own services");
+    assert!(p.due("p50", now), "a refused pull is still due");
+    assert!(p.start(51, "p51", Via::Outbound, now).is_some(), "the rest are kept for publishers this node chose");
+    assert!(p.start(52, "p52", Via::Pull, now).is_some());
 }

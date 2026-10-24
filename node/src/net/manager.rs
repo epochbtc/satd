@@ -5922,6 +5922,9 @@ impl PeerManager {
         if pull_connection {
             puller.dial_ended(&source);
         }
+        let Some(via) = nap_pull_via(conn_type) else {
+            return;
+        };
         // Behind the publishers' tips, every anchor would fail on chain
         // state; the collection tick pulls the publisher once synced.
         if !pull_connection && self.is_ibd() {
@@ -5934,7 +5937,7 @@ impl PeerManager {
             }
             return;
         }
-        match puller.start(id, &source, pull_connection, Instant::now()) {
+        match puller.start(id, &source, via, Instant::now()) {
             Some(req) => {
                 tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
                 self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
@@ -6020,10 +6023,12 @@ impl PeerManager {
                 self.disconnect_by_id(id);
             }
         }
-        let (p, pm) = (puller.clone(), Arc::clone(self));
+        // Behind the publishers' tips, a deferred attestation's anchor may
+        // not be on the chain yet; it waits until the node is synced.
+        let (p, pm, ibd) = (puller.clone(), Arc::clone(self), self.is_ibd());
         let drained = tokio::task::spawn_blocking(move || {
             let collector = p.collector();
-            let bad = collector.drain_deferred(&*pm.chain_state, Instant::now());
+            let bad = if ibd { Vec::new() } else { collector.drain_deferred(&*pm.chain_state, Instant::now()) };
             if let Err(e) = collector.aggregate().save_if_dirty() {
                 tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
             }
@@ -6049,20 +6054,19 @@ impl PeerManager {
             return;
         }
         // Connected publishers that are due.
-        let connected: Vec<(PeerId, String)> = self
+        let connected: Vec<(PeerId, String, crate::nap::pull::Via)> = self
             .peers
             .read()
             .values()
-            .filter(|h| {
-                h.info.state == PeerState::Connected
-                    && h.info.conn_type != ConnType::NapPull
-                    && h.info.services.has(crate::nap::p2p::node_nap())
+            .filter(|h| h.info.state == PeerState::Connected && h.info.services.has(crate::nap::p2p::node_nap()))
+            .filter_map(|h| match nap_pull_via(h.info.conn_type)? {
+                crate::nap::pull::Via::Pull => None,
+                via => Some((h.info.id, h.info.addr_string(), via)),
             })
-            .map(|h| (h.info.id, h.info.addr_string()))
             .collect();
-        for (id, source) in connected {
+        for (id, source, via) in connected {
             if puller.due(&source, now)
-                && let Some(req) = puller.start(id, &source, false, now)
+                && let Some(req) = puller.start(id, &source, via, now)
             {
                 tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
                 self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
@@ -13454,6 +13458,20 @@ impl PeerManager {
 }
 
 /// Current Unix time in whole seconds (saturating; 0 before the epoch).
+/// The connection a NAP pull from a peer of this kind would run over, or
+/// `None` if none runs over it: an address-fetch or feeler connection closes
+/// at once, so a pull would die with it and wait an hour to be tried again,
+/// and a block-relay connection carries nothing but blocks.
+fn nap_pull_via(conn_type: ConnType) -> Option<crate::nap::pull::Via> {
+    use crate::nap::pull::Via;
+    match conn_type {
+        ConnType::NapPull => Some(Via::Pull),
+        ConnType::OutboundFullRelay | ConnType::Manual => Some(Via::Outbound),
+        ConnType::Inbound => Some(Via::Inbound),
+        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler => None,
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)

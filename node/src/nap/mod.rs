@@ -173,6 +173,6 @@ pub(crate) mod p2p_tests;
 #[cfg(test)]
 mod publisher_tests;
 #[cfg(test)]
-mod pull_tests;
+pub(crate) mod pull_tests;
 #[cfg(test)]
 mod tests;
