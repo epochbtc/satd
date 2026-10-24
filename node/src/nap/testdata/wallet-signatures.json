@@ -36,7 +36,7 @@
     "address": "tb1qjs83xm8n7lfxkap4eeds3g58sqetr07gpdj47u",
     "script_pubkey": "0014940f136cf3f7d26b7435ce5b08a2878032b1bfc8",
     "message": "NAP attestation v1\noutpoint: 37f17f1a4e9b1253103ab412c17ce6b12a4ce9c237fd94c29345e5ab4358de7f:1\nkey: g1.sparrow-2.5.5.p2wpkh\nvalue: yes\nanchor: 327522 00000002037bdc24f71de9e03edd0aa53103501a8fa4aa5f720cd9c8e051887a",
-    "signature": "smpAkcwRAIgOO9XWN2c0zvdiACRmAZ/uEjUO40xzyjVyF3ho7xkjcUCIGM2cORGuvMmoNC/w8buG147e3Gp1ymJyk1XgBPxafptASECuSiBFhPikyC6TWx4ugsyBEkCZbJgjUZC2nE32wldAG4=",
+    "signature": "smpAkcwRAIgeK2qI6r6Ni2NcGcjYgLzqd7uh8ieGOxNGSaz2Ba02OECIGcPj9GGV9l0O7DhprlkP3rXKwaQwHajaLkuDRQrtREoASECuSiBFhPikyC6TWx4ugsyBEkCZbJgjUZC2nE32wldAG4=",
     "format": "simple"
   },
   {
@@ -44,7 +44,7 @@
     "address": "tb1p3pnfq644s8g62ku6gwmy9d0ddyhplan03s62p3l0hq2ndaqhslwsfqymxn",
     "script_pubkey": "51208866906ab581d1a55b9a43b642b5ed692e1ff66f8c34a0c7efb81536f41787dd",
     "message": "NAP attestation v1\noutpoint: b030d57c6f9ce185960199ed1693d7ec884c1eee88b044c822992e9080a3a46f:0\nkey: g1.sparrow-2.5.5.p2tr\nvalue: yes\nanchor: 327535 000000111748b4ab0eefe3de1f81d554b7cff3e94772cf68491ca6fa2a83cbdf",
-    "signature": "smpAUF4fXt5wHJUxzgA0tXG2JksWeV08HTlonqBopfD8VnphI84Sni8gr3qm9ECOge8LUS++g66PshifN7AYgB+kurFAQ==",
+    "signature": "smpAUGlFdb39ENxduOGv2Re5KmMZiZIwDWsMRxbJ2mGjNYSrrI1A3yFx3X31/6piJaGmx489w+VOumhofMyKDaA2bcEAQ==",
     "format": "simple"
   }
 ]
