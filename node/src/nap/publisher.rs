@@ -25,7 +25,9 @@ use bitcoin::psbt::Psbt;
 use bitcoin::{Amount, BlockHash, OutPoint};
 use parking_lot::Mutex;
 
-use super::validity::{Timelocks, check_chain, check_coin_age, check_timelocks, verify_signature};
+use super::validity::{
+    Timelocks, check_chain, check_coin_age, check_coin_value, check_timelocks, verify_signature,
+};
 use super::{
     ANCHOR_DEPTH, Attestation, ChainView, Coin, FormatError, LEGACY_SIGNATURE_LEN,
     MAX_KEYS_PER_OUTPOINT, NapSignature, Rejection, message, store, supersedes,
@@ -204,7 +206,7 @@ impl Publisher {
 
     /// The message for `outpoint`, `key` and `value`, anchored
     /// [`ANCHOR_DEPTH`] blocks below the tip, after checking that the coin
-    /// exists and is old enough at that anchor.
+    /// exists, holds enough to attest, and is old enough at that anchor.
     pub fn create(
         &self,
         chain: &impl ChainSource,
@@ -223,6 +225,7 @@ impl Publisher {
         let (anchor_height, anchor_hash, coin, network) = read.ok_or(PublishError::ChainTooShort)?;
         let anchor_hash = anchor_hash.ok_or(PublishError::Busy)?;
         let coin = coin.ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
+        check_coin_value(&coin).map_err(PublishError::Rejected)?;
         check_coin_age(network, &coin, anchor_height).map_err(PublishError::Rejected)?;
 
         let text = message::render(&outpoint, key, value, anchor_height, &anchor_hash);

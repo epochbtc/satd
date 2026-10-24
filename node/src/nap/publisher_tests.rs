@@ -203,6 +203,14 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
     assert!(draft.message.len() > COLDCARD_MESSAGE_LIMIT);
     assert!(draft.warnings.iter().any(|w| w.contains("Coldcard")), "{:?}", draft.warnings);
 
+    // The coin must hold enough to attest.
+    let value = chain.coins[&op].value;
+    chain.coins.get_mut(&op).unwrap().value = MIN_COIN_VALUE - bitcoin::Amount::ONE_SAT;
+    assert_eq!(rule(p.create(&chain, op, "k", "v")), "coin-too-small");
+    chain.coins.get_mut(&op).unwrap().value = MIN_COIN_VALUE;
+    assert!(p.create(&chain, op, "k", "v").is_ok());
+    chain.coins.get_mut(&op).unwrap().value = value;
+
     // The coin must be old enough at the anchor, not at the tip.
     chain.coins.get_mut(&op).unwrap().height = TIP - ANCHOR_DEPTH - MIN_COIN_AGE + 1;
     assert_eq!(rule(p.create(&chain, op, "k", "v")), "coin-too-young");

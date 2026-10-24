@@ -402,6 +402,17 @@ fn freshness_boundary() {
 }
 
 #[test]
+fn a_coin_attests_from_ten_thousand_sats() {
+    let signer = p2wpkh();
+    let (mut chain, att) = setup(&signer, COIN_HEIGHT, ANCHOR);
+    chain.coins.get_mut(&att.outpoint()).unwrap().value = MIN_COIN_VALUE;
+    assert!(evaluate(&att, &chain).is_ok());
+    chain.coins.get_mut(&att.outpoint()).unwrap().value = MIN_COIN_VALUE - Amount::ONE_SAT;
+    assert_eq!(evaluate(&att, &chain), Err(Rejection::CoinTooSmall { value: 9_999, min: 10_000 }));
+    assert_eq!(Rejection::CoinTooSmall { value: 9_999, min: 10_000 }.rule(), "coin-too-small");
+}
+
+#[test]
 fn coin_age_boundary_at_the_anchor() {
     let signer = p2wpkh();
     let (chain, att) = setup(&signer, ANCHOR - MIN_COIN_AGE, ANCHOR);
@@ -559,6 +570,7 @@ fn chain_state_rejections_are_distinguished_from_bad_signatures() {
     ];
     assert!(chain_state.iter().all(Rejection::is_chain_state));
     let never = [
+        Rejection::CoinTooSmall { value: 1, min: 10_000 },
         Rejection::WrongFormat("x"),
         Rejection::SignatureInvalid("x".into()),
         Rejection::SignatureInconclusive("x".into()),
