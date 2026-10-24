@@ -566,3 +566,77 @@ fn a_pending_attestation_collected_again_is_saved_once() {
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1, "one entry in the file");
 }
+
+// --- Round 3 fixes ------------------------------------------------------------
+
+/// A chain that runs a hook during the first read, standing for whatever
+/// happens on another thread while a pass reads the chain.
+struct Hooked<'a> {
+    chain: &'a Chain,
+    hook: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+
+impl ChainSource for Hooked<'_> {
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        if let Some(hook) = self.hook.borrow_mut().take() {
+            hook();
+        }
+        Some(read(self.chain))
+    }
+}
+
+#[test]
+fn a_save_while_pending_entries_are_judged_keeps_them() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 2);
+    let (_d, path) = agg_path();
+    let waits = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        take(&c, &chain, "a", vec![waits]);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    let mut behind = chain_with(&s, 0);
+    behind.tip = COIN_HEIGHT - 1;
+    let agg = Aggregate::open(path.clone(), &behind).unwrap();
+    assert_eq!(pending_len(&agg), 1);
+    // Something else changes the set and saves while a tip pass is judging
+    // the pending entry, which still waits.
+    let other = attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR);
+    let hooked = Hooked {
+        chain: &behind,
+        hook: std::cell::RefCell::new(Some(Box::new(|| {
+            agg.insert(other, Default::default(), "b".into(), Ok(VALUE));
+            agg.save_if_dirty().unwrap();
+        }))),
+    };
+    agg.on_tip(&hooked);
+    let reopened = Aggregate::open(path, &behind).unwrap();
+    assert_eq!(pending_len(&reopened), 2, "the waiting entry is still in the file, with the new one");
+}
+
+#[test]
+fn a_verified_entry_the_tip_will_not_judge_is_held_unjudged() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 1);
+    let (_d, path) = agg_path();
+    {
+        let c = Collector::new(Aggregate::open(path.clone(), &chain).unwrap());
+        take(&c, &chain, "a", vec![attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR)]);
+        c.aggregate().save_if_dirty().unwrap();
+    }
+    // Reads the coin, then the tip moves on every judging read.
+    struct Flaky<'a>(&'a Chain, std::cell::Cell<u32>);
+    impl ChainSource for Flaky<'_> {
+        fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+            let n = self.1.get();
+            self.1.set(n + 1);
+            (n == 0).then(|| read(self.0))
+        }
+    }
+    let agg = Aggregate::open(path, &Flaky(&chain, std::cell::Cell::new(0))).unwrap();
+    assert_eq!((agg.len(), pending_len(&agg)), (1, 0), "held, not left to verify again");
+    assert!(agg.counting().is_empty(), "and not counted until judged");
+    agg.on_tip(&chain);
+    assert_eq!(agg.counting().len(), 1);
+}

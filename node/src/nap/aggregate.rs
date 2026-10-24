@@ -160,12 +160,13 @@ impl Aggregate {
     /// is one whose signature no longer verifies. The rest wait. Returns
     /// whether any was dropped.
     fn judge_pending(&self, chain: &impl ChainSource) -> bool {
-        let pending = std::mem::take(&mut self.state.lock().pending);
+        // Left in place while judged, so a save meanwhile still writes them.
+        let pending = self.state.lock().pending.clone();
         if pending.is_empty() {
             return false;
         }
         let mut dropped = false;
-        let mut waiting = Vec::new();
+        let mut decided = std::collections::HashSet::new();
         for (att, source) in pending {
             // The coin first, the signature outside the read (a read may run
             // more than once), then the chain rules at the tip.
@@ -186,14 +187,22 @@ impl Aggregate {
                 Err(p) => p,
                 Ok(script) => match verify_signature(&att, &script) {
                     Err(r) => Pending::Bad(r),
-                    Ok(locks) => match chain.read(&|v| judge(&att, &locks, v)) {
-                        Some(status) => Pending::Verified(locks, status),
-                        None => Pending::Wait,
-                    },
+                    // Verified; if the tip will not hold still for the
+                    // judging, it is held unjudged and the tip pass judges it.
+                    Ok(locks) => Pending::Verified(
+                        locks,
+                        chain
+                            .read(&|v| judge(&att, &locks, v))
+                            .unwrap_or(Err(Rejection::NotYetValid("not judged yet"))),
+                    ),
                 },
             };
+            if !matches!(outcome, Pending::Wait) {
+                decided.insert(att.id());
+            }
             match outcome {
-                Pending::Wait => waiting.push((att, source)),
+                // Still in `pending`, and in the file.
+                Pending::Wait => {}
                 Pending::Spent => dropped = true,
                 Pending::Verified(locks, status) => {
                     // A refusal (already held, too old, or a full outpoint, as
@@ -214,9 +223,8 @@ impl Aggregate {
                 }
             }
         }
-        // A pending entry still waiting is in the file already.
         let mut st = self.state.lock();
-        st.pending.extend(waiting);
+        st.pending.retain(|(a, _)| !decided.contains(&a.id()));
         st.dirty |= dropped;
         dropped
     }
