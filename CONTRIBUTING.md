@@ -113,6 +113,13 @@ are not required to. Verification details are in `SECURITY.md`.
   `scripts/fuzz/run-standalone-targets.sh` and need a job of their own).
   Run one locally with
   `SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh <target>`.
+- Coverage — the nightly `Coverage` workflow runs the unit, integration and
+  E2E suites under `cargo-llvm-cov` and posts a per-crate and per-`node`-module
+  table in its run summary, with the HTML report as an artifact. It gates
+  nothing. Use it to find code no test reaches. Locally,
+  `. scripts/ci/coverage-env.sh`, then the `cargo test` commands you want,
+  then `cargo llvm-cov report --html`; the script makes the satd processes
+  the regtest harness spawns count, which plain `cargo llvm-cov` misses.
 
 ## AI-assisted contributions
 

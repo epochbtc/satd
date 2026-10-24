@@ -1,0 +1,144 @@
+# Test coverage report: runs the same Rust tests as CI's `Tests (unit +
+# integration)` and `Tests (E2E)` jobs under cargo-llvm-cov, and publishes the
+# result as a per-crate table in the run summary, plus an HTML report and an
+# lcov file as artifacts.
+#
+# Report only. It gates nothing and sets no floor: line coverage counts code
+# that ran, not code a test checked, so a floor rewards running code over
+# asserting on it. What the table is for is finding the places tests do not
+# reach at all. Whether the tests that do reach code would notice it breaking
+# is the question mutation testing asks.
+#
+# Coverage includes the satd and sat-cli processes the regtest and E2E
+# harnesses spawn, although the harnesses SIGKILL them: see
+# scripts/ci/coverage-env.sh for how. The report step fails if `satd::main`
+# reads as never run, which is what losing them looks like.
+#
+# Nightly on master and on demand. A PR does not run it: an instrumented
+# build of the whole workspace roughly doubles the test jobs' time.
+
+name: Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly 02:40 UTC, clear of the fuzz, Core functional and Warnet jobs.
+    - cron: '40 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+# Not named CARGO_*: rust-cache folds CARGO_* and RUST* variables into its key,
+# and the restore below must match the key the test jobs use.
+env:
+  LLVM_COV_VERSION: '0.9.1'
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      # Same reason as ci.yml: the instrumented debug build plus the registry
+      # outgrow the ~14 GB a hosted runner has free.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      # The same toolchain step as ci.yml's test jobs, not dtolnay/rust-toolchain:
+      # that one exports CARGO_* variables, which rust-cache hashes into its key,
+      # so the `tests` cache restore below would miss.
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          components: llvm-tools-preview
+          override: true
+
+      # Restores the `tests` dependency build that `seed-cache` keeps on master
+      # and saves nothing. cargo-llvm-cov instruments only workspace crates, so
+      # the dependencies are reused; a cache of its own would cost several GB
+      # of the repository's 10 GB Actions cache and evict master's.
+      - name: Cache Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      # A prebuilt binary, as deny.yml installs cargo-deny.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-llvm-cov@${{ env.LLVM_COV_VERSION }}
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+
+      # The E2E parity test spawns this; without it the test skips itself.
+      - name: Build the Go parity dumper
+        working-directory: clients/go
+        run: go build -o "${{ runner.temp }}/paritydump" ./cmd/paritydump
+
+      # The environment and settings below match ci.yml's test jobs, so the
+      # report describes the suite CI runs. See ci.yml for why each is set.
+      - name: Run the tests under coverage
+        id: tests
+        env:
+          SATD_TEST_TIMEOUT_MULT: "2"
+          SATD_E2E_TIMEOUT_MULT: "3"
+          SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+          PARITYDUMP_BIN: ${{ runner.temp }}/paritydump
+        run: |
+          set -euo pipefail
+          . scripts/ci/coverage-env.sh
+          cargo llvm-cov clean --workspace
+          cargo build -p sat-cli --locked
+          RUST_TEST_THREADS=4 cargo test --all --locked
+          RUST_TEST_THREADS=1 cargo test --test e2e --locked --features e2e
+
+      # Written even when a test failed, so one flake does not cost the night's
+      # report. The job stays red, and the numbers then undercount whatever
+      # the failed test would have reached.
+      - name: Write the reports
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          . scripts/ci/coverage-env.sh
+          mkdir -p coverage
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          # Every regtest and E2E test starts satd, so a report in which its
+          # main() never ran has lost the spawned processes.
+          if ! grep -Eq '^FNDA:[1-9][0-9]*,_R[A-Za-z0-9_]*4satd4main$' coverage/lcov.info; then
+            echo "::error::satd::main has no hits: the spawned satd processes were not measured"
+            exit 1
+          fi
+          cargo llvm-cov report --html --output-dir coverage
+          cargo llvm-cov report --json --summary-only --output-path coverage/summary.json
+          python3 scripts/ci/coverage-summary.py coverage/summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the reports
+        if: always() && steps.tests.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
