@@ -70,7 +70,8 @@ if ! grep -qx -- "$LABEL" <<<"$names" &&
 fi
 existing=""
 if [ ${#labelled[@]} -gt 0 ]; then
-    existing=$(retry gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+    # A list that keeps failing files a possible duplicate rather than nothing.
+    existing=$(retry gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty') || existing=""
 fi
 if [ -n "$existing" ]; then
     echo "Commenting on existing issue #$existing ($LABEL)"
