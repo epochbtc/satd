@@ -45,14 +45,36 @@ if [ "${DRY_RUN:-}" = "1" ]; then
     exit 0
 fi
 
+# This is the last report a lost run gets, so a transient API error must not
+# drop it: each call is tried three times.
+retry() {
+    local i
+    for i in 1 2 3; do
+        "$@" && return 0
+        echo "attempt $i of: $* failed" >&2
+        [ "$i" -lt 3 ] && sleep $((i * 10))
+    done
+    return 1
+}
+
 # One open issue per label, as the workflows' own triage steps keep it:
-# comment on the open one, else open one.
-gh label create "$LABEL" --color "$LABEL_COLOR" --description "$LABEL_DESC" 2>/dev/null || true
-existing=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+# comment on the open one, else open one. A label that cannot be created
+# (it usually exists already) only costs the label: the issue is filed
+# without it rather than not at all.
+labelled=(--label "$LABEL")
+if ! gh label list --search "$LABEL" --json name --jq '.[].name' | grep -qx "$LABEL" &&
+   ! retry gh label create "$LABEL" --color "$LABEL_COLOR" --description "$LABEL_DESC"; then
+    echo "warning: could not create label $LABEL; filing without it" >&2
+    labelled=()
+fi
+existing=""
+if [ ${#labelled[@]} -gt 0 ]; then
+    existing=$(retry gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+fi
 if [ -n "$existing" ]; then
     echo "Commenting on existing issue #$existing ($LABEL)"
-    gh issue comment "$existing" --body "$body"
+    retry gh issue comment "$existing" --body "$body"
 else
     echo "Opening a new $LABEL issue"
-    gh issue create --label "$LABEL" --title "$TITLE ($today)" --body "$body"
+    retry gh issue create "${labelled[@]}" --title "$TITLE ($today)" --body "$body"
 fi

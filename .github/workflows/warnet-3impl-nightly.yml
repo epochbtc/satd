@@ -131,7 +131,7 @@ jobs:
         run: scripts/canary/warnet-3impl.sh
 
       - name: Upload logs
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: warnet-3impl-logs
@@ -141,9 +141,13 @@ jobs:
 
       - name: File or update the tracking issue
         id: triage
-        if: failure() && github.event_name == 'schedule'
+        # cancelled() too: a job that hits `timeout-minutes` is cancelled, not
+        # failed. The concurrency group never cancels a run, so a cancelled
+        # scheduled run is in practice a timeout.
+        if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
+          JOB_CANCELLED: ${{ job.status == 'cancelled' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           LOGS: ${{ runner.temp }}/warnet-logs
         run: |
@@ -168,6 +172,11 @@ jobs:
               "$RUN_URL" "$GITHUB_SHA" "$RBITCOIN_COMMIT" "${WARNET_CORE_IMAGE%%@*}" "$table")
             notify warnet-3impl-divergence B60205 "three-implementation Warnet rig: tanks diverged" \
               "Warnet three-implementation rig: tanks diverged ($today)" "$body"
+          elif [ "$JOB_CANCELLED" = "true" ]; then
+            body=$(printf 'The nightly three-implementation Warnet rig was cancelled before reaching a verdict, which for a scheduled run means it hit its `timeout-minutes`.\n\n- Run: %s\n- Commit: `%s`\n- rbitcoin: `%s`\n\nCompare the step times with an earlier green run to see which step grew.\n' \
+              "$RUN_URL" "$GITHUB_SHA" "$RBITCOIN_COMMIT")
+            notify warnet-3impl-broken FBCA04 "three-implementation Warnet rig is failing" \
+              "Warnet three-implementation rig timed out ($today)" "$body"
           else
             body=$(printf 'The nightly three-implementation Warnet rig failed before reaching a verdict.\n\n- Run: %s\n- Commit: `%s`\n- rbitcoin: `%s`\n\nCheck the run log; a moved or broken downstream is bumped or held in `scripts/canary/PINS`.\n' \
               "$RUN_URL" "$GITHUB_SHA" "$RBITCOIN_COMMIT")
@@ -183,15 +192,17 @@ jobs:
   # The triage step runs on the runner it reports on. When that runner is lost
   # ("The hosted runner lost communication with the server"), the step and the
   # log go with it and nothing is filed. This job runs on a fresh runner and
-  # files the "broken" issue for a failed or cancelled run whose triage step did
-  # not finish. Dispatched runs only print what would be filed.
+  # files the "broken" issue for a failed run whose triage step did not finish.
+  # A lost runner fails the job; a cancelled one is left to the triage step,
+  # which runs on cancellation and tells a timeout from a superseded run.
+  # Dispatched runs only print what would be filed.
   report-untriaged:
     name: report a run that ended before triage
     needs: three-impl
     if: >-
       always()
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      && (needs.three-impl.result == 'failure' || needs.three-impl.result == 'cancelled')
+      && needs.three-impl.result == 'failure'
       && needs.three-impl.outputs.triaged != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
