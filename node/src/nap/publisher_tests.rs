@@ -30,6 +30,27 @@ fn coin(chain: &mut Chain, signer: &Signer, n: u8) -> OutPoint {
     op
 }
 
+/// What the store on disk holds: the file with its journal applied, as the
+/// publisher opens it before judging anything.
+fn on_disk(path: &std::path::Path) -> Vec<Attestation> {
+    let opened = store::read(path).unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    for att in opened.base {
+        held.insert((att.outpoint(), att.key().to_owned()), att);
+    }
+    for record in opened.records {
+        match record {
+            store::Record::Put(att) => {
+                held.insert((att.outpoint(), att.key().to_owned()), att);
+            }
+            store::Record::Remove(outpoint, key) => {
+                held.remove(&(outpoint, key));
+            }
+        }
+    }
+    held.into_values().collect()
+}
+
 fn submit(p: &Publisher, chain: &Chain, att: &Attestation) -> Result<Option<sha256::Hash>, PublishError> {
     p.submit(chain, &att.message(), &encode_signature(att.signature())).map(|(_, replaced)| replaced)
 }
@@ -49,8 +70,9 @@ fn a_submitted_attestation_is_stored_and_survives_a_reload() {
     let p = Publisher::open(path.clone(), &chain).unwrap();
     assert_eq!(submit(&p, &chain, &att), Ok(None));
     assert_eq!(submit(&p, &chain, &legacy_att), Ok(None));
-    assert!(path.exists());
+    assert!(store::journal_path(&path).exists());
     assert!(!path.with_extension("dat.tmp").exists(), "no temporary file left behind");
+    assert!(!path.with_extension("journal.tmp").exists(), "no temporary file left behind");
 
     let p = Publisher::open(path, &chain).unwrap();
     let listed = p.list(&chain);
@@ -268,7 +290,7 @@ fn a_new_tip_drops_spent_coins_and_keeps_the_rest() {
     let listed = p.list(&chain);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].attestation, kept);
-    assert_eq!(store::load(&path).unwrap(), vec![kept], "the drop was written");
+    assert_eq!(on_disk(&path), vec![kept], "the drop was written");
 }
 
 #[test]
@@ -348,17 +370,18 @@ fn a_failed_write_changes_nothing() {
     let (mut chain, att) = setup(&signer, COIN_HEIGHT, ANCHOR);
     let op = coin(&mut chain, &signer, 8);
     let other = attest(&chain, &signer, op, "k", "v", ANCHOR);
+    store::save(&path, &store::encode([&att].into_iter())).unwrap();
     let p = Publisher::open(path.clone(), &chain).unwrap();
-    submit(&p, &chain, &att).unwrap();
-    // The store's path is a directory, so every write fails at the rename.
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
+    // The journal's path is a directory, so every write fails putting the
+    // journal in place.
+    std::fs::create_dir(store::journal_path(&path)).unwrap();
     assert_eq!(rule(submit(&p, &chain, &other)), "io");
     assert_eq!(rule(p.remove(att.outpoint(), att.key())), "io");
     let listed = p.list(&chain);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].attestation, att);
-    assert!(!path.with_extension("dat.tmp").exists(), "no temporary file left behind");
+    assert!(!path.with_extension("journal.tmp").exists(), "no temporary file left behind");
+    assert_eq!(store::load(&path).unwrap(), vec![att], "the file is as it was");
 }
 
 #[test]
@@ -435,7 +458,139 @@ fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
     assert!(!path.exists());
     assert!(p.list(&chain).is_empty());
     submit(&p, &chain, &att).unwrap();
-    assert_eq!(store::load(&path).unwrap(), vec![att]);
+    assert_eq!(on_disk(&path), vec![att]);
+}
+
+// --- The journal --------------------------------------------------------------
+
+/// `count` coins for one signer, each with an attestation.
+fn attested(chain: &mut Chain, count: u8) -> Vec<Attestation> {
+    let signer = p2wpkh();
+    (1..=count)
+        .map(|n| {
+            let op = coin(chain, &signer, n);
+            attest(chain, &signer, op, "k", "v", ANCHOR)
+        })
+        .collect()
+}
+
+#[test]
+fn a_change_appends_one_record_and_leaves_the_file_alone() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 30);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    let mut lens = vec![p.journal_len()];
+    for att in &atts {
+        submit(&p, &chain, att).unwrap();
+        lens.push(p.journal_len());
+    }
+    // Each submission grew the journal by one record (the first also by
+    // the journal's 40-byte header), as much for the thirtieth as for the
+    // first: no change rewrites what is stored. A DER signature's length
+    // varies by a byte.
+    let grew: Vec<u64> = lens.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(grew[1..].iter().all(|g| g.abs_diff(grew[1]) <= 1), "{grew:?}");
+    assert!(grew[0].abs_diff(grew[1] + 40) <= 1, "{grew:?}");
+    assert!(!path.exists(), "the file is written only when the journal is folded in");
+    assert_eq!(on_disk(&path), atts);
+    p.remove(atts[3].outpoint(), "k").unwrap();
+    let mut left = atts.clone();
+    left.remove(3);
+    assert_eq!(on_disk(&path), left);
+    let reopened = Publisher::open(path, &chain).unwrap().list(&chain);
+    assert_eq!(reopened.iter().map(|p| p.attestation.clone()).collect::<Vec<_>>(), left);
+}
+
+#[test]
+fn a_torn_last_record_is_dropped_and_the_journal_goes_on() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 3);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &atts[0]).unwrap();
+    submit(&p, &chain, &atts[1]).unwrap();
+    let whole = std::fs::read(store::journal_path(&path)).unwrap();
+    // A crash during the second append: its record cut short, or written
+    // whole but not its checksum.
+    let first_end = whole.len() - (whole.len() - 40) / 2;
+    for torn in [&whole[..whole.len() - 5], &whole[..first_end + 3]] {
+        std::fs::write(store::journal_path(&path), torn).unwrap();
+        let p = Publisher::open(path.clone(), &chain).unwrap();
+        assert_eq!(on_disk(&path), vec![atts[0].clone()]);
+        assert_eq!(std::fs::read(store::journal_path(&path)).unwrap(), whole[..first_end], "the torn end is cut off");
+        // The next change follows the last whole record.
+        submit(&p, &chain, &atts[2]).unwrap();
+        assert_eq!(on_disk(&path), vec![atts[0].clone(), atts[2].clone()]);
+    }
+}
+
+#[test]
+fn a_damaged_record_before_the_end_is_an_error_and_recovery_sets_both_files_aside() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 2);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &atts[0]).unwrap();
+    submit(&p, &chain, &atts[1]).unwrap();
+    drop(p);
+    let jpath = store::journal_path(&path);
+    let mut damaged = std::fs::read(&jpath).unwrap();
+    damaged[50] ^= 1;
+    std::fs::write(&jpath, &damaged).unwrap();
+    let err = Publisher::open(path.clone(), &chain).err().unwrap();
+    assert!(err.contains("checksum"), "{err}");
+    let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
+    let (aside, _) = aside.unwrap();
+    assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("attestations.journal.bad-"), "{aside:?}");
+    assert_eq!(std::fs::read(&aside).unwrap(), damaged, "kept as it was");
+    assert!(!jpath.exists());
+    assert!(p.list(&chain).is_empty());
+}
+
+#[test]
+fn a_journal_that_names_another_file_is_ignored() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 2);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &atts[0]).unwrap();
+    drop(p);
+    // A compaction that wrote the new file and crashed before starting the
+    // new journal: the file holds everything, and the old journal, which
+    // names no file, must not be applied over it.
+    store::save(&path, &store::encode([&atts[1]].into_iter())).unwrap();
+    assert_eq!(on_disk(&path), vec![atts[1].clone()]);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    assert_eq!(p.list(&chain).len(), 1);
+    // The first change after it starts a journal naming the file.
+    submit(&p, &chain, &atts[0]).unwrap();
+    assert_eq!(on_disk(&path), atts);
+}
+
+#[test]
+fn a_journal_that_outgrows_the_file_is_folded_into_it() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 20);
+    let p = Publisher::open(path.clone(), &chain).unwrap().with_compaction_at(1);
+    for att in &atts {
+        submit(&p, &chain, att).unwrap();
+    }
+    p.remove(atts[0].outpoint(), "k").unwrap();
+    // Folded in as it went: the journal never grows past the file.
+    let file = std::fs::metadata(&path).unwrap().len();
+    assert!(p.journal_len() <= file, "{} > {file}", p.journal_len());
+    assert_eq!(on_disk(&path), atts[1..]);
+    let reopened = Publisher::open(path.clone(), &chain).unwrap().list(&chain);
+    assert_eq!(reopened.iter().map(|p| p.attestation.clone()).collect::<Vec<_>>(), atts[1..]);
+    // Under the real threshold a store this small is never rewritten.
+    let (_dir, path) = store_path();
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    for att in &atts {
+        submit(&p, &chain, att).unwrap();
+    }
+    assert!(!path.exists());
 }
 
 /// A chain source that runs `hook` before its first read and gives up after
