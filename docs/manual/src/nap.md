@@ -419,7 +419,9 @@ each key, the weight behind each value. Weight is the coin's value, so one
 integer: weights in satoshis (`weight_sat`), and shares and coverage in parts
 per million, rounded down (`250000` is 25%). The report is computed once per
 tip and set and served again until either changes, so a dashboard can poll
-it.
+it. While collection keeps changing the set, a report on the same tip is
+served again for up to 30 seconds; its `digest` names the set it covers. A
+new block is always reported on afresh.
 
 ```text
 sat-cli getnapreport

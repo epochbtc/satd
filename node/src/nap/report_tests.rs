@@ -475,37 +475,70 @@ fn without_hard_links_an_export_writes_in_place_and_still_never_replaces() {
 fn a_cached_report_is_served_again_until_the_tip_or_the_set_changes() {
     let cache = Cache::default();
     let computed = std::cell::Cell::new(0);
+    let t0 = std::time::Instant::now();
+    let later = t0 + REPORT_REUSE;
     let tip = BlockHash::from_byte_array([1; 32]);
     let other = BlockHash::from_byte_array([2; 32]);
-    let ask = |tip: BlockHash, changes: u64| {
+    let ask = |tip: BlockHash, changes: u64, now| {
         cache
-            .get_or::<()>(tip, changes, || {
+            .get_or::<()>(tip, changes, now, || {
                 computed.set(computed.get() + 1);
                 Ok((tip, serde_json::json!({ "n": computed.get() })))
             })
             .unwrap()
     };
-    assert_eq!(ask(tip, 7)["n"], 1);
-    assert_eq!(ask(tip, 7)["n"], 1, "served again");
-    assert_eq!(ask(tip, 8)["n"], 2, "the set changed");
-    assert_eq!(ask(other, 8)["n"], 3, "the tip moved");
-    assert_eq!(ask(other, 8)["n"], 3);
+    assert_eq!(ask(tip, 7, t0)["n"], 1);
+    assert_eq!(ask(tip, 7, later)["n"], 1, "served again, however late, while nothing changed");
+    assert_eq!(ask(tip, 8, later)["n"], 2, "the set changed and the report is old");
+    assert_eq!(ask(other, 8, later)["n"], 3, "the tip moved");
+    assert_eq!(ask(other, 8, later)["n"], 3);
     assert_eq!(computed.get(), 3);
     // A failed computation is not cached.
-    assert!(cache.get_or(tip, 9, || Err::<(BlockHash, Value), _>("busy")).is_err());
-    assert_eq!(ask(tip, 9)["n"], 4);
+    assert!(cache.get_or(tip, 9, later, || Err::<(BlockHash, Value), _>("busy")).is_err());
+    assert_eq!(ask(tip, 9, later)["n"], 4);
+}
+
+#[test]
+fn a_changing_set_is_reported_on_at_most_once_per_reuse_interval() {
+    let cache = Cache::default();
+    let computed = std::cell::Cell::new(0);
+    let t0 = std::time::Instant::now();
+    let tip = BlockHash::from_byte_array([1; 32]);
+    let ask = |changes: u64, now| {
+        cache
+            .get_or::<()>(tip, changes, now, || {
+                computed.set(computed.get() + 1);
+                Ok((tip, serde_json::json!(computed.get())))
+            })
+            .unwrap()
+    };
+    // Collection changes the set before every call.
+    for (n, secs) in (0..30).enumerate() {
+        ask(n as u64, t0 + std::time::Duration::from_secs(secs));
+    }
+    assert_eq!(computed.get(), 1, "one report in the first interval");
+    ask(30, t0 + REPORT_REUSE);
+    assert_eq!(computed.get(), 2);
+    // A new tip is reported on at once.
+    cache.get_or::<()>(BlockHash::from_byte_array([2; 32]), 31, t0 + REPORT_REUSE, || {
+        computed.set(computed.get() + 1);
+        Ok((BlockHash::from_byte_array([2; 32]), serde_json::json!(0)))
+    })
+    .unwrap();
+    assert_eq!(computed.get(), 3);
 }
 
 #[test]
 fn a_cached_report_is_filed_under_the_tip_it_judged_at() {
     let cache = Cache::default();
+    let now = std::time::Instant::now();
     let asked = BlockHash::from_byte_array([1; 32]);
     let judged = BlockHash::from_byte_array([2; 32]);
     // The tip moved between the caller's read and the judging.
-    cache.get_or::<()>(asked, 1, || Ok((judged, serde_json::json!(1)))).unwrap();
-    let again = cache.get_or::<()>(asked, 1, || Ok((asked, serde_json::json!(2)))).unwrap();
+    cache.get_or::<()>(asked, 1, now, || Ok((judged, serde_json::json!(1)))).unwrap();
+    let again = cache.get_or::<()>(asked, 1, now, || Ok((asked, serde_json::json!(2)))).unwrap();
     assert_eq!(again, 2, "not served for a tip it was not judged at");
-    let at_judged = cache.get_or::<()>(asked, 1, || Ok((asked, serde_json::json!(3)))).unwrap();
+    let at_judged = cache.get_or::<()>(asked, 1, now, || Ok((asked, serde_json::json!(3)))).unwrap();
     assert_eq!(at_judged, 2);
 }
 

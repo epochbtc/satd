@@ -307,36 +307,48 @@ pub fn replay(chain: &impl ChainSource, atts: &[Attestation]) -> Option<Replay> 
     None
 }
 
-/// The last report on a live set: computed once per tip and set, however
-/// often it is asked for. Callers that ask while it is computed wait for it
-/// rather than computing it again.
+/// The last report on a live set: computed at most once per tip and set,
+/// however often it is asked for. While collection keeps changing the set,
+/// a report on the same tip is served again for [`REPORT_REUSE`] even so:
+/// it names the set it was computed from by its digest. Callers that ask
+/// while it is computed wait for it rather than computing it again.
 #[derive(Default)]
 pub struct Cache(parking_lot::Mutex<Option<Cached>>);
+
+/// How long a report on the current tip is served again although the set
+/// changed since. A new tip is always reported on afresh.
+pub const REPORT_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct Cached {
     tip: BlockHash,
     changes: u64,
+    at: std::time::Instant,
     report: Value,
 }
 
 impl Cache {
     /// The report at `tip` on the set as of `changes`
     /// ([`Aggregate::changes`](super::aggregate::Aggregate::changes)): the
-    /// cached one if it was computed for both, otherwise `compute`'s, which
+    /// cached one if it was computed at `tip` and for `changes`, or at `tip`
+    /// less than [`REPORT_REUSE`] before `now`; otherwise `compute`'s, which
     /// returns the tip it judged at and is cached under it. An error is not
     /// cached.
     pub fn get_or<E>(
         &self,
         tip: BlockHash,
         changes: u64,
+        now: std::time::Instant,
         compute: impl FnOnce() -> Result<(BlockHash, Value), E>,
     ) -> Result<Value, E> {
         let mut cached = self.0.lock();
-        if let Some(c) = cached.as_ref().filter(|c| c.tip == tip && c.changes == changes) {
+        let fresh = |c: &&Cached| {
+            c.tip == tip && (c.changes == changes || now.saturating_duration_since(c.at) < REPORT_REUSE)
+        };
+        if let Some(c) = cached.as_ref().filter(fresh) {
             return Ok(c.report.clone());
         }
         let (judged_at, report) = compute()?;
-        *cached = Some(Cached { tip: judged_at, changes, report: report.clone() });
+        *cached = Some(Cached { tip: judged_at, changes, at: now, report: report.clone() });
         Ok(report)
     }
 }

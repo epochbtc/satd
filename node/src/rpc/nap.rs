@@ -102,13 +102,14 @@ fn tip_kept_changing() -> ErrorObjectOwned {
 /// attestation held judged at the tip, with the digest of the set. The
 /// signatures verified when the attestations were collected, so this reads
 /// only the chain. It is computed once per tip and set, and served again
-/// until either changes, so asking often costs nothing.
+/// until either changes, or for [`report::REPORT_REUSE`] on the same tip
+/// while collection keeps changing the set, so asking often costs nothing.
 pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value, ErrorObjectOwned> {
     let aggregate = p.collector().aggregate();
     // Read before the set is: a change meanwhile is computed again next time.
     let changes = aggregate.changes();
     let tip = chain.read(&|v| v.block_hash(v.tip_height())).flatten().ok_or_else(tip_kept_changing)?;
-    p.report_cache().get_or(tip, changes, || {
+    p.report_cache().get_or(tip, changes, std::time::Instant::now(), || {
         let held: Vec<(Attestation, Timelocks)> =
             aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
         let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
