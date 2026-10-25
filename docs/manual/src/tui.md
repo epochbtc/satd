@@ -67,13 +67,13 @@ now. The TUI recovers on its own when polling resumes.
 
 ## Views
 
-There are four main views, plus a startup splash and three modal
-overlays.
+There are four main views, a fifth while the node has NAP on, plus a
+startup splash and three modal overlays.
 
 The active view is auto-selected from chain state (`is_ibd`): the IBD
 view during initial block download, the Steady view once synced. Press
-`1` / `2` / `3` / `4` to force a view. Press the same key again to
-return to auto-detect.
+`1` / `2` / `3` / `4` (and `5`, see [NAP view](#nap-view-5)) to force a
+view. Press the same key again to return to auto-detect.
 
 ### Startup splash
 
@@ -426,6 +426,54 @@ peer set or an unexpected dominant client.
 Trivia: subsidy era name, halving date, next halving block height.
 Light reading.
 
+### NAP view (`5`)
+
+The [Node Attestation Protocol](nap.md) as this node runs it. The view is
+offered only while the node has `nap=1`, `napaggregator=1`, or both: on
+any other node `5` does nothing, and neither the help screen nor the
+footer lists it. If the node restarts with both off, the TUI goes back to
+the automatic view. The TUI learns this from the replies to the two RPCs
+below, which it asks once the node is synced.
+
+It is the only report renderer satd ships. It shows what the node says
+and checks nothing itself.
+
+#### NAP panel
+
+- **Publisher**: `on` with how many attestations the node serves and how
+  many of them are valid at the tip, or `off`.
+- **Aggregator**: `on` with the tip the report was computed at, or `off`.
+- **Held / counting / invalid**: attestations the aggregator holds, the
+  ones that count at the tip, and those whose signatures failed.
+- **UTXO total**: the value of every coin at the tip, which coverage is a
+  part of; and the **digest** of the held set.
+
+#### Report
+
+From `getnapreport`. Each key in bold with its participating weight (in
+BTC), coverage and the weight of coins that withdrew from it; under it,
+its values, heaviest first, with each value's **share** of the key,
+weight, coverage and number of coins. Shares and coverage are the node's
+parts per million shown as percentages rounded down; weights are the
+node's satoshis shown as BTC with all eight decimals, so nothing is
+rounded through floating point.
+
+#### Breakdown
+
+For the value selected with `Up` / `Down`: its weight by coin value tier,
+anchor age, coin age and script type, each bucket as a share of the value
+with its coin count, and the share held by its 10 and 100 heaviest coins.
+
+#### Published
+
+From `listnapattestations`: the first six attestations the node serves,
+with outpoint, key, value, anchor height, the coin's value and `valid` or
+the rule the attestation fails.
+
+Keys and values are chosen by holders. satd accepts only printable ASCII
+in them, but the TUI does not count on the node it talks to: it draws
+anything else as `?`, so no escape sequence reaches the terminal.
+
 ## Modal overlays
 
 Modals are drawn over the active view. `Esc` or the toggle key closes
@@ -480,10 +528,11 @@ the modal reappears.
 | `2` | Steady view (or back to auto). |
 | `3` | Mempool view (or back to auto). |
 | `4` | Chain view (or back to auto). |
+| `5` | NAP view (or back to auto). Only while the node has NAP on. |
 | `a` | Acknowledge all visible warnings. |
 | `w` | Re-show dismissed warnings. |
 | `Esc` | Close Help or Reorg modal. |
-| `Up` / `Down` | Scroll peers (IBD / Steady / Chain) or top-N (Mempool). |
+| `Up` / `Down` | Scroll peers (IBD / Steady / Chain) or top-N (Mempool), or select a value (NAP). |
 
 ## Polling and refresh
 
@@ -495,7 +544,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset. |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

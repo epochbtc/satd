@@ -54,6 +54,9 @@ item below is (or will be) written up in full in the in-development
   `replaynapsnapshot` replays it on any node, byte for byte at the same
   tip.
 
+- `sat-tui` NAP view (`5`, only while the node has `-nap` or `-napaggregator`
+  on): what the node publishes and its `getnapreport` report, in BTC and
+  percentages, with each value's breakdowns.
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering

@@ -18,8 +18,8 @@ wallet and hands the signature to their node, which checks it, stores it and
 judges it again at every new block, and serves the valid ones to peers that
 ask. satd is also an aggregator: with `napaggregator=1` it collects the
 attestations publishers serve and keeps the ones that count (see
-[Aggregating](#aggregating)). Reports on the collected set are not in this
-build.
+[Aggregating](#aggregating)) and reports on them (see [Reports](#reports)).
+[`sat-tui`](tui.md#nap-view-5) shows both halves on key `5`.
 
 ## Enabling
 
