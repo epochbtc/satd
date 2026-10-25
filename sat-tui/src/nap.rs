@@ -25,7 +25,7 @@ pub enum Half<T> {
     /// No answer yet.
     #[default]
     Unknown,
-    /// Off on the node (or a node without NAP at all).
+    /// Off on the node.
     Off,
     /// On; the last answer.
     On(T),
@@ -46,11 +46,16 @@ pub enum Poll<T> {
     /// tip that kept moving). The half keeps what it had, and the failure
     /// is shown like any other RPC's.
     Failed(String),
+    /// The method is not served: a satd older than NAP, or any satd still
+    /// starting or reindexing, which answers every steady-state method so.
+    /// The two cannot be told apart, so the half keeps what it had and
+    /// nothing is recorded: a node without NAP never reaches `On`, and a
+    /// reindexing one keeps its view.
+    Unanswered,
 }
 
 /// Classify one NAP RPC result. `disabled` is the message satd gives when
-/// that half is off. A method the node does not know is off too: a satd
-/// older than NAP.
+/// that half is off.
 pub fn classify<T>(
     res: Result<Value, RpcError>,
     disabled: &str,
@@ -62,7 +67,7 @@ pub fn classify<T>(
             None => Poll::Failed("unexpected reply".into()),
         },
         Err(RpcError::Rpc { code: -1, message }) if message == disabled => Poll::Off,
-        Err(RpcError::Rpc { code, .. }) if code == JSONRPC_METHOD_NOT_FOUND => Poll::Off,
+        Err(RpcError::Rpc { code, .. }) if code == JSONRPC_METHOD_NOT_FOUND => Poll::Unanswered,
         Err(e) => Poll::Failed(e.to_string()),
     }
 }
@@ -293,8 +298,8 @@ pub(crate) mod tests {
         let parse = |_: &Value| Some(());
         assert!(matches!(classify(rpc(-1, PUBLISHER_DISABLED), PUBLISHER_DISABLED, parse), Poll::Off));
         assert!(matches!(classify(rpc(-1, AGGREGATOR_DISABLED), AGGREGATOR_DISABLED, parse), Poll::Off));
-        // An older satd has no NAP methods at all.
-        assert!(matches!(classify(rpc(JSONRPC_METHOD_NOT_FOUND, "Method not found"), PUBLISHER_DISABLED, parse), Poll::Off));
+        // An older satd, or one still reindexing: no answer either way.
+        assert!(matches!(classify(rpc(JSONRPC_METHOD_NOT_FOUND, "Method not found"), PUBLISHER_DISABLED, parse), Poll::Unanswered));
         // The other half's message, a busy node, a timeout: not off.
         assert!(matches!(classify(rpc(-1, AGGREGATOR_DISABLED), PUBLISHER_DISABLED, parse), Poll::Failed(_)));
         assert!(matches!(classify(rpc(-1, "the chain tip kept changing"), AGGREGATOR_DISABLED, parse), Poll::Failed(_)));

@@ -389,10 +389,22 @@ mod tests {
         st.update_nap_publisher(Poll::Failed("timed out".into()));
         assert_eq!(st.active_mode(), ViewMode::Nap);
         assert!(st.rpc_failures.contains_key("listnapattestations"));
+        // A node that stops serving the methods for a while (reindexing)
+        // keeps the view, and that is no failure either.
+        st.update_nap_publisher(Poll::Unanswered);
+        st.update_nap_report(Poll::Unanswered);
+        assert_eq!(st.active_mode(), ViewMode::Nap);
         // A node restarted with NAP off takes it away, and off is no failure.
         st.update_nap_publisher(Poll::Off);
         assert_ne!(st.active_mode(), ViewMode::Nap);
         assert!(st.rpc_failures.is_empty());
+        // A satd older than NAP never answers, so the view is never offered.
+        let mut old = AppState::new();
+        old.update_nap_publisher(Poll::Unanswered);
+        old.update_nap_report(Poll::Unanswered);
+        old.press_nap_key();
+        assert_ne!(old.active_mode(), ViewMode::Nap);
+        assert!(old.rpc_failures.is_empty());
     }
 
     #[test]

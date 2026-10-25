@@ -1752,6 +1752,7 @@ impl AppState {
             crate::nap::Poll::Failed(e) => {
                 failures.insert(method, e);
             }
+            crate::nap::Poll::Unanswered => {}
         }
     }
 
