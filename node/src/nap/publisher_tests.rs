@@ -199,7 +199,7 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
 
     // D16: over 330 characters, a Coldcard cannot sign it.
     let long = "v".repeat(MAX_VALUE_LEN);
-    let draft = p.create(&chain, op, "a.long.key", &long).unwrap();
+    let draft = p.create(&chain, op, "a.much.longer.key", &long).unwrap();
     assert!(draft.message.len() > COLDCARD_MESSAGE_LIMIT);
     assert!(draft.warnings.iter().any(|w| w.contains("Coldcard")), "{:?}", draft.warnings);
 
@@ -680,7 +680,7 @@ fn real_wallet_signatures_are_accepted() {
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
     let vectors = vectors.as_array().unwrap();
-    assert_eq!(vectors.len(), 7);
+    assert_eq!(vectors.len(), 6);
     for v in vectors {
         let field = |k: &str| v[k].as_str().unwrap();
         let (wallet, text, signature) = (field("wallet"), field("message"), field("signature"));

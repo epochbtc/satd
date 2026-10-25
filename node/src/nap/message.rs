@@ -1,7 +1,7 @@
 //! The signed message text.
 //!
 //! ```text
-//! satd NAP attestation v1
+//! NAP attestation v1
 //! outpoint: <txid>:<vout>
 //! key: <key>
 //! value: <value>
@@ -17,7 +17,7 @@ use bitcoin::{BlockHash, OutPoint};
 use super::{FormatError, MAX_KEY_LEN, MAX_VALUE_LEN};
 
 /// The first line.
-pub const HEADER: &str = "satd NAP attestation v1";
+pub const HEADER: &str = "NAP attestation v1";
 
 /// The fields of a parsed message.
 #[derive(Debug, Clone, PartialEq, Eq)]
