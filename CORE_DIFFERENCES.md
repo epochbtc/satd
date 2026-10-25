@@ -670,8 +670,8 @@ preserved; the satd extension is opt-in per request or per flag.
   holders' signed statements weighted by their coins, with `-nap=1` (off by
   default), and **`listnapaggregate`** lists those an aggregator collected,
   with `-napaggregator=1`. **`getnapreport`** reports on the collected set
-  and **`exportnapsnapshot`** exports it; `getnapreport` over an exported
-  snapshot needs no flag. Core has no equivalent. Without the flag they
+  and **`exportnapsnapshot`** exports it; **`replaynapsnapshot`** reports
+  on an exported snapshot and needs no flag. Core has no equivalent. Without the flag they
   answer -1. An aggregator's pulls from publishers it is not connected to
   run over connections `getpeerinfo` lists as `connection_type`
   `nap-pull`, a type Core does not have. See the manual's

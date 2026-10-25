@@ -417,7 +417,9 @@ is one per coin and key.
 each key, the weight behind each value. Weight is the coin's value, so one
 1 BTC coin weighs what a hundred 0.01 BTC coins do. Every number is an
 integer: weights in satoshis (`weight_sat`), and shares and coverage in parts
-per million, rounded down (`250000` is 25%).
+per million, rounded down (`250000` is 25%). The report is computed once per
+tip and set and served again until either changes, so a dashboard can poll
+it.
 
 ```text
 sat-cli getnapreport
@@ -484,7 +486,7 @@ sat-cli exportnapsnapshot nap-snapshot.dat
 ```
 
 A relative path is resolved against the datadir, as `dumptxoutset` does, and
-an existing file is not overwritten. `getnapreport "path"` reports on a
+an existing file is not overwritten. `replaynapsnapshot "path"` reports on a
 snapshot instead of the node's own set. It verifies every signature, and
 judges the set at this node's tip. Any node can do this, without
 `napaggregator`. At the same tip it gives the same bytes as the aggregator
@@ -503,16 +505,18 @@ node that does not aggregate.
 `createnapattestation`, `listnapattestations` and `listnapaggregate` change
 nothing and need `rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
 and `removenapattestation` decide what the node publishes and need
-`rpc:write`. `getnapreport` judges the whole set, and over a snapshot reads
-a file and verifies every signature in it. `exportnapsnapshot` writes a
-file. Both need `rpc:write` and are refused on the read-only listener, as
-`scantxoutset` and `dumptxoutset` are. See [Authentication & Authorization](authentication.md).
+`rpc:write`. `getnapreport` needs `rpc:read` and is allowed on the
+read-only listener: it is computed once per tip and set, however often it
+is asked. `replaynapsnapshot` reads a file and verifies every signature in
+it, and `exportnapsnapshot` writes a file. Both need `rpc:write` and are
+refused on the read-only listener, as `scantxoutset` and `dumptxoutset`
+are. See [Authentication & Authorization](authentication.md).
 
 | Error | Meaning |
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
-| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, `removenapattestation` found nothing to remove, a snapshot file does not read or is malformed, or `exportnapsnapshot`'s file exists. |
-| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`, `exportnapsnapshot` and `getnapreport` without a snapshot), the chain moved during the call (try again), or a snapshot could not be written. |
+| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, `removenapattestation` found nothing to remove, a snapshot file does not read or is malformed (`replaynapsnapshot`), or `exportnapsnapshot`'s file exists. |
+| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`, `getnapreport` and `exportnapsnapshot`), the chain moved during the call (try again), or a snapshot could not be written. |
 
 ## Privacy and key exposure
 

@@ -183,7 +183,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getmempoolsummary" => &[("top_n", false)],
         "getmininginfo" => &[],
         // SATD_ONLY: getnapreport
-        "getnapreport" => &[("snapshot", false)],
+        "getnapreport" => &[],
         "getnettotals" => &[],
         "getnetworkhashps" => &[("nblocks", false), ("height", false)],
         "getnetworkinfo" => &[],
@@ -232,6 +232,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "reconsiderblock" => &[("blockhash", false)],
         // SATD_ONLY: removenapattestation
         "removenapattestation" => &[("outpoint", false), ("key", false)],
+        // SATD_ONLY: replaynapsnapshot
+        "replaynapsnapshot" => &[("path", false)],
         "resumeindex" => &[("index_name", false)],
         "savemempool" => &[],
         "scantxoutset" => &[("action", false), ("scanobjects", false)],
@@ -371,7 +373,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "listquarantine", "loadtxoutset", "logging",
     "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
     "pruneblockchain",
-    "reconsiderblock", "removenapattestation", "resumeindex", "savemempool", "scantxoutset",
+    "reconsiderblock", "removenapattestation", "replaynapsnapshot", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
     "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
     "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",

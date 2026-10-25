@@ -44,6 +44,10 @@ const MAGIC: &[u8; 4] = b"NAPS";
 pub const SNAPSHOT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 4 + 4 + 4 + 32 + 4;
 const CHECKSUM_LEN: usize = 32;
+/// The fewest bytes an entry takes: its length and the smallest
+/// attestation (version, outpoint, a one-byte key, an empty value, the
+/// anchor, the format and an empty signature), well over this.
+pub(super) const MIN_ENTRY_LEN: usize = 64;
 
 /// Value tiers, by coin value in satoshis: each is below its bound, the
 /// last unbounded.
@@ -137,7 +141,7 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
         return Err(format!("the snapshot holds {count} attestations, more than the {max} this node takes"));
     }
     let mut rest = &body[HEADER_LEN..];
-    let mut out: Vec<Attestation> = Vec::with_capacity(count.min(rest.len()));
+    let mut out: Vec<Attestation> = Vec::with_capacity(room_for(count, rest.len()));
     let mut last: Option<sha256::Hash> = None;
     for i in 0..count {
         let len = encode::VarInt::consensus_decode(&mut rest).map_err(|e| format!("entry {i}: {e}"))?.0;
@@ -167,6 +171,13 @@ fn max_snapshot_len(max: usize) -> Option<u64> {
     (max != 0).then(|| {
         ((max as u64).saturating_mul((3 + MAX_ATTESTATION_SIZE) as u64)).saturating_add((HEADER_LEN + CHECKSUM_LEN) as u64)
     })
+}
+
+/// How many entries to reserve room for: those the file states, at most
+/// as many as `bytes` can hold. The count is the file's word, so with no
+/// limit a large one would otherwise reserve far more than the bytes fill.
+pub(super) fn room_for(count: usize, bytes: usize) -> usize {
+    count.min(bytes / MIN_ENTRY_LEN)
 }
 
 /// Read and parse the snapshot file at `path`, holding at most `max`
@@ -294,6 +305,40 @@ pub fn replay(chain: &impl ChainSource, atts: &[Attestation]) -> Option<Replay> 
         }
     }
     None
+}
+
+/// The last report on a live set: computed once per tip and set, however
+/// often it is asked for. Callers that ask while it is computed wait for it
+/// rather than computing it again.
+#[derive(Default)]
+pub struct Cache(parking_lot::Mutex<Option<Cached>>);
+
+struct Cached {
+    tip: BlockHash,
+    changes: u64,
+    report: Value,
+}
+
+impl Cache {
+    /// The report at `tip` on the set as of `changes`
+    /// ([`Aggregate::changes`](super::aggregate::Aggregate::changes)): the
+    /// cached one if it was computed for both, otherwise `compute`'s, which
+    /// returns the tip it judged at and is cached under it. An error is not
+    /// cached.
+    pub fn get_or<E>(
+        &self,
+        tip: BlockHash,
+        changes: u64,
+        compute: impl FnOnce() -> Result<(BlockHash, Value), E>,
+    ) -> Result<Value, E> {
+        let mut cached = self.0.lock();
+        if let Some(c) = cached.as_ref().filter(|c| c.tip == tip && c.changes == changes) {
+            return Ok(c.report.clone());
+        }
+        let (judged_at, report) = compute()?;
+        *cached = Some(Cached { tip: judged_at, changes, report: report.clone() });
+        Ok(report)
+    }
 }
 
 /// An attestation that counts, with its coin.

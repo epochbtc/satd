@@ -49,8 +49,10 @@ item below is (or will be) written up in full in the in-development
 - NAP reports: `getnapreport` gives each key's weight per value (in
   satoshis, shares in parts per million), with breakdowns by coin value,
   anchor age, coin age and script type, and the digest of the set it came
-  from; `exportnapsnapshot` writes that set to a file, and `getnapreport
-  "path"` replays it on any node, byte for byte at the same tip.
+  from, computed once per tip and set and allowed on the read-only
+  listener; `exportnapsnapshot` writes that set to a file, and
+  `replaynapsnapshot` replays it on any node, byte for byte at the same
+  tip.
 
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,

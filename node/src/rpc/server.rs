@@ -179,6 +179,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("listnapattestations", "Util"),
     ("pauseindex", "Util"),
     ("removenapattestation", "Util"),
+    ("replaynapsnapshot", "Util"),
     ("resumeindex", "Util"),
     ("signmessagewithprivkey", "Util"),
     ("submitnapattestation", "Util"),
@@ -4301,35 +4302,35 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(aggregator, &ctx.chain_state))
     })?;
 
-    // A report judges every attestation held at the tip, and over a
-    // snapshot verifies every signature: off the RPC threads, as
-    // `scantxoutset` is.
+    // A report judges every attestation held at the tip, once per tip and
+    // set, and a replay verifies every signature in a file: off the RPC
+    // threads, as `scantxoutset` is.
     module.register_async_method("getnapreport", |params, ctx, _extensions| async move {
-        let mut args = Args::new(&params);
-        let snapshot: Option<String> = args.optional("snapshot")?;
-        args.check()?;
-        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        Args::new(&params).check()?;
         let aggregator = ctx.nap_aggregator.clone();
-        let path = match snapshot {
-            Some(p) => Some(resolve_datadir_path(&ctx, &p)?),
-            None => {
-                crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
-                None
-            }
-        };
-        tokio::task::spawn_blocking(move || match path {
-            // A replay takes as many attestations as this node's own set
-            // may hold, or the default if it aggregates nothing.
-            Some(path) => {
-                let max = aggregator.as_deref().map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
-                    p.collector().aggregate().max_attestations()
-                });
-                crate::rpc::nap::report_snapshot(&chain, &path, max)
-            }
-            None => crate::rpc::nap::report(aggregator.as_deref().expect("checked above"), &chain),
+        crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        tokio::task::spawn_blocking(move || {
+            crate::rpc::nap::report(aggregator.as_deref().expect("checked above"), &chain)
         })
         .await
         .map_err(|e| ErrorObjectOwned::owned(-32603, format!("report task failed: {e}"), None::<()>))?
+    })?;
+
+    module.register_async_method("replaynapsnapshot", |params, ctx, _extensions| async move {
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        args.check()?;
+        let path = resolve_datadir_path(&ctx, &path)?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        // A replay takes as many attestations as this node's own set may
+        // hold, or the default if it aggregates nothing.
+        let max = ctx.nap_aggregator.as_deref().map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
+            p.collector().aggregate().max_attestations()
+        });
+        tokio::task::spawn_blocking(move || crate::rpc::nap::report_snapshot(&chain, &path, max))
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("replay task failed: {e}"), None::<()>))?
     })?;
 
     module.register_async_method("exportnapsnapshot", |params, ctx, _extensions| async move {

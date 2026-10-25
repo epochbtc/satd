@@ -1,9 +1,9 @@
 //! The NAP RPCs, satd's own. The publisher's, `createnapattestation`,
 //! `submitnapattestation`, `listnapattestations` and
 //! `removenapattestation`, answer an error unless the node runs with
-//! `-nap=1`; the aggregator's, `listnapaggregate`, `exportnapsnapshot` and
-//! `getnapreport`, unless it runs with `-napaggregator=1`. `getnapreport`
-//! over a snapshot file needs only the chain.
+//! `-nap=1`; the aggregator's, `listnapaggregate`, `getnapreport` and
+//! `exportnapsnapshot`, unless it runs with `-napaggregator=1`.
+//! `replaynapsnapshot` reports on a snapshot file and needs only the chain.
 
 use std::path::Path;
 use std::str::FromStr as _;
@@ -98,21 +98,29 @@ fn tip_kept_changing() -> ErrorObjectOwned {
         .into_error_object()
 }
 
-/// `getnapreport` over the aggregator's own set: every attestation held,
-/// judged at the tip, with the digest of the set. The signatures verified
-/// when the attestations were collected, so this reads only the chain.
+/// `getnapreport`: the report on the aggregator's own set, every
+/// attestation held judged at the tip, with the digest of the set. The
+/// signatures verified when the attestations were collected, so this reads
+/// only the chain. It is computed once per tip and set, and served again
+/// until either changes, so asking often costs nothing.
 pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value, ErrorObjectOwned> {
-    let held: Vec<(Attestation, Timelocks)> =
-        p.collector().aggregate().all().into_iter().map(|h| (h.attestation, h.locks)).collect();
-    let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
-    let digest = report::digest(&set);
-    let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
-    Ok(report::report(tip, digest, set.len(), 0, &counting))
+    let aggregate = p.collector().aggregate();
+    // Read before the set is: a change meanwhile is computed again next time.
+    let changes = aggregate.changes();
+    let tip = chain.read(&|v| v.block_hash(v.tip_height())).flatten().ok_or_else(tip_kept_changing)?;
+    p.report_cache().get_or(tip, changes, || {
+        let held: Vec<(Attestation, Timelocks)> =
+            aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
+        let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
+        let digest = report::digest(&set);
+        let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
+        Ok((tip.hash, report::report(tip, digest, set.len(), 0, &counting)))
+    })
 }
 
-/// `getnapreport` over a snapshot file: each signature is verified against
-/// its coin, and the set judged at this node's tip, as the aggregator that
-/// exported it would at the same tip ([`report::replay`]). `max` bounds the
+/// `replaynapsnapshot`: the report on a snapshot file. Each signature is
+/// verified against its coin, and the set judged at this node's tip, as the
+/// aggregator that exported it would at the same tip ([`report::replay`]). `max` bounds the
 /// attestations read (0 is no limit).
 pub fn report_snapshot(chain: &ChainState, path: &Path, max: usize) -> Result<Value, ErrorObjectOwned> {
     let snapshot = report::read_snapshot(path, max)

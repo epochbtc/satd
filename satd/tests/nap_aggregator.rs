@@ -262,8 +262,8 @@ fn nap_report_replays_byte_for_byte_from_an_exported_snapshot() {
 
     // The replay, at the same tip, on the aggregator and on a node that
     // aggregates nothing: the same bytes.
-    let replayed = c.rpc_ok("getnapreport", vec![json!(path)]);
-    let elsewhere = a.rpc_ok("getnapreport", vec![json!(path)]);
+    let replayed = c.rpc_ok("replaynapsnapshot", vec![json!(path)]);
+    let elsewhere = a.rpc_ok("replaynapsnapshot", vec![json!(path)]);
     let bytes = serde_json::to_string(&live).unwrap();
     assert_eq!(serde_json::to_string(&replayed).unwrap(), bytes);
     assert_eq!(serde_json::to_string(&elsewhere).unwrap(), bytes);
@@ -271,7 +271,16 @@ fn nap_report_replays_byte_for_byte_from_an_exported_snapshot() {
     // Without the aggregator, only a snapshot can be reported on.
     assert_eq!(refused(&a, "getnapreport", vec![]), -1);
     assert_eq!(refused(&a, "exportnapsnapshot", vec![json!("x.dat")]), -1);
-    assert_eq!(refused(&a, "getnapreport", vec![json!("no-such-file.dat")]), -8);
+    assert_eq!(refused(&a, "replaynapsnapshot", vec![json!("no-such-file.dat")]), -8);
+
+    // The live report, asked again, is the one computed; a new block makes
+    // a new one.
+    assert_eq!(c.rpc_ok("getnapreport", vec![]), live);
+    a.mine_blocks(1, BURN);
+    synced(&[&a, &c]);
+    let next = c.rpc_ok("getnapreport", vec![]);
+    assert_eq!(next["height"], height(&c));
+    assert_ne!(next["hash"], live["hash"]);
 
     a.stop();
 }

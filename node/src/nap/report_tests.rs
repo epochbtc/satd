@@ -468,3 +468,66 @@ fn without_hard_links_an_export_writes_in_place_and_still_never_replaces() {
     assert!(write_new_linking(&dir.path().join("b.dat"), b"x", other).is_err());
     assert!(!dir.path().join("b.dat").exists());
 }
+
+// --- Read-only reports and the snapshot buffer ----------------------------------
+
+#[test]
+fn a_cached_report_is_served_again_until_the_tip_or_the_set_changes() {
+    let cache = Cache::default();
+    let computed = std::cell::Cell::new(0);
+    let tip = BlockHash::from_byte_array([1; 32]);
+    let other = BlockHash::from_byte_array([2; 32]);
+    let ask = |tip: BlockHash, changes: u64| {
+        cache
+            .get_or::<()>(tip, changes, || {
+                computed.set(computed.get() + 1);
+                Ok((tip, serde_json::json!({ "n": computed.get() })))
+            })
+            .unwrap()
+    };
+    assert_eq!(ask(tip, 7)["n"], 1);
+    assert_eq!(ask(tip, 7)["n"], 1, "served again");
+    assert_eq!(ask(tip, 8)["n"], 2, "the set changed");
+    assert_eq!(ask(other, 8)["n"], 3, "the tip moved");
+    assert_eq!(ask(other, 8)["n"], 3);
+    assert_eq!(computed.get(), 3);
+    // A failed computation is not cached.
+    assert!(cache.get_or(tip, 9, || Err::<(BlockHash, Value), _>("busy")).is_err());
+    assert_eq!(ask(tip, 9)["n"], 4);
+}
+
+#[test]
+fn a_cached_report_is_filed_under_the_tip_it_judged_at() {
+    let cache = Cache::default();
+    let asked = BlockHash::from_byte_array([1; 32]);
+    let judged = BlockHash::from_byte_array([2; 32]);
+    // The tip moved between the caller's read and the judging.
+    cache.get_or::<()>(asked, 1, || Ok((judged, serde_json::json!(1)))).unwrap();
+    let again = cache.get_or::<()>(asked, 1, || Ok((asked, serde_json::json!(2)))).unwrap();
+    assert_eq!(again, 2, "not served for a tip it was not judged at");
+    let at_judged = cache.get_or::<()>(asked, 1, || Ok((asked, serde_json::json!(3)))).unwrap();
+    assert_eq!(at_judged, 2);
+}
+
+#[test]
+fn the_smallest_entry_is_at_least_min_entry_len() {
+    let att = Attestation::new(
+        outpoint(1),
+        "k".into(),
+        String::new(),
+        ANCHOR,
+        BlockHash::all_zeros(),
+        NapSignature::Simple(bitcoin::Witness::new()),
+    )
+    .unwrap();
+    // Its length prefix is one byte.
+    assert!(1 + att.to_bytes().len() >= report::MIN_ENTRY_LEN, "{}", att.to_bytes().len());
+}
+
+#[test]
+fn a_snapshot_reserves_room_only_for_the_entries_its_bytes_can_hold() {
+    // A file that claims u32::MAX entries in a megabyte.
+    assert_eq!(report::room_for(u32::MAX as usize, 1_000_000), 1_000_000 / report::MIN_ENTRY_LEN);
+    assert_eq!(report::room_for(3, 1_000_000), 3);
+    assert_eq!(report::room_for(5, 10), 0);
+}
