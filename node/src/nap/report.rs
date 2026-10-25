@@ -164,7 +164,9 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
 /// limit): the header, the checksum, and `max` entries at the largest size,
 /// whose length prefix is three bytes.
 fn max_snapshot_len(max: usize) -> Option<u64> {
-    (max != 0).then(|| (HEADER_LEN + CHECKSUM_LEN) as u64 + max as u64 * (3 + MAX_ATTESTATION_SIZE) as u64)
+    (max != 0).then(|| {
+        ((max as u64).saturating_mul((3 + MAX_ATTESTATION_SIZE) as u64)).saturating_add((HEADER_LEN + CHECKSUM_LEN) as u64)
+    })
 }
 
 /// Read and parse the snapshot file at `path`, holding at most `max`
@@ -175,7 +177,7 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
     let mut bytes = Vec::new();
     match max_snapshot_len(max) {
         Some(limit) => {
-            file.take(limit + 1).read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            file.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
             if bytes.len() as u64 > limit {
                 return Err(format!(
                     "{}: the file is longer than a snapshot of {max} attestations can be",
@@ -191,19 +193,25 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
     decode_snapshot(&bytes, max).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Write `bytes` to `path`, which must not exist: the check and the
-/// creation are one step, so a file made meanwhile is never replaced, and
-/// no temporary file is shared with another writer. A failed write leaves
-/// no file behind.
+/// Write `bytes` to `path`, which must not exist. They go to a temporary
+/// file of this writer's own, synced, which is then linked to `path`: the
+/// link fails if `path` exists, so a file made meanwhile is never replaced,
+/// and `path` appears only whole, so a crash leaves at most a stray
+/// temporary, never a partial file that blocks the next export.
 pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    if written.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("the path names no file"))?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{seq}.tmp", name.to_string_lossy(), std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::hard_link(&tmp, path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
     written
 }
 

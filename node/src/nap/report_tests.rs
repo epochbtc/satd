@@ -433,6 +433,8 @@ fn a_snapshot_file_too_long_for_its_limit_is_refused_before_it_is_read() {
     std::fs::write(&long, vec![0u8; 4 + 4 + 4 + 32 + 4 + 32 + 3 + MAX_ATTESTATION_SIZE + 1]).unwrap();
     assert!(read_snapshot(&long, 1).unwrap_err().contains("longer than a snapshot of 1"));
     assert!(read_snapshot(&dir.path().join("missing.dat"), 1).unwrap_err().contains("reading"));
+    // A limit too large to multiply out is no limit, not a panic.
+    assert_eq!(read_snapshot(&good, usize::MAX).unwrap().attestations, set);
 }
 
 #[test]
