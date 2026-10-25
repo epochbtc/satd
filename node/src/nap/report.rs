@@ -197,21 +197,56 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
 /// file of this writer's own, synced, which is then linked to `path`: the
 /// link fails if `path` exists, so a file made meanwhile is never replaced,
 /// and `path` appears only whole, so a crash leaves at most a stray
-/// temporary, never a partial file that blocks the next export.
+/// temporary, never a partial file that blocks the next export. On a
+/// filesystem without hard links the bytes are written to `path` directly,
+/// created only if it does not exist: never replacing a file, though a
+/// crash then can leave a partial one. The directory is synced, so the name
+/// outlives a power loss.
 pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_new_linking(path, bytes, |from, to| std::fs::hard_link(from, to))
+}
+
+/// [`write_new`], with the link step given: tests stand in a filesystem
+/// without hard links.
+pub(super) fn write_new_linking(
+    path: &Path,
+    bytes: &[u8],
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().ok_or_else(|| std::io::Error::other("the path names no file"))?;
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{}.{}.{seq}.tmp", name.to_string_lossy(), std::process::id()));
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::hard_link(&tmp, path)
-    })();
+    let linked = write_synced(&tmp, bytes).and_then(|()| link(&tmp, path));
     let _ = std::fs::remove_file(&tmp);
+    match linked {
+        // `link(2)` fails with EPERM (PermissionDenied) on a filesystem
+        // without hard links, such as FAT and exFAT. A real permission
+        // problem fails the direct write the same way.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied) => {
+            write_synced(path, bytes)?
+        }
+        other => other?,
+    }
+    // Directories cannot be opened for syncing on every platform; the file
+    // itself is already synced.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Create `path`, which must not exist, with `bytes`, synced. A failed
+/// write removes the file it created; a file it did not create is never
+/// touched.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
     written
 }
 

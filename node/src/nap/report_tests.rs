@@ -448,3 +448,23 @@ fn an_export_never_replaces_a_file_and_leaves_no_temporary() {
     let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(names, ["snap.dat"]);
 }
+
+#[test]
+fn without_hard_links_an_export_writes_in_place_and_still_never_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snap.dat");
+    let no_links = |_: &std::path::Path, _: &std::path::Path| {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    };
+    write_new_linking(&path, b"first", no_links).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    let err = write_new_linking(&path, b"second", no_links).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["snap.dat"], "no temporary is left");
+    // Any other link failure is the export's.
+    let other = |_: &std::path::Path, _: &std::path::Path| Err(std::io::Error::other("disk on fire"));
+    assert!(write_new_linking(&dir.path().join("b.dat"), b"x", other).is_err());
+    assert!(!dir.path().join("b.dat").exists());
+}
