@@ -19,7 +19,7 @@ use crate::chain::state::ChainState;
 use crate::nap::publisher::{Published, encode_signature};
 use crate::nap::publisher::ChainSource as _;
 use crate::nap::report;
-use crate::nap::validity::{Timelocks, verify_signature};
+use crate::nap::validity::Timelocks;
 use crate::nap::{Attestation, NapSignature, PublishError, Publisher};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::error::RpcError;
@@ -112,33 +112,14 @@ pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value,
 
 /// `getnapreport` over a snapshot file: each signature is verified against
 /// its coin, and the set judged at this node's tip, as the aggregator that
-/// exported it would at the same tip. An attestation whose coin is not in
-/// the UTXO set cannot count and is not verified; one whose signature fails
-/// counts as `invalid`. `max` bounds the attestations read (0 is no limit).
+/// exported it would at the same tip ([`report::replay`]). `max` bounds the
+/// attestations read (0 is no limit).
 pub fn report_snapshot(chain: &ChainState, path: &Path, max: usize) -> Result<Value, ErrorObjectOwned> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        RpcError::new(-8, "storage.io", format!("reading {}: {e}", path.display())).into_error_object()
-    })?;
-    let snapshot = report::decode_snapshot(&bytes, max).map_err(|e| {
-        RpcError::new(-8, "rpc.input.parse", format!("{}: {e}", path.display())).into_error_object()
-    })?;
-    // A coin's scriptPubKey never changes for its outpoint, so the scripts
-    // read here judge the signatures at any later tip.
-    let scripts: Vec<Option<ScriptBuf>> = chain
-        .read(&|v| snapshot.attestations.iter().map(|a| v.coin(&a.outpoint()).map(|c| c.script_pubkey)).collect())
-        .ok_or_else(tip_kept_changing)?;
-    let mut held = Vec::with_capacity(snapshot.attestations.len());
-    let mut invalid = 0;
-    for (att, script) in snapshot.attestations.iter().zip(scripts) {
-        let Some(script) = script else { continue };
-        match verify_signature(att, &script) {
-            Ok(locks) => held.push((att.clone(), locks)),
-            Err(_) => invalid += 1,
-        }
-    }
+    let snapshot = report::read_snapshot(path, max)
+        .map_err(|e| RpcError::new(-8, "rpc.input.parse", e).into_error_object())?;
+    let replay = report::replay(chain, &snapshot.attestations).ok_or_else(tip_kept_changing)?;
     let digest = report::digest(&snapshot.attestations);
-    let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
-    Ok(report::report(tip, digest, snapshot.attestations.len(), invalid, &counting))
+    Ok(report::report(replay.tip, digest, snapshot.attestations.len(), replay.invalid, &replay.counting))
 }
 
 /// `exportnapsnapshot`: write every attestation the aggregator holds to
@@ -148,14 +129,6 @@ pub fn export_snapshot(
     chain: &ChainState,
     path: &Path,
 ) -> Result<Value, ErrorObjectOwned> {
-    if path.exists() {
-        return Err(RpcError::new(
-            -8,
-            "storage.exists",
-            format!("refusing to overwrite existing file: {}", path.display()),
-        )
-        .into_error_object());
-    }
     let set = report::canonical(p.collector().aggregate().all().into_iter().map(|h| h.attestation));
     let (height, hash) = chain
         .read(&|v| {
@@ -163,8 +136,14 @@ pub fn export_snapshot(
             (h, v.block_hash(h).expect("the active chain holds its tip"))
         })
         .ok_or_else(tip_kept_changing)?;
-    crate::nap::store::save(path, &report::encode_snapshot(height, hash, &set))
-        .map_err(|e| RpcError::new(-1, "storage.io", e).into_error_object())?;
+    report::write_new(path, &report::encode_snapshot(height, hash, &set)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            RpcError::new(-8, "storage.exists", format!("refusing to overwrite existing file: {}", path.display()))
+        } else {
+            RpcError::new(-1, "storage.io", format!("writing {}: {e}", path.display()))
+        }
+        .into_error_object()
+    })?;
     Ok(json!({
         "path": path.to_string_lossy(),
         "height": height,

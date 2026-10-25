@@ -333,3 +333,116 @@ fn concentration_is_the_largest_outpoints_share_of_a_value() {
     assert_eq!(c["top10_ppm"], top10 * 1_000_000 / total);
     assert_eq!(c["top100_ppm"], top100 * 1_000_000 / total);
 }
+
+// --- Round 1 fixes --------------------------------------------------------------
+
+/// A chain that shows `chains[i]` at its `i`th read, and the last one after.
+struct Moving<'a> {
+    chains: Vec<&'a Chain>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl super::publisher::ChainSource for Moving<'_> {
+    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        let i = self.reads.get();
+        self.reads.set(i + 1);
+        Some(read(self.chains[i.min(self.chains.len() - 1)]))
+    }
+}
+
+#[test]
+fn a_replay_reads_again_when_a_block_lands_between_its_reads() {
+    let s = p2wpkh();
+    let mut before = Chain::new();
+    before.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let mut after = Chain::new();
+    after.tip = TIP + 1;
+    after.coins = before.coins.clone();
+    // A coin the block brings back, as a reorg can.
+    after.coins.insert(outpoint(2), coin_of(&s, 70_000, COIN_HEIGHT));
+    let atts = canonical([
+        attest(&after, &s, outpoint(1), "k", "yes", ANCHOR),
+        attest(&after, &s, outpoint(2), "k", "yes", ANCHOR),
+    ]);
+    // The coins read before the block, the set judged after it.
+    let moving = Moving { chains: vec![&before, &after], reads: Default::default() };
+    let replay = replay(&moving, &atts).unwrap();
+    assert_eq!(replay.tip.height, TIP + 1);
+    assert_eq!(replay.counting.len(), 2, "the coin read before the block is judged with the rest");
+    let held = verified(&after, &atts);
+    let (tip, counting) = counting_at(&held, &after);
+    assert_eq!(
+        serde_json::to_string(&report(replay.tip, digest(&atts), atts.len(), replay.invalid, &replay.counting))
+            .unwrap(),
+        serde_json::to_string(&report(tip, digest(&atts), atts.len(), 0, &counting)).unwrap(),
+        "the same bytes as the live set at that tip"
+    );
+}
+
+#[test]
+fn a_replay_gives_up_on_a_chain_that_never_holds_still() {
+    let s = p2wpkh();
+    let mut chains: Vec<Chain> = Vec::new();
+    for n in 0..10 {
+        let mut c = Chain::new();
+        c.tip = TIP + n;
+        c.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+        chains.push(c);
+    }
+    let atts = [attest(&chains[0], &s, outpoint(1), "k", "yes", ANCHOR)];
+    let moving = Moving { chains: chains.iter().collect(), reads: Default::default() };
+    assert!(replay(&moving, &atts).is_none());
+}
+
+#[test]
+fn a_replay_counts_failed_signatures_only_for_coins_it_holds() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let good = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let other = attest(&chain, &s, outpoint(1), "k", "no", ANCHOR);
+    let forge = |op| {
+        Attestation::new(op, "k".into(), "no".into(), ANCHOR, chain.block_hash(ANCHOR).unwrap(), good.signature().clone())
+            .unwrap()
+    };
+    // Coin 1's "no" with the "yes" signature, and the same for a coin that
+    // is not in the UTXO set.
+    let atts = canonical([good.clone(), forge(outpoint(1)), forge(outpoint(9))]);
+    assert_ne!(forge(outpoint(1)).id(), other.id());
+    let moving = Moving { chains: vec![&chain], reads: Default::default() };
+    let replay = replay(&moving, &atts).unwrap();
+    assert_eq!(replay.invalid, 1);
+    assert_eq!(replay.counting.len(), 1);
+    assert_eq!(replay.counting[0].attestation, good);
+}
+
+#[test]
+fn a_snapshot_file_too_long_for_its_limit_is_refused_before_it_is_read() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let set = canonical([attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR)]);
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.dat");
+    std::fs::write(&good, encode_snapshot(TIP, BlockHash::all_zeros(), &set)).unwrap();
+    assert_eq!(read_snapshot(&good, 1).unwrap().attestations, set);
+    assert_eq!(read_snapshot(&good, 0).unwrap().attestations, set);
+
+    // One byte longer than any snapshot of one attestation.
+    let long = dir.path().join("long.dat");
+    std::fs::write(&long, vec![0u8; 4 + 4 + 4 + 32 + 4 + 32 + 3 + MAX_ATTESTATION_SIZE + 1]).unwrap();
+    assert!(read_snapshot(&long, 1).unwrap_err().contains("longer than a snapshot of 1"));
+    assert!(read_snapshot(&dir.path().join("missing.dat"), 1).unwrap_err().contains("reading"));
+}
+
+#[test]
+fn an_export_never_replaces_a_file_and_leaves_no_temporary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sub").join("snap.dat");
+    write_new(&path, b"first").unwrap();
+    let err = write_new(&path, b"second").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["snap.dat"]);
+}

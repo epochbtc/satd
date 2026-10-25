@@ -26,14 +26,17 @@
 //! The digest is over the entries alone, so it names the set whatever tip
 //! the file was exported at.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read as _, Write as _};
+use std::path::Path;
 
 use bitcoin::consensus::encode::{self, Decodable, Encodable};
 use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{Amount, BlockHash, OutPoint, Script};
 use serde_json::{Value, json};
 
-use super::validity::{Timelocks, check_chain, check_timelocks};
+use super::publisher::ChainSource;
+use super::validity::{Timelocks, check_chain, check_timelocks, verify_signature};
 use super::{Attestation, ChainView, Coin, MAX_ATTESTATION_SIZE, supersedes};
 
 const MAGIC: &[u8; 4] = b"NAPS";
@@ -155,6 +158,99 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
         return Err(format!("{} bytes follow the last entry", rest.len()));
     }
     Ok(Snapshot { height, hash, attestations: out })
+}
+
+/// The longest snapshot file holding at most `max` attestations (0 is no
+/// limit): the header, the checksum, and `max` entries at the largest size,
+/// whose length prefix is three bytes.
+fn max_snapshot_len(max: usize) -> Option<u64> {
+    (max != 0).then(|| (HEADER_LEN + CHECKSUM_LEN) as u64 + max as u64 * (3 + MAX_ATTESTATION_SIZE) as u64)
+}
+
+/// Read and parse the snapshot file at `path`, holding at most `max`
+/// attestations (0 is no limit). A file longer than `max` attestations can
+/// be is refused before it is read in full.
+pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    match max_snapshot_len(max) {
+        Some(limit) => {
+            file.take(limit + 1).read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            if bytes.len() as u64 > limit {
+                return Err(format!(
+                    "{}: the file is longer than a snapshot of {max} attestations can be",
+                    path.display()
+                ));
+            }
+        }
+        None => {
+            let mut file = file;
+            file.read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        }
+    }
+    decode_snapshot(&bytes, max).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Write `bytes` to `path`, which must not exist: the check and the
+/// creation are one step, so a file made meanwhile is never replaced, and
+/// no temporary file is shared with another writer. A failed write leaves
+/// no file behind.
+pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// How many times [`replay`] reads the chain again when it moved between
+/// reading the coins and judging the set.
+const REPLAY_ATTEMPTS: usize = 3;
+
+/// A snapshot judged at a tip.
+#[derive(Debug, Clone)]
+pub struct Replay {
+    pub tip: Tip,
+    pub counting: Vec<Counted>,
+    /// Attestations whose coin is in the UTXO set and whose signature fails.
+    pub invalid: usize,
+}
+
+/// Verify `atts`, a snapshot's attestations, against their coins and judge
+/// them at `chain`'s tip. The signatures are verified outside any chain
+/// read, so the coins are read first and the set judged after; if the tip
+/// moved in between, a coin read at one tip could be judged at another, so
+/// both reads are made again until they agree. A signature's result is
+/// kept across attempts: an outpoint's scriptPubKey never changes. `None`
+/// when the chain would not hold still.
+pub fn replay(chain: &impl ChainSource, atts: &[Attestation]) -> Option<Replay> {
+    let mut verified: HashMap<sha256::Hash, Option<Timelocks>> = HashMap::new();
+    for _ in 0..REPLAY_ATTEMPTS {
+        let (read_at, scripts) = chain.read(&|v| {
+            let h = v.tip_height();
+            let scripts: Vec<_> = atts.iter().map(|a| v.coin(&a.outpoint()).map(|c| c.script_pubkey)).collect();
+            ((h, v.block_hash(h)), scripts)
+        })?;
+        let mut held = Vec::with_capacity(atts.len());
+        let mut invalid = 0;
+        for (att, script) in atts.iter().zip(scripts) {
+            // A coin not in the UTXO set cannot count; it is not verified.
+            let Some(script) = script else { continue };
+            match verified.entry(att.id()).or_insert_with(|| verify_signature(att, &script).ok()) {
+                Some(locks) => held.push((att.clone(), *locks)),
+                None => invalid += 1,
+            }
+        }
+        let (tip, counting) = chain.read(&|v| counting_at(&held, v))?;
+        if read_at == (tip.height, Some(tip.hash)) {
+            return Some(Replay { tip, counting, invalid });
+        }
+    }
+    None
 }
 
 /// An attestation that counts, with its coin.
