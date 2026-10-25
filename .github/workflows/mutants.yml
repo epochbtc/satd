@@ -102,13 +102,19 @@ jobs:
           if [ -z "$WANT" ]; then
             parts=$(seq 0 $(( PARTS - 1 )) | paste -sd, -)
           else
-            parts="${WANT// /}"
-            for j in ${parts//,/ }; do
-              if ! [[ "$j" =~ ^[0-9]+$ ]] || [ "$j" -ge "$PARTS" ]; then
+            # Each part once: two legs of one part would collide on its
+            # artifact name.
+            if ! [[ "${WANT// /}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+              echo "::error::parts '$WANT' must be a comma-separated list of 0 to $(( PARTS - 1 ))"
+              exit 1
+            fi
+            for j in ${WANT//,/ }; do
+              if [ "$j" -ge "$PARTS" ]; then
                 echo "::error::part '$j' must be 0 to $(( PARTS - 1 ))"
                 exit 1
               fi
             done
+            parts=$(echo "${WANT// /}" | tr , '\n' | sort -nu | paste -sd, -)
           fi
           echo "Shard $shard, parts $parts of $PARTS."
           echo "shard=$shard" >> "$GITHUB_OUTPUT"
@@ -210,7 +216,9 @@ jobs:
         with:
           sparse-checkout: scripts/mutants
 
+      # Not fatal: when no part uploaded anything, `merge` still says so.
       - name: Download the parts' results
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           pattern: mutants-part-*
@@ -252,9 +260,12 @@ jobs:
           SHARD: ${{ needs.plan.outputs.shard }}
         run: |
           set -euo pipefail
+          # Any part that ended other than in success: a lost runner is
+          # `failure`, a job past its timeout `cancelled` or `timed_out`.
           failed=$(gh run view "$RUN_ID" --json jobs --jq \
-            '[.jobs[] | select(.conclusion == "failure") | .name
-              | capture("^mutants \\(part (?<j>[0-9]+) of") | .j] | join(",")')
+            '[.jobs[] | select(.status == "completed" and .conclusion != "success")
+              | .name | capture("^mutants \\(part (?<j>[0-9]+) of") | .j]
+              | join(",")')
           if [ -z "$failed" ]; then
             echo "No failed part found in run $RUN_ID; nothing to retry."
             exit 0
