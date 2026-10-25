@@ -170,8 +170,10 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("deriveaddresses", "Util"),
     ("estimaterawfee", "Util"),
     ("estimatesmartfee", "Util"),
+    ("exportnapsnapshot", "Util"),
     ("getdescriptorinfo", "Util"),
     ("getindexinfo", "Util"),
+    ("getnapreport", "Util"),
     ("getsatdindexinfo", "Util"),
     ("listnapaggregate", "Util"),
     ("listnapattestations", "Util"),
@@ -631,6 +633,18 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
         bitcoin::Network::Signet => base.join("signet"),
         bitcoin::Network::Regtest => base.join("regtest"),
     })
+}
+
+/// `path` as `dumptxoutset` resolves it: an absolute path as given, a
+/// relative one against the network datadir.
+fn resolve_datadir_path(ctx: &RpcContext, path: &str) -> Result<std::path::PathBuf, ErrorObjectOwned> {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    net_datadir_from(ctx)
+        .map(|d| d.join(p))
+        .ok_or_else(|| ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>))
 }
 
 /// How the node prunes, from the effective config. Read by
@@ -4285,6 +4299,52 @@ pub async fn start(
         Args::new(&params).check()?;
         let aggregator = crate::rpc::nap::aggregator_enabled(ctx.nap_aggregator.as_deref())?;
         Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(aggregator, &ctx.chain_state))
+    })?;
+
+    // A report judges every attestation held at the tip, and over a
+    // snapshot verifies every signature: off the RPC threads, as
+    // `scantxoutset` is.
+    module.register_async_method("getnapreport", |params, ctx, _extensions| async move {
+        let mut args = Args::new(&params);
+        let snapshot: Option<String> = args.optional("snapshot")?;
+        args.check()?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        let aggregator = ctx.nap_aggregator.clone();
+        let path = match snapshot {
+            Some(p) => Some(resolve_datadir_path(&ctx, &p)?),
+            None => {
+                crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
+                None
+            }
+        };
+        tokio::task::spawn_blocking(move || match path {
+            // A replay takes as many attestations as this node's own set
+            // may hold, or the default if it aggregates nothing.
+            Some(path) => {
+                let max = aggregator.as_deref().map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
+                    p.collector().aggregate().max_attestations()
+                });
+                crate::rpc::nap::report_snapshot(&chain, &path, max)
+            }
+            None => crate::rpc::nap::report(aggregator.as_deref().expect("checked above"), &chain),
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("report task failed: {e}"), None::<()>))?
+    })?;
+
+    module.register_async_method("exportnapsnapshot", |params, ctx, _extensions| async move {
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        args.check()?;
+        let aggregator = ctx.nap_aggregator.clone();
+        crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
+        let path = resolve_datadir_path(&ctx, &path)?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        tokio::task::spawn_blocking(move || {
+            crate::rpc::nap::export_snapshot(aggregator.as_deref().expect("checked above"), &chain, &path)
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("export task failed: {e}"), None::<()>))?
     })?;
 
     module.register_method("removenapattestation", |params, ctx, _extensions| {

@@ -312,6 +312,8 @@ SATD_ONLY = {
     "verifybip322": [["address", False], ["signature", False], ["message", False]],
     # NAP publisher RPCs (docs/manual/src/nap.md).
     "createnapattestation": [["outpoint", False], ["key", False], ["value", False], ["descriptor", False]],
+    "exportnapsnapshot": [["path", False]],
+    "getnapreport": [["snapshot", False]],
     "listnapaggregate": [],
     "listnapattestations": [],
     "removenapattestation": [["outpoint", False], ["key", False]],

@@ -36,6 +36,12 @@ impl ChainView for View<'_> {
             coinbase: c.coinbase,
         })
     }
+
+    fn utxo_total(&self) -> Amount {
+        // The store's running total, kept with the coins, so a report reads
+        // it without walking the set.
+        Amount::from_sat(self.0.coin_total_amount())
+    }
 }
 
 impl ChainSource for ChainState {

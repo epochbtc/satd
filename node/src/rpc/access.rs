@@ -241,7 +241,11 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "generate"
         | "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain"
         // walks the whole UTXO set; minute-scale on mainnet
-        | "scantxoutset" => Control,
+        | "scantxoutset"
+        // NAP: a report judges the whole aggregate set at the tip, and over a
+        // snapshot reads a file and verifies every signature in it; an
+        // export writes a file.
+        | "getnapreport" | "exportnapsnapshot" => Control,
 
         // --- Block-connecting / chainstate-activating (correctness-critical) ---
         "generateblock"

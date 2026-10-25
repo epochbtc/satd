@@ -359,6 +359,11 @@ impl Aggregate {
         self.state.lock().entries.values().flatten().cloned().collect()
     }
 
+    /// The most attestations the set holds (0 is no limit).
+    pub fn max_attestations(&self) -> usize {
+        self.max_attestations
+    }
+
     /// How many attestations the set holds.
     pub fn len(&self) -> usize {
         self.state.lock().ids.len()

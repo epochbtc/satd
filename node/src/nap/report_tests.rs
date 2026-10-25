@@ -1,0 +1,335 @@
+use bitcoin::hashes::Hash as _;
+use bitcoin::script::Builder;
+use bitcoin::{Amount, BlockHash};
+use serde_json::Value;
+
+use super::report::*;
+use super::tests::*;
+use super::validity::{Coin, Timelocks, verify_signature};
+use super::*;
+
+/// A coin of `sat` for `signer`, confirmed at `height`.
+fn coin_of(signer: &Signer, sat: u64, height: u32) -> Coin {
+    Coin { value: Amount::from_sat(sat), script_pubkey: signer.spk.clone(), height, coinbase: false }
+}
+
+/// `atts` with the timelocks their signatures leave, as the aggregator
+/// holds them.
+fn verified(chain: &Chain, atts: &[Attestation]) -> Vec<(Attestation, Timelocks)> {
+    atts.iter()
+        .map(|a| {
+            let script = &chain.coins[&a.outpoint()].script_pubkey;
+            (a.clone(), verify_signature(a, script).unwrap())
+        })
+        .collect()
+}
+
+/// The report on `atts` at `chain`'s tip.
+fn report_on(chain: &Chain, atts: &[Attestation]) -> Value {
+    let held = verified(chain, atts);
+    let set = canonical(atts.iter().cloned());
+    let (tip, counting) = counting_at(&held, chain);
+    report(tip, digest(&set), set.len(), 0, &counting)
+}
+
+/// The report's entry for `key`.
+fn key<'a>(r: &'a Value, key: &str) -> &'a Value {
+    r["keys"].as_array().unwrap().iter().find(|k| k["key"] == key).unwrap()
+}
+
+/// The entry for `value` of `key`.
+fn value<'a>(r: &'a Value, k: &str, v: &str) -> &'a Value {
+    key(r, k)["values"].as_array().unwrap().iter().find(|e| e["value"] == v).unwrap()
+}
+
+/// The bucket labelled `label` in `buckets`, as (weight, outpoints).
+fn bucket(buckets: &Value, field: &str, label: &str) -> (u64, u64) {
+    let b = buckets.as_array().unwrap().iter().find(|b| b[field] == label).unwrap();
+    (b["weight_sat"].as_u64().unwrap(), b["outpoints"].as_u64().unwrap())
+}
+
+#[test]
+fn one_coin_and_a_hundred_coins_of_the_same_value_weigh_the_same() {
+    let s = p2wpkh();
+    let mut one = Chain::new();
+    one.coins.insert(outpoint(1), coin_of(&s, 100_000_000, COIN_HEIGHT));
+    let mut split = Chain::new();
+    for n in 1..=100 {
+        split.coins.insert(outpoint(n), coin_of(&s, 1_000_000, COIN_HEIGHT));
+    }
+    let whole = report_on(&one, &[attest(&one, &s, outpoint(1), "k", "yes", ANCHOR)]);
+    let parts: Vec<Attestation> = (1..=100).map(|n| attest(&split, &s, outpoint(n), "k", "yes", ANCHOR)).collect();
+    let parts = report_on(&split, &parts);
+    assert_eq!(value(&whole, "k", "yes")["weight_sat"], 100_000_000);
+    assert_eq!(value(&parts, "k", "yes")["weight_sat"], value(&whole, "k", "yes")["weight_sat"]);
+    assert_eq!(key(&parts, "k")["weight_sat"], key(&whole, "k")["weight_sat"]);
+    assert_eq!(
+        (value(&whole, "k", "yes")["outpoints"].as_u64(), value(&parts, "k", "yes")["outpoints"].as_u64()),
+        (Some(1), Some(100)),
+        "outpoints are counted, but they carry no weight of their own"
+    );
+}
+
+#[test]
+fn the_same_set_gives_the_same_bytes_in_any_order() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    for n in 1..=6 {
+        chain.coins.insert(outpoint(n), coin_of(&s, 20_000 * u64::from(n), COIN_HEIGHT));
+    }
+    let mut atts: Vec<Attestation> = (1..=6)
+        .map(|n| attest(&chain, &s, outpoint(n), "k", if n % 2 == 0 { "yes" } else { "no" }, ANCHOR))
+        .collect();
+    atts.push(attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR - 50));
+    atts.push(attest(&chain, &s, outpoint(2), "other", "x", ANCHOR));
+    let forward = serde_json::to_string(&report_on(&chain, &atts)).unwrap();
+    atts.reverse();
+    // A repeat is one attestation, as in the set.
+    atts.push(atts[0].clone());
+    let backward = serde_json::to_string(&report_on(&chain, &atts)).unwrap();
+    assert_eq!(forward, backward);
+}
+
+#[test]
+fn a_snapshot_round_trips_and_replays_the_same_report() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    for n in 1..=3 {
+        chain.coins.insert(outpoint(n), coin_of(&s, 50_000, COIN_HEIGHT));
+    }
+    let atts: Vec<Attestation> = vec![
+        attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR),
+        attest(&chain, &s, outpoint(1), "k", "no", ANCHOR - 10),
+        attest(&chain, &s, outpoint(2), "k", "no", ANCHOR),
+        attest(&chain, &s, outpoint(3), "k", "", ANCHOR),
+    ];
+    let set = canonical(atts.iter().cloned());
+    let tip_hash = chain.block_hash(TIP).unwrap();
+    let file = encode_snapshot(TIP, tip_hash, &set);
+    let snap = decode_snapshot(&file, 0).unwrap();
+    assert_eq!(snap, Snapshot { height: TIP, hash: tip_hash, attestations: set.clone() });
+    assert_eq!(report_on(&chain, &snap.attestations), report_on(&chain, &atts));
+    // The digest names the set, not the tip it was exported at.
+    let elsewhere = decode_snapshot(&encode_snapshot(7, BlockHash::all_zeros(), &set), 0).unwrap();
+    assert_eq!(digest(&elsewhere.attestations), digest(&set));
+    assert_eq!(report_on(&chain, &atts)["digest"], digest(&set).to_string());
+}
+
+#[test]
+fn the_digest_is_over_length_prefixed_wire_forms_in_id_order() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let a = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let b = attest(&chain, &s, outpoint(1), "k", "no", ANCHOR);
+    let set = canonical([a.clone(), b.clone()]);
+    assert!(set[0].id() < set[1].id());
+    let mut bytes = Vec::new();
+    for att in &set {
+        let wire = att.to_bytes();
+        assert!(wire.len() < 0xfd, "a one-byte compact size");
+        bytes.push(wire.len() as u8);
+        bytes.extend_from_slice(&wire);
+    }
+    assert_eq!(digest(&set), bitcoin::hashes::sha256::Hash::hash(&bytes));
+}
+
+#[test]
+fn a_snapshot_has_one_form() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let set = canonical([
+        attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR),
+        attest(&chain, &s, outpoint(1), "k", "no", ANCHOR),
+    ]);
+    let hash = BlockHash::all_zeros();
+    let good = encode_snapshot(TIP, hash, &set);
+    assert!(decode_snapshot(&good, 0).is_ok());
+    assert!(decode_snapshot(&good, 2).is_ok());
+    assert!(decode_snapshot(&good, 1).unwrap_err().contains("more than the 1"));
+
+    let unordered = encode_snapshot(TIP, hash, &[set[1].clone(), set[0].clone()]);
+    assert!(decode_snapshot(&unordered, 0).unwrap_err().contains("ascending id order"));
+    let repeated = encode_snapshot(TIP, hash, &[set[0].clone(), set[0].clone()]);
+    assert!(decode_snapshot(&repeated, 0).unwrap_err().contains("ascending id order"));
+
+    let mut corrupt = good.clone();
+    corrupt[60] ^= 1;
+    assert!(decode_snapshot(&corrupt, 0).unwrap_err().contains("checksum"));
+    assert!(decode_snapshot(&good[..good.len() - 1], 0).is_err());
+    assert!(decode_snapshot(b"SNAG", 0).unwrap_err().contains("truncated"));
+
+    // A byte more inside the checksummed body.
+    let mut long = good[..good.len() - 32].to_vec();
+    long.push(0);
+    let checksum = bitcoin::hashes::sha256::Hash::hash(&long);
+    long.extend_from_slice(checksum.as_byte_array());
+    assert!(decode_snapshot(&long, 0).unwrap_err().contains("follow the last entry"));
+}
+
+#[test]
+fn the_newest_valid_attestation_counts_and_a_lost_anchor_brings_back_the_older() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let old = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR - 100);
+    let new = attest(&chain, &s, outpoint(1), "k", "no", ANCHOR);
+    let atts = [old, new];
+    let r = report_on(&chain, &atts);
+    assert_eq!(r["counting"], 1);
+    assert_eq!(value(&r, "k", "no")["weight_sat"], 50_000);
+    assert!(key(&r, "k")["values"].as_array().unwrap().iter().all(|v| v["value"] != "yes"));
+
+    // Reorganised from below the newer anchor: the older one counts.
+    let held = verified(&chain, &atts);
+    chain.fork_at = ANCHOR - 50;
+    let set = canonical(atts.iter().cloned());
+    let (tip, counting) = counting_at(&held, &chain);
+    let r = report(tip, digest(&set), set.len(), 0, &counting);
+    assert_eq!(value(&r, "k", "yes")["weight_sat"], 50_000);
+    assert_eq!(r["hash"], chain.block_hash(TIP).unwrap().to_string());
+}
+
+#[test]
+fn spent_coins_and_unmet_timelocks_do_not_count() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    chain.coins.insert(outpoint(2), coin_of(&s, 60_000, COIN_HEIGHT));
+    let atts = [
+        attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR),
+        attest(&chain, &s, outpoint(2), "k", "yes", ANCHOR),
+    ];
+    let held = verified(&chain, &atts);
+    chain.coins.remove(&outpoint(2));
+    let (_, counting) = counting_at(&held, &chain);
+    assert_eq!(counting.len(), 1);
+    assert_eq!(counting[0].attestation.outpoint(), outpoint(1));
+
+    // A full proof whose locktime is past the next block.
+    let locked = p2wsh_full(Builder::new(), 2, TIP + 10, 0xFFFF_FFFE);
+    chain.coins.insert(outpoint(3), coin_of(&locked, 70_000, COIN_HEIGHT));
+    let att = attest(&chain, &locked, outpoint(3), "k", "yes", ANCHOR);
+    let (_, counting) = counting_at(&verified(&chain, &[att]), &chain);
+    assert!(counting.is_empty(), "not yet valid counts nothing");
+}
+
+#[test]
+fn withdrawals_are_reported_apart_and_take_no_share() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 300_000, COIN_HEIGHT));
+    chain.coins.insert(outpoint(2), coin_of(&s, 100_000, COIN_HEIGHT));
+    chain.coins.insert(outpoint(3), coin_of(&s, 600_000, COIN_HEIGHT));
+    let r = report_on(
+        &chain,
+        &[
+            attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR),
+            attest(&chain, &s, outpoint(2), "k", "no", ANCHOR),
+            attest(&chain, &s, outpoint(3), "k", "", ANCHOR),
+        ],
+    );
+    let k = key(&r, "k");
+    assert_eq!(k["withdrawn"], serde_json::json!({ "weight_sat": 600_000, "outpoints": 1 }));
+    assert_eq!(k["weight_sat"], 400_000);
+    assert_eq!(k["outpoints"], 2);
+    assert_eq!(value(&r, "k", "yes")["share_ppm"], 750_000);
+    assert_eq!(value(&r, "k", "no")["share_ppm"], 250_000);
+    assert!(k["values"].as_array().unwrap().iter().all(|v| v["value"] != ""));
+    // The mock's UTXO set is twice the coins: 2,000,000 sats.
+    assert_eq!(r["utxo_total_sat"], 2_000_000);
+    assert_eq!(k["coverage_ppm"], 200_000);
+    assert_eq!(value(&r, "k", "yes")["coverage_ppm"], 150_000);
+    // Heaviest value first.
+    assert_eq!(k["values"][0]["value"], "yes");
+}
+
+#[test]
+fn shares_round_down_in_parts_per_million() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    for n in 1..=3 {
+        chain.coins.insert(outpoint(n), coin_of(&s, 100_000, COIN_HEIGHT));
+    }
+    let r = report_on(
+        &chain,
+        &[
+            attest(&chain, &s, outpoint(1), "k", "a", ANCHOR),
+            attest(&chain, &s, outpoint(2), "k", "b", ANCHOR),
+            attest(&chain, &s, outpoint(3), "k", "c", ANCHOR),
+        ],
+    );
+    for v in ["a", "b", "c"] {
+        assert_eq!(value(&r, "k", v)["share_ppm"], 333_333, "1/3 rounds down");
+    }
+    // Equal weights are ordered by value.
+    let order: Vec<&str> = key(&r, "k")["values"].as_array().unwrap().iter().map(|v| v["value"].as_str().unwrap()).collect();
+    assert_eq!(order, ["a", "b", "c"]);
+}
+
+#[test]
+fn breakdowns_file_each_coin_by_value_ages_and_script() {
+    let w = p2wpkh();
+    let l = p2pkh();
+    let mut chain = Chain::new();
+    // Long enough for the oldest coin age bucket.
+    chain.tip = 300_000;
+    let tip = chain.tip;
+    // (coin, signer, value: each tier at its lower bound or just under the
+    // next, coin age at the tip, anchor age).
+    let coins = [
+        (1, &w, 999_999, 13_103, ANCHOR_DEPTH),
+        (2, &w, 1_000_000, 13_104, 2_016),
+        (3, &l, 100_000_000, 262_079, 13_104),
+        (4, &w, 10_000_000_000, 262_080, ANCHOR_DEPTH),
+    ];
+    let mut atts = Vec::new();
+    for (n, signer, sat, coin_age, anchor_age) in coins {
+        chain.coins.insert(outpoint(n), coin_of(signer, sat, tip - coin_age));
+        atts.push(attest(&chain, signer, outpoint(n), "k", "yes", tip - anchor_age));
+    }
+    let r = report_on(&chain, &atts);
+    let v = value(&r, "k", "yes");
+    let tiers = &v["value_tiers"];
+    assert_eq!(bucket(tiers, "tier", "<0.01"), (999_999, 1));
+    assert_eq!(bucket(tiers, "tier", "0.01-1"), (1_000_000, 1));
+    assert_eq!(bucket(tiers, "tier", "1-100"), (100_000_000, 1));
+    assert_eq!(bucket(tiers, "tier", ">=100"), (10_000_000_000, 1));
+
+    let ages = &v["anchor_age"];
+    assert_eq!(bucket(ages, "blocks", "<2016"), (999_999 + 10_000_000_000, 2));
+    assert_eq!(bucket(ages, "blocks", "<13104"), (1_000_000, 1));
+    assert_eq!(bucket(ages, "blocks", "<26208"), (100_000_000, 1));
+
+    let ages = &v["coin_age"];
+    assert_eq!(bucket(ages, "blocks", "<13104"), (999_999, 1));
+    assert_eq!(bucket(ages, "blocks", "<52416"), (1_000_000, 1));
+    assert_eq!(bucket(ages, "blocks", "<104832"), (0, 0), "an empty bucket is listed");
+    assert_eq!(bucket(ages, "blocks", "<262080"), (100_000_000, 1));
+    assert_eq!(bucket(ages, "blocks", ">=262080"), (10_000_000_000, 1));
+
+    let scripts = &v["script_types"];
+    assert_eq!(bucket(scripts, "type", "p2pkh"), (100_000_000, 1));
+    assert_eq!(bucket(scripts, "type", "p2wpkh"), (999_999 + 1_000_000 + 10_000_000_000, 3));
+    assert_eq!(bucket(scripts, "type", "p2tr"), (0, 0));
+    assert_eq!(scripts.as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn concentration_is_the_largest_outpoints_share_of_a_value() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    // Coin n holds n × 10,000 sats: 110 coins, 61,050,000 sats in all.
+    for n in 1..=110u8 {
+        chain.coins.insert(outpoint(n), coin_of(&s, 10_000 * u64::from(n), COIN_HEIGHT));
+    }
+    let atts: Vec<Attestation> = (1..=110).map(|n| attest(&chain, &s, outpoint(n), "k", "yes", ANCHOR)).collect();
+    let r = report_on(&chain, &atts);
+    let c = &value(&r, "k", "yes")["concentration"];
+    let total: u64 = (1..=110).map(|n| 10_000 * n).sum();
+    let top10: u64 = (101..=110).map(|n| 10_000 * n).sum();
+    let top100: u64 = (11..=110).map(|n| 10_000 * n).sum();
+    assert_eq!(c["top10_ppm"], top10 * 1_000_000 / total);
+    assert_eq!(c["top100_ppm"], top100 * 1_000_000 / total);
+}

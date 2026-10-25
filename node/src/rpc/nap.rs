@@ -1,9 +1,11 @@
 //! The NAP RPCs, satd's own. The publisher's, `createnapattestation`,
 //! `submitnapattestation`, `listnapattestations` and
 //! `removenapattestation`, answer an error unless the node runs with
-//! `-nap=1`; the aggregator's, `listnapaggregate`, unless it runs with
-//! `-napaggregator=1`.
+//! `-nap=1`; the aggregator's, `listnapaggregate`, `exportnapsnapshot` and
+//! `getnapreport`, unless it runs with `-napaggregator=1`. `getnapreport`
+//! over a snapshot file needs only the chain.
 
+use std::path::Path;
 use std::str::FromStr as _;
 
 use base64::Engine as _;
@@ -15,7 +17,10 @@ use serde_json::{Value, json};
 use crate::bip322;
 use crate::chain::state::ChainState;
 use crate::nap::publisher::{Published, encode_signature};
-use crate::nap::{NapSignature, PublishError, Publisher};
+use crate::nap::publisher::ChainSource as _;
+use crate::nap::report;
+use crate::nap::validity::{Timelocks, verify_signature};
+use crate::nap::{Attestation, NapSignature, PublishError, Publisher};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::error::RpcError;
 
@@ -84,6 +89,89 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
     });
     annotate_units(&mut out, unit);
     out
+}
+
+/// The tip moved through every read of a report or a snapshot.
+fn tip_kept_changing() -> ErrorObjectOwned {
+    RpcError::new(-1, "node.busy", "the chain tip kept changing while the NAP set was judged")
+        .with_suggestion("Ask again.")
+        .into_error_object()
+}
+
+/// `getnapreport` over the aggregator's own set: every attestation held,
+/// judged at the tip, with the digest of the set. The signatures verified
+/// when the attestations were collected, so this reads only the chain.
+pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value, ErrorObjectOwned> {
+    let held: Vec<(Attestation, Timelocks)> =
+        p.collector().aggregate().all().into_iter().map(|h| (h.attestation, h.locks)).collect();
+    let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
+    let digest = report::digest(&set);
+    let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
+    Ok(report::report(tip, digest, set.len(), 0, &counting))
+}
+
+/// `getnapreport` over a snapshot file: each signature is verified against
+/// its coin, and the set judged at this node's tip, as the aggregator that
+/// exported it would at the same tip. An attestation whose coin is not in
+/// the UTXO set cannot count and is not verified; one whose signature fails
+/// counts as `invalid`. `max` bounds the attestations read (0 is no limit).
+pub fn report_snapshot(chain: &ChainState, path: &Path, max: usize) -> Result<Value, ErrorObjectOwned> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        RpcError::new(-8, "storage.io", format!("reading {}: {e}", path.display())).into_error_object()
+    })?;
+    let snapshot = report::decode_snapshot(&bytes, max).map_err(|e| {
+        RpcError::new(-8, "rpc.input.parse", format!("{}: {e}", path.display())).into_error_object()
+    })?;
+    // A coin's scriptPubKey never changes for its outpoint, so the scripts
+    // read here judge the signatures at any later tip.
+    let scripts: Vec<Option<ScriptBuf>> = chain
+        .read(&|v| snapshot.attestations.iter().map(|a| v.coin(&a.outpoint()).map(|c| c.script_pubkey)).collect())
+        .ok_or_else(tip_kept_changing)?;
+    let mut held = Vec::with_capacity(snapshot.attestations.len());
+    let mut invalid = 0;
+    for (att, script) in snapshot.attestations.iter().zip(scripts) {
+        let Some(script) = script else { continue };
+        match verify_signature(att, &script) {
+            Ok(locks) => held.push((att.clone(), locks)),
+            Err(_) => invalid += 1,
+        }
+    }
+    let digest = report::digest(&snapshot.attestations);
+    let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
+    Ok(report::report(tip, digest, snapshot.attestations.len(), invalid, &counting))
+}
+
+/// `exportnapsnapshot`: write every attestation the aggregator holds to
+/// `path` as a snapshot. An existing file is not overwritten.
+pub fn export_snapshot(
+    p: &crate::nap::pull::Puller,
+    chain: &ChainState,
+    path: &Path,
+) -> Result<Value, ErrorObjectOwned> {
+    if path.exists() {
+        return Err(RpcError::new(
+            -8,
+            "storage.exists",
+            format!("refusing to overwrite existing file: {}", path.display()),
+        )
+        .into_error_object());
+    }
+    let set = report::canonical(p.collector().aggregate().all().into_iter().map(|h| h.attestation));
+    let (height, hash) = chain
+        .read(&|v| {
+            let h = v.tip_height();
+            (h, v.block_hash(h).expect("the active chain holds its tip"))
+        })
+        .ok_or_else(tip_kept_changing)?;
+    crate::nap::store::save(path, &report::encode_snapshot(height, hash, &set))
+        .map_err(|e| RpcError::new(-1, "storage.io", e).into_error_object())?;
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "height": height,
+        "hash": hash.to_string(),
+        "attestations": set.len(),
+        "digest": report::digest(&set).to_string(),
+    }))
 }
 
 /// `"<txid>:<vout>"`, as `createnapattestation` and `removenapattestation`

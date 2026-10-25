@@ -663,6 +663,9 @@ impl ChainView for Signed {
     fn coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         (*outpoint == self.outpoint).then(|| self.coin.clone())
     }
+    fn utxo_total(&self) -> bitcoin::Amount {
+        self.coin.value
+    }
 }
 
 impl ChainSource for Signed {
