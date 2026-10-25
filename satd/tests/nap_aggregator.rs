@@ -457,3 +457,138 @@ impl FakePublisher {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
+
+/// Coins for the budget measurement: one transaction spending the coinbase
+/// at `height` into `count` P2WPKH outputs for the wallet.
+fn fan_out(node: &TestNode, height: u64, count: usize) -> String {
+    use bitcoin::{Sequence, Transaction, TxIn, TxOut, absolute::LockTime};
+    let w = wallet();
+    let txid: bitcoin::Txid = coinbase_txid_at(node, height).parse().unwrap();
+    // Regtest's subsidy before the first halving, less a fee of about
+    // 2.5 sat/vB on a transaction of this many outputs.
+    let total: u64 = 50 * 100_000_000 - 100 * count as u64;
+    let each = total / count as u64;
+    let mut tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: (0..count)
+            .map(|_| TxOut { value: Amount::from_sat(each), script_pubkey: w.address.script_pubkey() })
+            .collect(),
+    };
+    let sighash = SighashCache::new(&tx)
+        .p2wpkh_signature_hash(0, &w.address.script_pubkey(), Amount::from_sat(50 * 100_000_000), EcdsaSighashType::All)
+        .unwrap();
+    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &w.sk);
+    let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All };
+    let pk = bitcoin::CompressedPublicKey::from_slice(&w.pk.to_bytes()).unwrap();
+    tx.input[0].witness = Witness::p2wpkh(&sig, &pk.0);
+    node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(encode::serialize(&tx)))]);
+    tx.compute_txid().to_string()
+}
+
+/// N9 budget measurement, not a check: a publisher serving
+/// `NAP_BUDGET_COINS` attestations (default 12,000, more than two pulls'
+/// worth of the per-pull verification budget) and an aggregator pulling
+/// them from scratch under the default budgets. It prints how long the
+/// publisher took to take them, the set's growth over time with the pull
+/// counters, the bytes the pull moved, and the cost of a report, an export
+/// and a replay. Run with
+/// `cargo test -p satd --release --test nap_aggregator nap_budget -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement; run by hand"]
+fn nap_budget_measurement() {
+    const PER_TX: usize = 2_500;
+    let n: usize = std::env::var("NAP_BUDGET_COINS").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+    let txs = n.div_ceil(PER_TX);
+    assert!(txs < 40, "the fan-out spends coinbases from below the first halving");
+    let mut a = TestNode::start(&["--nap=1", "--v2transport=0"]);
+    let w = wallet();
+    a.mine_blocks(txs as u64, &w.address.to_string());
+    a.mine_blocks(100, BURN);
+    let mut outpoints = Vec::with_capacity(n);
+    for t in 0..txs {
+        let count = PER_TX.min(n - t * PER_TX);
+        let txid = fan_out(&a, t as u64 + 1, count);
+        outpoints.extend((0..count).map(|v| format!("{txid}:{v}")));
+    }
+    // The coins confirm and are six blocks old at an anchor six deep, with
+    // a block to spare.
+    a.mine_blocks(14, BURN);
+
+    let start = std::time::Instant::now();
+    for (i, op) in outpoints.iter().enumerate() {
+        attest(&a, op, "budget", if i % 3 == 0 { "no" } else { "yes" });
+    }
+    let submit = start.elapsed();
+    println!("publisher: {n} attestations created and submitted in {submit:.1?} ({:.0}/s)", n as f64 / submit.as_secs_f64());
+
+    let c = TestNode::start(&["--napaggregator=1", "--v2transport=0"]);
+    c.rpc_ok("addnode", vec![json!(p2p(&a)), json!("onetry")]);
+    synced(&[&a, &c]);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    println!("{:>8} {:>8} {:>9} {:>6} {:>6}", "secs", "held", "deferred", "pulls", "pages");
+    loop {
+        let agg = aggregate(&c);
+        let row = (
+            agg["held"].as_u64().unwrap(),
+            agg["deferred"].as_u64().unwrap(),
+            agg["pulls"]["completed"].as_u64().unwrap(),
+            agg["pulls"]["pages"].as_u64().unwrap(),
+        );
+        if last != Some(row) {
+            println!("{:>8.1} {:>8} {:>9} {:>6} {:>6}", start.elapsed().as_secs_f64(), row.0, row.1, row.2, row.3);
+            last = Some(row);
+        }
+        if row.0 as usize >= n || start.elapsed() > Duration::from_secs(3 * 60 * 60) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let fill = start.elapsed();
+    println!("aggregator: {} of {n} held after {fill:.1?}", last.unwrap().0);
+    let peer = |node: &TestNode, other: &TestNode| -> Value {
+        let peers = node.rpc_ok("getpeerinfo", vec![]);
+        let port = other.p2p_port.unwrap().to_string();
+        peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["addr"].as_str().unwrap().ends_with(&port) || p["addrbind"].as_str().is_some_and(|b| b.ends_with(&port)))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    println!("aggregator received per message: {}", peer(&c, &a)["bytesrecv_per_msg"]);
+    let served = a.rpc_ok("getpeerinfo", vec![]);
+    for p in served.as_array().unwrap() {
+        println!("publisher sent to {} per message: {}", p["addr"], p["bytessent_per_msg"]);
+    }
+
+    let start = std::time::Instant::now();
+    let report = c.rpc_ok("getnapreport", vec![]);
+    let first = start.elapsed();
+    let start = std::time::Instant::now();
+    c.rpc_ok("getnapreport", vec![]);
+    let cached = start.elapsed();
+    println!(
+        "report: {} counting, {} bytes of JSON, first {first:.1?}, cached {cached:.1?}",
+        report["counting"],
+        serde_json::to_string(&report).unwrap().len()
+    );
+    let start = std::time::Instant::now();
+    let export = c.rpc_ok("exportnapsnapshot", vec![json!("budget.dat")]);
+    let exported = start.elapsed();
+    let path = export["path"].as_str().unwrap().to_owned();
+    let size = std::fs::metadata(&path).unwrap().len();
+    println!("export: {size} bytes ({:.0} per attestation) in {exported:.1?}", size as f64 / n as f64);
+    let start = std::time::Instant::now();
+    let replayed = a.rpc_ok("replaynapsnapshot", vec![json!(path)]);
+    println!("replay on the publisher: {:.1?}, same report: {}", start.elapsed(), replayed == report);
+    a.stop();
+}
