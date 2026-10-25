@@ -3324,11 +3324,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let opened = if config.napstorerecover {
             node::nap::Publisher::open_recovering(path, &*chain_state).map(|(p, aside)| {
                 if let Some((aside, why)) = aside {
+                    let moved: Vec<String> = aside.iter().map(|p| p.display().to_string()).collect();
                     tracing::warn!(
                         target: "nap",
                         "NAP: the attestation store did not read back ({why}); moved it to {} \
                          and started with an empty one",
-                        aside.display()
+                        moved.join(" and ")
                     );
                 }
                 p

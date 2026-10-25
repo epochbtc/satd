@@ -213,14 +213,15 @@ impl Publisher {
         self.max_attestations != 0 && len >= self.max_attestations
     }
 
-    /// [`Self::open`], but a store that does not read back is renamed to
-    /// `<name>.bad-<unix seconds>` and the publisher starts empty
-    /// (`-napstorerecover`). Returns the path the file was moved to, for the
-    /// caller to report. Fails only if the file cannot be moved aside.
+    /// [`Self::open`], but a store that does not read back is renamed, the
+    /// file and its journal each to `<name>.bad-<unix seconds>`, and the
+    /// publisher starts empty (`-napstorerecover`). Returns the paths they
+    /// were moved to and why, for the caller to report. Fails only if a
+    /// file cannot be moved aside.
     pub fn open_recovering(
         path: PathBuf,
         chain: &impl ChainSource,
-    ) -> Result<(Self, Option<(PathBuf, String)>), String> {
+    ) -> Result<(Self, Option<(Vec<PathBuf>, String)>), String> {
         let why = match store::read(&path) {
             Ok(_) => return Self::open(path, chain).map(|p| (p, None)),
             Err(why) => why,
@@ -239,9 +240,8 @@ impl Publisher {
             }
         };
         // The journal follows the file, so the two go aside together.
-        let base = set_aside(&path)?;
-        let journal = set_aside(&store::journal_path(&path))?;
-        let aside = base.or(journal).expect("a store that does not read back exists");
+        let aside: Vec<PathBuf> =
+            [set_aside(&path)?, set_aside(&store::journal_path(&path))?].into_iter().flatten().collect();
         Ok((Self::open(path, chain)?, Some((aside, why))))
     }
 

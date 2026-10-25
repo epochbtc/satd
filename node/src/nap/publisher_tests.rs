@@ -453,8 +453,11 @@ fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
     let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
     let (aside, why) = aside.expect("the damaged file was set aside");
     assert!(why.contains("truncated"), "{why}");
+    // The file and the journal that followed it.
+    assert_eq!(aside.len(), 2, "{aside:?}");
+    let aside = &aside[0];
     assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("attestations.dat.bad-"), "{aside:?}");
-    assert_eq!(std::fs::read(&aside).unwrap(), damaged, "the damaged file is kept as it was");
+    assert_eq!(std::fs::read(aside).unwrap(), damaged, "the damaged file is kept as it was");
     assert!(!path.exists());
     assert!(p.list(&chain).is_empty());
     submit(&p, &chain, &att).unwrap();
@@ -542,8 +545,10 @@ fn a_damaged_record_before_the_end_is_an_error_and_recovery_sets_both_files_asid
     assert!(err.contains("checksum"), "{err}");
     let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
     let (aside, _) = aside.unwrap();
-    assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("attestations.journal.bad-"), "{aside:?}");
-    assert_eq!(std::fs::read(&aside).unwrap(), damaged, "kept as it was");
+    // No file was written yet, so the journal is all there is to set aside.
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(aside[0].file_name().unwrap().to_str().unwrap().starts_with("attestations.journal.bad-"), "{aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), damaged, "kept as it was");
     assert!(!jpath.exists());
     assert!(p.list(&chain).is_empty());
 }
