@@ -108,7 +108,7 @@ jobs:
               echo "::error::parts '$WANT' must be a comma-separated list of 0 to $(( PARTS - 1 ))"
               exit 1
             fi
-            for j in ${WANT//,/ }; do
+            for j in $(echo "${WANT// /}" | tr , ' '); do
               if [ "$j" -ge "$PARTS" ]; then
                 echo "::error::part '$j' must be 0 to $(( PARTS - 1 ))"
                 exit 1
