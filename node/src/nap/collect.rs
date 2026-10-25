@@ -38,8 +38,12 @@ use super::{Attestation, Rejection};
 /// Signature verifications one pull may spend.
 pub const PULL_VERIFICATIONS: u32 = 5_000;
 /// Signature verifications all pulls together may spend per
-/// [`BUDGET_WINDOW`].
-pub const HOURLY_VERIFICATIONS: u32 = 50_000;
+/// [`BUDGET_WINDOW`]. A verification costs about 0.1 ms on one core, 0.3 ms
+/// for a 2-of-3 multisig (measured, N9), so this is at most five or six
+/// minutes of one core an hour, and a fresh aggregator can collect a full
+/// default set (`-napaggregatormax`, 1,000,000) in about an hour, which is
+/// also what the serving budget lets a publisher send.
+pub const HOURLY_VERIFICATIONS: u32 = 1_000_000;
 /// The window [`HOURLY_VERIFICATIONS`] is counted over.
 pub const BUDGET_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Signature results remembered by attestation id.

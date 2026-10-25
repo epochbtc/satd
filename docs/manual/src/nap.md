@@ -358,7 +358,8 @@ not need `nap=1`, and does not advertise `NODE_NAP` unless it also publishes.
     attestation, then the anchor, freshness, the coin and its age, and only
     then the signature. Signature results are cached, so an attestation
     served by many publishers is verified once. At most 5,000 signatures are
-    verified per pull and 50,000 an hour; the rest wait, and pulling pauses
+    verified per pull and 1,000,000 an hour (at most five or six minutes
+    of one core); the rest wait, and pulling pauses
     while 16 MB of them are waiting. Nothing received is dropped for lack of
     budget.
 *   **Misbehaviour.** A malformed `napatt`, or an attestation whose
