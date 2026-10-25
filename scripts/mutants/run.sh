@@ -1,9 +1,11 @@
 #!/bin/bash
 # Mutation testing with cargo-mutants, in one of two scopes.
 #
-#   scripts/mutants/run.sh diff <diff-file>   # mutants on the lines a diff changed
-#   scripts/mutants/run.sh nightly [k/n]      # one shard of the consensus-critical code
-#   scripts/mutants/run.sh report             # (re)write the report of the last run
+#   scripts/mutants/run.sh diff <diff-file>    # mutants on the lines a diff changed
+#   scripts/mutants/run.sh nightly [k/n [j/p]] # one shard (or part j of p of it)
+#   scripts/mutants/run.sh shard               # print tonight's shard, as k/n
+#   scripts/mutants/run.sh report              # (re)write the report of the last run
+#   scripts/mutants/run.sh merge <dir>...      # one report over several parts' runs
 #
 # A mutant is a small deliberate break (`<` for `<=`, a function body replaced
 # by a default value). cargo-mutants builds each one and runs the tests of the
@@ -19,6 +21,10 @@
 # different slices and the whole scope comes round every n nights. The shard
 # count follows the size of the scope (NIGHTLY_SHARD_SIZE mutants each). A
 # shard given as k/n is 0-based, as cargo-mutants numbers them: 0/41 to 40/41.
+# CI splits a shard into p parts that run in parallel, so a runner lost
+# part-way through costs one part rather than the night: part j/p of shard k/n
+# is cargo-mutants shard k+j*n of n*p, round-robin, so the parts of a shard are
+# disjoint and together are exactly that shard.
 #
 # Both stop at BUDGET_MINUTES and report what they finished; the order is
 # shuffled, so a run cut short is a sample of its scope rather than its first
@@ -29,6 +35,9 @@
 # `report` exists so CI can write the report in a step of its own, which still
 # runs when the mutating step was killed by the job timeout. With
 # MUTANTS_SKIP_REPORT=1, `diff` and `nightly` leave the report to it.
+# MUTANTS_ANNOTATE=0 leaves out the per-mutant annotations, for a part whose
+# results `merge` reports again. `merge` takes the MUTANTS_OUT directories of
+# the parts, and names any part whose directory has no results.
 #
 # Env: BUDGET_MINUTES (default 120), MUTANTS_OUT (default target/mutants-run),
 # TEST_TIMEOUT / BUILD_TIMEOUT in seconds, GITHUB_STEP_SUMMARY when set.
@@ -60,7 +69,7 @@ NIGHTLY_GLOBS=(
     'node/src/mempool/**'
 )
 
-usage() { sed -n '2,7p' "$0" >&2; exit 64; }
+usage() { sed -n '2,9p' "$0" >&2; exit 64; }
 
 # Markdown for the run summary, or the terminal outside Actions.
 emit() { if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat >> "$GITHUB_STEP_SUMMARY"; else cat; fi; }
@@ -84,18 +93,88 @@ report() {
         echo "error: no mutant finished" >&2
         return 1
     fi
-    local args=("$outcomes" --listed "$listed" --note "$note" --annotate)
+    local args=("$outcomes" --listed "$listed" --note "$note")
+    [ "${MUTANTS_ANNOTATE:-1}" = 0 ] || args+=(--annotate)
+    [ -z "${GITHUB_STEP_SUMMARY:-}" ] || args+=(--summary "$GITHUB_STEP_SUMMARY")
+    python3 "$SCRIPT_DIR/report.py" "${args[@]}"
+}
+
+# The shard count follows the size of the nightly scope; tonight's shard is
+# the day number modulo it. Prints k/n; needs the nightly globs in file_args.
+tonight() {
+    local total shards
+    total=$(cargo mutants --list "${file_args[@]}" | wc -l)
+    shards=$(( (total + NIGHTLY_SHARD_SIZE - 1) / NIGHTLY_SHARD_SIZE ))
+    [ "$shards" -ge 1 ] || shards=1
+    echo "$(( $(date -u +%s) / 86400 % shards ))/$shards"
+}
+
+# k/n with 0 <= k < n, or exit 64.
+check_fraction() {
+    local what="$1" v="$2"
+    if ! [[ "$v" =~ ^[0-9]+/[0-9]+$ ]] || [ "${v%/*}" -ge "${v#*/}" ]; then
+        echo "error: $what '$v' must be k/n with 0 <= k < n (0-based)" >&2
+        exit 64
+    fi
+}
+
+# One report over the MUTANTS_OUT directories of a shard's parts. A part with
+# no results is named. One whose runner was lost uploaded nothing, not even
+# its scope, so its mutants are left out of the counts; one that started but
+# finished no mutant counts its mutants as in scope but untested.
+merge() {
+    [ "$#" -ge 1 ] || usage
+    local d listed=0 note="" n files=() lost=() missing=() extra=()
+    for d in "$@"; do
+        if [ ! -f "$d/scope" ]; then
+            lost+=("$(basename "$d")")
+            continue
+        fi
+        n=$(sed -n 1p "$d/scope")
+        listed=$(( listed + n ))
+        [ -n "$note" ] || note=$(sed -n 2p "$d/scope" | sed 's/, part [0-9]*\/[0-9]*//')
+        # Lines after the note: a part stopped at its budget says so.
+        while IFS= read -r line; do extra+=("$(basename "$d"): $line"); done < <(sed -n '3,$p' "$d/scope")
+        if [ -f "$d/mutants.out/outcomes.json" ]; then
+            files+=("$d/mutants.out/outcomes.json")
+        elif [ "$n" -gt 0 ]; then
+            missing+=("$(basename "$d")")
+        fi
+    done
+    [ "${#lost[@]}" -eq 0 ] || extra+=("No results from: ${lost[*]}. A part that did not finish uploads nothing (a lost runner, usually), so its mutants are not in the counts below.")
+    [ "${#missing[@]}" -eq 0 ] || extra+=("No mutant finished in: ${missing[*]}. Their mutants are counted as in scope but untested.")
+    [ -n "$note" ] || note="Mutation testing parts."
+    local full="$note"
+    for line in "${extra[@]}"; do full+=$'\n\n'"$line"; done
+    if [ "${#files[@]}" -eq 0 ]; then
+        printf '### Mutation testing\n\n%s\n\nNo part has results.\n' "$full" | emit
+        echo "error: no part has results" >&2
+        return 1
+    fi
+    local args=("${files[@]}" --listed "$listed" --note "$full")
+    [ "${MUTANTS_ANNOTATE:-1}" = 0 ] || args+=(--annotate)
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || args+=(--summary "$GITHUB_STEP_SUMMARY")
     python3 "$SCRIPT_DIR/report.py" "${args[@]}"
 }
 
 mode="${1:-}"
+file_args=()
+for g in "${NIGHTLY_GLOBS[@]}"; do file_args+=(--file "$g"); done
 scope_args=()
 note=""
 cd "$REPO_ROOT"
 case "$mode" in
     report)
         report
+        exit
+        ;;
+    merge)
+        shift
+        merge "$@"
+        exit
+        ;;
+    shard)
+        tonight
         exit
         ;;
     diff)
@@ -105,23 +184,17 @@ case "$mode" in
         note="Mutants on the lines this change touched."
         ;;
     nightly)
-        file_args=()
-        for g in "${NIGHTLY_GLOBS[@]}"; do file_args+=(--file "$g"); done
         total=$(cargo mutants --list "${file_args[@]}" | wc -l)
-        if [ -n "${2:-}" ]; then
-            shard="$2"
-            k="${shard%/*}"; n="${shard#*/}"
-            if ! [[ "$shard" =~ ^[0-9]+/[0-9]+$ ]] || [ "$k" -ge "$n" ]; then
-                echo "error: shard '$shard' must be k/n with 0 <= k < n (0-based)" >&2
-                exit 64
-            fi
-        else
-            shards=$(( (total + NIGHTLY_SHARD_SIZE - 1) / NIGHTLY_SHARD_SIZE ))
-            [ "$shards" -ge 1 ] || shards=1
-            shard="$(( $(date -u +%s) / 86400 % shards ))/$shards"
-        fi
-        scope_args=("${file_args[@]}" --shard "$shard" --sharding round-robin)
-        note="Shard $shard (0-based) of the consensus-critical scope ($total mutants: ${NIGHTLY_GLOBS[*]})."
+        shard="${2:-$(tonight)}"
+        check_fraction shard "$shard"
+        part="${3:-0/1}"
+        check_fraction part "$part"
+        k="${shard%/*}"; n="${shard#*/}"
+        j="${part%/*}"; p="${part#*/}"
+        scope_args=("${file_args[@]}" --shard "$(( k + j * n ))/$(( n * p ))" --sharding round-robin)
+        label="Shard $shard"
+        [ "$p" -eq 1 ] || label+=", part $part"
+        note="$label (0-based) of the consensus-critical scope ($total mutants: ${NIGHTLY_GLOBS[*]})."
         ;;
     *) usage ;;
 esac
