@@ -93,7 +93,14 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ViewMode::Steady => steady_help(),
         ViewMode::Mempool => mempool_help(),
         ViewMode::Chain => chain_help(),
+        ViewMode::Nap => nap_help(),
     };
+    let mut lines = lines;
+    // Every view's help ends with its keys; `5` does nothing, and is not
+    // listed, unless the node has NAP on.
+    if state.nap_available() {
+        lines.push(label("5", "Force the NAP view (press again for auto)"));
+    }
 
     let help = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(help, inner);
@@ -125,6 +132,53 @@ fn label(key: &str, desc: &str) -> Line<'static> {
 
 fn blank() -> Line<'static> {
     Line::from("")
+}
+
+fn nap_help() -> Vec<Line<'static>> {
+    vec![
+        heading("NAP View  --  Node Attestation Protocol"),
+        blank(),
+        heading("NAP Panel"),
+        label("Publisher", "nap=1: attestations this node serves to peers, and how many are valid."),
+        label("Aggregator", "napaggregator=1: the report on attestations collected from peers."),
+        label("Held", "Attestations the aggregator holds; counting = the ones that count at the tip."),
+        label("invalid", "Attestations whose signatures failed (0 for the node's own set)."),
+        label("UTXO total", "Value of every coin at the tip: the denominator of coverage."),
+        label("digest", "SHA256 of the held set; a replayed snapshot with it gives the same report."),
+        blank(),
+        heading("Report Table"),
+        Line::from(vec![
+            Span::styled("  Each key in bold, then its values, heaviest first. Weight is coin value.", Style::default().fg(Color::White)),
+        ]),
+        label("Share", "A value's part of its key's participating weight."),
+        label("Weight", "Value of the coins attesting, in BTC."),
+        label("Coverage", "Weight as a part of the UTXO total."),
+        label("Coins", "Outpoints attesting."),
+        label("Withdrawn", "Weight of coins that withdrew from the key; not in any share."),
+        Line::from(vec![
+            Span::styled("  Percentages are rounded down from the node's parts per million.", Style::default().fg(Color::Gray)),
+        ]),
+        blank(),
+        heading("Breakdown (selected value)"),
+        label("Value", "Weight by coin size: <0.01, 0.01-1, 1-100, >=100 BTC."),
+        label("Anchor age", "Weight by how old the attestation's anchor block is."),
+        label("Coin age", "Weight by how long ago the coin was created."),
+        label("Script", "Weight by output type."),
+        label("top N", "Share of the value's weight held by its N heaviest coins."),
+        blank(),
+        heading("Published Table"),
+        label("Status", "`valid`, or the rule the attestation fails at the tip."),
+        Line::from(vec![
+            Span::styled("  Keys and values are holder-chosen; anything but printable ASCII shows as ?.", Style::default().fg(Color::Gray)),
+        ]),
+        blank(),
+        heading("Keyboard"),
+        label("q", "Quit (or close help / reorgs)"),
+        label("h / ?", "Toggle this help screen"),
+        label("r", "Toggle reorg history (last 7 days)"),
+        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label("Up / Down", "Select a value for the breakdown"),
+    ]
 }
 
 fn ibd_help() -> Vec<Line<'static>> {

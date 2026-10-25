@@ -3,6 +3,7 @@ pub mod failure;
 pub mod help;
 pub mod ibd;
 pub mod mempool;
+pub mod nap;
 pub mod reorgs;
 pub mod startup;
 pub mod steady;
@@ -12,6 +13,12 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Cell};
 use ratatui::layout::Constraint;
+
+/// The view keys for the footers: `5` is listed only while the node has NAP
+/// on, as it does nothing otherwise.
+pub fn view_keys(state: &crate::state::AppState) -> &'static str {
+    if state.nap_available() { "1/2/3/4/5" } else { "1/2/3/4" }
+}
 
 /// Format bytes as human-readable (e.g., "1.23 MB").
 pub fn format_bytes(n: u64) -> String {
