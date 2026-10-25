@@ -312,9 +312,12 @@ SATD_ONLY = {
     "verifybip322": [["address", False], ["signature", False], ["message", False]],
     # NAP publisher RPCs (docs/manual/src/nap.md).
     "createnapattestation": [["outpoint", False], ["key", False], ["value", False], ["descriptor", False]],
+    "exportnapsnapshot": [["path", False]],
+    "getnapreport": [],
     "listnapaggregate": [],
     "listnapattestations": [],
     "removenapattestation": [["outpoint", False], ["key", False]],
+    "replaynapsnapshot": [["path", False]],
     "submitnapattestation": [["message", False], ["signature", False]],
     "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],

@@ -54,9 +54,9 @@ pub struct RpcError {
     /// - `mempool.conflicts`, `mempool.missing_inputs`
     /// - `validation.consensus`, `validation.witness`, `validation.sighash`
     /// - `rpc.input.parse`, `rpc.input.missing`, `rpc.input.range`
-    /// - `storage.not_found`, `storage.pruned`
+    /// - `storage.not_found`, `storage.pruned`, `storage.exists`, `storage.io`
     /// - `network.peer_not_found`, `network.disabled`
-    /// - `node.shutting_down`, `node.initializing`
+    /// - `node.shutting_down`, `node.initializing`, `node.busy`
     pub category: &'static str,
     /// Operator-facing remediation hint. Should be concrete and actionable.
     pub suggestion: Option<String>,

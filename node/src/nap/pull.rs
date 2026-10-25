@@ -125,6 +125,9 @@ pub enum Next {
 pub struct Puller {
     collector: Arc<Collector>,
     state: Mutex<State>,
+    /// The last `getnapreport`, served again while the tip and the set are
+    /// unchanged.
+    report: super::report::Cache,
 }
 
 #[derive(Default)]
@@ -142,11 +145,16 @@ struct State {
 
 impl Puller {
     pub fn new(collector: Arc<Collector>) -> Self {
-        Puller { collector, state: Mutex::new(State::default()) }
+        Puller { collector, state: Mutex::new(State::default()), report: Default::default() }
     }
 
     pub fn collector(&self) -> &Arc<Collector> {
         &self.collector
+    }
+
+    /// The cached `getnapreport`.
+    pub fn report_cache(&self) -> &super::report::Cache {
+        &self.report
     }
 
     pub fn stats(&self) -> Stats {

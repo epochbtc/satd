@@ -219,6 +219,72 @@ fn nap_aggregator_collects_supersedes_withdraws_reorgs_spends_and_punishes() {
     a.stop();
 }
 
+/// An error's code from an RPC that must fail.
+fn refused(node: &TestNode, method: &str, params: Vec<Value>) -> i64 {
+    let resp = node.rpc_call_with_params(method, params).unwrap();
+    resp["error"]["code"].as_i64().unwrap_or_else(|| panic!("{method} succeeded: {resp}"))
+}
+
+#[test]
+fn nap_report_replays_byte_for_byte_from_an_exported_snapshot() {
+    let mut a = TestNode::start(&["--nap=1", "--v2transport=0"]);
+    let c = TestNode::start(&["--napaggregator=1", "--v2transport=0"]);
+    let w = wallet();
+    a.mine_blocks(3, &w.address.to_string());
+    a.mine_blocks(ATTESTABLE_AFTER, BURN);
+    let (coin1, coin2, coin3) = (coin(&a, 1), coin(&a, 2), coin(&a, 3));
+    attest(&a, &coin1, "k", "yes");
+    attest(&a, &coin2, "k", "no");
+    attest(&a, &coin3, "k", "");
+
+    c.rpc_ok("addnode", vec![json!(p2p(&a)), json!("onetry")]);
+    synced(&[&a, &c]);
+    wait_counted(&c, &coin1, "k", "yes", "coin 1");
+    wait_counted(&c, &coin2, "k", "no", "coin 2");
+    wait_counted(&c, &coin3, "k", "", "coin 3's withdrawal");
+
+    let live = c.rpc_ok("getnapreport", vec![]);
+    assert_eq!(live["height"], height(&c));
+    assert_eq!(live["counting"], 3);
+    let k = &live["keys"][0];
+    assert_eq!(k["key"], "k");
+    // Regtest's early coinbases hold 50 BTC each.
+    assert_eq!(k["weight_sat"], 10_000_000_000u64);
+    assert_eq!(k["withdrawn"], json!({ "weight_sat": 5_000_000_000u64, "outpoints": 1 }));
+    assert_eq!(k["values"][0]["share_ppm"], 500_000);
+
+    let export = c.rpc_ok("exportnapsnapshot", vec![json!("nap-snapshot.dat")]);
+    assert_eq!(export["digest"], live["digest"]);
+    assert_eq!(export["attestations"], 3);
+    let path = export["path"].as_str().unwrap().to_owned();
+    assert!(path.ends_with("nap-snapshot.dat") && std::path::Path::new(&path).is_absolute(), "{path}");
+    assert_eq!(refused(&c, "exportnapsnapshot", vec![json!(path)]), -8, "an existing file is not overwritten");
+
+    // The replay, at the same tip, on the aggregator and on a node that
+    // aggregates nothing: the same bytes.
+    let replayed = c.rpc_ok("replaynapsnapshot", vec![json!(path)]);
+    let elsewhere = a.rpc_ok("replaynapsnapshot", vec![json!(path)]);
+    let bytes = serde_json::to_string(&live).unwrap();
+    assert_eq!(serde_json::to_string(&replayed).unwrap(), bytes);
+    assert_eq!(serde_json::to_string(&elsewhere).unwrap(), bytes);
+
+    // Without the aggregator, only a snapshot can be reported on.
+    assert_eq!(refused(&a, "getnapreport", vec![]), -1);
+    assert_eq!(refused(&a, "exportnapsnapshot", vec![json!("x.dat")]), -1);
+    assert_eq!(refused(&a, "replaynapsnapshot", vec![json!("no-such-file.dat")]), -8);
+
+    // The live report, asked again, is the one computed; a new block makes
+    // a new one.
+    assert_eq!(c.rpc_ok("getnapreport", vec![]), live);
+    a.mine_blocks(1, BURN);
+    synced(&[&a, &c]);
+    let next = c.rpc_ok("getnapreport", vec![]);
+    assert_eq!(next["height"], height(&c));
+    assert_ne!(next["hash"], live["hash"]);
+
+    a.stop();
+}
+
 /// A `napatt` with one attestation for `outpoint` whose signature signs
 /// another message: well formed, on a real coin, and false.
 fn forged_page(outpoint: OutPoint, anchor_height: u32, anchor: BlockHash) -> Vec<u8> {

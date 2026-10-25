@@ -62,6 +62,9 @@ pub trait ChainView {
     /// The coin at `outpoint` in the UTXO set at the tip. Never an
     /// unconfirmed output.
     fn coin(&self, outpoint: &OutPoint) -> Option<Coin>;
+    /// The value of the whole UTXO set at the tip: a report's coverage
+    /// denominator. Lost coins count in it.
+    fn utxo_total(&self) -> Amount;
 }
 
 /// Why an attestation is not valid at a tip, naming the rule.

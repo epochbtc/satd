@@ -141,6 +141,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "estimatefees" => &[("targets", false), ("mode", false)],
         "estimaterawfee" => &[("conf_target", false), ("threshold", false)],
         "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false)],
+        // SATD_ONLY: exportnapsnapshot
+        "exportnapsnapshot" => &[("path", false)],
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
         "generate" => &[],
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
@@ -180,6 +182,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getmempoolinfo" => &[],
         "getmempoolsummary" => &[("top_n", false)],
         "getmininginfo" => &[],
+        // SATD_ONLY: getnapreport
+        "getnapreport" => &[],
         "getnettotals" => &[],
         "getnetworkhashps" => &[("nblocks", false), ("height", false)],
         "getnetworkinfo" => &[],
@@ -228,6 +232,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "reconsiderblock" => &[("blockhash", false)],
         // SATD_ONLY: removenapattestation
         "removenapattestation" => &[("outpoint", false), ("key", false)],
+        // SATD_ONLY: replaynapsnapshot
+        "replaynapsnapshot" => &[("path", false)],
         "resumeindex" => &[("index_name", false)],
         "savemempool" => &[],
         "scantxoutset" => &[("action", false), ("scanobjects", false)],
@@ -341,7 +347,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
     "deriveaddresses", "disconnectnode", "dumptxoutset",
     "echo", "echoipc", "echojson",
-    "estimatefees", "estimaterawfee", "estimatesmartfee",
+    "estimatefees", "estimaterawfee", "estimatesmartfee", "exportnapsnapshot",
     "finalizepsbt", "generate", "generateblock", "generatetoaddress",
     "generatetodescriptor",
     "getaddednodeinfo", "getaddressbalance", "getaddrmaninfo", "getaddresshistory",
@@ -354,7 +360,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "getmemoryinfo",
     "getmempoolancestors", "getmempooldescendants", "getmempoolentry",
     "getmempoolhistory", "getmempoolinfo", "getmempoolsummary",
-    "getmininginfo", "getnettotals",
+    "getmininginfo", "getnapreport", "getnettotals",
     "getnetworkhashps", "getnetworkinfo", "getnodeaddresses", "getorphaninfo", "getorphantxs", "getpeerinfo",
     "getpolicyinfo", "getprioritisedtransactions", "getquarantineentry",
     "getquarantineinfo", "getrawaddrman", "getrawmempool",
@@ -367,7 +373,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "listquarantine", "loadtxoutset", "logging",
     "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
     "pruneblockchain",
-    "reconsiderblock", "removenapattestation", "resumeindex", "savemempool", "scantxoutset",
+    "reconsiderblock", "removenapattestation", "replaynapsnapshot", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
     "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
     "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",

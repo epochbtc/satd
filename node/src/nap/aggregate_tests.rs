@@ -695,3 +695,23 @@ fn under_a_lowered_cap_a_dead_entry_takes_no_place() {
     let held: Vec<_> = agg.all().into_iter().map(|h| h.attestation).collect();
     assert_eq!(held, vec![live], "the live entry keeps the one place");
 }
+
+#[test]
+fn the_change_count_moves_with_what_the_set_holds() {
+    let s = p2wpkh();
+    let mut chain = chain_with(&s, 2);
+    let (_d, c) = open(&chain);
+    let start = c.aggregate().changes();
+    let a = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    take(&c, &chain, "a", vec![a.clone()]);
+    let added = c.aggregate().changes();
+    assert!(added > start, "an attestation added");
+    take(&c, &chain, "b", vec![a]);
+    assert_eq!(c.aggregate().changes(), added, "one already held changes nothing");
+    c.aggregate().on_tip(&chain);
+    assert_eq!(c.aggregate().changes(), added, "judging alone changes nothing");
+    // Spent: dropped at the next tip.
+    chain.coins.remove(&outpoint(1));
+    assert_eq!(c.aggregate().on_tip(&chain), 1);
+    assert!(c.aggregate().changes() > added, "an attestation dropped");
+}

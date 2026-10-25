@@ -745,7 +745,8 @@ pub struct Config {
     pub napmaxattestations: usize,
     /// `-napaggregator`: collect NAP attestations from publishers over P2P
     /// into `<datadir>/nap/aggregate/aggregate.dat`, and enable
-    /// `listnapaggregate`. Independent of `-nap`. Default false. satd-only.
+    /// `listnapaggregate`, `getnapreport` and `exportnapsnapshot`.
+    /// Independent of `-nap`. Default false. satd-only.
     pub napaggregator: bool,
     /// `-napaggregatormax`: with `-napaggregator`, the most attestations the
     /// collected set holds; past it new `(outpoint, key)` pairs are refused
@@ -7619,7 +7620,7 @@ const NAP_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "napaggregator",
         "BOOL",
         StratumArgKind::Bool,
-        "Collect Node Attestation Protocol attestations from publishers over P2P and enable listnapaggregate (default: 0)",
+        "Collect Node Attestation Protocol attestations from publishers over P2P and enable listnapaggregate, getnapreport and exportnapsnapshot (default: 0)",
     ),
     (
         "napaggregatormax",

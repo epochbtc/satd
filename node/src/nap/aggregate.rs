@@ -113,11 +113,14 @@ struct State {
     pending: Vec<(Attestation, String)>,
     /// Changed since the last save.
     dirty: bool,
+    /// Bumped whenever an attestation is added or dropped, so a report on
+    /// the set can tell it is still current.
+    changes: u64,
 }
 
 impl State {
     fn remove_where(&mut self, key: &Key, drop: impl Fn(usize, &Held) -> bool) -> usize {
-        let State { entries, ids, dirty, .. } = self;
+        let State { entries, ids, dirty, changes, .. } = self;
         let Some(gens) = entries.get_mut(key) else { return 0 };
         let before = gens.len();
         let mut i = 0;
@@ -135,6 +138,7 @@ impl State {
         }
         if removed > 0 {
             *dirty = true;
+            *changes += 1;
         }
         removed
     }
@@ -286,6 +290,7 @@ impl Aggregate {
         }
         st.ids.insert(id, key);
         st.dirty = true;
+        st.changes += 1;
         Inserted::Added
     }
 
@@ -357,6 +362,16 @@ impl Aggregate {
     /// within each.
     pub fn all(&self) -> Vec<Held> {
         self.state.lock().entries.values().flatten().cloned().collect()
+    }
+
+    /// A count that moves whenever an attestation is added or dropped.
+    pub fn changes(&self) -> u64 {
+        self.state.lock().changes
+    }
+
+    /// The most attestations the set holds (0 is no limit).
+    pub fn max_attestations(&self) -> usize {
+        self.max_attestations
     }
 
     /// How many attestations the set holds.

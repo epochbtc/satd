@@ -67,6 +67,10 @@ impl ChainView for Chain {
     fn coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         self.coins.get(outpoint).cloned()
     }
+    /// The coins held, and as much again in coins no attestation names.
+    fn utxo_total(&self) -> Amount {
+        self.coins.values().map(|c| c.value).sum::<Amount>() * 2
+    }
 }
 
 pub(super) fn outpoint(n: u8) -> OutPoint {

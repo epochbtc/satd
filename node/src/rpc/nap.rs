@@ -1,9 +1,11 @@
 //! The NAP RPCs, satd's own. The publisher's, `createnapattestation`,
 //! `submitnapattestation`, `listnapattestations` and
 //! `removenapattestation`, answer an error unless the node runs with
-//! `-nap=1`; the aggregator's, `listnapaggregate`, unless it runs with
-//! `-napaggregator=1`.
+//! `-nap=1`; the aggregator's, `listnapaggregate`, `getnapreport` and
+//! `exportnapsnapshot`, unless it runs with `-napaggregator=1`.
+//! `replaynapsnapshot` reports on a snapshot file and needs only the chain.
 
+use std::path::Path;
 use std::str::FromStr as _;
 
 use base64::Engine as _;
@@ -15,7 +17,10 @@ use serde_json::{Value, json};
 use crate::bip322;
 use crate::chain::state::ChainState;
 use crate::nap::publisher::{Published, encode_signature};
-use crate::nap::{NapSignature, PublishError, Publisher};
+use crate::nap::publisher::ChainSource as _;
+use crate::nap::report;
+use crate::nap::validity::Timelocks;
+use crate::nap::{Attestation, NapSignature, PublishError, Publisher};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::error::RpcError;
 
@@ -84,6 +89,77 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
     });
     annotate_units(&mut out, unit);
     out
+}
+
+/// The tip moved through every read of a report or a snapshot.
+fn tip_kept_changing() -> ErrorObjectOwned {
+    RpcError::new(-1, "node.busy", "the chain tip kept changing while the NAP set was judged")
+        .with_suggestion("Ask again.")
+        .into_error_object()
+}
+
+/// `getnapreport`: the report on the aggregator's own set, every
+/// attestation held judged at the tip, with the digest of the set. The
+/// signatures verified when the attestations were collected, so this reads
+/// only the chain. It is computed once per tip and set, and served again
+/// until either changes, or for [`report::REPORT_REUSE`] on the same tip
+/// while collection keeps changing the set, so asking often costs nothing.
+pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value, ErrorObjectOwned> {
+    let aggregate = p.collector().aggregate();
+    // Read before the set is: a change meanwhile is computed again next time.
+    let changes = aggregate.changes();
+    let tip = chain.read(&|v| v.block_hash(v.tip_height())).flatten().ok_or_else(tip_kept_changing)?;
+    p.report_cache().get_or(tip, changes, std::time::Instant::now(), || {
+        let held: Vec<(Attestation, Timelocks)> =
+            aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
+        let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
+        let digest = report::digest(&set);
+        let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
+        Ok((tip.hash, report::report(tip, digest, set.len(), 0, &counting)))
+    })
+}
+
+/// `replaynapsnapshot`: the report on a snapshot file. Each signature is
+/// verified against its coin, and the set judged at this node's tip, as the
+/// aggregator that exported it would at the same tip ([`report::replay`]). `max` bounds the
+/// attestations read (0 is no limit).
+pub fn report_snapshot(chain: &ChainState, path: &Path, max: usize) -> Result<Value, ErrorObjectOwned> {
+    let snapshot = report::read_snapshot(path, max)
+        .map_err(|e| RpcError::new(-8, "rpc.input.parse", e).into_error_object())?;
+    let replay = report::replay(chain, &snapshot.attestations).ok_or_else(tip_kept_changing)?;
+    let digest = report::digest(&snapshot.attestations);
+    Ok(report::report(replay.tip, digest, snapshot.attestations.len(), replay.invalid, &replay.counting))
+}
+
+/// `exportnapsnapshot`: write every attestation the aggregator holds to
+/// `path` as a snapshot. An existing file is not overwritten.
+pub fn export_snapshot(
+    p: &crate::nap::pull::Puller,
+    chain: &ChainState,
+    path: &Path,
+) -> Result<Value, ErrorObjectOwned> {
+    let set = report::canonical(p.collector().aggregate().all().into_iter().map(|h| h.attestation));
+    let (height, hash) = chain
+        .read(&|v| {
+            let h = v.tip_height();
+            (h, v.block_hash(h).expect("the active chain holds its tip"))
+        })
+        .ok_or_else(tip_kept_changing)?;
+    report::write_new(path, &report::encode_snapshot(height, hash, &set)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            RpcError::new(-8, "storage.exists", format!("refusing to overwrite existing file: {}", path.display()))
+        } else {
+            RpcError::new(-1, "storage.io", format!("writing {}: {e}", path.display()))
+        }
+        .into_error_object()
+    })?;
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "height": height,
+        "hash": hash.to_string(),
+        "attestations": set.len(),
+        "digest": report::digest(&set).to_string(),
+    }))
 }
 
 /// `"<txid>:<vout>"`, as `createnapattestation` and `removenapattestation`

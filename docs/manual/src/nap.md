@@ -411,18 +411,114 @@ sat-cli listnapaggregate
 `held` counts the superseded attestations kept for reorgs too; `counting`
 is one per coin and key.
 
+### Reports
+
+`getnapreport` judges every attestation held at the tip and reports, for
+each key, the weight behind each value. Weight is the coin's value, so one
+1 BTC coin weighs what a hundred 0.01 BTC coins do. Every number is an
+integer: weights in satoshis (`weight_sat`), and shares and coverage in parts
+per million, rounded down (`250000` is 25%). The report is computed once per
+tip and set and served again until either changes, so a dashboard can poll
+it. While collection keeps changing the set, a report on the same tip is
+served again for up to 30 seconds; its `digest` names the set it covers. A
+new block is always reported on afresh.
+
+```text
+sat-cli getnapreport
+{
+  "height": 870000,
+  "hash": "…",
+  "utxo_total_sat": 1980000000000000,
+  "digest": "…",
+  "attestations": 3,
+  "invalid": 0,
+  "counting": 2,
+  "keys": [
+    { "key": "bip_xyz.support", "weight_sat": 50000000, "outpoints": 1, "coverage_ppm": 0,
+      "withdrawn": { "weight_sat": 0, "outpoints": 0 },
+      "values": [
+        { "value": "yes", "weight_sat": 50000000, "outpoints": 1,
+          "share_ppm": 1000000, "coverage_ppm": 0,
+          "value_tiers": [ { "tier": "<0.01", "weight_sat": 0, "outpoints": 0 }, … ],
+          "anchor_age": [ { "blocks": "<2016", "weight_sat": 50000000, "outpoints": 1 }, … ],
+          "coin_age": [ … ],
+          "script_types": [ … ],
+          "concentration": { "top10_ppm": 1000000, "top100_ppm": 1000000 } }
+      ] }
+  ]
+}
+```
+
+*   **The key.** `weight_sat` and `outpoints` are the coins stating a value.
+    `coverage_ppm` is that weight's share of the whole UTXO set's value at the
+    tip (`utxo_total_sat`), in which lost coins count. Coins that withdrew
+    (an empty value) are in `withdrawn`, and in no share.
+*   **Each value**, heaviest first: its weight, its `share_ppm` of the key's
+    weight and its `coverage_ppm`, then breakdowns. Each breakdown lists
+    every bucket, including empty ones.
+    *   `value_tiers`, by coin value: `<0.01`, `0.01-1`, `1-100` and `>=100`
+        BTC.
+    *   `anchor_age`, in blocks below the tip: `<2016` (about two weeks),
+        `<13104` (three months) and `<26208` (the six-month freshness
+        window).
+    *   `coin_age`, in blocks since the coin confirmed: `<13104`, `<52416`
+        (a year), `<104832` (two years), `<262080` (five years) and
+        `>=262080`.
+    *   `script_types`, by the coin's script: `p2pkh`, `p2sh`, `p2wpkh`,
+        `p2wsh`, `p2tr` and `other`.
+    *   `concentration`: the share of the value's weight in its 10 and 100
+        largest coins.
+*   **Coins, not holders.** Tiers and concentration describe coins. One
+    holder can spread across tiers, and several can share a custodian's coin.
+
+Keys and values are shown exactly as signed, ordered by bytes, with no
+grouping of variant spellings.
+
+### Snapshots
+
+The report's `digest` names the set it was computed from. It is SHA256 over
+each attestation's serialized form, prefixed with its length as a compact
+size, in ascending id order. `exportnapsnapshot "path"` writes that set,
+including the superseded attestations kept for reorgs, to a file:
+
+```text
+sat-cli exportnapsnapshot nap-snapshot.dat
+{ "path": "/home/me/.satd/nap-snapshot.dat", "height": 870000, "hash": "…",
+  "attestations": 3, "digest": "…" }
+```
+
+A relative path is resolved against the datadir, as `dumptxoutset` does, and
+an existing file is not overwritten. `replaynapsnapshot "path"` reports on a
+snapshot instead of the node's own set. It verifies every signature, and
+judges the set at this node's tip. Any node can do this, without
+`napaggregator`. At the same tip it gives the same bytes as the aggregator
+that exported the snapshot, so anyone can check a published report. The
+replay does not add the snapshot to the node's set. `invalid` counts
+attestations whose signatures fail. An attestation whose coin is gone is
+not verified, and does not count.
+
+The file is `"NAPS"`, a version (1), the height and hash it was exported
+at, a count, the length-prefixed attestations, and a SHA256 checksum. A
+replay reads at most `napaggregatormax` attestations, or 1,000,000 on a
+node that does not aggregate.
+
 ## Access
 
 `createnapattestation`, `listnapattestations` and `listnapaggregate` change
 nothing and need `rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
 and `removenapattestation` decide what the node publishes and need
-`rpc:write`. See [Authentication & Authorization](authentication.md).
+`rpc:write`. `getnapreport` needs `rpc:read` and is allowed on the
+read-only listener: it is computed once per tip and set, however often it
+is asked. `replaynapsnapshot` reads a file and verifies every signature in
+it, and `exportnapsnapshot` writes a file. Both need `rpc:write` and are
+refused on the read-only listener, as `scantxoutset` and `dumptxoutset`
+are. See [Authentication & Authorization](authentication.md).
 
 | Error | Meaning |
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
-| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, or `removenapattestation` found nothing to remove. |
-| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`), or the chain moved during the call (try again). |
+| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, `removenapattestation` found nothing to remove, a snapshot file does not read or is malformed (`replaynapsnapshot`), or `exportnapsnapshot`'s file exists. |
+| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`, `getnapreport` and `exportnapsnapshot`), the chain moved during the call (try again), or a snapshot could not be written. |
 
 ## Privacy and key exposure
 
