@@ -10,7 +10,16 @@
 # breaks. Each night tests one shard of the consensus-critical code
 # (consensus/, node's validation, chain and mempool modules), rotating so every
 # shard comes round. The shard and scope are in scripts/mutants/run.sh. Missed
-# mutants are listed in the run summary and as warning annotations.
+# mutants are listed in the summary of the `report` job and as warning
+# annotations.
+#
+# The shard is split into parts that run as parallel jobs of about an hour and
+# a quarter each. A hosted runner is sometimes lost mid-job, and a lost runner
+# uploads nothing: as one job of nearly five hours, one loss cost the whole
+# night, and that shard did not come round again for weeks. Now it costs one
+# part, and a scheduled run re-runs its failed parts once, by dispatching this
+# workflow for the same shard. `plan` picks the shard once per run, so the
+# retry tests the same mutants even on a later day.
 #
 # To check your own change the same way, run `scripts/mutants/run.sh diff`
 # locally (see CONTRIBUTING.md).
@@ -28,28 +37,100 @@ on:
         description: "Nightly shard to run, as k/n, 0-based: 0/41 to 40/41 (default: tonight's)"
         required: false
         default: ""
+      parts:
+        description: "Parts of the shard to run, comma-separated, 0-based: 0 to 3 (default: all)"
+        required: false
+        default: ""
   schedule:
-    # Nightly 00:30 UTC: the run takes most of the six hours a hosted job may.
     - cron: '30 0 * * *'
 
 permissions:
   contents: read
 
+# Queued, not cancelled: the retry a scheduled run dispatches joins this group
+# while that run is still finishing, and must wait for it rather than cancel it.
 concurrency:
   group: mutants-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # Not named CARGO_* or RUST*: rust-cache folds those into its key, and the
 # restores below must match the key the test jobs use. The test settings are
 # on the steps that run the tests, as in ci.yml.
 env:
   MUTANTS_VERSION: '27.1.0'
+  # How many parallel jobs a shard is split into. The `parts` input's
+  # description names the range.
+  PARTS: '4'
 
 jobs:
-  nightly:
-    name: mutants (nightly shard)
+  plan:
+    name: pick the shard
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 10
+    outputs:
+      shard: ${{ steps.plan.outputs.shard }}
+      parts: ${{ steps.plan.outputs.parts }}
+      count: ${{ env.PARTS }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
+
+      - name: Pick the shard and parts
+        id: plan
+        env:
+          SHARD: ${{ github.event.inputs.shard }}
+          WANT: ${{ github.event.inputs.parts }}
+        run: |
+          set -euo pipefail
+          shard="${SHARD:-$(bash scripts/mutants/run.sh shard)}"
+          if ! [[ "$shard" =~ ^[0-9]+/[0-9]+$ ]] || [ "${shard%/*}" -ge "${shard#*/}" ]; then
+            echo "::error::shard '$shard' must be k/n with 0 <= k < n"
+            exit 1
+          fi
+          if [ -z "$WANT" ]; then
+            parts=$(seq 0 $(( PARTS - 1 )) | paste -sd, -)
+          else
+            # Each part once: two legs of one part would collide on its
+            # artifact name.
+            if ! [[ "${WANT// /}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+              echo "::error::parts '$WANT' must be a comma-separated list of 0 to $(( PARTS - 1 ))"
+              exit 1
+            fi
+            for j in $(echo "${WANT// /}" | tr , ' '); do
+              if [ "$j" -ge "$PARTS" ]; then
+                echo "::error::part '$j' must be 0 to $(( PARTS - 1 ))"
+                exit 1
+              fi
+            done
+            parts=$(echo "${WANT// /}" | tr , '\n' | sort -nu | paste -sd, -)
+          fi
+          echo "Shard $shard, parts $parts of $PARTS."
+          echo "shard=$shard" >> "$GITHUB_OUTPUT"
+          echo "parts=[$parts]" >> "$GITHUB_OUTPUT"
+
+  mutate:
+    name: mutants (part ${{ matrix.part }} of ${{ needs.plan.outputs.count }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    # About 75 minutes of mutants (a shard of 150 took 290 minutes on one
+    # runner), the budget below with room to spare, and setup.
+    timeout-minutes: 160
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.parts) }}
 
     steps:
       - name: Checkout sources
@@ -93,27 +174,107 @@ jobs:
       - name: Pre-build sat-cli (test fixture)
         run: cargo build -p sat-cli --locked
 
-      # 290 of the job's 350 minutes; the rest is setup, build and report.
-      - name: Mutate tonight's shard
+      # 120 of the job's 160 minutes; the rest is setup, build and report.
+      - name: Mutate this part of the shard
         id: mutate
         env:
           MUTANTS_SKIP_REPORT: "1"
-          BUDGET_MINUTES: "290"
+          BUDGET_MINUTES: "120"
           RUST_TEST_THREADS: "4"
           SATD_TEST_TIMEOUT_MULT: "2"
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
-          SHARD: ${{ github.event.inputs.shard }}
-        run: bash scripts/mutants/run.sh nightly ${SHARD:+"$SHARD"}
+          SHARD: ${{ needs.plan.outputs.shard }}
+          PART: ${{ matrix.part }}/${{ needs.plan.outputs.count }}
+        run: bash scripts/mutants/run.sh nightly "$SHARD" "$PART"
 
+      # This part's own summary; the annotations come from `report`, once.
       - name: Report
         if: always() && steps.mutate.outcome != 'skipped'
+        env:
+          MUTANTS_ANNOTATE: "0"
         run: bash scripts/mutants/run.sh report
 
+      # The scope file as well as mutants.out: `report` reads both.
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: mutants-nightly
-          path: target/mutants-run/mutants.out/
+          name: mutants-part-${{ matrix.part }}
+          path: target/mutants-run/
           if-no-files-found: ignore
           retention-days: 30
+
+  report:
+    name: report the shard
+    needs: [plan, mutate]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/mutants
+
+      # Not fatal: when no part uploaded anything, `merge` still says so.
+      - name: Download the parts' results
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mutants-part-*
+          path: parts
+
+      # A part with no artifact (its runner lost) is named in the report.
+      - name: Report
+        env:
+          PARTS_RUN: ${{ needs.plan.outputs.parts }}
+        run: |
+          set -euo pipefail
+          dirs=()
+          for j in $(echo "$PARTS_RUN" | tr -d '[]' | tr , ' '); do
+            dirs+=("$GITHUB_WORKSPACE/parts/mutants-part-$j")
+          done
+          bash scripts/mutants/run.sh merge "${dirs[@]}"
+
+  # A scheduled run whose parts failed (usually a lost runner) runs them again
+  # once, for the same shard. The retry is a dispatched run, so it is never
+  # retried itself.
+  retry:
+    name: retry failed parts
+    needs: [plan, mutate]
+    if: >-
+      always()
+      && github.event_name == 'schedule'
+      && needs.plan.result == 'success'
+      && needs.mutate.result == 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch a run of the failed parts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHARD: ${{ needs.plan.outputs.shard }}
+        run: |
+          set -euo pipefail
+          # Any part that ended other than in success: a lost runner is
+          # `failure`, a job past its timeout `cancelled` or `timed_out`.
+          failed=$(gh run view "$RUN_ID" --json jobs --jq \
+            '[.jobs[] | select(.status == "completed" and .conclusion != "success")
+              | .name | capture("^mutants \\(part (?<j>[0-9]+) of") | .j]
+              | join(",")')
+          if [ -z "$failed" ]; then
+            echo "No failed part found in run $RUN_ID; nothing to retry."
+            exit 0
+          fi
+          echo "Retrying shard $SHARD, parts $failed."
+          gh workflow run mutants.yml --ref "$GITHUB_REF_NAME" \
+            -f shard="$SHARD" -f parts="$failed"
+          {
+            echo "### Retry"
+            echo
+            echo "Parts $failed of shard $SHARD failed; dispatched a run of them."
+          } >> "$GITHUB_STEP_SUMMARY"

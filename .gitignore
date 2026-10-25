@@ -40,3 +40,6 @@ result-*
 # Built appliance images. Multi-GB disk images and ISOs; the build writes
 # here by default and nothing in the tree should ever carry one.
 contrib/appliance/out/
+
+# Python bytecode, written when a script under scripts/ is run or compiled.
+__pycache__/
