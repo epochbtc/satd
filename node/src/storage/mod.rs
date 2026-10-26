@@ -6,6 +6,7 @@ pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
 pub mod profile;
+pub mod punch;
 pub mod recent_window;
 pub mod rocksdb_store;
 pub mod split_store;
