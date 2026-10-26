@@ -146,6 +146,9 @@ item below is (or will be) written up in full in the in-development
 - `rustls-webpki` 0.103.16 and `webpki-roots` / `webpki-root-certs` 1.0.10
   (RUSTSEC-2026-0381, -0382, -0383: distrusted emSign intermediates).
 
+- `zstd-sys` 2.1.2 (RUSTSEC-2026-0410: a wasm32-only allocator bug; satd
+  builds no wasm32 target, so it was not affected).
+
 - `getrawmempool` lists transactions in Core's mining order: best chunk
   feerate first, a cluster's transactions in its order. It listed them in
   hash-map order, which changed when a reorg returned the same
