@@ -44,8 +44,12 @@ Move both files aside to start without them, or set `napstorerecover=1`, and
 satd does that itself: it renames them to `attestations.dat.bad-<unix time>`
 and `attestations.journal.bad-<unix time>`, logs a warning, and starts with
 an empty store. Either way the damaged files' signatures are still on disk.
-Copy both files to back the store up; the file alone may miss the latest
-changes.
+A clean shutdown also writes the store to the file whole and empties the
+journal, so after one the file alone holds every attestation, as an older
+satd, which does not read the journal, would load it. After a crash the
+newest attestations may be only in the journal: copy both files to back
+the store up, and before going back to an older satd, start and stop this
+one cleanly.
 
 ## What gets signed
 
