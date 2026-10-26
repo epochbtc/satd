@@ -567,18 +567,25 @@ impl Publisher {
     }
 
     /// Write the store to the file whole and empty the journal, whatever
-    /// their sizes: at a clean shutdown, so the file alone holds every
-    /// attestation and a build that does not read the journal (an older
-    /// satd, after a rollback) loses none. Returns whether there was
-    /// anything to fold.
+    /// their sizes, and accept no change after: at a clean shutdown, so the
+    /// file alone holds every attestation and a build that does not read the
+    /// journal (an older satd, after a rollback) loses none. A tip pass or an
+    /// RPC still running when shutdown begins may come after it: a
+    /// submission or removal is then refused, and a spent coin's drop is
+    /// made only in memory, again at the next load. Returns whether there
+    /// was anything to fold.
     pub fn fold_journal(&self) -> Result<bool, String> {
         let mut journal = self.writer.lock();
-        if !journal.has_records() {
-            return Ok(false);
-        }
-        let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
-        journal.compact(&self.path, atts.iter())?;
-        Ok(true)
+        let folded = if journal.has_records() {
+            let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+            journal.compact(&self.path, atts.iter()).map(|()| true)
+        } else {
+            Ok(false)
+        };
+        // Closed even when the fold failed: the journal then still holds
+        // every change, and must not take one the next start cannot order.
+        journal.close();
+        folded
     }
 
     /// Fold the journal into the file once it has outgrown it, so loading

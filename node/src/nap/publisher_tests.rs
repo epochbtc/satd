@@ -911,6 +911,14 @@ fn a_damaged_length_is_an_error_not_a_torn_end() {
     Publisher::open(path.clone(), &chain).unwrap();
     assert_eq!(on_disk(&path), atts);
     assert_eq!(std::fs::read(&jpath).unwrap(), whole);
+    // So is a last record whose checksum fails, with zeros after it.
+    let mut torn = whole.clone();
+    let last = torn.len() - 10;
+    torn[last..].fill(0);
+    torn.extend_from_slice(&[0; 300]);
+    std::fs::write(&jpath, &torn).unwrap();
+    Publisher::open(path.clone(), &chain).unwrap();
+    assert_eq!(on_disk(&path), atts[..1]);
 }
 
 #[test]
@@ -982,8 +990,8 @@ fn a_fold_leaves_the_file_holding_everything_as_an_older_build_reads_it() {
     let (_dir, path) = store_path();
     let mut chain = Chain::new();
     let atts = attested(&mut chain, 5);
+    assert_eq!(Publisher::open(path.clone(), &chain).unwrap().fold_journal(), Ok(false), "nothing to fold");
     let p = Publisher::open(path.clone(), &chain).unwrap();
-    assert_eq!(p.fold_journal(), Ok(false), "nothing to fold");
     for att in &atts {
         submit(&p, &chain, att).unwrap();
     }
@@ -997,7 +1005,15 @@ fn a_fold_leaves_the_file_holding_everything_as_an_older_build_reads_it() {
     assert_eq!(store::load(&path).unwrap(), left);
     assert_eq!(on_disk(&path), left);
     assert_eq!(p.fold_journal(), Ok(false), "folded already");
-    // The journal goes on after it.
+    // Nothing is recorded after it: a submission still running at shutdown
+    // is refused, and the file stays whole.
+    let journal = std::fs::read(store::journal_path(&path)).unwrap();
+    assert_eq!(rule(submit(&p, &chain, &atts[2])), "io");
+    assert_eq!(rule(p.remove(atts[0].outpoint(), "k")), "io");
+    assert_eq!(std::fs::read(store::journal_path(&path)).unwrap(), journal);
+    assert_eq!(store::load(&path).unwrap(), left);
+    // The next start takes changes again.
+    let p = Publisher::open(path.clone(), &chain).unwrap();
     submit(&p, &chain, &atts[2]).unwrap();
     assert_eq!(on_disk(&path), atts);
 }

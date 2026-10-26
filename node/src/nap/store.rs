@@ -250,8 +250,8 @@ fn journal_records(bytes: &[u8]) -> Result<(Vec<Record>, usize), String> {
         }
         let (body, checksum) = rest[..end].split_at(end - CHECKSUM_LEN);
         if sha256::Hash::hash(body).as_byte_array() != checksum {
-            if rest.len() == end {
-                break; // the last record, torn
+            if rest[end..].iter().all(|b| *b == 0) {
+                break; // the last record, torn, perhaps with zeros after it
             }
             return Err(format!("journal record at byte {at}: the checksum does not match"));
         }
@@ -290,7 +290,7 @@ pub fn read(path: &Path) -> Result<Opened, String> {
     let base_len = base_bytes.as_ref().map_or(0, |b| b.len() as u64);
     let jpath = journal_path(path);
     let mut journal =
-        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0, partial: false,
+        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0, partial: false, closed: false,
         #[cfg(test)]
         compactions: 0,
     };
@@ -351,6 +351,8 @@ pub struct Journal {
     retry_at: u64,
     /// A failed append left bytes past `len` that are not yet cut off.
     partial: bool,
+    /// Closed by the shutdown fold: no change is recorded after it.
+    closed: bool,
     /// Compactions tried, for tests.
     #[cfg(test)]
     pub(super) compactions: u32,
@@ -359,6 +361,9 @@ pub struct Journal {
 impl Journal {
     /// Append `record` and sync it. On an error the journal is as it was.
     pub fn append(&mut self, record: &Record) -> Result<(), String> {
+        if self.closed {
+            return Err("the node is shutting down".into());
+        }
         if self.file.is_none() {
             self.start()?;
         }
@@ -384,7 +389,13 @@ impl Journal {
 
     /// Whether the journal has outgrown the file it follows.
     pub fn wants_compaction(&self) -> bool {
-        self.len >= self.compact_at && self.len > self.base_len && self.len >= self.retry_at
+        !self.closed && self.len >= self.compact_at && self.len > self.base_len && self.len >= self.retry_at
+    }
+
+    /// Record no change after this one: the shutdown fold has written the
+    /// file whole, and nothing may follow it into the journal.
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 
     /// Whether the journal holds changes the file does not.
