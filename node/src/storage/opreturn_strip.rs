@@ -340,9 +340,10 @@ impl StripRecord {
             return Err(RecordDecodeError::UnsupportedVersion(version));
         }
         let filled_sha256: [u8; 32] = r.take(32, "filled_sha256")?.try_into().unwrap();
-        // A stripped tx takes at least 36 bytes (index, txid, flag, count,
-        // one output).
-        let n_txs = r.count(36, "n_txs")?;
+        // A stripped tx takes at least 35 bytes (index, txid, flags, output
+        // count). That bound only stops a hostile count from driving the
+        // allocation; the per-field checks below give the precise error.
+        let n_txs = r.count(35, "n_txs")?;
         let mut txs = Vec::with_capacity(n_txs);
         let mut last_tx: Option<u32> = None;
         for _ in 0..n_txs {

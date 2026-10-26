@@ -2987,6 +2987,7 @@ dependencies = [
  "node-index",
  "node-sp-index",
  "parking_lot",
+ "proptest",
  "rand 0.8.6",
  "rcgen",
  "reqwest",
