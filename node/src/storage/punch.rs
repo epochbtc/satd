@@ -76,19 +76,45 @@ pub fn freed_bytes(offset: u64, len: u64, fs_block: u64) -> u64 {
 /// Zero `[offset, offset + len)` of `file` and deallocate the whole
 /// filesystem blocks inside it. `file` must be open for writing.
 ///
-/// Returns the bytes deallocated by the alignment arithmetic of
-/// [`freed_bytes`], not a measurement of `st_blocks`. Nothing is synced:
-/// the caller decides when to `sync_data`.
+/// The range must lie inside the file: a range past the end is refused
+/// rather than punched, so the file never grows (macOS writes the
+/// unaligned edges, which past the end would extend it) and both platforms
+/// behave the same. `caps.fs_block` must be a power of two no larger than
+/// 1 MiB, as [`probe`] guarantees.
+///
+/// Returns the bytes the alignment arithmetic of [`freed_bytes`] says the
+/// range contains. That is an upper bound, not a measurement: punching a
+/// range again (a redo after a crash) or a range that is already a hole
+/// returns the same value and frees nothing, so a caller keeping a running
+/// total must count each span once. Nothing is synced: the caller decides
+/// when to `sync_data`.
 pub fn zero_and_punch(file: &File, offset: u64, len: u64, caps: &PunchCaps) -> io::Result<u64> {
+    if !valid_fs_block(caps.fs_block) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid filesystem block size {}", caps.fs_block),
+        ));
+    }
     if len == 0 {
         return Ok(0);
     }
-    offset
+    let end = offset
         .checked_add(len)
         .filter(|end| *end <= i64::MAX as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch range overflows"))?;
+    let file_len = file.metadata()?.len();
+    if end > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("punch range ends at {end}, past the end of the file ({file_len})"),
+        ));
+    }
     sys::punch(file, offset, len, caps.fs_block)?;
     Ok(freed_bytes(offset, len, caps.fs_block))
+}
+
+fn valid_fs_block(fs_block: u64) -> bool {
+    fs_block.is_power_of_two() && fs_block <= 1 << 20
 }
 
 /// Check that hole punching works in `dir` and learn its block size.
@@ -119,7 +145,7 @@ fn probe_at(path: &Path, dir: &Path) -> Result<PunchCaps, PunchError> {
         .open(path)
         .map_err(io_err)?;
     let fs_block = sys::fs_block_size(&file).map_err(io_err)?;
-    if fs_block == 0 || fs_block > 1 << 20 {
+    if !valid_fs_block(fs_block) {
         return Err(PunchError::ProbeFailed {
             dir: dir.to_path_buf(),
             reason: format!("implausible filesystem block size {fs_block}"),
@@ -164,16 +190,25 @@ mod sys {
     use std::os::fd::AsRawFd;
 
     pub(super) fn punch(file: &File, offset: u64, len: u64, _fs_block: u64) -> io::Result<()> {
-        // SAFETY: a plain syscall on a file descriptor `file` keeps open.
-        let rc = unsafe {
-            libc::fallocate(
-                file.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset as libc::off_t,
-                len as libc::off_t,
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        loop {
+            // SAFETY: a plain syscall on a file descriptor `file` keeps open.
+            let rc = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            // Retried as std's own file calls are: a signal is not a failure.
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 
     pub(super) fn fs_block_size(file: &File) -> io::Result<u64> {
@@ -199,11 +234,18 @@ mod sys {
                 fp_offset: first as libc::off_t,
                 fp_length: (last - first) as libc::off_t,
             };
-            // SAFETY: `arg` is a valid `fpunchhole_t` for the duration of
-            // the call, on a file descriptor `file` keeps open.
-            let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
-            if rc == -1 {
-                return Err(io::Error::last_os_error());
+            loop {
+                // SAFETY: `arg` is a valid `fpunchhole_t` for the duration
+                // of the call, on a file descriptor `file` keeps open.
+                let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
+                if rc != -1 {
+                    break;
+                }
+                let err = io::Error::last_os_error();
+                // Retried as std's own file calls are.
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
             }
             write_zeros(file, offset, first - offset)?;
             write_zeros(file, last, end - last)?;

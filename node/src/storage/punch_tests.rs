@@ -59,6 +59,19 @@ fn an_overflowing_range_is_refused() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
 
+#[test]
+fn an_invalid_block_size_is_refused_not_divided_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    std::fs::write(&path, [1u8; 8192]).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    for fs_block in [0, 3, 4095, 2 << 20] {
+        let err = zero_and_punch(&file, 0, 4096, &PunchCaps { fs_block }).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "fs_block {fs_block}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 8192], "nothing was touched");
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod on_disk {
     use super::*;
@@ -162,6 +175,23 @@ mod on_disk {
         assert!(data[..s].iter().all(|b| *b == FILL));
         assert!(data[e..].iter().all(|b| *b == FILL));
         assert_eq!(data.len(), FILE_LEN);
+    }
+
+    /// A range that runs past the end of the file is refused and the file
+    /// neither grows nor changes, on every platform.
+    #[test]
+    fn a_range_past_the_end_is_refused_and_the_file_does_not_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, caps) = filled_file(dir.path());
+        let len = FILE_LEN as u64;
+        for (offset, n) in [(len - 100, 4 * caps.fs_block), (len, 1), (len + 4096, 4096)] {
+            let err = zero_and_punch(&file, offset, n, &caps).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "offset {offset} len {n}");
+        }
+        assert_eq!(contents(dir.path()), vec![FILL; FILE_LEN]);
+        // A range ending exactly at the end is fine.
+        zero_and_punch(&file, len - 10, 10, &caps).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), len);
     }
 
     /// Punching a range twice (a redo after a crash) is harmless.
