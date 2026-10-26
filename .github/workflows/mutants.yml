@@ -185,7 +185,23 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
           SHARD: ${{ needs.plan.outputs.shard }}
           PART: ${{ matrix.part }}/${{ needs.plan.outputs.count }}
-        run: bash scripts/mutants/run.sh nightly "$SHARD" "$PART"
+        # In a cgroup capped below the runner's 16 GB. A mutant can turn a
+        # loop into one that allocates without end, faster than the test
+        # timeout: uncapped, it takes the runner down and the part uploads
+        # nothing. Capped, its test is stopped and the mutant counted.
+        run: |
+          set -euo pipefail
+          grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || {
+            echo "::error::no cgroup v2 memory controller to cap the mutants with"
+            exit 1
+          }
+          cg=/sys/fs/cgroup/mutants
+          sudo mkdir -p "$cg"
+          echo 12G | sudo tee "$cg/memory.max" >/dev/null
+          echo 0 | sudo tee "$cg/memory.swap.max" >/dev/null
+          echo $$ | sudo tee "$cg/cgroup.procs" >/dev/null
+          echo "Mutants capped at $(numfmt --to=iec < "$cg/memory.max") ($(cat /proc/self/cgroup))."
+          bash scripts/mutants/run.sh nightly "$SHARD" "$PART"
 
       # This part's own summary; the annotations come from `report`, once.
       - name: Report
