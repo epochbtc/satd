@@ -430,6 +430,8 @@ impl Journal {
             return Err(e);
         }
         sync_dir(path);
+        // The file has just been written: back to the usual threshold.
+        self.retry_at = 0;
         // The file is the store now; a journal naming the old one is
         // ignored, so until the new journal is in place nothing is lost.
         self.base = base_checksum(Some(&bytes));

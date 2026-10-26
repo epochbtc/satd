@@ -957,6 +957,20 @@ fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
     // a handful of times for forty changes, not forty.
     assert!(p.compactions() <= 7, "{} compactions for {} changes", p.compactions(), atts.len());
     assert!(p.compactions() >= 2, "still tried again as the journal grows");
+    // Once the file can be written, the next try succeeds, and after it the
+    // usual threshold applies again, not the backed-off one.
+    std::fs::remove_dir(&path).unwrap();
+    let tried = p.compactions();
+    let signer = p2wpkh();
+    for n in 41..=200u8 {
+        let op = coin(&mut chain, &signer, n);
+        let att = attest(&chain, &signer, op, "k", "v", ANCHOR);
+        submit(&p, &chain, &att).unwrap();
+    }
+    assert!(path.is_file(), "folded in once the file could be written");
+    assert!(p.compactions() > tried + 1, "folded again at the usual size, not after a backed-off one");
+    let file = std::fs::metadata(&path).unwrap().len();
+    assert!(p.journal_len() <= file, "{} > {file}", p.journal_len());
 }
 
 /// The journal's records alone, for a store whose file cannot be read.
