@@ -1,3 +1,4 @@
+mod nap;
 mod rpc;
 mod state;
 mod ui;
@@ -203,6 +204,7 @@ fn run_app(
                         ViewMode::Steady => ui::steady::draw(f, &st),
                         ViewMode::Mempool => ui::mempool::draw(f, &st),
                         ViewMode::Chain => ui::chain::draw(f, &st),
+                        ViewMode::Nap => ui::nap::draw(f, &st),
                     }
                 }
                 // Draw warnings modal LAST so it overlays every other view.
@@ -257,12 +259,14 @@ fn run_app(
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
                     KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
                     KeyCode::Char('4') => st.toggle_mode(ViewMode::Chain),
+                    KeyCode::Char('5') => st.press_nap_key(),
                     KeyCode::Up => match st.active_mode() {
                         ViewMode::Mempool => {
                             if st.selected_mempool_row > 0 {
                                 st.selected_mempool_row -= 1;
                             }
                         }
+                        ViewMode::Nap => st.move_nap_selection(-1),
                         _ => {
                             if st.selected_peer > 0 {
                                 st.selected_peer -= 1;
@@ -275,6 +279,7 @@ fn run_app(
                                 st.selected_mempool_row += 1;
                             }
                         }
+                        ViewMode::Nap => st.move_nap_selection(1),
                         _ => {
                             if st.selected_peer + 1 < st.peers.len() {
                                 st.selected_peer += 1;
@@ -470,6 +475,25 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     apply_poll!(st, "getreorghistory", reorgs_res, update_reorg_history);
                     apply_poll!(st, "getmempoolhistory", mhist_res, update_mempool_history);
                     apply_poll!(st, "getpolicyinfo", policy_res, update_policy_info);
+                }
+
+                // NAP: each half answers, or says it is off. The report is
+                // computed once per tip and set node-side, so asking every
+                // slow tick costs a cached reply.
+                let (nap_pub_res, nap_report_res) =
+                    tokio::join!(rpc.list_nap_attestations(), rpc.get_nap_report());
+                {
+                    let mut st = state.lock();
+                    st.update_nap_publisher(nap::classify(
+                        nap_pub_res,
+                        nap::PUBLISHER_DISABLED,
+                        nap::parse_published,
+                    ));
+                    st.update_nap_report(nap::classify(
+                        nap_report_res,
+                        nap::AGGREGATOR_DISABLED,
+                        nap::parse_report,
+                    ));
                 }
 
                 // The quarantine rollup costs a mempool walk, so it is asked

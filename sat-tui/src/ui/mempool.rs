@@ -46,7 +46,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     }
     draw_histogram(f, chunks[3], state);
     draw_trend_and_top(f, chunks[4], state);
-    draw_footer(f, chunks[5]);
+    draw_footer(f, chunks[5], state);
 }
 
 /// Rule rows the quarantine panel shows before it summarises the rest.
@@ -621,7 +621,7 @@ fn top_row(i: usize, e: &MempoolTopEntry, selected: bool) -> Row<'static> {
     .style(style)
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
+fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let footer = Line::from(vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
@@ -629,7 +629,7 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("1/2/3/4", Style::default().fg(Color::White)),
+        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
         Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": scroll top-N", Style::default().fg(Color::DarkGray)),

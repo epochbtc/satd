@@ -26,7 +26,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     draw_row_one(f, chunks[1], state);
     draw_row_two(f, chunks[2], state);
     draw_row_three(f, chunks[3], state);
-    draw_footer(f, chunks[5]);
+    draw_footer(f, chunks[5], state);
 }
 
 fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
@@ -326,7 +326,7 @@ fn render_panel(f: &mut Frame, area: Rect, title: &str, lines: &[Line<'_>]) {
     }
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
+fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let footer = Line::from(vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
@@ -334,7 +334,7 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("1/2/3/4", Style::default().fg(Color::White)),
+        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
         Span::styled(": view", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(footer), area);

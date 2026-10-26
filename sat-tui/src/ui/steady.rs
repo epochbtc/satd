@@ -90,7 +90,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("1/2/3/4", Style::default().fg(Color::White)),
+        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
         Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": peers", Style::default().fg(Color::DarkGray)),

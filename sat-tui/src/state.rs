@@ -27,6 +27,8 @@ pub enum ViewMode {
     Steady,
     Mempool,
     Chain,
+    /// Offered only while the node has NAP on; see [`AppState::nap_available`].
+    Nap,
 }
 
 /// One snapshot from getmempoolhistory.
@@ -643,6 +645,13 @@ pub struct AppState {
     /// than one showing an error.
     pub rpc_failures: std::collections::BTreeMap<&'static str, String>,
 
+    /// What the node publishes over NAP (`listnapattestations`).
+    pub nap_publisher: crate::nap::Half<Vec<crate::nap::Published>>,
+    /// The node's NAP report (`getnapreport`).
+    pub nap_report: crate::nap::Half<crate::nap::Report>,
+    /// Selected value row in the NAP view, over [`crate::nap::Report::value_rows`].
+    pub selected_nap_row: usize,
+
     // Internal tracking
     prev_blocks: u32,
     prev_headers: u32,
@@ -861,6 +870,10 @@ impl AppState {
             show_reorgs: false,
 
             rpc_failures: std::collections::BTreeMap::new(),
+
+            nap_publisher: crate::nap::Half::Unknown,
+            nap_report: crate::nap::Half::Unknown,
+            selected_nap_row: 0,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -1700,6 +1713,80 @@ impl AppState {
                 self.rpc_failures.insert(method, e.to_string());
             }
         }
+    }
+
+    /// Apply one `listnapattestations` poll.
+    pub fn update_nap_publisher(&mut self, poll: crate::nap::Poll<Vec<crate::nap::Published>>) {
+        Self::apply_nap(&mut self.rpc_failures, "listnapattestations", &mut self.nap_publisher, poll);
+        self.leave_nap_view_if_off();
+    }
+
+    /// Apply one `getnapreport` poll.
+    pub fn update_nap_report(&mut self, poll: crate::nap::Poll<crate::nap::Report>) {
+        Self::apply_nap(&mut self.rpc_failures, "getnapreport", &mut self.nap_report, poll);
+        let rows = match &self.nap_report {
+            crate::nap::Half::On(r) => r.value_rows().len(),
+            _ => 0,
+        };
+        self.selected_nap_row = self.selected_nap_row.min(rows.saturating_sub(1));
+        self.leave_nap_view_if_off();
+    }
+
+    /// A half that is off is not failing: only other errors are recorded,
+    /// and those leave the half as it was.
+    fn apply_nap<T>(
+        failures: &mut std::collections::BTreeMap<&'static str, String>,
+        method: &'static str,
+        half: &mut crate::nap::Half<T>,
+        poll: crate::nap::Poll<T>,
+    ) {
+        match poll {
+            crate::nap::Poll::On(t) => {
+                failures.remove(method);
+                *half = crate::nap::Half::On(t);
+            }
+            crate::nap::Poll::Off => {
+                failures.remove(method);
+                *half = crate::nap::Half::Off;
+            }
+            crate::nap::Poll::Failed(e) => {
+                failures.insert(method, e);
+            }
+            crate::nap::Poll::Unanswered => {}
+        }
+    }
+
+    /// Whether the NAP view is offered: the node has `nap=1`,
+    /// `napaggregator=1`, or both.
+    pub fn nap_available(&self) -> bool {
+        self.nap_publisher.is_on() || self.nap_report.is_on()
+    }
+
+    /// Key `5`: toggle the NAP view, which is offered only while the node
+    /// has NAP on. Otherwise the key does nothing.
+    pub fn press_nap_key(&mut self) {
+        if self.nap_available() {
+            self.toggle_mode(ViewMode::Nap);
+        }
+    }
+
+    /// A node restarted with NAP off takes the view away from under a
+    /// forced key 5; fall back to automatic.
+    fn leave_nap_view_if_off(&mut self) {
+        use crate::nap::Half::Off;
+        if self.force_mode == Some(ViewMode::Nap)
+            && matches!(self.nap_publisher, Off)
+            && matches!(self.nap_report, Off)
+        {
+            self.toggle_mode(ViewMode::Nap);
+        }
+    }
+
+    /// Move the NAP view's value selection by `delta` rows.
+    pub fn move_nap_selection(&mut self, delta: isize) {
+        let crate::nap::Half::On(r) = &self.nap_report else { return };
+        let last = r.value_rows().len().saturating_sub(1);
+        self.selected_nap_row = self.selected_nap_row.saturating_add_signed(delta).min(last);
     }
 
     /// One-line summary of currently-failing methods for the title bar, or
