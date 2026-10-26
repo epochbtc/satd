@@ -391,7 +391,7 @@ impl BackfillRunner {
     /// block's row had; by now the reorg's disconnect has removed the
     /// displaced rows and its connect has written the replacement's under
     /// those keys. What is left to remove is what only a backfill wrote and
-    /// no live block owns (for example the rows pass 1 writes for
+    /// no live block owns (for example the rows an older pass 1 wrote for
     /// unspendable outputs, which the live path does not index). Runs under
     /// `accept_lock` so the active chain cannot move while it decides.
     pub fn cleanup_stale_rows_after_reorg(
@@ -709,6 +709,12 @@ impl BackfillRunner {
                 batch.tx_loc_puts.push((txid, txseq));
                 batch.txseq_txid_puts.push((txseq, txid));
                 for (vout, output) in tx.output.iter().enumerate() {
+                    // As `connect_block`: unspendable outputs are not
+                    // indexed, and no input can spend one, so pass 2 never
+                    // needs its lookup row either.
+                    if crate::chain::connect::is_unspendable(&output.script_pubkey) {
+                        continue;
+                    }
                     let sh = scripthash_of(&output.script_pubkey);
                     batch.addr_funding_puts.push(AddrFundingRowV3 {
                         scripthash: sh,

@@ -124,6 +124,12 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- The address index built by a backfill (`-addressindex` turned on for an
+  already-synced chain) leaves out unspendable outputs, as the index built
+  while blocks connect always has. It used to record each OP_RETURN output,
+  and each output script over 10,000 bytes, as an unspent coin under that
+  script's scripthash.
+
 - The address book's service bits follow an outbound peer's `version` and
   add up over later announcements, as Core's do; they used to stay as first
   heard.
