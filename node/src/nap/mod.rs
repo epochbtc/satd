@@ -27,7 +27,7 @@ pub mod aggregate;
 pub mod chain;
 pub mod collect;
 pub mod message;
-mod par;
+pub(crate) mod par;
 pub mod p2p;
 pub mod publisher;
 pub mod pull;

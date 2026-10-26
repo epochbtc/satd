@@ -113,14 +113,13 @@ pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value,
         let held: Vec<(Attestation, Timelocks)> =
             aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
         // The digest, hashed in order, while the chain rules are checked.
-        let ((len, digest), judged) = std::thread::scope(|s| {
-            let digest = s.spawn(|| {
+        let ((len, digest), judged) = crate::nap::par::join(
+            || {
                 let set = report::canonical(held.iter().map(|(a, _)| a));
                 (set.len(), report::digest(set.iter().copied()))
-            });
-            let judged = chain.read(&|v| report::counting_at(&held, v));
-            (digest.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), judged)
-        });
+            },
+            || chain.read(&|v| report::counting_at(&held, v)),
+        );
         let (tip, counting) = judged.ok_or_else(tip_kept_changing)?;
         Ok((tip.hash, report::report(tip, digest, len, 0, &counting)))
     })

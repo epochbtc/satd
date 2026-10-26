@@ -14,6 +14,8 @@ const MIN_PER_THREAD: usize = 1_024;
 thread_local! {
     /// Tests run a map over this many threads whatever its size.
     static THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests stand in a system that will not start a thread.
+    static NO_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// `items.iter().map(f).collect()`, in the same order, the items split
@@ -28,12 +30,7 @@ pub(super) fn map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> 
     std::thread::scope(|s| {
         let shares: Vec<_> = items
             .chunks(items.len().div_ceil(threads))
-            .map(|share| {
-                std::thread::Builder::new()
-                    .name("nap-par".into())
-                    .spawn_scoped(s, move || share.iter().map(f).collect::<Vec<R>>())
-                    .map_err(|_| share)
-            })
+            .map(|share| spawn(s, move || share.iter().map(f).collect::<Vec<R>>()).map_err(|_| share))
             .collect();
         let mut out = Vec::with_capacity(items.len());
         for share in shares {
@@ -46,6 +43,41 @@ pub(super) fn map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> 
     })
 }
 
+/// `(a(), b())`, `a` on a thread of its own while `b` runs on the caller's.
+/// If the system will not start the thread, `a` runs on the caller's too; a
+/// panic in `a` is raised again here.
+pub(crate) fn join<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> (A, B) {
+    std::thread::scope(|s| match spawn(s, a) {
+        Ok(handle) => {
+            let b = b();
+            (handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
+        }
+        Err(a) => (a(), b()),
+    })
+}
+
+/// Start `f` on a scoped thread, or give it back if the system will not.
+fn spawn<'scope, T: Send + 'scope, F: FnOnce() -> T + Send + 'scope>(
+    s: &'scope std::thread::Scope<'scope, '_>,
+    f: F,
+) -> Result<std::thread::ScopedJoinHandle<'scope, T>, F> {
+    #[cfg(test)]
+    if NO_THREADS.with(std::cell::Cell::get) {
+        return Err(f);
+    }
+    // The builder consumes `f` even when it fails, so it gets a slot it
+    // can take `f` from, and `f` is left there if the thread never ran.
+    let slot = std::sync::Arc::new(parking_lot::Mutex::new(Some(f)));
+    let theirs = slot.clone();
+    match std::thread::Builder::new().name("nap-par".into()).spawn_scoped(s, move || {
+        let f = theirs.lock().take().expect("a started thread finds its work");
+        f()
+    }) {
+        Ok(handle) => Ok(handle),
+        Err(_) => Err(slot.lock().take().expect("a thread that never started left its work")),
+    }
+}
+
 fn threads_for(items: usize) -> usize {
     #[cfg(test)]
     if let Some(n) = THREADS.with(std::cell::Cell::get) {
@@ -53,6 +85,15 @@ fn threads_for(items: usize) -> usize {
     }
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     cores.min(MAX_THREADS).min(items / MIN_PER_THREAD).max(1)
+}
+
+/// Run `f` with no thread starting, as on a system out of threads.
+#[cfg(test)]
+pub(super) fn without_threads<R>(f: impl FnOnce() -> R) -> R {
+    let before = NO_THREADS.with(|t| t.replace(true));
+    let out = f();
+    NO_THREADS.with(|t| t.set(before));
+    out
 }
 
 /// Run `f` with maps on this thread over `n` threads, whatever their size.
@@ -88,6 +129,23 @@ mod tests {
         }
         let small = map(&items[..MIN_PER_THREAD], |_| std::thread::current().id());
         assert!(small.iter().all(|id| *id == std::thread::current().id()), "a small map stays on the caller's thread");
+    }
+
+    /// Perturbation: drop either fallback to the caller's thread and this
+    /// panics.
+    #[test]
+    fn work_runs_on_the_callers_thread_when_no_thread_starts() {
+        let items: Vec<u32> = (0..10_000).collect();
+        let me = std::thread::current().id();
+        let (ids, doubled) = without_threads(|| {
+            with_threads(4, || (map(&items, |_| std::thread::current().id()), map(&items, |x| x * 2)))
+        });
+        assert!(ids.iter().all(|id| *id == me));
+        assert_eq!(doubled, items.iter().map(|x| x * 2).collect::<Vec<_>>());
+        let (a, b) = without_threads(|| join(|| std::thread::current().id(), || 7));
+        assert_eq!((a, b), (me, 7));
+        let (a, b) = join(|| std::thread::current().name().map(str::to_owned), || 7);
+        assert_eq!((a.as_deref(), b), (Some("nap-par"), 7), "with threads, on a thread of its own");
     }
 
     #[test]
