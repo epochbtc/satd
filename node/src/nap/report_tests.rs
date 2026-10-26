@@ -134,6 +134,50 @@ fn the_digest_is_over_length_prefixed_wire_forms_in_id_order() {
     assert_eq!(digest(&set), bitcoin::hashes::sha256::Hash::hash(&bytes));
 }
 
+/// A writer that keeps what it is given and the largest single write.
+#[derive(Default)]
+struct Recording {
+    bytes: Vec<u8>,
+    largest: usize,
+}
+
+impl std::io::Write for Recording {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.largest = self.largest.max(buf.len());
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_snapshot_is_written_an_entry_at_a_time() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    let atts: Vec<Attestation> = (1..=40)
+        .map(|i| {
+            chain.coins.insert(outpoint(i), coin_of(&s, 50_000, COIN_HEIGHT));
+            attest(&chain, &s, outpoint(i), "k", "yes", ANCHOR)
+        })
+        .collect();
+    let set = canonical(atts);
+    let largest_entry = set.iter().map(|a| a.to_bytes().len()).max().unwrap();
+    let mut out = Recording::default();
+    write_snapshot(&mut out, TIP, BlockHash::all_zeros(), &set).unwrap();
+    // No write holds more than one entry (its wire form, or its length and
+    // the 32-byte header fields): the set and the file are never in one
+    // buffer, however large the set.
+    assert!(out.largest <= largest_entry.max(32), "{} > {largest_entry}", out.largest);
+    // And what was written is the snapshot, which reads back with the
+    // digest computed the same way, an entry at a time.
+    let back = decode_snapshot(&out.bytes, 0).unwrap();
+    assert_eq!(back.attestations, set);
+    assert_eq!(digest(&back.attestations), digest(set.iter()));
+}
+
 #[test]
 fn a_snapshot_has_one_form() {
     let s = p2wpkh();
@@ -456,16 +500,16 @@ fn without_hard_links_an_export_writes_in_place_and_still_never_replaces() {
     let no_links = |_: &std::path::Path, _: &std::path::Path| {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     };
-    write_new_linking(&path, b"first", no_links).unwrap();
+    write_new_linking(&path, |w| w.write_all(b"first"), no_links).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"first");
-    let err = write_new_linking(&path, b"second", no_links).unwrap_err();
+    let err = write_new_linking(&path, |w| w.write_all(b"second"), no_links).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&path).unwrap(), b"first");
     let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(names, ["snap.dat"], "no temporary is left");
     // Any other link failure is the export's.
     let other = |_: &std::path::Path, _: &std::path::Path| Err(std::io::Error::other("disk on fire"));
-    assert!(write_new_linking(&dir.path().join("b.dat"), b"x", other).is_err());
+    assert!(write_new_linking(&dir.path().join("b.dat"), |w| w.write_all(b"x"), other).is_err());
     assert!(!dir.path().join("b.dat").exists());
 }
 

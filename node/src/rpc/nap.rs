@@ -112,8 +112,8 @@ pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value,
     p.report_cache().get_or(tip, changes, std::time::Instant::now(), || {
         let held: Vec<(Attestation, Timelocks)> =
             aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
-        let set = report::canonical(held.iter().map(|(a, _)| a.clone()));
-        let digest = report::digest(&set);
+        let set = report::canonical(held.iter().map(|(a, _)| a));
+        let digest = report::digest(set.iter().copied());
         let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
         Ok((tip.hash, report::report(tip, digest, set.len(), 0, &counting)))
     })
@@ -145,7 +145,7 @@ pub fn export_snapshot(
             (h, v.block_hash(h).expect("the active chain holds its tip"))
         })
         .ok_or_else(tip_kept_changing)?;
-    report::write_new(path, &report::encode_snapshot(height, hash, &set)).map_err(|e| {
+    report::write_new_with(path, |w| report::write_snapshot(w, height, hash, &set)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             RpcError::new(-8, "storage.exists", format!("refusing to overwrite existing file: {}", path.display()))
         } else {

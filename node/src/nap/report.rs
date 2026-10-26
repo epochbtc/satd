@@ -26,12 +26,13 @@
 //! The digest is over the entries alone, so it names the set whatever tip
 //! the file was exported at.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Write};
 use std::path::Path;
 
-use bitcoin::consensus::encode::{self, Decodable, Encodable};
-use bitcoin::hashes::{Hash as _, sha256};
+use bitcoin::consensus::encode::{self, Decodable};
+use bitcoin::hashes::{Hash as _, HashEngine as _, sha256};
 use bitcoin::{Amount, BlockHash, OutPoint, Script};
 use serde_json::{Value, json};
 
@@ -77,41 +78,72 @@ pub struct Snapshot {
     pub attestations: Vec<Attestation>,
 }
 
-/// `atts` in snapshot order: ascending by id, each once.
-pub fn canonical(atts: impl IntoIterator<Item = Attestation>) -> Vec<Attestation> {
-    let mut keyed: Vec<(sha256::Hash, Attestation)> = atts.into_iter().map(|a| (a.id(), a)).collect();
+/// `atts` in snapshot order: ascending by id, each once. Owned
+/// attestations or references to them, so a set can be ordered without
+/// copying it.
+pub fn canonical<A: Borrow<Attestation>>(atts: impl IntoIterator<Item = A>) -> Vec<A> {
+    let mut keyed: Vec<(sha256::Hash, A)> = atts.into_iter().map(|a| (a.borrow().id(), a)).collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.dedup_by(|a, b| a.0 == b.0);
     keyed.into_iter().map(|(_, a)| a).collect()
 }
 
-/// The entries' bytes: each attestation's wire form prefixed by its length.
-fn entries(atts: &[Attestation]) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Write the entries to `w`, one at a time: each attestation's wire form
+/// prefixed by its length. The whole set is never in one buffer.
+fn write_entries<'a>(w: &mut dyn Write, atts: impl IntoIterator<Item = &'a Attestation>) -> std::io::Result<()> {
     for att in atts {
         let bytes = att.to_bytes();
-        encode::VarInt(bytes.len() as u64).consensus_encode(&mut buf).expect("a Vec does not fail");
-        buf.extend_from_slice(&bytes);
+        w.write_all(&encode::serialize(&encode::VarInt(bytes.len() as u64)))?;
+        w.write_all(&bytes)?;
     }
-    buf
+    Ok(())
 }
 
-/// The digest of `atts`, which are in snapshot order ([`canonical`]).
-pub fn digest(atts: &[Attestation]) -> sha256::Hash {
-    sha256::Hash::hash(&entries(atts))
+/// A writer that hashes what passes through it.
+struct Hashing<'w> {
+    inner: &'w mut dyn Write,
+    engine: sha256::HashEngine,
 }
 
-/// The snapshot file's bytes. `atts` are in snapshot order.
+impl Write for Hashing<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.engine.input(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The digest of `atts`, which are in snapshot order ([`canonical`]),
+/// hashed an entry at a time.
+pub fn digest<'a>(atts: impl IntoIterator<Item = &'a Attestation>) -> sha256::Hash {
+    let mut sink = std::io::sink();
+    let mut hashing = Hashing { inner: &mut sink, engine: sha256::Hash::engine() };
+    write_entries(&mut hashing, atts).expect("a sink does not fail");
+    sha256::Hash::from_engine(hashing.engine)
+}
+
+/// Write the snapshot file to `w`, the checksum computed as it goes, so
+/// the file is never held whole in memory. `atts` are in snapshot order.
+pub fn write_snapshot(w: &mut dyn Write, height: u32, hash: BlockHash, atts: &[Attestation]) -> std::io::Result<()> {
+    let mut hashing = Hashing { inner: w, engine: sha256::Hash::engine() };
+    hashing.write_all(MAGIC)?;
+    hashing.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
+    hashing.write_all(&height.to_le_bytes())?;
+    hashing.write_all(hash.as_byte_array())?;
+    hashing.write_all(&(atts.len() as u32).to_le_bytes())?;
+    write_entries(&mut hashing, atts)?;
+    let checksum = sha256::Hash::from_engine(hashing.engine);
+    hashing.inner.write_all(checksum.as_byte_array())
+}
+
+/// The snapshot file's bytes, as [`write_snapshot`] writes them.
 pub fn encode_snapshot(height: u32, hash: BlockHash, atts: &[Attestation]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(HEADER_LEN);
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(hash.as_byte_array());
-    buf.extend_from_slice(&(atts.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&entries(atts));
-    let checksum = sha256::Hash::hash(&buf);
-    buf.extend_from_slice(checksum.as_byte_array());
+    let mut buf = Vec::new();
+    write_snapshot(&mut buf, height, hash, atts).expect("a Vec does not fail");
     buf
 }
 
@@ -214,14 +246,21 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
 /// crash then can leave a partial one. The directory is synced, so the name
 /// outlives a power loss.
 pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_new_linking(path, bytes, |from, to| std::fs::hard_link(from, to))
+    write_new_with(path, |w| w.write_all(bytes))
 }
 
-/// [`write_new`], with the link step given: tests stand in a filesystem
-/// without hard links.
+/// [`write_new`], the contents written by `write`, which may run twice (the
+/// second time to `path` directly, on a filesystem without hard links). Its
+/// writes are buffered on their way to the file, so it can stream.
+pub fn write_new_with(path: &Path, write: impl Fn(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<()> {
+    write_new_linking(path, write, |from, to| std::fs::hard_link(from, to))
+}
+
+/// [`write_new_with`], with the link step given: tests stand in a
+/// filesystem without hard links.
 pub(super) fn write_new_linking(
     path: &Path,
-    bytes: &[u8],
+    write: impl Fn(&mut dyn Write) -> std::io::Result<()>,
     link: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -230,14 +269,14 @@ pub(super) fn write_new_linking(
     let name = path.file_name().ok_or_else(|| std::io::Error::other("the path names no file"))?;
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{}.{}.{seq}.tmp", name.to_string_lossy(), std::process::id()));
-    let linked = write_synced(&tmp, bytes).and_then(|()| link(&tmp, path));
+    let linked = write_synced(&tmp, &write).and_then(|()| link(&tmp, path));
     let _ = std::fs::remove_file(&tmp);
     match linked {
         // `link(2)` fails with EPERM (PermissionDenied) on a filesystem
         // without hard links, such as FAT and exFAT. A real permission
         // problem fails the direct write the same way.
         Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied) => {
-            write_synced(path, bytes)?
+            write_synced(path, &write)?
         }
         other => other?,
     }
@@ -249,12 +288,16 @@ pub(super) fn write_new_linking(
     Ok(())
 }
 
-/// Create `path`, which must not exist, with `bytes`, synced. A failed
-/// write removes the file it created; a file it did not create is never
-/// touched.
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+/// Create `path`, which must not exist, with what `write` writes, buffered
+/// and synced. A failed write removes the file it created; a file it did
+/// not create is never touched.
+fn write_synced(path: &Path, write: &dyn Fn(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let written = (|| {
+        let mut buffered = std::io::BufWriter::new(file);
+        write(&mut buffered)?;
+        buffered.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
     if written.is_err() {
         let _ = std::fs::remove_file(path);
     }
