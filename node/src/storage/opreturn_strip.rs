@@ -401,7 +401,15 @@ impl StripRecord {
     /// Build the record for stripping `block` (whose serialization is
     /// `bytes`) under `threshold`. `None` when nothing is eligible. The
     /// returned buffer is the filled form.
+    ///
+    /// `bytes` must be exactly `block`'s serialization: the record's txids
+    /// come from `block` and the filled form from `bytes`, so a mismatch
+    /// would build a record no read could ever verify, and the punch that
+    /// follows would leave the block unreadable for good.
     pub fn build(bytes: &[u8], block: &Block, threshold: u64) -> Result<Option<(Self, Vec<u8>)>, FillError> {
+        if bitcoin::consensus::encode::serialize(block) != bytes {
+            return Err(FillError::BytesNotBlock);
+        }
         let eligible = eligible_outputs(block, threshold);
         if eligible.is_empty() {
             return Ok(None);
@@ -491,6 +499,8 @@ impl<'a> RecordReader<'a> {
 pub enum FillError {
     #[error("strip record: block bytes do not parse: {0}")]
     Spans(SpanError),
+    #[error("strip record: the block bytes are not the block's serialization")]
+    BytesNotBlock,
     #[error("strip record names tx {0}, which the block does not have")]
     NoSuchTx(u32),
     #[error("strip record names output {vout} of tx {tx_index}, which does not exist")]
@@ -509,7 +519,11 @@ pub enum FillError {
 /// Zero every span `record` names in `buf` (the block bytes `spans` was
 /// parsed from), after checking that each named output exists, has the
 /// recorded length and starts with `OP_RETURN`.
+///
+/// Every named output is checked before any byte is written, so on an error
+/// `buf` is unchanged.
 pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Result<(), FillError> {
+    let mut ranges = Vec::new();
     for tx in &record.txs {
         let tx_spans = spans
             .get(tx.tx_index as usize)
@@ -536,8 +550,11 @@ pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Re
                     vout: o.vout,
                 });
             }
-            buf[span.strip_range()].fill(0);
+            ranges.push(span.strip_range());
         }
+    }
+    for range in ranges {
+        buf[range].fill(0);
     }
     Ok(())
 }

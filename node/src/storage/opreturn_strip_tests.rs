@@ -364,6 +364,31 @@ fn build_then_read_back_gives_the_original_identity() {
 }
 
 #[test]
+fn build_refuses_bytes_that_are_not_the_block() {
+    let (b, mut bytes) = stripped_fixture();
+    let spans = tx_spans(&bytes).unwrap();
+    // Another output value: still a valid serialization, of a different block.
+    let at = spans[3].outputs[0].script_offset - 1 - 8;
+    bytes[at] ^= 1;
+    assert_eq!(StripRecord::build(&bytes, &b, 300).unwrap_err(), FillError::BytesNotBlock);
+}
+
+#[test]
+fn a_failed_fill_leaves_the_buffer_untouched() {
+    let (b, bytes) = stripped_fixture();
+    let (mut record, _) = StripRecord::build(&bytes, &b, 300).unwrap().unwrap();
+    // The first named output is fine; the second does not exist.
+    record.txs[1].outputs[0].vout = 9;
+    let spans = tx_spans(&bytes).unwrap();
+    let mut buf = bytes.clone();
+    assert!(matches!(
+        fill_spans(&mut buf, &record, &spans),
+        Err(FillError::NoSuchOutput { .. })
+    ));
+    assert_eq!(buf, bytes, "the first span was zeroed before the error");
+}
+
+#[test]
 fn nothing_eligible_builds_no_record() {
     let (b, bytes) = stripped_fixture();
     assert!(StripRecord::build(&bytes, &b, 10_001).unwrap().is_none());
