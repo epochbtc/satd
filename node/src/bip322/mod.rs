@@ -23,6 +23,12 @@
 //! 4. Otherwise [`Verification::Valid`], "valid at time T and age S": the
 //!    caller decides what `to_sign`'s locktime and input sequence mean.
 //!
+//! The scripts run under both flag sets first: the upgradeable flags only
+//! add failures, so a proof that passes them passes steps 2 and 3, and runs
+//! once. Only one that fails runs again under [`REQUIRED_FLAGS`] alone, to
+//! tell an invalid proof from an inconclusive one. The outcome is the one
+//! the BIP's order gives.
+//!
 //! Proof-of-funds (`pof`) signatures are not supported: they prove other
 //! UTXOs through a PSBT, which needs a UTXO view this module does not have.
 
@@ -229,6 +235,8 @@ pub fn verify(challenge: &Script, message: &[u8], proof: &Proof) -> Verification
         return Verification::Invalid(reason.into());
     }
     let run = |flags: u32| {
+        #[cfg(test)]
+        SCRIPT_RUNS.with(|n| n.set(n.get() + 1));
         let checker = Bip322Checker {
             inner: TxSignatureChecker::new(&to_sign, 0, Amount::ZERO, &prevouts),
             bad_sighash: Cell::new(false),
@@ -242,15 +250,22 @@ pub fn verify(challenge: &Script, message: &[u8], proof: &Proof) -> Verification
         );
         (result, checker.bad_sighash.get())
     };
-    match run(REQUIRED_FLAGS) {
-        (Ok(()), _) => {}
-        (Err(_), true) => {
-            return Verification::Invalid(
-                "a signature uses a sighash type other than SIGHASH_ALL (or SIGHASH_DEFAULT for Taproot)"
-                    .into(),
-            );
+    // The upgradeable flags only add failures, so scripts that pass under
+    // them pass under the required flags alone: a valid proof runs once.
+    // Only a failure runs the required rules on their own, to tell an
+    // invalid proof from an inconclusive one.
+    let upgradeable = run(REQUIRED_FLAGS | UPGRADEABLE_FLAGS).0;
+    if upgradeable.is_err() {
+        match run(REQUIRED_FLAGS) {
+            (Ok(()), _) => {}
+            (Err(_), true) => {
+                return Verification::Invalid(
+                    "a signature uses a sighash type other than SIGHASH_ALL (or SIGHASH_DEFAULT for Taproot)"
+                        .into(),
+                );
+            }
+            (Err(e), false) => return Verification::Invalid(script_reason(e)),
         }
-        (Err(e), false) => return Verification::Invalid(script_reason(e)),
     }
 
     // 3. Upgradeable rules.
@@ -260,7 +275,7 @@ pub fn verify(challenge: &Script, message: &[u8], proof: &Proof) -> Verification
             to_sign.version.0
         ));
     }
-    if let (Err(e), _) = run(REQUIRED_FLAGS | UPGRADEABLE_FLAGS) {
+    if let Err(e) = upgradeable {
         return Verification::Inconclusive(script_reason(e));
     }
 
@@ -269,6 +284,12 @@ pub fn verify(challenge: &Script, message: &[u8], proof: &Proof) -> Verification
         lock_time: to_sign.lock_time.to_consensus_u32(),
         sequence: input.sequence.0,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`verify`] has run the scripts on this thread.
+    pub(crate) static SCRIPT_RUNS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn script_reason(e: ScriptError) -> String {
