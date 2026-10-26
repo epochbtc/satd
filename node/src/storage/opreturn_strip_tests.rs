@@ -312,13 +312,14 @@ fn record_decode_is_strict() {
 // --- fill, StoredBlock ---------------------------------------------------
 
 /// A block with a large OP_RETURN in a witness tx, a small one in a legacy
-/// tx, and a coinbase OP_RETURN that must never be touched.
+/// tx, a coinbase OP_RETURN that must never be touched, and a tx paying a
+/// 25-byte non-OP_RETURN script.
 fn stripped_fixture() -> (Block, Vec<u8>) {
     let b = block(vec![
         coinbase(vec![op_return(38)]),
         tx(1, true, vec![ScriptBuf::new(), op_return(10_000)], 1),
         tx(2, false, vec![op_return(300), ScriptBuf::new()], 2),
-        tx(1, false, vec![ScriptBuf::new()], 3),
+        tx(1, false, vec![ScriptBuf::from_bytes(vec![0x51; 25])], 3),
     ]);
     let bytes = serialize(&b);
     (b, bytes)
@@ -375,7 +376,7 @@ fn a_flipped_byte_outside_the_spans_is_caught_by_the_filled_hash() {
     let (record, filled) = StripRecord::build(&bytes, &b, 300).unwrap().unwrap();
     let spans = tx_spans(&bytes).unwrap();
     // tx 3's output value: inside the block, outside every span.
-    let at = spans[3].offset + spans[3].len - 4 - 1 - 8;
+    let at = spans[3].outputs[0].script_offset - 1 - 8;
     let mut bad = filled.clone();
     bad[at] ^= 1;
     assert_eq!(
@@ -421,6 +422,15 @@ fn a_record_that_does_not_fit_the_bytes_is_refused() {
     r.txs[1].outputs[0].vout = 1;
     r.txs[1].outputs[0].script_len = 0;
     assert!(matches!(read(r), StoredBlockError::Fill(FillError::NotOpReturn { .. })));
+
+    // The right length, but a script that is not an OP_RETURN.
+    let mut r = record.clone();
+    r.txs[1].tx_index = 3;
+    r.txs[1].outputs[0].script_len = 25;
+    assert!(
+        matches!(read(r), StoredBlockError::Fill(FillError::NotOpReturn { tx_index: 3, vout: 0 })),
+        "a record naming a non-OP_RETURN output must not zero it"
+    );
 
     let mut r = record.clone();
     r.txs[1].outputs[0].vout = 9;
