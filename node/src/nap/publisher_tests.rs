@@ -674,6 +674,52 @@ impl ChainSource for Signed {
     }
 }
 
+/// N9 budget measurement, not a check: how long `verify_signature` takes
+/// for each kind of signature real wallets make, and how many bytes each
+/// attestation takes on the wire. Run with
+/// `cargo test -p node --release --lib verification_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement; run by hand"]
+fn verification_cost_per_wallet_format() {
+    use super::validity::verify_signature;
+    const ROUNDS: u32 = 2_000;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
+    println!("{:<62} {:>6} {:>10} {:>10}", "wallet", "bytes", "us/verify", "verify/s");
+    for v in vectors.as_array().unwrap() {
+        let field = |k: &str| v[k].as_str().unwrap();
+        let msg = message::parse(field("message")).unwrap();
+        let script = bitcoin::ScriptBuf::from_hex(field("script_pubkey")).unwrap();
+        let chain = Signed {
+            anchor_height: msg.anchor_height,
+            anchor_hash: msg.anchor_hash,
+            outpoint: msg.outpoint,
+            coin: Coin {
+                value: VALUE,
+                script_pubkey: script.clone(),
+                height: msg.anchor_height - TEST_MIN_COIN_AGE,
+                coinbase: false,
+            },
+        };
+        let (_dir, path) = store_path();
+        let p = Publisher::open(path, &chain).unwrap();
+        let (stored, _) = p.submit(&chain, field("message"), field("signature")).unwrap();
+        let att = stored.attestation;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            verify_signature(&att, &script).unwrap();
+        }
+        let each = start.elapsed() / ROUNDS;
+        println!(
+            "{:<62} {:>6} {:>10.1} {:>10.0}",
+            field("wallet").chars().take(62).collect::<String>(),
+            att.to_bytes().len(),
+            each.as_secs_f64() * 1e6,
+            1.0 / each.as_secs_f64(),
+        );
+    }
+}
+
 /// G1: signatures real wallets made on signet, submitted exactly as each
 /// wallet emitted them (a PSBT, a raw transaction, prefixed or not), so
 /// later changes are tested against what wallets actually produce. Each
