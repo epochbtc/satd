@@ -5,6 +5,7 @@ pub mod coinview;
 pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
+pub mod opreturn_strip;
 pub mod profile;
 pub mod punch;
 pub mod recent_window;
