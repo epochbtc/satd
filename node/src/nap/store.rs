@@ -290,7 +290,7 @@ pub fn read(path: &Path) -> Result<Opened, String> {
     let base_len = base_bytes.as_ref().map_or(0, |b| b.len() as u64);
     let jpath = journal_path(path);
     let mut journal =
-        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0,
+        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0, partial: false,
         #[cfg(test)]
         compactions: 0,
     };
@@ -349,6 +349,8 @@ pub struct Journal {
     /// the next is tried, so a file that cannot be written does not cost a
     /// whole rewrite on every change.
     retry_at: u64,
+    /// A failed append left bytes past `len` that are not yet cut off.
+    partial: bool,
     /// Compactions tried, for tests.
     #[cfg(test)]
     pub(super) compactions: u32,
@@ -361,11 +363,19 @@ impl Journal {
             self.start()?;
         }
         let file = self.file.as_mut().expect("started");
+        if self.partial {
+            // A failed append's bytes could not be cut off: until they are,
+            // a record after them would read back as damage before the end.
+            file.set_len(self.len)
+                .and_then(|()| file.sync_data())
+                .map_err(|e| format!("cutting a failed write off {}: {e}", self.path.display()))?;
+            self.partial = false;
+        }
         let bytes = record.encode();
         let written = file.write_all(&bytes).and_then(|()| file.sync_data());
         if let Err(e) = written {
             // Leave no partial record for the next one to follow.
-            let _ = file.set_len(self.len);
+            self.partial = file.set_len(self.len).is_err();
             return Err(format!("writing {}: {e}", self.path.display()));
         }
         self.len += bytes.len() as u64;
@@ -436,6 +446,7 @@ impl Journal {
                 sync_dir(&self.path);
                 self.file = Some(file);
                 self.len = JOURNAL_HEADER_LEN as u64;
+                self.partial = false;
                 Ok(())
             }
             Err(e) => {
@@ -454,5 +465,32 @@ fn sync_dir(path: &Path) {
         && let Ok(d) = File::open(dir)
     {
         let _ = d.sync_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_append_whose_failure_cannot_be_cut_off_blocks_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attestations.dat");
+        let record = Record::Remove(OutPoint::null(), "k".into());
+        let mut journal = read(&path).unwrap().journal;
+        journal.append(&record).unwrap();
+        // A handle that can neither write nor truncate: the append fails
+        // and its rollback too.
+        journal.file = Some(File::open(&journal.path).unwrap());
+        assert!(journal.append(&record).is_err());
+        assert!(journal.partial);
+        // While the rollback still fails, nothing is appended after it.
+        let err = journal.append(&record).unwrap_err();
+        assert!(err.contains("cutting a failed write off"), "{err}");
+        // Once it can be cut off, the journal goes on, whole.
+        journal.file = Some(std::fs::OpenOptions::new().append(true).open(&journal.path).unwrap());
+        journal.append(&record).unwrap();
+        assert!(!journal.partial);
+        assert_eq!(read(&path).unwrap().records, vec![record.clone(), record]);
     }
 }

@@ -256,8 +256,12 @@ impl Publisher {
             }
         };
         // The journal follows the file, so the two go aside together.
-        let aside: Vec<PathBuf> =
-            [set_aside(&path)?, set_aside(&store::journal_path(&path))?].into_iter().flatten().collect();
+        let base = set_aside(&path)?;
+        let journal = set_aside(&store::journal_path(&path)).map_err(|e| match &base {
+            Some(moved) => format!("{e}; {} was already moved to {}", path.display(), moved.display()),
+            None => e,
+        })?;
+        let aside: Vec<PathBuf> = [base, journal].into_iter().flatten().collect();
         Ok((Self::open(path, chain)?, Some((aside, why))))
     }
 

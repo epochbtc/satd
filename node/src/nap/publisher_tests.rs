@@ -516,7 +516,10 @@ fn a_torn_last_record_is_dropped_and_the_journal_goes_on() {
     let whole = std::fs::read(store::journal_path(&path)).unwrap();
     // A crash during the second append: its record cut short, or written
     // whole but not its checksum.
-    let first_end = whole.len() - (whole.len() - 40) / 2;
+    // The first record ends after its kind, length, payload and checksum;
+    // its length is the four bytes after the 40-byte header and its kind.
+    let first_len = u32::from_le_bytes(whole[41..45].try_into().unwrap()) as usize;
+    let first_end = 40 + 5 + first_len + 32;
     for torn in [&whole[..whole.len() - 5], &whole[..first_end + 3]] {
         std::fs::write(store::journal_path(&path), torn).unwrap();
         let p = Publisher::open(path.clone(), &chain).unwrap();
