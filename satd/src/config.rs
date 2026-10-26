@@ -735,8 +735,9 @@ pub struct Config {
     /// and enables the NAP RPCs. Default false. satd-only.
     pub nap: bool,
     /// `-napstorerecover`: with `-nap`, a store that does not read back at
-    /// startup is moved aside to `attestations.dat.bad-<unix seconds>` with
-    /// a warning and the publisher starts empty, instead of startup failing.
+    /// startup is moved aside (`attestations.dat` and `attestations.journal`,
+    /// each with a `.bad-<unix seconds>` suffix) with a warning and the
+    /// publisher starts empty, instead of startup failing.
     /// Default false. satd-only.
     pub napstorerecover: bool,
     /// `-napmaxattestations`: with `-nap`, the most attestations the store

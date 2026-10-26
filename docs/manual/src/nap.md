@@ -31,14 +31,25 @@ or `nap=1` in the config file. Changing it needs a restart. Without it, the
 four NAP RPCs answer `-1` "NAP is disabled".
 
 The attestations are kept in `nap/attestations.dat` in the network's data
-directory (`~/.bitcoin/signet/nap/attestations.dat` on signet, for example).
-Every change is written through a temporary file and a rename. If the file
-cannot be read back at startup, satd refuses to start rather than start with
-none of them: it holds signatures that may be hard to make again. Move the
-file aside to start without it, or set `napstorerecover=1`, and satd does
-that itself: it renames the file to `attestations.dat.bad-<unix time>`, logs
-a warning naming it, and starts with an empty store. Either way the damaged
-file's signatures are still on disk.
+directory (`~/.bitcoin/signet/nap/attestations.dat` on signet, for example),
+with `attestations.journal` beside it. Each change is one record appended to
+the journal and synced before the RPC returns, so a change costs the same
+however many attestations are stored. Once the journal is larger than the
+file (and at least 1 MiB), the store is written to the file whole, through a
+temporary file and a rename, and the journal starts again. A last journal
+record cut short by a crash is dropped: its RPC had not returned. If the
+store cannot be read back at startup, satd refuses to start rather than
+start with none of them: it holds signatures that may be hard to make again.
+Move both files aside to start without them, or set `napstorerecover=1`, and
+satd does that itself: it renames them to `attestations.dat.bad-<unix time>`
+and `attestations.journal.bad-<unix time>`, logs a warning, and starts with
+an empty store. Either way the damaged files' signatures are still on disk.
+A clean shutdown also writes the store to the file whole and empties the
+journal, so after one the file alone holds every attestation, as an older
+satd, which does not read the journal, would load it. After a crash the
+newest attestations may be only in the journal: copy both files to back
+the store up, and before going back to an older satd, start and stop this
+one cleanly.
 
 ## What gets signed
 
