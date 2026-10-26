@@ -960,17 +960,25 @@ fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
     // Once the file can be written, the next try succeeds, and after it the
     // usual threshold applies again, not the backed-off one.
     std::fs::remove_dir(&path).unwrap();
-    let tried = p.compactions();
     let signer = p2wpkh();
+    let (mut file, mut folds) = (None, 0);
     for n in 41..=200u8 {
         let op = coin(&mut chain, &signer, n);
         let att = attest(&chain, &signer, op, "k", "v", ANCHOR);
+        let before = p.journal_len();
         submit(&p, &chain, &att).unwrap();
+        if p.journal_len() < before {
+            // Folded in during this change. After the first fold that
+            // succeeds, each is at the usual size: as soon as the journal
+            // outgrows the file, within a record, not at a backed-off one.
+            if let Some(f) = file {
+                assert!(before <= f + 300, "the journal reached {before} bytes over a file of {f}");
+                folds += 1;
+            }
+            file = Some(std::fs::metadata(&path).unwrap().len());
+        }
     }
-    assert!(path.is_file(), "folded in once the file could be written");
-    assert!(p.compactions() > tried + 1, "folded again at the usual size, not after a backed-off one");
-    let file = std::fs::metadata(&path).unwrap().len();
-    assert!(p.journal_len() <= file, "{} > {file}", p.journal_len());
+    assert!(folds >= 1, "no fold after the file could be written");
 }
 
 /// The journal's records alone, for a store whose file cannot be read.
