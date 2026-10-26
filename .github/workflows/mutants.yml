@@ -131,6 +131,10 @@ jobs:
       fail-fast: false
       matrix:
         part: ${{ fromJSON(needs.plan.outputs.parts) }}
+    # The results sit in a directory named for the part, uploaded with its
+    # parent, so each part's artifact carries that name inside it.
+    env:
+      MUTANTS_OUT: ${{ github.workspace }}/target/mutants-parts/mutants-part-${{ matrix.part }}
 
     steps:
       - name: Checkout sources
@@ -216,7 +220,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mutants-part-${{ matrix.part }}
-          path: target/mutants-run/
+          path: target/mutants-parts/
           if-no-files-found: ignore
           retention-days: 30
 
@@ -233,12 +237,17 @@ jobs:
           sparse-checkout: scripts/mutants
 
       # Not fatal: when no part uploaded anything, `merge` still says so.
+      # Merged, because each artifact holds its own mutants-part-<j>
+      # directory. Unmerged, a single matching artifact is unpacked into
+      # `path` itself rather than a directory named for it, and a run with
+      # one part (a retry of one lost part) then reports no results.
       - name: Download the parts' results
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           pattern: mutants-part-*
           path: parts
+          merge-multiple: true
 
       # A part with no artifact (its runner lost) is named in the report.
       - name: Report
