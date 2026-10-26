@@ -131,6 +131,10 @@ jobs:
       fail-fast: false
       matrix:
         part: ${{ fromJSON(needs.plan.outputs.parts) }}
+    # The results sit in a directory named for the part, uploaded with its
+    # parent, so each part's artifact carries that name inside it.
+    env:
+      MUTANTS_OUT: ${{ github.workspace }}/target/mutants-parts/mutants-part-${{ matrix.part }}
 
     steps:
       - name: Checkout sources
@@ -185,7 +189,23 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
           SHARD: ${{ needs.plan.outputs.shard }}
           PART: ${{ matrix.part }}/${{ needs.plan.outputs.count }}
-        run: bash scripts/mutants/run.sh nightly "$SHARD" "$PART"
+        # In a cgroup capped below the runner's 16 GB. A mutant can turn a
+        # loop into one that allocates without end, faster than the test
+        # timeout: uncapped, it takes the runner down and the part uploads
+        # nothing. Capped, its test is stopped and the mutant counted.
+        run: |
+          set -euo pipefail
+          grep -qw memory /sys/fs/cgroup/cgroup.subtree_control || {
+            echo "::error::no cgroup v2 memory controller to cap the mutants with"
+            exit 1
+          }
+          cg=/sys/fs/cgroup/mutants
+          sudo mkdir -p "$cg"
+          echo 12G | sudo tee "$cg/memory.max" >/dev/null
+          echo 0 | sudo tee "$cg/memory.swap.max" >/dev/null
+          echo $$ | sudo tee "$cg/cgroup.procs" >/dev/null
+          echo "Mutants capped at $(numfmt --to=iec < "$cg/memory.max") ($(cat /proc/self/cgroup))."
+          bash scripts/mutants/run.sh nightly "$SHARD" "$PART"
 
       # This part's own summary; the annotations come from `report`, once.
       - name: Report
@@ -200,7 +220,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mutants-part-${{ matrix.part }}
-          path: target/mutants-run/
+          path: target/mutants-parts/
           if-no-files-found: ignore
           retention-days: 30
 
@@ -217,12 +237,17 @@ jobs:
           sparse-checkout: scripts/mutants
 
       # Not fatal: when no part uploaded anything, `merge` still says so.
+      # Merged, because each artifact holds its own mutants-part-<j>
+      # directory. Unmerged, a single matching artifact is unpacked into
+      # `path` itself rather than a directory named for it, and a run with
+      # one part (a retry of one lost part) then reports no results.
       - name: Download the parts' results
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           pattern: mutants-part-*
           path: parts
+          merge-multiple: true
 
       # A part with no artifact (its runner lost) is named in the report.
       - name: Report
