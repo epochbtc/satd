@@ -43,7 +43,7 @@ pub trait ChainSource {
     /// Run `read` against one chain state that does not change during it.
     /// `read` may run more than once. `None` when the chain would not hold
     /// still, which callers report as "try again".
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T>;
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T>;
 }
 
 /// Why the publisher refused a request.

@@ -112,10 +112,17 @@ pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value,
     p.report_cache().get_or(tip, changes, std::time::Instant::now(), || {
         let held: Vec<(Attestation, Timelocks)> =
             aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
-        let set = report::canonical(held.iter().map(|(a, _)| a));
-        let digest = report::digest(set.iter().copied());
-        let (tip, counting) = chain.read(&|v| report::counting_at(&held, v)).ok_or_else(tip_kept_changing)?;
-        Ok((tip.hash, report::report(tip, digest, set.len(), 0, &counting)))
+        // The digest, hashed in order, while the chain rules are checked.
+        let ((len, digest), judged) = std::thread::scope(|s| {
+            let digest = s.spawn(|| {
+                let set = report::canonical(held.iter().map(|(a, _)| a));
+                (set.len(), report::digest(set.iter().copied()))
+            });
+            let judged = chain.read(&|v| report::counting_at(&held, v));
+            (digest.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), judged)
+        });
+        let (tip, counting) = judged.ok_or_else(tip_kept_changing)?;
+        Ok((tip.hash, report::report(tip, digest, len, 0, &counting)))
     })
 }
 
@@ -145,7 +152,13 @@ pub fn export_snapshot(
             (h, v.block_hash(h).expect("the active chain holds its tip"))
         })
         .ok_or_else(tip_kept_changing)?;
-    report::write_new_with(path, |w| report::write_snapshot(w, height, hash, &set)).map_err(|e| {
+    // Set by the write, which may run twice; both runs write the same set.
+    let digest = std::cell::Cell::new(None);
+    report::write_new_with(path, |w| {
+        digest.set(Some(report::write_snapshot(w, height, hash, &set)?));
+        Ok(())
+    })
+    .map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             RpcError::new(-8, "storage.exists", format!("refusing to overwrite existing file: {}", path.display()))
         } else {
@@ -158,7 +171,7 @@ pub fn export_snapshot(
         "height": height,
         "hash": hash.to_string(),
         "attestations": set.len(),
-        "digest": report::digest(&set).to_string(),
+        "digest": digest.get().expect("a written snapshot has a digest").to_string(),
     }))
 }
 

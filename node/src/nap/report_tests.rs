@@ -167,10 +167,10 @@ fn a_snapshot_is_written_an_entry_at_a_time() {
     let largest_entry = set.iter().map(|a| a.to_bytes().len()).max().unwrap();
     let mut out = Recording::default();
     write_snapshot(&mut out, TIP, BlockHash::all_zeros(), &set).unwrap();
-    // No write holds more than one entry (its wire form, or its length and
-    // the 32-byte header fields): the set and the file are never in one
-    // buffer, however large the set.
-    assert!(out.largest <= largest_entry.max(32), "{} > {largest_entry}", out.largest);
+    // No write holds more than one entry (its length, at most three bytes,
+    // and its wire form, or a 32-byte header field): the set and the file
+    // are never in one buffer, however large the set.
+    assert!(out.largest <= (largest_entry + 3).max(32), "{} > {largest_entry} + 3", out.largest);
     // And what was written is the snapshot, which reads back with the
     // digest computed the same way, an entry at a time.
     let back = decode_snapshot(&out.bytes, 0).unwrap();
@@ -387,7 +387,7 @@ struct Moving<'a> {
 }
 
 impl super::publisher::ChainSource for Moving<'_> {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         let i = self.reads.get();
         self.reads.set(i + 1);
         Some(read(self.chains[i.min(self.chains.len() - 1)]))
@@ -607,4 +607,92 @@ fn a_snapshot_reserves_room_only_for_the_entries_its_bytes_can_hold() {
     assert_eq!(report::room_for(u32::MAX as usize, 1_000_000), 1_000_000 / report::MIN_ENTRY_LEN);
     assert_eq!(report::room_for(3, 1_000_000), 3);
     assert_eq!(report::room_for(5, 10), 0);
+}
+
+// --- Work split between threads ---------------------------------------------
+
+/// A set with something of every kind a report and a replay sort out:
+/// two script types, two keys, superseded generations, failed signatures,
+/// and coins not in the UTXO set.
+fn mixed_set() -> (Chain, Vec<Attestation>) {
+    let (wpkh, pkh) = (p2wpkh(), p2pkh());
+    let mut chain = Chain::new();
+    let mut atts = Vec::new();
+    for n in 1..=40u8 {
+        let s = if n % 3 == 0 { &pkh } else { &wpkh };
+        chain.coins.insert(outpoint(n), coin_of(s, 10_000 * u64::from(n), COIN_HEIGHT));
+        atts.push(attest(&chain, s, outpoint(n), "k", if n % 2 == 0 { "yes" } else { "no" }, ANCHOR - 10));
+        if n % 4 == 0 {
+            atts.push(attest(&chain, s, outpoint(n), "k", "maybe", ANCHOR));
+        }
+        if n % 5 == 0 {
+            atts.push(attest(&chain, s, outpoint(n), "j", "x", ANCHOR));
+        }
+    }
+    let good = attest(&chain, &wpkh, outpoint(1), "k", "yes", ANCHOR);
+    for op in [outpoint(2), outpoint(200), outpoint(201)] {
+        let forged =
+            Attestation::new(op, "f".into(), "no".into(), ANCHOR, chain.block_hash(ANCHOR).unwrap(), good.signature().clone());
+        atts.push(forged.unwrap());
+    }
+    atts.push(attest(&chain, &wpkh, outpoint(202), "k", "gone", ANCHOR));
+    (chain, canonical(atts))
+}
+
+/// Nothing in a report or a replay depends on how many threads did the
+/// work. Perturbation: join `par::map`'s shares in reverse and the reports
+/// differ.
+#[test]
+fn a_report_and_a_replay_are_the_same_on_one_thread_or_several() {
+    let (chain, atts) = mixed_set();
+    let valid: Vec<Attestation> =
+        atts.iter().filter(|a| chain.coins.get(&a.outpoint()).is_some_and(|c| verify_signature(a, &c.script_pubkey).is_ok())).cloned().collect();
+    let one = par::with_threads(1, || report_on(&chain, &valid));
+    for n in [2, 3, 8] {
+        assert_eq!(par::with_threads(n, || report_on(&chain, &valid)), one, "{n} threads");
+    }
+    let replayed = |n| {
+        par::with_threads(n, || {
+            let r = replay(&Moving { chains: vec![&chain], reads: Default::default() }, &atts).unwrap();
+            (r.tip, r.invalid, r.counting.into_iter().map(|c| (c.attestation, c.coin)).collect::<Vec<_>>())
+        })
+    };
+    let one = replayed(1);
+    assert_eq!(one.1, 1, "the forged signature on a coin the chain holds");
+    assert!(!one.2.is_empty());
+    for n in [2, 3, 8] {
+        assert_eq!(replayed(n), one, "{n} threads");
+    }
+}
+
+/// Entries serialized between threads, a batch at a time, are hashed and
+/// written in order across batches. Perturbation: write a batch's entries
+/// in reverse, or the batches out of order, and the digest differs.
+#[test]
+fn a_digest_over_many_batches_hashes_the_entries_in_order() {
+    let s = p2wpkh();
+    let mut chain = Chain::new();
+    chain.coins.insert(outpoint(1), coin_of(&s, 50_000, COIN_HEIGHT));
+    let first = attest(&chain, &s, outpoint(1), "k", "yes", ANCHOR);
+    let atts: Vec<Attestation> = (0..(2 * ENTRY_BATCH + 5) as u32)
+        .map(|vout| {
+            let op = bitcoin::OutPoint { txid: outpoint(1).txid, vout };
+            Attestation::new(op, "k".into(), "yes".into(), ANCHOR, first.anchor_hash(), first.signature().clone()).unwrap()
+        })
+        .collect();
+    let atts = par::with_threads(4, || canonical(atts));
+    let mut engine = bitcoin::hashes::sha256::Hash::engine();
+    for a in &atts {
+        let bytes = a.to_bytes();
+        bitcoin::hashes::HashEngine::input(&mut engine, &bitcoin::consensus::encode::serialize(&bitcoin::consensus::encode::VarInt(bytes.len() as u64)));
+        bitcoin::hashes::HashEngine::input(&mut engine, &bytes);
+    }
+    let expected = bitcoin::hashes::sha256::Hash::from_engine(engine);
+    for n in [1, 4] {
+        assert_eq!(par::with_threads(n, || digest(&atts)), expected, "{n} threads");
+        let mut file = Vec::new();
+        let written = par::with_threads(n, || write_snapshot(&mut file, TIP, BlockHash::all_zeros(), &atts)).unwrap();
+        assert_eq!(written, expected, "the digest a write returns, {n} threads");
+        assert_eq!(decode_snapshot(&file, 0).unwrap().attestations, atts);
+    }
 }

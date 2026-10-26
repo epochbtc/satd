@@ -45,7 +45,7 @@ impl ChainView for View<'_> {
 }
 
 impl ChainSource for ChainState {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         self.coherent_read(|| read(&View(self)))
     }
 }
