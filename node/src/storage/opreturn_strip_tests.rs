@@ -1,7 +1,6 @@
 use super::*;
 
 use bitcoin::absolute::LockTime;
-use bitcoin::blockdata::opcodes::all::OP_RETURN;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
