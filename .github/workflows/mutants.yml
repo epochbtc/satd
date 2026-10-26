@@ -83,7 +83,7 @@ jobs:
           override: true
 
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
 
@@ -171,7 +171,7 @@ jobs:
       # A prebuilt binary, as deny.yml installs cargo-deny: building
       # cargo-mutants from source would take minutes of the budget every run.
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-mutants@${{ env.MUTANTS_VERSION }}
 
