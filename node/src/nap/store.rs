@@ -30,8 +30,9 @@
 //! When the journal outgrows the file, the store is written whole and the
 //! journal started again ([`Journal::compact`]). A crash between the two
 //! leaves a journal naming the old file, which the new file already
-//! includes, so it is ignored. A last record cut short by a crash was never
-//! reported done and is dropped; anything else wrong is an error.
+//! includes, so it is ignored, with a warning. A last record cut short by a
+//! crash, or left as zeros, was never reported done and is dropped; anything
+//! else wrong is an error, a length longer than any record included.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -42,7 +43,7 @@ use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::OutPoint;
 use bitcoin::consensus::encode;
 
-use super::Attestation;
+use super::{Attestation, MAX_ATTESTATION_SIZE, MAX_KEY_LEN};
 
 const MAGIC: &[u8; 4] = b"SNAP";
 /// The file format version.
@@ -191,11 +192,8 @@ fn base_checksum(base: Option<&[u8]>) -> [u8; 32] {
     base.map_or([0; 32], |b| b[b.len() - CHECKSUM_LEN..].try_into().expect("a decoded file holds its checksum"))
 }
 
-/// Parse a journal's bytes: the base it names and its records, and how many
-/// bytes of it are whole. A last record cut short, or whose checksum fails
-/// where it runs to the end, is left out of both; anything else wrong is an
-/// error.
-fn decode_journal(bytes: &[u8]) -> Result<([u8; 32], Vec<Record>, usize), String> {
+/// The checksum of the file a journal's bytes name, from its header.
+fn journal_base(bytes: &[u8]) -> Result<[u8; 32], String> {
     if bytes.len() < JOURNAL_HEADER_LEN {
         // The header is written whole before the journal takes its name, so
         // a short one is not a journal this node wrote.
@@ -208,15 +206,44 @@ fn decode_journal(bytes: &[u8]) -> Result<([u8; 32], Vec<Record>, usize), String
     if version != JOURNAL_VERSION {
         return Err(format!("unsupported journal version {version}"));
     }
-    let base: [u8; 32] = bytes[8..JOURNAL_HEADER_LEN].try_into().expect("32 bytes");
+    Ok(bytes[8..JOURNAL_HEADER_LEN].try_into().expect("32 bytes"))
+}
+
+/// The longest payload a record of `kind` can have, or `None` for a kind
+/// the journal does not write.
+fn max_payload(kind: u8) -> Option<usize> {
+    match kind {
+        PUT => Some(MAX_ATTESTATION_SIZE),
+        REMOVE => Some(36 + MAX_KEY_LEN),
+        _ => None,
+    }
+}
+
+/// A journal's records, after its header, and how many of its bytes are
+/// whole. A crash can leave only the last record incomplete: cut short,
+/// whole but for its checksum, or as zeros a filesystem filled in. Those
+/// are left out. Anything else wrong is an error, so damage before the end
+/// is never cut off with the records behind it: a record's kind and length
+/// are checked against what the journal writes before its length is
+/// trusted to find the end.
+fn journal_records(bytes: &[u8]) -> Result<(Vec<Record>, usize), String> {
     let mut records = Vec::new();
     let mut at = JOURNAL_HEADER_LEN;
     while at < bytes.len() {
         let rest = &bytes[at..];
+        if rest.iter().all(|b| *b == 0) {
+            break; // zeros past the last write
+        }
+        let Some(max) = max_payload(rest[0]) else {
+            return Err(format!("journal record at byte {at}: unknown record kind {}", rest[0]));
+        };
         let Some(len) = rest.get(1..RECORD_HEADER_LEN).map(|l| u32::from_le_bytes(l.try_into().expect("4 bytes")) as usize)
         else {
             break; // cut short
         };
+        if len > max {
+            return Err(format!("journal record at byte {at}: a length of {len}, longer than any record"));
+        }
         let end = RECORD_HEADER_LEN + len + CHECKSUM_LEN;
         if rest.len() < end {
             break; // cut short
@@ -233,7 +260,7 @@ fn decode_journal(bytes: &[u8]) -> Result<([u8; 32], Vec<Record>, usize), String
         records.push(record);
         at += end;
     }
-    Ok((base, records, at))
+    Ok((records, at))
 }
 
 /// The store read back from disk, and the journal to record changes in.
@@ -263,13 +290,28 @@ pub fn read(path: &Path) -> Result<Opened, String> {
     let base_len = base_bytes.as_ref().map_or(0, |b| b.len() as u64);
     let jpath = journal_path(path);
     let mut journal =
-        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN };
+        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0,
+        #[cfg(test)]
+        compactions: 0,
+    };
     let records = match std::fs::read(&jpath) {
         Ok(bytes) => {
-            let (named, records, whole) = decode_journal(&bytes).map_err(|e| format!("{}: {e}", jpath.display()))?;
+            let named = journal_base(&bytes).map_err(|e| format!("{}: {e}", jpath.display()))?;
             if named != checksum {
+                // Left by a compaction that wrote the file and stopped before
+                // starting a new journal, which the file already holds; or by
+                // an older file restored over a newer journal, whose changes
+                // are then lost. Neither is read, damaged or not.
+                tracing::warn!(
+                    target: "nap",
+                    "NAP: ignoring {} ({} bytes): it follows another {}; the next change replaces it",
+                    jpath.display(),
+                    bytes.len(),
+                    path.display()
+                );
                 Vec::new()
             } else {
+                let (records, whole) = journal_records(&bytes).map_err(|e| format!("{}: {e}", jpath.display()))?;
                 let file = std::fs::OpenOptions::new()
                     .append(true)
                     .open(&jpath)
@@ -303,6 +345,13 @@ pub struct Journal {
     base_len: u64,
     /// The shortest journal folded in; [`MIN_COMPACT_LEN`] but in tests.
     compact_at: u64,
+    /// After a compaction fails, the length the journal must reach before
+    /// the next is tried, so a file that cannot be written does not cost a
+    /// whole rewrite on every change.
+    retry_at: u64,
+    /// Compactions tried, for tests.
+    #[cfg(test)]
+    pub(super) compactions: u32,
 }
 
 impl Journal {
@@ -325,7 +374,7 @@ impl Journal {
 
     /// Whether the journal has outgrown the file it follows.
     pub fn wants_compaction(&self) -> bool {
-        self.len >= self.compact_at && self.len > self.base_len
+        self.len >= self.compact_at && self.len > self.base_len && self.len >= self.retry_at
     }
 
     /// The journal's length on disk, in bytes.
@@ -345,8 +394,15 @@ impl Journal {
         path: &Path,
         attestations: impl ExactSizeIterator<Item = &'a Attestation>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            self.compactions += 1;
+        }
         let bytes = encode(attestations);
-        save(path, &bytes)?;
+        if let Err(e) = save(path, &bytes) {
+            self.retry_at = self.len.saturating_mul(2);
+            return Err(e);
+        }
         sync_dir(path);
         // The file is the store now; a journal naming the old one is
         // ignored, so until the new journal is in place nothing is lost.

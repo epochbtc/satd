@@ -875,3 +875,101 @@ fn real_wallet_signatures_are_accepted() {
         assert!(p.submit(&chain, &other, signature).is_err(), "{wallet}: signs any value");
     }
 }
+
+#[test]
+fn a_damaged_length_is_an_error_not_a_torn_end() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 2);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &atts[0]).unwrap();
+    submit(&p, &chain, &atts[1]).unwrap();
+    drop(p);
+    let jpath = store::journal_path(&path);
+    let whole = std::fs::read(&jpath).unwrap();
+    // The first record's length, made to reach past the end: were it
+    // trusted, the second record, reported done, would be cut off with it.
+    let mut damaged = whole.clone();
+    damaged[41..45].copy_from_slice(&1_000_000u32.to_le_bytes());
+    std::fs::write(&jpath, &damaged).unwrap();
+    let err = Publisher::open(path.clone(), &chain).err().unwrap();
+    assert!(err.contains("longer than any record"), "{err}");
+    assert_eq!(std::fs::read(&jpath).unwrap(), damaged, "nothing is cut off");
+    // A record kind the journal does not write is damage too.
+    let mut damaged = whole.clone();
+    damaged[40] = 9;
+    std::fs::write(&jpath, &damaged).unwrap();
+    assert!(Publisher::open(path.clone(), &chain).err().unwrap().contains("unknown record kind"));
+    // Zeros after the last record, as a filesystem may leave after a power
+    // loss, are a torn end.
+    let mut zeros = whole.clone();
+    zeros.extend_from_slice(&[0; 300]);
+    std::fs::write(&jpath, &zeros).unwrap();
+    Publisher::open(path.clone(), &chain).unwrap();
+    assert_eq!(on_disk(&path), atts);
+    assert_eq!(std::fs::read(&jpath).unwrap(), whole);
+}
+
+#[test]
+fn a_damaged_journal_naming_another_file_does_not_stop_startup() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 2);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    submit(&p, &chain, &atts[0]).unwrap();
+    submit(&p, &chain, &atts[1]).unwrap();
+    drop(p);
+    store::save(&path, &store::encode([&atts[1]].into_iter())).unwrap();
+    let jpath = store::journal_path(&path);
+    let mut damaged = std::fs::read(&jpath).unwrap();
+    damaged[50] ^= 1;
+    std::fs::write(&jpath, &damaged).unwrap();
+    // Its records are never read, so their damage does not matter.
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    assert_eq!(p.list(&chain).len(), 1);
+}
+
+#[test]
+fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 40);
+    let p = Publisher::open(path.clone(), &chain).unwrap().with_compaction_at(1);
+    // The file's path is a directory: every compaction fails at the rename,
+    // while the journal takes each change.
+    std::fs::create_dir_all(&path).unwrap();
+    for att in &atts {
+        submit(&p, &chain, att).unwrap();
+    }
+    assert_eq!(on_disk_journal_only(&path), atts);
+    // Tried again only once the journal has doubled since the last try:
+    // a handful of times for forty changes, not forty.
+    assert!(p.compactions() <= 7, "{} compactions for {} changes", p.compactions(), atts.len());
+    assert!(p.compactions() >= 2, "still tried again as the journal grows");
+}
+
+/// The journal's records alone, for a store whose file cannot be read.
+fn on_disk_journal_only(path: &std::path::Path) -> Vec<Attestation> {
+    let bytes = std::fs::read(store::journal_path(path)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("attestations.dat");
+    std::fs::write(store::journal_path(&copy), bytes).unwrap();
+    on_disk(&copy)
+}
+
+#[test]
+fn recoveries_in_the_same_second_keep_every_damaged_file() {
+    let (_dir, path) = store_path();
+    let (chain, _) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut kept = Vec::new();
+    for damage in [b"first".as_slice(), b"second"] {
+        std::fs::write(&path, damage).unwrap();
+        let (_, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
+        kept.extend(aside.unwrap().0);
+    }
+    assert_eq!(kept.len(), 2);
+    assert_ne!(kept[0], kept[1]);
+    assert_eq!(std::fs::read(&kept[0]).unwrap(), b"first");
+    assert_eq!(std::fs::read(&kept[1]).unwrap(), b"second");
+}

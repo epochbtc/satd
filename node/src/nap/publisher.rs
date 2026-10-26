@@ -212,6 +212,12 @@ impl Publisher {
         self.writer.lock().bytes()
     }
 
+    /// Compactions tried since the store was opened.
+    #[cfg(test)]
+    pub(super) fn compactions(&self) -> u32 {
+        self.writer.lock().compactions
+    }
+
     fn full(&self, len: usize) -> bool {
         self.max_attestations != 0 && len >= self.max_attestations
     }
@@ -233,9 +239,16 @@ impl Publisher {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let set_aside = |file: &std::path::Path| -> Result<Option<PathBuf>, String> {
-            let mut aside = file.to_path_buf().into_os_string();
-            aside.push(format!(".bad-{secs}"));
-            let aside = PathBuf::from(aside);
+            // A name not taken, so a second recovery in the same second does
+            // not replace the file the first one kept.
+            let aside = (0..)
+                .map(|n| {
+                    let mut aside = file.to_path_buf().into_os_string();
+                    aside.push(if n == 0 { format!(".bad-{secs}") } else { format!(".bad-{secs}-{n}") });
+                    PathBuf::from(aside)
+                })
+                .find(|p| !p.exists())
+                .expect("an unbounded range");
             match std::fs::rename(file, &aside) {
                 Ok(()) => Ok(Some(aside)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
