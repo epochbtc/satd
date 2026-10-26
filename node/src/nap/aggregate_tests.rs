@@ -577,7 +577,7 @@ struct Hooked<'a> {
 }
 
 impl ChainSource for Hooked<'_> {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         if let Some(hook) = self.hook.borrow_mut().take() {
             hook();
         }
@@ -628,7 +628,7 @@ fn a_verified_entry_the_tip_will_not_judge_is_held_unjudged() {
     // Reads the coin, then the tip moves on every judging read.
     struct Flaky<'a>(&'a Chain, std::cell::Cell<u32>);
     impl ChainSource for Flaky<'_> {
-        fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+        fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
             let n = self.1.get();
             self.1.set(n + 1);
             (n == 0).then(|| read(self.0))

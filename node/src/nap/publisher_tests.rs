@@ -8,7 +8,7 @@ use super::validity::{ChainView, Coin};
 use super::*;
 
 impl ChainSource for Chain {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         Some(read(self))
     }
 }
@@ -617,7 +617,7 @@ impl<'a> Hooked<'a> {
 }
 
 impl ChainSource for Hooked<'_> {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         if let Some(hook) = self.hook.take() {
             hook();
         }
@@ -832,7 +832,7 @@ impl ChainView for Signed {
 }
 
 impl ChainSource for Signed {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         Some(read(self))
     }
 }

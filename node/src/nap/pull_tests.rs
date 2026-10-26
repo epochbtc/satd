@@ -215,7 +215,7 @@ struct Hooked<'a> {
 }
 
 impl ChainSource for Hooked<'_> {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         if let Some(hook) = self.hook.borrow_mut().take() {
             hook();
         }

@@ -25,6 +25,13 @@
 //!
 //! The digest is over the entries alone, so it names the set whatever tip
 //! the file was exported at.
+//!
+//! Work over the whole set is split between threads where its items are
+//! independent ([`par`]): ids for sorting, entries' bytes (hashed and
+//! written in order), the chain rules for each attestation, and a replay's
+//! signatures. What depends on order, the hashing and the choice of the
+//! attestation that counts, runs in order as before, so nothing a report
+//! or a snapshot holds depends on how the work was split.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
@@ -36,6 +43,7 @@ use bitcoin::hashes::{Hash as _, HashEngine as _, sha256};
 use bitcoin::{Amount, BlockHash, OutPoint, Script};
 use serde_json::{Value, json};
 
+use super::par;
 use super::publisher::ChainSource;
 use super::validity::{Timelocks, check_chain, check_timelocks, verify_signature};
 use super::{Attestation, ChainView, Coin, MAX_ATTESTATION_SIZE, supersedes};
@@ -81,22 +89,43 @@ pub struct Snapshot {
 /// `atts` in snapshot order: ascending by id, each once. Owned
 /// attestations or references to them, so a set can be ordered without
 /// copying it.
-pub fn canonical<A: Borrow<Attestation>>(atts: impl IntoIterator<Item = A>) -> Vec<A> {
-    let mut keyed: Vec<(sha256::Hash, A)> = atts.into_iter().map(|a| (a.borrow().id(), a)).collect();
+pub fn canonical<A: Borrow<Attestation> + Send + Sync>(atts: impl IntoIterator<Item = A>) -> Vec<A> {
+    let atts: Vec<A> = atts.into_iter().collect();
+    let ids = par::map(&atts, |a| a.borrow().id());
+    let mut keyed: Vec<(sha256::Hash, A)> = ids.into_iter().zip(atts).collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.dedup_by(|a, b| a.0 == b.0);
     keyed.into_iter().map(|(_, a)| a).collect()
 }
 
-/// Write the entries to `w`, one at a time: each attestation's wire form
-/// prefixed by its length. The whole set is never in one buffer.
+/// How many entries are serialized at a time, between threads, before
+/// they are written in order: the most of the set held in memory at once.
+pub(super) const ENTRY_BATCH: usize = 4_096;
+
+/// Write the entries to `w` in order: each attestation's wire form
+/// prefixed by its length. They are serialized [`ENTRY_BATCH`] at a time,
+/// so the whole set is never in one buffer.
 fn write_entries<'a>(w: &mut dyn Write, atts: impl IntoIterator<Item = &'a Attestation>) -> std::io::Result<()> {
-    for att in atts {
-        let bytes = att.to_bytes();
-        w.write_all(&encode::serialize(&encode::VarInt(bytes.len() as u64)))?;
-        w.write_all(&bytes)?;
+    let mut atts = atts.into_iter();
+    let mut batch: Vec<&Attestation> = Vec::with_capacity(ENTRY_BATCH);
+    loop {
+        batch.clear();
+        batch.extend(atts.by_ref().take(ENTRY_BATCH));
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for entry in par::map(&batch, |att| entry(att)) {
+            w.write_all(&entry)?;
+        }
     }
-    Ok(())
+}
+
+/// One entry: `att`'s wire form prefixed by its length.
+fn entry(att: &Attestation) -> Vec<u8> {
+    let bytes = att.to_bytes();
+    let mut out = encode::serialize(&encode::VarInt(bytes.len() as u64));
+    out.extend_from_slice(&bytes);
+    out
 }
 
 /// A writer that hashes what passes through it.
@@ -127,23 +156,32 @@ pub fn digest<'a>(atts: impl IntoIterator<Item = &'a Attestation>) -> sha256::Ha
 }
 
 /// Write the snapshot file to `w`, the checksum computed as it goes, so
-/// the file is never held whole in memory. `atts` are in snapshot order.
-pub fn write_snapshot(w: &mut dyn Write, height: u32, hash: BlockHash, atts: &[Attestation]) -> std::io::Result<()> {
+/// the file is never held whole in memory, and return the set's digest,
+/// computed from the same bytes. `atts` are in snapshot order.
+pub fn write_snapshot(
+    w: &mut dyn Write,
+    height: u32,
+    hash: BlockHash,
+    atts: &[Attestation],
+) -> std::io::Result<sha256::Hash> {
     let mut hashing = Hashing { inner: w, engine: sha256::Hash::engine() };
     hashing.write_all(MAGIC)?;
     hashing.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
     hashing.write_all(&height.to_le_bytes())?;
     hashing.write_all(hash.as_byte_array())?;
     hashing.write_all(&(atts.len() as u32).to_le_bytes())?;
-    write_entries(&mut hashing, atts)?;
+    let mut entries = Hashing { inner: &mut hashing, engine: sha256::Hash::engine() };
+    write_entries(&mut entries, atts)?;
+    let digest = sha256::Hash::from_engine(entries.engine);
     let checksum = sha256::Hash::from_engine(hashing.engine);
-    hashing.inner.write_all(checksum.as_byte_array())
+    hashing.inner.write_all(checksum.as_byte_array())?;
+    Ok(digest)
 }
 
 /// The snapshot file's bytes, as [`write_snapshot`] writes them.
 pub fn encode_snapshot(height: u32, hash: BlockHash, atts: &[Attestation]) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_snapshot(&mut buf, height, hash, atts).expect("a Vec does not fail");
+    let _ = write_snapshot(&mut buf, height, hash, atts).expect("a Vec does not fail");
     buf
 }
 
@@ -325,20 +363,35 @@ pub struct Replay {
 /// kept across attempts: an outpoint's scriptPubKey never changes. `None`
 /// when the chain would not hold still.
 pub fn replay(chain: &impl ChainSource, atts: &[Attestation]) -> Option<Replay> {
+    let ids = par::map(atts, Attestation::id);
     let mut verified: HashMap<sha256::Hash, Option<Timelocks>> = HashMap::new();
     for _ in 0..REPLAY_ATTEMPTS {
         let (read_at, scripts) = chain.read(&|v| {
             let h = v.tip_height();
-            let scripts: Vec<_> = atts.iter().map(|a| v.coin(&a.outpoint()).map(|c| c.script_pubkey)).collect();
+            let scripts = par::map(atts, |a| v.coin(&a.outpoint()).map(|c| c.script_pubkey));
             ((h, v.block_hash(h)), scripts)
         })?;
+        // A coin not in the UTXO set cannot count; it is not verified. The
+        // rest not verified on an earlier attempt are, between threads.
+        let todo: Vec<(&sha256::Hash, &Attestation, &bitcoin::ScriptBuf)> = ids
+            .iter()
+            .zip(atts)
+            .zip(&scripts)
+            .filter_map(|((id, att), script)| Some((id, att, script.as_ref()?)))
+            .filter(|(id, _, _)| !verified.contains_key(*id))
+            .collect();
+        let results = par::map(&todo, |(_, att, script)| verify_signature(att, script).ok());
+        for ((id, _, _), result) in todo.iter().zip(results) {
+            verified.insert(**id, result);
+        }
         let mut held = Vec::with_capacity(atts.len());
         let mut invalid = 0;
-        for (att, script) in atts.iter().zip(scripts) {
-            // A coin not in the UTXO set cannot count; it is not verified.
-            let Some(script) = script else { continue };
-            match verified.entry(att.id()).or_insert_with(|| verify_signature(att, &script).ok()) {
-                Some(locks) => held.push((att.clone(), *locks)),
+        for ((att, id), script) in atts.iter().zip(&ids).zip(&scripts) {
+            if script.is_none() {
+                continue;
+            }
+            match verified[id] {
+                Some(locks) => held.push((att.clone(), locks)),
                 None => invalid += 1,
             }
         }
@@ -415,13 +468,17 @@ pub struct Tip {
 /// they left, at `v`'s tip, and return the tip and, for each
 /// `(outpoint, key)`, the newest valid one: the attestations that count.
 /// Ordered by outpoint and key.
-pub fn counting_at(held: &[(Attestation, Timelocks)], v: &dyn ChainView) -> (Tip, Vec<Counted>) {
+///
+/// The rules are checked between threads; the attestation that counts is
+/// chosen in `held`'s order, as it would be on one.
+pub fn counting_at(held: &[(Attestation, Timelocks)], v: &(dyn ChainView + Sync)) -> (Tip, Vec<Counted>) {
+    let coins = par::map(held, |(att, locks)| {
+        let coin = check_chain(att, v).ok()?;
+        check_timelocks(v, &coin, locks).ok().map(|_| coin)
+    });
     let mut best: BTreeMap<(OutPoint, &str), Counted> = BTreeMap::new();
-    for (att, locks) in held {
-        let Ok(coin) = check_chain(att, v) else { continue };
-        if check_timelocks(v, &coin, locks).is_err() {
-            continue;
-        }
+    for ((att, _), coin) in held.iter().zip(coins) {
+        let Some(coin) = coin else { continue };
         best.entry((att.outpoint(), att.key()))
             .and_modify(|cur| {
                 if supersedes(att, &cur.attestation) {

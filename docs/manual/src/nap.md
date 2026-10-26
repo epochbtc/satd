@@ -509,6 +509,13 @@ replay does not add the snapshot to the node's set. `invalid` counts
 attestations whose signatures fail. An attestation whose coin is gone is
 not verified, and does not count.
 
+A report, an export and a replay split their work between up to eight
+threads once the set holds a few thousand attestations: the replay's
+signatures, the chain rules for each attestation, and each entry's bytes.
+What depends on order, the digest and the choice of the attestation that
+counts, is computed in order, so the result is the same however the work
+was split.
+
 The file is `"NAPS"`, a version (1), the height and hash it was exported
 at, a count, the length-prefixed attestations, and a SHA256 checksum. A
 replay reads at most `napaggregatormax` attestations, or 1,000,000 on a
