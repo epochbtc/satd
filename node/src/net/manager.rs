@@ -7107,23 +7107,23 @@ impl PeerManager {
     }
 
     /// Peer ids eligible to serve a block re-fetch: connected, advertising
-    /// `NODE_NETWORK`, or `NODE_NETWORK_LIMITED` with `NODE_INTACT_BLOCKS`,
-    /// so they should hold historical blocks, and `NODE_WITNESS` so they can
-    /// serve the witness serialization we ask for. `NODE_NETWORK` peers come
-    /// first: an intact peer may have stripped the block.
+    /// `NODE_NETWORK` so they should hold historical blocks, and
+    /// `NODE_WITNESS` so they can serve the witness serialization we ask for.
+    /// Only when no such peer is connected, the `NODE_NETWORK_LIMITED` peers
+    /// with `NODE_INTACT_BLOCKS` instead: one may have stripped the block,
+    /// and a re-fetch does not track a `notfound` to move on from it.
     pub fn block_serving_peer_ids(&self) -> Vec<PeerId> {
         let peers = self.peers.read();
-        let mut ids: Vec<(bool, PeerId)> = peers
-            .iter()
-            .filter(|(_, h)| {
-                h.info.state == PeerState::Connected
-                    && h.info.serves_deep_blocks()
-                    && h.info.services.has(ServiceFlags::WITNESS)
-            })
-            .map(|(id, h)| (h.info.is_limited(), *id))
-            .collect();
-        ids.sort_by_key(|&(limited, _)| limited);
-        ids.into_iter().map(|(_, id)| id).collect()
+        let (mut full, mut intact) = (Vec::new(), Vec::new());
+        for (id, h) in peers.iter() {
+            if h.info.state == PeerState::Connected
+                && h.info.serves_deep_blocks()
+                && h.info.services.has(ServiceFlags::WITNESS)
+            {
+                if h.info.is_limited() { intact.push(*id) } else { full.push(*id) }
+            }
+        }
+        if full.is_empty() { intact } else { full }
     }
 
     /// Route a block that `getblockfrompeer` asked for into the repair path.

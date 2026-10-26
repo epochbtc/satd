@@ -307,15 +307,16 @@ fn the_background_download_asks_intact_peers_but_not_plain_limited_ones() {
 }
 
 /// A re-fetch (`getblockfrompeer` without a peer id, an unreadable stored
-/// block) may go to an intact peer, after every NODE_NETWORK one; never to a
-/// plain limited peer.
+/// block) goes to an intact peer only when no NODE_NETWORK peer is
+/// connected; never to a plain limited peer.
 #[test]
-fn block_serving_peers_put_full_peers_before_intact_ones() {
+fn block_serving_peers_fall_back_to_intact_ones_only_without_a_full_peer() {
     let (pm, _dir) = mk_pm();
     let _intact = add_peer(&pm, 1, intact(), 300);
     let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    assert_eq!(pm.block_serving_peer_ids(), vec![1], "no full peer: the intact one");
     let _full = add_peer(&pm, 3, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
-    assert_eq!(pm.block_serving_peer_ids(), vec![3, 1]);
+    assert_eq!(pm.block_serving_peer_ids(), vec![3], "a full peer: only it");
 }
 
 /// Intact peers are used only when already connected: while the tip is old,
