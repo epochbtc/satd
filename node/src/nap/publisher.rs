@@ -141,6 +141,9 @@ enum Assessed {
 
 type Key = (OutPoint, String);
 
+/// The files a store that did not read back was moved to, and why.
+pub type SetAside = (Vec<PathBuf>, String);
+
 pub struct Publisher {
     path: PathBuf,
     entries: Mutex<BTreeMap<Key, Entry>>,
@@ -206,7 +209,7 @@ impl Publisher {
     /// The journal's length on disk.
     #[cfg(test)]
     pub(super) fn journal_len(&self) -> u64 {
-        self.writer.lock().len()
+        self.writer.lock().bytes()
     }
 
     fn full(&self, len: usize) -> bool {
@@ -221,7 +224,7 @@ impl Publisher {
     pub fn open_recovering(
         path: PathBuf,
         chain: &impl ChainSource,
-    ) -> Result<(Self, Option<(Vec<PathBuf>, String)>), String> {
+    ) -> Result<(Self, Option<SetAside>), String> {
         let why = match store::read(&path) {
             Ok(_) => return Self::open(path, chain).map(|p| (p, None)),
             Err(why) => why,

@@ -328,8 +328,8 @@ impl Journal {
         self.len >= self.compact_at && self.len > self.base_len
     }
 
-    /// The journal's length on disk.
-    pub fn len(&self) -> u64 {
+    /// The journal's length on disk, in bytes.
+    pub fn bytes(&self) -> u64 {
         self.len
     }
 
