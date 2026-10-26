@@ -387,6 +387,11 @@ impl Journal {
         self.len >= self.compact_at && self.len > self.base_len && self.len >= self.retry_at
     }
 
+    /// Whether the journal holds changes the file does not.
+    pub fn has_records(&self) -> bool {
+        self.len > JOURNAL_HEADER_LEN as u64
+    }
+
     /// The journal's length on disk, in bytes.
     pub fn bytes(&self) -> u64 {
         self.len

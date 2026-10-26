@@ -976,3 +976,28 @@ fn recoveries_in_the_same_second_keep_every_damaged_file() {
     assert_eq!(std::fs::read(&kept[0]).unwrap(), b"first");
     assert_eq!(std::fs::read(&kept[1]).unwrap(), b"second");
 }
+
+#[test]
+fn a_fold_leaves_the_file_holding_everything_as_an_older_build_reads_it() {
+    let (_dir, path) = store_path();
+    let mut chain = Chain::new();
+    let atts = attested(&mut chain, 5);
+    let p = Publisher::open(path.clone(), &chain).unwrap();
+    assert_eq!(p.fold_journal(), Ok(false), "nothing to fold");
+    for att in &atts {
+        submit(&p, &chain, att).unwrap();
+    }
+    p.remove(atts[2].outpoint(), "k").unwrap();
+    let mut left = atts.clone();
+    left.remove(2);
+    // Too small to be folded in as it went: the file does not exist yet.
+    assert!(!path.exists());
+    assert_eq!(p.fold_journal(), Ok(true));
+    // The file alone, as a build that ignores the journal reads it.
+    assert_eq!(store::load(&path).unwrap(), left);
+    assert_eq!(on_disk(&path), left);
+    assert_eq!(p.fold_journal(), Ok(false), "folded already");
+    // The journal goes on after it.
+    submit(&p, &chain, &atts[2]).unwrap();
+    assert_eq!(on_disk(&path), atts);
+}

@@ -566,6 +566,21 @@ impl Publisher {
         self.compact_if_due(&mut journal);
     }
 
+    /// Write the store to the file whole and empty the journal, whatever
+    /// their sizes: at a clean shutdown, so the file alone holds every
+    /// attestation and a build that does not read the journal (an older
+    /// satd, after a rollback) loses none. Returns whether there was
+    /// anything to fold.
+    pub fn fold_journal(&self) -> Result<bool, String> {
+        let mut journal = self.writer.lock();
+        if !journal.has_records() {
+            return Ok(false);
+        }
+        let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+        journal.compact(&self.path, atts.iter())?;
+        Ok(true)
+    }
+
     /// Fold the journal into the file once it has outgrown it, so loading
     /// stays proportional to what is stored. The entries' lock is held only
     /// to copy them; the writer lock, held by the caller, keeps them as

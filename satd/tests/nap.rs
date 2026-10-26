@@ -367,6 +367,12 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
 
     // The store survives a restart.
     node.stop();
+    // A clean stop writes the store to its file whole, so the file alone
+    // holds every attestation, as a build that does not read the journal
+    // would load it, and the journal is left empty.
+    let store = datadir.join("regtest").join("nap").join("attestations.dat");
+    assert_eq!(node::nap::store::load(&store).unwrap().len(), holders.len());
+    assert_eq!(std::fs::metadata(node::nap::store::journal_path(&store)).unwrap().len(), 40, "an empty journal");
     let max = format!("--napmaxattestations={}", holders.len());
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", &max]);
     assert_eq!(list(&node), before);

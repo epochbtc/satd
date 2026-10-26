@@ -3361,6 +3361,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     } else {
         None
     };
+    // Kept for shutdown, which folds the publisher's journal into its file.
+    let nap_at_shutdown = nap.clone();
 
     // -napaggregator: load the collected set, judge it at the tip, and start
     // collecting. The set is rebuilt by collection, so a file that does not
@@ -4921,6 +4923,22 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             tracing::warn!(
                 "utxo recent-height window build did not stop within 5s; continuing shutdown"
             );
+        }
+    }
+
+    // Fold the NAP publisher's journal into its file, so the file alone
+    // holds every attestation: a store too small to have been folded in as
+    // it went would otherwise keep its newest ones only in the journal,
+    // which an older satd does not read. One write of the store, before the
+    // chain flush takes the rest of the deadline.
+    if let Some(publisher) = &nap_at_shutdown {
+        match publisher.fold_journal() {
+            Ok(true) => tracing::info!(target: "nap", "NAP: wrote the attestation store"),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                target: "nap",
+                "NAP: could not write the attestation store at shutdown; its journal still holds every change: {e}"
+            ),
         }
     }
 
