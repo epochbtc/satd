@@ -244,6 +244,7 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         pre_verified_txs: None,
         num_threads: 1,
         precomputed_txids: None,
+        script_skip_txs: None,
         address_index: &Default::default(),
         // Both indexes default to disabled: this target fuzzes consensus
         // accept/reject, and index emission is not part of that verdict.
