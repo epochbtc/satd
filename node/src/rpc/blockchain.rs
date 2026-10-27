@@ -659,18 +659,25 @@ pub fn get_block(
         }
     };
 
+    let stored = chain_state
+        .get_stored_block(&hash)
+        .ok_or_else(block_unavailable_msg)?;
+
     if verbosity == 0 {
-        let block = chain_state
-            .get_block(&hash)
-            .ok_or_else(block_unavailable_msg)?;
-        let raw = serialize(&block);
+        // The raw block is exactly what stripping removed: its filled form
+        // would hash right and carry the wrong txids, so it is never served.
+        // The message is Core's for a block whose data is gone.
+        if stored.is_stripped() {
+            return Err("Block not available (pruned data)".to_string());
+        }
+        let raw = serialize(&stored.block);
         return Ok(Value::String(hex::encode(raw)));
     }
 
-    // verbosity >= 1: JSON response
-    let block = chain_state
-        .get_block(&hash)
-        .ok_or_else(block_unavailable_msg)?;
+    // verbosity >= 1: JSON response. A stripped block answers from its
+    // filled form, whose sizes and weight equal the original's, and from
+    // the txids its strip record holds.
+    let block = &stored.block;
 
     let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
@@ -686,37 +693,30 @@ pub fn get_block(
             .read_undo(&hash)
             .map_err(|_| crate::rpc::rawtx::UNDO_UNREADABLE.to_string())?;
         let per_tx = match &undo {
-            Some(u) => Some(crate::rpc::rawtx::undo_by_tx(&block, u)?),
+            Some(u) => Some(crate::rpc::rawtx::undo_by_tx(block, u)?),
             None => None,
         };
-        let txs: Vec<Value> = block
-            .txdata
-            .iter()
-            .enumerate()
-            .map(|(i, tx)| {
-                crate::rpc::rawtx::decode_transaction_verbose_net(
-                    tx,
+        let txs: Vec<Value> = (0..block.txdata.len())
+            .map(|i| {
+                crate::rpc::rawtx::stored_tx_verbose(
+                    &stored,
+                    i,
                     None,
                     per_tx.as_ref().and_then(|p| p[i]),
                     verbosity >= 3,
-                    true,
                     chain_state.network,
                 )
             })
             .collect();
         Value::Array(txs)
     } else {
-        let txids: Vec<String> = block
-            .txdata
-            .iter()
-            .map(|tx| tx.compute_txid().to_string())
-            .collect();
+        let txids: Vec<String> = stored.txids().iter().map(|t| t.to_string()).collect();
         json!(txids)
     };
 
     let difficulty = target_to_difficulty(entry.header.bits);
     let chainwork_hex = hex::encode(entry.chainwork);
-    let block_size = serialize(&block).len();
+    let block_size = serialize(block).len();
 
     let prev_hash = if entry.height > 0 {
         Some(entry.header.prev_blockhash.to_string())
@@ -772,8 +772,23 @@ pub fn get_block(
     if let Some(nh) = next_hash {
         result["nextblockhash"] = Value::String(nh);
     }
+    if let Some(record) = stored.record() {
+        result["opreturn_stripped"] = opreturn_stripped_summary(record);
+    }
 
     Ok(result)
+}
+
+/// What stripping removed from a block, for `getblock`: the transactions and
+/// outputs it touched, and the payload bytes it zeroed. Each output keeps its
+/// `OP_RETURN` opcode, so a script of `n` bytes lost `n - 1`.
+fn opreturn_stripped_summary(record: &crate::storage::opreturn_strip::StripRecord) -> Value {
+    let outputs = record.txs.iter().flat_map(|t| &t.outputs);
+    json!({
+        "transactions": record.txs.len(),
+        "outputs": outputs.clone().count(),
+        "bytes": outputs.map(|o| o.script_len.saturating_sub(1)).sum::<u64>(),
+    })
 }
 
 /// `getblockheader` — return block header data.
@@ -1163,9 +1178,13 @@ pub fn get_block_stats(
     let entry = chain_state
         .get_block_index(&hash)
         .ok_or("Block not found")?;
+    // A stripped block's filled form has the original's sizes, weights and
+    // output values, and its fees come from undo data, so every statistic
+    // is the same as before the strip.
     let block = chain_state
-        .get_block(&hash)
-        .ok_or("Block data not available")?;
+        .get_stored_block(&hash)
+        .ok_or("Block data not available")?
+        .block;
 
     let block_bytes = serialize(&block);
     let total_size = block_bytes.len();
@@ -1862,9 +1881,11 @@ pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) ->
             return json!(false);
         };
         // Level 1+: the body must be readable, unless the operator pruned it.
+        // A stripped body is readable: the read verifies its filled form's
+        // hash and its txids against the merkle root.
         if check_level >= 1
             && !chain_state.is_pruned(&hash)
-            && chain_state.get_block(&hash).is_none()
+            && chain_state.get_stored_block(&hash).is_none()
         {
             return json!(false);
         }

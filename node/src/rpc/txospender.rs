@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Block, BlockHash, OutPoint, Txid};
+use bitcoin::{BlockHash, OutPoint, Txid};
 use node_index::{IndexError, SpendIndex};
 use serde_json::{Map, Value};
 
@@ -20,6 +20,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::util::parse_hash_v;
 use crate::storage::Store as _;
+use crate::storage::opreturn_strip::StoredBlock;
 
 /// The JSON type names Core's `uvTypeName` prints.
 fn type_name(v: &Value) -> &'static str {
@@ -132,7 +133,7 @@ fn answer(
     let outpoints: Vec<OutPoint> = prevouts.iter().map(|(op, _)| *op).collect();
     let (in_mempool, mempool_txs) = mempool.spending_transactions_acting(&outpoints, return_spending_tx);
     let mut hex: HashMap<Txid, String> = HashMap::new();
-    let mut last_block: Option<(BlockHash, Block)> = None;
+    let mut last_block: Option<(BlockHash, StoredBlock, Vec<Txid>)> = None;
     // The answer repeats a spender's hex for every output it spends, as
     // Core's does. jsonrpsee refuses a reply past `RPC_MAX_RESPONSE_SIZE`
     // only once it is built, so the copies are counted as they are made and
@@ -170,19 +171,23 @@ fn answer(
                         let h = match hex.entry(spending_txid) {
                             Entry::Occupied(e) => e.into_mut(),
                             Entry::Vacant(e) => {
-                                if last_block.as_ref().is_none_or(|(h, _)| *h != block_hash) {
+                                if last_block.as_ref().is_none_or(|(h, _, _)| *h != block_hash) {
                                     let block = chain
-                                        .get_block(&block_hash)
+                                        .get_stored_block(&block_hash)
                                         .ok_or((-1, format!("Block {block_hash} not available")))?;
-                                    last_block = Some((block_hash, block));
+                                    let txids = block.txids();
+                                    last_block = Some((block_hash, block, txids));
                                 }
-                                let (_, block) = last_block.as_ref().expect("read above");
-                                let tx = block
-                                    .txdata
+                                let (_, block, txids) = last_block.as_ref().expect("read above");
+                                let i = txids
                                     .iter()
-                                    .find(|t| t.compute_txid() == spending_txid)
+                                    .position(|t| *t == spending_txid)
                                     .ok_or((-1, format!("Transaction {spending_txid} not in block {block_hash}")))?;
-                                e.insert(serialize_hex(tx))
+                                // Its bytes are gone; the filled form is not it.
+                                if block.tx_is_stripped(i) {
+                                    return Err((-1, crate::rpc::rawtx::TX_DATA_STRIPPED.to_string()));
+                                }
+                                e.insert(serialize_hex(&block.block.txdata[i]))
                             }
                         };
                         o.insert("spendingtx".into(), copy_hex(h)?);

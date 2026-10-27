@@ -1,7 +1,8 @@
 //! The test-only `stripopreturns` RPC against a real node: it strips, the
 //! strip survives a restart, a kill between the record and the punch leaves
 //! a consistent block that the next call finishes, and a corrupt stored copy
-//! is refused.
+//! is refused. Then the RPC surfaces that read a stripped block: each answers
+//! from the record, or refuses when it needs the stripped bytes.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -315,6 +316,193 @@ fn a_strip_under_blocksxor_reads_through_its_record() {
     assert_raw_block_unavailable(&node, &hash);
     let out = strip(&node, &hash).expect("a repeat verifies the record");
     assert_eq!(out["outcome"], "redone", "{out}");
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+}
+
+/// A block holding a stripped transaction and an intact one, both spending a
+/// coinbase, buried ten deep. Returns the block hash and the two
+/// transactions' `(txid, raw hex)`.
+struct MixedBlock {
+    hash: String,
+    stripped: (String, String),
+    intact: (String, String),
+}
+
+fn block_with_a_stripped_and_an_intact_tx(node: &TestNode) -> MixedBlock {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::script::{Builder, PushBytesBuf};
+
+    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
+    let addr = wallet.address.to_string();
+    mine(node, 102, &addr);
+    let data = Builder::new()
+        .push_opcode(OP_RETURN)
+        .push_slice(PushBytesBuf::try_from(vec![PAYLOAD_BYTE; PAYLOAD - 4]).unwrap())
+        .into_script();
+    let (stripped_raw, stripped) = common::build_signed_p2wpkh_spend_of_coinbases(
+        node,
+        &[(1, &wallet)],
+        &[wallet.address.script_pubkey(), data],
+        100_000,
+    );
+    let (intact_raw, intact) = common::build_signed_p2wpkh_spend_of_coinbases(
+        node,
+        &[(2, &wallet)],
+        &[wallet.address.script_pubkey()],
+        100_000,
+    );
+    node.rpc_ok(
+        "sendrawtransaction",
+        vec![serde_json::json!(stripped_raw), serde_json::json!(0.1), serde_json::json!(50)],
+    );
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(intact_raw)]);
+    let hash = mine(node, 1, &addr).remove(0);
+    let block = node.rpc_ok("getblock", vec![serde_json::json!(hash), serde_json::json!(1)]);
+    assert_eq!(block["tx"].as_array().unwrap().len(), 3, "premise: both are in the block: {block}");
+    mine(node, 10, &addr);
+    MixedBlock {
+        hash,
+        stripped: (stripped, stripped_raw),
+        intact: (intact, intact_raw),
+    }
+}
+
+/// `tx`, a verbose transaction from before the strip, as it must read after:
+/// no `hex`, the flag, and output `vout` reduced to its bare `OP_RETURN`.
+fn as_stripped(mut tx: serde_json::Value, vout: usize, script_len: usize) -> serde_json::Value {
+    tx.as_object_mut().unwrap().remove("hex");
+    tx["opreturn_stripped"] = serde_json::json!(true);
+    tx["vout"][vout]["scriptPubKey"] = serde_json::json!({
+        "asm": "OP_RETURN",
+        "hex": "6a",
+        "type": "nulldata",
+        "stripped_size": script_len,
+    });
+    tx
+}
+
+fn rpc_err(node: &TestNode, method: &str, params: Vec<serde_json::Value>) -> serde_json::Value {
+    let resp = node.rpc_call_with_params(method, params).expect("rpc transport");
+    assert!(!resp["error"].is_null(), "{method} must refuse: {resp}");
+    resp["error"].clone()
+}
+
+/// Every RPC that reads a block, on a block with a stripped and an intact
+/// transaction. Each answer is captured before the strip and compared with
+/// the answer after it: equal, or equal but for exactly what stripping
+/// changes. Each refusal is paired with the same call on the intact
+/// transaction, which must still succeed.
+#[test]
+fn rpc_surfaces_read_a_stripped_block_through_its_record() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&["--allowteststrip", "--txindex", "--txospenderindex"]);
+    let b = block_with_a_stripped_and_an_intact_tx(&node);
+    let (stripped, _) = &b.stripped;
+    let (intact, intact_raw) = &b.intact;
+    let i = |v: &serde_json::Value, txid: &str| {
+        v["tx"].as_array().unwrap().iter().position(|t| t["txid"] == txid).unwrap()
+    };
+    let getblock = |v: u32| node.rpc_ok("getblock", vec![json!(b.hash), json!(v)]);
+    let rawtx = |txid: &str, verbosity: u32, block: bool| {
+        let mut params = vec![json!(txid), json!(verbosity)];
+        if block {
+            params.push(json!(b.hash));
+        }
+        node.rpc_call_with_params("getrawtransaction", params).expect("rpc transport")
+    };
+    let proof = |txid: &str| node.rpc_ok("gettxoutproof", vec![json!([txid])]);
+    let spender = |height: u64| {
+        let coinbase = common::coinbase_txid_at(&node, height);
+        node.rpc_call_with_params(
+            "gettxspendingprevout",
+            vec![json!([{"txid": coinbase, "vout": 0}]), json!({"return_spending_tx": true})],
+        )
+        .expect("rpc transport")
+    };
+    common::poll_until(
+        || node.rpc_ok("getindexinfo", vec![])["txospenderindex"]["synced"] == json!(true),
+        test_timeout(30),
+        "txospenderindex never synced",
+    );
+
+    let before_1 = getblock(1);
+    let before_2 = getblock(2);
+    let before_3 = getblock(3);
+    let before_stats = node.rpc_ok("getblockstats", vec![json!(b.hash)]);
+    let before_tx = rawtx(stripped, 2, false)["result"].clone();
+    let before_tx_in_block = rawtx(stripped, 2, true)["result"].clone();
+    let before_intact = rawtx(intact, 2, false)["result"].clone();
+    let before_proof = proof(stripped);
+    let before_spender = spender(2)["result"].clone();
+    let vout = before_tx["vout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|o| o["scriptPubKey"]["type"] == "nulldata")
+        .unwrap();
+
+    let out = strip(&node, &b.hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    assert!(!payload_on_disk(&node), "premise: the payload is gone");
+
+    // getblock 0: the raw block is never served; the next block's still is.
+    let err = rpc_err(&node, "getblock", vec![json!(b.hash), json!(0)]);
+    assert_eq!(err["code"], -1, "{err}");
+    assert_eq!(err["message"], "Block not available (pruned data)");
+    let next = before_1["nextblockhash"].clone();
+    assert!(node.rpc_ok("getblock", vec![next, json!(0)]).is_string());
+
+    // getblock 1: the same, txids and sizes included, plus the summary.
+    let mut expected = before_1.clone();
+    expected["opreturn_stripped"] = json!({"transactions": 1, "outputs": 1, "bytes": PAYLOAD - 1});
+    assert_eq!(getblock(1), expected);
+
+    // getblock 2 and 3: the stripped tx changes as `as_stripped` says, the
+    // coinbase and the intact tx not at all. Fees and prevouts come from
+    // undo data, so they are unchanged.
+    for (v, before) in [(2, &before_2), (3, &before_3)] {
+        let mut expected = before.clone();
+        let at = i(before, stripped);
+        expected["tx"][at] = as_stripped(before["tx"][at].clone(), vout, PAYLOAD);
+        expected["opreturn_stripped"] = json!({"transactions": 1, "outputs": 1, "bytes": PAYLOAD - 1});
+        assert_eq!(getblock(v), expected, "getblock {v}");
+    }
+
+    // getrawtransaction: hex is refused for the stripped tx, through the
+    // txindex and with a block hash; the intact tx's is served.
+    for block in [false, true] {
+        let resp = rawtx(stripped, 0, block);
+        assert_eq!(resp["error"]["code"], -1, "{resp}");
+        assert_eq!(resp["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+        assert_eq!(rawtx(intact, 0, block)["result"], json!(intact_raw));
+    }
+    // Verbose reads like getblock 2's entry, through either path.
+    assert_eq!(rawtx(stripped, 2, false)["result"], as_stripped(before_tx, vout, PAYLOAD));
+    assert_eq!(rawtx(stripped, 2, true)["result"], as_stripped(before_tx_in_block, vout, PAYLOAD));
+    assert_eq!(rawtx(intact, 2, false)["result"], before_intact);
+
+    // gettxoutproof needs only the txids: the same proof, and it verifies.
+    assert_eq!(proof(stripped), before_proof);
+    assert_eq!(node.rpc_ok("verifytxoutproof", vec![before_proof]), json!([stripped]));
+    let intact_proof = proof(intact);
+    assert_eq!(node.rpc_ok("verifytxoutproof", vec![intact_proof]), json!([intact]));
+
+    // getblockstats: identical.
+    assert_eq!(node.rpc_ok("getblockstats", vec![json!(b.hash)]), before_stats);
+
+    // verifychain reads the stripped block and finds it sound.
+    assert_eq!(node.rpc_ok("verifychain", vec![json!(4), json!(20)]), json!(true));
+
+    // gettxspendingprevout: the stripped spender's bytes are refused; the
+    // intact one's are served as before.
+    let resp = spender(1);
+    assert_eq!(resp["error"]["code"], -1, "{resp}");
+    assert_eq!(resp["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+    assert_eq!(spender(2)["result"], before_spender);
+
+    // Nothing above was reported as corruption or an index mismatch.
     assert!(!has_corrupt_warning(&node));
     node.stop();
 }
