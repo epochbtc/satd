@@ -990,6 +990,9 @@ pub struct Config {
     /// Core's `-fastprune`: a 64 KiB block-file size, so pruning a short
     /// test chain actually deletes something.
     pub fastprune: bool,
+    /// satd's hidden `-allowteststrip`: register the test-only
+    /// `stripopreturns` RPC. Regtest only; refused on any other chain.
+    pub allow_test_strip: bool,
     pub check_block_index: bool,
     /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
     /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
@@ -4296,6 +4299,8 @@ impl Config {
                 .fastprune
                 .or_else(|| file_get("fastprune").and_then(|v| parse_bool(&v)))
                 .unwrap_or(false),
+            // Command line only: a test tool has no business in a config file.
+            allow_test_strip: cli.allowteststrip.unwrap_or(false),
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -6131,6 +6136,18 @@ pub struct CliArgs {
         help = "Roll block files every 64 KiB instead of 128 MiB, so a prune on a short chain has whole files to delete (testing)"
     )]
     pub fastprune: Option<bool>,
+
+    /// Test-only: register the hidden `stripopreturns` RPC on regtest.
+    /// Never documented.
+    #[arg(
+        long = "allowteststrip",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        hide = true
+    )]
+    pub allowteststrip: Option<bool>,
 
     #[arg(
         long = "checkblockindex",
@@ -12210,6 +12227,7 @@ testactivationheight=bip34@2
             blocksxor: None,
             checkblockindex: None,
             fastprune: None,
+            allowteststrip: None,
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
@@ -12531,6 +12549,7 @@ testactivationheight=bip34@2
             blocksxor: None,
             checkblockindex: None,
             fastprune: None,
+            allowteststrip: None,
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,

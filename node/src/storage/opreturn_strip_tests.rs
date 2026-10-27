@@ -470,3 +470,50 @@ fn a_record_that_does_not_fit_the_bytes_is_refused() {
         StoredBlockError::WrongHash { .. }
     ));
 }
+
+/// `fixture` with a BIP141 commitment in its coinbase, over a zero nonce.
+fn committed(mut b: Block) -> Block {
+    b.txdata[0].input[0].witness = Witness::from_slice(&[[0u8; 32]]);
+    let root = b.witness_root().unwrap();
+    let commitment = Block::compute_witness_commitment(&root, &[0u8; 32]);
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(commitment.as_byte_array());
+    b.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    });
+    b.header.merkle_root = b.compute_merkle_root().unwrap();
+    b
+}
+
+/// The wtxids a stripped block reports, recorded or computed, must agree
+/// with the coinbase's commitment once the block has witness data; a block
+/// with none passes without one.
+#[test]
+fn the_witness_commitment_check_covers_recorded_wtxids() {
+    let witness_free = block(vec![
+        coinbase(vec![]),
+        tx(1, false, vec![op_return(500)], 1),
+    ]);
+    assert!(StoredBlock::intact(witness_free).verify_witness_commitment());
+
+    let (uncommitted, _) = stripped_fixture();
+    assert!(
+        !StoredBlock::intact(uncommitted.clone()).verify_witness_commitment(),
+        "witness data with no commitment"
+    );
+
+    let b = committed(uncommitted);
+    assert!(StoredBlock::intact(b.clone()).verify_witness_commitment());
+    let bytes = serialize(&b);
+    let (record, filled) = StripRecord::build(&bytes, &b, 300).unwrap().unwrap();
+    assert!(record.txs[0].wtxid.is_some(), "premise: the witness tx is stripped");
+    let stored = StoredBlock::from_bytes(filled.clone(), Some(record.clone()), &b.block_hash()).unwrap();
+    assert!(stored.verify_witness_commitment());
+
+    let mut wrong = record;
+    wrong.txs[0].wtxid = Some(Wtxid::from_byte_array([7; 32]));
+    let stored = StoredBlock::from_bytes(filled, Some(wrong), &b.block_hash()).unwrap();
+    assert!(stored.verify_merkle(), "the merkle root does not cover wtxids");
+    assert!(!stored.verify_witness_commitment());
+}

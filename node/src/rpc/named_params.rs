@@ -214,6 +214,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getzmqnotifications" => &[],
         "help" => &[("command", false)],
         "invalidateblock" => &[("blockhash", false)],
+        "stripopreturns" => &[("blockhash", false), ("threshold", false)],
         "joinpsbts" => &[("txs", false)],
         "listbanned" => &[],
         // SATD_ONLY: listnapaggregate
@@ -375,7 +376,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "pruneblockchain",
     "reconsiderblock", "removenapattestation", "replaynapsnapshot", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
-    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
+    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "stripopreturns", "submitblock", "submitheader",
     "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
     "testmempoolaccept", "unsubscribemempool", "uptime",
     "utxoupdatepsbt", "validateaddress", "verifybip322", "verifychain", "verifymessage", "verifytxoutproof",

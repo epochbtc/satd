@@ -19,6 +19,10 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+#[path = "state_strip.rs"]
+mod strip;
+pub use strip::{FAILPOINT_ENV, StripError, StripOutcome, StripStats};
+
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
 /// moves it on a mockable chain; off regtest that is always the system clock.
@@ -634,6 +638,12 @@ pub struct ChainState {
     /// [`Self::set_startup_stop`]. Unset in tests that do not need it, and
     /// then never requested.
     startup_stop: std::sync::OnceLock<crate::shutdown::StartupStop>,
+    /// Whether the chainstate is in `BulkLoad` write mode, mirrored from
+    /// [`Self::set_write_mode`]: IBD and the startup replays. Stripping
+    /// waits for it to end.
+    bulk_load: std::sync::atomic::AtomicBool,
+    /// OP_RETURN stripping ([`Self::strip_block`]).
+    strip: strip::StripState,
 }
 
 /// RAII clear for [`ChainState::snapshot_load_active`]. The flag must drop
@@ -966,6 +976,8 @@ impl ChainState {
                     pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
                     startup_stop: std::sync::OnceLock::new(),
+                    bulk_load: std::sync::atomic::AtomicBool::new(false),
+                    strip: Default::default(),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -1102,6 +1114,8 @@ impl ChainState {
             pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
             startup_stop: std::sync::OnceLock::new(),
+            bulk_load: std::sync::atomic::AtomicBool::new(false),
+            strip: Default::default(),
         })
     }
 
@@ -3879,6 +3893,10 @@ impl ChainState {
             );
         }
         self.store.set_write_mode(mode);
+        self.bulk_load.store(
+            mode == crate::storage::WriteMode::BulkLoad,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Force all cached writes to durable storage. Intended to be called

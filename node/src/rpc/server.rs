@@ -200,6 +200,9 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("addpeeraddress", "hidden"),
     ("getrawaddrman", "hidden"),
     ("getorphantxs", "hidden"),
+    // satd's test-only strip tool; registered only with `-allowteststrip`
+    // on regtest.
+    ("stripopreturns", "hidden"),
 ];
 
 /// Core's `GetNetworkNames()`: every network `getaddrmaninfo` reports and
@@ -967,6 +970,9 @@ pub async fn start(
         nap_aggregator,
     });
 
+    // `stripopreturns` exists only on a regtest node started with
+    // `-allowteststrip`; see its registration below.
+    let test_strip = ctx.chain_state.test_strip_allowed();
     let mut module = RpcModule::new(ctx);
 
     // --- Blockchain RPCs ---
@@ -3233,6 +3239,55 @@ pub async fn start(
     // Regtest-gated exactly as Core gates it: on any other chain a caller with
     // RPC access could otherwise force the node to open arbitrary outbound
     // connections of arbitrary type.
+    // `stripopreturns <blockhash> <threshold>`: strip one block's OP_RETURN
+    // payloads at or above `threshold` bytes, now, whatever its depth. A test
+    // tool, so the consumers of stripped blocks can be tested before the
+    // strip worker exists. Registered only on regtest with the hidden
+    // `-allowteststrip`, so on any other node it is method-not-found, and
+    // never advertised by `help`.
+    if test_strip {
+        module.register_async_method("stripopreturns", |params, ctx, _extensions| async move {
+            let mut args = Args::new(&params);
+            let hash: String = args.required("blockhash")?;
+            let threshold: u64 = args.required("threshold")?;
+            args.check()?;
+            let hash = hash.parse::<bitcoin::BlockHash>().map_err(|e| {
+                ErrorObjectOwned::owned(-8, format!("blockhash must be a block hash: {e}"), None::<()>)
+            })?;
+            let chain_state = ctx.chain_state.clone();
+            let outcome = tokio::task::spawn_blocking(move || chain_state.strip_block(&hash, threshold))
+                .await
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(-32603, format!("strip task join error: {e}"), None::<()>)
+                })?;
+            use crate::chain::state::{StripError, StripOutcome};
+            let (name, stats) = match outcome {
+                Ok(StripOutcome::NothingEligible) => ("nothing_eligible", Default::default()),
+                Ok(StripOutcome::Stripped(s)) => ("stripped", s),
+                Ok(StripOutcome::Redone(s)) => ("redone", s),
+                Ok(StripOutcome::Extended(s)) => ("extended", s),
+                Ok(StripOutcome::Raced) => ("raced", Default::default()),
+                Err(e) => {
+                    let code = match e {
+                        StripError::UnknownBlock(_) => -5,
+                        StripError::NotQuiet(_) => -10,
+                        StripError::NotActive(_) | StripError::NotValid { .. } => -8,
+                        _ => -1,
+                    };
+                    return Err(ErrorObjectOwned::owned(code, e.to_string(), None::<()>));
+                }
+            };
+            let stats: crate::chain::state::StripStats = stats;
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                "outcome": name,
+                "txs": stats.txs,
+                "outputs": stats.outputs,
+                "span_bytes": stats.span_bytes,
+                "freed_bytes": stats.freed_bytes,
+            }))
+        })?;
+    }
+
     module.register_async_method("addconnection", |params, ctx, _extensions| async move {
         if ctx.chain_state.network != bitcoin::Network::Regtest {
             // Core throws a bare `std::runtime_error` here, which its
@@ -5517,7 +5572,7 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_seven() {
+    fn the_hidden_commands_are_the_expected_eight() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
@@ -5533,6 +5588,7 @@ mod help_listing_tests {
                 "addpeeraddress",
                 "getrawaddrman",
                 "getorphantxs",
+                "stripopreturns",
             ]
         );
     }

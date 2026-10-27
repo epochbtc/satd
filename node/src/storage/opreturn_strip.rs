@@ -537,6 +537,19 @@ pub enum FillError {
 /// Every named output is checked before any byte is written, so on an error
 /// `buf` is unchanged.
 pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Result<(), FillError> {
+    for range in strip_ranges(buf, record, spans)? {
+        buf[range].fill(0);
+    }
+    Ok(())
+}
+
+/// The byte ranges of `buf` (the block bytes `spans` was parsed from) that
+/// `record` strips, in record order, after the checks [`fill_spans`] makes.
+pub fn strip_ranges(
+    buf: &[u8],
+    record: &StripRecord,
+    spans: &[TxSpans],
+) -> Result<Vec<std::ops::Range<usize>>, FillError> {
     let mut ranges = Vec::new();
     for tx in &record.txs {
         let tx_spans = spans
@@ -567,10 +580,7 @@ pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Re
             ranges.push(span.strip_range());
         }
     }
-    for range in ranges {
-        buf[range].fill(0);
-    }
-    Ok(())
+    Ok(ranges)
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +703,54 @@ impl StoredBlock {
         let hashes = self.txids().into_iter().map(|t| t.to_raw_hash());
         bitcoin::merkle_tree::calculate_root(hashes)
             .is_some_and(|root| root == self.block.header.merkle_root.to_raw_hash())
+    }
+
+    /// Whether the wtxids agree with the coinbase's BIP141 commitment.
+    ///
+    /// The merkle root covers txids only, so this is what vouches for the
+    /// witness bytes. A block with witness data must recompute its
+    /// commitment from the wtxids (the coinbase's counted as zero) and its
+    /// coinbase witness nonce, as `check_witness_rules` requires. A block
+    /// with none passes either way: every wtxid then equals its txid, and a
+    /// commitment-shaped output from before segwit says nothing.
+    pub fn verify_witness_commitment(&self) -> bool {
+        let wtxids = self.wtxids();
+        let Some(coinbase) = self.block.txdata.first() else {
+            return false;
+        };
+        let witness_free = coinbase.input.iter().all(|i| i.witness.is_empty())
+            && (1..wtxids.len()).all(|i| wtxids[i].to_raw_hash() == self.txid(i).to_raw_hash());
+        witness_free || self.commitment_matches(&wtxids)
+    }
+
+    fn commitment_matches(&self, wtxids: &[Wtxid]) -> bool {
+        const HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        let coinbase = &self.block.txdata[0];
+        let Some(expected) = coinbase.output.iter().rev().find_map(|o| {
+            let s = o.script_pubkey.as_bytes();
+            (s.len() >= 38 && s[..6] == HEADER).then(|| <[u8; 32]>::try_from(&s[6..38]).unwrap())
+        }) else {
+            return false;
+        };
+        let Some(nonce) = coinbase
+            .input
+            .first()
+            .map(|i| &i.witness)
+            .filter(|w| w.len() == 1)
+            .and_then(|w| w.nth(0))
+            .and_then(|item| <[u8; 32]>::try_from(item).ok())
+        else {
+            return false;
+        };
+        let hashes = std::iter::once(bitcoin::hashes::sha256d::Hash::all_zeros())
+            .chain(wtxids.iter().skip(1).map(|w| w.to_raw_hash()));
+        let Some(root) = bitcoin::merkle_tree::calculate_root(hashes) else {
+            return false;
+        };
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(root.as_byte_array());
+        preimage[32..].copy_from_slice(&nonce);
+        bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array() == expected
     }
 }
 
