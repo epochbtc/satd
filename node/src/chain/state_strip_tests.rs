@@ -377,37 +377,49 @@ fn only_a_valid_block_on_the_active_chain_is_stripped() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A repair that points the entry at a fresh copy between the record and
-/// the punch leaves the fresh copy intact and drops the record, which
-/// describes the old copy. Nothing is punched.
+/// A repair that points the entry at a fresh copy between the plan and the
+/// punch drops the record in its own batch. The strip's record lands after
+/// it and describes the old copy, so it is removed again, and nothing is
+/// punched. The repair needs a record to act (it leaves a readable intact
+/// block alone), so this is an extension of a block stripped once.
 #[test]
 fn a_repoint_before_the_punch_leaves_no_record() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
     let b = blocks[101].clone();
     let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
     let old = cs.store.get_block_index(&hash).unwrap();
-    let original = on_disk(&cs, &hash);
-    *cs.strip.after_record_hook.lock() = Some(Box::new(move |cs: &ChainState| {
-        assert!(record(cs, &b.block_hash()).is_some(), "the hook runs after the record");
+    let before = on_disk(&cs, &hash);
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
         // `get_block` sees the record and answers None, so the repair
         // appends a full copy.
         assert!(matches!(
             cs.repair_block_data(&b).unwrap(),
             crate::chain::state::BlockDataRepair::Repaired { .. }
         ));
+        assert!(record(cs, &b.block_hash()).is_none(), "the repair dropped the record");
     }));
 
-    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
     let now = cs.store.get_block_index(&hash).unwrap();
     assert_ne!((now.file_number, now.data_pos), (old.file_number, old.data_pos), "premise: moved");
     assert_eq!(record(&cs, &hash), None);
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
-    assert_eq!(on_disk(&cs, &hash), original);
+    // Neither copy was punched by the extension.
+    let at_old = {
+        let path = cs.blocks_dir().join(format!("blk{:05}.dat", old.file_number));
+        let mut data = vec![0u8; before.len()];
+        std::fs::File::open(path).unwrap().read_exact_at(&mut data, u64::from(old.data_pos) + 8).unwrap();
+        let key = cs.flat_files.lock().xor_key();
+        crate::storage::flatfile::xor_in_place(&mut data, &key, u64::from(old.data_pos) + 8);
+        data
+    };
+    assert_eq!(at_old, before);
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A block whose entry changes in place between the record and the punch
+/// A block whose entry changes in place between the plan and the punch
 /// keeps the record it had before the call: nothing new is punched, and
 /// what an earlier strip punched still has its record.
 ///
@@ -425,7 +437,7 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     };
 
     // No prior record: none is left.
-    *cs.strip.after_record_hook.lock() = Some(Box::new(invalidate));
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
     assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
     assert_eq!(record(&cs, &hash), None);
     assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
@@ -438,7 +450,7 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     assert_eq!(blocks[101].block_hash(), hash);
     assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
     let prior = record(&cs, &hash);
-    *cs.strip.after_record_hook.lock() = Some(Box::new(invalidate));
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
     assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
     assert_eq!(record(&cs, &hash), prior);
     assert_eq!(payload_on_disk(&cs, &hash, 2, 1), op_return(SMALL, 3).as_bytes()[1..], "not punched");
@@ -500,7 +512,7 @@ fn an_entry_pointing_at_another_block_is_refused() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A prune between the record and the punch drops the record in its own
+/// A prune between the plan and the punch drops the record in its own
 /// batch. The entry did not move, but its data is gone, so the record it
 /// had before the call is not put back.
 #[test]
@@ -510,7 +522,7 @@ fn a_prune_before_the_punch_leaves_no_record() {
     let hash = blocks[101].block_hash();
     cs.strip_block(&hash, THRESHOLD).unwrap();
     assert!(record(&cs, &hash).is_some());
-    *cs.strip.after_record_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
         // What `prune_up_to` writes for the block.
         let mut entry = cs.store.get_block_index(&hash).unwrap();
         entry.status = BlockStatus::Pruned;

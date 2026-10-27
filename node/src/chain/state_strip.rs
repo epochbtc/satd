@@ -112,9 +112,10 @@ pub(crate) struct StripState {
     /// `-allowteststrip` on a regtest node: the `stripopreturns` RPC is
     /// registered.
     test_rpc: std::sync::atomic::AtomicBool,
-    /// Runs once the record is durable and before the punch locks.
+    /// Runs between the plan and the record write, where anything that
+    /// moves the block lands before the punch re-checks it.
     #[cfg(test)]
-    pub(crate) after_record_hook: Mutex<Option<Box<dyn FnOnce(&ChainState) + Send>>>,
+    pub(crate) after_plan_hook: Mutex<Option<Box<dyn FnOnce(&ChainState) + Send>>>,
 }
 
 /// The plan for punching one block.
@@ -164,6 +165,10 @@ impl ChainState {
         let Some(plan) = self.plan_strip(hash, threshold)? else {
             return Ok(StripOutcome::NothingEligible);
         };
+        #[cfg(test)]
+        if let Some(hook) = self.strip.after_plan_hook.lock().take() {
+            hook(self);
+        }
         if let Some(record) = &plan.commit {
             self.store.write_batch(StoreBatch {
                 opreturn_strip_puts: vec![(*hash, record.encode())],
@@ -174,10 +179,6 @@ impl ChainState {
             self.flush_durable()?;
         }
         self.strip_failpoint();
-        #[cfg(test)]
-        if let Some(hook) = self.strip.after_record_hook.lock().take() {
-            hook(self);
-        }
 
         let pos = FlatFilePos {
             file_number: plan.entry.file_number,

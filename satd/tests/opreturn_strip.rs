@@ -152,17 +152,33 @@ fn stripopreturns_needs_allowteststrip() {
 #[test]
 fn allowteststrip_is_refused_off_regtest() {
     let datadir = fresh_test_datadir("satd-allowteststrip-signet");
-    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+    let stderr = datadir.join("stderr.log");
+    let _ = std::fs::create_dir_all(&datadir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
         .arg("--signet")
         .arg(format!("--datadir={}", datadir.display()))
         .arg(format!("--rpcport={}", find_available_port()))
         .arg(format!("--port={}", find_available_port()))
         .arg("--connect=0")
         .arg("--allowteststrip")
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
         .expect("run satd");
-    let text = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{text}");
+    let deadline = Instant::now() + test_timeout(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let text = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert_eq!(status.and_then(|s| s.code()), Some(1), "refused at startup: {text}");
     assert!(text.contains("-allowteststrip"), "{text}");
     let _ = std::fs::remove_dir_all(&datadir);
 }
