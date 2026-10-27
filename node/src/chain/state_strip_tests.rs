@@ -473,3 +473,101 @@ fn the_test_rpc_is_allowed_only_on_regtest() {
     cs.allow_test_strip();
     assert!(!cs.test_strip_allowed());
 }
+
+/// An entry pointing at the wrong record is not stripped: the bytes there
+/// are another block, which passes `check_block` on its own terms, so the
+/// record would describe the wrong transactions.
+#[test]
+fn an_entry_pointing_at_another_block_is_refused() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let other = cs.store.get_block_index(&blocks[100].block_hash()).unwrap();
+    let mut entry = cs.store.get_block_index(&hash).unwrap();
+    entry.file_number = other.file_number;
+    entry.data_pos = other.data_pos;
+    cs.store
+        .write_batch(StoreBatch {
+            block_index_puts: vec![(hash, entry)],
+            ..Default::default()
+        })
+        .unwrap();
+    match cs.strip_block(&hash, 0) {
+        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("different block"), "{detail}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prune between the record and the punch drops the record in its own
+/// batch. The entry did not move, but its data is gone, so the record it
+/// had before the call is not put back.
+#[test]
+fn a_prune_before_the_punch_leaves_no_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    assert!(record(&cs, &hash).is_some());
+    *cs.strip.after_record_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        // What `prune_up_to` writes for the block.
+        let mut entry = cs.store.get_block_index(&hash).unwrap();
+        entry.status = BlockStatus::Pruned;
+        cs.store
+            .write_batch(StoreBatch {
+                block_index_puts: vec![(hash, entry)],
+                opreturn_strip_removes: vec![hash],
+                ..Default::default()
+            })
+            .unwrap();
+    }));
+    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An extension takes the new transactions' txids and wtxids from their
+/// bytes. The merkle root does not cover witnesses, but the old record's
+/// filled hash covers every byte, so a witness gone bad on disk since the
+/// first strip is refused.
+#[test]
+fn an_extension_refuses_bytes_changed_since_the_first_strip() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let mut witness_tx = spend(coinbase_of(&blocks[2]), vec![ScriptBuf::new(), op_return(SMALL, 4)]);
+    witness_tx.input[0].witness = Witness::from_slice(&[vec![0xab; 40]]);
+    let mut b = build_test_block(blocks[104].block_hash(), 106, time(106));
+    b.txdata.push(spend(coinbase_of(&blocks[3]), vec![ScriptBuf::new(), op_return(BIG, 5)]));
+    b.txdata.push(witness_tx);
+    b.txdata[0].input[0].witness = Witness::from_slice(&[[0u8; 32]]);
+    let root = b.witness_root().unwrap();
+    let commitment = Block::compute_witness_commitment(&root, &[0u8; 32]);
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(commitment.as_byte_array());
+    b.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    });
+    b.header.merkle_root = b.compute_merkle_root().unwrap();
+    grind_test_pow(&mut b);
+    connect(&cs, &b);
+    let hash = b.block_hash();
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+
+    // A witness byte of tx 2, which the extension would record.
+    let bytes = on_disk(&cs, &hash);
+    let spans = tx_spans(&bytes).unwrap();
+    let tx2 = &spans[2];
+    let at = (tx2.offset..tx2.offset + tx2.len)
+        .rev()
+        .find(|i| bytes[*i] == 0xab)
+        .expect("the witness item");
+    write_on_disk(&cs, &hash, at, &[0xac]);
+    match cs.strip_block(&hash, SMALL as u64) {
+        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("recorded hash"), "{detail}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(record(&cs, &hash).unwrap().txs.len(), 1, "the record is unchanged");
+    let _ = std::fs::remove_dir_all(dir);
+}

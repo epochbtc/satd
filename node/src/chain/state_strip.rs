@@ -360,14 +360,13 @@ impl ChainState {
                 opreturn_strip::fill_spans(&mut filled, &extended, &spans)
                     .map_err(|e| corrupt(format!("extended strip record does not fit: {e}")))?;
                 extended.filled_sha256 = sha256::Hash::hash(&filled).to_byte_array();
-                // The newly recorded txids and wtxids come from the bytes, so
-                // check them against the header and the coinbase commitment
-                // before they become the only copy.
-                let check = StoredBlock::from_bytes(bytes.clone(), Some(extended.clone()), hash)
+                // The newly recorded txids and wtxids come from bytes the old
+                // record's filled hash pins, and that hash was taken from a
+                // copy that passed `check_block` (witness commitment
+                // included): the read above has already checked every byte.
+                // What is left to check is the new record itself.
+                StoredBlock::from_bytes(bytes.clone(), Some(extended.clone()), hash)
                     .map_err(|e| corrupt(format!("extended strip record does not verify: {e}")))?;
-                if !check.verify_witness_commitment() {
-                    return Err(corrupt("the wtxids miss the coinbase witness commitment".into()));
-                }
                 let new_only = only_new(&extended, &record);
                 let ranges = opreturn_strip::strip_ranges(&bytes, &new_only, &spans)
                     .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
