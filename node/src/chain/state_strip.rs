@@ -129,7 +129,7 @@ enum Planned {
     Nothing,
     /// The block moved or went away while it was being read.
     Raced,
-    Strip(Plan),
+    Strip(Box<Plan>),
 }
 
 /// The plan for punching one block.
@@ -179,7 +179,7 @@ impl ChainState {
         let plan = match self.plan_strip(hash, threshold)? {
             Planned::Nothing => return Ok(StripOutcome::NothingEligible),
             Planned::Raced => return Ok(StripOutcome::Raced),
-            Planned::Strip(plan) => plan,
+            Planned::Strip(plan) => *plan,
         };
         #[cfg(test)]
         if let Some(hook) = self.strip.after_plan_hook.lock().take() {
@@ -377,14 +377,14 @@ impl ChainState {
                 };
                 let ranges = opreturn_strip::strip_ranges(&bytes, &record, &spans)
                     .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                Ok(Planned::Strip(Plan {
+                Ok(Planned::Strip(Box::new(Plan {
                     entry,
                     txs: record.txs.len() as u64,
                     commit: Some(record),
                     prior,
                     ranges,
                     kind: StripOutcome::Stripped,
-                }))
+                })))
             }
             Some(prior_bytes) => {
                 let record = StripRecord::decode(prior_bytes)
@@ -395,14 +395,14 @@ impl ChainState {
                 if extended == record {
                     let ranges = opreturn_strip::strip_ranges(&bytes, &record, &spans)
                         .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                    return Ok(Planned::Strip(Plan {
+                    return Ok(Planned::Strip(Box::new(Plan {
                         entry,
                         txs: record.txs.len() as u64,
                         commit: None,
                         prior,
                         ranges,
                         kind: StripOutcome::Redone,
-                    }));
+                    })));
                 }
                 let mut extended = extended;
                 let mut filled = bytes.clone();
@@ -419,14 +419,14 @@ impl ChainState {
                 let new_only = only_new(&extended, &record);
                 let ranges = opreturn_strip::strip_ranges(&bytes, &new_only, &spans)
                     .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                Ok(Planned::Strip(Plan {
+                Ok(Planned::Strip(Box::new(Plan {
                     entry,
                     txs: new_only.txs.len() as u64,
                     commit: Some(extended),
                     prior,
                     ranges,
                     kind: StripOutcome::Extended,
-                }))
+                })))
             }
         }
     }
