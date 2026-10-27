@@ -678,3 +678,21 @@ fn compute_tap_tweak(internal_key: &[u8; 32], merkle_root: &[u8; 32]) -> [u8; 32
     engine.input(merkle_root);
     sha256::Hash::from_engine(engine).to_byte_array()
 }
+
+/// OP_2SWAP swaps the top two pairs and leaves everything below them alone.
+/// Core's vectors run it on a stack of exactly four items, where the indices
+/// it touches start at 0; one item below shows they are counted from the top.
+#[test]
+fn test_2swap_leaves_items_below_the_top_four() {
+    let checker = NoopChecker;
+    for depth in 0..3u8 {
+        let below: Vec<Vec<u8>> = (0..depth).map(|i| vec![0x10 + i]).collect();
+        let mut stack = below.clone();
+        stack.extend([vec![1], vec![2], vec![3], vec![4]]);
+        let result = eval_script_simple(&mut stack, &[0x72], 0, &checker, SigVersion::Base);
+        assert_eq!(result, Ok(()));
+        let mut want = below;
+        want.extend([vec![3], vec![4], vec![1], vec![2]]);
+        assert_eq!(stack, want, "{depth} item(s) below");
+    }
+}

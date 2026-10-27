@@ -115,6 +115,29 @@ fn multisig_counts_up_to_twenty_are_core_multisig() {
 }
 
 #[test]
+fn get_op_reads_every_push_form() {
+    for (script, data) in [
+        (&[0x01, 0xaa, 0x51][..], &[0xaa][..]),
+        (&[0x4c, 0x01, 0xaa, 0x51], &[0xaa]),
+        (&[0x4d, 0x01, 0x00, 0xaa, 0x51], &[0xaa]),
+        (&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xaa, 0x51], &[0xaa]),
+    ] {
+        let next = script.len() - 1;
+        assert_eq!(get_op(script, 0), Some((script[0], data, next)), "{script:02x?}");
+        assert_eq!(get_op(script, next), Some((0x51, &[][..], script.len())), "{script:02x?}");
+        assert_eq!(get_op(&script[..next - 1], 0), None, "{script:02x?} cut short");
+    }
+}
+
+#[test]
+fn script_numbers_run_to_four_bytes() {
+    // Core's `CScriptNum` default `nMaxNumSize`.
+    assert_eq!(script_number(0x04, &[0xff, 0xff, 0xff, 0x7f], 0, i64::MAX), Some(0x7fff_ffff));
+    assert_eq!(script_number(0x04, &[0xff, 0xff, 0xff, 0xff], i64::MIN, 0), Some(-0x7fff_ffff));
+    assert_eq!(script_number(0x05, &[0xff, 0xff, 0xff, 0xff, 0x00], 0, i64::MAX), None);
+}
+
+#[test]
 fn an_unknown_spent_script_is_nonstandard() {
     let t = tx(vec![(ScriptBuf::new(), Witness::new()), (ScriptBuf::new(), Witness::new())]);
     // OP_TRUE, and a multisig whose "key" has no valid prefix.

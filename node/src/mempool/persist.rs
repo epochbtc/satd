@@ -561,6 +561,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Only a missing file reads as an empty mempool. Any other failure to
+    /// reach it is the caller's to report: one under a datadir that is not a
+    /// directory, where looking it up fails, and one that is a directory,
+    /// where reading it does.
+    #[test]
+    fn load_reports_errors_other_than_a_missing_file() {
+        let dir = temp_datadir("unreadable");
+        let cs = empty_chainstate(&dir);
+        let mp = Mempool::new(300_000_000, 1000);
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        assert!(load_mempool(&mp, &cs, &NoopVerifier, &not_a_dir).is_err());
+        std::fs::create_dir(dir.join(FILE_NAME)).unwrap();
+        assert!(load_mempool(&mp, &cs, &NoopVerifier, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn empty_dump_round_trips() {
         let dir = temp_datadir("empty");

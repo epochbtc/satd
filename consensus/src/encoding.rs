@@ -349,4 +349,23 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(result, vec![0x51]);
     }
+
+    #[test]
+    fn test_find_and_delete_skips_push_data() {
+        // Each push form carries three bytes of the pattern as data, then the
+        // pattern follows as an opcode. Only that last one is deleted.
+        let pushes: [&[u8]; 4] = [
+            &[0x03],
+            &[0x4c, 0x03],
+            &[0x4d, 0x03, 0x00],
+            &[0x4e, 0x03, 0x00, 0x00, 0x00],
+        ];
+        for push in pushes {
+            let mut script = push.to_vec();
+            script.extend([0x61; 4]);
+            let (result, count) = find_and_delete_exact(&script, &[0x61]);
+            assert_eq!(count, 1, "push {push:02x?}");
+            assert_eq!(result, script[..script.len() - 1], "push {push:02x?}");
+        }
+    }
 }
