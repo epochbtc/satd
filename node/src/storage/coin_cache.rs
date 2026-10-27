@@ -567,6 +567,10 @@ impl CoinCache {
             // co-occurring block-index/tip write can't silently drop them.
             || !batch.sp_tweak_puts.is_empty()
             || !batch.sp_tweak_removes.is_empty()
+            // Strip records ride a connect batch only as removes (a fresh
+            // copy of a block superseding its record), which no other term
+            // here would keep.
+            || batch.has_opreturn_strip_ops()
             || has_filter_rows;
 
         if has_data {
@@ -1173,6 +1177,9 @@ impl CoinCache {
             || !batch.sp_tweak_puts.is_empty()
             || !batch.sp_tweak_removes.is_empty()
             || batch.sp_backfill_cursor_advance.is_some()
+            || !batch.opreturn_strip_puts.is_empty()
+            || !batch.opreturn_strip_removes.is_empty()
+            || batch.opreturn_strip_meta.is_some()
             || has_filter
             || {
                 #[cfg(feature = "block-filter-index")]
@@ -1250,6 +1257,9 @@ impl CoinCache {
                     sp_tweak_puts: batch.sp_tweak_puts,
                     sp_tweak_removes: batch.sp_tweak_removes,
                     sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
+                    opreturn_strip_puts: batch.opreturn_strip_puts,
+                    opreturn_strip_removes: batch.opreturn_strip_removes,
+                    opreturn_strip_meta: batch.opreturn_strip_meta,
                 };
                 // A pass-through write is *newer* than anything still buffered
                 // for the same hash, and it lands in the inner store directly.
@@ -1274,6 +1284,28 @@ impl CoinCache {
                     pending
                         .block_index_puts
                         .retain(|(h, _)| !superseded.contains(h));
+                }
+                // The same for strip records. A buffered remove left behind
+                // a newer pass-through put would shadow the record in reads
+                // and delete it at the next flush, and the punched bytes
+                // would then read as an intact block.
+                if pass_through.has_opreturn_strip_ops() {
+                    let superseded: std::collections::HashSet<BlockHash> = pass_through
+                        .opreturn_strip_puts
+                        .iter()
+                        .map(|(h, _)| *h)
+                        .chain(pass_through.opreturn_strip_removes.iter().copied())
+                        .collect();
+                    let mut pending = self.pending_batch.lock();
+                    pending
+                        .opreturn_strip_puts
+                        .retain(|(h, _)| !superseded.contains(h));
+                    pending
+                        .opreturn_strip_removes
+                        .retain(|h| !superseded.contains(h));
+                    if pass_through.opreturn_strip_meta.is_some() {
+                        pending.opreturn_strip_meta = None;
+                    }
                 }
                 self.write_pass_through(pass_through, mode)?;
             } else {
@@ -1316,6 +1348,11 @@ impl CoinCache {
                     sp_tweak_puts: batch.sp_tweak_puts,
                     sp_tweak_removes: batch.sp_tweak_removes,
                     sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
+                    // Buffered with the connect that carries them; reads
+                    // consult the pending batch (`pending_opreturn_strip`).
+                    opreturn_strip_puts: batch.opreturn_strip_puts,
+                    opreturn_strip_removes: batch.opreturn_strip_removes,
+                    opreturn_strip_meta: batch.opreturn_strip_meta,
                     ..Default::default()
                 };
                 pending.merge(keyed);
@@ -1390,6 +1427,21 @@ impl CoinCache {
         self.inner.write_batch_recoverable(pass_through, mode)
     }
 
+    /// What the pending batch says about a block's strip record: `Some`
+    /// when it puts or removes one (`Some(None)` for a remove), `None`
+    /// when the flushed rows stand. `merge` keeps puts and removes
+    /// disjoint by hash, so at most one of them names the block.
+    fn pending_opreturn_strip(&self, hash: &BlockHash) -> Option<Option<Vec<u8>>> {
+        let pending = self.pending_batch.lock();
+        if let Some((_, record)) = pending.opreturn_strip_puts.iter().rev().find(|(h, _)| h == hash) {
+            Some(Some(record.clone()))
+        } else if pending.opreturn_strip_removes.contains(hash) {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
     fn pending_tx_loc(&self, txid: &Txid) -> PendingTxLoc {
         let pending = self.pending_batch.lock();
         if let Some((_, seq)) = pending.tx_loc_puts.iter().find(|(t, _)| t == txid) {
@@ -1412,6 +1464,20 @@ impl CoinCache {
 }
 
 impl Store for CoinCache {
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.pending_opreturn_strip(hash) {
+            Some(pending) => Ok(pending),
+            None => self.inner.get_opreturn_strip(hash),
+        }
+    }
+
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        if let Some(meta) = self.pending_batch.lock().opreturn_strip_meta.clone() {
+            return Ok(Some(meta));
+        }
+        self.inner.opreturn_strip_meta()
+    }
+
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         // Snapshot the invalidation generation BEFORE the dirty check: if
         // a batch pops this outpoint from `clean` after this load, the
@@ -5429,6 +5495,12 @@ mod tests {
         ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
             self.write_gate.pause();
             self.inner.write_batch_recoverable(batch, mode)
+        }
+        fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.get_opreturn_strip(hash)
+        }
+        fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.opreturn_strip_meta()
         }
         fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
             self.inner.get_undo(hash)

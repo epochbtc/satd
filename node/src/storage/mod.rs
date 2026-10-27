@@ -13,6 +13,9 @@ pub mod rocksdb_store;
 pub mod split_store;
 #[cfg(test)]
 pub(crate) mod test_store;
+#[cfg(test)]
+#[path = "opreturn_strip_store_tests.rs"]
+mod opreturn_strip_store_tests;
 pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
@@ -222,6 +225,17 @@ pub struct StoreBatch {
     /// a cargo feature), so this field is never `cfg`-gated. Mirrors
     /// `filter_backfill_cursor_advance` for the filter family.
     pub sp_backfill_cursor_advance: Option<SpBackfillCursorWrite>,
+    /// OP_RETURN strip records (`opreturn_strip` CF), keyed by block hash.
+    /// The value is a [`opreturn_strip::StripRecord`] encoding. A store
+    /// creates the column family on the first put that needs it.
+    pub opreturn_strip_puts: Vec<(BlockHash, Vec<u8>)>,
+    /// Strip records to drop: the block's data was pruned, or its index
+    /// entry now points at a fresh full copy that supersedes the record.
+    /// A no-op when the column family does not exist.
+    pub opreturn_strip_removes: Vec<BlockHash>,
+    /// The strip worker's cursor and counters (`opreturn_strip` CF, key
+    /// `meta`). `None` leaves the stored value alone.
+    pub opreturn_strip_meta: Option<Vec<u8>>,
 }
 
 /// Atomic cursor update emitted by the backfill task at each batch boundary.
@@ -512,6 +526,34 @@ impl StoreBatch {
         if other.sp_backfill_cursor_advance.is_some() {
             self.sp_backfill_cursor_advance = other.sp_backfill_cursor_advance;
         }
+
+        // Strip records: last-writer-wins by block hash. A strip followed
+        // by a fresh full copy of the same block must end with the record
+        // gone, and a re-strip after a removal must end with it present.
+        if !other.opreturn_strip_removes.is_empty() && !self.opreturn_strip_puts.is_empty() {
+            let drop: std::collections::HashSet<BlockHash> =
+                other.opreturn_strip_removes.iter().copied().collect();
+            self.opreturn_strip_puts.retain(|(h, _)| !drop.contains(h));
+        }
+        if !other.opreturn_strip_puts.is_empty() && !self.opreturn_strip_removes.is_empty() {
+            let drop: std::collections::HashSet<BlockHash> =
+                other.opreturn_strip_puts.iter().map(|(h, _)| *h).collect();
+            self.opreturn_strip_removes.retain(|h| !drop.contains(h));
+        }
+        self.opreturn_strip_puts.extend(other.opreturn_strip_puts);
+        self.opreturn_strip_removes.extend(other.opreturn_strip_removes);
+        // Incoming wins only when it carries a value: a later batch with no
+        // meta must not erase an earlier one.
+        if other.opreturn_strip_meta.is_some() {
+            self.opreturn_strip_meta = other.opreturn_strip_meta;
+        }
+    }
+
+    /// Whether the batch touches the `opreturn_strip` column family.
+    pub fn has_opreturn_strip_ops(&self) -> bool {
+        !self.opreturn_strip_puts.is_empty()
+            || !self.opreturn_strip_removes.is_empty()
+            || self.opreturn_strip_meta.is_some()
     }
 }
 
@@ -766,6 +808,13 @@ pub trait Store: Send + Sync {
     }
     /// Clear UTXO set, undo data, tx index, and tip. Keep block index intact.
     /// Used by `-reindex-chainstate`.
+    /// The OP_RETURN strip record of a block, if it has one. No default:
+    /// a layered store that forgot to forward this would report a
+    /// stripped block as intact, and its zeroed bytes as the block. A read
+    /// failure is an error, never `Ok(None)`, for the same reason.
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError>;
+    /// The strip worker's stored cursor and counters.
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError>;
     fn clear_chainstate(&self) -> Result<(), StoreError>;
     /// Clear everything: block index, UTXO set, undo data, tx index, height index, tip.
     /// Used by `-reindex`.

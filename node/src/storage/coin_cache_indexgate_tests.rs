@@ -108,6 +108,12 @@ impl Store for GatedStore {
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         self.inner.get_undo(hash)
     }
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get_opreturn_strip(hash)
+    }
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.opreturn_strip_meta()
+    }
     fn coin_count(&self) -> u64 {
         self.inner.coin_count()
     }

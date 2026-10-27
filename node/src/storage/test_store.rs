@@ -76,7 +76,15 @@ pub(crate) struct StoreControls {
     /// Milliseconds every address-history read sleeps first: what a long
     /// read of a busy scripthash looks like to the thread that makes it.
     addr_read_delay_ms: Arc<AtomicU64>,
+    /// Run once, right after the next strip-record lookup has read the
+    /// store: a strip that commits between a reader's lookup and whatever
+    /// it does next.
+    after_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
+    /// Strip-record reads fail, as a corrupt RocksDB row does.
+    strip_unreadable: Arc<AtomicBool>,
 }
+
+type StripLookupHook = Box<dyn FnOnce(&InMemoryStore) + Send>;
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
 /// that reaches this store and covers the outpoint signals `entered` and then
@@ -162,6 +170,16 @@ impl StoreControls {
 
     pub(crate) fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Run `hook` once, against the backing store, right after the next
+    /// strip-record lookup has read it.
+    pub(crate) fn after_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+        *self.after_strip_lookup.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    pub(crate) fn set_strip_unreadable(&self, yes: bool) {
+        self.strip_unreadable.store(yes, Ordering::SeqCst);
     }
 
     /// Set the chainstate L0 file count the store reports.
@@ -280,6 +298,8 @@ impl ControllableStore {
                 addr_reads: Arc::new(AtomicU64::new(0)),
                 addr_rows_served: Arc::new(AtomicU64::new(0)),
                 addr_read_delay_ms: Arc::new(AtomicU64::new(0)),
+                after_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
+                strip_unreadable: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -325,6 +345,21 @@ impl Store for ControllableStore {
 
     // ---- everything below is straight delegation ----
 
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        let read = if self.controls.strip_unreadable.load(Ordering::SeqCst) {
+            Err(StoreError::Database("injected strip-record read fault".into()))
+        } else {
+            self.inner.get_opreturn_strip(hash)
+        };
+        let hook = self.controls.after_strip_lookup.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(&self.inner);
+        }
+        read
+    }
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.opreturn_strip_meta()
+    }
     fn flush_durable(&self) -> Result<(), StoreError> {
         self.inner.flush_durable()
     }
