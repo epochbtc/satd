@@ -8969,8 +8969,9 @@ impl ChainState {
             disconnected_txs,
         })
     }
-    /// Whether `hash` has an OP_RETURN strip record. A record that cannot be
-    /// read counts as none: the read that follows fails closed on its own.
+    /// Whether `hash` has an OP_RETURN strip record, for choosing an error
+    /// message. A record that cannot be read counts as none: the read that
+    /// failed already failed closed.
     fn has_strip_record(&self, hash: &BlockHash) -> bool {
         matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
     }
@@ -9003,6 +9004,12 @@ impl ChainState {
     /// Returns [`ChainError::BlockNotFound`] for an unknown hash and
     /// [`ChainError::InvalidArgument`] when asked to invalidate genesis.
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        // The strip lock first, in its order (before `accept_lock`): a strip
+        // commits its record before it takes `accept_lock`, so without it a
+        // record could land between the stripped-block check below and the
+        // invalid marks, and the marks would stand over a rollback that then
+        // fails on that block.
+        let _strip_guard = self.strip.lock.lock();
         let _accept_guard = self.accept_lock.lock();
         self.check_no_snapshot_load()?;
 
@@ -9044,7 +9051,9 @@ impl ChainState {
                 if e.height < entry.height {
                     break;
                 }
-                if self.has_strip_record(&cursor) {
+                // A record that cannot be read refuses too: the marks would
+                // otherwise land before the disconnect hit the same fault.
+                if self.store.get_opreturn_strip(&cursor)?.is_some() {
                     return Err(ChainError::InvalidArgument(stripped_block_message(&cursor, e.height)));
                 }
                 cursor = e.header.prev_blockhash;

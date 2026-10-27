@@ -921,3 +921,33 @@ fn the_chainstate_audit_reads_a_stripped_block_through_its_record() {
     assert!(report.unreadable.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `invalidate_block` waits for a strip in progress: a strip commits its
+/// record before `accept_lock`, so only the strip lock keeps a record from
+/// landing between invalidate's stripped-block check and its marks.
+#[test]
+fn invalidate_block_waits_for_a_strip_in_progress() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let cs = std::sync::Arc::new(cs);
+    let tip = blocks.last().unwrap().block_hash();
+    let held = cs.strip.lock.lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let cs = cs.clone();
+        std::thread::spawn(move || {
+            let r = cs.invalidate_block(tip);
+            done_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "invalidate_block ran while a strip held the lock"
+    );
+    drop(held);
+    done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
+    worker.join().unwrap().expect("invalidate");
+    assert_eq!(cs.store.get_block_index(&tip).unwrap().status, BlockStatus::Invalid);
+    let _ = std::fs::remove_dir_all(dir);
+}
