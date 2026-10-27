@@ -862,8 +862,12 @@ fn render_unconfirmed_txs(
 ) -> EsploraResult<Vec<TxJson>> {
     let mut out = Vec::with_capacity(txids.len());
     for txid in txids {
-        if late.contains(txid) {
-            out.extend(build_late_tx_json(state, txid)?);
+        // A late transaction is confirmed, so the txindex holds it; should it
+        // not, the mempool may still.
+        if late.contains(txid)
+            && let Some(json) = build_late_tx_json(state, txid)?
+        {
+            out.push(json);
         } else {
             out.extend(render_mempool_txs(state, std::slice::from_ref(txid))?);
         }

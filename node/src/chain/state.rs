@@ -2106,6 +2106,14 @@ impl ChainState {
         }
         let retreats = self.tip_retreats.load(Ordering::Acquire);
         let (tip_hash, tip_height) = self.tip_snapshot();
+        // A tip write between the two loads above would pair its retreat
+        // count with the tip it replaced, and `view_change` could then call a
+        // read of the new chainstate an extension of the old tip. Every tip
+        // write is inside a mutation, so an unchanged generation rules that
+        // out.
+        if self.chain_gen.load(Ordering::Acquire) != generation {
+            return None;
+        }
         Some(ChainView {
             tip_hash,
             tip_height,
