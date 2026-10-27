@@ -1067,6 +1067,9 @@ fn a_pass_strips_only_below_tip_minus_depth_minus_two() {
     let r = pass(&cs, 1000);
     assert_eq!((r.examined, r.stripped), (1, 1));
     assert!(record(&cs, &hash).is_some());
+    // The pass added the totals up for `getblockchaininfo`, which never
+    // reads the store itself.
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1);
     assert_reads_as(&cs, &blocks[101]);
     let s = cs.opreturn_strip_summary().unwrap();
     assert_eq!((s.blocks, s.transactions, s.outputs), (1, 1, 1));
@@ -1119,5 +1122,23 @@ fn a_pass_without_the_option_does_nothing() {
     assert_eq!(cs.opreturn_strip_worker_status(), WorkerStatus::Off);
     assert_eq!(record(&cs, &blocks[101].block_hash()), None);
     assert!(!cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record that does not read back still marks the node as holding
+/// stripped blocks: its block is stripped on disk either way.
+#[test]
+fn an_unreadable_record_still_counts_as_stripped() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: vec![(blocks[101].block_hash(), vec![0xff, 0x00])],
+            ..Default::default()
+        })
+        .unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert!(cs.opreturn_prune_active());
+    assert_eq!(cs.opreturn_strip_summary().unwrap().blocks, 0, "not counted in the totals");
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -131,6 +131,9 @@ pub(crate) struct StripState {
     worker: Mutex<WorkerStatus>,
     /// The records' totals and when they were added up.
     summary: Mutex<Option<(std::time::Instant, opreturn_strip::StripSummary)>>,
+    /// The totals as last added up, however long ago: what `getblockchaininfo`
+    /// reports, so it never reads the whole CF on the RPC executor.
+    last_summary: Mutex<opreturn_strip::StripSummary>,
     /// [`ChainState::blocks_dir_usage`] and when it was taken.
     usage: Mutex<Option<(std::time::Instant, (u64, u64))>>,
     /// Runs between the plan's index read and its read of the bytes.
@@ -547,22 +550,28 @@ impl ChainState {
 
     /// Read the store once at startup for whether any block is stripped.
     pub fn load_opreturn_strip_state(&self) -> Result<(), StoreError> {
-        let summary = self.compute_strip_summary()?;
-        self.strip.has_records.store(summary.blocks > 0, Ordering::Release);
+        let (summary, records) = self.compute_strip_summary()?;
+        // Every record counts here, read back or not: its block is stripped
+        // on disk either way.
+        self.strip.has_records.store(records > 0, Ordering::Release);
         *self.strip.summary.lock() = Some((std::time::Instant::now(), summary));
         Ok(())
     }
 
-    fn compute_strip_summary(&self) -> Result<opreturn_strip::StripSummary, StoreError> {
+    /// The records' totals, and how many records there are, decodable or not.
+    fn compute_strip_summary(&self) -> Result<(opreturn_strip::StripSummary, u64), StoreError> {
         let fs_block = self.opreturn_strip_fs_block().unwrap_or(4096);
         let mut summary = opreturn_strip::StripSummary::default();
+        let mut records = 0u64;
         self.store.for_each_opreturn_strip(&mut |_, bytes| {
+            records += 1;
             // An unreadable record is not counted; reading its block reports it.
             if let Ok(record) = StripRecord::decode(bytes) {
                 summary.add(&record, fs_block);
             }
         })?;
-        Ok(summary)
+        *self.strip.last_summary.lock() = summary;
+        Ok((summary, records))
     }
 
     /// The block files' apparent and allocated bytes, `(st_size,
@@ -600,9 +609,16 @@ impl ChainState {
         {
             return Ok(summary);
         }
-        let summary = self.compute_strip_summary()?;
+        let (summary, _) = self.compute_strip_summary()?;
         *cached = Some((std::time::Instant::now(), summary));
         Ok(summary)
+    }
+
+    /// The totals as last added up, without reading the store: at startup,
+    /// after each worker pass that changed them, and by
+    /// [`Self::opreturn_strip_summary`].
+    pub fn opreturn_strip_summary_last(&self) -> opreturn_strip::StripSummary {
+        *self.strip.last_summary.lock()
     }
 
     /// Drop the cached totals and the blocks directory's stat: a record was
@@ -655,7 +671,10 @@ impl ChainState {
         // of them durable.
         self.flush_durable()?;
 
-        let mut meta = self.opreturn_strip_meta().unwrap_or(opreturn_strip::StripMeta {
+        // A store error ends the pass rather than reading as "no cursor",
+        // which would start the scan over from genesis.
+        let stored = self.store.opreturn_strip_meta()?.and_then(|b| opreturn_strip::StripMeta::decode(&b));
+        let mut meta = stored.unwrap_or(opreturn_strip::StripMeta {
             next_height: 0,
             size_threshold: config.size_threshold,
             depth: config.depth,
@@ -712,6 +731,11 @@ impl ChainState {
             Ok(())
         })();
         self.write_strip_meta(&meta)?;
+        // A strip or a restore dropped the cached totals: add them up here,
+        // off the RPC path, for `getblockchaininfo`.
+        if self.strip.summary.lock().is_none() {
+            let _ = self.opreturn_strip_summary();
+        }
         result.map(|()| report)
     }
 

@@ -142,7 +142,13 @@ impl PruneMode {
 pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
     let config = chain_state.opreturn_prune_config();
     let meta = chain_state.opreturn_strip_meta();
-    let summary = chain_state.opreturn_strip_summary().unwrap_or_default();
+    // `getblockchaininfo` runs on the RPC executor: it reports the totals as
+    // last added up and never reads the whole CF itself.
+    let summary = if detailed {
+        chain_state.opreturn_strip_summary().unwrap_or_default()
+    } else {
+        chain_state.opreturn_strip_summary_last()
+    };
     let mut out = json!({
         "enabled": config.is_some(),
         "depth": config.map(|c| c.depth).or(meta.map(|m| m.depth)),
