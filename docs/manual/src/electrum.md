@@ -81,11 +81,11 @@ exactly as in the Electrum protocol.
 
 | Method | Description |
 |---|---|
-| `server.version` | Negotiate client/server software + protocol version. |
+| `server.version` | Negotiate client/server software + protocol version. Also accepts rbitcoin's `1.4.2-asof`; see [Chain-tip stamps](#chain-tip-stamps). |
 | `server.ping` | Keepalive; returns null. |
 | `server.banner` | Server banner text (configurable via `--electrumbanner`). |
 | `server.donation_address` | Configured donation address (empty if unset). |
-| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), etc. |
+| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), etc. |
 | `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set; no peer gossip). |
 
 ### Headers & blocks
@@ -132,6 +132,46 @@ exactly as in the Electrum protocol.
 | Method | Description |
 |---|---|
 | `blockchain.tweaks.subscribe` | BIP 352 tweak stream for client-side scanning. Requires `-silentpaymentindex=1`; see below. |
+
+## Chain-tip stamps
+
+The methods that read the chain at one block answer for the tip the
+request started at, and name it beside `result`:
+
+```json
+{"jsonrpc": "2.0", "id": 7, "result": {"confirmed": 5000, "unconfirmed": 0},
+ "chain_tip": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+ "chain_tip_height": 3}
+```
+
+They are `blockchain.scripthash.get_history`, `get_balance` and
+`listunspent`, and `blockchain.transaction.get`, `get_merkle` and
+`id_from_pos`. The members and methods are rbitcoin's (satd adds
+`id_from_pos`), and as on rbitcoin every connection gets them. A wallet
+that syncs with several requests compares `chain_tip` across them: if it
+changed, a block connected or a reorg happened in between, and the answers
+do not describe one chain.
+
+- Nothing above the pinned tip counts as confirmed. A transaction that
+  confirms while the request runs is listed as the unconfirmed transaction
+  it was: `get_history` and `listunspent` give it height `0` (`-1` when it
+  spends another transaction that was unconfirmed then) and `get_history`
+  its fee when its inputs can be read; `get_balance` counts it in
+  `unconfirmed`; `transaction.get` gives it no block, and `get_merkle`
+  and `id_from_pos` no proof or position.
+- A mempool transaction whose parent confirmed above the pinned tip spent
+  an unconfirmed parent as of it, and has height `-1` too.
+- `transaction.get`'s `confirmations` counts to the pinned tip.
+- A disconnect while a request runs (a reorg, or `invalidateblock`) runs it
+  again at the new tip. One that a disconnect interrupts eight times in a
+  row is answered with the error `chain view moved`.
+- The mempool part of an answer is read as it is when the request reads it.
+- Errors, and every other method, carry no stamp.
+
+`server.version` also accepts rbitcoin's protocol string `1.4.2-asof`, alone
+or at either end of a `[min, max]` range, and answers with it, so a client
+written for rbitcoin negotiates as it does there. The protocol spoken is
+still 1.4, and the stamps do not depend on it.
 
 ## Subscriptions
 
@@ -305,7 +345,8 @@ backend.
 - **Histories over the cap are refused**, not truncated: see
   [History cap](#history-cap).
 - satd advertises a single protocol version (`protocol_min == protocol_max
-  == 1.4`); it does not negotiate a range.
+  == 1.4`); it does not negotiate a range. The one other string it accepts
+  is rbitcoin's `1.4.2-asof` ([Chain-tip stamps](#chain-tip-stamps)).
 - `server.peers.subscribe` returns an empty list: satd does not participate
   in Electrum peer gossip.
 - The protocol layer is vendored from `romanz/electrs` (MIT; attribution in

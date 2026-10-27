@@ -8,6 +8,7 @@ pub mod consistency;
 pub mod disconnect;
 pub mod events;
 pub mod height_index_repair;
+pub mod pin;
 pub mod prefetch;
 pub mod reorg_log;
 pub mod replay_plan;

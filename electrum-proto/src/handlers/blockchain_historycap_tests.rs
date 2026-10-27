@@ -4,7 +4,8 @@
 //! The index here holds a five-transaction history (one transaction funds
 //! and spends, one funds twice), so the cap counts transactions, not rows.
 //! Each method is refused with a cap of four and answers exactly as before
-//! with a cap of five. That the refusal reads only about `cap` rows is
+//! with a cap of five. The chain is as tall as the history, so the
+//! request's pinned tip covers every row. That the refusal reads only about `cap` rows is
 //! proven against the chainstate-backed index in the `node` crate.
 
 use std::sync::Arc;
@@ -34,9 +35,12 @@ use crate::state::ElectrumState;
 use crate::subscribe::Subscriptions;
 use crate::types::scripthash_to_wire_hex;
 
-const SH: Scripthash = [0x5c; 32];
+pub(super) const SH: Scripthash = [0x5c; 32];
 
-fn txid(n: u8) -> Txid {
+/// The fixture chain's height: the history's last row is at 9.
+pub(super) const TIP_HEIGHT: u32 = 9;
+
+pub(super) fn txid(n: u8) -> Txid {
     Txid::from_byte_array([n; 32])
 }
 
@@ -72,7 +76,7 @@ fn history() -> Vec<HistoryEntry> {
 
 /// The history above for `SH`; nothing for any other script.
 #[derive(Default)]
-struct FixedIndex {
+pub(super) struct FixedIndex {
     senders: Mutex<Vec<broadcast::Sender<StatusUpdate>>>,
 }
 
@@ -131,7 +135,7 @@ impl node::net::manager::TxBroadcaster for NoBroadcast {
 
 /// An Electrum state over an empty regtest chain and [`FixedIndex`], with
 /// the history cap at `cap`.
-fn electrum_state(cap: usize) -> (ElectrumState, tempfile::TempDir) {
+pub(super) fn electrum_state(cap: usize) -> (ElectrumState, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let chain = Arc::new(
         ChainState::new(
@@ -148,6 +152,11 @@ fn electrum_state(cap: usize) -> (ElectrumState, tempfile::TempDir) {
         )
         .unwrap(),
     );
+    // A chain as tall as the history, so a request pinned to the tip reads
+    // every row as confirmed.
+    for salt in 0..TIP_HEIGHT {
+        crate::test_support::extend_tip(&chain, salt);
+    }
     let state = ElectrumState {
         chain: chain.clone(),
         mempool: Arc::new(Mempool::new(1_000_000, 0)),
@@ -167,7 +176,7 @@ fn electrum_state(cap: usize) -> (ElectrumState, tempfile::TempDir) {
     (state, dir)
 }
 
-fn request(method: &str) -> Request {
+pub(super) fn request(method: &str) -> Request {
     Request {
         jsonrpc: Some("2.0".into()),
         id: Some(json!(1)),
@@ -187,12 +196,12 @@ fn assert_refused(resp: &Response, cap: usize) {
     assert_eq!(err.message, format!("history too large (cap = {cap} entries)"));
 }
 
-fn result(resp: Response) -> Value {
+pub(super) fn result(resp: Response) -> Value {
     assert!(resp.error.is_none(), "expected an answer, got {resp:?}");
     resp.result.unwrap()
 }
 
-fn hex(n: u8) -> String {
+pub(super) fn hex(n: u8) -> String {
     txid(n).to_string()
 }
 

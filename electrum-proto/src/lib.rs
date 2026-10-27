@@ -42,6 +42,8 @@ pub mod server;
 pub mod state;
 pub mod status;
 pub mod subscribe;
+#[cfg(test)]
+mod test_support;
 pub mod types;
 
 pub use config::ElectrumConfig;
@@ -69,3 +71,10 @@ pub use types::{
 /// `server.version` negotiation expects an exact match — the client's
 /// stated version must be `1.4` to be acceptable, just like electrs.
 pub const PROTOCOL_VERSION: &str = "1.4";
+
+/// rbitcoin's Electrum dialect, which `server.version` also accepts and
+/// answers with, so a client written for rbitcoin negotiates as it does
+/// there. Not a dotted version; the protocol spoken is still
+/// [`PROTOCOL_VERSION`]. The `chain_tip` stamps do not depend on it: every
+/// connection gets them, as on rbitcoin.
+pub const PROTOCOL_ASOF: &str = "1.4.2-asof";
