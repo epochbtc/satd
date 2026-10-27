@@ -1192,12 +1192,13 @@ fn a_reorg_past_a_stripped_block_fails_closed_with_the_stripped_message() {
 /// `getblockfrompeer` restores a stripped block in place (plan §2.12, PR 7).
 /// Node A strips a block that node B holds intact, then fetches it from B:
 /// the raw block is served again, the strip summary is gone, the payload is
-/// back in A's block files, and the punched space is allocated again.
+/// back in A's block files, and the punched space is allocated again. A runs
+/// with a blocks-dir xor key, so the restore must encode what it writes.
 #[test]
 fn getblockfrompeer_restores_a_stripped_block_in_place() {
     use serde_json::json;
 
-    let mut a = TestNode::start(&["--allowteststrip"]);
+    let mut a = TestNode::start(&["--allowteststrip", "--blocksxor=1"]);
     let hash = block_with_a_big_op_return(&a);
     let tip = a.rpc_ok("getbestblockhash", vec![]);
     let raw = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
@@ -1236,7 +1237,7 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     let rpcport = a.rpcport;
     a.stop();
     a.datadir = PathBuf::new();
-    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip"]);
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--blocksxor=1"]);
     assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), raw);
     a.stop();
     b.stop();
