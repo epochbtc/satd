@@ -58,6 +58,12 @@ pub enum RepairError {
     Store(#[from] StoreError),
     #[error("postcondition failed after writing the repair batch: {0}")]
     Postcondition(String),
+    #[error(
+        "block {0} has stripped OP_RETURN data, so its transactions cannot be re-connected \
+         from its bytes; rebuild the chainstate with -reindex-chainstate, which replays \
+         stripped blocks from their strip records"
+    )]
+    Stripped(BlockHash),
 }
 
 /// What the repair found and (when `applied`) wrote.
@@ -109,6 +115,13 @@ pub fn repair_lost_connect_delta(
         .get_block_index(&block_hash)
         .ok_or(RepairError::MissingIndexEntry(block_hash))?;
     let height = entry.height;
+
+    // A stripped block's bytes are its filled form: their txids are not the
+    // transactions', and their scripts would fail the full validation below.
+    // The replay path that knows the record is -reindex-chainstate.
+    if store.get_opreturn_strip(&block_hash)?.is_some() {
+        return Err(RepairError::Stripped(block_hash));
+    }
 
     if matches!(entry.status, BlockStatus::HeaderOnly | BlockStatus::Pruned) {
         return Err(RepairError::SignatureMismatch(format!(
@@ -702,6 +715,38 @@ mod tests {
         assert!(store.get_coin(&seeded).is_none());
         assert!(store.get_undo(&block1_hash).is_some());
         assert_eq!(store.get_tip(), Some(block2_hash));
+    }
+
+    /// A block with a strip record is refused before anything else is
+    /// checked, naming -reindex-chainstate: its bytes are the filled form.
+    /// The same block without the record passes the dry run.
+    #[test]
+    fn refuses_a_stripped_block_and_names_reindex_chainstate() {
+        let (store, block1, _block2_hash, seeded) = make_holed_store();
+        let hash = block1.block_hash();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.opreturn_strip_puts.push((hash, vec![0x01]));
+        store.write_batch(batch).unwrap();
+        let repair = |apply| {
+            repair_lost_connect_delta(
+                &store,
+                &block1,
+                &NoopVerifier,
+                Network::Regtest,
+                1,
+                &AddressIndexConfig::default(),
+                apply,
+            )
+        };
+        let err = repair(true).unwrap_err();
+        assert!(matches!(err, RepairError::Stripped(h) if h == hash), "got: {err}");
+        assert!(err.to_string().contains("-reindex-chainstate"), "{err}");
+        assert!(store.get_coin(&seeded).is_some() && store.get_undo(&hash).is_none(), "nothing written");
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.opreturn_strip_removes.push(hash);
+        store.write_batch(batch).unwrap();
+        assert!(repair(false).is_ok(), "without the record the same block passes");
     }
 
     #[test]

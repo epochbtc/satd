@@ -1074,3 +1074,117 @@ fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
     let _ = std::fs::remove_dir_all(&stripped_dir);
     let _ = std::fs::remove_dir_all(&intact_dir);
 }
+
+/// `satd-chainstate-audit` reads a stripped block through its record (PR 5e):
+/// with the txindex on, its transactions are found under their recorded txids,
+/// so a healthy node with a stripped block in the window is `consistent`.
+#[test]
+fn the_offline_audit_reads_a_stripped_block_through_its_record() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-strip-audit");
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--txindex"]);
+    let hash = block_with_a_big_op_return(&node);
+    let out = strip(&node, &hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_satd-chainstate-audit"))
+        .arg(format!("--datadir={}", datadir.join("regtest").display()))
+        .arg("--window=50")
+        .output()
+        .expect("run the audit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("checked 50 blocks"), "premise: the stripped block is in the window: {stdout}");
+    assert!(stdout.trim_end().ends_with("consistent"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// The tip, and each block's hash and confirmations, from `getblockheader`.
+fn chain_state(node: &TestNode, hashes: &[String]) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+    let headers = hashes
+        .iter()
+        .map(|h| node.rpc_ok("getblockheader", vec![serde_json::json!(h)])["confirmations"].clone())
+        .collect();
+    (tip, headers)
+}
+
+/// `invalidateblock` refuses, before marking anything, when the rollback would
+/// disconnect a stripped block (plan §2.10). Paired with an invalidation above
+/// the stripped block, which goes through.
+#[test]
+fn invalidateblock_below_a_stripped_block_is_refused_and_changes_nothing() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&["--allowteststrip"]);
+    let hash = block_with_a_big_op_return(&node);
+    let out = strip(&node, &hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"].as_u64().unwrap();
+    let below = node.rpc_ok("getblockhash", vec![json!(height - 1)]).as_str().unwrap().to_string();
+    let above = node.rpc_ok("getblockhash", vec![json!(height + 5)]).as_str().unwrap().to_string();
+    let watched = [below.clone(), hash.clone(), above.clone()];
+    let before = chain_state(&node, &watched);
+    let tips = node.rpc_ok("getchaintips", vec![]);
+
+    for target in [&below, &hash] {
+        let err = rpc_err(&node, "invalidateblock", vec![json!(target)]);
+        let msg = err["message"].as_str().unwrap();
+        assert!(
+            msg.contains(&format!("block {hash} at height {height} has stripped OP_RETURN data"))
+                && msg.contains("getblockfrompeer"),
+            "{err}"
+        );
+        assert_eq!(chain_state(&node, &watched), before, "nothing moved");
+        assert_eq!(node.rpc_ok("getchaintips", vec![]), tips, "nothing was marked");
+    }
+
+    // Above the stripped block, the same call goes through.
+    node.rpc_ok("invalidateblock", vec![json!(above)]);
+    let tip = node.rpc_ok("getblockheader", vec![node.rpc_ok("getbestblockhash", vec![])]);
+    assert_eq!(tip["height"].as_u64(), Some(height + 4));
+    node.rpc_ok("reconsiderblock", vec![json!(above)]);
+    assert_eq!(chain_state(&node, &watched), before);
+    node.stop();
+}
+
+/// A reorg whose disconnect walk reaches a stripped block fails closed with
+/// the stripped-data message and leaves the tip where it was (plan §2.10). The
+/// competing chain, longer and forking below the stripped block, comes from a
+/// second node through `submitblock`.
+#[test]
+fn a_reorg_past_a_stripped_block_fails_closed_with_the_stripped_message() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&["--allowteststrip"]);
+    let hash = block_with_a_big_op_return(&node);
+    let out = strip(&node, &hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"].as_u64().unwrap();
+    let tip_height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap();
+    let below = node.rpc_ok("getblockhash", vec![json!(height - 1)]).as_str().unwrap().to_string();
+    let watched = [below.clone(), hash.clone()];
+    let before = chain_state(&node, &watched);
+
+    // A competing chain from genesis, longer than the stripped node's.
+    let mut other = TestNode::start(&[]);
+    let addr = DeterministicWallet::from_secret([0x63; 32]).address.to_string();
+    let fork = mine(&other, tip_height + 5, &addr);
+    for h in &fork {
+        let raw = other.rpc_ok("getblock", vec![json!(h), json!(0)]);
+        let _ = node.rpc_call_with_params("submitblock", vec![raw]);
+    }
+    other.stop();
+
+    assert_eq!(chain_state(&node, &watched), before, "the reorg did not go through");
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
+    assert!(
+        log.contains(&format!("block {hash} at height {height} has stripped OP_RETURN data")),
+        "the reorg failure names the stripped block: {}",
+        log.lines().filter(|l| l.contains("reorg")).collect::<Vec<_>>().join("\n")
+    );
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+}
