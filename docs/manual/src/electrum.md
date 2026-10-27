@@ -85,7 +85,7 @@ exactly as in the Electrum protocol.
 | `server.ping` | Keepalive; returns null. |
 | `server.banner` | Server banner text (configurable via `--electrumbanner`). |
 | `server.donation_address` | Configured donation address (empty if unset). |
-| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), etc. |
+| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), `asof` / `asof_protocol` ([As of a block](#as-of-a-block)), etc. |
 | `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set; no peer gossip). |
 
 ### Headers & blocks
@@ -172,6 +172,44 @@ do not describe one chain.
 or at either end of a `[min, max]` range, and answers with it, so a client
 written for rbitcoin negotiates as it does there. The protocol spoken is
 still 1.4, and the stamps do not depend on it.
+
+### As of a block
+
+The same six methods take one more argument, after their own (optional
+ones included): `asof:<blockhash>`, rbitcoin's. The answer is then as of
+that block, which must be on the best chain, and leaves out the mempool:
+
+```json
+{"id": 1, "method": "blockchain.scripthash.listunspent",
+ "params": ["<scripthash>", "asof:<blockhash>"]}
+{"id": 2, "method": "blockchain.transaction.get",
+ "params": ["<txid>", true, "asof:<blockhash>"]}
+```
+
+- Blocks above the asof block do not count: a transaction confirmed later
+  is left out of `get_history`, an output spent later is still in
+  `listunspent` and `get_balance`, and `transaction.get`, `get_merkle` and
+  `id_from_pos` find nothing confirmed later.
+- `chain_tip` / `chain_tip_height` name the asof block.
+- A hash that is not a block on the best chain is the error
+  `asof not on chain`, and so is one that leaves the best chain while the
+  request runs. The answer never comes from another block at that height.
+- A malformed hash, or `asof:` on any other method, is an error, never
+  ignored.
+- `listunspent` and `get_balance` as of a block are worked out from the
+  scripthash's history, under the same [history cap](#history-cap).
+
+rbitcoin takes `asof:` only after `server.version` negotiated `1.4.2-asof`;
+satd takes it on any connection, so sending it is the opt-in.
+`server.features` reports `asof: true` and `asof_protocol: "1.4.2-asof"`.
+
+**Check `server.features` before sending `asof:`.** A server without the
+feature does not always refuse it: `transaction.get`, `get_merkle` and
+`id_from_pos` already take an optional last argument, and an older satd (or
+another server) reads `asof:…` there as `verbose = false` or
+`merkle = false`, or ignores it, and answers live, with no error. Check the
+answer too: its `chain_tip` names the asof block only when the asof was
+applied.
 
 ## Subscriptions
 

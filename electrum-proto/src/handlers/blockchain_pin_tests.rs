@@ -526,3 +526,114 @@ mod races {
         assert_eq!(rows[5], json!({"height": 0, "tx_hash": txid.to_string(), "fee": 1_000}));
     }
 }
+
+fn asof(height: u32) -> Pin {
+    Pin {
+        mempool: false,
+        ..pin_at(height)
+    }
+}
+
+/// As of 5: the rows at or below it, the balance funded and unspent by it,
+/// and the outputs unspent by it, read from the history. tx 2's output,
+/// spent at 9, is unspent as of 5; tx 1's, spent at 5, is not.
+#[test]
+fn asof_answers_from_the_history_at_the_block() {
+    let (state, _dir) = electrum_state(100);
+    assert_eq!(
+        scripthash_get_history(&state, params(), &asof(5)).unwrap(),
+        json!([
+            {"height": 3, "tx_hash": hex(1)},
+            {"height": 5, "tx_hash": hex(2)},
+            {"height": 5, "tx_hash": hex(3)},
+        ])
+    );
+    assert_eq!(
+        scripthash_get_balance(&state, params(), &asof(5)).unwrap(),
+        json!({"confirmed": 5_000, "unconfirmed": 0})
+    );
+    assert_eq!(
+        scripthash_listunspent(&state, params(), &asof(5)).unwrap(),
+        json!([
+            {"height": 5, "tx_hash": hex(2), "tx_pos": 0, "value": 2_000},
+            {"height": 5, "tx_hash": hex(3), "tx_pos": 1, "value": 3_000},
+        ])
+    );
+    assert_eq!(
+        scripthash_listunspent(&state, params(), &asof(2)).unwrap(),
+        json!([])
+    );
+}
+
+/// As of a block, a transaction confirmed after it is not found.
+#[test]
+fn asof_transaction_get_needs_a_confirmation_by_the_block() {
+    let (state, _dir) = electrum_state(100);
+    let (txid, height) = chain_with_block_above(&state);
+    let req = json!([txid.to_string()]);
+    assert!(transaction_get(&state, req.clone(), &asof(height - 1)).is_err());
+    assert!(transaction_get(&state, req, &asof(height)).is_ok());
+}
+
+fn with_params(method: &str, params: Value) -> Request {
+    Request {
+        params: Some(params),
+        ..request(method)
+    }
+}
+
+fn dispatched(state: &ElectrumState, req: Request) -> Value {
+    serde_json::to_value(crate::dispatch::dispatch(state, req)).unwrap()
+}
+
+/// The trailing `asof:` argument through dispatch: pins the answer to a
+/// best-chain block and stamps it, without any negotiation; keeps the
+/// method's own optional arguments; and is an error on a hash not on the
+/// best chain, on a malformed hash, and on a method that does not take it.
+#[tokio::test]
+async fn trailing_asof_pins_stamps_and_is_refused_where_it_does_not_apply() {
+    let (state, _dir) = electrum_state(100);
+    let five = state.chain.get_block_hash_by_height(5).unwrap();
+    let tag = format!("asof:{five}");
+    let sh = scripthash_to_wire_hex(&SH);
+
+    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, tag])));
+    assert_eq!(wire["result"], json!({"confirmed": 5_000, "unconfirmed": 0}), "{wire}");
+    assert_eq!(wire["chain_tip"], five.to_string());
+    assert_eq!(wire["chain_tip_height"], 5);
+
+    // The optional argument before it is still read: verbose, here.
+    let coinbase = state.electrum_extras.txid_at_pos(5, 0).unwrap();
+    let wire = dispatched(
+        &state,
+        with_params("blockchain.transaction.get", json!([coinbase.to_string(), true, tag])),
+    );
+    assert_eq!(wire["result"]["confirmations"], 1, "{wire}");
+
+    let error = |wire: &Value| wire["error"]["message"].as_str().unwrap_or_default().to_string();
+    let unknown = format!("asof:{}", BlockHash::all_zeros());
+    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, unknown])));
+    assert_eq!(error(&wire), "asof not on chain", "{wire}");
+    assert!(wire.get("chain_tip").is_none());
+
+    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, "asof:xyz"])));
+    assert_eq!(error(&wire), "asof must be asof:<blockhash>", "{wire}");
+
+    let wire = dispatched(&state, with_params("blockchain.scripthash.get_mempool", json!([sh, tag])));
+    assert_eq!(error(&wire), "asof is not supported by blockchain.scripthash.get_mempool");
+
+    let (tx, _rx) = mpsc::channel(8);
+    let mut subs = Subscriptions::new(tx, 10);
+    let resp = dispatch_with_subscriptions(
+        &state,
+        &mut subs,
+        state.chain.as_ref(),
+        state.electrum_extras.clone(),
+        with_params("blockchain.scripthash.subscribe", json!([sh, tag])),
+    );
+    assert_eq!(
+        error(&serde_json::to_value(resp).unwrap()),
+        "asof is not supported by blockchain.scripthash.subscribe"
+    );
+    assert_eq!(subs.scripthash_count(), 0);
+}

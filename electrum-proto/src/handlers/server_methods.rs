@@ -143,9 +143,13 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
         // configured and refuses every subscribe, so reporting `true` there
         // would send a wallet to a backend that cannot answer it for hours.
         "tweaks": state.sp_index.as_ref().is_some_and(|i| i.is_complete()),
-        // rbitcoin's key: the answers of the stamped methods name the block
-        // they were read at.
+        // rbitcoin's keys: the answers of the stamped methods name the block
+        // they were read at, and take a trailing `asof:<blockhash>`. The
+        // dialect is `asof_protocol`, which satd accepts but does not
+        // require before `asof:`.
         "chain_tip": true,
+        "asof": true,
+        "asof_protocol": PROTOCOL_ASOF,
     }))
 }
 

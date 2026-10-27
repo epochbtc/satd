@@ -147,7 +147,17 @@ pub fn scripthash_get_history(
     // the cap, so the refusal costs `O(cap)` reads and memory, never the
     // whole history; the cap counts DISTINCT transactions (round-3 review
     // H1 — the schema has one row per matching output AND input).
-    let rows = pinned_history_rows(state, &sh.0, cap, pin)?;
+    let rows = if pin.mempool {
+        pinned_history_rows(state, &sh.0, cap, pin)?
+    } else {
+        // As of a block: the confirmed rows at or below it, and no mempool.
+        // A transaction confirmed above it is left out.
+        node_index::capped_history_rows(state.address_index.as_ref(), &sh.0, cap, |_| None)
+            .map_err(JsonRpcError::from_index)?
+            .into_iter()
+            .filter(|r| r.height <= i64::from(pin.height))
+            .collect()
+    };
 
     // `fee` (sats) is set on mempool rows only, from the live mempool
     // entry, which pre-computes it at admission.
@@ -401,6 +411,19 @@ pub fn scripthash_get_balance(
         .address_index
         .check_history_cap(&sh.0, cap)
         .map_err(JsonRpcError::from_index)?;
+    if !pin.mempool {
+        // As of a block: its confirmed balance from the history, and no
+        // mempool.
+        let history = state
+            .address_index
+            .confirmed_history(&sh.0)
+            .map_err(JsonRpcError::from_index)?;
+        return Ok(serde_json::to_value(BalanceResponse {
+            confirmed: confirmed_balance_at(&history, pin),
+            unconfirmed: 0,
+        })
+        .unwrap());
+    }
     let (confirmed, unconfirmed, at_pin) = {
         let mut attempt = 0;
         loop {
@@ -476,6 +499,9 @@ pub fn scripthash_listunspent(
         .address_index
         .check_history_cap(&sh.0, cap)
         .map_err(JsonRpcError::from_index)?;
+    if !pin.mempool {
+        return Ok(serde_json::to_value(utxos_as_of(state, &sh.0, pin)?).unwrap());
+    }
 
     // The mempool part is read before the coin set, as `pinned_history_rows`
     // reads the history: a transaction that confirms between the two reads
@@ -589,6 +615,56 @@ pub fn scripthash_listunspent(
     Ok(serde_json::to_value(&out).unwrap())
 }
 
+/// `listunspent` as of a block: the outputs funded at or below it and not
+/// spent at or below it, from the history rows alone, in `(height, txid,
+/// vout)` order. The live coin set cannot answer this: a later spend has
+/// removed the coin. Within the history cap, as the caller checked.
+fn utxos_as_of(
+    state: &ElectrumState,
+    sh: &node_index::Scripthash,
+    pin: &Pin,
+) -> Result<Vec<ListUnspentEntry>, JsonRpcError> {
+    let history = state
+        .address_index
+        .confirmed_history(sh)
+        .map_err(JsonRpcError::from_index)?;
+    let spent: std::collections::HashSet<OutPoint> = history
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Spending {
+                height,
+                prev_outpoint,
+                ..
+            } if pin.covers(*height) => Some(*prev_outpoint),
+            _ => None,
+        })
+        .collect();
+    Ok(history
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Funding {
+                height,
+                txid,
+                vout,
+                amount_sat,
+            } if pin.covers(*height)
+                && !spent.contains(&OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                }) =>
+            {
+                Some(ListUnspentEntry {
+                    height: i64::from(*height),
+                    tx_hash: TxidHex(*txid),
+                    tx_pos: *vout,
+                    value: *amount_sat,
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
 pub fn scripthash_get_mempool(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_mempool")?;
     // The mempool part of `get_history`, in the same order.
@@ -680,7 +756,14 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
         // `getrawtransaction` (`rawtx.rs`), which filters to the acting class.
         // Without this filter any Electrum client could pull a withheld tx by
         // txid. Fall through to the txindex/not-found path when quarantined.
-        if let Some(entry) = state.mempool.get(&txid).filter(|e| e.scope.is_acting()) {
+        //
+        // As of a block there is no mempool, and a transaction must have
+        // confirmed at or below the block.
+        if let Some(entry) = state
+            .mempool
+            .get(&txid)
+            .filter(|e| pin.mempool && e.scope.is_acting())
+        {
             (entry.tx, None)
         } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
             let parsed: Transaction = deserialize(&raw)
@@ -697,6 +780,9 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
                 block_time: c.block_time,
                 confirmations: pin.height.saturating_sub(c.height).saturating_add(1),
             });
+            if location.is_none() && !pin.mempool {
+                return Err(JsonRpcError::bad_request(format!("tx not found: {txid}")));
+            }
             (parsed, location)
         } else {
             return Err(JsonRpcError::bad_request(format!("tx not found: {txid}")));
