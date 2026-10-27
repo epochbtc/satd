@@ -62,6 +62,7 @@ use crate::index::address::cursor::BackfillState;
 use crate::index::address::keys::{
     AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKeyV3, AddrSpendingRowV3, scripthash_of,
 };
+use crate::storage::opreturn_strip::StoredBlock;
 use crate::storage::{BackfillCursorWrite, Store, StoreBatch, WriteMode};
 
 /// Inter-task command from RPC handlers to the supervisor.
@@ -118,7 +119,10 @@ impl LiveKeys {
         let store = chain.store_ref();
         let mut keys = Self::default();
         for &hash in live_hashes.iter().skip(from as usize) {
-            let block = chain.get_block(&hash)?;
+            // The stored form: an OP_RETURN-stripped block's outputs keep their
+            // `0x6a` first byte, so they are skipped as unspendable exactly as
+            // the originals were.
+            let block = chain.get_stored_block(&hash)?.block;
             let undo = store.get_undo(&hash)?;
             let first_txseq = store.get_cumulative_tx_count(&block.header.prev_blockhash)?;
             let mut undo_cursor = 0usize;
@@ -512,8 +516,11 @@ impl BackfillRunner {
                 continue;
             }
             // OLD block is no longer active. Emit removes.
-            let old_block = match chain.get_block(&old_hash) {
-                Some(b) => b,
+            // Rows are named by ordinal and scripthash, never by txid, so an
+            // OP_RETURN-stripped block's filled form names them correctly:
+            // only unspendable outputs differ, and those have no rows.
+            let old_block = match chain.get_stored_block(&old_hash) {
+                Some(b) => b.block,
                 None => {
                     // Pruned or missing; we wrote rows but can't read
                     // the block to derive scripthashes. Best effort:
@@ -620,7 +627,7 @@ impl BackfillRunner {
         &self,
         snapshot: &ActiveChainSnapshot,
         h: u32,
-    ) -> Result<bitcoin::Block, BackfillError> {
+    ) -> Result<StoredBlock, BackfillError> {
         let hash = *snapshot.hashes.get(h as usize).ok_or_else(|| {
             BackfillError::Chain(format!(
                 "snapshot index out of range: h={} (snapshot_height={})",
@@ -628,7 +635,7 @@ impl BackfillRunner {
                 snapshot.snapshot_height()
             ))
         })?;
-        self.chain.get_block(&hash).ok_or_else(|| {
+        self.chain.get_stored_block(&hash).ok_or_else(|| {
             BackfillError::Chain(format!(
                 "missing block data for {} at height {} (pruned or corrupt?)",
                 hash, h
@@ -700,8 +707,11 @@ impl BackfillRunner {
                 .ok_or(BackfillError::ChainTxGap { height: h })?;
 
             let mut batch = StoreBatch::default();
-            for (tx_idx, tx) in block.txdata.iter().enumerate() {
-                let txid = tx.compute_txid();
+            for (tx_idx, tx) in block.block.txdata.iter().enumerate() {
+                // The stored txid: an OP_RETURN-stripped transaction's is in
+                // its strip record, and its filled bytes hash to something
+                // else.
+                let txid = block.txid(tx_idx);
                 // Ordinal rows. Idempotent on a resumed pass: the same
                 // block yields the same ordinals, so a rewrite lands on
                 // identical values.
@@ -793,7 +803,7 @@ impl BackfillRunner {
                 std::thread::sleep(Duration::from_millis(debug_delay));
             }
 
-            let block = self.read_via_snapshot(snapshot, h)?;
+            let block = self.read_via_snapshot(snapshot, h)?.block;
 
             // This block's ordinal base, for the spending end of each
             // `spent` row. Same source and same failure mode as pass 1.

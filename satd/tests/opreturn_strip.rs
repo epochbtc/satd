@@ -942,3 +942,135 @@ fn a_stripped_chain_replays_to_the_same_chainstate() {
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// The column families the index backfills write.
+const INDEX_CFS: &[&str] = &[
+    "tx_loc",
+    "txseq_txid",
+    "txseq_block",
+    "addr_funding_v3",
+    "addr_spending_v3",
+    "spent",
+    "block_filter",
+    "block_filter_header",
+    "sp_tweaks",
+];
+
+/// Restart a chain built without indexes with `INDEXES` on, run each
+/// backfill to completion, stop, and dump the index column families.
+fn backfill_and_dump(datadir: &Path, rpcport: u16, tip: &str) -> Dump {
+    let mut args: Vec<&str> = vec!["--allowteststrip"];
+    args.extend_from_slice(INDEXES);
+    let mut node = TestNode::start_with_datadir(datadir, rpcport, &args);
+    for (target, key) in [
+        ("address", "address"),
+        ("blockfilter", "basic block filter index"),
+        ("silentpayment", "silentpayments"),
+    ] {
+        node.rpc_ok("backfillindex", vec![serde_json::json!(target)]);
+        common::poll_until(
+            || node.rpc_ok("getsatdindexinfo", vec![])[key]["synced"] == true,
+            test_timeout(60),
+            "a backfill never completed",
+        );
+    }
+    assert_eq!(node.rpc_ok("getbestblockhash", vec![]), serde_json::json!(tip));
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+    node.datadir = PathBuf::new();
+    let mut dump = dump_chainstate(datadir);
+    dump.retain(|name, _| INDEX_CFS.contains(&name.as_str()));
+    for cf in INDEX_CFS {
+        assert!(dump.get(*cf).is_some_and(|rows| !rows.is_empty()), "premise: {cf} has rows");
+    }
+    dump
+}
+
+/// The address, filter and silent-payment backfills over stripped blocks
+/// (plan §2.8, PR 5c). A chain built with no index on carries a block with two
+/// stripped transactions, one silent-payment eligible, and a later block
+/// spends that one's taproot output. The datadir is copied before the strip;
+/// both copies then backfill every index, and the rows must be byte-identical.
+/// Pass 1 of the address backfill names each output by its stored txid, so a
+/// pass 1 that hashed the filled bytes would leave pass 2 unable to find the
+/// spent output.
+#[test]
+fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::script::{Builder, PushBytesBuf};
+    use serde_json::json;
+
+    let rpcport = find_available_port();
+    let stripped_dir = fresh_test_datadir("satd-strip-backfill");
+    let intact_dir = fresh_test_datadir("satd-strip-backfill-intact");
+    let mut node = TestNode::start_with_datadir(&stripped_dir, rpcport, &["--allowteststrip"]);
+    let wallet = DeterministicWallet::from_secret([0x5f; 32]);
+    let addr = wallet.address.to_string();
+    mine(&node, 104, &addr);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (kp, p2tr) = common::p2tr_keypath_output(&secp, [0x40; 32]);
+    let data = |byte: u8| {
+        Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(PushBytesBuf::try_from(vec![byte; PAYLOAD - 4]).unwrap())
+            .into_script()
+    };
+    let send = |raw: &str| {
+        node.rpc_ok("sendrawtransaction", vec![json!(raw), json!(0.1), json!(50)]);
+    };
+    const FEE: u64 = 100_000;
+    let (sp_raw, sp) = common::build_signed_p2wpkh_spend_of_coinbases(
+        &node,
+        &[(1, &wallet)],
+        &[p2tr.clone(), data(PAYLOAD_BYTE)],
+        FEE,
+    );
+    let (plain_raw, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+        &node,
+        &[(2, &wallet)],
+        &[wallet.address.script_pubkey(), data(PAYLOAD_BYTE ^ 0xff)],
+        FEE,
+    );
+    send(&sp_raw);
+    send(&plain_raw);
+    let x = mine(&node, 1, &addr).remove(0);
+    let sp_value = (50 * 100_000_000 - FEE) / 2;
+    let (spend_raw, _) = common::build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: sp.parse().unwrap(), vout: 0 },
+        p2tr,
+        sp_value,
+        wallet.address.script_pubkey(),
+        FEE,
+    );
+    send(&spend_raw);
+    mine(&node, 1, &addr);
+    let tip = mine(&node, 10, &addr).pop().unwrap();
+    assert_eq!(node.rpc_ok("getblock", vec![json!(x), json!(1)])["tx"].as_array().unwrap().len(), 3);
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", stripped_dir.display()))
+        .arg(&intact_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "copy the datadir");
+
+    let mut node = TestNode::start_with_datadir(&stripped_dir, rpcport, &["--allowteststrip"]);
+    let out = strip(&node, &x).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    assert_eq!(out["txs"], 2, "{out}");
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    let intact = backfill_and_dump(&intact_dir, rpcport, &tip);
+    let stripped = backfill_and_dump(&stripped_dir, rpcport, &tip);
+    if let Some(diff) = first_difference(&intact, &stripped) {
+        panic!("backfill over stripped blocks differs: {diff}");
+    }
+    let _ = std::fs::remove_dir_all(&stripped_dir);
+    let _ = std::fs::remove_dir_all(&intact_dir);
+}

@@ -216,7 +216,8 @@ impl BackfillRunner {
             for h in (cursor + 1)..=tip_height {
                 self.check_pause_loop()?;
                 let hash = hashes[h as usize];
-                let block = self.chain.get_block(&hash).ok_or_else(|| {
+                // The stored form (see `read_via_snapshot`).
+                let block = self.chain.get_stored_block(&hash).map(|s| s.block).ok_or_else(|| {
                     BackfillError::Chain(format!(
                         "tail catch-up: missing block data for {} at height {}",
                         hash, h
@@ -496,7 +497,11 @@ impl BackfillRunner {
                 snapshot.snapshot_height()
             ))
         })?;
-        self.chain.get_block(&hash).ok_or_else(|| {
+        // The stored form. An OP_RETURN-stripped block's filled form gives a
+        // byte-identical filter: BIP 158 leaves out every output script that
+        // starts with OP_RETURN, and a stripped output still does; its inputs
+        // and its other outputs are intact.
+        self.chain.get_stored_block(&hash).map(|s| s.block).ok_or_else(|| {
             BackfillError::Chain(format!(
                 "missing block data for {} at height {} (pruned or corrupt?)",
                 hash, h
