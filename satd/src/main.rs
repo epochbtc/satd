@@ -3202,10 +3202,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // once. Until it lands, the RPC reports the young buckets as an
     // estimate (`exact: false`). A failed scan is retried a few times with
     // growing waits, then left until the next start.
-    // The OP_RETURN strip worker (plan §2.6), when -pruneopreturn is on. A
-    // thread of its own: every pass is blocking I/O, paced by the tip.
+    // The OP_RETURN strip worker (plan §2.6), when -pruneopreturn is on, or
+    // when it is off on a node that holds stripped blocks: there it only
+    // keeps the totals current as records go. A thread of its own: every
+    // pass is blocking I/O, paced by the tip.
     let strip_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let strip_thread = if config.opreturn_prune_depth > 0 {
+    let strip_thread = if chain_state.opreturn_prune_active() {
         let chain = chain_state.clone();
         let stop = strip_stop.clone();
         match std::thread::Builder::new()

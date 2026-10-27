@@ -1187,3 +1187,30 @@ fn a_reorg_below_the_cursor_rescans_from_the_fork() {
     assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(b[2].block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A record removed by another write (here the append repair; `-prune` and a
+/// fresh full copy go the same way) drops the cached totals, and the
+/// worker's pass adds them up again even with the option off, so
+/// `getblockchaininfo` and `/metrics` stop counting it.
+#[test]
+fn a_record_removed_elsewhere_leaves_the_totals_after_the_next_pass() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1);
+    // A record that does not describe the block, so the repair appends.
+    let mut wrong = record(&cs, &hash).unwrap();
+    wrong.filled_sha256[0] ^= 1;
+    cs.store
+        .write_batch(StoreBatch { opreturn_strip_puts: vec![(hash, wrong.encode())], ..Default::default() })
+        .unwrap();
+    cs.repair_block_data(b).unwrap();
+    assert_eq!(record(&cs, &hash), None, "premise: the append removed the record");
+
+    assert_eq!(pass(&cs, 1000), PassReport::default(), "the option is off");
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

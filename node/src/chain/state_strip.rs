@@ -621,6 +621,14 @@ impl ChainState {
         *self.strip.last_summary.lock()
     }
 
+    /// Whether `hash` has a strip record, for a caller about to remove it
+    /// with other writes: it calls [`Self::forget_strip_summary`] after the
+    /// write when so. One point read, and none on a node that has never
+    /// stripped.
+    pub(super) fn holds_strip_record(&self, hash: &BlockHash) -> bool {
+        self.strip.has_records.load(Ordering::Acquire) && matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
+    }
+
     /// Drop the cached totals and the blocks directory's stat: a record was
     /// written or removed, and a span punched or filled in.
     pub(super) fn forget_strip_summary(&self) {
@@ -659,7 +667,13 @@ impl ChainState {
     /// raised one keeps it, and what is stripped stays stripped.
     pub fn strip_pass(&self, max_blocks: u32, stop: &std::sync::atomic::AtomicBool) -> Result<PassReport, StripError> {
         let Some(config) = self.opreturn_prune_config() else {
+            // The option is off on a node that holds stripped blocks: nothing
+            // to strip, but a record removed since the last pass (`-prune`,
+            // `getblockfrompeer`, a fresh copy) dropped the totals.
             *self.strip.worker.lock() = WorkerStatus::Off;
+            if self.strip.summary.lock().is_none() {
+                let _ = self.opreturn_strip_summary();
+            }
             return Ok(PassReport::default());
         };
         if let Err(StripError::NotQuiet(why)) = self.check_quiet() {
