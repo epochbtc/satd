@@ -432,8 +432,12 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
+    // Mark it the way invalidateblock does. Not through invalidateblock: it
+    // refuses to disconnect a block that already has a strip record (plan
+    // §2.10), which the second case below needs.
     let invalidate = move |cs: &ChainState| {
-        let _ = cs.invalidate_block(hash);
+        let _accept = cs.accept_lock.lock();
+        cs.mark_subtree_invalid(hash).unwrap();
         assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
     };
 
