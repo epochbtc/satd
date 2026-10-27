@@ -247,6 +247,20 @@ pub fn eligible_outputs(block: &Block, threshold: u64) -> Vec<(usize, Vec<u32>)>
         .collect()
 }
 
+/// Whether any non-coinbase output of `block` looks stripped: an OP_RETURN
+/// whose payload after the opcode is non-empty and all zero. That is what a
+/// strip leaves on disk, so a block read with no record that has one may be
+/// a stripped block whose record was lost. It may also be a genuine payload
+/// of zeros, which is why a hit only calls for a merkle check.
+pub fn has_zeroed_op_return(block: &Block) -> bool {
+    block.txdata.iter().skip(1).any(|tx| {
+        tx.output.iter().any(|o| {
+            let script = o.script_pubkey.as_bytes();
+            script.len() >= 2 && script[0] == 0x6a && script[1..].iter().all(|b| *b == 0)
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The strip record
 // ---------------------------------------------------------------------------

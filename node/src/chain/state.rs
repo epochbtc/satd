@@ -14,7 +14,7 @@ use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_fo
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos, PendingRecord};
-use crate::storage::opreturn_strip::{StoredBlock, StoredBlockError, StripRecord};
+use crate::storage::opreturn_strip::{self, StoredBlock, StoredBlockError, StripRecord};
 use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
@@ -4745,6 +4745,25 @@ impl ChainState {
         };
         let on_disk = data.len();
         match StoredBlock::from_bytes(data, record, hash) {
+            // A lost record leaves the zeroed bytes looking intact, and
+            // nothing above checks their txids: only the header hash. So a
+            // block with no record but a zeroed OP_RETURN payload must still
+            // reproduce its merkle root. A genuine payload of zeros does;
+            // punched bytes do not. Only such blocks pay for the check.
+            Ok(stored)
+                if !stored.is_stripped()
+                    && opreturn_strip::has_zeroed_op_return(&stored.block)
+                    && !stored.verify_merkle() =>
+            {
+                self.report_corrupt_block_data(
+                    hash,
+                    &entry,
+                    &pos,
+                    "an OP_RETURN payload is zeroed, no strip record names it, and the txids \
+                     miss the merkle root (a lost strip record?)",
+                );
+                None
+            }
             Ok(stored) => Some(stored),
             Err(e) => {
                 let detail = match e {

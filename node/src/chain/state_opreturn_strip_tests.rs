@@ -374,3 +374,48 @@ fn storing_a_side_chain_copy_over_a_stale_record_drops_the_record() {
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&fork));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A record lost some other way than the writes above, as store corruption
+/// loses a row, leaves the punched bytes looking like an intact block whose
+/// header hash still matches. The zeroed payload calls for a merkle check,
+/// and the check refuses it.
+#[test]
+fn a_lost_strip_record_is_caught_by_the_merkle_check() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain_with_a_big_op_return(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    strip(&cs, b);
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(cs.get_stored_block(&hash).is_none(), "punched bytes must not read as the block");
+    let warning = corrupt_warning(&cs, &hash).expect("a lost record is reported");
+    assert!(warning.contains("lost strip record"), "{warning}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The must-succeed pair: a genuine OP_RETURN payload of zeros, never
+/// stripped, reproduces its merkle root and reads as the block.
+#[test]
+fn a_genuine_zero_payload_reads_as_the_block() {
+    let (cs, dir) = make_chain_state();
+    let blocks = mature_chain(&cs);
+    let mut b = block_with_big_op_return(blocks[100].block_hash(), 102, coinbase_of(&blocks[0]));
+    let mut zeros = vec![0x6a];
+    zeros.resize(PAYLOAD, 0);
+    b.txdata[1].output[1].script_pubkey = ScriptBuf::from_bytes(zeros);
+    b.header.merkle_root = b.compute_merkle_root().unwrap();
+    grind_test_pow(&mut b);
+    assert!(crate::storage::opreturn_strip::has_zeroed_op_return(&b), "premise");
+    assert!(cs.accept_block(&b).expect("accept").connected());
+
+    let hash = b.block_hash();
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&b));
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
