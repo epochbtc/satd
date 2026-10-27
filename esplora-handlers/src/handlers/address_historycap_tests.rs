@@ -28,19 +28,28 @@ use node_index::{
 use tokio::sync::{Semaphore, broadcast};
 
 use super::{build_address_info, build_utxos, compute_chain_stats_from_history};
+use crate::chain_tip::Pin;
 use crate::config::EsploraConfig;
 use crate::error::EsploraError;
 use crate::state::EsploraState;
 
-const SH: Scripthash = [0x5c; 32];
+pub(super) const SH: Scripthash = [0x5c; 32];
 
-fn txid(n: u8) -> Txid {
+/// A pinned tip above every row of [`history`], so all of it is confirmed.
+fn pin_above_all() -> Pin {
+    Pin {
+        hash: bitcoin::BlockHash::all_zeros(),
+        height: u32::MAX,
+    }
+}
+
+pub(super) fn txid(n: u8) -> Txid {
     Txid::from_byte_array([n; 32])
 }
 
 /// Five transactions, five funding and two spending rows, in the
 /// `(height, txid, vout/vin)` order the trait promises.
-fn history() -> Vec<HistoryEntry> {
+pub(super) fn history() -> Vec<HistoryEntry> {
     let fund = |height, n, vout, amount_sat| HistoryEntry::Funding {
         height,
         txid: txid(n),
@@ -124,7 +133,7 @@ impl node::net::manager::TxBroadcaster for NoBroadcast {
 
 /// An Esplora state over an empty regtest chain and [`FixedIndex`], with
 /// the history cap at `cap`.
-fn esplora_state(cap: usize) -> (EsploraState, tempfile::TempDir) {
+pub(super) fn esplora_state(cap: usize) -> (EsploraState, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let chain = Arc::new(
         ChainState::new(
@@ -169,11 +178,11 @@ fn assert_refused(err: EsploraError, cap: usize) {
 #[test]
 fn address_stats_are_refused_over_the_cap_and_unchanged_at_it() {
     let (state, _dir) = esplora_state(4);
-    let err = build_address_info(&state, "label", &SH).expect_err("over the cap");
+    let err = build_address_info(&state, &pin_above_all(), "label", &SH).expect_err("over the cap");
     assert_refused(err, 4);
 
     let (state, _dir) = esplora_state(5);
-    let info = build_address_info(&state, "label", &SH).unwrap();
+    let info = build_address_info(&state, &pin_above_all(), "label", &SH).unwrap();
     let expected = compute_chain_stats_from_history(&history());
     assert_eq!(
         serde_json::to_value(&info.chain_stats).unwrap(),
@@ -196,11 +205,11 @@ fn address_stats_are_refused_over_the_cap_and_unchanged_at_it() {
 #[test]
 fn utxo_list_is_refused_over_the_history_cap_and_unchanged_at_it() {
     let (state, _dir) = esplora_state(4);
-    let err = build_utxos(&state, &SH).expect_err("over the cap");
+    let err = build_utxos(&state, &pin_above_all(), &SH).expect_err("over the cap");
     assert_refused(err, 4);
 
     let (state, _dir) = esplora_state(5);
-    let got: Vec<(String, u32, u64)> = build_utxos(&state, &SH)
+    let got: Vec<(String, u32, u64)> = build_utxos(&state, &pin_above_all(), &SH)
         .unwrap()
         .into_iter()
         .map(|u| (u.txid, u.vout, u.value))

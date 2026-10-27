@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod blocking;
+pub mod chain_tip;
 pub mod config;
 pub mod encode;
 pub mod error;
@@ -26,6 +27,8 @@ pub mod handlers;
 pub mod router;
 pub mod serve;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 
 pub use blocking::work_permits_for;
 pub use config::{EsploraAuth, EsploraConfig};

@@ -18,6 +18,7 @@ use node::storage::Store;
 use satd_auth::{Capability, Principal};
 use serde::{Deserialize, Serialize};
 
+use crate::chain_tip::Pin;
 use crate::error::{EsploraError, EsploraResult};
 use crate::state::EsploraState;
 
@@ -27,14 +28,16 @@ fn parse_txid(s: &str) -> EsploraResult<Txid> {
 }
 
 /// `/tx/:txid` → full tx JSON. Looks up via txindex first; falls back
-/// to the mempool when not yet confirmed.
+/// to the mempool when not yet confirmed. Confirmed means at or below the
+/// pinned tip (see [`lookup_confirmed_at`]).
 pub async fn tx_detail(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(txid): Path<String>,
 ) -> EsploraResult<Json<TxJson>> {
     let txid = parse_txid(&txid)?;
-    if let Some((tx, location)) = lookup_confirmed(&state, &txid)? {
-        Ok(Json(build_tx_json(&state, &tx, Some(location))?))
+    if let Some((tx, location)) = lookup_confirmed_at(&state, &txid, &pin)? {
+        Ok(Json(build_tx_json(&state, &tx, location)?))
     } else if let Some(tx) = lookup_mempool(&state, &txid) {
         Ok(Json(build_tx_json(&state, &tx, None)?))
     } else {
@@ -45,15 +48,19 @@ pub async fn tx_detail(
 /// `/tx/:txid/status` → `{confirmed, block_height?, block_hash?, block_time?}`.
 pub async fn tx_status(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(txid): Path<String>,
 ) -> EsploraResult<Json<TxStatusJson>> {
     let txid = parse_txid(&txid)?;
-    if let Some((_, location)) = lookup_confirmed(&state, &txid)? {
-        Ok(Json(TxStatusJson {
-            confirmed: true,
-            block_height: Some(location.height),
-            block_hash: Some(location.block_hash.to_string()),
-            block_time: Some(location.block_time),
+    if let Some((_, location)) = lookup_confirmed_at(&state, &txid, &pin)? {
+        Ok(Json(match location {
+            Some(location) => TxStatusJson {
+                confirmed: true,
+                block_height: Some(location.height),
+                block_hash: Some(location.block_hash.to_string()),
+                block_time: Some(location.block_time),
+            },
+            None => unconfirmed_status(),
         }))
     } else if lookup_mempool(&state, &txid).is_some() {
         Ok(Json(TxStatusJson {
@@ -282,6 +289,40 @@ fn lookup_confirmed(
             block_time: entry.header.time,
         },
     )))
+}
+
+/// [`lookup_confirmed`] as of `pin`: a transaction confirmed above the pinned
+/// tip comes back with no location. It confirmed while the request ran, and
+/// as of the pinned tip it was unconfirmed.
+fn lookup_confirmed_at(
+    state: &EsploraState,
+    txid: &Txid,
+    pin: &Pin,
+) -> EsploraResult<Option<(Transaction, Option<ConfirmedLocation>)>> {
+    Ok(lookup_confirmed(state, txid)?
+        .map(|(tx, location)| (tx, Some(location).filter(|l| pin.covers(l.height)))))
+}
+
+pub(crate) fn unconfirmed_status() -> TxStatusJson {
+    TxStatusJson {
+        confirmed: false,
+        block_height: None,
+        block_hash: None,
+        block_time: None,
+    }
+}
+
+/// Full JSON for a transaction the txindex has confirmed above the pinned
+/// tip, as the unconfirmed transaction it was at the pin. `None` if the
+/// txindex does not hold it.
+pub(crate) fn build_late_tx_json(
+    state: &EsploraState,
+    txid: &Txid,
+) -> EsploraResult<Option<TxJson>> {
+    match lookup_confirmed(state, txid)? {
+        Some((tx, _)) => Ok(Some(build_tx_json(state, &tx, None)?)),
+        None => Ok(None),
+    }
 }
 
 fn lookup_mempool(state: &EsploraState, txid: &Txid) -> Option<Transaction> {

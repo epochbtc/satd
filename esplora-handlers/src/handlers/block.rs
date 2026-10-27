@@ -23,6 +23,7 @@ use axum::http::{HeaderValue, Response, StatusCode};
 use bitcoin::BlockHash;
 use bitcoin::consensus::{Encodable, encode::serialize};
 
+use crate::chain_tip::Pin;
 use crate::encode::{BlockHeaderJson, block_header_json};
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::tx::{TxJson, build_block_tx_json};
@@ -118,6 +119,7 @@ pub struct BlockStatusJson {
 
 pub async fn block_status(
     State(state): State<EsploraState>,
+    axum::Extension(pin): axum::Extension<Pin>,
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<BlockStatusJson>> {
     let hash = parse_hash(&hash)?;
@@ -125,15 +127,11 @@ pub async fn block_status(
         .chain
         .get_block_index(&hash)
         .ok_or(EsploraError::NotFound)?;
-    let in_best = state
-        .chain
-        .get_block_hash_by_height(entry.height)
-        .map(|h| h == hash)
-        .unwrap_or(false);
+    // Status as of the pinned tip: a block above it is not yet in the best
+    // chain, and the pinned tip has no next block.
+    let in_best = pin.hash_at_height(&state.chain, entry.height) == Some(hash);
     let next_best = if in_best {
-        state
-            .chain
-            .get_block_hash_by_height(entry.height + 1)
+        pin.hash_at_height(&state.chain, entry.height + 1)
             .map(|h| h.to_string())
     } else {
         None
