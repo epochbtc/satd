@@ -254,3 +254,27 @@ fn build_single_push(data: &[u8]) -> Vec<u8> {
     result.extend_from_slice(data);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_push_only_skips_push_data() {
+        // Each push form carries three OP_CHECKSIG bytes as data: still push
+        // only. An OP_CHECKSIG after the push is not.
+        let pushes: [&[u8]; 4] = [
+            &[0x03],
+            &[0x4c, 0x03],
+            &[0x4d, 0x03, 0x00],
+            &[0x4e, 0x03, 0x00, 0x00, 0x00],
+        ];
+        for push in pushes {
+            let mut script = push.to_vec();
+            script.extend([0xac; 3]);
+            assert!(is_push_only(&script), "push {push:02x?}");
+            script.push(0xac);
+            assert!(!is_push_only(&script), "push {push:02x?} then OP_CHECKSIG");
+        }
+    }
+}

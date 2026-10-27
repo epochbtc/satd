@@ -114,3 +114,17 @@ pub fn valid_flags(flags: u32) -> bool {
 pub fn has_flag(flags: u32, flag: u32) -> bool {
     flags & flag != 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// libbitcoinconsensus's `VERIFY_ALL` without taproot: P2SH, DERSIG,
+    /// NULLDUMMY, CHECKLOCKTIMEVERIFY, CHECKSEQUENCEVERIFY and WITNESS, bits
+    /// 0, 2, 4, 9, 10 and 11 of Core's `script_verify_flag_name`. A literal,
+    /// so the check does not repeat the expression it pins.
+    #[test]
+    fn all_pre_taproot_is_libconsensus_verify_all_without_taproot() {
+        assert_eq!(VERIFY_ALL_PRE_TAPROOT, 0b1110_0001_0101);
+    }
+}

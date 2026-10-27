@@ -686,6 +686,16 @@ mod tests {
     use bitcoin::hashes::Hash;
     use std::collections::HashMap;
 
+    /// Core's `StateName` (`src/versionbits.cpp`).
+    #[test]
+    fn state_names_are_cores() {
+        assert_eq!(ThresholdState::Defined.as_str(), "defined");
+        assert_eq!(ThresholdState::Started.as_str(), "started");
+        assert_eq!(ThresholdState::LockedIn.as_str(), "locked_in");
+        assert_eq!(ThresholdState::Active.as_str(), "active");
+        assert_eq!(ThresholdState::Failed.as_str(), "failed");
+    }
+
     /// A straight chain of synthetic headers, indexed by hash. Height `h`
     /// gets hash `[h as bytes]`, so a test can name any block cheaply.
     struct FakeChain {

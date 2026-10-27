@@ -45,6 +45,25 @@ fn op_success_prescan_finds_left_right_and_bitwise_opcodes() {
     assert_eq!(scan_for_op_success(&[0x82], 0), None);
 }
 
+#[test]
+fn op_success_prescan_skips_push_data() {
+    // Each push form carries three OP_SUCCESS80 bytes as data, which the
+    // prescan steps over as GetOp does. An OP_SUCCESS80 after the push counts.
+    let pushes: [&[u8]; 4] = [
+        &[0x03],
+        &[0x4c, 0x03],
+        &[0x4d, 0x03, 0x00],
+        &[0x4e, 0x03, 0x00, 0x00, 0x00],
+    ];
+    for push in pushes {
+        let mut leaf = push.to_vec();
+        leaf.extend([0x50; 3]);
+        assert_eq!(scan_for_op_success(&leaf, 0), None, "push {push:02x?}");
+        leaf.push(0x50);
+        assert_eq!(scan_for_op_success(&leaf, 0), Some(Ok(())), "push {push:02x?} then OP_SUCCESS80");
+    }
+}
+
 const P2A_PROGRAM: [u8; 2] = [0x4e, 0x73];
 
 fn discourage() -> u32 {
