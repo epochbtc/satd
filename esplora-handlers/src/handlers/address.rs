@@ -266,8 +266,14 @@ fn build_address_info(
 ) -> EsploraResult<AddressInfoJson> {
     let history = capped_history(state, sh)?;
     let (chain_stats, late) = split_stats_at_pin(&history, pin);
-    let mut mempool_stats = build_mempool_stats(state, sh, &late);
-    add_stats(&mut mempool_stats, &late);
+    // As of a block (`?asof=`) the answer has no mempool part.
+    let mempool_stats = if pin.mempool {
+        let mut stats = build_mempool_stats(state, sh, &late);
+        add_stats(&mut stats, &late);
+        stats
+    } else {
+        compute_chain_stats_from_history(&[])
+    };
     Ok(AddressInfoJson {
         address: label.to_string(),
         chain_stats,
@@ -760,6 +766,16 @@ fn build_combined_txs(
     sh: &Scripthash,
     after_txid: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
+    // As of a block (`?asof=`), only the confirmed part.
+    if !pin.mempool {
+        return match after_txid {
+            None => build_chain_txs(state, pin, sh, None),
+            Some(cursor) => match pinned_page(state, pin, sh, Some(cursor))? {
+                Some(page) => render_confirmed_txs(state, &page),
+                None => Err(after_txid_not_found()),
+            },
+        };
+    }
     // Mempool first, then the confirmed history: a transaction that
     // confirms between the two reads is still in at least one of them.
     let mempool = mempool_txids_in_admission_order(state, sh);
@@ -910,6 +926,9 @@ fn build_utxos(
     pin: &Pin,
     sh: &Scripthash,
 ) -> EsploraResult<Vec<UtxoJson>> {
+    if !pin.mempool {
+        return build_utxos_as_of(state, pin, sh);
+    }
     // Build the mempool-spent-outpoint set up front so we can filter
     // both confirmed and mempool-created UTXOs against it. The set
     // covers every prev_output of every mempool tx touching `sh`.
@@ -988,6 +1007,59 @@ fn build_utxos(
         }
     }
 
+    Ok(out)
+}
+
+/// `/utxo?asof=`: the outputs funded at or below the pin and not spent at or
+/// below it, from the history rows alone. The live coin set cannot answer
+/// this: a later spend has removed the coin.
+fn build_utxos_as_of(
+    state: &EsploraState,
+    pin: &Pin,
+    sh: &Scripthash,
+) -> EsploraResult<Vec<UtxoJson>> {
+    let history = capped_history(state, sh)?;
+    let spent: std::collections::HashSet<OutPoint> = history
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Spending {
+                height,
+                prev_outpoint,
+                ..
+            } if pin.covers(*height) => Some(*prev_outpoint),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for e in &history {
+        let HistoryEntry::Funding {
+            height,
+            txid,
+            vout,
+            amount_sat,
+        } = e
+        else {
+            continue;
+        };
+        if !pin.covers(*height) || spent.contains(&OutPoint { txid: *txid, vout: *vout }) {
+            continue;
+        }
+        let block_hash = pin.hash_at_height(&state.chain, *height);
+        let block_time = block_hash
+            .and_then(|h| state.chain.get_block_index(&h))
+            .map(|entry| entry.header.time);
+        out.push(UtxoJson {
+            txid: txid.to_string(),
+            vout: *vout,
+            value: *amount_sat,
+            status: TxStatusJson {
+                confirmed: true,
+                block_height: Some(*height),
+                block_hash: block_hash.map(|h| h.to_string()),
+                block_time,
+            },
+        });
+    }
     Ok(out)
 }
 

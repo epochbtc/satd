@@ -62,7 +62,9 @@ pub async fn tx_status(
             },
             None => unconfirmed_status(),
         }))
-    } else if lookup_mempool(&state, &txid).is_some() {
+    } else if pin.mempool && lookup_mempool(&state, &txid).is_some() {
+        // As of a block (`?asof=`), a transaction only in the mempool is
+        // unknown.
         Ok(Json(TxStatusJson {
             confirmed: false,
             block_height: None,

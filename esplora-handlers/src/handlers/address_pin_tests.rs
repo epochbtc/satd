@@ -17,6 +17,7 @@ fn pin_at(height: u32) -> Pin {
     Pin {
         hash: BlockHash::all_zeros(),
         height,
+        mempool: true,
     }
 }
 
@@ -84,4 +85,41 @@ fn confirmed_pages_hold_only_rows_at_or_below_the_pin() {
     // A cursor continues below itself; one not in the history is None.
     assert_eq!(rows(5, Some(txid(4))), Some(vec![5, 5, 3]));
     assert_eq!(rows(5, Some(txid(0xee))), None);
+}
+
+fn asof(height: u32) -> Pin {
+    Pin {
+        mempool: false,
+        ..pin_at(height)
+    }
+}
+
+/// As of a block, the UTXOs are the outputs funded at or below it and not
+/// spent at or below it: tx 2's output, spent at 9, is unspent as of 5,
+/// and tx 1's, spent at 5, is not. Read from the history, not the live
+/// coin set.
+#[test]
+fn asof_utxos_come_from_the_history_at_the_pin() {
+    let (state, _dir) = esplora_state(100);
+    let got: Vec<(String, u32, bool)> = build_utxos(&state, &asof(5), &SH)
+        .unwrap()
+        .into_iter()
+        .map(|u| (u.txid, u.vout, u.status.confirmed))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(txid(2).to_string(), 0, true), (txid(3).to_string(), 1, true)]
+    );
+    assert_eq!(build_utxos(&state, &asof(2), &SH).unwrap().len(), 0);
+}
+
+#[test]
+fn asof_stats_have_no_mempool_part() {
+    let (state, _dir) = esplora_state(100);
+    let info = build_address_info(&state, &asof(5), "label", &SH).unwrap();
+    assert_eq!(info.chain_stats.tx_count, 3);
+    assert_eq!(
+        serde_json::to_value(&info.mempool_stats).unwrap(),
+        serde_json::to_value(compute_chain_stats_from_history(&[])).unwrap()
+    );
 }

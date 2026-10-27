@@ -68,7 +68,7 @@ pub async fn tx_outspend(
     // Without this check, every malformed request fell through to the
     // bottom of build_outspend and returned `200 {spent:false}`, which
     // looks indistinguishable from a real unspent outpoint.
-    let output_count = output_count_of(&state, &txid)?;
+    let output_count = output_count_of(&state, &pin, &txid)?;
     if vout as usize >= output_count {
         return Err(EsploraError::NotFound);
     }
@@ -86,12 +86,16 @@ pub async fn tx_outspends(
     // Determine the tx's output count. For confirmed txs we look up the
     // tx body via txindex; for mempool txs we read it from the entry.
     // Either path returns the output count without serializing the body.
-    let output_count = output_count_of(&state, &txid)?;
+    let output_count = output_count_of(&state, &pin, &txid)?;
 
     // Precompute the mempool's prev_output → (spending_txid, vin)
     // index once per request so /outspends is O(N) rather than
     // O(N × mempool_size).
-    let mempool_index = build_mempool_spent_index(&state);
+    let mempool_index = if pin.mempool {
+        build_mempool_spent_index(&state)
+    } else {
+        HashMap::new()
+    };
 
     // Confirmed spends for the whole transaction in one prefix scan.
     // The spend index keys on the funding transaction's ordinal, so all
@@ -184,6 +188,7 @@ fn build_outspend(
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
         return Ok(confirmed_outspend(state, pin, &sref));
     }
+    // Empty as of a block (`?asof=`).
     if let Some((spend_txid, vin)) = mempool_index.get(outpoint) {
         return Ok(mempool_outspend(*spend_txid, *vin));
     }
@@ -207,6 +212,9 @@ fn build_outspend_one(
     // matching the batched `/outspends` path (`build_mempool_spent_index`) and
     // `getrawmempool`. The single-output path previously used the unfiltered
     // `spending_tx`, so the two endpoints disagreed for the same outpoint.
+    if !pin.mempool {
+        return Ok(unspent_outspend());
+    }
     if let Some((spend_txid, vin)) = state.mempool.spending_tx_acting(outpoint) {
         return Ok(mempool_outspend(spend_txid, vin));
     }
@@ -215,13 +223,18 @@ fn build_outspend_one(
 
 /// A spend the spend index holds. One confirmed above the pinned tip
 /// confirmed while the request ran: as of the pin it was a mempool spend.
+/// As of a block (`?asof=`), with no mempool, the output was unspent.
 fn confirmed_outspend(
     state: &EsploraState,
     pin: &Pin,
     sref: &node_index::SpendingRef,
 ) -> OutspendJson {
     if !pin.covers(sref.height) {
-        return mempool_outspend(sref.spending_txid, sref.spending_vin);
+        return if pin.mempool {
+            mempool_outspend(sref.spending_txid, sref.spending_vin)
+        } else {
+            unspent_outspend()
+        };
     }
     let block_hash = pin.hash_at_height(&state.chain, sref.height);
     let block_time = block_hash
@@ -265,7 +278,11 @@ fn unspent_outspend() -> OutspendJson {
 
 /// Resolve a tx's output count without serializing the body. Confirmed
 /// txs are looked up via txindex; mempool txs are read from the entry.
-fn output_count_of(state: &EsploraState, txid: &Txid) -> EsploraResult<usize> {
+///
+/// As of a block (`?asof=`) a transaction only in the mempool is unknown. One
+/// the txindex holds is known at any height, as rbitcoin answers: its
+/// outputs are unspent until a spend at or below the pin.
+fn output_count_of(state: &EsploraState, pin: &Pin, txid: &Txid) -> EsploraResult<usize> {
     if state.chain.store_ref().has_txindex()
         && let Some(block_hash) = state.chain.store_ref().get_tx_location(txid)
         && let Some(block) = state.chain.get_block(&block_hash)
@@ -273,7 +290,9 @@ fn output_count_of(state: &EsploraState, txid: &Txid) -> EsploraResult<usize> {
     {
         return Ok(tx.output.len());
     }
-    if let Some(entry) = state.mempool.get(txid) {
+    if pin.mempool
+        && let Some(entry) = state.mempool.get(txid)
+    {
         return Ok(entry.tx.output.len());
     }
     Err(EsploraError::NotFound)

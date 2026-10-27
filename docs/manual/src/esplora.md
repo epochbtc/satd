@@ -237,6 +237,35 @@ that a disconnect interrupts eight times in a row answers 503
 The mempool part of an answer (unconfirmed transactions, mempool stats and
 UTXOs, mempool spends) is read as it is when the request reads it.
 
+## As of a block: `?asof=<blockhash>`
+
+Some routes answer as of an earlier block on the best chain, given its hash
+(display hex, as `/block/:hash` takes it):
+
+```sh
+curl "http://127.0.0.1:3000/address/bc1q.../utxo?asof=00000000000000000002a7c4..."
+```
+
+| Route | As of the block |
+|---|---|
+| `/address/:address` <br> `/scripthash/:hash` | `chain_stats` over blocks up to and including it; `mempool_stats` all zero. |
+| `.../txs` | The confirmed transactions only, newest first; `?after_txid=` pages them. |
+| `.../txs/chain[/:last_seen_txid]` | The confirmed transactions up to it. |
+| `.../utxo` | Outputs funded up to it and not spent up to it, all confirmed. |
+| `/tx/:txid/status` | `confirmed: true` if it confirmed up to it, `confirmed: false` if later; 404 if only in the mempool. |
+| `/tx/:txid/outspend/:vout` <br> `/tx/:txid/outspends` | Spent only by a spend confirmed up to it; a later or mempool spend leaves the output unspent. 404 for a transaction only in the mempool. |
+
+The mempool is never part of the answer. The
+[chain-tip headers](#chain-tip-headers) name the asof block and its height.
+
+A hash that is not a block on the best chain is 404, and so is one that leaves
+the best chain while the request runs: satd never answers from another block
+at that height. A malformed or empty `asof`, or `asof` on any route not in
+the table, is 404 too. `/utxo?asof=` is worked out from the address's
+history, not the live coin set, so it is refused above the same history cap
+as the stats. rbitcoin's Esplora takes the same parameter with the same
+rules.
+
 Every route carries the headers except `POST /tx`, `/mempool`,
 `/mempool/txids`, `/mempool/recent`, `/fee-estimates`, the
 `/txs/mempool` lists and the SSE streams, which do not read the chain.
