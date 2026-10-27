@@ -137,6 +137,11 @@ impl SplitStore {
             // genesis→base fills land in one CF — visible to getchaintxstats
             // before and after handoff.
             chain_tx_puts: std::mem::take(&mut batch.chain_tx_puts),
+            // Strip records describe the bytes in the shared block files,
+            // so they live beside the block index that points at them.
+            opreturn_strip_puts: std::mem::take(&mut batch.opreturn_strip_puts),
+            opreturn_strip_removes: std::mem::take(&mut batch.opreturn_strip_removes),
+            opreturn_strip_meta: batch.opreturn_strip_meta.take(),
             ..StoreBatch::default()
         };
         (block_batch, batch)
@@ -155,6 +160,14 @@ impl Store for SplitStore {
 
     fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
         self.block_store.get_cumulative_tx_count(hash)
+    }
+
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        self.block_store.get_opreturn_strip(hash)
+    }
+
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.block_store.opreturn_strip_meta()
     }
 
     fn chain_tx_backfill_complete(&self) -> bool {

@@ -14,6 +14,7 @@ use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_fo
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos, PendingRecord};
+use crate::storage::opreturn_strip::{self, StoredBlock, StoredBlockError, StripRecord};
 use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
@@ -4665,7 +4666,24 @@ impl ChainState {
         );
     }
 
-    pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
+    /// The block as stored: intact, or OP_RETURN-stripped with its record
+    /// applied, so a stripped block comes back in its filled form with the
+    /// original txids.
+    ///
+    /// The bytes are read before the record is looked up. The strip worker
+    /// commits a record before it punches the bytes it describes, so a read
+    /// that found no record read the bytes before the record existed, and
+    /// therefore before any punch: they are intact. A read that found the
+    /// record zero-fills the spans, so bytes punched or torn under it do not
+    /// matter. Looking the record up first would let a strip land in between
+    /// and serve the zeroed bytes as an intact block.
+    pub fn get_stored_block(&self, hash: &BlockHash) -> Option<StoredBlock> {
+        self.read_stored_block(hash, true)
+    }
+
+    /// [`Self::get_stored_block`], which may retry once when the block's
+    /// entry moved under it.
+    fn read_stored_block(&self, hash: &BlockHash, may_retry: bool) -> Option<StoredBlock> {
         let entry = self.store.get_block_index(hash)?;
         // HeaderOnly/Pruned entries never carry local block data. An `Invalid`
         // block (set only by `invalidate_block`) KEEPS its data on disk, and
@@ -4705,40 +4723,103 @@ impl ChainState {
                 return None;
             }
         };
-        let block: Block = match bitcoin::consensus::deserialize(&data) {
-            Ok(block) => block,
+        // The record lookup comes second; see the function doc.
+        let record = match self.store.get_opreturn_strip(hash) {
+            Ok(None) => None,
+            Ok(Some(bytes)) => match StripRecord::decode(&bytes) {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    self.report_corrupt_block_data(
+                        hash,
+                        &entry,
+                        &pos,
+                        &format!("strip record does not decode: {e}"),
+                    );
+                    return None;
+                }
+            },
+            // Not "no record": that would serve punched bytes as the block.
             Err(e) => {
                 self.report_corrupt_block_data(
                     hash,
                     &entry,
                     &pos,
-                    &format!("record does not deserialize ({} bytes on disk): {e}", data.len()),
+                    &format!("strip record could not be read: {e}"),
                 );
                 return None;
             }
         };
-        // Verify the record we landed on is the block we asked for.
-        //
-        // The recorded offset can describe the wrong record — that is the
-        // whole failure class the flat-file durability work addresses, and a
-        // mis-recorded offset lands on another record's *start*, not on
-        // garbage, so deserialization succeeds and returns a different block
-        // under the requested hash. Without this check `getblock` serves the
-        // wrong block, `block_data_readable` reports a broken entry as
-        // healthy, and `getblockfrompeer` refuses to repair it.
-        if block.block_hash() != *hash {
-            self.report_corrupt_block_data(
-                hash,
-                &entry,
-                &pos,
-                &format!(
-                    "record holds a different block ({}); the entry points at the wrong offset",
-                    block.block_hash()
-                ),
-            );
-            return None;
+        let on_disk = data.len();
+        match StoredBlock::from_bytes(data, record, hash) {
+            // A lost record leaves the zeroed bytes looking intact, and
+            // nothing above checks their txids: only the header hash. So a
+            // block with no record but a zeroed OP_RETURN payload must still
+            // reproduce its merkle root. A genuine payload of zeros does;
+            // punched bytes do not. Only such blocks pay for the check.
+            Ok(stored)
+                if !stored.is_stripped()
+                    && opreturn_strip::has_zeroed_op_return(&stored.block)
+                    && !stored.verify_merkle() =>
+            {
+                // A repair can point the entry at a fresh copy and drop the
+                // record in one batch, between this reader's index read and
+                // its record lookup. The reader then holds the old, punched
+                // bytes and no record, on a store that is consistent. Read
+                // again from where the entry points now.
+                let moved = self.store.get_block_index(hash).is_some_and(|now| {
+                    now.file_number != entry.file_number || now.data_pos != entry.data_pos
+                });
+                if moved && may_retry {
+                    return self.read_stored_block(hash, false);
+                }
+                self.report_corrupt_block_data(
+                    hash,
+                    &entry,
+                    &pos,
+                    "an OP_RETURN payload is zeroed, no strip record names it, and the txids \
+                     miss the merkle root (a lost strip record?)",
+                );
+                None
+            }
+            Ok(stored) => Some(stored),
+            Err(e) => {
+                let detail = match e {
+                    StoredBlockError::Deserialize(e) => {
+                        format!("record does not deserialize ({on_disk} bytes on disk): {e}")
+                    }
+                    // The recorded offset can describe the wrong record —
+                    // that is the whole failure class the flat-file
+                    // durability work addresses, and a mis-recorded offset
+                    // lands on another record's *start*, not on garbage, so
+                    // deserialization succeeds and returns a different block
+                    // under the requested hash. Without this check
+                    // `getblock` serves the wrong block,
+                    // `block_data_readable` reports a broken entry as
+                    // healthy, and `getblockfrompeer` refuses to repair it.
+                    StoredBlockError::WrongHash { got, .. } => format!(
+                        "record holds a different block ({got}); the entry points at the wrong offset"
+                    ),
+                    // The record does not fit the bytes it was found with:
+                    // spans that are not OP_RETURN outputs of the recorded
+                    // sizes, a filled form that hashes wrong, or txids that
+                    // miss the header's merkle root.
+                    e => format!("strip record does not match the stored bytes: {e}"),
+                };
+                self.report_corrupt_block_data(hash, &entry, &pos, &detail);
+                None
+            }
         }
-        Some(block)
+    }
+
+    /// The block, only if it is stored intact.
+    ///
+    /// A stripped block is `None`, and that is not corruption, so no warning
+    /// is raised for it: stripping is a choice the operator made. Callers that
+    /// can serve a stripped block use [`Self::get_stored_block`]; every other
+    /// caller sees "unavailable", never a block whose recomputed txids are
+    /// wrong.
+    pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
+        self.get_stored_block(hash).and_then(StoredBlock::into_intact)
     }
 
     /// Report a live `block_index` entry whose block data is unusable.
@@ -5068,6 +5149,10 @@ impl ChainState {
             {
                 batch.height_hash_puts.push((new_height, block_hash));
             }
+            // The entry now points at a fresh full copy, which supersedes
+            // any strip record left from an earlier copy (one a `-reindex`
+            // could not find, say).
+            batch.opreturn_strip_removes.push(block_hash);
             self.write_chain_batch(batch)?;
             // Core's `ReceivedBlockTransactions`, called under the same lock
             // that made the data durable: this block's arrival order is now
@@ -5270,6 +5355,9 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, repaired));
+        // The entry now points at the appended full copy; a strip record of
+        // the old one no longer describes it.
+        batch.opreturn_strip_removes.push(hash);
         self.write_chain_batch(batch)?;
         // Readable data where there was none can unblock a reorg that failed
         // on it, so `activate_best_stored_chain` should look again.
@@ -7707,6 +7795,9 @@ impl ChainState {
             // above the tip follow the new best header.
             let mut batch = crate::storage::StoreBatch::default();
             batch.block_index_puts.push((block_hash, entry.clone()));
+            // A fresh full copy supersedes any strip record (see
+            // `commit_block_store`).
+            batch.opreturn_strip_removes.push(block_hash);
             let batch_index = std::collections::HashMap::from([(block_hash, entry.clone())]);
             self.commit_accepted_headers_locked(
                 batch,
@@ -8151,6 +8242,10 @@ impl ChainState {
             }
         };
 
+        // The connect points the entry at the copy written above, which
+        // supersedes any strip record (see `commit_block_store`).
+        let mut batch = batch;
+        batch.opreturn_strip_removes.push(block_hash);
         let _chain_mutation = self.begin_chain_mutation();
         if let Err(e) = self.write_chain_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
@@ -10166,6 +10261,8 @@ impl ChainState {
                 }
                 tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
                 batch.block_index_puts.push((*hash, entry));
+                // The bytes a strip record describes are gone with the file.
+                batch.opreturn_strip_removes.push(*hash);
             }
             deleted += 1;
             tracing::info!(file = file_num, "Deleted block file");
@@ -10281,6 +10378,11 @@ mod ctxcheck_tests;
 #[cfg(test)]
 #[path = "state_assumevalid_tests.rs"]
 mod assumevalid_tests;
+
+// Unix only: the tests overwrite block files in place with `FileExt`.
+#[cfg(all(test, unix))]
+#[path = "state_opreturn_strip_tests.rs"]
+mod opreturn_strip_tests;
 
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,

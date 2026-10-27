@@ -69,6 +69,10 @@ pub struct InMemoryStore {
     spent_complete: parking_lot::RwLock<bool>,
     sp_backfill_cursor: parking_lot::RwLock<node_sp_index::cursor::BackfillCursor>,
     sp_backfill_last_error: parking_lot::RwLock<Option<String>>,
+    /// OP_RETURN strip records by block hash, and the worker's meta.
+    /// Neither clear touches them, as in the RocksDB store.
+    opreturn_strip: parking_lot::RwLock<std::collections::HashMap<BlockHash, Vec<u8>>>,
+    opreturn_strip_meta: parking_lot::RwLock<Option<Vec<u8>>>,
 }
 
 impl Default for InMemoryStore {
@@ -129,6 +133,8 @@ impl InMemoryStore {
                 node_sp_index::cursor::BackfillCursor::idle(),
             ),
             sp_backfill_last_error: parking_lot::RwLock::new(None),
+            opreturn_strip: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            opreturn_strip_meta: parking_lot::RwLock::new(None),
         }
     }
 
@@ -335,7 +341,31 @@ impl Store for InMemoryStore {
             }
         }
 
+        if !batch.opreturn_strip_puts.is_empty()
+            || !batch.opreturn_strip_removes.is_empty()
+            || batch.opreturn_strip_meta.is_some()
+        {
+            let mut st = self.opreturn_strip.write();
+            for (hash, record) in batch.opreturn_strip_puts {
+                st.insert(hash, record);
+            }
+            for hash in batch.opreturn_strip_removes {
+                st.remove(&hash);
+            }
+            if let Some(meta) = batch.opreturn_strip_meta {
+                *self.opreturn_strip_meta.write() = Some(meta);
+            }
+        }
+
         Ok(())
+    }
+
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.opreturn_strip.read().get(hash).cloned())
+    }
+
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.opreturn_strip_meta.read().clone())
     }
 
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
