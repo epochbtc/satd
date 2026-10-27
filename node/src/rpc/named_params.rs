@@ -214,7 +214,6 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getzmqnotifications" => &[],
         "help" => &[("command", false)],
         "invalidateblock" => &[("blockhash", false)],
-        "stripopreturns" => &[("blockhash", false), ("threshold", false)],
         "joinpsbts" => &[("txs", false)],
         "listbanned" => &[],
         // SATD_ONLY: listnapaggregate
@@ -246,6 +245,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "signmessagewithprivkey" => &[("privkey", false), ("message", false)],
         "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
         "stop" => &[("wait", false)],
+        "stripopreturns" => &[("blockhash", false), ("threshold", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
         "submitheader" => &[("hexdata", false)],
         // SATD_ONLY: submitnapattestation
