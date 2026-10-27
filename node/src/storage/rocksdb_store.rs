@@ -4067,13 +4067,14 @@ mod tests {
         }
         let mut created = DB::list_cf(&Options::default(), dir.path().join("chainstate")).unwrap();
         // The backfill temp CF is created lazily when a backfill starts,
-        // so a freshly opened store has not made it yet.
-        created.retain(|n| n != CF_ADDR_BACKFILL_TEMP);
+        // and the strip CF by the first strip, so a freshly opened store
+        // has made neither yet.
+        created.retain(|n| n != CF_ADDR_BACKFILL_TEMP && n != CF_OPRETURN_STRIP);
         created.sort();
 
         let mut listed: Vec<String> = ALL_CFS
             .iter()
-            .filter(|n| **n != CF_ADDR_BACKFILL_TEMP)
+            .filter(|n| **n != CF_ADDR_BACKFILL_TEMP && **n != CF_OPRETURN_STRIP)
             .map(|n| n.to_string())
             .collect();
         listed.sort();
