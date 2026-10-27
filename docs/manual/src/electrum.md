@@ -159,6 +159,8 @@ do not describe one chain.
   its fee when its inputs can be read; `get_balance` counts it in
   `unconfirmed`; `transaction.get` gives it no block, and `get_merkle`
   and `id_from_pos` no proof or position.
+- A mempool transaction whose parent confirmed above the pinned tip spent
+  an unconfirmed parent as of it, and has height `-1` too.
 - `transaction.get`'s `confirmations` counts to the pinned tip.
 - A disconnect while a request runs (a reorg, or `invalidateblock`) runs it
   again at the new tip. One that a disconnect interrupts eight times in a

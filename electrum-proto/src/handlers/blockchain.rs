@@ -181,7 +181,22 @@ fn pinned_history_rows(
     let mempool = state.mempool.as_ref();
     idx.check_history_cap(sh, cap)
         .map_err(JsonRpcError::from_index)?;
-    let mempool_rows = mempool_history_rows(idx, sh, |txid| mempool_facts(mempool, txid));
+    let mut mempool_rows = mempool_history_rows(idx, sh, |txid| mempool_facts(mempool, txid));
+    // `-1` as of the pin, not as of now: a parent that confirmed above the
+    // pin was unconfirmed then.
+    let mut moved = false;
+    for row in mempool_rows.iter_mut().filter(|r| r.height == 0) {
+        if mempool
+            .get(&row.txid)
+            .is_some_and(|entry| spends_above_pin(state, &entry.tx, pin))
+        {
+            row.height = -1;
+            moved = true;
+        }
+    }
+    if moved {
+        sort_mempool_rows(&mut mempool_rows);
+    }
     let mut rows: Vec<HistoryRow> = idx
         .confirmed_txs_in_chain_order(sh, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?
@@ -308,6 +323,25 @@ impl<'a> LateFacts<'a> {
         let fee = input_sum.and_then(|sum| sum.checked_sub(output_sum));
         (if unconfirmed_parent { -1 } else { 0 }, fee)
     }
+}
+
+/// Whether `tx`, in the mempool now, spends a transaction confirmed above
+/// the pin: one that was unconfirmed as of the pin, which makes `tx`'s
+/// Electrum height `-1` as of it, as [`LateFacts::of`] counts it for a late
+/// transaction. Nothing is confirmed above the pin until the tip passes it,
+/// so the usual request, whose tip has not moved, reads nothing here; one
+/// whose tip has moved reads each input's block index entry, no block.
+fn spends_above_pin(state: &ElectrumState, tx: &Transaction, pin: &Pin) -> bool {
+    if state.chain.tip_height() <= pin.height {
+        return false;
+    }
+    tx.input.iter().any(|input| {
+        state
+            .chain
+            .get_tx_location(&input.previous_output.txid)
+            .and_then(|hash| state.chain.get_block_index(&hash))
+            .is_some_and(|entry| !pin.covers(entry.height))
+    })
 }
 
 /// Whether `sh` has a transaction confirmed above the pin: one read of the
@@ -526,7 +560,9 @@ pub fn scripthash_listunspent(
     // `sh`, or a flood of mempool funding txs, can't push the
     // response past `cap` entries.
     for (txid, entry) in mempool_txs {
-        let height: i64 = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool) {
+        let height: i64 = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool)
+            || spends_above_pin(state, &entry.tx, pin)
+        {
             -1
         } else {
             0

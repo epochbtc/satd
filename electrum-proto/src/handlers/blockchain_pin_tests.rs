@@ -439,6 +439,81 @@ mod races {
         );
     }
 
+    /// [`FixedIndex`] plus `tx` in the mempool part, for every script.
+    struct InMempool {
+        inner: FixedIndex,
+        tx: Txid,
+    }
+
+    impl AddressIndex for InMempool {
+        fn confirmed_history(&self, sh: &Scripthash) -> Result<Vec<HistoryEntry>, IndexError> {
+            self.inner.confirmed_history(sh)
+        }
+        fn mempool_history(&self, _sh: &Scripthash) -> Vec<MempoolHistoryEntry> {
+            vec![MempoolHistoryEntry { txid: self.tx }]
+        }
+        fn balance(&self, sh: &Scripthash) -> Result<(u64, i64), IndexError> {
+            self.inner.balance(sh)
+        }
+        fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
+            self.inner.utxos(sh)
+        }
+        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+            self.inner.subscribe(sh)
+        }
+    }
+
+    /// A mempool transaction whose parent confirmed above the pin spent an
+    /// unconfirmed parent as of the pin: `-1`, in `get_history` and in
+    /// `listunspent`, as a late transaction's child would be. Pinned at or
+    /// above the parent's block, it is `0`.
+    #[test]
+    fn a_mempool_child_of_a_late_parent_is_minus_one() {
+        let (mut state, _dir) = electrum_state(100);
+        let first = state.electrum_extras.txid_at_pos(1, 0).unwrap();
+        for salt in 0..100 {
+            crate::test_support::extend_tip(&state.chain, 6_000 + salt);
+        }
+        let pin = pin_at(state.chain.tip_height());
+        let parent = spend(OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+        extend_tip_with(&state.chain, 6_500, vec![parent.clone()]);
+        let child = spend(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            5_000_000_000 - 2_000,
+        );
+        let txid = state
+            .mempool
+            .accept_transaction(
+                child,
+                &state.chain,
+                &node::validation::script::NoopVerifier,
+                node::mempool::pool::TxSource::Rpc,
+                false,
+            )
+            .expect("into the mempool");
+        state.address_index = Arc::new(InMempool {
+            inner: FixedIndex::default(),
+            tx: txid,
+        });
+        let sh = json!([scripthash_to_wire_hex(&node_index::scripthash_of(
+            &crate::test_support::anyone_can_spend()
+        ))]);
+
+        let history = scripthash_get_history(&state, sh.clone(), &pin).unwrap();
+        assert_eq!(history, json!([{"height": -1, "tx_hash": txid.to_string(), "fee": 1_000}]));
+        let utxos = scripthash_listunspent(&state, sh.clone(), &pin).unwrap();
+        assert_eq!(utxos[0]["height"], -1, "{utxos}");
+
+        let now = pin_at(state.chain.tip_height());
+        let history = scripthash_get_history(&state, sh.clone(), &now).unwrap();
+        assert_eq!(history[0]["height"], 0, "{history}");
+        let utxos = scripthash_listunspent(&state, sh, &now).unwrap();
+        assert_eq!(utxos[0]["height"], 0, "{utxos}");
+    }
+
     /// A transaction that confirms between the history's two reads is in at
     /// least one of them, and listed once, as the unconfirmed transaction it
     /// was at the pin.
