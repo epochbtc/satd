@@ -512,6 +512,12 @@ pub struct ChainState {
     /// `chain_gen`, so a reader would certify its half-published coins as
     /// settled. Any new mutator must take `accept_lock` first.
     mutation_depth: AtomicU32,
+    /// Bumped by every tip write that is not a one-block extension of the
+    /// tip it replaces: a disconnect, a reorg, a rollback, a multi-block
+    /// jump. A reader pinned to a tip uses it to tell a chain that only grew
+    /// on top of that tip, whose history at and below it is unchanged, from
+    /// one that moved under it. See [`Self::view_change`].
+    tip_retreats: AtomicU64,
 
     connect_heartbeat: AtomicU64,
     /// Lock-free monotonic counter bumped on every iteration of the
@@ -774,6 +780,33 @@ impl Drop for ChainMutationGuard<'_> {
     }
 }
 
+/// The tip a reader started from, and the chainstate generation it was
+/// published under. See [`ChainState::begin_view`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainView {
+    pub tip_hash: BlockHash,
+    pub tip_height: u32,
+    generation: u64,
+    retreats: u64,
+}
+
+/// How the chainstate changed since a [`ChainView`] was taken. See
+/// [`ChainState::view_change`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewChange {
+    /// No mutation has run.
+    Unchanged,
+    /// Only blocks connected on top of the view's tip: everything at and
+    /// below its height reads as it did.
+    Extended,
+    /// The tip was replaced by something other than a child: blocks were
+    /// disconnected, and what the view's height range holds may have
+    /// changed.
+    Retreated,
+    /// A mutation is in flight; ask again once it finishes.
+    InFlight,
+}
+
 /// How many times [`ChainState::coherent_read`] re-runs its read before giving
 /// up. A connect that lands between the two samples costs one retry; the cap is
 /// generous enough that only a chain advancing continuously exhausts it.
@@ -964,6 +997,7 @@ impl ChainState {
                     chain_event_tx: parking_lot::Mutex::new(None),
                     chain_gen: AtomicU64::new(0),
                     mutation_depth: AtomicU32::new(0),
+                    tip_retreats: AtomicU64::new(0),
                     connect_heartbeat: AtomicU64::new(0),
                     manager_heartbeat: AtomicU64::new(0),
                     connect_phases: std::sync::Arc::new(
@@ -1103,6 +1137,7 @@ impl ChainState {
             chain_event_tx: parking_lot::Mutex::new(None),
             chain_gen: AtomicU64::new(0),
             mutation_depth: AtomicU32::new(0),
+            tip_retreats: AtomicU64::new(0),
             connect_heartbeat: AtomicU64::new(0),
             manager_heartbeat: AtomicU64::new(0),
             connect_phases: std::sync::Arc::new(
@@ -1993,6 +2028,17 @@ impl ChainState {
             "tip moved to {hash} at height {height} outside a chain-mutation guard; \
              readers pairing a coin read with the tip cannot detect this change"
         );
+        // Mutators are serialized, so the tip read here is the one this
+        // write replaces.
+        let current = self.tip_snapshot();
+        let extends = height == current.1.wrapping_add(1)
+            && self
+                .store
+                .get_block_index(&hash)
+                .is_some_and(|e| e.header.prev_blockhash == current.0);
+        if !extends {
+            self.tip_retreats.fetch_add(1, Ordering::Release);
+        }
         let mut tip = self.tip.write();
         tip.hash = hash;
         tip.height = height;
@@ -2042,6 +2088,62 @@ impl ChainState {
         match self.coherent_attempt(&read) {
             Attempt::Read(value) => Some(value),
             Attempt::Moved | Attempt::Stuck => None,
+        }
+    }
+
+    /// Start a read that must see a single chainstate, for a reader that
+    /// cannot run inside [`coherent_read`](Self::coherent_read)'s closure --
+    /// an async request handler, say. `None` while a mutation is in flight:
+    /// wait and ask again.
+    ///
+    /// The returned view names the tip the read is answering for. Once the
+    /// read is done, [`view_is_current`](Self::view_is_current) says whether
+    /// the chainstate it read is still that one; if not, discard the answer.
+    pub fn begin_view(&self) -> Option<ChainView> {
+        let generation = self.chain_gen.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return None;
+        }
+        let retreats = self.tip_retreats.load(Ordering::Acquire);
+        let (tip_hash, tip_height) = self.tip_snapshot();
+        // A tip write between the two loads above would pair its retreat
+        // count with the tip it replaced, and `view_change` could then call a
+        // read of the new chainstate an extension of the old tip. Every tip
+        // write is inside a mutation, so an unchanged generation rules that
+        // out.
+        if self.chain_gen.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(ChainView {
+            tip_hash,
+            tip_height,
+            generation,
+            retreats,
+        })
+    }
+
+    /// What has happened to the chainstate since `view` was taken by
+    /// [`begin_view`](Self::begin_view).
+    ///
+    /// [`ViewChange::Unchanged`]: every store read made in between saw the
+    /// chainstate whose tip `view` names. [`ViewChange::Extended`]: only
+    /// blocks on top of that tip connected, so a read bounded to heights at
+    /// or below it saw what it would have seen at the view. Anything else
+    /// may have changed what the view's heights hold.
+    pub fn view_change(&self, view: &ChainView) -> ViewChange {
+        let generation = self.chain_gen.load(Ordering::Acquire);
+        if generation == view.generation {
+            return ViewChange::Unchanged;
+        }
+        if !generation.is_multiple_of(2) {
+            return ViewChange::InFlight;
+        }
+        // Every tip write of a finished mutation happened before the
+        // generation went even, so its retreat is visible here.
+        if self.tip_retreats.load(Ordering::Acquire) == view.retreats {
+            ViewChange::Extended
+        } else {
+            ViewChange::Retreated
         }
     }
 
@@ -11078,6 +11180,66 @@ pub(crate) mod tests {
             COHERENT_READ_ATTEMPTS as u32,
             "every attempt should have been spent before giving up"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `begin_view` / `view_change` are `coherent_read` split in two: no view
+    /// while a mutation is open, and a view taken before a mutation is no
+    /// longer `Unchanged` once one has run, even one that left the tip where
+    /// it was.
+    #[test]
+    fn a_view_is_refused_mid_mutation_and_changed_after_one() {
+        let (cs, dir) = make_chain_state();
+
+        let view = cs.begin_view().expect("a settled chainstate gives a view");
+        assert_eq!((view.tip_hash, view.tip_height), cs.tip_snapshot());
+        assert_eq!(cs.view_change(&view), ViewChange::Unchanged);
+
+        let guard = cs.begin_chain_mutation();
+        assert!(cs.begin_view().is_none(), "no view while a mutation is open");
+        assert_eq!(cs.view_change(&view), ViewChange::InFlight);
+        drop(guard);
+
+        assert_eq!(
+            cs.view_change(&view),
+            ViewChange::Extended,
+            "a mutation that moved no tip leaves the view's heights as they were"
+        );
+        let after = cs.begin_view().expect("settled again");
+        assert_eq!(cs.view_change(&after), ViewChange::Unchanged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blocks connected on the view's tip are an extension; a disconnect, or a
+    /// reorg that comes back to a tip of the same height, is a retreat.
+    #[test]
+    fn connects_extend_a_view_and_disconnects_retreat_it() {
+        let (cs, dir) = make_chain_state();
+        let genesis = cs.tip_hash();
+        let a1 = build_test_block(genesis, 1, 1_708_000_600);
+        cs.accept_block(&a1).unwrap();
+
+        let view = cs.begin_view().unwrap();
+        let a2 = build_test_block(a1.block_hash(), 2, 1_708_001_200);
+        cs.accept_block(&a2).unwrap();
+        let a3 = build_test_block(a2.block_hash(), 3, 1_708_001_800);
+        cs.accept_block(&a3).unwrap();
+        assert_eq!(cs.view_change(&view), ViewChange::Extended);
+
+        // Replace a1..a3 with a longer branch from genesis: a reorg below the
+        // view's tip.
+        let at_three = cs.begin_view().unwrap();
+        let mut parent = genesis;
+        for h in 1..=4 {
+            let b = build_test_block(parent, h, 1_708_000_601 + 600 * (h - 1));
+            cs.accept_block(&b).unwrap();
+            parent = b.block_hash();
+        }
+        assert_eq!(cs.tip_snapshot(), (parent, 4), "the longer branch won");
+        assert_eq!(cs.view_change(&at_three), ViewChange::Retreated);
+        assert_eq!(cs.view_change(&view), ViewChange::Retreated);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

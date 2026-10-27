@@ -197,6 +197,53 @@ the standard endpoints (`/address/:addr` or `/blocks/tip/{hash,height}`).
   with `block_height`, `block_hash`, and `block_time`. Mempool spends carry
   `status: { confirmed: false }`.
 
+## Chain-tip headers
+
+Every route that reads the chain answers with two extra headers:
+
+| Header | Value |
+|---|---|
+| `X-Bitcoin-Chain-Tip` | The best-chain tip's block hash (display hex) the answer was read at. |
+| `X-Bitcoin-Chain-Tip-Height` | That tip's height. |
+
+They let a client that makes several requests check that the answers
+describe one chain: if the hash differs between two responses, a block
+connected or a reorg happened in between, and the client should fetch the
+batch again. Compare the hash, not the height; a block replaced at the same
+height changes only the hash. The headers follow the proposal in
+mempool/mempool#6584, and rbitcoin's Esplora serves the same two.
+
+Each request answers for the tip it started at, and the headers name that
+tip. Nothing above it counts as confirmed, however many blocks connect while
+the request runs:
+
+- A transaction that confirms in a later block is served as unconfirmed:
+  `status.confirmed: false` from `/tx/:txid` and `/tx/:txid/status`, in the
+  unconfirmed part of `/address/:address/txs`, in `mempool_stats`, and as a
+  mempool spend on the outspend routes. Its outputs are unconfirmed UTXOs.
+  It has no merkle proof yet (404).
+- Confirmed history, chain stats and confirmed UTXOs stop at the tip's
+  height. `/blocks/tip/hash`, `/blocks/tip/height`, `/blocks`,
+  `/block-height/:height` and `/` report the tip, and `/block/:hash/status`
+  reports a later block as not in the best chain.
+- `/block/:hash/...` routes still serve any block the node holds by hash,
+  as before.
+
+A disconnect while a request runs (a reorg, or `invalidateblock`) can change
+the blocks the answer covers, so the request is run again at the new tip. One
+that a disconnect interrupts eight times in a row answers 503
+`chain view moved` with no tip headers.
+
+The mempool part of an answer (unconfirmed transactions, mempool stats and
+UTXOs, mempool spends) is read as it is when the request reads it.
+
+Every route carries the headers except `POST /tx`, `/mempool`,
+`/mempool/txids`, `/mempool/recent`, `/fee-estimates`, the
+`/txs/mempool` lists and the SSE streams, which do not read the chain.
+Error answers from a chain route (a 404 for an unknown transaction, say)
+carry them too. With [CORS](#cors) enabled both are listed in
+`Access-Control-Expose-Headers`, so browser clients can read them.
+
 ## Auth
 
 > **Warning.** The default auth mode is `none`. Loopback-only deployments
@@ -233,7 +280,8 @@ cannot be established (unreadable cookie file, or `--esplorauserpass` missing).
 
 `--esploracors=<origin>` enables CORS for the listed origins; `*` allows any
 origin. Allowed methods: `GET` and `POST`. Allowed headers: `Content-Type` and
-`Authorization`. CORS does not bypass authentication; it only admits
+`Authorization`. Exposed headers: the two
+[chain-tip headers](#chain-tip-headers). CORS does not bypass authentication; it only admits
 cross-origin browser requests.
 
 ## Bench harness

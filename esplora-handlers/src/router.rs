@@ -39,8 +39,11 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
     let cfg = state.config.clone();
 
     // Build the route table first; auth, CORS, and prefix nesting are
-    // applied around it.
-    let routes = Router::new()
+    // applied around it. Routes that read the chain go through
+    // `stamp_chain_tip` (see `crate::chain_tip`); the mempool, fee,
+    // broadcast and streaming routes do not.
+    let chain_routes = Router::new()
+        .route("/", get(mempool::root))
         .route("/blocks/tip/hash", get(chain::tip_hash))
         .route("/blocks/tip/height", get(chain::tip_height))
         .route("/blocks", get(chain::blocks_recent))
@@ -66,17 +69,6 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             "/tx/{txid}/merkleblock-proof",
             get(outspend::tx_merkleblock_proof),
         )
-        // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
-        // weight units; a witness-heavy standard tx can serialize to
-        // around 400 KB, so hex-encoded the body can approach 800 KB.
-        // 1 MB covers that with margin and stays well under the 4 MB
-        // consensus block limit. Per-route layer so the cap doesn't
-        // apply to GET endpoints that don't accept bodies. (Review M4
-        // round 1 + round 2.)
-        .route(
-            "/tx",
-            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(1024 * 1024)),
-        )
         // Address-string family (Esplora plan PR 5).
         .route("/address/{addr}", get(address::address_info))
         .route("/address/{addr}/txs", get(address::address_txs_combined))
@@ -84,10 +76,6 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route(
             "/address/{addr}/txs/chain/{last_seen_txid}",
             get(address::address_txs_chain_paged),
-        )
-        .route(
-            "/address/{addr}/txs/mempool",
-            get(address::address_txs_mempool),
         )
         .route("/address/{addr}/utxo", get(address::address_utxo))
         // Scripthash family — parallel set; same handlers branched on
@@ -105,13 +93,33 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             "/scripthash/{hash}/txs/chain/{last_seen_txid}",
             get(address::scripthash_txs_chain_paged),
         )
+        .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::chain_tip::stamp_chain_tip,
+        ));
+
+    let routes = Router::new()
+        // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
+        // weight units; a witness-heavy standard tx can serialize to
+        // around 400 KB, so hex-encoded the body can approach 800 KB.
+        // 1 MB covers that with margin and stays well under the 4 MB
+        // consensus block limit. Per-route layer so the cap doesn't
+        // apply to GET endpoints that don't accept bodies. (Review M4
+        // round 1 + round 2.)
+        .route(
+            "/tx",
+            post(tx::tx_broadcast).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/address/{addr}/txs/mempool",
+            get(address::address_txs_mempool),
+        )
         .route(
             "/scripthash/{hash}/txs/mempool",
             get(address::scripthash_txs_mempool),
         )
-        .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
-        // Mempool / fee / root (Esplora plan PR 7).
-        .route("/", get(mempool::root))
+        // Mempool / fee (Esplora plan PR 7).
         .route("/mempool", get(mempool::mempool_summary))
         .route("/mempool/txids", get(mempool::mempool_txids))
         .route("/mempool/recent", get(mempool::mempool_recent))
@@ -120,6 +128,7 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/blocks/sse", get(sse::blocks_sse))
         .route("/address/{addr}/sse", get(sse::address_sse))
         .route("/scripthash/{hash}/sse", get(sse::scripthash_sse))
+        .merge(chain_routes)
         .with_state(state);
 
     // Auth is active when either the legacy operator credential (cookie /
@@ -178,6 +187,12 @@ fn build_cors_layer(cfg: &EsploraConfig) -> Result<CorsLayer, RouterBuildError> 
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+        ])
+        // A browser client can only read the chain-tip headers if they are
+        // exposed.
+        .expose_headers([
+            crate::chain_tip::CHAIN_TIP_HEADER,
+            crate::chain_tip::CHAIN_TIP_HEIGHT_HEADER,
         ]);
     if cfg.cors_origins.iter().any(|o| o == "*") {
         return Ok(layer.allow_origin(AllowOrigin::any()));

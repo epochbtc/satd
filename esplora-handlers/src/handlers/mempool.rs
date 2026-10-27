@@ -83,15 +83,16 @@ pub struct ChainTipJson {
 // **acting class only** (design §6.1/§10): the quarantine class is invisible
 // here, exactly as on a Core node whose relay policy refused the transaction.
 
-pub async fn root(State(state): State<EsploraState>) -> Json<RootJson> {
+pub async fn root(
+    State(state): State<EsploraState>,
+    axum::Extension(pin): axum::Extension<crate::chain_tip::Pin>,
+) -> Json<RootJson> {
     let count = state.mempool.get_acting_entries().len() as u64;
-    // One read -- see `ChainState::tip_snapshot`. Reporting a height beside the
-    // hash of a different block is the one thing a chain-tip field must not do.
-    let (tip_hash, tip_height) = state.chain.tip_snapshot();
+    // The pinned tip, which the chain-tip headers name too.
     Json(RootJson {
         chain_tip: ChainTipJson {
-            hash: tip_hash.to_string(),
-            height: tip_height,
+            hash: pin.hash.to_string(),
+            height: pin.height,
         },
         mempool_count: count,
     })

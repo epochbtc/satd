@@ -29,16 +29,19 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::{Extension, Json};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Network, OutPoint, Txid};
 use node_index::{HistoryEntry, Scripthash, scripthash_of};
 use serde::{Deserialize, Serialize};
 
 use crate::blocking::off_worker;
+use crate::chain_tip::Pin;
 use crate::error::{EsploraError, EsploraResult};
-use crate::handlers::tx::{TxJson, TxStatusJson, build_confirmed_tx_json};
+use crate::handlers::tx::{
+    TxJson, TxStatusJson, build_confirmed_tx_json, build_late_tx_json, unconfirmed_status,
+};
 use crate::state::EsploraState;
 
 /// Esplora's mempool-txs cap. Matches the upstream contract: `/txs`
@@ -90,37 +93,41 @@ pub struct UtxoJson {
 
 pub async fn address_info(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_address_info(st, &addr, &sh)).await?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &pin, &addr, &sh)).await?))
 }
 
 pub async fn address_txs_combined(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(addr): Path<String>,
     Query(query): Query<TxsQuery>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &pin, &sh, after_txid)).await?))
 }
 
 pub async fn address_txs_chain(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?))
 }
 
 pub async fn address_txs_chain_paged(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path((addr, last_seen)): Path<(String, String)>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
 }
 
 pub async fn address_txs_mempool(
@@ -133,47 +140,52 @@ pub async fn address_txs_mempool(
 
 pub async fn address_utxo(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?))
 }
 
 // ── Scripthash handlers (parallel set) ─────────────────────────────
 
 pub async fn scripthash_info(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_address_info(st, &hash, &sh)).await?))
+    Ok(Json(off_worker(&state, move |st| build_address_info(st, &pin, &hash, &sh)).await?))
 }
 
 pub async fn scripthash_txs_combined(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(hash): Path<String>,
     Query(query): Query<TxsQuery>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &sh, after_txid)).await?))
+    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &pin, &sh, after_txid)).await?))
 }
 
 pub async fn scripthash_txs_chain(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, None)).await?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?))
 }
 
 pub async fn scripthash_txs_chain_paged(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path((hash, last_seen)): Path<(String, String)>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &sh, Some(last_seen))).await?))
+    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
 }
 
 pub async fn scripthash_txs_mempool(
@@ -186,10 +198,11 @@ pub async fn scripthash_txs_mempool(
 
 pub async fn scripthash_utxo(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_utxos(st, &sh)).await?))
+    Ok(Json(off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?))
 }
 
 #[cfg(test)]
@@ -247,11 +260,14 @@ fn after_txid_not_found() -> EsploraError {
 
 fn build_address_info(
     state: &EsploraState,
+    pin: &Pin,
     label: &str,
     sh: &Scripthash,
 ) -> EsploraResult<AddressInfoJson> {
-    let chain_stats = build_chain_stats(state, sh)?;
-    let mempool_stats = build_mempool_stats(state, sh);
+    let history = capped_history(state, sh)?;
+    let (chain_stats, late) = split_stats_at_pin(&history, pin);
+    let mut mempool_stats = build_mempool_stats(state, sh, &late);
+    add_stats(&mut mempool_stats, &late);
     Ok(AddressInfoJson {
         address: label.to_string(),
         chain_stats,
@@ -259,21 +275,61 @@ fn build_address_info(
     })
 }
 
-/// Chain stats — derived purely from confirmed-history rows.
-///
-/// The stats sum over the whole confirmed history, so a history over
+/// The whole confirmed history, which the stats sum over. A history over
 /// `max_history_entries` transactions is refused (400 `Too many history
 /// entries`) by a count that stops at the first transaction past the cap,
 /// before the history is read.
-fn build_chain_stats(
-    state: &EsploraState,
-    sh: &Scripthash,
-) -> EsploraResult<AddressStatsJson> {
+fn capped_history(state: &EsploraState, sh: &Scripthash) -> EsploraResult<Vec<HistoryEntry>> {
     state
         .address_index
         .check_history_cap(sh, state.config.max_history_entries)?;
-    let history = state.address_index.confirmed_history(sh)?;
-    Ok(compute_chain_stats_from_history(&history))
+    Ok(state.address_index.confirmed_history(sh)?)
+}
+
+/// What a history confirmed above the pinned tip adds to the stats.
+struct LateStats {
+    stats: AddressStatsJson,
+    txids: BTreeSet<Txid>,
+}
+
+/// Split the confirmed history at the pin: the chain stats of the rows at
+/// or below it, and what the rows above it (confirmed while the request
+/// ran, unconfirmed as of the pin) add.
+///
+/// A spending row spends a funding row at or below its own height, so the
+/// rows at or below the pin resolve their own spends, and the late rows'
+/// contribution is the whole history's stats less the pinned rows'.
+fn split_stats_at_pin(history: &[HistoryEntry], pin: &Pin) -> (AddressStatsJson, LateStats) {
+    let pinned: Vec<HistoryEntry> = history
+        .iter()
+        .filter(|e| pin.covers(e.height()))
+        .cloned()
+        .collect();
+    let chain = compute_chain_stats_from_history(&pinned);
+    let all = compute_chain_stats_from_history(history);
+    let late = LateStats {
+        stats: AddressStatsJson {
+            tx_count: all.tx_count - chain.tx_count,
+            funded_txo_count: all.funded_txo_count - chain.funded_txo_count,
+            funded_txo_sum: all.funded_txo_sum - chain.funded_txo_sum,
+            spent_txo_count: all.spent_txo_count - chain.spent_txo_count,
+            spent_txo_sum: all.spent_txo_sum - chain.spent_txo_sum,
+        },
+        txids: history
+            .iter()
+            .filter(|e| !pin.covers(e.height()))
+            .map(|e| e.txid())
+            .collect(),
+    };
+    (chain, late)
+}
+
+fn add_stats(stats: &mut AddressStatsJson, late: &LateStats) {
+    stats.tx_count = stats.tx_count.saturating_add(late.stats.tx_count);
+    stats.funded_txo_count = stats.funded_txo_count.saturating_add(late.stats.funded_txo_count);
+    stats.funded_txo_sum = stats.funded_txo_sum.saturating_add(late.stats.funded_txo_sum);
+    stats.spent_txo_count = stats.spent_txo_count.saturating_add(late.stats.spent_txo_count);
+    stats.spent_txo_sum = stats.spent_txo_sum.saturating_add(late.stats.spent_txo_sum);
 }
 
 /// Pure history-reduction helper, exposed so unit tests can hit it
@@ -347,6 +403,10 @@ mod esplorapaging_tests;
 #[cfg(test)]
 #[path = "address_historycap_tests.rs"]
 mod historycap_tests;
+
+#[cfg(test)]
+#[path = "address_pin_tests.rs"]
+mod pin_tests;
 
 #[cfg(test)]
 mod tests {
@@ -437,7 +497,10 @@ mod tests {
 /// against `sh`) and inputs (spending against `sh`) using the chain
 /// UTXO set + mempool ancestors, mirroring the address-index's mempool
 /// resolver. Bounded by `mempool-txs-touching-sh × tx-input/output-count`.
-fn build_mempool_stats(state: &EsploraState, sh: &Scripthash) -> AddressStatsJson {
+///
+/// A transaction the late rows already count (it confirmed above the pin
+/// while the mempool index still listed it) is skipped.
+fn build_mempool_stats(state: &EsploraState, sh: &Scripthash, late: &LateStats) -> AddressStatsJson {
     let entries = state.address_index.mempool_history(sh);
 
     let mut tx_count: u64 = 0;
@@ -447,6 +510,9 @@ fn build_mempool_stats(state: &EsploraState, sh: &Scripthash) -> AddressStatsJso
     let mut spent_txo_sum: u64 = 0;
 
     for e in entries {
+        if late.txids.contains(&e.txid) {
+            continue;
+        }
         let Some(entry) = state.mempool.get(&e.txid) else {
             continue;
         };
@@ -493,6 +559,73 @@ fn build_mempool_stats(state: &EsploraState, sh: &Scripthash) -> AddressStatsJso
 }
 
 // ── Tx pagination ──────────────────────────────────────────────────
+
+/// The script's transactions confirmed above the pinned tip, newest first:
+/// they confirmed while the request ran, and as of the pin they were
+/// unconfirmed. They head the newest-first history, so this reads only
+/// until the first transaction at or below the pin, normally one page.
+fn late_txs(state: &EsploraState, pin: &Pin, sh: &Scripthash) -> EsploraResult<Vec<(u32, Txid)>> {
+    let mut late = Vec::new();
+    let mut cursor = None;
+    loop {
+        let Some(page) = confirmed_page(state, sh, cursor)? else {
+            // The cursor left the history: a disconnect, which reruns the
+            // request.
+            return Ok(late);
+        };
+        let full = page.len() == CONFIRMED_TXS_PAGE;
+        for row in page {
+            if pin.covers(row.0) {
+                return Ok(late);
+            }
+            late.push(row);
+        }
+        if !full {
+            return Ok(late);
+        }
+        cursor = late.last().map(|(_, t)| *t);
+    }
+}
+
+/// One page of the script's distinct transactions confirmed at or below the
+/// pinned tip, newest first, starting after `after`; `None` when `after` is
+/// not in the confirmed history.
+///
+/// Rows above the pin (confirmed while the request ran) head the
+/// newest-first history, so only a page read from the top can meet them:
+/// they are skipped and the page filled from the rows after them, so a short
+/// page still means the history ended.
+fn pinned_page(
+    state: &EsploraState,
+    pin: &Pin,
+    sh: &Scripthash,
+    after: Option<Txid>,
+) -> EsploraResult<Option<Vec<(u32, Txid)>>> {
+    let mut cursor = after;
+    let mut out = Vec::with_capacity(CONFIRMED_TXS_PAGE);
+    let mut first = true;
+    loop {
+        let Some(page) = confirmed_page(state, sh, cursor)? else {
+            // An unknown `after`, or (past the first read) a cursor a
+            // disconnect removed, which reruns the request.
+            return Ok(if first { None } else { Some(out) });
+        };
+        first = false;
+        let full = page.len() == CONFIRMED_TXS_PAGE;
+        cursor = page.last().map(|(_, t)| *t);
+        for row in page {
+            if pin.covers(row.0) {
+                out.push(row);
+                if out.len() == CONFIRMED_TXS_PAGE {
+                    return Ok(Some(out));
+                }
+            }
+        }
+        if !full {
+            return Ok(Some(out));
+        }
+    }
+}
 
 /// One page of the script's distinct confirmed transactions, newest first,
 /// starting after `after`; `None` when `after` is not in the confirmed
@@ -617,8 +750,13 @@ fn locate_after_txid(
 /// mempool transactions that follow it, then the first 25 confirmed. A cursor
 /// that is in neither list is 422 `after_txid not found`. Ignoring the cursor
 /// would hand a client paging this way its first page again on every request.
+///
+/// As of the pinned tip, the transactions confirmed above it were still
+/// unconfirmed: they lead the unconfirmed part, oldest first, ahead of the
+/// mempool.
 fn build_combined_txs(
     state: &EsploraState,
+    pin: &Pin,
     sh: &Scripthash,
     after_txid: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
@@ -626,10 +764,24 @@ fn build_combined_txs(
     // confirms between the two reads is still in at least one of them.
     let mempool = mempool_txids_in_admission_order(state, sh);
     let mempool = without_confirmed(mempool, |txid| in_confirmed_history(state, sh, txid))?;
+    let late = late_txs(state, pin, sh)?;
+    let late_set: std::collections::HashSet<Txid> = late.iter().map(|(_, t)| *t).collect();
+    let mempool: Vec<Txid> = late
+        .iter()
+        .rev()
+        .map(|(_, t)| *t)
+        .chain(mempool.into_iter().filter(|t| !late_set.contains(t)))
+        .collect();
     let mempool_from = match after_txid {
         None => 0,
         Some(cursor) => {
-            match locate_after_txid(&mempool, &cursor, |c| confirmed_page(state, sh, Some(*c)))? {
+            // A late cursor is in the unconfirmed part as of the pin.
+            match locate_after_txid(&mempool, &cursor, |c| {
+                if late_set.contains(c) {
+                    return Ok(None);
+                }
+                pinned_page(state, pin, sh, Some(*c))
+            })? {
                 Some(AfterTxid::Mempool(i)) => i,
                 Some(AfterTxid::Confirmed(page)) => return render_confirmed_txs(state, &page),
                 None => return Err(after_txid_not_found()),
@@ -642,12 +794,12 @@ fn build_combined_txs(
     // The confirmed page is read after the membership checks above, so a
     // transaction that confirmed in between is on it: drop it from the
     // mempool part too, so it is listed once, as confirmed.
-    let page = confirmed_page(state, sh, None)?.unwrap_or_default();
+    let page = pinned_page(state, pin, sh, None)?.unwrap_or_default();
     let on_page: std::collections::HashSet<Txid> = page.iter().map(|(_, t)| *t).collect();
     let served = without_confirmed(mempool[mempool_from..end].to_vec(), |t| {
         Ok(on_page.contains(t))
     })?;
-    let mut out = render_mempool_txs(state, &served)?;
+    let mut out = render_unconfirmed_txs(state, &served, &late_set)?;
     out.extend(render_confirmed_txs(state, &page)?);
     Ok(out)
 }
@@ -661,10 +813,11 @@ fn build_combined_txs(
 /// or they hand-crafted a request).
 fn build_chain_txs(
     state: &EsploraState,
+    pin: &Pin,
     sh: &Scripthash,
     last_seen: Option<Txid>,
 ) -> EsploraResult<Vec<TxJson>> {
-    match confirmed_page(state, sh, last_seen)? {
+    match pinned_page(state, pin, sh, last_seen)? {
         Some(page) => render_confirmed_txs(state, &page),
         None => Ok(Vec::new()),
     }
@@ -699,6 +852,29 @@ fn build_mempool_txs(
     render_mempool_txs(state, &txids)
 }
 
+/// Render the unconfirmed part of `/txs`: a `late` transaction (confirmed
+/// above the pinned tip) from the txindex, the rest from the mempool, all as
+/// unconfirmed.
+fn render_unconfirmed_txs(
+    state: &EsploraState,
+    txids: &[Txid],
+    late: &std::collections::HashSet<Txid>,
+) -> EsploraResult<Vec<TxJson>> {
+    let mut out = Vec::with_capacity(txids.len());
+    for txid in txids {
+        // A late transaction is confirmed, so the txindex holds it; should it
+        // not, the mempool may still.
+        if late.contains(txid)
+            && let Some(json) = build_late_tx_json(state, txid)?
+        {
+            out.push(json);
+        } else {
+            out.extend(render_mempool_txs(state, std::slice::from_ref(txid))?);
+        }
+    }
+    Ok(out)
+}
+
 /// Render mempool transactions: no ConfirmedLocation, so each comes out
 /// with `confirmed: false`. Only these are fetched (cloned) from the pool;
 /// one that left it since its txid was listed is skipped.
@@ -726,8 +902,12 @@ fn render_mempool_txs(state: &EsploraState, txids: &[Txid]) -> EsploraResult<Vec
 /// Wallet-correctness: a confirmed UTXO with a mempool spend is NOT
 /// listed (review H2). Listing it would let clients double-spend the
 /// outpoint by signing a fresh tx against the same input.
+///
+/// A confirmed UTXO created above the pinned tip was an unconfirmed output
+/// as of the pin, and is listed as one.
 fn build_utxos(
     state: &EsploraState,
+    pin: &Pin,
     sh: &Scripthash,
 ) -> EsploraResult<Vec<UtxoJson>> {
     // Build the mempool-spent-outpoint set up front so we can filter
@@ -754,20 +934,25 @@ fn build_utxos(
         if mempool_spends.contains(&outpoint) {
             continue;
         }
-        let block_hash = state.chain.get_block_hash_by_height(u.height);
-        let block_time = block_hash
-            .and_then(|h| state.chain.get_block_index(&h))
-            .map(|entry| entry.header.time);
-        out.push(UtxoJson {
-            txid: u.txid.to_string(),
-            vout: u.vout,
-            value: u.amount_sat,
-            status: TxStatusJson {
+        let status = if pin.covers(u.height) {
+            let block_hash = pin.hash_at_height(&state.chain, u.height);
+            let block_time = block_hash
+                .and_then(|h| state.chain.get_block_index(&h))
+                .map(|entry| entry.header.time);
+            TxStatusJson {
                 confirmed: true,
                 block_height: Some(u.height),
                 block_hash: block_hash.map(|h| h.to_string()),
                 block_time,
-            },
+            }
+        } else {
+            unconfirmed_status()
+        };
+        out.push(UtxoJson {
+            txid: u.txid.to_string(),
+            vout: u.vout,
+            value: u.amount_sat,
+            status,
         });
     }
 

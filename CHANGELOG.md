@@ -126,6 +126,11 @@ item below is (or will be) written up in full in the in-development
   against the budget, confirmed-anyway count, foregone fees, a per-rule
   table), and the held count beside the Txs line of the steady view.
 
+- Esplora responses that read the chain carry `X-Bitcoin-Chain-Tip` and
+  `X-Bitcoin-Chain-Tip-Height`. Each request answers for the tip it started
+  at, however many blocks connect while it runs; a disconnect under it runs
+  it again.
+
 ### Fixed
 
 - The address index built by a backfill (`-addressindex` turned on for an
