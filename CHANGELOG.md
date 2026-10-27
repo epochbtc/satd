@@ -17,6 +17,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- satd downloads old blocks from a connected `NODE_NETWORK_LIMITED` peer
+  that also advertises `NODE_INTACT_BLOCKS` (service bit 28), moving a
+  block it answers `notfound` for to another peer.
+
 - `verifymessage` and `signmessagewithprivkey`, Bitcoin Core's message-signing
   RPCs, byte-compatible with Core.
 

@@ -4,6 +4,19 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
+/// `NODE_INTACT_BLOCKS`: a `NODE_NETWORK_LIMITED` node that still serves
+/// every block it holds intact, at any depth, and answers `notfound` for the
+/// rest without disconnecting. A satd node stripping OP_RETURN data under
+/// `-pruneopreturnpeers=intact` advertises it. Bit 28, from the range Bitcoin
+/// Core reserves for temporary experiments (`protocol.h`); bits 26, 29 and 30
+/// are taken by full-RBF, Libre Relay and `NODE_NAP`.
+pub const NODE_INTACT_BLOCKS_BIT: u64 = 1 << 28;
+
+/// [`NODE_INTACT_BLOCKS_BIT`] as service flags.
+pub fn node_intact_blocks() -> ServiceFlags {
+    ServiceFlags::from(NODE_INTACT_BLOCKS_BIT)
+}
+
 /// Address that can represent either a regular socket address or a .onion hostname.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PeerAddr {
@@ -426,6 +439,21 @@ impl PeerInfo {
         !self.services.has(ServiceFlags::NETWORK) && self.services.has(ServiceFlags::NETWORK_LIMITED)
     }
 
+    /// Whether to ask this peer only for recent blocks: a limited peer
+    /// that does not also advertise [`NODE_INTACT_BLOCKS_BIT`]. An intact
+    /// peer may be asked for any block; one it no longer holds intact comes
+    /// back as `notfound`, and the request moves to another peer.
+    pub fn is_depth_limited(&self) -> bool {
+        self.is_limited() && !self.services.has(node_intact_blocks())
+    }
+
+    /// Whether this peer can be asked for a historical block outside the
+    /// download scheduler (`getblockfrompeer`, a re-fetch): `NODE_NETWORK`,
+    /// or `NODE_NETWORK_LIMITED` with [`NODE_INTACT_BLOCKS_BIT`].
+    pub fn serves_deep_blocks(&self) -> bool {
+        self.advertises_blocks() && !self.is_depth_limited()
+    }
+
     /// Whether this peer participates in tx relay — the BIP 37 `fRelay`
     /// flag from its version message. A peer that set `relay = false`
     /// (e.g. Bitcoin Core under `-blocksonly`, or a block-relay-only
@@ -511,6 +539,7 @@ impl PeerInfo {
                 6 => "COMPACT_FILTERS".to_string(),
                 10 => "NETWORK_LIMITED".to_string(),
                 11 => "P2P_V2".to_string(),
+                28 => "INTACT_BLOCKS".to_string(),
                 30 => "NAP".to_string(),
                 other => format!("UNKNOWN[2^{other}]"),
             });
@@ -783,7 +812,7 @@ mod rpc_json_tests {
         // NETWORK (bit 0) | WITNESS (bit 3) | NETWORK_LIMITED (bit 10),
         // plus an unnamed high bit that must not appear.
         info.services = ServiceFlags::from(
-            (1 << 0) | (1 << 3) | (1 << 10) | (1u64 << 40),
+            (1 << 0) | (1 << 3) | (1 << 10) | NODE_INTACT_BLOCKS_BIT | (1u64 << 40),
         );
         let v = info.to_rpc_json(&PeerStats::new(NetTotals::new()));
         let names: Vec<&str> = v["servicesnames"]
@@ -797,7 +826,7 @@ mod rpc_json_tests {
         // faithful rendering of the flags word.
         assert_eq!(
             names,
-            ["NETWORK", "WITNESS", "NETWORK_LIMITED", "UNKNOWN[2^40]"],
+            ["NETWORK", "WITNESS", "NETWORK_LIMITED", "INTACT_BLOCKS", "UNKNOWN[2^40]"],
             "{v}"
         );
     }

@@ -984,6 +984,13 @@ pub struct PeerManager {
     /// [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`], which bounds the whole table by the
     /// connection limit no matter what peers announce.
     in_flight_blocks: RwLock<HashMap<PeerId, HashMap<bitcoin::BlockHash, BlockRequest>>>,
+    /// Peers that answered a full-block request from the sweep with
+    /// `notfound`, by block. The sweep asks them for that block again only
+    /// when no other peer can be asked, so a `NODE_INTACT_BLOCKS` peer that
+    /// stripped a block does not keep getting the request. Kept only for
+    /// blocks the sweep still misses, and a peer leaves it when it
+    /// disconnects.
+    sweep_not_found: RwLock<HashMap<bitcoin::BlockHash, Vec<PeerId>>>,
     /// Blocks on their way in as a `cmpctblock`: hash → when we asked for
     /// one or, for a pushed or answered `cmpctblock`, when reconstruction
     /// started. Dropped when the block arrives by any route, when its
@@ -1445,6 +1452,7 @@ impl PeerManager {
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(HashMap::new()),
+            sweep_not_found: RwLock::new(HashMap::new()),
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
@@ -5487,6 +5495,10 @@ impl PeerManager {
         self.pending_compact.write().remove(&id);
         self.hb_peers.lock().retain(|p| *p != id);
         self.in_flight_blocks.write().remove(&id);
+        self.sweep_not_found.write().retain(|_, peers| {
+            peers.retain(|p| *p != id);
+            !peers.is_empty()
+        });
         // Core's `TxDownloadManagerImpl::DisconnectedPeer`: its announcements
         // go, an orphan only it announced goes, and what it was asked for
         // goes to the next announcer at once.
@@ -5823,8 +5835,14 @@ impl PeerManager {
                     // A tip-following request it cannot answer no longer
                     // holds the block back from the sweep's next pass.
                     if let Some(asked) = self.in_flight_blocks.write().get_mut(&id) {
+                        let mut not_found = self.sweep_not_found.write();
                         for h in &block_hashes {
-                            asked.remove(h);
+                            if asked.remove(h).is_some() {
+                                let peers = not_found.entry(*h).or_default();
+                                if !peers.contains(&id) {
+                                    peers.push(id);
+                                }
+                            }
                         }
                     }
                     // The background download's heights too, so the next
@@ -6914,7 +6932,7 @@ impl PeerManager {
             // What the peer claimed at connect, or has announced since.
             (
                 (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from)),
-                handle.info.is_limited(),
+                handle.info.is_depth_limited(),
             )
         };
         let (peer_height, limited) = peer_height;
@@ -6938,7 +6956,9 @@ impl PeerManager {
             // [`LIMITED_PEER_BLOCK_DEPTH`] of its tip (`net_processing.cpp:1533`)
             // and not at all during IBD (`:6164`). The scheduler can hand out
             // any height above the cursor, so use such a peer only when every
-            // one of those is that recent.
+            // one of those is that recent. A limited peer advertising
+            // `NODE_INTACT_BLOCKS` is not held to this: a block it has
+            // stripped comes back `notfound` and goes to another peer.
             if limited && max_height - scheduler.connect_cursor() >= LIMITED_PEER_BLOCK_DEPTH {
                 return;
             }
@@ -7089,17 +7109,21 @@ impl PeerManager {
     /// Peer ids eligible to serve a block re-fetch: connected, advertising
     /// `NODE_NETWORK` so they should hold historical blocks, and
     /// `NODE_WITNESS` so they can serve the witness serialization we ask for.
+    /// Only when no such peer is connected, the `NODE_NETWORK_LIMITED` peers
+    /// with `NODE_INTACT_BLOCKS` instead: one may have stripped the block,
+    /// and a re-fetch does not track a `notfound` to move on from it.
     pub fn block_serving_peer_ids(&self) -> Vec<PeerId> {
         let peers = self.peers.read();
-        peers
-            .iter()
-            .filter(|(_, h)| {
-                h.info.state == PeerState::Connected
-                    && h.info.services.has(ServiceFlags::NETWORK)
-                    && h.info.services.has(ServiceFlags::WITNESS)
-            })
-            .map(|(id, _)| *id)
-            .collect()
+        let (mut full, mut intact) = (Vec::new(), Vec::new());
+        for (id, h) in peers.iter() {
+            if h.info.state == PeerState::Connected
+                && h.info.serves_deep_blocks()
+                && h.info.services.has(ServiceFlags::WITNESS)
+            {
+                if h.info.is_limited() { intact.push(*id) } else { full.push(*id) }
+            }
+        }
+        if full.is_empty() { intact } else { full }
     }
 
     /// Route a block that `getblockfrompeer` asked for into the repair path.
@@ -7563,6 +7587,26 @@ impl PeerManager {
     /// Drive the AssumeUTXO background catch-up download: request the next
     /// window of historical block data above the background connect cursor
     /// from connected peers. Frees the tracker once no background remains.
+    /// The peers the background download asks, in id order. Core downloads
+    /// historical blocks only from a peer that keeps them all: NODE_NETWORK,
+    /// not a limited one (`net_processing.cpp:6176`). A limited peer
+    /// advertising `NODE_INTACT_BLOCKS` is asked too.
+    fn bg_catchup_peer_ids(&self) -> Vec<PeerId> {
+        let peers = self.peers.read();
+        let mut ids: Vec<PeerId> = peers
+            .iter()
+            .filter(|(_, h)| {
+                h.info.state == PeerState::Connected
+                    && h.info.serves_blocks()
+                    && h.info.advertises_blocks()
+                    && !h.info.is_depth_limited()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     fn drive_bg_catchup_download(&self) {
         let bg = match self.chain_state.background() {
             Some(b) => b,
@@ -7610,23 +7654,7 @@ impl PeerManager {
             return;
         }
 
-        // Core downloads historical blocks only from a peer that keeps them
-        // all: NODE_NETWORK, not a limited one (`net_processing.cpp:6176`).
-        let peer_ids: Vec<PeerId> = {
-            let peers = self.peers.read();
-            let mut ids: Vec<PeerId> = peers
-                .iter()
-                .filter(|(_, h)| {
-                    h.info.state == PeerState::Connected
-                        && h.info.serves_blocks()
-                        && h.info.advertises_blocks()
-                        && !h.info.is_limited()
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            ids.sort_unstable();
-            ids
-        };
+        let peer_ids = self.bg_catchup_peer_ids();
         if peer_ids.is_empty() {
             return;
         }
@@ -11606,13 +11634,19 @@ impl PeerManager {
     ///
     /// A block goes to a peer known to have it, as Core downloads from a peer
     /// only up to its `pindexBestKnownBlock` and from a limited peer only
-    /// within [`LIMITED_PEER_BLOCK_DEPTH`] of it (`net_processing.cpp:1533`).
+    /// within [`LIMITED_PEER_BLOCK_DEPTH`] of it (`net_processing.cpp:1533`),
+    /// unless it advertises `NODE_INTACT_BLOCKS`.
     /// When no peer qualifies (heights not yet known), any peer is asked.
     fn sweep_missing_blocks(&self, peers: &[PeerId]) {
         if peers.is_empty() {
             return;
         }
         let missing = self.missing_blocks_to_fetch();
+        let not_found = {
+            let mut not_found = self.sweep_not_found.write();
+            not_found.retain(|hash, _| missing.contains(hash));
+            not_found.clone()
+        };
         if missing.is_empty() {
             return;
         }
@@ -11625,7 +11659,7 @@ impl PeerManager {
                     handles.get(id).map_or((-1, false), |h| {
                         let height = (h.info.best_height as i64)
                             .max(h.info.best_known_height.map_or(-1, i64::from));
-                        (height, h.info.is_limited())
+                        (height, h.info.is_depth_limited())
                     })
                 })
                 .collect()
@@ -11651,11 +11685,14 @@ impl PeerManager {
         let mut given: Vec<Vec<bitcoin::BlockHash>> = vec![Vec::new(); peers.len()];
         let mut next = 0usize;
         for hash in missing {
-            let before: &[PeerId] = match asked.get(&hash) {
+            // Peers to try last: those asked before, and those that said
+            // `notfound`.
+            let mut before: Vec<PeerId> = match asked.get(&hash) {
                 Some((age, _)) if *age < SWEEP_REREQUEST_AFTER => continue,
-                Some((_, who)) => who,
-                None => &[],
+                Some((_, who)) => who.clone(),
+                None => Vec::new(),
             };
+            before.extend(not_found.get(&hash).into_iter().flatten());
             let height = self.chain_state.get_block_index(&hash).map(|e| e.height);
             let any_has_it = (0..peers.len()).any(|i| can_serve(i, height));
             let pick = |fresh_only: bool| {
@@ -13115,6 +13152,10 @@ impl PeerManager {
     /// block-relay-only or addr-fetch peer: `NETWORK | WITNESS`, or
     /// `NETWORK_LIMITED | WITNESS` from a pruned peer while our tip is within a
     /// day of now. Returns the flags wanted when the peer lacks them.
+    ///
+    /// `NODE_INTACT_BLOCKS` does not count for `NETWORK` here: an intact peer
+    /// is used for old blocks only when we are connected to it anyway, so the
+    /// outbound slots keep finding peers that hold every block.
     fn missing_desirable_services(&self, services: ServiceFlags) -> Option<ServiceFlags> {
         let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         if services.has(ServiceFlags::NETWORK_LIMITED) {

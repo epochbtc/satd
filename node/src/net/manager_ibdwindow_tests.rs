@@ -151,9 +151,14 @@ fn a_local_write_failure_does_not_charge_the_sender() {
     }
 }
 
+/// A satd node serving under `-pruneopreturnpeers=intact`.
+fn intact() -> ServiceFlags {
+    ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | crate::net::peer::node_intact_blocks()
+}
+
 /// Core downloads only from a peer that advertises NODE_NETWORK or
 /// NODE_NETWORK_LIMITED, and from a limited one only blocks within 286 of
-/// its tip.
+/// its tip. A limited peer advertising NODE_INTACT_BLOCKS is asked for any.
 #[test]
 fn ibd_work_goes_only_to_peers_that_can_serve_it() {
     let chain = blocks(5);
@@ -162,6 +167,7 @@ fn ibd_work_goes_only_to_peers_that_can_serve_it() {
         ("no block service", ServiceFlags::WITNESS, 5, false),
         ("limited, every height recent", ServiceFlags::NETWORK_LIMITED, 5, true),
         ("limited, heights too deep", ServiceFlags::NETWORK_LIMITED, 300, false),
+        ("limited and intact, heights too deep", intact(), 300, true),
     ];
     for (what, services, best_height, expect) in cases {
         let (pm, _dir) = mk_pm();
@@ -263,4 +269,87 @@ fn the_sweep_asks_a_peer_that_has_the_block() {
     pm.handle_message(3, NetworkMessage::NotFound(vec![Inventory::WitnessBlock(chain[0].block_hash())]), InFlight::adopt(None));
     pm.sweep_missing_blocks(&[1, 2, 3]);
     assert!(blocks_asked(&drain(&mut full)).contains(&chain[0].block_hash()));
+}
+
+/// A limited peer advertising NODE_INTACT_BLOCKS is asked for deep blocks by
+/// the sweep too. When it answers `notfound` (it stripped the block), the
+/// next pass asks a peer that keeps every block.
+#[test]
+fn the_sweep_asks_an_intact_peer_for_deep_blocks_and_falls_back_on_notfound() {
+    let (pm, _dir) = mk_pm();
+    let chain = blocks(300);
+    for b in &chain {
+        pm.chain_state.accept_header(&b.header).unwrap();
+    }
+    let mut intact_peer = add_peer(&pm, 1, intact(), 300);
+    let mut full = add_peer(&pm, 2, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
+    let deep = chain[0].block_hash();
+    // Both could serve it; the first in turn is the intact peer.
+    pm.sweep_missing_blocks(&[1, 2]);
+    assert!(blocks_asked(&drain(&mut intact_peer)).contains(&deep), "the intact peer was not asked for a deep block");
+    assert!(!blocks_asked(&drain(&mut full)).contains(&deep));
+
+    pm.handle_message(1, NetworkMessage::NotFound(vec![Inventory::WitnessBlock(deep)]), InFlight::adopt(None));
+    pm.sweep_missing_blocks(&[1, 2]);
+    assert!(blocks_asked(&drain(&mut full)).contains(&deep), "after notfound the block did not go to the full peer");
+    assert!(!blocks_asked(&drain(&mut intact_peer)).contains(&deep), "the peer that said notfound was asked again");
+}
+
+/// The background download asks NODE_NETWORK peers and intact limited ones,
+/// not plain limited ones.
+#[test]
+fn the_background_download_asks_intact_peers_but_not_plain_limited_ones() {
+    let (pm, _dir) = mk_pm();
+    let _full = add_peer(&pm, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
+    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    let _intact = add_peer(&pm, 3, intact(), 300);
+    assert_eq!(pm.bg_catchup_peer_ids(), vec![1, 3]);
+}
+
+/// A re-fetch (`getblockfrompeer` without a peer id, an unreadable stored
+/// block) goes to an intact peer only when no NODE_NETWORK peer is
+/// connected; never to a plain limited peer.
+#[test]
+fn block_serving_peers_fall_back_to_intact_ones_only_without_a_full_peer() {
+    let (pm, _dir) = mk_pm();
+    let _intact = add_peer(&pm, 1, intact(), 300);
+    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    assert_eq!(pm.block_serving_peer_ids(), vec![1], "no full peer: the intact one");
+    let _full = add_peer(&pm, 3, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
+    assert_eq!(pm.block_serving_peer_ids(), vec![3], "a full peer: only it");
+}
+
+/// Intact peers are used only when already connected: while the tip is old,
+/// an outbound peer must still advertise NODE_NETWORK, so the outbound slots
+/// keep finding peers that hold every block, stripped ones included.
+#[test]
+fn an_intact_peer_does_not_stand_in_for_network_while_catching_up() {
+    let (pm, _dir) = mk_pm();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    assert_eq!(pm.missing_desirable_services(intact()), Some(full), "the regtest genesis tip is years old");
+    assert_eq!(pm.missing_desirable_services(full), None);
+}
+
+/// A peer's `notfound` record for the sweep goes when the peer disconnects,
+/// and a block's record goes once the sweep no longer misses the block.
+#[test]
+fn the_sweeps_notfound_record_is_dropped_with_the_peer_and_the_block() {
+    let (pm, _dir) = mk_pm();
+    let chain = blocks(300);
+    for b in &chain {
+        pm.chain_state.accept_header(&b.header).unwrap();
+    }
+    let mut intact_peer = add_peer(&pm, 1, intact(), 300);
+    pm.sweep_missing_blocks(&[1]);
+    let asked = blocks_asked(&drain(&mut intact_peer));
+    let notfound: Vec<Inventory> = asked.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
+    pm.handle_message(1, NetworkMessage::NotFound(notfound), InFlight::adopt(None));
+    assert_eq!(pm.sweep_not_found.read().len(), asked.len(), "each block answered notfound is recorded");
+    pm.handle_peer_disconnected(1);
+    assert!(pm.sweep_not_found.read().is_empty(), "a departed peer's notfound record stayed");
+
+    // A record for a block the chain no longer misses goes on the next pass.
+    pm.sweep_not_found.write().insert(bitcoin::BlockHash::all_zeros(), vec![1]);
+    pm.sweep_missing_blocks(&[2]);
+    assert!(pm.sweep_not_found.read().is_empty(), "a record for a block not missing stayed");
 }

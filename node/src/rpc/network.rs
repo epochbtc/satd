@@ -101,7 +101,7 @@ pub fn get_block_from_peer(
             .ok_or_else(|| {
                 (
                     RPC_MISC_ERROR,
-                    "No connected peer advertises NODE_NETWORK; \
+                    "No connected peer advertises NODE_NETWORK or INTACT_BLOCKS; \
                      connect one or name a peer explicitly"
                         .to_string(),
                 )
@@ -132,6 +132,7 @@ pub fn get_network_info(
         (bitcoin::p2p::ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
         (bitcoin::p2p::ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
         (bitcoin::p2p::ServiceFlags::P2P_V2, "P2P_V2"),
+        (crate::net::peer::node_intact_blocks(), "INTACT_BLOCKS"),
         (crate::nap::p2p::node_nap(), "NAP"),
     ]
     .into_iter()
