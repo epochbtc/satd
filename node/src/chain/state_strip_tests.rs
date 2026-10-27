@@ -900,3 +900,20 @@ fn a_replay_names_a_lost_strip_record() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The live chainstate audit reads a stripped block through its record: the
+/// block is neither unreadable nor short of txindex rows, so a healthy chain
+/// with a stripped block in the window is consistent (plan §2.8, PR 5e).
+#[test]
+fn the_chainstate_audit_reads_a_stripped_block_through_its_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    assert!(cs.verify_chainstate_default().is_consistent(), "premise: consistent before");
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    assert_eq!(cs.get_block(&hash), None, "premise: stripped");
+    let report = cs.verify_chainstate_default();
+    assert!(report.is_consistent(), "{}", report.describe());
+    assert!(report.unreadable.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
