@@ -332,6 +332,7 @@ message ScriptMatched {
   uint64 amount     = 7;      // matched value; funded output or spent-prevout, per streamprevoutmeta tier
   bool   has_amount = 8;      // distinguishes a genuine 0-value match from "not retained at this tier"
   bytes  raw_tx     = 9;      // full matching tx, inline; only when this stream opted in (SetWatchOptions)
+  bool   raw_tx_stripped = 10; // opted in, but the tx's OP_RETURN payloads were stripped: raw_tx is empty
 }
 
 // Per-stream delivery options (SubscribeControl.set_watch_options). Off by
@@ -373,6 +374,15 @@ matching transaction, inlined only for a connection that has sent
 `SetWatchOptions{include_raw_tx = true}` (off by default; the matcher only
 pays the serialization cost when at least one connection has opted in, and
 the bytes are cached and shared across matches on the same transaction).
+
+**OP_RETURN-stripped blocks.** A node running with `-pruneopreturn` zeroes the
+payloads of large OP_RETURN outputs in old blocks. A match produced from such a
+block (a `RescanBlocks`, or a lag resync that reaches one) names the transaction
+by its real txid, but its bytes are not available. On an opted-in stream such a
+match carries an empty `raw_tx` and `raw_tx_stripped = true` (on WS/SSE,
+`"raw_tx": null` and `"raw_tx_stripped": true`); it never carries zero-filled
+bytes. The same flag is on `SilentPaymentMatched` and `PrefixMatched`. A script
+watch on the stripped output's own content cannot fire: that content is gone.
 
 #### 7.2.1 Per-script `min_value` floor
 
@@ -681,6 +691,8 @@ message PrefixMatched {                       // body field 23
   bool         confirmed        = 3;
   uint32       height           = 4;
   repeated SpentPrevout matched_prevouts = 5; // spend side (see SpentPrevout); empty on a pure funding match
+  bool         raw_tx_stripped  = 6;          // the tx's OP_RETURN payloads were stripped: raw_tx is empty
+  bytes        txid             = 7;          // the matching tx's txid (internal byte order)
 }
 // script_pubkey/amount carriage depends on the retention tier (§12.1): confirmed
 // spends always carry both (from undo); mempool spends carry the script only
@@ -709,7 +721,12 @@ operator's `streamprevoutmeta` (§12.1): under `full` the real prevout `scriptPu
 is carried (the chainstate-less / privacy client's case — confirm locally, no
 outpoint resolution, no re-leak); under the default `amount` the value is carried
 but the script is empty; under `hash` neither is, and the client confirms the match
-against its own UTXO set. Because a bucket is
+against its own UTXO set. The exception is a transaction from an
+OP_RETURN-stripped block (`raw_tx_stripped`): its bytes are gone, so `raw_tx` is
+empty and the outputs cannot be filtered locally. `txid` names it, and both SDKs'
+filters report its outputs as unavailable rather than unmatched; fetching them by
+txid re-leaks the interest the bucket hid, so the choice is the client's. Spend-side
+matches from `matched_prevouts` still work. Because a bucket is
 a 2⁻ᵏ slice of uniform scripthash space, inline full-tx delivery is cheap: even a
 coarse k=8 bucket (anonymity set ≈ 256×) is a low-single-digit transactions per
 block plus a trickle from the mempool.
@@ -1020,6 +1037,7 @@ message SilentPaymentMatched {  // NodeEvent body 29 — one per matched output,
   bool   confirmed     = 10; // false on mempool acceptance; re-emitted true on block connect
   uint32 height        = 11; // block height when confirmed; 0 in the mempool
   bytes  raw_tx        = 12; // only under SetWatchOptions.include_raw_tx
+  bool   raw_tx_stripped = 13; // opted in, but the tx's OP_RETURN payloads were stripped: raw_tx is empty
 }
 ```
 

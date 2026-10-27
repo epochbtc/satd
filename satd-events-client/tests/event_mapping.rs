@@ -27,6 +27,7 @@ fn script_matched_carries_descriptor_attribution() {
         amount: 50_000,
         has_amount: true,
         raw_tx: vec![0xde, 0xad, 0xbe, 0xef],
+        raw_tx_stripped: false,
     }));
     match Event::from(ev) {
         Event::ScriptMatched { descriptors, is_output, amount, raw_tx, .. } => {
@@ -60,6 +61,7 @@ fn script_matched_without_descriptor_is_empty_attribution() {
         has_amount: false,
         // no opt-in → empty raw_tx decodes to None.
         raw_tx: vec![],
+        raw_tx_stripped: false,
     }));
     match Event::from(ev) {
         Event::ScriptMatched { descriptors, amount, raw_tx, .. } => {
@@ -128,6 +130,8 @@ fn spent_prevout_has_amount_becomes_option() {
     let ev = node_event(pb::node_event::Body::PrefixMatched(pb::PrefixMatched {
         prefix: Some(prefix),
         raw_tx: vec![0xde, 0xad],
+        raw_tx_stripped: false,
+        txid: vec![0x42; 32],
         confirmed: true,
         height: 7,
         matched_prevouts: vec![retained, zero, absent],
@@ -136,6 +140,8 @@ fn spent_prevout_has_amount_becomes_option() {
         Event::PrefixMatched(p) => {
             assert_eq!(p.prefix.bits, 8);
             assert_eq!(p.raw_tx, vec![0xde, 0xad]);
+            assert!(!p.raw_tx_stripped);
+            assert_eq!(p.txid, vec![0x42; 32]);
             assert!(p.confirmed);
             assert_eq!(p.matched_prevouts[0].amount, Some(1000));
             assert_eq!(p.matched_prevouts[0].script_pubkey, vec![0x51]);
@@ -292,6 +298,7 @@ fn silent_payment_matched_confirmed_carries_tweak_and_k() {
             confirmed: true,
             height: 880_000,
             raw_tx: vec![0xaa, 0xbb],
+            raw_tx_stripped: false,
         },
     ));
     match Event::from(ev) {
@@ -338,6 +345,7 @@ fn silent_payment_matched_unconfirmed_has_no_height_or_label() {
             // 0 on the wire while unconfirmed.
             height: 0,
             raw_tx: vec![],
+            raw_tx_stripped: false,
         },
     ));
     match Event::from(ev) {
@@ -553,5 +561,70 @@ fn an_unset_evict_reason_is_still_unspecified() {
     match Event::from(ev) {
         Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::Unspecified),
         other => panic!("expected evicted, got {other:?}"),
+    }
+}
+
+/// A match on a transaction whose OP_RETURN payloads the node stripped carries
+/// the flag and no bytes, on all three bodies that can inline a transaction.
+#[test]
+fn a_stripped_transaction_maps_to_no_bytes_and_the_flag() {
+    let script = node_event(pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
+        scripthash: vec![0x11; 32],
+        txid: vec![0x22; 32],
+        is_output: true,
+        index: 0,
+        confirmed: true,
+        descriptor_matches: vec![],
+        amount: 1,
+        has_amount: true,
+        raw_tx: vec![],
+        raw_tx_stripped: true,
+    }));
+    match Event::from(script) {
+        Event::ScriptMatched { raw_tx, raw_tx_stripped, txid, .. } => {
+            assert_eq!(raw_tx, None);
+            assert!(raw_tx_stripped);
+            assert_eq!(txid, vec![0x22; 32]);
+        }
+        other => panic!("expected ScriptMatched, got {other:?}"),
+    }
+    let prefix = node_event(pb::node_event::Body::PrefixMatched(pb::PrefixMatched {
+        prefix: Some(pb::ScriptPrefix { prefix: vec![0xab], bits: 8 }),
+        raw_tx: vec![],
+        raw_tx_stripped: true,
+        txid: vec![0x33; 32],
+        confirmed: true,
+        height: 7,
+        matched_prevouts: vec![],
+    }));
+    match Event::from(prefix) {
+        Event::PrefixMatched(p) => {
+            assert!(p.raw_tx.is_empty());
+            assert!(p.raw_tx_stripped);
+            assert_eq!(p.txid, vec![0x33; 32]);
+        }
+        other => panic!("expected prefix match, got {other:?}"),
+    }
+    let sp = node_event(pb::node_event::Body::SilentPaymentMatched(pb::SilentPaymentMatched {
+        scan_pubkey: vec![0x02; 33],
+        txid: vec![0x44; 32],
+        vout: 0,
+        output_pubkey: vec![0x55; 32],
+        amount: 1,
+        tweak: vec![0x02; 33],
+        k: 0,
+        has_label: false,
+        label: 0,
+        confirmed: true,
+        height: 9,
+        raw_tx: vec![],
+        raw_tx_stripped: true,
+    }));
+    match Event::from(sp) {
+        Event::SilentPaymentMatched { raw_tx, raw_tx_stripped, .. } => {
+            assert_eq!(raw_tx, None);
+            assert!(raw_tx_stripped);
+        }
+        other => panic!("expected SilentPaymentMatched, got {other:?}"),
     }
 }

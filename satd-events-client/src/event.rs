@@ -410,8 +410,16 @@ impl From<pb::SpentPrevout> for SpentPrevout {
 pub struct PrefixMatch {
     /// The registered bucket that fired.
     pub prefix: ScriptPrefix,
-    /// Consensus-serialized matching transaction.
+    /// Consensus-serialized matching transaction. Empty when
+    /// [`raw_tx_stripped`](Self::raw_tx_stripped).
     pub raw_tx: Vec<u8>,
+    /// The transaction was read from a block whose OP_RETURN payloads the node
+    /// has stripped: its bytes are not available, so `raw_tx` is empty and its
+    /// outputs cannot be filtered locally. Fetch them by [`txid`](Self::txid).
+    pub raw_tx_stripped: bool,
+    /// The matching transaction's txid (internal byte order), as raw bytes.
+    /// Empty from a node that predates the field.
+    pub txid: Vec<u8>,
     /// `false` = mempool, `true` = connected block.
     pub confirmed: bool,
     /// Block height when confirmed; 0 in the mempool.
@@ -587,6 +595,10 @@ pub enum Event {
         /// [`set_watch_options`](crate::WatchControls::set_watch_options) with
         /// `include_raw_tx = true`; `None` otherwise.
         raw_tx: Option<Vec<u8>>,
+        /// On a stream that opted into `raw_tx`: the transaction was read from
+        /// a block whose OP_RETURN payloads the node has stripped, so its bytes
+        /// are not available and `raw_tx` is `None`. `txid` is still its txid.
+        raw_tx_stripped: bool,
         /// Descriptor attribution: the descriptor watch(es) this scripthash
         /// belongs to, if it was registered via `add_descriptor`. Empty for a
         /// directly-watched script. See [`DescriptorMatch`].
@@ -841,6 +853,8 @@ pub enum Event {
         /// The full serialized transaction, only when this connection opted in
         /// via `SetWatchOptions.include_raw_tx`; `None` otherwise.
         raw_tx: Option<Vec<u8>>,
+        /// As [`Event::ScriptMatched`]'s `raw_tx_stripped`.
+        raw_tx_stripped: bool,
     },
     /// An incremental watch add (`add_scripts`, `add_outpoints`, …) that the
     /// server did **not** register: over the quota, over the per-add rate
@@ -1124,6 +1138,7 @@ impl From<pb::NodeEvent> for Event {
                 confirmed: s.confirmed,
                 amount: s.has_amount.then_some(s.amount),
                 raw_tx: (!s.raw_tx.is_empty()).then_some(s.raw_tx),
+                raw_tx_stripped: s.raw_tx_stripped,
                 descriptors: s
                     .descriptor_matches
                     .into_iter()
@@ -1165,6 +1180,8 @@ impl From<pb::NodeEvent> for Event {
                 Some(sp) => Event::PrefixMatched(PrefixMatch {
                     prefix: ScriptPrefix { prefix: sp.prefix, bits: sp.bits },
                     raw_tx: p.raw_tx,
+                    raw_tx_stripped: p.raw_tx_stripped,
+                    txid: p.txid,
                     confirmed: p.confirmed,
                     height: p.height,
                     matched_prevouts: p.matched_prevouts.into_iter().map(Into::into).collect(),
@@ -1276,6 +1293,7 @@ impl From<pb::NodeEvent> for Event {
                 // `height` is 0 on the wire while unconfirmed; surface `None`.
                 height: s.confirmed.then_some(s.height),
                 raw_tx: (!s.raw_tx.is_empty()).then_some(s.raw_tx),
+                raw_tx_stripped: s.raw_tx_stripped,
             },
             // Forward-compatible catch-all: any body a still-newer proto adds maps
             // to `Unknown`. It is unreachable against the *current* workspace proto

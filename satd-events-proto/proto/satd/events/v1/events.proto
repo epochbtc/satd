@@ -294,6 +294,11 @@ message ScriptMatched {
   // needs the whole tx (e.g. multi-input net-of-change accounting) skip the
   // enrichment getrawtransaction entirely. Bandwidth-heavy — off by default.
   bytes raw_tx = 9;
+  // Set, on a stream that opted into raw_tx, when the matching transaction was
+  // read from a block whose OP_RETURN payloads this node has stripped
+  // (-pruneopreturn): its bytes are not available, so `raw_tx` is empty. Never
+  // zero-filled bytes. `txid` is still the transaction's txid.
+  bool raw_tx_stripped = 10;
 }
 
 message DescriptorMatch {
@@ -371,6 +376,15 @@ message PrefixMatched {
   // Spend side: the matched prevout(s) for inputs whose prevout script fell in
   // the bucket. Empty for a pure funding (output-side) match.
   repeated SpentPrevout matched_prevouts = 5;
+  // Set when the transaction was read from a block whose OP_RETURN payloads
+  // this node has stripped (-pruneopreturn): its bytes are not available, so
+  // `raw_tx` is empty and the bucket cannot be filtered locally. Never
+  // zero-filled bytes.
+  bool raw_tx_stripped = 6;
+  // The matching transaction's txid. For an intact transaction it is the hash
+  // of `raw_tx`; for a stripped one it is the only way to name it, so a client
+  // can fetch the transaction's outputs elsewhere and finish the filter.
+  bytes txid = 7;
 }
 
 // A transaction paid a registered BIP 352 silent-payment target (Tier 2, §4).
@@ -393,6 +407,9 @@ message SilentPaymentMatched {
   bool   confirmed     = 10; // false on mempool acceptance; re-emitted true on block connect (D7)
   uint32 height        = 11; // block height when confirmed; 0 in the mempool
   bytes  raw_tx        = 12; // full serialized tx, only under SetWatchOptions.include_raw_tx
+  // As ScriptMatched.raw_tx_stripped: the tx's OP_RETURN payloads were stripped
+  // from this node's block files, so `raw_tx` is empty. Never zero-filled bytes.
+  bool   raw_tx_stripped = 13;
 }
 
 // A block's BIP 352 tweak data (Tier 1, §3.5), streamed on the Subscribe

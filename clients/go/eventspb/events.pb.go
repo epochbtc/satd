@@ -2289,7 +2289,12 @@ type ScriptMatched struct {
 	// (parity with PrefixMatched.raw_tx). Empty otherwise. Lets a consumer that
 	// needs the whole tx (e.g. multi-input net-of-change accounting) skip the
 	// enrichment getrawtransaction entirely. Bandwidth-heavy — off by default.
-	RawTx         []byte `protobuf:"bytes,9,opt,name=raw_tx,json=rawTx,proto3" json:"raw_tx,omitempty"`
+	RawTx []byte `protobuf:"bytes,9,opt,name=raw_tx,json=rawTx,proto3" json:"raw_tx,omitempty"`
+	// Set, on a stream that opted into raw_tx, when the matching transaction was
+	// read from a block whose OP_RETURN payloads this node has stripped
+	// (-pruneopreturn): its bytes are not available, so `raw_tx` is empty. Never
+	// zero-filled bytes. `txid` is still the transaction's txid.
+	RawTxStripped bool `protobuf:"varint,10,opt,name=raw_tx_stripped,json=rawTxStripped,proto3" json:"raw_tx_stripped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2385,6 +2390,13 @@ func (x *ScriptMatched) GetRawTx() []byte {
 		return x.RawTx
 	}
 	return nil
+}
+
+func (x *ScriptMatched) GetRawTxStripped() bool {
+	if x != nil {
+		return x.RawTxStripped
+	}
+	return false
 }
 
 type DescriptorMatch struct {
@@ -2886,8 +2898,17 @@ type PrefixMatched struct {
 	// Spend side: the matched prevout(s) for inputs whose prevout script fell in
 	// the bucket. Empty for a pure funding (output-side) match.
 	MatchedPrevouts []*SpentPrevout `protobuf:"bytes,5,rep,name=matched_prevouts,json=matchedPrevouts,proto3" json:"matched_prevouts,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Set when the transaction was read from a block whose OP_RETURN payloads
+	// this node has stripped (-pruneopreturn): its bytes are not available, so
+	// `raw_tx` is empty and the bucket cannot be filtered locally. Never
+	// zero-filled bytes.
+	RawTxStripped bool `protobuf:"varint,6,opt,name=raw_tx_stripped,json=rawTxStripped,proto3" json:"raw_tx_stripped,omitempty"`
+	// The matching transaction's txid. For an intact transaction it is the hash
+	// of `raw_tx`; for a stripped one it is the only way to name it, so a client
+	// can fetch the transaction's outputs elsewhere and finish the filter.
+	Txid          []byte `protobuf:"bytes,7,opt,name=txid,proto3" json:"txid,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PrefixMatched) Reset() {
@@ -2955,6 +2976,20 @@ func (x *PrefixMatched) GetMatchedPrevouts() []*SpentPrevout {
 	return nil
 }
 
+func (x *PrefixMatched) GetRawTxStripped() bool {
+	if x != nil {
+		return x.RawTxStripped
+	}
+	return false
+}
+
+func (x *PrefixMatched) GetTxid() []byte {
+	if x != nil {
+		return x.Txid
+	}
+	return nil
+}
+
 // A transaction paid a registered BIP 352 silent-payment target (Tier 2, §4).
 // Emitted on the Watch stream by the scan-key matcher: one event per matched
 // output. `scan_pubkey` attributes the match to the registered target (mirrors
@@ -2963,19 +2998,22 @@ func (x *PrefixMatched) GetMatchedPrevouts() []*SpentPrevout {
 // the node ever holding a spending key. Mempool matches arrive `confirmed=false`
 // and are re-emitted `confirmed=true` on block connect (D7).
 type SilentPaymentMatched struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ScanPubkey    []byte                 `protobuf:"bytes,1,opt,name=scan_pubkey,json=scanPubkey,proto3" json:"scan_pubkey,omitempty"` // registered target identity (b_scan·G, 33 bytes)
-	Txid          []byte                 `protobuf:"bytes,2,opt,name=txid,proto3" json:"txid,omitempty"`
-	Vout          uint32                 `protobuf:"varint,3,opt,name=vout,proto3" json:"vout,omitempty"`
-	OutputPubkey  []byte                 `protobuf:"bytes,4,opt,name=output_pubkey,json=outputPubkey,proto3" json:"output_pubkey,omitempty"` // 32-byte x-only taproot output key
-	Amount        uint64                 `protobuf:"varint,5,opt,name=amount,proto3" json:"amount,omitempty"`                                // output value in satoshis
-	Tweak         []byte                 `protobuf:"bytes,6,opt,name=tweak,proto3" json:"tweak,omitempty"`                                   // 33-byte shared-secret tweak; with `k`, derives the output key offline
-	K             uint32                 `protobuf:"varint,7,opt,name=k,proto3" json:"k,omitempty"`                                          // output counter for this tx (BIP 352 k)
-	HasLabel      bool                   `protobuf:"varint,8,opt,name=has_label,json=hasLabel,proto3" json:"has_label,omitempty"`            // true when the match hit a registered label
-	Label         uint32                 `protobuf:"varint,9,opt,name=label,proto3" json:"label,omitempty"`                                  // the label int that matched (valid only when has_label)
-	Confirmed     bool                   `protobuf:"varint,10,opt,name=confirmed,proto3" json:"confirmed,omitempty"`                         // false on mempool acceptance; re-emitted true on block connect (D7)
-	Height        uint32                 `protobuf:"varint,11,opt,name=height,proto3" json:"height,omitempty"`                               // block height when confirmed; 0 in the mempool
-	RawTx         []byte                 `protobuf:"bytes,12,opt,name=raw_tx,json=rawTx,proto3" json:"raw_tx,omitempty"`                     // full serialized tx, only under SetWatchOptions.include_raw_tx
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ScanPubkey   []byte                 `protobuf:"bytes,1,opt,name=scan_pubkey,json=scanPubkey,proto3" json:"scan_pubkey,omitempty"` // registered target identity (b_scan·G, 33 bytes)
+	Txid         []byte                 `protobuf:"bytes,2,opt,name=txid,proto3" json:"txid,omitempty"`
+	Vout         uint32                 `protobuf:"varint,3,opt,name=vout,proto3" json:"vout,omitempty"`
+	OutputPubkey []byte                 `protobuf:"bytes,4,opt,name=output_pubkey,json=outputPubkey,proto3" json:"output_pubkey,omitempty"` // 32-byte x-only taproot output key
+	Amount       uint64                 `protobuf:"varint,5,opt,name=amount,proto3" json:"amount,omitempty"`                                // output value in satoshis
+	Tweak        []byte                 `protobuf:"bytes,6,opt,name=tweak,proto3" json:"tweak,omitempty"`                                   // 33-byte shared-secret tweak; with `k`, derives the output key offline
+	K            uint32                 `protobuf:"varint,7,opt,name=k,proto3" json:"k,omitempty"`                                          // output counter for this tx (BIP 352 k)
+	HasLabel     bool                   `protobuf:"varint,8,opt,name=has_label,json=hasLabel,proto3" json:"has_label,omitempty"`            // true when the match hit a registered label
+	Label        uint32                 `protobuf:"varint,9,opt,name=label,proto3" json:"label,omitempty"`                                  // the label int that matched (valid only when has_label)
+	Confirmed    bool                   `protobuf:"varint,10,opt,name=confirmed,proto3" json:"confirmed,omitempty"`                         // false on mempool acceptance; re-emitted true on block connect (D7)
+	Height       uint32                 `protobuf:"varint,11,opt,name=height,proto3" json:"height,omitempty"`                               // block height when confirmed; 0 in the mempool
+	RawTx        []byte                 `protobuf:"bytes,12,opt,name=raw_tx,json=rawTx,proto3" json:"raw_tx,omitempty"`                     // full serialized tx, only under SetWatchOptions.include_raw_tx
+	// As ScriptMatched.raw_tx_stripped: the tx's OP_RETURN payloads were stripped
+	// from this node's block files, so `raw_tx` is empty. Never zero-filled bytes.
+	RawTxStripped bool `protobuf:"varint,13,opt,name=raw_tx_stripped,json=rawTxStripped,proto3" json:"raw_tx_stripped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3092,6 +3130,13 @@ func (x *SilentPaymentMatched) GetRawTx() []byte {
 		return x.RawTx
 	}
 	return nil
+}
+
+func (x *SilentPaymentMatched) GetRawTxStripped() bool {
+	if x != nil {
+		return x.RawTxStripped
+	}
+	return false
 }
 
 // A block's BIP 352 tweak data (Tier 1, §3.5), streamed on the Subscribe
@@ -5994,7 +6039,7 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\routpoint_vout\x18\x02 \x01(\rR\foutpointVout\x12#\n" +
 	"\rspending_txid\x18\x03 \x01(\fR\fspendingTxid\x12!\n" +
 	"\fspending_vin\x18\x04 \x01(\rR\vspendingVin\x12\x1c\n" +
-	"\tconfirmed\x18\x05 \x01(\bR\tconfirmed\"\xb2\x02\n" +
+	"\tconfirmed\x18\x05 \x01(\bR\tconfirmed\"\xda\x02\n" +
 	"\rScriptMatched\x12\x1e\n" +
 	"\n" +
 	"scripthash\x18\x01 \x01(\fR\n" +
@@ -6007,7 +6052,9 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x06amount\x18\a \x01(\x04R\x06amount\x12\x1d\n" +
 	"\n" +
 	"has_amount\x18\b \x01(\bR\thasAmount\x12\x15\n" +
-	"\x06raw_tx\x18\t \x01(\fR\x05rawTx\"t\n" +
+	"\x06raw_tx\x18\t \x01(\fR\x05rawTx\x12&\n" +
+	"\x0fraw_tx_stripped\x18\n" +
+	" \x01(\bR\rrawTxStripped\"t\n" +
 	"\x0fDescriptorMatch\x12\x1e\n" +
 	"\n" +
 	"descriptor\x18\x01 \x01(\tR\n" +
@@ -6042,13 +6089,15 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\rscript_pubkey\x18\x03 \x01(\fR\fscriptPubkey\x12\x16\n" +
 	"\x06amount\x18\x04 \x01(\x04R\x06amount\x12\x1d\n" +
 	"\n" +
-	"has_amount\x18\x05 \x01(\bR\thasAmount\"\xdb\x01\n" +
+	"has_amount\x18\x05 \x01(\bR\thasAmount\"\x97\x02\n" +
 	"\rPrefixMatched\x124\n" +
 	"\x06prefix\x18\x01 \x01(\v2\x1c.satd.events.v1.ScriptPrefixR\x06prefix\x12\x15\n" +
 	"\x06raw_tx\x18\x02 \x01(\fR\x05rawTx\x12\x1c\n" +
 	"\tconfirmed\x18\x03 \x01(\bR\tconfirmed\x12\x16\n" +
 	"\x06height\x18\x04 \x01(\rR\x06height\x12G\n" +
-	"\x10matched_prevouts\x18\x05 \x03(\v2\x1c.satd.events.v1.SpentPrevoutR\x0fmatchedPrevouts\"\xc0\x02\n" +
+	"\x10matched_prevouts\x18\x05 \x03(\v2\x1c.satd.events.v1.SpentPrevoutR\x0fmatchedPrevouts\x12&\n" +
+	"\x0fraw_tx_stripped\x18\x06 \x01(\bR\rrawTxStripped\x12\x12\n" +
+	"\x04txid\x18\a \x01(\fR\x04txid\"\xe8\x02\n" +
 	"\x14SilentPaymentMatched\x12\x1f\n" +
 	"\vscan_pubkey\x18\x01 \x01(\fR\n" +
 	"scanPubkey\x12\x12\n" +
@@ -6063,7 +6112,8 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\tconfirmed\x18\n" +
 	" \x01(\bR\tconfirmed\x12\x16\n" +
 	"\x06height\x18\v \x01(\rR\x06height\x12\x15\n" +
-	"\x06raw_tx\x18\f \x01(\fR\x05rawTx\"\x96\x01\n" +
+	"\x06raw_tx\x18\f \x01(\fR\x05rawTx\x12&\n" +
+	"\x0fraw_tx_stripped\x18\r \x01(\bR\rrawTxStripped\"\x96\x01\n" +
 	"\vBlockTweaks\x12\x1d\n" +
 	"\n" +
 	"block_hash\x18\x01 \x01(\fR\tblockHash\x12\x16\n" +

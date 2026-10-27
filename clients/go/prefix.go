@@ -102,8 +102,8 @@ type SpendingHit struct {
 // PrefixHits is the result of re-filtering one [PrefixMatched] against the
 // watched set.
 type PrefixHits struct {
-	// Txid is the delivered transaction's id, recomputed from the raw bytes, in
-	// internal byte order.
+	// Txid is the delivered transaction's id in internal byte order: recomputed
+	// from the raw bytes, or, when they were stripped, the txid the node sent.
 	Txid [32]byte
 	// Confirmed is false for a mempool delivery, true for one in a connected
 	// block.
@@ -121,6 +121,13 @@ type PrefixHits struct {
 	// outpoints yourself to complete the filter - never treat them as
 	// non-matches.
 	Unresolved []Outpoint
+	// OutputsUnavailable is set when the node had stripped this transaction's
+	// OP_RETURN payloads and so sent no bytes: Funding is empty because the
+	// outputs could not be checked, not because none matched. Fetch the
+	// transaction's outputs by Txid (for example getrawtransaction verbose) to
+	// complete the filter. Spending hits are still found from the retained
+	// prevout scripts, with Vin unknown.
+	OutputsUnavailable bool
 }
 
 // IsMatch reports whether any genuine output or spend match was found.
@@ -128,10 +135,12 @@ func (h *PrefixHits) IsMatch() bool {
 	return len(h.Funding) > 0 || len(h.Spending) > 0
 }
 
-// HasUnresolved reports whether any spend-side prevout could not be filtered
-// locally. The caller must resolve [PrefixHits.Unresolved] before concluding
-// that this transaction is a true non-match.
-func (h *PrefixHits) HasUnresolved() bool { return len(h.Unresolved) > 0 }
+// HasUnresolved reports whether part of the match could not be filtered
+// locally: a spend-side prevout whose script was not retained, or outputs the
+// node could not send ([PrefixHits.OutputsUnavailable]). The caller must resolve
+// [PrefixHits.Unresolved] and fetch unavailable outputs before concluding that
+// this transaction is a true non-match.
+func (h *PrefixHits) HasUnresolved() bool { return len(h.Unresolved) > 0 || h.OutputsUnavailable }
 
 // PrefixWatcher holds the consumer's real scriptPubKeys and re-filters coarse
 // prefix-bucket deliveries down to true matches.
@@ -221,19 +230,36 @@ func (w *PrefixWatcher) Prefixes(bits uint32) []ScriptPrefix {
 // It decodes the delivered transaction, recomputes sha256(scriptPubKey) for each
 // output and each retained spent prevout, and returns the true hits. A raw
 // transaction that is not a valid consensus serialization is a decode error.
+//
+// A match whose transaction the node had OP_RETURN-stripped carries no bytes:
+// its txid comes from the match, and the result has
+// [PrefixHits.OutputsUnavailable] set.
 func (w *PrefixWatcher) Filter(m *PrefixMatched) (*PrefixHits, error) {
-	tx, err := decodeTx(m.RawTx)
-	if err != nil {
-		return nil, err
-	}
-
 	hits := &PrefixHits{
-		Txid:      tx.txid,
 		Confirmed: m.Confirmed,
 		Height:    m.Height,
 	}
+	var tx *decodedTx
+	if m.RawTxStripped {
+		if len(m.Txid) != 32 {
+			return nil, newError(KindDecode, "prefix txid: %d bytes, want 32", len(m.Txid))
+		}
+		copy(hits.Txid[:], m.Txid)
+		hits.OutputsUnavailable = true
+	} else {
+		var err error
+		tx, err = decodeTx(m.RawTx)
+		if err != nil {
+			return nil, err
+		}
+		hits.Txid = tx.txid
+	}
 
-	for vout, out := range tx.outputs {
+	var outputs []txOutput
+	if tx != nil {
+		outputs = tx.outputs
+	}
+	for vout, out := range outputs {
 		sh := ScripthashOf(out.scriptPubKey)
 		if _, ok := w.watched[sh]; !ok {
 			continue
@@ -272,6 +298,9 @@ func (w *PrefixWatcher) Filter(m *PrefixMatched) (*PrefixHits, error) {
 // findVin locates the input index spending outpoint, comparing the raw internal
 // byte order the wire carries.
 func findVin(tx *decodedTx, outpoint Outpoint) *uint32 {
+	if tx == nil {
+		return nil
+	}
 	for i, in := range tx.inputs {
 		if in.prevVout != outpoint.Vout {
 			continue

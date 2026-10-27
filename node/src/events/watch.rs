@@ -37,10 +37,11 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 use node_index::keys::{scripthash_of, Scripthash};
-use node_sp_index::{TweakEntry, compute_tweak, scan_outputs};
+use node_sp_index::{TweakEntry, compute_tweak_with_txid, scan_outputs};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::{EvictReason, MempoolEvent};
+use crate::storage::opreturn_strip::StoredBlock;
 use crate::storage::undo::UndoData;
 
 /// Default per-subscriber match-channel depth. A subscriber that falls
@@ -230,6 +231,10 @@ pub enum WatchMatch {
         /// The per-connection encoder puts it on the wire only for a connection
         /// that opted in; others carry the pointer and drop it.
         raw_tx: Option<Arc<[u8]>>,
+        /// The matching tx was read from an OP_RETURN-stripped block, so its
+        /// bytes are not available: `raw_tx` is `None` whatever the opt-in.
+        /// Never zero-filled bytes in its place.
+        raw_tx_stripped: bool,
     },
     /// A watched transaction id appeared — in the mempool (`confirmed =
     /// false`) or a connected block (`confirmed = true`). The "seen/confirmed"
@@ -295,6 +300,8 @@ pub enum WatchMatch {
         /// `Arc` so the per-tx serialization happens at most once — same
         /// mechanism as `ScriptMatched`.
         raw_tx: Option<Arc<[u8]>>,
+        /// As `ScriptMatched::raw_tx_stripped`.
+        raw_tx_stripped: bool,
     },
 }
 
@@ -325,7 +332,16 @@ pub struct PrefixMatch {
     /// The full consensus-serialized matching transaction. Self-contained: the
     /// client decodes it and filters the bucket locally. `Arc`-wrapped so the
     /// per-subscriber delivery clone is a refcount bump, not a full-body copy.
+    /// Empty when `raw_tx_stripped`.
     pub raw_tx: Arc<[u8]>,
+    /// The transaction was read from an OP_RETURN-stripped block, so its bytes
+    /// are not available and `raw_tx` is empty; never zero-filled bytes. The
+    /// client cannot filter the bucket locally for this transaction.
+    pub raw_tx_stripped: bool,
+    /// The matching transaction's txid. Redundant with `raw_tx` for an intact
+    /// transaction; for a stripped one it is the only way to name it, so the
+    /// client can fetch its outputs elsewhere and finish the filter.
+    pub txid: Txid,
     /// `true` in a connected block, `false` in the mempool.
     pub confirmed: bool,
     /// Block height when `confirmed`; `None` in the mempool.
@@ -977,14 +993,15 @@ impl WatchRegistry {
     /// reveal (it carries no prevout `scriptPubKey`). The caller passes `None`
     /// when no script is watched (or the undo is unavailable, e.g. pruned), in
     /// which case only outpoint-spend and output-side script matching run.
-    pub fn scan_block(&self, block: &Block, height: u32, undo: Option<&UndoData>) {
+    pub fn scan_block(&self, block: &impl ScanBlock, height: u32, undo: Option<&UndoData>) {
         if !self.has_watchers() {
             return;
         }
         let inner = self.read_inner();
         let wants_raw = self.wants_any_raw_tx();
         let mut sink = LiveSink;
-        for tx in &block.txdata {
+        let txs = block.scan_txs();
+        for &tx in &txs {
             scan_tx(&inner, tx, true, Some(height), wants_raw, &mut sink);
         }
         // Input-side script/prefix matching: only meaningful with a watched
@@ -993,14 +1010,14 @@ impl WatchRegistry {
         if let Some(undo) = undo
             && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
-            scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
+            scan_block_spent_scripts(&inner, &txs, height, undo, wants_raw, &mut sink);
         }
         // Silent-payment (Tier 2) matching also needs the block's undo data to
         // recover the input prevout scripts the per-tx tweak is computed over.
         if let Some(undo) = undo
             && !inner.sp_subs.is_empty()
         {
-            scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+            scan_block_sp(&inner, &txs, height, undo, wants_raw, &mut sink);
         }
     }
 
@@ -1018,7 +1035,7 @@ impl WatchRegistry {
     /// subscriber — there is no cross-subscriber leakage and no drop-on-lag.
     pub fn scan_block_collect(
         &self,
-        block: &Block,
+        block: &impl ScanBlock,
         height: u32,
         undo: Option<&UndoData>,
     ) -> Vec<WatchMatch> {
@@ -1042,7 +1059,7 @@ impl WatchRegistry {
     /// recompute path.
     pub fn scan_block_collect_accel(
         &self,
-        block: &Block,
+        block: &impl ScanBlock,
         height: u32,
         undo: Option<&UndoData>,
         sp_tweaks: Option<&[TweakEntry]>,
@@ -1053,25 +1070,26 @@ impl WatchRegistry {
         }
         let inner = self.read_inner();
         let wants_raw = self.wants_any_raw_tx();
-        for tx in &block.txdata {
+        let txs = block.scan_txs();
+        for &tx in &txs {
             scan_tx(&inner, tx, true, Some(height), wants_raw, &mut sink);
         }
         if let Some(undo) = undo
             && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
-            scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
+            scan_block_spent_scripts(&inner, &txs, height, undo, wants_raw, &mut sink);
         }
         if !inner.sp_subs.is_empty() {
             match sp_tweaks {
                 // D4 fast path: authoritative stored tweaks (index complete +
                 // row.block_hash verified by the caller) — no undo needed.
                 Some(entries) => {
-                    scan_block_sp_from_tweaks(&inner, block, height, entries, wants_raw, &mut sink);
+                    scan_block_sp_from_tweaks(&inner, &txs, height, entries, wants_raw, &mut sink);
                 }
                 // Recompute path: needs undo to derive each tweak.
                 None => {
                     if let Some(undo) = undo {
-                        scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+                        scan_block_sp(&inner, &txs, height, undo, wants_raw, &mut sink);
                     }
                 }
             }
@@ -1177,7 +1195,7 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
-        scan_tx(&inner, tx, false, None, self.wants_any_raw_tx(), &mut LiveSink);
+        scan_tx(&inner, ScanTx::intact(tx), false, None, self.wants_any_raw_tx(), &mut LiveSink);
     }
 
     /// Mempool **spend-side** script matching: the unconfirmed analogue of
@@ -1242,7 +1260,8 @@ impl WatchRegistry {
         if !scan_scripts && !scan_prefixes {
             return;
         }
-        let txid = tx.compute_txid();
+        let stx = ScanTx::intact(tx);
+        let txid = stx.txid;
         // Prefix matches are aggregated per bucket across this tx's inputs (one
         // PrefixMatched per bucket, mirroring the confirmed undo path); exact
         // matches fire per input. `zip` aligns each input with its prevout hash
@@ -1268,7 +1287,8 @@ impl WatchRegistry {
                     confirmed: false,
                     height: None,
                     amount: value,
-                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
+                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                    raw_tx_stripped: false,
                 };
                 for sid in subs {
                     if floor_allows(&inner, *sid, sh, value) {
@@ -1309,12 +1329,14 @@ impl WatchRegistry {
         }
         // Reuse the per-tx cache: if the exact spend path above already
         // serialized (raw-tx opt-in), the prefix deliveries share that Arc.
-        let raw = raw_tx_bytes(&mut raw_tx_cache, tx);
+        let raw = prefix_raw_tx(&mut raw_tx_cache, stx);
         for (key, matched_prevouts) in prefix_spends {
             if let Some(subs) = inner.by_prefix.get(&key) {
                 let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
                     prefix: (key.1, key.0),
                     raw_tx: raw.clone(),
+                    raw_tx_stripped: false,
+                    txid,
                     confirmed: false,
                     height: None,
                     matched_prevouts,
@@ -1372,8 +1394,7 @@ impl WatchRegistry {
         sp_scan_tx_outputs(
             &inner,
             &work,
-            tx,
-            entry.txid,
+            ScanTx { tx, txid: entry.txid, stripped: false },
             &entry.tweak,
             false,
             None,
@@ -1389,7 +1410,7 @@ impl WatchRegistry {
 
     /// Arm depth entries whose txid appears in a freshly connected block,
     /// anchoring each on `(height, block_hash)`. Gated by `has_depth_watchers`.
-    fn arm_depths_for_block(&self, block: &Block, height: u32) {
+    fn arm_depths_for_block(&self, block: &impl ScanBlock, height: u32) {
         if !self.has_depth_watchers() {
             return;
         }
@@ -1398,8 +1419,8 @@ impl WatchRegistry {
         if inner.by_txid_depth.is_empty() {
             return;
         }
-        for tx in &block.txdata {
-            let txid = tx.compute_txid();
+        for tx in block.scan_txs() {
+            let txid = tx.txid;
             let keys: Vec<DepthKey> = match inner.by_txid_depth.get(&txid) {
                 Some(set) => set.iter().copied().collect(),
                 None => continue,
@@ -1580,7 +1601,7 @@ impl WatchRegistry {
     /// Scan a disconnected block: emit `TxidUnconfirmed` for watched txids in it
     /// (their confirming block was rolled back by a reorg). Best-effort — the
     /// caller skips this when the block data is unavailable (pruned).
-    fn scan_block_disconnected(&self, block: &Block, height: u32) {
+    fn scan_block_disconnected(&self, block: &impl ScanBlock, height: u32) {
         if !self.has_txid_watchers() {
             return;
         }
@@ -1588,8 +1609,8 @@ impl WatchRegistry {
         if inner.by_txid.is_empty() {
             return;
         }
-        for tx in &block.txdata {
-            let txid = tx.compute_txid();
+        for tx in block.scan_txs() {
+            let txid = tx.txid;
             if let Some(subs) = inner.by_txid.get(&txid) {
                 let m = WatchMatch::TxidUnconfirmed {
                     txid,
@@ -1734,6 +1755,79 @@ pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
     u32::from_be_bytes(buf) & prefix_mask(bits)
 }
 
+/// A transaction the matcher scans: its txid, and whether its bytes are its
+/// own. A transaction read from an OP_RETURN-stripped block is the filled form:
+/// its inputs and spendable outputs are the original's, but its computed txid
+/// is not its txid and its bytes must never be served as the transaction.
+#[derive(Clone, Copy)]
+pub struct ScanTx<'a> {
+    tx: &'a Transaction,
+    txid: Txid,
+    stripped: bool,
+}
+
+impl<'a> ScanTx<'a> {
+    /// A transaction whose bytes are its own (the mempool, an intact block).
+    fn intact(tx: &'a Transaction) -> Self {
+        Self { tx, txid: tx.compute_txid(), stripped: false }
+    }
+}
+
+/// A block the matcher scans. A `Block` is intact by construction: the only
+/// way to hold a stripped block is a [`StoredBlock`], which `get_block` never
+/// returns, so a plain `Block` always hashes to its own txids.
+pub trait ScanBlock {
+    fn block_hash(&self) -> BlockHash;
+    /// Every transaction, in block order.
+    fn scan_txs(&self) -> Vec<ScanTx<'_>>;
+}
+
+impl ScanBlock for Block {
+    fn block_hash(&self) -> BlockHash {
+        Block::block_hash(self)
+    }
+    fn scan_txs(&self) -> Vec<ScanTx<'_>> {
+        self.txdata.iter().map(ScanTx::intact).collect()
+    }
+}
+
+/// A stored block names each transaction by its stored txid, which a stripped
+/// transaction's strip record holds.
+impl ScanBlock for StoredBlock {
+    fn block_hash(&self) -> BlockHash {
+        self.block.block_hash()
+    }
+    fn scan_txs(&self) -> Vec<ScanTx<'_>> {
+        self.block
+            .txdata
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| ScanTx { tx, txid: self.txid(i), stripped: self.tx_is_stripped(i) })
+            .collect()
+    }
+}
+
+/// Lazily serialize `tx` once into the shared per-tx cache and return a cheap
+/// `Arc` clone. Callers gate on the raw-tx opt-in before invoking, so an
+/// un-opted stream never serializes. `None` for a stripped transaction, whose
+/// bytes are not its own.
+fn raw_tx_bytes(cache: &mut Option<Arc<[u8]>>, tx: ScanTx<'_>) -> Option<Arc<[u8]>> {
+    if tx.stripped {
+        return None;
+    }
+    Some(
+        cache
+            .get_or_insert_with(|| Arc::from(bitcoin::consensus::serialize(tx.tx)))
+            .clone(),
+    )
+}
+
+/// The `raw_tx` a [`PrefixMatch`] carries: the bytes, or empty for a stripped
+/// transaction (with `raw_tx_stripped` set).
+fn prefix_raw_tx(cache: &mut Option<Arc<[u8]>>, tx: ScanTx<'_>) -> Arc<[u8]> {
+    raw_tx_bytes(cache, tx).unwrap_or_else(|| Arc::from(&[][..]))
+}
+
 /// Funding (output-side) prefix delivery for one output's scripthash. A funding
 /// match's payload is identical for every output that lands in the same bucket
 /// (it carries no vout and no prevout — just "this tx funds bucket B"), so
@@ -1741,21 +1835,11 @@ pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
 /// per bucket per tx, not one per matching output. `raw_tx` is the per-tx
 /// serialization cache, filled at most once and only on a real match.
 #[allow(clippy::too_many_arguments)] // threaded matcher context + delivery sink
-/// Lazily serialize `tx` once into the shared per-tx cache and return a cheap
-/// `Arc` clone. Callers gate on the raw-tx opt-in before invoking, so an
-/// un-opted stream never serializes.
-fn raw_tx_bytes(cache: &mut Option<Arc<[u8]>>, tx: &Transaction) -> Arc<[u8]> {
-    cache
-        .get_or_insert_with(|| Arc::from(bitcoin::consensus::serialize(tx)))
-        .clone()
-}
-
-#[allow(clippy::too_many_arguments)]
 fn deliver_prefix_funding(
     inner: &Inner,
     sh: &Scripthash,
     raw_tx: &mut Option<Arc<[u8]>>,
-    tx: &Transaction,
+    tx: ScanTx<'_>,
     confirmed: bool,
     height: Option<u32>,
     fired: &mut HashSet<(u8, u32)>,
@@ -1771,10 +1855,11 @@ fn deliver_prefix_funding(
             && let Some(subs) = inner.by_prefix.get(&key)
         {
             fired.insert(key);
-            let raw = raw_tx.get_or_insert_with(|| Arc::from(bitcoin::consensus::serialize(tx)));
             let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
                 prefix: (key.1, key.0),
-                raw_tx: raw.clone(),
+                raw_tx: prefix_raw_tx(raw_tx, tx),
+                raw_tx_stripped: tx.stripped,
+                txid: tx.txid,
                 confirmed,
                 height,
                 matched_prevouts: Vec::new(),
@@ -1824,13 +1909,13 @@ impl MatchSink for CollectSink {
 /// matching subscribers. Pure given `inner`; the hot loop the matcher runs.
 fn scan_tx(
     inner: &Inner,
-    tx: &Transaction,
+    stx: ScanTx<'_>,
     confirmed: bool,
     height: Option<u32>,
     wants_raw: bool,
     sink: &mut dyn MatchSink,
 ) {
-    let txid = tx.compute_txid();
+    let (tx, txid) = (stx.tx, stx.txid);
 
     // Inputs → watched-outpoint spends.
     for (vin, input) in tx.input.iter().enumerate() {
@@ -1873,7 +1958,8 @@ fn scan_tx(
                     confirmed,
                     height,
                     amount: Some(value),
-                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx, tx)),
+                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx, stx) } else { None },
+                    raw_tx_stripped: stx.stripped,
                 };
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
@@ -1883,7 +1969,7 @@ fn scan_tx(
             }
             if scan_prefixes {
                 deliver_prefix_funding(
-                    inner, &sh, &mut raw_tx, tx, confirmed, height, &mut fired, sink,
+                    inner, &sh, &mut raw_tx, stx, confirmed, height, &mut fired, sink,
                 );
             }
         }
@@ -1917,7 +2003,7 @@ fn scan_tx(
 /// that predates the watch).
 fn scan_block_spent_scripts(
     inner: &Inner,
-    block: &Block,
+    txs: &[ScanTx<'_>],
     height: u32,
     undo: &UndoData,
     wants_raw: bool,
@@ -1926,11 +2012,11 @@ fn scan_block_spent_scripts(
     let scan_scripts = !inner.by_scripthash.is_empty();
     let scan_prefixes = !inner.prefix_lens.is_empty();
     let mut undo_idx = 0usize;
-    for tx in &block.txdata {
+    for &stx in txs {
+        let (tx, txid) = (stx.tx, stx.txid);
         if tx.is_coinbase() {
             continue; // coinbase has no spent prevouts in undo
         }
-        let txid = tx.compute_txid();
         // Spend-side prefix matches are aggregated per bucket across this tx's
         // inputs: all matched prevouts for a bucket ride one PrefixMatched (one
         // full-tx body), not one event per input.
@@ -1972,7 +2058,8 @@ fn scan_block_spent_scripts(
                     confirmed: true,
                     height: Some(height),
                     amount: Some(value),
-                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
+                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                    raw_tx_stripped: stx.stripped,
                 };
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
@@ -1999,12 +2086,14 @@ fn scan_block_spent_scripts(
         }
         // One PrefixMatched per matched bucket, carrying all its spent prevouts.
         if !prefix_spends.is_empty() {
-            let raw = raw_tx_bytes(&mut raw_tx_cache, tx);
+            let raw = prefix_raw_tx(&mut raw_tx_cache, stx);
             for (key, matched_prevouts) in prefix_spends {
                 if let Some(subs) = inner.by_prefix.get(&key) {
                     let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
                         prefix: (key.1, key.0),
                         raw_tx: raw.clone(),
+                        raw_tx_stripped: stx.stripped,
+                        txid,
                         confirmed: true,
                         height: Some(height),
                         matched_prevouts,
@@ -2034,7 +2123,7 @@ fn scan_block_spent_scripts(
 /// target, one ECDH and a bounded output scan.
 fn scan_block_sp(
     inner: &Inner,
-    block: &Block,
+    txs: &[ScanTx<'_>],
     height: u32,
     undo: &UndoData,
     wants_raw: bool,
@@ -2056,7 +2145,8 @@ fn scan_block_sp(
     }
 
     let mut undo_idx = 0usize;
-    for tx in &block.txdata {
+    for &stx in txs {
+        let tx = stx.tx;
         if tx.is_coinbase() {
             continue; // coinbase has no spent prevouts in undo (and is never eligible)
         }
@@ -2083,7 +2173,7 @@ fn scan_block_sp(
         scan_tx_sp(
             inner,
             &work,
-            tx,
+            stx,
             &prevout_spks,
             true,
             Some(height),
@@ -2115,7 +2205,7 @@ fn scan_block_sp(
 fn scan_tx_sp(
     inner: &Inner,
     work: &[(SubId, SecretKey, &SpWatchTarget)],
-    tx: &Transaction,
+    stx: ScanTx<'_>,
     prevout_spks: &[ScriptBuf],
     confirmed: bool,
     height: Option<u32>,
@@ -2123,14 +2213,14 @@ fn scan_tx_sp(
     sink: &mut dyn MatchSink,
 ) {
     // One tweak per eligible tx, shared across all targets. Recompute path.
-    let Some(entry) = compute_tweak(tx, prevout_spks) else {
+    // Named by the stored txid: a stripped tx's filled bytes hash elsewhere.
+    let Some(entry) = compute_tweak_with_txid(stx.tx, prevout_spks, stx.txid) else {
         return;
     };
     sp_scan_tx_outputs(
         inner,
         work,
-        tx,
-        entry.txid,
+        stx,
         &entry.tweak,
         confirmed,
         height,
@@ -2158,14 +2248,14 @@ fn scan_tx_sp(
 fn sp_scan_tx_outputs(
     inner: &Inner,
     work: &[(SubId, SecretKey, &SpWatchTarget)],
-    tx: &Transaction,
-    txid: Txid,
+    stx: ScanTx<'_>,
     tweak: &PublicKey,
     confirmed: bool,
     height: Option<u32>,
     wants_raw: bool,
     sink: &mut dyn MatchSink,
 ) {
+    let (tx, txid) = (stx.tx, stx.txid);
     // Taproot output table: (vout, x-only key, value). Built once per tx.
     let mut tap: Vec<(u32, XOnlyPublicKey, u64)> = Vec::new();
     for (vout, o) in tx.output.iter().enumerate() {
@@ -2210,7 +2300,8 @@ fn sp_scan_tx_outputs(
                 label: m.label_m,
                 confirmed,
                 height,
-                raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
+                raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                raw_tx_stripped: stx.stripped,
             };
             sink.emit(inner, *sid, &wm);
         }
@@ -2233,7 +2324,7 @@ fn sp_scan_tx_outputs(
 /// no work regardless of block size.
 fn scan_block_sp_from_tweaks(
     inner: &Inner,
-    block: &Block,
+    txs: &[ScanTx<'_>],
     height: u32,
     entries: &[TweakEntry],
     wants_raw: bool,
@@ -2260,19 +2351,17 @@ fn scan_block_sp_from_tweaks(
     // map lets us pair each with its transaction without relying on block order.
     let by_txid: HashMap<Txid, &PublicKey> =
         entries.iter().map(|e| (e.txid, &e.tweak)).collect();
-    for tx in &block.txdata {
-        if tx.is_coinbase() {
+    for &stx in txs {
+        if stx.tx.is_coinbase() {
             continue;
         }
-        let txid = tx.compute_txid();
-        let Some(tweak) = by_txid.get(&txid) else {
+        let Some(tweak) = by_txid.get(&stx.txid) else {
             continue; // not an SP-eligible tx per the index
         };
         sp_scan_tx_outputs(
             inner,
             &work,
-            tx,
-            txid,
+            stx,
             tweak,
             true,
             Some(height),
@@ -2574,8 +2663,11 @@ pub async fn run_watch_matcher(
             _ = shutdown.changed() => break,
             res = chain_rx.recv() => match res {
                 Ok(ChainEvent::BlockConnected { hash, height }) => {
+                    // Stored reads throughout: a block never connects stripped,
+                    // but a disconnect or a lag rescan may reach one, and its
+                    // transactions match under their recorded txids.
                     if registry.has_watchers()
-                        && let Some(block) = chain.get_block(&hash)
+                        && let Some(block) = chain.get_stored_block(&hash)
                     {
                         let undo = block_undo_for_scan(&registry, &chain, &hash);
                         registry.scan_block(&block, height, undo.as_ref());
@@ -2597,7 +2689,7 @@ pub async fn run_watch_matcher(
                 // matcher takes no action on it directly.
                 Ok(ChainEvent::BlockDisconnected { hash, height }) => {
                     if registry.has_txid_watchers()
-                        && let Some(block) = chain.get_block(&hash)
+                        && let Some(block) = chain.get_stored_block(&hash)
                     {
                         registry.scan_block_disconnected(&block, height);
                     }
@@ -2700,7 +2792,7 @@ pub async fn run_watch_matcher(
                                 if i % 64 == 63 {
                                     tokio::task::yield_now().await;
                                 }
-                                match chain.get_block(hash) {
+                                match chain.get_stored_block(hash) {
                                     Some(block) => {
                                         let undo = block_undo_for_scan(&registry, &chain, hash);
                                         registry.scan_block(&block, *h, undo.as_ref());
@@ -2782,6 +2874,7 @@ pub async fn run_watch_matcher(
 
 #[cfg(test)]
 mod tests {
+    use node_sp_index::compute_tweak;
     use super::*;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
@@ -4886,6 +4979,7 @@ mod tests {
                 confirmed,
                 height,
                 raw_tx,
+                ..
             } => {
                 assert_eq!(scan_pubkey, scan_id);
                 assert_eq!(got_txid, txid);
@@ -5063,6 +5157,7 @@ mod tests {
                 confirmed,
                 height,
                 raw_tx,
+                ..
             } => {
                 assert_eq!(scan_pubkey, scan_id);
                 assert_eq!(got_txid, txid);
@@ -5506,6 +5601,7 @@ mod tests {
                     confirmed,
                     height,
                     raw_tx,
+                    ..
                 } = m
                 else {
                     panic!("[{c}] unexpected non-SP match: {m:?}");
@@ -5610,6 +5706,7 @@ mod tests {
                     confirmed,
                     height,
                     raw_tx,
+                    ..
                 } = &m
                 else {
                     panic!("[{c}] unexpected non-SP match: {m:?}");
@@ -5970,4 +6067,142 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    /// A block read from an OP_RETURN-stripped copy: the stripped transaction
+    /// matches under its recorded txid and never carries bytes (raw_tx `None`,
+    /// a prefix match's raw_tx empty, the flag set), while the intact
+    /// transaction in the same block still inlines its bytes. Live, disconnect
+    /// and rescan scans agree.
+    #[test]
+    fn a_stripped_transaction_matches_by_its_recorded_txid_without_bytes() {
+        use crate::storage::opreturn_strip::StripRecord;
+
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
+        data.extend(std::iter::repeat_n(0x5a, 4000));
+        let mut stripped_tx = funding_tx_value(spk.clone(), 5_000);
+        stripped_tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) });
+        let intact_tx = funding_tx_value(spk.clone(), 6_000);
+        let (s_txid, i_txid) = (stripped_tx.compute_txid(), intact_tx.compute_txid());
+        let intact_raw = bitcoin::consensus::serialize(&intact_tx);
+        let mut block = block_with(vec![coinbase_tx(), stripped_tx, intact_tx]);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
+        assert!(stored.tx_is_stripped(1) && !stored.tx_is_stripped(2), "premise");
+        assert_ne!(stored.block.txdata[1].compute_txid(), s_txid, "premise: filled bytes hash elsewhere");
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_scripthashes(&[sh]);
+        handle.add_prefixes(&[bucket(&sh, 12)]);
+        handle.add_txids(&[s_txid], 0);
+        handle.set_raw_tx(true);
+
+        let check = |matches: Vec<WatchMatch>| {
+            let (mut script, mut prefix, mut txid) = (0, 0, 0);
+            for m in matches {
+                match m {
+                    WatchMatch::ScriptMatched { txid, raw_tx, raw_tx_stripped, .. } if txid == s_txid => {
+                        assert!(raw_tx.is_none() && raw_tx_stripped, "stripped: no bytes, flag set");
+                        script += 1;
+                    }
+                    WatchMatch::ScriptMatched { txid, raw_tx, raw_tx_stripped, .. } => {
+                        assert_eq!(txid, i_txid, "only the two transactions match");
+                        assert_eq!(raw_tx.as_deref(), Some(intact_raw.as_slice()));
+                        assert!(!raw_tx_stripped);
+                        script += 1;
+                    }
+                    WatchMatch::PrefixMatched(pm) if pm.txid == s_txid => {
+                        assert!(pm.raw_tx.is_empty() && pm.raw_tx_stripped);
+                        prefix += 1;
+                    }
+                    WatchMatch::PrefixMatched(pm) => {
+                        assert_eq!(pm.txid, i_txid);
+                        assert_eq!(pm.raw_tx.as_ref(), intact_raw.as_slice());
+                        assert!(!pm.raw_tx_stripped);
+                        prefix += 1;
+                    }
+                    WatchMatch::TxidMatched { txid: t, .. } => {
+                        assert_eq!(t, s_txid, "the watched txid is the recorded one");
+                        txid += 1;
+                    }
+                    other => panic!("unexpected match: {other:?}"),
+                }
+            }
+            assert_eq!((script, prefix, txid), (2, 2, 1));
+        };
+
+        reg.scan_block(&stored, 9, None);
+        check(std::iter::from_fn(|| rx.try_recv().ok()).collect());
+
+        // A rescan's ephemeral registry inherits the raw-tx opt-in.
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("a watch-set");
+        check(eph.scan_block_collect(&stored, 9, None));
+
+        reg.scan_block_disconnected(&stored, 9);
+        match rx.try_recv().expect("the stripped tx is unconfirmed") {
+            WatchMatch::TxidUnconfirmed { txid, prev_height } => {
+                assert_eq!((txid, prev_height), (s_txid, 9));
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+    }
+
+    /// A silent payment in a transaction read from an OP_RETURN-stripped block
+    /// matches under the transaction's recorded txid, on both the live scan and
+    /// the index-accelerated rescan. BIP 352 output keys depend only on the
+    /// inputs, so the extra OP_RETURN output leaves the payment at `k = 0`.
+    #[test]
+    fn a_silent_payment_in_a_stripped_transaction_carries_its_recorded_txid() {
+        use crate::storage::opreturn_strip::StripRecord;
+
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
+        let (mut tx, undo, p0_xonly, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
+        let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
+        data.extend(std::iter::repeat_n(0x5a, 4000));
+        tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) });
+        let txid = tx.compute_txid();
+        let mut block = block_with(vec![coinbase_tx(), tx]);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
+        assert!(stored.tx_is_stripped(1), "premise");
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+        handle.set_raw_tx(true);
+        let check = |m: WatchMatch| match m {
+            WatchMatch::SilentPaymentMatched { txid: got, output_pubkey, raw_tx, raw_tx_stripped, .. } => {
+                assert_eq!(got, txid, "the recorded txid, not the filled bytes' hash");
+                assert_eq!(output_pubkey, p0_xonly);
+                assert!(raw_tx.is_none() && raw_tx_stripped);
+            }
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        reg.scan_block(&stored, 100, Some(&undo));
+        check(rx.try_recv().expect("a silent-payment match"));
+        assert!(rx.try_recv().is_err(), "exactly one match");
+
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("a watch-set");
+        let entries = [TweakEntry {
+            txid,
+            tweak,
+            max_taproot_value: Amount::from_sat(12_345),
+            taproot_outputs: vec![],
+        }];
+        let got = eph.scan_block_collect_accel(&stored, 100, None, Some(&entries));
+        assert_eq!(got.len(), 1, "the fast path finds it by the recorded txid");
+        got.into_iter().for_each(check);
+    }
 }
+

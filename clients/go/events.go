@@ -328,6 +328,11 @@ type ScriptMatched struct {
 	// when this stream opted in via SetWatchOptions with IncludeRawTx; nil
 	// otherwise.
 	RawTx []byte
+	// RawTxStripped is set, on a stream that opted into RawTx, when the
+	// transaction was read from a block whose OP_RETURN payloads the node has
+	// stripped: its bytes are not available, so RawTx is nil. Txid is still its
+	// txid.
+	RawTxStripped bool
 	// Descriptors is descriptor attribution: the descriptor watch(es) this
 	// scripthash belongs to, if it was registered via AddDescriptor. Empty for a
 	// directly-watched script.
@@ -404,8 +409,17 @@ type TxidFinalized struct {
 type PrefixMatched struct {
 	// Prefix is the registered bucket that fired.
 	Prefix ScriptPrefix
-	// RawTx is the consensus-serialized matching transaction.
+	// RawTx is the consensus-serialized matching transaction. Empty when
+	// RawTxStripped.
 	RawTx []byte
+	// RawTxStripped is set when the transaction was read from a block whose
+	// OP_RETURN payloads the node has stripped: its bytes are not available, so
+	// RawTx is empty and its outputs cannot be filtered locally. Fetch them by
+	// Txid.
+	RawTxStripped bool
+	// Txid is the matching transaction's id (internal byte order). Empty from a
+	// node that predates the field.
+	Txid []byte
 	// Confirmed is false for a mempool match, true for a connected block.
 	Confirmed bool
 	// Height is the block height when confirmed; 0 in the mempool.
@@ -448,6 +462,8 @@ type SilentPaymentMatched struct {
 	// RawTx is the full serialized transaction, only when this connection opted
 	// in via SetWatchOptions with IncludeRawTx; nil otherwise.
 	RawTx []byte
+	// RawTxStripped is as ScriptMatched.RawTxStripped.
+	RawTxStripped bool
 }
 
 // ---- silent-payment firehose ------------------------------------------------
@@ -782,13 +798,14 @@ func decodeEvent(ev *eventspb.NodeEvent) Event {
 	case *eventspb.NodeEvent_ScriptMatched:
 		s := body.ScriptMatched
 		out := &ScriptMatched{
-			Scripthash: s.GetScripthash(),
-			Txid:       s.GetTxid(),
-			IsOutput:   s.GetIsOutput(),
-			Index:      s.GetIndex(),
-			Confirmed:  s.GetConfirmed(),
-			Amount:     optUint64(s.GetHasAmount(), s.GetAmount()),
-			RawTx:      nonEmpty(s.GetRawTx()),
+			Scripthash:    s.GetScripthash(),
+			Txid:          s.GetTxid(),
+			IsOutput:      s.GetIsOutput(),
+			Index:         s.GetIndex(),
+			Confirmed:     s.GetConfirmed(),
+			Amount:        optUint64(s.GetHasAmount(), s.GetAmount()),
+			RawTx:         nonEmpty(s.GetRawTx()),
+			RawTxStripped: s.GetRawTxStripped(),
 		}
 		for _, d := range s.GetDescriptorMatches() {
 			out.Descriptors = append(out.Descriptors, DescriptorMatch{
@@ -825,10 +842,12 @@ func decodeEvent(ev *eventspb.NodeEvent) Event {
 			return unknownEvent
 		}
 		out := &PrefixMatched{
-			Prefix:    ScriptPrefix{Prefix: p.GetPrefix().GetPrefix(), Bits: p.GetPrefix().GetBits()},
-			RawTx:     p.GetRawTx(),
-			Confirmed: p.GetConfirmed(),
-			Height:    p.GetHeight(),
+			Prefix:        ScriptPrefix{Prefix: p.GetPrefix().GetPrefix(), Bits: p.GetPrefix().GetBits()},
+			RawTx:         p.GetRawTx(),
+			Confirmed:     p.GetConfirmed(),
+			Height:        p.GetHeight(),
+			RawTxStripped: p.GetRawTxStripped(),
+			Txid:          p.GetTxid(),
 		}
 		for _, sp := range p.GetMatchedPrevouts() {
 			out.MatchedPrevouts = append(out.MatchedPrevouts, SpentPrevout{
@@ -841,15 +860,16 @@ func decodeEvent(ev *eventspb.NodeEvent) Event {
 	case *eventspb.NodeEvent_SilentPaymentMatched:
 		s := body.SilentPaymentMatched
 		out := &SilentPaymentMatched{
-			ScanPubkey:   s.GetScanPubkey(),
-			Txid:         s.GetTxid(),
-			Vout:         s.GetVout(),
-			OutputPubkey: s.GetOutputPubkey(),
-			Amount:       s.GetAmount(),
-			Tweak:        s.GetTweak(),
-			K:            s.GetK(),
-			Confirmed:    s.GetConfirmed(),
-			RawTx:        nonEmpty(s.GetRawTx()),
+			ScanPubkey:    s.GetScanPubkey(),
+			Txid:          s.GetTxid(),
+			Vout:          s.GetVout(),
+			OutputPubkey:  s.GetOutputPubkey(),
+			Amount:        s.GetAmount(),
+			Tweak:         s.GetTweak(),
+			K:             s.GetK(),
+			Confirmed:     s.GetConfirmed(),
+			RawTx:         nonEmpty(s.GetRawTx()),
+			RawTxStripped: s.GetRawTxStripped(),
 		}
 		if s.GetHasLabel() {
 			l := s.GetLabel()
