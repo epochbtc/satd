@@ -261,3 +261,18 @@ fn split_store_keeps_strip_records_in_the_block_store() {
     assert_eq!(split.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
     assert_eq!(split.opreturn_strip_meta().unwrap().as_deref(), Some(&b"meta"[..]));
 }
+
+/// One batch can carry a put and a remove for the same block. Every store
+/// applies puts before removes, so it lands as removed, and a read of it
+/// while still buffered must say the same.
+#[test]
+fn a_buffered_put_and_remove_in_one_batch_reads_as_it_flushes() {
+    let cache = CoinCache::new(Box::new(InMemoryStore::new()), 10);
+    let mut connect = coin_batch();
+    connect.opreturn_strip_puts.push((hash(1), b"record".to_vec()));
+    connect.opreturn_strip_removes.push(hash(1));
+    cache.write_batch(connect).unwrap();
+    assert_eq!(cache.get_opreturn_strip(&hash(1)).unwrap(), None, "buffered");
+    cache.flush().unwrap();
+    assert_eq!(cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(), None, "flushed");
+}

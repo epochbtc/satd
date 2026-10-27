@@ -80,6 +80,8 @@ pub(crate) struct StoreControls {
     /// store: a strip that commits between a reader's lookup and whatever
     /// it does next.
     after_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
+    /// Run once, right before the next strip-record lookup reads the store.
+    before_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
     /// Strip-record reads fail, as a corrupt RocksDB row does.
     strip_unreadable: Arc<AtomicBool>,
 }
@@ -176,6 +178,12 @@ impl StoreControls {
     /// strip-record lookup has read it.
     pub(crate) fn after_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
         *self.after_strip_lookup.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once, against the backing store, right before the next
+    /// strip-record lookup reads it.
+    pub(crate) fn before_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+        *self.before_strip_lookup.lock().unwrap() = Some(Box::new(hook));
     }
 
     pub(crate) fn set_strip_unreadable(&self, yes: bool) {
@@ -299,6 +307,7 @@ impl ControllableStore {
                 addr_rows_served: Arc::new(AtomicU64::new(0)),
                 addr_read_delay_ms: Arc::new(AtomicU64::new(0)),
                 after_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
+                before_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
                 strip_unreadable: Arc::new(AtomicBool::new(false)),
             },
         }
@@ -346,6 +355,10 @@ impl Store for ControllableStore {
     // ---- everything below is straight delegation ----
 
     fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        let before = self.controls.before_strip_lookup.lock().unwrap().take();
+        if let Some(hook) = before {
+            hook(&self.inner);
+        }
         let read = if self.controls.strip_unreadable.load(Ordering::SeqCst) {
             Err(StoreError::Database("injected strip-record read fault".into()))
         } else {

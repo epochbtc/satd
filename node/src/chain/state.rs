@@ -4678,6 +4678,12 @@ impl ChainState {
     /// matter. Looking the record up first would let a strip land in between
     /// and serve the zeroed bytes as an intact block.
     pub fn get_stored_block(&self, hash: &BlockHash) -> Option<StoredBlock> {
+        self.read_stored_block(hash, true)
+    }
+
+    /// [`Self::get_stored_block`], which may retry once when the block's
+    /// entry moved under it.
+    fn read_stored_block(&self, hash: &BlockHash, may_retry: bool) -> Option<StoredBlock> {
         let entry = self.store.get_block_index(hash)?;
         // HeaderOnly/Pruned entries never carry local block data. An `Invalid`
         // block (set only by `invalidate_block`) KEEPS its data on disk, and
@@ -4755,6 +4761,17 @@ impl ChainState {
                     && opreturn_strip::has_zeroed_op_return(&stored.block)
                     && !stored.verify_merkle() =>
             {
+                // A repair can point the entry at a fresh copy and drop the
+                // record in one batch, between this reader's index read and
+                // its record lookup. The reader then holds the old, punched
+                // bytes and no record, on a store that is consistent. Read
+                // again from where the entry points now.
+                let moved = self.store.get_block_index(hash).is_some_and(|now| {
+                    now.file_number != entry.file_number || now.data_pos != entry.data_pos
+                });
+                if moved && may_retry {
+                    return self.read_stored_block(hash, false);
+                }
                 self.report_corrupt_block_data(
                     hash,
                     &entry,

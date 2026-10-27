@@ -1429,16 +1429,21 @@ impl CoinCache {
 
     /// What the pending batch says about a block's strip record: `Some`
     /// when it puts or removes one (`Some(None)` for a remove), `None`
-    /// when the flushed rows stand. `merge` keeps puts and removes
-    /// disjoint by hash, so at most one of them names the block.
+    /// when the flushed rows stand. `merge` keeps puts and removes disjoint
+    /// across batches, but one batch can carry both for a hash, and the
+    /// stores apply a batch's puts before its removes. So a remove wins
+    /// here, as it will at the flush.
     fn pending_opreturn_strip(&self, hash: &BlockHash) -> Option<Option<Vec<u8>>> {
         let pending = self.pending_batch.lock();
-        if let Some((_, record)) = pending.opreturn_strip_puts.iter().rev().find(|(h, _)| h == hash) {
-            Some(Some(record.clone()))
-        } else if pending.opreturn_strip_removes.contains(hash) {
+        if pending.opreturn_strip_removes.contains(hash) {
             Some(None)
         } else {
-            None
+            pending
+                .opreturn_strip_puts
+                .iter()
+                .rev()
+                .find(|(h, _)| h == hash)
+                .map(|(_, record)| Some(record.clone()))
         }
     }
 

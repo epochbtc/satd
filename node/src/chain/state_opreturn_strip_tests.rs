@@ -419,3 +419,40 @@ fn a_genuine_zero_payload_reads_as_the_block() {
     assert_eq!(corrupt_warning(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A repair that repoints the entry at a fresh copy and drops the record,
+/// landing between a reader's index read and its record lookup. The reader
+/// holds the old, punched bytes and finds no record, on a consistent store.
+/// It must read again from the new copy, not report corruption.
+#[test]
+fn a_repoint_between_the_index_read_and_the_record_lookup_is_not_corruption() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = chain_with_a_big_op_return(&cs);
+    let b = blocks[101].clone();
+    let hash = b.block_hash();
+    strip(&cs, &b);
+    cs.flush_durable().unwrap();
+
+    // The fresh copy the repair appends, written ahead; the hook commits
+    // the batch that points the entry at it and drops the record.
+    let (fresh, _pending) = cs.write_block_durable(&serialize(&b), 102).unwrap();
+    let mut repointed = cs.store.get_block_index(&hash).unwrap();
+    repointed.file_number = fresh.file_number;
+    repointed.data_pos = fresh.data_pos;
+    controls.before_next_strip_lookup(move |inner: &InMemoryStore| {
+        inner
+            .write_batch(StoreBatch {
+                block_index_puts: vec![(hash, repointed)],
+                opreturn_strip_removes: vec![hash],
+                ..Default::default()
+            })
+            .unwrap();
+    });
+    cs.store_ref().drop_read_overlays();
+
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&b), "the reader follows the repoint");
+    assert_eq!(corrupt_warning(&cs, &hash), None, "a repoint is not corruption");
+    let _ = std::fs::remove_dir_all(dir);
+}
