@@ -142,6 +142,10 @@ item below is (or will be) written up in full in the in-development
   `chain_tip` / `chain_tip_height` members, as rbitcoin does.
   `server.version` also accepts rbitcoin's `1.4.2-asof`.
 
+- Electrum trailing `asof:<blockhash>` argument on those six methods: the
+  answer as of a block still on the best chain, with no mempool. rbitcoin's
+  argument; satd does not require negotiating `1.4.2-asof` first.
+
 ### Fixed
 
 - The address index built by a backfill (`-addressindex` turned on for an
