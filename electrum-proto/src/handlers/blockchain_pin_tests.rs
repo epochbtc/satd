@@ -377,19 +377,27 @@ mod races {
             self.inner.balance(sh)
         }
         fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
-            self.inner.utxos(sh)
+            let mut utxos = self.inner.utxos(sh)?;
+            if self.confirmed.swap(true, Ordering::SeqCst) {
+                utxos.push(Utxo {
+                    txid: self.tx,
+                    vout: 0,
+                    height: 10,
+                    amount_sat: 5_000_000_000 - 1_000,
+                });
+            }
+            Ok(utxos)
         }
         fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
             self.inner.subscribe(sh)
         }
     }
 
-    /// A transaction that confirms between the history's two reads is in at
-    /// least one of them, and listed once, as the unconfirmed transaction it
-    /// was at the pin.
-    #[test]
-    fn a_transaction_confirming_mid_history_is_listed_once() {
-        let (mut state, _dir) = electrum_state(100);
+    /// The fixture chain grown past coinbase maturity, with a spend of block
+    /// 1's coinbase (paying [`crate::test_support::anyone_can_spend`]) in
+    /// the mempool, behind a [`ConfirmsOnFirstRead`] index for it.
+    fn confirming_mid_read() -> (ElectrumState, tempfile::TempDir, Txid) {
+        let (mut state, dir) = electrum_state(100);
         let first = state.electrum_extras.txid_at_pos(1, 0).unwrap();
         for salt in 0..100 {
             crate::test_support::extend_tip(&state.chain, 5_000 + salt);
@@ -410,6 +418,33 @@ mod races {
             tx: txid,
             confirmed: AtomicBool::new(false),
         });
+        (state, dir, txid)
+    }
+
+    /// An output whose transaction confirms between `listunspent`'s two
+    /// reads is listed once, as the unconfirmed output it was at the pin.
+    #[test]
+    fn an_output_confirming_mid_listunspent_is_listed_once() {
+        let (state, _dir, txid) = confirming_mid_read();
+        let sh = node_index::scripthash_of(&crate::test_support::anyone_can_spend());
+        let got = scripthash_listunspent(
+            &state,
+            json!([scripthash_to_wire_hex(&sh)]),
+            &pin_at(9),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            json!([{"height": 0, "tx_hash": txid.to_string(), "tx_pos": 0, "value": 5_000_000_000u64 - 1_000}])
+        );
+    }
+
+    /// A transaction that confirms between the history's two reads is in at
+    /// least one of them, and listed once, as the unconfirmed transaction it
+    /// was at the pin.
+    #[test]
+    fn a_transaction_confirming_mid_history_is_listed_once() {
+        let (state, _dir, txid) = confirming_mid_read();
         let rows = scripthash_get_history(&state, params(), &pin_at(9)).unwrap();
         let rows = rows.as_array().unwrap();
         assert_eq!(rows.len(), 6, "{rows:?}");

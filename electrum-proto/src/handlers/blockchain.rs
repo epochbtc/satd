@@ -14,7 +14,7 @@
 //! response. The push-notification side lives in PR-4
 //! ([`crate::subscribe`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{OutPoint, Transaction, Txid};
@@ -445,6 +445,29 @@ pub fn scripthash_listunspent(
         .address_index
         .check_history_cap(&sh.0, cap)
         .map_err(JsonRpcError::from_index)?;
+
+    // The mempool part is read before the coin set, as `pinned_history_rows`
+    // reads the history: a transaction that confirms between the two reads
+    // is then in both, and listed once, as the unconfirmed transaction it
+    // was at the pin; a spend that confirms between them is in the mempool
+    // part or has removed the coin. Read the other way round, the first
+    // would be in neither and the second would leave the output listed.
+    let mempool = state.mempool.as_ref();
+    let mempool_txs: Vec<_> = state
+        .address_index
+        .mempool_history(&sh.0)
+        .into_iter()
+        .filter_map(|mp| mempool.get(&mp.txid).map(|entry| (mp.txid, entry)))
+        .collect();
+    let mempool_txids: HashSet<Txid> = mempool_txs.iter().map(|(txid, _)| *txid).collect();
+    let mempool_spent: HashSet<OutPoint> = mempool_txs
+        .iter()
+        .flat_map(|(_, entry)| entry.tx.input.iter().map(|i| i.previous_output))
+        .collect();
+    let spent = |outpoint: &OutPoint| {
+        mempool_spent.contains(outpoint) || mempool.spending_tx(outpoint).is_some()
+    };
+
     let utxos = state
         .address_index
         .utxos_limited(&sh.0, cap.saturating_add(1))
@@ -468,19 +491,15 @@ pub fn scripthash_listunspent(
     // mempool height. One spent above the pin is gone from the coin set: as
     // of the pin it had an unconfirmed spend, and a confirmed output with a
     // mempool spend is not listed.
-    let mempool = state.mempool.as_ref();
     let (mut out, mut late): (Vec<ListUnspentEntry>, Vec<ListUnspentEntry>) = (Vec::new(), Vec::new());
     let mut facts = LateFacts::new(state, pin);
     for u in utxos {
         // Drop confirmed UTXOs whose outpoint is consumed by a
         // mempool spend — wallets shouldn't see them as spendable.
-        if mempool
-            .spending_tx(&OutPoint {
-                txid: u.txid,
-                vout: u.vout,
-            })
-            .is_some()
-        {
+        if spent(&OutPoint {
+            txid: u.txid,
+            vout: u.vout,
+        }) {
             continue;
         }
         let entry = ListUnspentEntry {
@@ -491,7 +510,8 @@ pub fn scripthash_listunspent(
         };
         if pin.covers(u.height) {
             out.push(entry);
-        } else {
+        } else if !mempool_txids.contains(&u.txid) {
+            // A transaction in the mempool part is listed with it.
             late.push(ListUnspentEntry {
                 height: facts.of(&u.txid).0,
                 ..entry
@@ -504,11 +524,7 @@ pub fn scripthash_listunspent(
     // every push so a single unconfirmed tx with many outputs to
     // `sh`, or a flood of mempool funding txs, can't push the
     // response past `cap` entries.
-    for mp in state.address_index.mempool_history(&sh.0) {
-        let entry = match mempool.get(&mp.txid) {
-            Some(e) => e,
-            None => continue, // raced with eviction
-        };
+    for (txid, entry) in mempool_txs {
         let height: i64 = if mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool) {
             -1
         } else {
@@ -519,10 +535,10 @@ pub fn scripthash_listunspent(
                 continue;
             }
             let outpoint = OutPoint {
-                txid: mp.txid,
+                txid,
                 vout: vout as u32,
             };
-            if mempool.spending_tx(&outpoint).is_some() {
+            if spent(&outpoint) {
                 continue; // already spent by a child mempool tx
             }
             if out.len() >= cap {
@@ -530,7 +546,7 @@ pub fn scripthash_listunspent(
             }
             out.push(ListUnspentEntry {
                 height,
-                tx_hash: TxidHex(mp.txid),
+                tx_hash: TxidHex(txid),
                 tx_pos: vout as u32,
                 value: txout.value.to_sat(),
             });
