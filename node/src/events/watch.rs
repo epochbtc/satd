@@ -2213,7 +2213,8 @@ fn scan_tx_sp(
     sink: &mut dyn MatchSink,
 ) {
     // One tweak per eligible tx, shared across all targets. Recompute path.
-    // Named by the stored txid: a stripped tx's filled bytes hash elsewhere.
+    // The tweak depends only on the inputs; the match is named by `stx.txid`,
+    // so passing it here only saves hashing the transaction again.
     let Some(entry) = compute_tweak_with_txid(stx.tx, prevout_spks, stx.txid) else {
         return;
     };
