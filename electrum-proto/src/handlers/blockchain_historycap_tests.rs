@@ -76,7 +76,7 @@ fn history() -> Vec<HistoryEntry> {
 
 /// The history above for `SH`; nothing for any other script.
 #[derive(Default)]
-struct FixedIndex {
+pub(super) struct FixedIndex {
     senders: Mutex<Vec<broadcast::Sender<StatusUpdate>>>,
 }
 

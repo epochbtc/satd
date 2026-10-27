@@ -10,6 +10,17 @@ use bitcoin::{
 };
 use node::chain::state::ChainState;
 
+/// The script every test coinbase pays: P2WSH of `OP_TRUE`, standard, and
+/// spent by [`anyone_can_spend_witness`].
+pub fn anyone_can_spend() -> ScriptBuf {
+    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(vec![0x51]).wscript_hash())
+}
+
+/// The witness that spends [`anyone_can_spend`].
+pub fn anyone_can_spend_witness() -> Witness {
+    Witness::from_slice(&[vec![0x51u8]])
+}
+
 /// A regtest block on `parent` at `height`: a coinbase, then `txs`. `salt`
 /// goes into the coinbase, so two blocks at one height on one parent differ.
 pub fn regtest_block(parent: BlockHash, height: u32, salt: u32, txs: Vec<Transaction>) -> Block {
@@ -29,7 +40,7 @@ pub fn regtest_block(parent: BlockHash, height: u32, salt: u32, txs: Vec<Transac
         }],
         output: vec![TxOut {
             value: Amount::from_sat(5_000_000_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            script_pubkey: anyone_can_spend(),
         }],
     };
     let mut txdata = vec![coinbase];
@@ -45,6 +56,20 @@ pub fn regtest_block(parent: BlockHash, height: u32, salt: u32, txs: Vec<Transac
         },
         txdata,
     };
+    if block.txdata.iter().skip(1).any(|tx| tx.input.iter().any(|i| !i.witness.is_empty())) {
+        // BIP 141: the coinbase commits to the witnesses, with an all-zero
+        // reserved value as its own witness.
+        let reserved = [0u8; 32];
+        block.txdata[0].input[0].witness = Witness::from_slice(&[reserved]);
+        let root = block.witness_root().expect("txdata is not empty");
+        let commitment = Block::compute_witness_commitment(&root, &reserved);
+        let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        script.extend_from_slice(commitment.as_ref());
+        block.txdata[0].output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        });
+    }
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let target = block.header.target();
     while !target.is_met_by(block.block_hash()) {

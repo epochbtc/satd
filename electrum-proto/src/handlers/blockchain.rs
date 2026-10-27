@@ -14,11 +14,13 @@
 //! response. The push-notification side lives in PR-4
 //! ([`crate::subscribe`]).
 
+use std::collections::HashMap;
+
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{OutPoint, Transaction, Txid};
 use node::chain::pin::Pin;
 use node_index::{
-    HistoryEntry, HistoryRow, capped_history_rows, mempool_history_rows, scripthash_of,
+    HistoryEntry, HistoryRow, mempool_history_rows, scripthash_of,
     sort_mempool_rows,
 };
 use serde_json::{Value, json};
@@ -145,12 +147,7 @@ pub fn scripthash_get_history(
     // the cap, so the refusal costs `O(cap)` reads and memory, never the
     // whole history; the cap counts DISTINCT transactions (round-3 review
     // H1 — the schema has one row per matching output AND input).
-    let mempool = state.mempool.as_ref();
-    let rows = capped_history_rows(state.address_index.as_ref(), &sh.0, cap, |txid| {
-        mempool_facts(mempool, txid)
-    })
-    .map_err(JsonRpcError::from_index)?;
-    let rows = unconfirm_late_rows(state, rows, pin);
+    let rows = pinned_history_rows(state, &sh.0, cap, pin)?;
 
     // `fee` (sats) is set on mempool rows only, from the live mempool
     // entry, which pre-computes it at admission.
@@ -166,13 +163,50 @@ pub fn scripthash_get_history(
     Ok(serde_json::to_value(&out).unwrap())
 }
 
+/// `sh`'s history as of the pin, in protocol order, refused above `cap`
+/// transactions as [`node_index::capped_history_rows`] refuses it.
+///
+/// The mempool part is read before the confirmed part. A transaction that
+/// confirms between the two reads is then in both, and
+/// [`unconfirm_late_rows`] lists it once, as the unconfirmed transaction it
+/// was at the pin (it confirmed above it). Read the other way round, as
+/// `capped_history_rows` reads, it would be in neither.
+fn pinned_history_rows(
+    state: &ElectrumState,
+    sh: &node_index::Scripthash,
+    cap: usize,
+    pin: &Pin,
+) -> Result<Vec<HistoryRow>, JsonRpcError> {
+    let idx = state.address_index.as_ref();
+    let mempool = state.mempool.as_ref();
+    idx.check_history_cap(sh, cap)
+        .map_err(JsonRpcError::from_index)?;
+    let mempool_rows = mempool_history_rows(idx, sh, |txid| mempool_facts(mempool, txid));
+    let mut rows: Vec<HistoryRow> = idx
+        .confirmed_txs_in_chain_order(sh, cap.saturating_add(1))
+        .map_err(JsonRpcError::from_index)?
+        .into_iter()
+        .map(|(height, txid)| HistoryRow {
+            height: i64::from(height),
+            txid,
+            fee_sat: None,
+        })
+        .collect();
+    rows.extend(mempool_rows);
+    let rows = unconfirm_late_rows(state, rows, pin);
+    if rows.len() > cap {
+        return Err(JsonRpcError::history_too_large(cap));
+    }
+    Ok(rows)
+}
+
 /// `rows` as of the pin: a transaction confirmed above it was unconfirmed
 /// when the request started, so it leaves the confirmed part and joins the
 /// mempool part, in that part's order, with the height and fee
-/// [`late_tx_facts`] gives it.
+/// [`LateFacts::of`] gives it.
 ///
-/// `capped_history_rows` lists confirmed rows (no fee) then mempool rows
-/// (each with its fee), so the fee tells the two apart.
+/// The confirmed rows have no fee and the mempool rows each have theirs, so
+/// the fee tells the two apart.
 fn unconfirm_late_rows(state: &ElectrumState, rows: Vec<HistoryRow>, pin: &Pin) -> Vec<HistoryRow> {
     let (mut mempool, confirmed): (Vec<HistoryRow>, Vec<HistoryRow>) =
         rows.into_iter().partition(|r| r.fee_sat.is_some());
@@ -183,13 +217,14 @@ fn unconfirm_late_rows(state: &ElectrumState, rows: Vec<HistoryRow>, pin: &Pin) 
         out.extend(mempool);
         return out;
     }
+    let mut facts = LateFacts::new(state, pin);
     for row in late {
         // A transaction leaves the mempool as it confirms, but the mempool
         // part was read after the confirmed part.
         if mempool.iter().any(|m| m.txid == row.txid) {
             continue;
         }
-        let (height, fee_sat) = late_tx_facts(state, &row.txid, pin);
+        let (height, fee_sat) = facts.of(&row.txid);
         mempool.push(HistoryRow {
             height,
             txid: row.txid,
@@ -201,39 +236,77 @@ fn unconfirm_late_rows(state: &ElectrumState, rows: Vec<HistoryRow>, pin: &Pin) 
     out
 }
 
-/// What a transaction confirmed above the pin was as of the pin: its
-/// Electrum mempool height, `-1` when it spends a transaction that was also
-/// unconfirmed then (in the mempool, or confirmed above the pin too) and
-/// `0` otherwise, and its fee when every parent can be read. A transaction
-/// the txindex cannot return is height `0` with no fee.
-fn late_tx_facts(state: &ElectrumState, txid: &Txid, pin: &Pin) -> (i64, Option<u64>) {
-    let read = |txid: &Txid| -> Option<Transaction> {
-        deserialize(&state.electrum_extras.raw_tx(txid)?).ok()
-    };
-    let Some(tx) = read(txid) else {
-        return (0, None);
-    };
-    if tx.is_coinbase() {
-        return (0, None);
-    }
-    let mut unconfirmed_parent = false;
-    let mut input_sum = Some(0u64);
-    for input in &tx.input {
-        let prev = input.previous_output;
-        if state.mempool.get(&prev.txid).is_some() {
-            unconfirmed_parent = true;
-        } else if let Some(c) = state.electrum_extras.confirmation(&prev.txid)
-            && !pin.covers(c.height)
-        {
-            unconfirmed_parent = true;
+/// What the transactions confirmed above the pin were as of the pin, for
+/// one request. Each transaction it reads from the txindex, a late one or a
+/// parent, is read once, as one block load, however many late rows or
+/// inputs name it.
+struct LateFacts<'a> {
+    state: &'a ElectrumState,
+    pin: &'a Pin,
+    /// The confirmed transactions read so far, with the height each
+    /// confirmed at; `None` for one the txindex cannot return.
+    read: HashMap<Txid, Option<(Transaction, u32)>>,
+}
+
+impl<'a> LateFacts<'a> {
+    fn new(state: &'a ElectrumState, pin: &'a Pin) -> Self {
+        Self {
+            state,
+            pin,
+            read: HashMap::new(),
         }
-        let value = read(&prev.txid)
-            .and_then(|parent| parent.output.get(prev.vout as usize).map(|o| o.value.to_sat()));
-        input_sum = input_sum.zip(value).and_then(|(sum, v)| sum.checked_add(v));
     }
-    let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-    let fee = input_sum.and_then(|sum| sum.checked_sub(output_sum));
-    (if unconfirmed_parent { -1 } else { 0 }, fee)
+
+    /// A confirmed transaction and its height, from the txindex.
+    fn confirmed(&mut self, txid: &Txid) -> Option<&(Transaction, u32)> {
+        let chain = &self.state.chain;
+        self.read
+            .entry(*txid)
+            .or_insert_with(|| {
+                let hash = chain.get_tx_location(txid)?;
+                let height = chain.get_block_index(&hash)?.height;
+                let block = chain.get_block(&hash)?;
+                let tx = block.txdata.into_iter().find(|t| t.compute_txid() == *txid)?;
+                Some((tx, height))
+            })
+            .as_ref()
+    }
+
+    /// The Electrum mempool height `txid`, confirmed above the pin, had as of
+    /// it: `-1` when it spends a transaction that was also unconfirmed then
+    /// (in the mempool, or confirmed above the pin too) and `0` otherwise;
+    /// and its fee when every parent's output can be read, from the mempool
+    /// or the txindex. A transaction the txindex cannot return is height `0`
+    /// with no fee.
+    fn of(&mut self, txid: &Txid) -> (i64, Option<u64>) {
+        let Some((tx, _)) = self.confirmed(txid).cloned() else {
+            return (0, None);
+        };
+        if tx.is_coinbase() {
+            return (0, None);
+        }
+        let mut unconfirmed_parent = false;
+        let mut input_sum = Some(0u64);
+        for input in &tx.input {
+            let prev = input.previous_output;
+            let value = if let Some(entry) = self.state.mempool.get(&prev.txid) {
+                unconfirmed_parent = true;
+                entry.tx.output.get(prev.vout as usize).map(|o| o.value.to_sat())
+            } else {
+                let pin = *self.pin;
+                self.confirmed(&prev.txid).and_then(|(parent, height)| {
+                    if !pin.covers(*height) {
+                        unconfirmed_parent = true;
+                    }
+                    parent.output.get(prev.vout as usize).map(|o| o.value.to_sat())
+                })
+            };
+            input_sum = input_sum.zip(value).and_then(|(sum, v)| sum.checked_add(v));
+        }
+        let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let fee = input_sum.and_then(|sum| sum.checked_sub(output_sum));
+        (if unconfirmed_parent { -1 } else { 0 }, fee)
+    }
 }
 
 /// Whether `sh` has a transaction confirmed above the pin: one read of the
@@ -297,29 +370,49 @@ pub fn scripthash_get_balance(
         .address_index
         .check_history_cap(&sh.0, cap)
         .map_err(JsonRpcError::from_index)?;
-    let (confirmed, unconfirmed) = state
-        .address_index
-        .balance(&sh.0)
-        .map_err(JsonRpcError::from_index)?;
-    // Read after the balance, so a block that connected before it shows up
-    // here. Normally nothing has confirmed above the pin, and the live
-    // balance is the answer.
-    if !confirmed_above(state, &sh.0, pin)? {
-        return Ok(serde_json::to_value(BalanceResponse {
-            confirmed,
-            unconfirmed,
-        })
-        .unwrap());
-    }
-    // What confirmed above the pin was unconfirmed as of it: the confirmed
-    // balance is the history's at the pin, and the difference moves to the
-    // unconfirmed delta. A transaction counted in the live balance as
-    // either confirmed or unconfirmed is counted once either way.
-    let history = state
-        .address_index
-        .confirmed_history(&sh.0)
-        .map_err(JsonRpcError::from_index)?;
-    let at_pin = confirmed_balance_at(&history, pin);
+    let (confirmed, unconfirmed, at_pin) = {
+        let mut attempt = 0;
+        loop {
+            let (confirmed, unconfirmed) = state
+                .address_index
+                .balance(&sh.0)
+                .map_err(JsonRpcError::from_index)?;
+            // Read after the balance, so a block that connected before it
+            // shows up here. Normally nothing has confirmed above the pin,
+            // and the live balance is the answer.
+            if !confirmed_above(state, &sh.0, pin)? {
+                return Ok(serde_json::to_value(BalanceResponse {
+                    confirmed,
+                    unconfirmed,
+                })
+                .unwrap());
+            }
+            // What confirmed above the pin was unconfirmed as of it: the
+            // confirmed balance is the history's at the pin, and the
+            // difference moves to the unconfirmed delta. A transaction the
+            // live balance counts, as confirmed or as unconfirmed, is counted
+            // once either way, provided the history is the one the balance
+            // was read from: a block that connects between the two reads is
+            // in the history but not the balance, and a transaction in it
+            // that the balance did not count as unconfirmed would count
+            // nowhere. The history's own confirmed balance shows it; read
+            // both again.
+            let history = state
+                .address_index
+                .confirmed_history(&sh.0)
+                .map_err(JsonRpcError::from_index)?;
+            let everything = Pin {
+                height: u32::MAX,
+                ..*pin
+            };
+            attempt += 1;
+            if confirmed_balance_at(&history, &everything) == confirmed
+                || attempt >= node::chain::pin::VIEW_ATTEMPTS
+            {
+                break (confirmed, unconfirmed, confirmed_balance_at(&history, pin));
+            }
+        }
+    };
     let unconfirmed = unconfirmed
         .saturating_add(i64::try_from(confirmed).unwrap_or(i64::MAX))
         .saturating_sub(i64::try_from(at_pin).unwrap_or(i64::MAX));
@@ -372,6 +465,7 @@ pub fn scripthash_listunspent(
     // mempool spend is not listed.
     let mempool = state.mempool.as_ref();
     let (mut out, mut late): (Vec<ListUnspentEntry>, Vec<ListUnspentEntry>) = (Vec::new(), Vec::new());
+    let mut facts = LateFacts::new(state, pin);
     for u in utxos {
         // Drop confirmed UTXOs whose outpoint is consumed by a
         // mempool spend — wallets shouldn't see them as spendable.
@@ -394,7 +488,7 @@ pub fn scripthash_listunspent(
             out.push(entry);
         } else {
             late.push(ListUnspentEntry {
-                height: late_tx_facts(state, &u.txid, pin).0,
+                height: facts.of(&u.txid).0,
                 ..entry
             });
         }
