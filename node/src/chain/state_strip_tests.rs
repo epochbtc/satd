@@ -680,11 +680,18 @@ fn a_prune_during_the_plan_is_a_race_not_corruption() {
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     *cs.strip.before_read_hook.lock() = Some(Box::new(move |cs: &ChainState| {
-        // The entry goes Pruned and its record is gone from where the plan
-        // will look for it.
+        // As a prune leaves it: the entry Pruned and the bytes gone. The
+        // file is cut at this block rather than deleted, since an open read
+        // handle would still see a deleted file.
         let mut entry = cs.store.get_block_index(&hash).unwrap();
+        let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(u64::from(entry.data_pos))
+            .unwrap();
         entry.status = BlockStatus::Pruned;
-        entry.data_pos = u32::MAX - 16;
         cs.store
             .write_batch(StoreBatch {
                 block_index_puts: vec![(hash, entry)],
