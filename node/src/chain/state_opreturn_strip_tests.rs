@@ -411,7 +411,7 @@ fn a_genuine_zero_payload_reads_as_the_block() {
     b.txdata[1].output[1].script_pubkey = ScriptBuf::from_bytes(zeros);
     b.header.merkle_root = b.compute_merkle_root().unwrap();
     grind_test_pow(&mut b);
-    assert!(crate::storage::opreturn_strip::has_zeroed_op_return(&b), "premise");
+    assert!(crate::storage::opreturn_strip::has_punched_op_return(&b, &[0; 8]), "premise");
     assert!(cs.accept_block(&b).expect("accept").connected());
 
     let hash = b.block_hash();

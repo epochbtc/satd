@@ -20108,6 +20108,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         "getorphantxs",
         "getrawaddrman",
         "sendmsgtopeer",
+        "stripopreturns",
         "unsubscribemempool",
     ];
     let mut missing: Vec<&str> = registered

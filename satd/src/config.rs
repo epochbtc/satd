@@ -990,6 +990,9 @@ pub struct Config {
     /// Core's `-fastprune`: a 64 KiB block-file size, so pruning a short
     /// test chain actually deletes something.
     pub fastprune: bool,
+    /// satd's hidden `-allowteststrip`: register the test-only
+    /// `stripopreturns` RPC. Regtest only; refused on any other chain.
+    pub allow_test_strip: bool,
     pub check_block_index: bool,
     /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
     /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
@@ -4296,6 +4299,8 @@ impl Config {
                 .fastprune
                 .or_else(|| file_get("fastprune").and_then(|v| parse_bool(&v)))
                 .unwrap_or(false),
+            // Command line only: a test tool has no business in a config file.
+            allow_test_strip: cli.test_strip_args.allowteststrip.unwrap_or(false),
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -6028,6 +6033,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub zmq_pub_args: ZmqPubArgs,
 
+    /// The hidden `-allowteststrip`, hand-built for the same stack-frame
+    /// reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub test_strip_args: TestStripArgs,
+
     #[arg(
         long,
         value_name = "BOOL_OR_BASIC",
@@ -7547,6 +7557,46 @@ impl clap::FromArgMatches for TxAnnounceArgs {
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { txannouncedelay: m.remove_one("txannouncedelay") })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// `-allowteststrip` (see [`CliArgs::test_strip_args`]): register the
+/// test-only `stripopreturns` RPC on regtest. Hidden from `--help` and never
+/// documented; command line only.
+#[derive(Debug, Clone, Default)]
+pub struct TestStripArgs {
+    pub allowteststrip: Option<bool>,
+}
+
+impl clap::Args for TestStripArgs {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        cmd.arg(
+            stratum_arg(&("allowteststrip", "BOOL", StratumArgKind::Bool, "Register the test-only stripopreturns RPC (regtest only)"))
+                .hide(true),
+        )
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for TestStripArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self { allowteststrip: m.remove_one("allowteststrip") })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -12087,6 +12137,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
+            test_strip_args: TestStripArgs::default(),
             nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
@@ -12408,6 +12459,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
+            test_strip_args: TestStripArgs::default(),
             nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,

@@ -1,0 +1,706 @@
+//! `ChainState::strip_block`: what it strips, what it refuses, and what it
+//! does when the block moves under it.
+
+use std::os::unix::fs::FileExt;
+
+use bitcoin::blockdata::locktime::absolute::LockTime;
+use bitcoin::{Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
+
+use super::super::tests::{build_test_block, grind_test_pow, make_chain_state};
+use super::*;
+use crate::storage::opreturn_strip::{StripRecord, tx_spans};
+
+const THRESHOLD: u64 = 4096;
+/// tx 1 carries a large OP_RETURN (vout 1) and a small one (vout 2); tx 2 a
+/// small one (vout 1).
+const BIG: usize = 5000;
+const SMALL: usize = 300;
+
+/// Recent enough that a tip near height 105 is out of IBD, and not in the
+/// future. Fixed once per run, so every chain this file builds is the same.
+fn time(h: u32) -> u32 {
+    static BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| crate::time::now_secs() as u32 - 120 * 600) + h * 600
+}
+
+fn op_return(len: usize, seed: u8) -> ScriptBuf {
+    let mut v = vec![0x6a];
+    v.extend((1..len).map(|i| (i % 251) as u8 ^ seed | 1));
+    ScriptBuf::from_bytes(v)
+}
+
+fn spend(prev: OutPoint, scripts: Vec<ScriptBuf>) -> Transaction {
+    Transaction {
+        version: transaction::Version(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: scripts
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| TxOut {
+                value: Amount::from_sat(if i == 0 { 1_000 } else { 0 }),
+                script_pubkey: s,
+            })
+            .collect(),
+    }
+}
+
+fn block_on(parent: BlockHash, height: u32, txs: Vec<Transaction>) -> Block {
+    let mut block = build_test_block(parent, height, time(height));
+    block.txdata.extend(txs);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    grind_test_pow(&mut block);
+    block
+}
+
+fn coinbase_of(b: &Block) -> OutPoint {
+    OutPoint {
+        txid: b.txdata[0].compute_txid(),
+        vout: 0,
+    }
+}
+
+fn connect(cs: &ChainState, b: &Block) {
+    assert!(cs.accept_block(b).expect("accept").connected());
+}
+
+/// Blocks 1 to 101, then block 102 with the OP_RETURNs, then 103 to 105.
+/// Returns every block; `blocks[101]` is the one with the OP_RETURNs.
+fn chain(cs: &ChainState) -> Vec<Block> {
+    let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let mut blocks = Vec::new();
+    for h in 1..=101 {
+        let b = build_test_block(parent, h, time(h));
+        connect(cs, &b);
+        parent = b.block_hash();
+        blocks.push(b);
+    }
+    let b = block_on(
+        parent,
+        102,
+        vec![
+            spend(
+                coinbase_of(&blocks[0]),
+                vec![ScriptBuf::new(), op_return(BIG, 1), op_return(SMALL, 2)],
+            ),
+            spend(coinbase_of(&blocks[1]), vec![ScriptBuf::new(), op_return(SMALL, 3)]),
+        ],
+    );
+    connect(cs, &b);
+    blocks.push(b);
+    for h in 103..=105 {
+        let b = build_test_block(blocks.last().unwrap().block_hash(), h, time(h));
+        connect(cs, &b);
+        blocks.push(b);
+    }
+    assert!(!cs.is_initial_block_download(), "premise: the fixture is out of IBD");
+    blocks
+}
+
+/// The block's bytes as they sit in its block file, decoded.
+fn on_disk(cs: &ChainState, hash: &BlockHash) -> Vec<u8> {
+    let entry = cs.store.get_block_index(hash).expect("indexed");
+    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let f = std::fs::File::open(path).unwrap();
+    let mut len = [0u8; 8];
+    f.read_exact_at(&mut len, u64::from(entry.data_pos)).unwrap();
+    let key = cs.flat_files.lock().xor_key();
+    crate::storage::flatfile::xor_in_place(&mut len, &key, u64::from(entry.data_pos));
+    let size = u32::from_le_bytes(len[4..8].try_into().unwrap()) as usize;
+    let mut data = vec![0u8; size];
+    f.read_exact_at(&mut data, u64::from(entry.data_pos) + 8).unwrap();
+    crate::storage::flatfile::xor_in_place(&mut data, &key, u64::from(entry.data_pos) + 8);
+    data
+}
+
+fn write_on_disk(cs: &ChainState, hash: &BlockHash, offset: usize, bytes: &[u8]) {
+    let entry = cs.store.get_block_index(hash).expect("indexed");
+    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let at = u64::from(entry.data_pos) + 8 + offset as u64;
+    let mut enc = bytes.to_vec();
+    let key = cs.flat_files.lock().xor_key();
+    crate::storage::flatfile::xor_in_place(&mut enc, &key, at);
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all_at(&enc, at).unwrap();
+}
+
+/// The bytes of output `vout` of tx `tx` after its opcode, as stored.
+fn payload_on_disk(cs: &ChainState, hash: &BlockHash, tx: usize, vout: usize) -> Vec<u8> {
+    let bytes = on_disk(cs, hash);
+    let span = tx_spans(&bytes).unwrap()[tx].outputs[vout];
+    bytes[span.strip_range()].to_vec()
+}
+
+fn record(cs: &ChainState, hash: &BlockHash) -> Option<StripRecord> {
+    cs.store.get_opreturn_strip(hash).unwrap().map(|b| StripRecord::decode(&b).unwrap())
+}
+
+fn corrupt_warning(cs: &ChainState, hash: &BlockHash) -> Option<String> {
+    let id = format!("blockdata.corrupt.{hash}");
+    cs.warnings().list().into_iter().find(|w| w.id == id).map(|w| w.message)
+}
+
+fn stats(outcome: StripOutcome) -> StripStats {
+    match outcome {
+        StripOutcome::Stripped(s) | StripOutcome::Redone(s) | StripOutcome::Extended(s) => s,
+        other => panic!("expected a strip, got {other:?}"),
+    }
+}
+
+/// `get_stored_block` reads the stripped block with its original identity.
+fn assert_reads_as(cs: &ChainState, original: &Block) {
+    let stored = cs.get_stored_block(&original.block_hash()).expect("the stripped block reads");
+    assert!(stored.is_stripped());
+    assert_eq!(stored.txids(), original.txdata.iter().map(|t| t.compute_txid()).collect::<Vec<_>>());
+    assert_eq!(stored.wtxids(), original.txdata.iter().map(|t| t.compute_wtxid()).collect::<Vec<_>>());
+}
+
+#[test]
+fn strip_block_records_then_zeroes_the_eligible_payloads() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    let before = on_disk(&cs, &hash);
+
+    let s = stats(cs.strip_block(&hash, THRESHOLD).unwrap());
+    assert_eq!((s.txs, s.outputs, s.span_bytes), (1, 1, BIG as u64 - 1));
+
+    let rec = record(&cs, &hash).expect("a record");
+    assert_eq!(rec.txs.len(), 1);
+    assert_eq!(rec.txs[0].tx_index, 1);
+    assert_eq!(rec.txs[0].txid, b.txdata[1].compute_txid());
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0), "the big payload is zeroed");
+    assert_eq!(
+        payload_on_disk(&cs, &hash, 1, 2),
+        op_return(SMALL, 2).as_bytes()[1..],
+        "below the threshold stays"
+    );
+    // Nothing else on disk changed.
+    let after = on_disk(&cs, &hash);
+    let span = tx_spans(&before).unwrap()[1].outputs[1].strip_range();
+    assert_eq!(before[..span.start], after[..span.start]);
+    assert_eq!(before[span.end..], after[span.end..]);
+
+    assert_eq!(cs.get_block(&hash), None);
+    assert_reads_as(&cs, b);
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    assert_eq!(cs.get_block(&blocks[100].block_hash()).as_ref(), Some(&blocks[100]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A strip a crash interrupted after its record is finished by the next
+/// call: it punches the spans again, and writes no new record.
+#[test]
+fn a_repeat_strip_re_punches_the_recorded_spans() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let original = on_disk(&cs, &hash);
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let rec = record(&cs, &hash);
+
+    // As if the punch never landed.
+    write_on_disk(&cs, &hash, 0, &original);
+    assert!(cs.get_stored_block(&hash).is_some(), "a record over intact bytes reads");
+    let s = match cs.strip_block(&hash, THRESHOLD).unwrap() {
+        StripOutcome::Redone(s) => s,
+        other => panic!("expected a redo, got {other:?}"),
+    };
+    assert_eq!((s.outputs, s.span_bytes), (1, BIG as u64 - 1));
+    assert_eq!(record(&cs, &hash), rec);
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0));
+    assert_reads_as(&cs, &blocks[101]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn nothing_eligible_writes_nothing() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let before = on_disk(&cs, &hash);
+    assert_eq!(cs.strip_block(&hash, BIG as u64 + 1).unwrap(), StripOutcome::NothingEligible);
+    assert_eq!(
+        cs.strip_block(&blocks[50].block_hash(), 0).unwrap(),
+        StripOutcome::NothingEligible,
+        "a coinbase-only block"
+    );
+    assert_eq!(record(&cs, &hash), None);
+    assert_eq!(on_disk(&cs, &hash), before);
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Lowering the threshold adds the newly eligible outputs to the record:
+/// a stripped transaction keeps its recorded txid, a new one takes its
+/// txid from its bytes, and only the new spans are punched.
+#[test]
+fn a_lower_threshold_extends_the_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+
+    let s = match cs.strip_block(&hash, SMALL as u64).unwrap() {
+        StripOutcome::Extended(s) => s,
+        other => panic!("expected an extension, got {other:?}"),
+    };
+    assert_eq!((s.txs, s.outputs, s.span_bytes), (2, 2, 2 * (SMALL as u64 - 1)));
+    let rec = record(&cs, &hash).unwrap();
+    let shape: Vec<(u32, Vec<u32>)> =
+        rec.txs.iter().map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect())).collect();
+    assert_eq!(shape, vec![(1, vec![1, 2]), (2, vec![1])]);
+    for (tx, vout) in [(1, 1), (1, 2), (2, 1)] {
+        assert!(payload_on_disk(&cs, &hash, tx, vout).iter().all(|x| *x == 0), "{tx}:{vout}");
+    }
+    assert_reads_as(&cs, b);
+    assert!(matches!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Redone(_)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Bytes that do not hash to the header's merkle root are never stripped:
+/// the record's txids would be wrong for good once the payload is gone.
+#[test]
+fn a_stored_copy_that_fails_check_block_is_refused_and_reported() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let spans = tx_spans(&on_disk(&cs, &hash)).unwrap();
+    // A byte of tx 1's prevout: it still deserializes, with the same header.
+    write_on_disk(&cs, &hash, spans[1].offset + 6, &[0xee]);
+    let before = on_disk(&cs, &hash);
+
+    match cs.strip_block(&hash, THRESHOLD) {
+        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("check_block"), "{detail}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let warning = corrupt_warning(&cs, &hash).expect("the corrupt copy is reported");
+    assert!(warning.contains("check_block"), "{warning}");
+    assert_eq!(record(&cs, &hash), None);
+    assert_eq!(on_disk(&cs, &hash), before, "nothing punched");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Punched bytes whose record was lost are not a block: re-stripping them
+/// would record txids computed from zeros.
+#[test]
+fn punched_bytes_with_a_lost_record_are_refused() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::Corrupt { .. })));
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_node_in_ibd_strips_nothing() {
+    let (cs, dir) = make_chain_state();
+    let genesis = cs.tip_hash();
+    assert!(cs.is_initial_block_download(), "premise: a genesis-only node is in IBD");
+    assert!(matches!(
+        cs.strip_block(&genesis, 0),
+        Err(StripError::NotQuiet("initial block download"))
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bulk_load_write_mode_strips_nothing() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.set_write_mode(crate::storage::WriteMode::BulkLoad);
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotQuiet(_))));
+    assert_eq!(record(&cs, &hash), None);
+    cs.set_write_mode(crate::storage::WriteMode::Normal);
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_background_chainstate_strips_nothing() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let snap = blocks[104].block_hash();
+    cs.attach_background(dir.join("chainstate_background"), 105, snap, [0u8; 32], 64, -1)
+        .unwrap();
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotQuiet(_))));
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn only_a_valid_block_on_the_active_chain_is_stripped() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+
+    let unknown = BlockHash::from_byte_array([9; 32]);
+    assert!(matches!(cs.strip_block(&unknown, THRESHOLD), Err(StripError::UnknownBlock(_))));
+
+    cs.invalidate_block(hash).unwrap();
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD),
+        Err(StripError::NotValid { status: BlockStatus::Invalid, .. })
+    ));
+    cs.reconsider_block(hash).unwrap();
+    assert_eq!(cs.tip_hash(), blocks[104].block_hash());
+
+    // A longer fork from block 101 takes over; 102 to 105 leave the active
+    // chain still Valid.
+    let mut parent = blocks[100].block_hash();
+    for h in 102..=107 {
+        let b = build_test_block(parent, h, time(h) + 1);
+        cs.accept_block(&b).expect("accept fork block");
+        parent = b.block_hash();
+    }
+    assert_eq!(cs.tip_hash(), parent, "premise: the fork is active");
+    let entry = cs.store.get_block_index(&hash).unwrap();
+    assert_eq!(entry.status, BlockStatus::Valid, "premise: a disconnected block stays Valid");
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotActive(_))));
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A repair that points the entry at a fresh copy between the plan and the
+/// punch drops the record in its own batch. The strip's record lands after
+/// it and describes the old copy, so it is removed again, and nothing is
+/// punched. The repair needs a record to act (it leaves a readable intact
+/// block alone), so this is an extension of a block stripped once.
+#[test]
+fn a_repoint_before_the_punch_leaves_no_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = blocks[101].clone();
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let old = cs.store.get_block_index(&hash).unwrap();
+    let before = on_disk(&cs, &hash);
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        // `get_block` sees the record and answers None, so the repair
+        // appends a full copy.
+        assert!(matches!(
+            cs.repair_block_data(&b).unwrap(),
+            crate::chain::state::BlockDataRepair::Repaired { .. }
+        ));
+        assert!(record(cs, &b.block_hash()).is_none(), "the repair dropped the record");
+    }));
+
+    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    let now = cs.store.get_block_index(&hash).unwrap();
+    assert_ne!((now.file_number, now.data_pos), (old.file_number, old.data_pos), "premise: moved");
+    assert_eq!(record(&cs, &hash), None);
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
+    // Neither copy was punched by the extension.
+    let at_old = {
+        let path = cs.blocks_dir().join(format!("blk{:05}.dat", old.file_number));
+        let mut data = vec![0u8; before.len()];
+        std::fs::File::open(path).unwrap().read_exact_at(&mut data, u64::from(old.data_pos) + 8).unwrap();
+        let key = cs.flat_files.lock().xor_key();
+        crate::storage::flatfile::xor_in_place(&mut data, &key, u64::from(old.data_pos) + 8);
+        data
+    };
+    assert_eq!(at_old, before);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A block whose entry changes in place between the plan and the punch
+/// keeps the record it had before the call: nothing new is punched, and
+/// what an earlier strip punched still has its record.
+///
+/// The change here is `invalidateblock`. With a record in place the block
+/// reads as stripped, so the disconnect fails closed (plan §2.10), but the
+/// block is marked `Invalid` all the same.
+#[test]
+fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let invalidate = move |cs: &ChainState| {
+        let _ = cs.invalidate_block(hash);
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+    };
+
+    // No prior record: none is left.
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
+    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), None);
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
+    let _ = std::fs::remove_dir_all(dir);
+
+    // A prior record: it is put back, so its punched span still reads.
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    assert_eq!(blocks[101].block_hash(), hash);
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    let prior = record(&cs, &hash);
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
+    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), prior);
+    assert_eq!(payload_on_disk(&cs, &hash, 2, 1), op_return(SMALL, 3).as_bytes()[1..], "not punched");
+    // Invalid, but its data is still served, through the record.
+    assert_reads_as(&cs, &blocks[101]);
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_test_rpc_is_allowed_only_on_regtest() {
+    let (cs, dir) = make_chain_state();
+    assert!(!cs.test_strip_allowed());
+    cs.allow_test_strip();
+    assert!(cs.test_strip_allowed());
+    let _ = std::fs::remove_dir_all(dir);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cs = ChainState::new(
+        Box::new(crate::storage::db::InMemoryStore::new()),
+        crate::storage::flatfile::FlatFileManager::new(&tmp.path().join("blocks")).unwrap(),
+        Network::Signet,
+        Box::new(crate::validation::script::NoopVerifier),
+        crate::chain::state::AssumeValid::Disabled,
+        450,
+        4,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    cs.allow_test_strip();
+    assert!(!cs.test_strip_allowed());
+}
+
+/// An entry pointing at the wrong record is not stripped: the bytes there
+/// are another block, which passes `check_block` on its own terms, so the
+/// record would describe the wrong transactions.
+#[test]
+fn an_entry_pointing_at_another_block_is_refused() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let other = cs.store.get_block_index(&blocks[100].block_hash()).unwrap();
+    let mut entry = cs.store.get_block_index(&hash).unwrap();
+    entry.file_number = other.file_number;
+    entry.data_pos = other.data_pos;
+    cs.store
+        .write_batch(StoreBatch {
+            block_index_puts: vec![(hash, entry)],
+            ..Default::default()
+        })
+        .unwrap();
+    match cs.strip_block(&hash, 0) {
+        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("different block"), "{detail}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prune between the plan and the punch drops the record in its own
+/// batch. The entry did not move, but its data is gone, so the record it
+/// had before the call is not put back.
+#[test]
+fn a_prune_before_the_punch_leaves_no_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    assert!(record(&cs, &hash).is_some());
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        // What `prune_up_to` writes for the block.
+        let mut entry = cs.store.get_block_index(&hash).unwrap();
+        entry.status = BlockStatus::Pruned;
+        cs.store
+            .write_batch(StoreBatch {
+                block_index_puts: vec![(hash, entry)],
+                opreturn_strip_removes: vec![hash],
+                ..Default::default()
+            })
+            .unwrap();
+    }));
+    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An extension takes the new transactions' txids and wtxids from their
+/// bytes. The merkle root does not cover witnesses, but the old record's
+/// filled hash covers every byte, so a witness gone bad on disk since the
+/// first strip is refused.
+#[test]
+fn an_extension_refuses_bytes_changed_since_the_first_strip() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let mut witness_tx = spend(coinbase_of(&blocks[2]), vec![ScriptBuf::new(), op_return(SMALL, 4)]);
+    witness_tx.input[0].witness = Witness::from_slice(&[vec![0xab; 40]]);
+    let mut b = build_test_block(blocks[104].block_hash(), 106, time(106));
+    b.txdata.push(spend(coinbase_of(&blocks[3]), vec![ScriptBuf::new(), op_return(BIG, 5)]));
+    b.txdata.push(witness_tx);
+    b.txdata[0].input[0].witness = Witness::from_slice(&[[0u8; 32]]);
+    let root = b.witness_root().unwrap();
+    let commitment = Block::compute_witness_commitment(&root, &[0u8; 32]);
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(commitment.as_byte_array());
+    b.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    });
+    b.header.merkle_root = b.compute_merkle_root().unwrap();
+    grind_test_pow(&mut b);
+    connect(&cs, &b);
+    let hash = b.block_hash();
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+
+    // A witness byte of tx 2, which the extension would record.
+    let bytes = on_disk(&cs, &hash);
+    let spans = tx_spans(&bytes).unwrap();
+    let tx2 = &spans[2];
+    let at = (tx2.offset..tx2.offset + tx2.len)
+        .rev()
+        .find(|i| bytes[*i] == 0xab)
+        .expect("the witness item");
+    write_on_disk(&cs, &hash, at, &[0xac]);
+    match cs.strip_block(&hash, SMALL as u64) {
+        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("recorded hash"), "{detail}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(record(&cs, &hash).unwrap().txs.len(), 1, "the record is unchanged");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reorg between the plan and the punch takes the block off the active
+/// chain, still `Valid` and in place. It must not be stripped: a reorg back
+/// would need its bytes.
+#[test]
+fn a_block_reorged_out_before_the_punch_is_not_stripped() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let fork_from = blocks[100].block_hash();
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        let mut parent = fork_from;
+        for h in 102..=107 {
+            let b = build_test_block(parent, h, time(h) + 1);
+            cs.accept_block(&b).expect("accept fork block");
+            parent = b.block_hash();
+        }
+        assert_eq!(cs.tip_hash(), parent, "premise: the fork is active");
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Valid);
+    }));
+    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), None);
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A chainstate whose blocks dir is obfuscated with a random `xor.dat` key,
+/// as `-blocksxor=1` makes it.
+fn make_xor_chain_state() -> (ChainState, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "satd-strip-xor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let flat_files = crate::storage::flatfile::FlatFileManager::with_xor_mode(
+        &dir.join("blocks"),
+        crate::storage::flatfile::XorMode::Enabled,
+    )
+    .unwrap();
+    assert_ne!(flat_files.xor_key(), [0; 8], "premise: a nonzero key");
+    let cs = ChainState::new(
+        Box::new(crate::storage::db::InMemoryStore::new()),
+        flat_files,
+        Network::Regtest,
+        Box::new(crate::validation::script::NoopVerifier),
+        crate::chain::state::AssumeValid::Disabled,
+        450,
+        4,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    (cs, dir)
+}
+
+/// Under a blocks-dir xor key a punched span reads back as the key, not as
+/// zeros. The strip still reads through its record, and a lost record is
+/// still caught: the payload is recognised as punched and the merkle check
+/// fails, rather than the block being served with txids computed from the
+/// key bytes.
+#[test]
+fn under_a_blocks_xor_key_a_lost_record_is_still_caught() {
+    let (cs, dir) = make_xor_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let key = cs.flat_files.lock().xor_key();
+    let payload = payload_on_disk(&cs, &hash, 1, 1);
+    assert!(payload.iter().any(|b| *b != 0), "premise: the punch decodes to the key, not zeros");
+    assert!(
+        (0..8).any(|p| payload.iter().enumerate().all(|(j, b)| *b == key[(p + j) % 8])),
+        "premise: the punch decodes to the key"
+    );
+    assert_reads_as(&cs, &blocks[101]);
+
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(cs.get_stored_block(&hash).is_none(), "never served with wrong txids");
+    assert!(cs.get_block(&hash).is_none());
+    let warning = corrupt_warning(&cs, &hash).expect("the lost record is reported");
+    assert!(warning.contains("lost strip record"), "{warning}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prune that lands between the plan's index read and its read of the
+/// bytes makes the read fail. That is a race, not corruption: no warning.
+#[test]
+fn a_prune_during_the_plan_is_a_race_not_corruption() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    *cs.strip.before_read_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        // As a prune leaves it: the entry Pruned and the bytes gone. The
+        // file is cut at this block rather than deleted, since an open read
+        // handle would still see a deleted file.
+        let mut entry = cs.store.get_block_index(&hash).unwrap();
+        let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(u64::from(entry.data_pos))
+            .unwrap();
+        entry.status = BlockStatus::Pruned;
+        cs.store
+            .write_batch(StoreBatch {
+                block_index_puts: vec![(hash, entry)],
+                ..Default::default()
+            })
+            .unwrap();
+    }));
+    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}

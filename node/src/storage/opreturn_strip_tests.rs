@@ -470,3 +470,4 @@ fn a_record_that_does_not_fit_the_bytes_is_refused() {
         StoredBlockError::WrongHash { .. }
     ));
 }
+

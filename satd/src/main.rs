@@ -1220,6 +1220,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
     flat_files.set_fast_prune(config.fastprune);
+    if config.allow_test_strip && config.network != bitcoin::Network::Regtest {
+        eprintln!("Error: -allowteststrip is a test option and is only accepted with -regtest");
+        auth.cleanup();
+        node::shutdown::exit_now(1);
+    }
 
     // -reindex used to eagerly slurp every block into a `Vec` here so the
     // FlatFileManager could be moved into ChainState; on a fully-synced
@@ -1356,6 +1361,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             cs.set_signet_challenge(config.signet_challenge.clone());
             node::chain::state::ChainState::set_max_tip_age(config.maxtipage);
             cs.set_minimum_chain_work(config.minimumchainwork);
+            if config.allow_test_strip {
+                cs.allow_test_strip();
+            }
             if cs.network == bitcoin::Network::Signet {
                 tracing::info!(
                     "Signet derived magic (message start): {}",

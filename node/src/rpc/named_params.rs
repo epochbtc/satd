@@ -245,6 +245,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "signmessagewithprivkey" => &[("privkey", false), ("message", false)],
         "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
         "stop" => &[("wait", false)],
+        "stripopreturns" => &[("blockhash", false), ("threshold", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
         "submitheader" => &[("hexdata", false)],
         // SATD_ONLY: submitnapattestation
@@ -375,7 +376,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "pruneblockchain",
     "reconsiderblock", "removenapattestation", "replaynapsnapshot", "resumeindex", "savemempool", "scantxoutset",
     "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
-    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
+    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "stripopreturns", "submitblock", "submitheader",
     "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
     "testmempoolaccept", "unsubscribemempool", "uptime",
     "utxoupdatepsbt", "validateaddress", "verifybip322", "verifychain", "verifymessage", "verifytxoutproof",

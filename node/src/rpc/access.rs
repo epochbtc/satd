@@ -246,7 +246,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "scantxoutset"
         // NAP: a replay reads a file and verifies every signature in it; an
         // export writes a file.
-        | "replaynapsnapshot" | "exportnapsnapshot" => Control,
+        | "replaynapsnapshot" | "exportnapsnapshot"
+        // satd's test-only strip tool (regtest, `-allowteststrip`): rewrites
+        // block files in place.
+        | "stripopreturns" => Control,
 
         // --- Block-connecting / chainstate-activating (correctness-critical) ---
         "generateblock"

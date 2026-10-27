@@ -248,15 +248,23 @@ pub fn eligible_outputs(block: &Block, threshold: u64) -> Vec<(usize, Vec<u32>)>
 }
 
 /// Whether any non-coinbase output of `block` looks stripped: an OP_RETURN
-/// whose payload after the opcode is non-empty and all zero. That is what a
-/// strip leaves on disk, so a block read with no record that has one may be
-/// a stripped block whose record was lost. It may also be a genuine payload
-/// of zeros, which is why a hit only calls for a merkle check.
-pub fn has_zeroed_op_return(block: &Block) -> bool {
+/// whose payload after the opcode is non-empty and is what a punch leaves.
+/// A punch leaves zeros on disk, and a block read decodes each byte through
+/// the blocks-dir obfuscation key (`xor.dat`), so the payload reads back as
+/// `xor_key` repeated from some phase: all zero for the zero key.
+///
+/// A block read with no record that has one may be a stripped block whose
+/// record was lost. It may also be a genuine payload of that shape, which is
+/// why a hit only calls for a merkle check.
+pub fn has_punched_op_return(block: &Block, xor_key: &[u8; 8]) -> bool {
     block.txdata.iter().skip(1).any(|tx| {
         tx.output.iter().any(|o| {
             let script = o.script_pubkey.as_bytes();
-            script.len() >= 2 && script[0] == 0x6a && script[1..].iter().all(|b| *b == 0)
+            script.len() >= 2
+                && script[0] == 0x6a
+                && (0..8).any(|phase| {
+                    script[1..].iter().enumerate().all(|(j, b)| *b == xor_key[(phase + j) % 8])
+                })
         })
     })
 }
@@ -537,6 +545,19 @@ pub enum FillError {
 /// Every named output is checked before any byte is written, so on an error
 /// `buf` is unchanged.
 pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Result<(), FillError> {
+    for range in strip_ranges(buf, record, spans)? {
+        buf[range].fill(0);
+    }
+    Ok(())
+}
+
+/// The byte ranges of `buf` (the block bytes `spans` was parsed from) that
+/// `record` strips, in record order, after the checks [`fill_spans`] makes.
+pub fn strip_ranges(
+    buf: &[u8],
+    record: &StripRecord,
+    spans: &[TxSpans],
+) -> Result<Vec<std::ops::Range<usize>>, FillError> {
     let mut ranges = Vec::new();
     for tx in &record.txs {
         let tx_spans = spans
@@ -567,10 +588,7 @@ pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Re
             ranges.push(span.strip_range());
         }
     }
-    for range in ranges {
-        buf[range].fill(0);
-    }
-    Ok(())
+    Ok(ranges)
 }
 
 // ---------------------------------------------------------------------------

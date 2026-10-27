@@ -19,6 +19,10 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+#[path = "state_strip.rs"]
+mod strip;
+pub use strip::{FAILPOINT_ENV, StripError, StripOutcome, StripStats};
+
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
 /// moves it on a mockable chain; off regtest that is always the system clock.
@@ -634,6 +638,12 @@ pub struct ChainState {
     /// [`Self::set_startup_stop`]. Unset in tests that do not need it, and
     /// then never requested.
     startup_stop: std::sync::OnceLock<crate::shutdown::StartupStop>,
+    /// Whether the chainstate is in `BulkLoad` write mode, mirrored from
+    /// [`Self::set_write_mode`]: IBD and the startup replays. Stripping
+    /// waits for it to end.
+    bulk_load: std::sync::atomic::AtomicBool,
+    /// OP_RETURN stripping ([`Self::strip_block`]).
+    strip: strip::StripState,
 }
 
 /// RAII clear for [`ChainState::snapshot_load_active`]. The flag must drop
@@ -966,6 +976,8 @@ impl ChainState {
                     pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
                     startup_stop: std::sync::OnceLock::new(),
+                    bulk_load: std::sync::atomic::AtomicBool::new(false),
+                    strip: Default::default(),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -1102,6 +1114,8 @@ impl ChainState {
             pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
             startup_stop: std::sync::OnceLock::new(),
+            bulk_load: std::sync::atomic::AtomicBool::new(false),
+            strip: Default::default(),
         })
     }
 
@@ -3878,7 +3892,16 @@ impl ChainState {
                  block index entries may become durable ahead of their data"
             );
         }
+        // Raised before the store enters BulkLoad and lowered only once it has
+        // left, so a strip never sees Normal while writes run WAL-less.
+        let bulk = mode == crate::storage::WriteMode::BulkLoad;
+        if bulk {
+            self.bulk_load.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.store.set_write_mode(mode);
+        if !bulk {
+            self.bulk_load.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Force all cached writes to durable storage. Intended to be called
@@ -4716,7 +4739,11 @@ impl ChainState {
         // signal. `None` is still the return value, because that is what the
         // callers are built around; what changes is that the condition is now
         // *reported*.
-        let data = match self.flat_files.lock().read_block(&pos) {
+        let (read, xor_key) = {
+            let mut flat_files = self.flat_files.lock();
+            (flat_files.read_block(&pos), flat_files.xor_key())
+        };
+        let data = match read {
             Ok(data) => data,
             Err(e) => {
                 self.report_corrupt_block_data(hash, &entry, &pos, &format!("read failed: {e}"));
@@ -4751,14 +4778,15 @@ impl ChainState {
         };
         let on_disk = data.len();
         match StoredBlock::from_bytes(data, record, hash) {
-            // A lost record leaves the zeroed bytes looking intact, and
+            // A lost record leaves the punched bytes looking intact, and
             // nothing above checks their txids: only the header hash. So a
-            // block with no record but a zeroed OP_RETURN payload must still
-            // reproduce its merkle root. A genuine payload of zeros does;
-            // punched bytes do not. Only such blocks pay for the check.
+            // block with no record but an OP_RETURN payload shaped like a
+            // punch (zeros, read through the xor key) must still reproduce
+            // its merkle root. A genuine payload of that shape does; punched
+            // bytes do not. Only such blocks pay for the check.
             Ok(stored)
                 if !stored.is_stripped()
-                    && opreturn_strip::has_zeroed_op_return(&stored.block)
+                    && opreturn_strip::has_punched_op_return(&stored.block, &xor_key)
                     && !stored.verify_merkle() =>
             {
                 // A repair can point the entry at a fresh copy and drop the
@@ -4776,8 +4804,8 @@ impl ChainState {
                     hash,
                     &entry,
                     &pos,
-                    "an OP_RETURN payload is zeroed, no strip record names it, and the txids \
-                     miss the merkle root (a lost strip record?)",
+                    "an OP_RETURN payload reads as punched, no strip record names it, and the \
+                     txids miss the merkle root (a lost strip record?)",
                 );
                 None
             }
