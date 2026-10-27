@@ -203,6 +203,14 @@ rbitcoin takes `asof:` only after `server.version` negotiated `1.4.2-asof`;
 satd takes it on any connection, so sending it is the opt-in.
 `server.features` reports `asof: true` and `asof_protocol: "1.4.2-asof"`.
 
+**Check `server.features` before sending `asof:`.** A server without the
+feature does not always refuse it: `transaction.get`, `get_merkle` and
+`id_from_pos` already take an optional last argument, and an older satd (or
+another server) reads `asof:…` there as `verbose = false` or
+`merkle = false`, or ignores it, and answers live, with no error. Check the
+answer too: its `chain_tip` names the asof block only when the asof was
+applied.
+
 ## Subscriptions
 
 Two long-lived push subscriptions are supported. Only
