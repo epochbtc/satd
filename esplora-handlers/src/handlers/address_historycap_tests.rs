@@ -40,6 +40,7 @@ fn pin_above_all() -> Pin {
     Pin {
         hash: bitcoin::BlockHash::all_zeros(),
         height: u32::MAX,
+        mempool: true,
     }
 }
 

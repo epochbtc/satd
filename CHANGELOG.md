@@ -131,6 +131,11 @@ item below is (or will be) written up in full in the in-development
   at, however many blocks connect while it runs; a disconnect under it runs
   it again.
 
+- Esplora `?asof=<blockhash>` on the address and scripthash stats, `/txs`,
+  `/txs/chain` and `/utxo` routes and on `/tx/:txid/status` and the outspend
+  routes: the answer as of a block still on the best chain, with no mempool.
+  Same parameter and rules as rbitcoin.
+
 ### Fixed
 
 - The address index built by a backfill (`-addressindex` turned on for an

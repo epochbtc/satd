@@ -24,6 +24,14 @@
 //! read the chain are pinned and carry the headers: the mempool and fee
 //! routes, `POST /tx`, the `/txs/mempool` lists and the SSE streams are
 //! mounted without this layer.
+//!
+//! `?asof=<blockhash>` pins a request to that block instead of the tip, while
+//! it is on the best chain, and leaves the mempool out of the answer: the
+//! wallet as of that block. The block's hash and height go in the headers. A
+//! block that is not on the best chain, or leaves it while the request runs,
+//! is 404, never an answer from another block at its height. Only the routes
+//! in [`AsOf::Accepted`] take it; on any other route, pinned or not, an
+//! `asof` parameter is 404.
 
 use std::time::{Duration, Instant};
 
@@ -54,12 +62,17 @@ const VIEW_WAIT: Duration = Duration::from_millis(500);
 /// The body of the 503 for a chain that retreated under every run.
 pub const CHAIN_VIEW_MOVED: &str = "chain view moved";
 
-/// The tip a chain route answers for. Every chain read the handler makes is
-/// bounded to it: nothing above `height` is confirmed.
+/// The block a chain route answers for. Every chain read the handler makes
+/// is bounded to it: nothing above `height` is confirmed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pin {
     pub hash: BlockHash,
     pub height: u32,
+    /// The answer includes the mempool: a live request pinned to the tip.
+    /// `false` for `?asof=`, which answers with confirmed data only, and
+    /// treats a transaction confirmed above the pin as unknown rather than
+    /// unconfirmed.
+    pub mempool: bool,
 }
 
 impl Pin {
@@ -82,21 +95,94 @@ impl Pin {
     }
 }
 
-/// Run the request pinned to the current tip, and stamp that tip.
+/// Whether a pinned route takes `?asof=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsOf {
+    Accepted,
+    Refused,
+}
+
+/// The state [`stamp_chain_tip`] runs with.
+#[derive(Clone)]
+pub struct PinnedRoutes {
+    pub state: EsploraState,
+    pub asof: AsOf,
+}
+
+/// The `asof` query parameter: `Ok(None)` when absent, `Err` when present
+/// but not a block hash (empty, or not 64 hex characters).
+fn asof_param(uri: &axum::http::Uri) -> Result<Option<BlockHash>, ()> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "asof" {
+            return value.parse::<BlockHash>().map(Some).map_err(|_| ());
+        }
+    }
+    Ok(None)
+}
+
+fn not_found() -> Response {
+    crate::error::EsploraError::NotFound.into_response()
+}
+
+/// On routes that are not pinned: an `asof` parameter is 404, as on a
+/// pinned route that does not take it.
+pub async fn refuse_asof(req: Request, next: Next) -> Response {
+    if !matches!(asof_param(req.uri()), Ok(None)) {
+        return not_found();
+    }
+    next.run(req).await
+}
+
+/// The pin for `?asof=<hash>`: the block, if it is on the best chain at or
+/// below `view`'s tip.
+fn asof_pin(chain: &ChainState, view: &ChainView, hash: BlockHash) -> Option<Pin> {
+    let entry = chain.get_block_index(&hash)?;
+    if entry.height > view.tip_height || !chain.active_chain_contains(&hash, entry.height) {
+        return None;
+    }
+    Some(Pin {
+        hash,
+        height: entry.height,
+        mempool: false,
+    })
+}
+
+/// Run the request pinned to the current tip, or to its `?asof=` block, and
+/// stamp the block it was pinned to.
 pub async fn stamp_chain_tip(
-    State(state): State<EsploraState>,
+    State(routes): State<PinnedRoutes>,
     req: Request,
     next: Next,
 ) -> Response {
+    let state = routes.state;
+    let asof = match asof_param(req.uri()) {
+        Ok(None) => None,
+        Ok(Some(_)) if routes.asof == AsOf::Refused => return not_found(),
+        Ok(Some(hash)) => Some(hash),
+        Err(()) => return not_found(),
+    };
     let (parts, body) = req.into_parts();
     let mut body = Some(body);
     for _ in 0..VIEW_ATTEMPTS {
         let Some(view) = settled_view(&state.chain).await else {
             return chain_view_moved();
         };
-        let pin = Pin {
-            hash: view.tip_hash,
-            height: view.tip_height,
+        let pin = match asof {
+            // Not on the best chain: 404, now or after a retreat, with no
+            // retry onto another block at its height.
+            Some(hash) => match asof_pin(&state.chain, &view, hash) {
+                Some(pin) => pin,
+                None => return not_found(),
+            },
+            None => Pin {
+                hash: view.tip_hash,
+                height: view.tip_height,
+                mempool: true,
+            },
         };
         // Every pinned route is a GET, whose handler reads no body. A rerun
         // gets an empty one; the first run keeps whatever was sent.
@@ -174,6 +260,8 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt as _;
 
+    use bitcoin::hashes::Hash as _;
+
     use super::*;
     use crate::test_support::{extend_tip, regtest_state};
 
@@ -192,7 +280,13 @@ mod tests {
                     }
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(state, stamp_chain_tip))
+            .layer(axum::middleware::from_fn_with_state(
+                PinnedRoutes {
+                    state,
+                    asof: AsOf::Refused,
+                },
+                stamp_chain_tip,
+            ))
     }
 
     async fn call(router: Router) -> Response {
@@ -286,7 +380,13 @@ mod tests {
                     }
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(state, stamp_chain_tip));
+            .layer(axum::middleware::from_fn_with_state(
+                PinnedRoutes {
+                    state,
+                    asof: AsOf::Refused,
+                },
+                stamp_chain_tip,
+            ));
         let resp = call(router).await;
         assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(tip.to_string().as_str()));
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -314,6 +414,110 @@ mod tests {
         assert!(header(&resp, &CHAIN_TIP_HEADER).is_none());
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], CHAIN_VIEW_MOVED.as_bytes());
+    }
+
+    async fn get_path(router: &Router, path: &str) -> Response {
+        router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// `?asof=` pins a request to that block, with no mempool, on the routes
+    /// that take it; anywhere else, or for a block not on the best chain, or
+    /// one that is not a hash, it is 404.
+    #[tokio::test]
+    async fn asof_pins_to_a_best_chain_block_on_the_routes_that_take_it() {
+        let (state, _dir) = regtest_state();
+        let one = extend_tip(&state.chain, 0);
+        let two = extend_tip(&state.chain, 0);
+        let pins = Router::new()
+            .route(
+                "/probe",
+                get(|axum::Extension(pin): axum::Extension<Pin>| async move {
+                    format!("{} {} {}", pin.hash, pin.height, pin.mempool)
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                PinnedRoutes {
+                    state: state.clone(),
+                    asof: AsOf::Accepted,
+                },
+                stamp_chain_tip,
+            ));
+
+        let resp = get_path(&pins, &format!("/probe?asof={one}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(one.to_string().as_str()));
+        assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], format!("{one} 1 false").as_bytes());
+
+        let resp = get_path(&pins, "/probe?other=1").await;
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], format!("{two} 2 true").as_bytes(), "no asof: the live tip");
+
+        // A side block at height 1, not on the best chain.
+        let side = crate::test_support::regtest_block(state.chain.get_block_hash_by_height(0).unwrap(), 1, 7);
+        let _ = state.chain.accept_block(&side);
+        let zero = BlockHash::all_zeros();
+        for query in [
+            format!("asof={zero}"),
+            format!("asof={}", side.block_hash()),
+            "asof=".to_string(),
+            "asof=nothex".to_string(),
+        ] {
+            let resp = get_path(&pins, &format!("/probe?{query}")).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{query}");
+            assert!(header(&resp, &CHAIN_TIP_HEADER).is_none(), "{query}");
+        }
+
+        // Through the real router: a pinned route that does not take asof,
+        // and an unpinned one, are 404.
+        let router = crate::build_router(state).unwrap();
+        for path in [format!("/tx/{zero}?asof={one}"), format!("/mempool?asof={one}")] {
+            assert_eq!(get_path(&router, &path).await.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(get_path(&router, &format!("/blocks/tip/hash?asof={one}")).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(get_path(&router, "/mempool").await.status(), StatusCode::OK);
+    }
+
+    /// An asof block that a disconnect takes off the best chain while the
+    /// request runs is 404, not an answer from whatever replaced it.
+    #[tokio::test]
+    async fn an_asof_block_disconnected_mid_request_is_404() {
+        let (state, _dir) = regtest_state();
+        extend_tip(&state.chain, 0);
+        let two = extend_tip(&state.chain, 0);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        let chain = state.chain.clone();
+        let router = Router::new()
+            .route(
+                "/probe",
+                get(move || {
+                    let chain = chain.clone();
+                    let counted = counted.clone();
+                    async move {
+                        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                            chain.invalidate_block(two).unwrap();
+                        }
+                        "ok"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                PinnedRoutes {
+                    state,
+                    asof: AsOf::Accepted,
+                },
+                stamp_chain_tip,
+            ));
+        let resp = get_path(&router, &format!("/probe?asof={two}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(header(&resp, &CHAIN_TIP_HEADER).is_none());
     }
 
     /// Through the real router: chain routes carry the stamp and agree with

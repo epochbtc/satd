@@ -40,35 +40,23 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
 
     // Build the route table first; auth, CORS, and prefix nesting are
     // applied around it. Routes that read the chain go through
-    // `stamp_chain_tip` (see `crate::chain_tip`); the mempool, fee,
-    // broadcast and streaming routes do not.
-    let chain_routes = Router::new()
-        .route("/", get(mempool::root))
-        .route("/blocks/tip/hash", get(chain::tip_hash))
-        .route("/blocks/tip/height", get(chain::tip_height))
-        .route("/blocks", get(chain::blocks_recent))
-        .route("/blocks/{start_height}", get(chain::blocks_at_or_below))
-        .route("/block-height/{height}", get(chain::block_height))
-        .route("/block/{hash}", get(block::block_detail))
-        .route("/block/{hash}/header", get(block::block_header))
-        .route("/block/{hash}/raw", get(block::block_raw))
-        .route("/block/{hash}/status", get(block::block_status))
-        .route("/block/{hash}/txs", get(block::block_txs))
-        .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
-        .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
-        .route("/block/{hash}/txids", get(block::block_txids))
-        .route("/tx/{txid}", get(tx::tx_detail))
+    // `stamp_chain_tip` (see `crate::chain_tip`), which pins each request to
+    // a block; those in `asof_routes` also take `?asof=<blockhash>`. The
+    // mempool, fee, broadcast and streaming routes are not pinned, and refuse
+    // `?asof=`.
+    let pinned = |asof| {
+        axum::middleware::from_fn_with_state(
+            crate::chain_tip::PinnedRoutes {
+                state: state.clone(),
+                asof,
+            },
+            crate::chain_tip::stamp_chain_tip,
+        )
+    };
+    let asof_routes = Router::new()
         .route("/tx/{txid}/status", get(tx::tx_status))
-        .route("/tx/{txid}/hex", get(tx::tx_hex))
-        .route("/tx/{txid}/raw", get(tx::tx_raw))
-        // Outspend + merkle-proof endpoints (Esplora plan PR 6).
         .route("/tx/{txid}/outspend/{vout}", get(outspend::tx_outspend))
         .route("/tx/{txid}/outspends", get(outspend::tx_outspends))
-        .route("/tx/{txid}/merkle-proof", get(outspend::tx_merkle_proof))
-        .route(
-            "/tx/{txid}/merkleblock-proof",
-            get(outspend::tx_merkleblock_proof),
-        )
         // Address-string family (Esplora plan PR 5).
         .route("/address/{addr}", get(address::address_info))
         .route("/address/{addr}/txs", get(address::address_txs_combined))
@@ -94,10 +82,33 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             get(address::scripthash_txs_chain_paged),
         )
         .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::chain_tip::stamp_chain_tip,
-        ));
+        .layer(pinned(crate::chain_tip::AsOf::Accepted));
+
+    let chain_routes = Router::new()
+        .route("/", get(mempool::root))
+        .route("/blocks/tip/hash", get(chain::tip_hash))
+        .route("/blocks/tip/height", get(chain::tip_height))
+        .route("/blocks", get(chain::blocks_recent))
+        .route("/blocks/{start_height}", get(chain::blocks_at_or_below))
+        .route("/block-height/{height}", get(chain::block_height))
+        .route("/block/{hash}", get(block::block_detail))
+        .route("/block/{hash}/header", get(block::block_header))
+        .route("/block/{hash}/raw", get(block::block_raw))
+        .route("/block/{hash}/status", get(block::block_status))
+        .route("/block/{hash}/txs", get(block::block_txs))
+        .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
+        .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
+        .route("/block/{hash}/txids", get(block::block_txids))
+        .route("/tx/{txid}", get(tx::tx_detail))
+        .route("/tx/{txid}/hex", get(tx::tx_hex))
+        .route("/tx/{txid}/raw", get(tx::tx_raw))
+        // Merkle-proof endpoints (Esplora plan PR 6).
+        .route("/tx/{txid}/merkle-proof", get(outspend::tx_merkle_proof))
+        .route(
+            "/tx/{txid}/merkleblock-proof",
+            get(outspend::tx_merkleblock_proof),
+        )
+        .layer(pinned(crate::chain_tip::AsOf::Refused));
 
     let routes = Router::new()
         // Body cap for broadcast. `MAX_STANDARD_TX_WEIGHT` is 400_000
@@ -128,6 +139,8 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/blocks/sse", get(sse::blocks_sse))
         .route("/address/{addr}/sse", get(sse::address_sse))
         .route("/scripthash/{hash}/sse", get(sse::scripthash_sse))
+        .layer(axum::middleware::from_fn(crate::chain_tip::refuse_asof))
+        .merge(asof_routes)
         .merge(chain_routes)
         .with_state(state);
 
