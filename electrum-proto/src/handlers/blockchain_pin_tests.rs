@@ -251,6 +251,55 @@ fn a_late_transaction_has_its_mempool_height_and_fee() {
     );
 }
 
+/// A late transaction whose parent sits in an OP_RETURN-stripped block still
+/// carries its fee: the parent is read from its stored form, found by its
+/// recorded txid, and its output values are the original's.
+#[test]
+fn a_late_transaction_with_a_parent_in_a_stripped_block_keeps_its_fee() {
+    let (state, _dir) = electrum_state(100);
+    let first = state
+        .electrum_extras
+        .txid_at_pos(1, 0)
+        .expect("block 1's coinbase");
+    for salt in 0..100 {
+        crate::test_support::extend_tip(&state.chain, 5_000 + salt);
+    }
+    let mut parent = spend(bitcoin::OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+    let mut data = vec![0x6a, 0x4d, 0x84, 0x13];
+    data.resize(5_000, 0x5a);
+    parent.output.push(bitcoin::TxOut {
+        value: bitcoin::Amount::ZERO,
+        script_pubkey: bitcoin::ScriptBuf::from_bytes(data),
+    });
+    // `regtest_block` adds the salt to the time: a salt that dates the block
+    // now takes the tip out of initial block download, where strips wait.
+    let now_salt = |height: u32| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        now - 1_708_000_000 - 600 * height
+    };
+    let parent_height = state.chain.tip_height() + 1;
+    let parent_block = extend_tip_with(&state.chain, now_salt(parent_height), vec![parent.clone()]);
+    let stripped = state.chain.strip_block(&parent_block.block_hash(), 4_096).expect("strip");
+    assert!(
+        matches!(stripped, node::chain::state::StripOutcome::Stripped(_)),
+        "premise: the parent's block is stripped: {stripped:?}"
+    );
+    let pin = pin_at(state.chain.tip_height());
+    let child = spend(
+        bitcoin::OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        5_000_000_000 - 3_000,
+    );
+    extend_tip_with(&state.chain, now_salt(parent_height + 1) + 1, vec![child.clone()]);
+
+    assert_eq!(
+        super::LateFacts::new(&state, &pin).of(&child.compute_txid()),
+        (0, Some(2_000))
+    );
+}
+
 mod races {
     //! Reads that a block connecting mid-request splits.
 

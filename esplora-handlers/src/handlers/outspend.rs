@@ -19,8 +19,9 @@ use axum::extract::{Path, State};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Block, OutPoint, TxMerkleNode, Txid};
+use bitcoin::{OutPoint, TxMerkleNode, Txid};
 use node::storage::Store;
+use node::storage::opreturn_strip::StoredBlock;
 use serde::Serialize;
 
 use crate::chain_tip::Pin;
@@ -121,7 +122,7 @@ pub async fn tx_merkle_proof(
 ) -> EsploraResult<Json<MerkleProofJson>> {
     let txid = parse_txid(&txid_s)?;
     let (block, height, pos) = locate_confirmed_tx(&state, &pin, &txid)?;
-    let txids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+    let txids = block.txids();
     let branch = compute_merkle_branch(&txids, pos);
     Ok(Json(MerkleProofJson {
         block_height: height,
@@ -140,7 +141,11 @@ pub async fn tx_merkleblock_proof(
     let (block, _height, _pos) = locate_confirmed_tx(&state, &pin, &txid)?;
     // Build a partial-merkle-tree containing only this txid. Encoded as
     // a P2P MerkleBlock and hex-stringified, matching upstream.
-    let mb = MerkleBlock::from_block_with_predicate(&block, |t| *t == txid);
+    // From the header and the stored txids, which a stripped block's
+    // strip record holds.
+    let mb = MerkleBlock::from_header_txids_with_predicate(&block.block.header, &block.txids(), |t| {
+        *t == txid
+    });
     Ok(hex::encode(serialize(&mb)))
 }
 
@@ -285,10 +290,11 @@ fn unspent_outspend() -> OutspendJson {
 fn output_count_of(state: &EsploraState, pin: &Pin, txid: &Txid) -> EsploraResult<usize> {
     if state.chain.store_ref().has_txindex()
         && let Some(block_hash) = state.chain.store_ref().get_tx_location(txid)
-        && let Some(block) = state.chain.get_block(&block_hash)
-        && let Some(tx) = block.txdata.iter().find(|t| t.compute_txid() == *txid)
+        && let Some(block) = state.chain.get_stored_block(&block_hash)
+        && let Some(i) = block.txids().iter().position(|t| t == txid)
     {
-        return Ok(tx.output.len());
+        // A stripped transaction keeps every output, OP_RETURNs included.
+        return Ok(block.block.txdata[i].output.len());
     }
     if pin.mempool
         && let Some(entry) = state.mempool.get(txid)
@@ -302,12 +308,12 @@ fn output_count_of(state: &EsploraState, pin: &Pin, txid: &Txid) -> EsploraResul
 /// position within the block's tx list. Used by both merkle-proof
 /// endpoints. Returns 404 if the tx is unknown or unconfirmed (mempool
 /// txs have no merkle proof until a block confirms them) — matches
-/// upstream Esplora.
+/// upstream Esplora. The block is as stored: a stripped one still proves.
 fn locate_confirmed_tx(
     state: &EsploraState,
     pin: &Pin,
     txid: &Txid,
-) -> EsploraResult<(Block, u32, usize)> {
+) -> EsploraResult<(StoredBlock, u32, usize)> {
     if !state.chain.store_ref().has_txindex() {
         return Err(EsploraError::ServiceUnavailable);
     }
@@ -318,7 +324,7 @@ fn locate_confirmed_tx(
         .ok_or(EsploraError::NotFound)?;
     let block = state
         .chain
-        .get_block(&block_hash)
+        .get_stored_block(&block_hash)
         .ok_or_else(|| {
             EsploraError::Internal(format!(
                 "txindex points at {block_hash} but block data is missing"
@@ -338,9 +344,9 @@ fn locate_confirmed_tx(
         return Err(EsploraError::NotFound);
     }
     let pos = block
-        .txdata
+        .txids()
         .iter()
-        .position(|t| t.compute_txid() == *txid)
+        .position(|t| t == txid)
         .ok_or_else(|| {
             EsploraError::Internal(format!(
                 "txindex points at {block_hash} but tx {txid} not present in block"

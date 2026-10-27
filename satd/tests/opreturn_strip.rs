@@ -330,10 +330,17 @@ struct MixedBlock {
 }
 
 fn block_with_a_stripped_and_an_intact_tx(node: &TestNode) -> MixedBlock {
+    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
+    let spk = wallet.address.script_pubkey();
+    mixed_block(node, &wallet, spk)
+}
+
+/// [`block_with_a_stripped_and_an_intact_tx`], with the stripped
+/// transaction's first output paying `first_output`.
+fn mixed_block(node: &TestNode, wallet: &DeterministicWallet, first_output: bitcoin::ScriptBuf) -> MixedBlock {
     use bitcoin::blockdata::opcodes::all::OP_RETURN;
     use bitcoin::script::{Builder, PushBytesBuf};
 
-    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
     let addr = wallet.address.to_string();
     mine(node, 102, &addr);
     let data = Builder::new()
@@ -342,13 +349,13 @@ fn block_with_a_stripped_and_an_intact_tx(node: &TestNode) -> MixedBlock {
         .into_script();
     let (stripped_raw, stripped) = common::build_signed_p2wpkh_spend_of_coinbases(
         node,
-        &[(1, &wallet)],
-        &[wallet.address.script_pubkey(), data],
+        &[(1, wallet)],
+        &[first_output, data],
         100_000,
     );
     let (intact_raw, intact) = common::build_signed_p2wpkh_spend_of_coinbases(
         node,
-        &[(2, &wallet)],
+        &[(2, wallet)],
         &[wallet.address.script_pubkey()],
         100_000,
     );
@@ -503,6 +510,227 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
     assert_eq!(spender(2)["result"], before_spender);
 
     // Nothing above was reported as corruption or an index mismatch.
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+}
+
+/// An HTTP GET against Esplora: `(status, body)`.
+fn esplora_get(port: u16, path: &str) -> (u16, String) {
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .send()
+        .unwrap();
+    (resp.status().as_u16(), resp.text().unwrap())
+}
+
+/// A 200 from Esplora, as JSON, or as a string for a plain-text endpoint.
+fn esplora_json(port: u16, path: &str) -> serde_json::Value {
+    let (status, body) = esplora_get(port, path);
+    assert_eq!(status, 200, "{path}: {body}");
+    serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body))
+}
+
+/// A line-oriented Electrum client: one request, then its response, skipping
+/// notifications; or, for `blockchain.tweaks.subscribe`, every line up to the
+/// `done` notification.
+struct Electrum {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl Electrum {
+    fn connect(port: u16) -> Self {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("electrum connect");
+        stream.set_read_timeout(Some(test_timeout(20))).unwrap();
+        let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        Self { reader, writer: stream }
+    }
+
+    fn line(&mut self) -> serde_json::Value {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        assert!(self.reader.read_line(&mut line).unwrap() > 0, "electrum closed the connection");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON: {line:?} ({e})"))
+    }
+
+    fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::Write as _;
+        let req = serde_json::json!({"id": 1, "method": method, "params": params});
+        writeln!(self.writer, "{req}").unwrap();
+        loop {
+            let resp = self.line();
+            if resp.get("id").is_some() {
+                return resp;
+            }
+        }
+    }
+
+    /// The response to `blockchain.tweaks.subscribe` and every notification
+    /// through the one that ends the chunk.
+    fn tweaks(&mut self, height: u64) -> Vec<serde_json::Value> {
+        let mut out = vec![self.call("blockchain.tweaks.subscribe", serde_json::json!([height, 1, true]))];
+        loop {
+            let n = self.line();
+            let done = n["params"][0]["message"] == "done";
+            out.push(n);
+            if done {
+                return out;
+            }
+        }
+    }
+}
+
+/// `tx`, an Esplora transaction from before the strip, as it must read after:
+/// the flag, and output `vout` described as its bare `OP_RETURN`.
+fn as_stripped_esplora(mut tx: serde_json::Value, vout: usize, script_len: usize) -> serde_json::Value {
+    tx["opreturn_stripped"] = serde_json::json!(true);
+    let out = &mut tx["vout"][vout];
+    out["scriptpubkey"] = serde_json::json!("6a");
+    out["scriptpubkey_asm"] = serde_json::json!("OP_RETURN");
+    out["scriptpubkey_type"] = serde_json::json!("op_return");
+    out["scriptpubkey_address"] = serde_json::Value::Null;
+    out["scriptpubkey_stripped_size"] = serde_json::json!(script_len);
+    tx
+}
+
+/// Esplora and Electrum on a block with a stripped and an intact transaction,
+/// the stripped one silent-payment eligible. As for the RPCs, each answer is
+/// captured before the strip and compared with the answer after it, and each
+/// refusal is paired with the same call on the intact transaction.
+#[test]
+fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
+    use serde_json::json;
+
+    let esplora = find_available_port();
+    let electrum = find_available_port();
+    let esplora_bind = format!("--esplorabind=127.0.0.1:{esplora}");
+    let electrum_bind = format!("--electrumbind=127.0.0.1:{electrum}");
+    let mut node = TestNode::start(&[
+        "--allowteststrip",
+        "--txindex",
+        "--addressindex",
+        "--silentpaymentindex=1",
+        "--esplora=1",
+        &esplora_bind,
+        "--electrum=1",
+        &electrum_bind,
+    ]);
+    let wallet = DeterministicWallet::from_secret([0x5e; 32]);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (_, p2tr) = common::p2tr_keypath_output(&secp, [0x3f; 32]);
+    let b = mixed_block(&node, &wallet, p2tr);
+    let (stripped, _) = &b.stripped;
+    let (intact, intact_raw) = &b.intact;
+    let height = node.rpc_ok("getblockheader", vec![json!(b.hash)])["height"].as_u64().unwrap();
+    common::poll_until(
+        || {
+            let info = node.rpc_ok("getindexinfo", vec![]);
+            info.as_object().is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
+        },
+        test_timeout(60),
+        "indexes never synced",
+    );
+    let addr = wallet.address.to_string();
+    let get = |path: &str| esplora_json(esplora, path);
+    let paths = [
+        format!("/block/{}", b.hash),
+        format!("/block/{}/txids", b.hash),
+        format!("/block/{}/txid/1", b.hash),
+        format!("/block/{}/txid/2", b.hash),
+        format!("/blocks/{height}"),
+        format!("/tx/{stripped}/status"),
+        format!("/tx/{stripped}/merkle-proof"),
+        format!("/tx/{stripped}/outspends"),
+        format!("/tx/{intact}"),
+        format!("/tx/{intact}/merkle-proof"),
+    ];
+    let before: Vec<_> = paths.iter().map(|p| get(p)).collect();
+    let (_, before_merkleblock) = esplora_get(esplora, &format!("/tx/{stripped}/merkleblock-proof"));
+    let before_tx = get(&format!("/tx/{stripped}"));
+    let before_txs = get(&format!("/block/{}/txs", b.hash));
+    let before_history = get(&format!("/address/{addr}/txs"));
+    let vout = before_tx["vout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|o| o["scriptpubkey_type"] == "op_return")
+        .unwrap();
+
+    let mut el = Electrum::connect(electrum);
+    let before_el_verbose = el.call("blockchain.transaction.get", json!([stripped, true]))["result"].clone();
+    let before_el_merkle = el.call("blockchain.transaction.get_merkle", json!([stripped, height]));
+    let id_from_pos = |el: &mut Electrum| {
+        [1, 2].map(|pos| el.call("blockchain.transaction.id_from_pos", json!([height, pos, true])))
+    };
+    let before_el_pos = id_from_pos(&mut el);
+    let before_el_tweaks = el.tweaks(height);
+    assert!(
+        before_el_tweaks.iter().any(|l| l.to_string().contains(stripped.as_str())),
+        "premise: the stripped tx has a tweak row: {before_el_tweaks:?}"
+    );
+
+    let out = strip(&node, &b.hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    assert!(!payload_on_disk(&node), "premise: the payload is gone");
+
+    // Esplora: everything that needs only txids, sizes and values is unchanged.
+    for (path, want) in paths.iter().zip(&before) {
+        assert_eq!(&get(path), want, "{path}");
+    }
+    assert_eq!(
+        esplora_get(esplora, &format!("/tx/{stripped}/merkleblock-proof")),
+        (200, before_merkleblock),
+    );
+    // The stripped transaction renders without its payload, wherever it is listed.
+    let want_tx = as_stripped_esplora(before_tx, vout, PAYLOAD);
+    assert_eq!(get(&format!("/tx/{stripped}")), want_tx);
+    let mut want_txs = before_txs.clone();
+    for t in want_txs.as_array_mut().unwrap() {
+        if t["txid"] == json!(stripped) {
+            *t = want_tx.clone();
+        }
+    }
+    assert_ne!(want_txs, before_txs, "premise: the page lists the stripped tx");
+    assert_eq!(get(&format!("/block/{}/txs", b.hash)), want_txs);
+    let mut want_history = before_history.clone();
+    for t in want_history.as_array_mut().unwrap() {
+        if t["txid"] == json!(stripped) {
+            *t = want_tx.clone();
+        }
+    }
+    assert_ne!(want_history, before_history, "premise: the history lists the stripped tx");
+    assert_eq!(get(&format!("/address/{addr}/txs")), want_history);
+    // Raw bytes are refused, paired with the intact tx and the next block.
+    let gone = |path: String, body: &str| {
+        assert_eq!(esplora_get(esplora, &path), (404, body.to_string()), "{path}");
+    };
+    gone(format!("/block/{}/raw", b.hash), "block data not available (OP_RETURN data stripped)");
+    gone(format!("/tx/{stripped}/hex"), "transaction data not available (OP_RETURN data stripped)");
+    gone(format!("/tx/{stripped}/raw"), "transaction data not available (OP_RETURN data stripped)");
+    let next = node.rpc_ok("getblockhash", vec![json!(height + 1)]);
+    assert_eq!(esplora_get(esplora, &format!("/block/{}/raw", next.as_str().unwrap())).0, 200);
+    assert_eq!(esplora_get(esplora, &format!("/tx/{intact}/hex")), (200, intact_raw.clone()));
+    assert_eq!(esplora_get(esplora, &format!("/tx/{intact}/raw")).0, 200);
+
+    // Electrum: the hex is refused and the intact tx's served; verbose reads as
+    // getrawtransaction's does; proofs and tweaks are unchanged.
+    let resp = el.call("blockchain.transaction.get", json!([stripped]));
+    assert_eq!(
+        resp["error"]["message"], "transaction data not available (OP_RETURN data stripped)",
+        "{resp}"
+    );
+    assert_eq!(el.call("blockchain.transaction.get", json!([intact]))["result"], json!(intact_raw));
+    assert_eq!(
+        el.call("blockchain.transaction.get", json!([stripped, true]))["result"],
+        as_stripped(before_el_verbose, vout, PAYLOAD)
+    );
+    assert_eq!(el.call("blockchain.transaction.get_merkle", json!([stripped, height])), before_el_merkle);
+    assert_eq!(id_from_pos(&mut el), before_el_pos);
+    assert_eq!(el.tweaks(height), before_el_tweaks);
+
     assert!(!has_corrupt_warning(&node));
     node.stop();
 }

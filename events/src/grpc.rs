@@ -3180,6 +3180,7 @@ fn refine_block_tweaks(
         bt.entries.iter().map(|e| e.txid).collect();
     let src = source.clone();
     let unspent = |op: &bitcoin::OutPoint| src.is_unspent(op);
+    let block = node::storage::opreturn_strip::StoredBlock::intact(block);
     let by_txid = node::sp_serve::taproot_outputs_by_txid(&block, &wanted);
 
     // Cut-through reads the UTXO set once per taproot output and then decides

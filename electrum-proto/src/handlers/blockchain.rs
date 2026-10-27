@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::dispatch::{require_array, require_array_range};
 use crate::error::JsonRpcError;
+use crate::extras::StoredTx;
 use crate::merkle::compute_merkle_branch;
 use crate::state::ElectrumState;
 use crate::status::{compute_status_hash, mempool_facts, status_hash_to_json};
@@ -287,8 +288,12 @@ impl<'a> LateFacts<'a> {
             .or_insert_with(|| {
                 let hash = chain.get_tx_location(txid)?;
                 let height = chain.get_block_index(&hash)?.height;
-                let block = chain.get_block(&hash)?;
-                let tx = block.txdata.into_iter().find(|t| t.compute_txid() == *txid)?;
+                // The stored form, so a transaction in an OP_RETURN-stripped
+                // block is found by its recorded txid. Only its inputs and
+                // output values are read, which the filled form keeps.
+                let block = chain.get_stored_block(&hash)?;
+                let i = block.txids().iter().position(|t| t == txid)?;
+                let tx = block.block.txdata.into_iter().nth(i)?;
                 Some((tx, height))
             })
             .as_ref()
@@ -750,7 +755,7 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
 
     // Resolve the tx — mempool first, then txindex fallback. Same
     // priority order satd's own `getrawtransaction` uses.
-    let (tx, location): (Transaction, Option<TxLocation>) =
+    let (stored, location): (StoredTx, Option<TxLocation>) =
         // Acting-only (design §6.1): a relay-quarantined tx is invisible to a
         // client that learned the txid elsewhere — matching satd's own
         // `getrawtransaction` (`rawtx.rs`), which filters to the acting class.
@@ -764,10 +769,12 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
             .get(&txid)
             .filter(|e| pin.mempool && e.scope.is_acting())
         {
-            (entry.tx, None)
-        } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
-            let parsed: Transaction = deserialize(&raw)
-                .map_err(|e| JsonRpcError::internal(format!("stored tx decode failed: {e}")))?;
+            let tx = entry.tx;
+            (
+                StoredTx { txid, wtxid: tx.compute_wtxid(), stripped: None, tx },
+                None,
+            )
+        } else if let Some(stored) = state.electrum_extras.stored_tx(&txid) {
             // A transaction confirmed above the pin was unconfirmed as of it,
             // and has no block yet.
             let confirmation = state
@@ -783,17 +790,24 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
             if location.is_none() && !pin.mempool {
                 return Err(JsonRpcError::bad_request(format!("tx not found: {txid}")));
             }
-            (parsed, location)
+            (stored, location)
         } else {
             return Err(JsonRpcError::bad_request(format!("tx not found: {txid}")));
         };
 
     if verbose {
-        Ok(verbose_transaction_json(&tx, location.as_ref(), state.network))
+        Ok(verbose_transaction_json(&stored, location.as_ref(), state.network))
+    } else if stored.stripped.is_some() {
+        // The filled bytes are not the transaction: never serve them.
+        Err(JsonRpcError::bad_request(TX_DATA_STRIPPED))
     } else {
-        Ok(Value::String(hex::encode(serialize(&tx))))
+        Ok(Value::String(hex::encode(serialize(&stored.tx))))
     }
 }
+
+/// The error for a request that needs an OP_RETURN-stripped transaction's
+/// bytes.
+pub(crate) const TX_DATA_STRIPPED: &str = "transaction data not available (OP_RETURN data stripped)";
 
 /// Confirmation envelope used by [`verbose_transaction_json`].
 /// `height` is captured for symmetry with Core's verbose tx response
@@ -831,14 +845,21 @@ struct TxLocation {
 /// - `coinbase` variant of `vin[]` omits txid/vout/scriptSig per Core.
 /// - `txinwitness` is omitted (not present in JSON) for non-segwit
 ///   inputs, matching Core.
+///
+/// An OP_RETURN-stripped transaction renders as satd's `getrawtransaction`
+/// renders it: from its filled form, whose size, weight, inputs and output
+/// values are the original's, with `txid` and `hash` from the strip record,
+/// no `hex`, `opreturn_stripped: true`, and each stripped output's
+/// `scriptPubKey` that of the bare `OP_RETURN` it keeps plus `stripped_size`,
+/// the original script length.
 fn verbose_transaction_json(
-    tx: &Transaction,
+    stored: &StoredTx,
     location: Option<&TxLocation>,
     network: bitcoin::Network,
 ) -> Value {
+    let tx = &stored.tx;
     let raw = serialize(tx);
-    let txid = tx.compute_txid();
-    let wtxid = tx.compute_wtxid();
+    let (txid, wtxid) = (stored.txid, stored.wtxid);
     let weight = tx.weight().to_wu();
     let vsize = weight.div_ceil(4);
 
@@ -913,6 +934,24 @@ fn verbose_transaction_json(
         "vout": vout,
         "hex": hex::encode(&raw),
     });
+
+    if let Some(stripped) = &stored.stripped {
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("hex");
+        }
+        result["opreturn_stripped"] = json!(true);
+        let bare = bitcoin::ScriptBuf::from_bytes(vec![bitcoin::opcodes::all::OP_RETURN.to_u8()]);
+        for (vout, script_len) in stripped {
+            if let Some(out) = result["vout"].get_mut(*vout as usize) {
+                out["scriptPubKey"] = json!({
+                    "asm": format!("{}", bare),
+                    "hex": hex::encode(bare.as_bytes()),
+                    "type": script_type_label(&bare),
+                    "stripped_size": script_len,
+                });
+            }
+        }
+    }
 
     if let Some(loc) = location {
         result["blockhash"] = Value::String(loc.block_hash.to_string());
@@ -1123,11 +1162,12 @@ pub fn transaction_id_from_pos(
     let block_hash = pin
         .hash_at_height(&state.chain, height)
         .ok_or_else(|| JsonRpcError::internal("height resolved txid but not block hash"))?;
+    // Stored txids: an OP_RETURN-stripped block still proves.
     let block = state
         .chain
-        .get_block(&block_hash)
+        .get_stored_block(&block_hash)
         .ok_or_else(|| JsonRpcError::internal("block resolved hash but data missing"))?;
-    let txids: Vec<bitcoin::Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+    let txids = block.txids();
     let branch = compute_merkle_branch(&txids, tx_pos as usize);
     let merkle_hex: Vec<String> = branch.iter().map(merkle_node_to_hex).collect();
     Ok(json!({

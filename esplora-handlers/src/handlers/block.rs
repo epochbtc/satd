@@ -11,6 +11,11 @@
 //! - `GET /block/:hash/txid/:i`      → `<txid hex>` for tx at index `i`
 //! - `GET /block/:hash/txids`        → array of every txid in the block
 //!
+//! Every handler reads through `get_stored_block`, so an OP_RETURN-stripped
+//! block is served from its strip record: txids from the record, sizes and
+//! weights from the filled form, which equal the original's. Only its raw
+//! bytes are refused (404, [`BLOCK_DATA_STRIPPED`]).
+//!
 //! Wire shapes match upstream Esplora exactly. The `BlockHeaderJson`
 //! summary defined in `crate::encode` is now populated with real
 //! `size`, `weight`, and `mediantime` since this PR pulls the full
@@ -31,6 +36,9 @@ use crate::state::EsploraState;
 
 const BLOCK_TXS_PAGE: usize = 25;
 
+/// The body of a 404 for a stripped block's raw bytes.
+pub(crate) const BLOCK_DATA_STRIPPED: &str = "block data not available (OP_RETURN data stripped)";
+
 fn parse_hash(s: &str) -> EsploraResult<BlockHash> {
     s.parse::<BlockHash>()
         .map_err(|e| EsploraError::BadRequest(format!("bad block hash: {e}")))
@@ -46,12 +54,8 @@ pub async fn block_detail(
         .chain
         .get_block_index(&hash)
         .ok_or(EsploraError::NotFound)?;
-    let block = state
-        .chain
-        .get_block(&hash)
-        .ok_or(EsploraError::NotFound)?;
-    let size = serialize(&block).len() as u32;
-    let weight = block.weight().to_wu() as u32;
+    let (size, weight) =
+        try_compute_block_size_weight(&state, &hash).ok_or(EsploraError::NotFound)?;
     // Median Time Past for the API field is the median of the
     // target block + up to 10 ancestors (Bitcoin Core / Esplora
     // explorer convention). The consensus helper
@@ -93,10 +97,14 @@ pub async fn block_raw(
     Path(hash): Path<String>,
 ) -> EsploraResult<Response<Body>> {
     let hash = parse_hash(&hash)?;
-    let block = state
+    let stored = state
         .chain
-        .get_block(&hash)
+        .get_stored_block(&hash)
         .ok_or(EsploraError::NotFound)?;
+    // The filled form of a stripped block is not the block: never serve it.
+    let block = stored
+        .into_intact()
+        .ok_or_else(|| EsploraError::NotFoundReason(BLOCK_DATA_STRIPPED.to_string()))?;
     let buf = serialize(&block);
     let mut resp = Response::new(Body::from(buf));
     resp.headers_mut().insert(
@@ -151,15 +159,9 @@ pub async fn block_txids(
     let hash = parse_hash(&hash)?;
     let block = state
         .chain
-        .get_block(&hash)
+        .get_stored_block(&hash)
         .ok_or(EsploraError::NotFound)?;
-    Ok(Json(
-        block
-            .txdata
-            .iter()
-            .map(|tx| tx.compute_txid().to_string())
-            .collect(),
-    ))
+    Ok(Json(block.txids().iter().map(|t| t.to_string()).collect()))
 }
 
 /// `/block/:hash/txid/:index` → `<txid hex>` at the given index.
@@ -170,10 +172,12 @@ pub async fn block_txid_at_index(
     let hash = parse_hash(&hash)?;
     let block = state
         .chain
-        .get_block(&hash)
+        .get_stored_block(&hash)
         .ok_or(EsploraError::NotFound)?;
-    let tx = block.txdata.get(index).ok_or(EsploraError::NotFound)?;
-    Ok(tx.compute_txid().to_string())
+    if index >= block.block.txdata.len() {
+        return Err(EsploraError::NotFound);
+    }
+    Ok(block.txid(index).to_string())
 }
 
 /// `/block/:hash/txs[/:start_index]` → page of 25 full Esplora-shape
@@ -192,18 +196,19 @@ pub async fn block_txs_page(
     let hash = parse_hash(&hash)?;
     let block = state
         .chain
-        .get_block(&hash)
+        .get_stored_block(&hash)
         .ok_or(EsploraError::NotFound)?;
     let entry = state
         .chain
         .get_block_index(&hash)
         .ok_or(EsploraError::NotFound)?;
-    let page = block_page_bounds(block.txdata.len(), start_index)?;
+    let page = block_page_bounds(block.block.txdata.len(), start_index)?;
     let mut out = Vec::with_capacity(page.len());
-    for tx in &block.txdata[page] {
+    for i in page {
         out.push(build_block_tx_json(
             &state,
-            tx,
+            &block,
+            i,
             hash,
             entry.height,
             entry.header.time,
@@ -243,12 +248,13 @@ mod esplorapaging_tests;
 
 /// Reusable helper exposed for the `/blocks` page summary in
 /// `chain::collect_blocks_descending`. Returns
-/// `(serialized_size_bytes, weight_units)`.
+/// `(serialized_size_bytes, weight_units)`. A stripped block's filled form
+/// has the original's size and weight.
 pub fn try_compute_block_size_weight(
     state: &EsploraState,
     hash: &BlockHash,
 ) -> Option<(u32, u32)> {
-    let block = state.chain.get_block(hash)?;
+    let block = state.chain.get_stored_block(hash)?.block;
     Some((serialize(&block).len() as u32, block.weight().to_wu() as u32))
 }
 
