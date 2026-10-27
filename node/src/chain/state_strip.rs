@@ -100,6 +100,9 @@ pub enum StripError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(test)]
+pub(crate) type StripHook = Box<dyn FnOnce(&ChainState) + Send>;
+
 /// Strip state held by [`ChainState`].
 #[derive(Default)]
 pub(crate) struct StripState {
@@ -115,7 +118,7 @@ pub(crate) struct StripState {
     /// Runs between the plan and the record write, where anything that
     /// moves the block lands before the punch re-checks it.
     #[cfg(test)]
-    pub(crate) after_plan_hook: Mutex<Option<Box<dyn FnOnce(&ChainState) + Send>>>,
+    pub(crate) after_plan_hook: Mutex<Option<StripHook>>,
 }
 
 /// The plan for punching one block.
