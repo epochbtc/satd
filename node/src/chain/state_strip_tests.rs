@@ -7,6 +7,7 @@ use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::{Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
 
 use super::super::tests::{build_test_block, grind_test_pow, make_chain_state};
+use super::super::ChainError;
 use super::*;
 use crate::storage::opreturn_strip::{StripRecord, tx_spans};
 
@@ -702,5 +703,173 @@ fn a_prune_during_the_plan_is_a_race_not_corruption() {
     assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
     assert_eq!(corrupt_warning(&cs, &hash), None);
     assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Replaying a stripped block (-reindex, -reindex-chainstate)
+// ---------------------------------------------------------------------------
+
+/// Clear the chainstate back to genesis, keeping the block index, as
+/// `-reindex-chainstate` does, and plan the replay.
+fn rewind(cs: &ChainState) -> crate::chain::replay_plan::ReplayPlan {
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    cs.flush_coin_cache().unwrap();
+    cs.store.flush().unwrap();
+    cs.store.clear_chainstate().unwrap();
+    cs.seed_genesis_chain_rows().unwrap();
+    {
+        let mut tip = cs.tip.write();
+        tip.hash = genesis;
+        tip.height = 0;
+    }
+    cs.mtp_cache.lock().clear();
+    crate::chain::replay_plan::plan_replay_from_block_index(&*cs.store, genesis, None).unwrap()
+}
+
+fn prefetch(cs: &ChainState, plan: &crate::chain::replay_plan::ReplayPlan, height: u32) -> Option<crate::chain::prefetch::PreprocessedBlock> {
+    crate::chain::prefetch::prefetch_block(
+        &*cs.store,
+        cs.blocks_dir(),
+        &cs.blocks_xor_key,
+        Some(plan),
+        height,
+        false,
+        cs.primary_engine(),
+        Network::Regtest,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// Replace the record's txid for its first transaction, keeping its filled
+/// hash: the record still fits the bytes, but names the wrong transaction.
+fn misname_first_stripped_tx(cs: &ChainState, hash: &BlockHash) {
+    let mut rec = record(cs, hash).unwrap();
+    rec.txs[0].txid = bitcoin::Txid::from_byte_array([0x42; 32]);
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: vec![(*hash, rec.encode())],
+            ..Default::default()
+        })
+        .unwrap();
+}
+
+/// A stripped block replays on both paths of `-reindex-chainstate`, the
+/// direct read and the prefetched one, and its outputs land under the txids
+/// its record holds. Each path is driven by hand: the prefetcher races the
+/// connect cursor, so a whole replay cannot pick the path.
+#[test]
+fn both_replay_paths_connect_a_stripped_block_under_its_recorded_txids() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let stripped = blocks[101].txdata[1].compute_txid();
+    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    assert_ne!(on_disk(&cs, &hash), bitcoin::consensus::serialize(&blocks[101]), "premise: punched");
+
+    for prefetched in [false, true] {
+        let plan = rewind(&cs);
+        for height in 1..=105u32 {
+            let planned = plan.hash_at(height).unwrap();
+            if prefetched && height == 102 {
+                let pre = prefetch(&cs, &plan, height).expect("the prefetcher reads a stripped block");
+                assert_eq!(pre.txids[1], stripped, "the recorded txid");
+                assert_eq!(pre.script_skip_txs, [1usize].into_iter().collect());
+                assert!(!pre.script_verified_txs.contains(&1), "never pre-verified");
+                cs.reindex_connect_prefetched(&plan, pre).unwrap();
+            } else {
+                cs.reindex_connect_direct(&plan, height, planned).unwrap();
+            }
+        }
+        assert_eq!(cs.tip_hash(), blocks[104].block_hash(), "prefetched: {prefetched}");
+        cs.flush_coin_cache().unwrap();
+        assert!(
+            cs.get_coin(&OutPoint { txid: stripped, vout: 0 }).is_some(),
+            "the stripped tx's output, under its real txid (prefetched: {prefetched})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record that fits the bytes but names the wrong txid is never replayed:
+/// the direct path stops with an error naming the remedy, and the
+/// prefetcher hands the block to it.
+#[test]
+fn a_replay_stops_at_a_stripped_block_whose_record_misnames_a_tx() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    misname_first_stripped_tx(&cs, &hash);
+
+    let plan = rewind(&cs);
+    for height in 1..=101u32 {
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+    }
+    assert!(prefetch(&cs, &plan, 102).is_none(), "deferred to the direct read");
+    match cs.reindex_connect_direct(&plan, 102, hash) {
+        Err(ChainError::FlatFile(msg)) => {
+            assert!(msg.contains("strip record") && msg.contains("getblockfrompeer"), "{msg}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(cs.tip_hash(), blocks[100].block_hash(), "nothing connected");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The MTP window a replay starts from is read through the records too: a
+/// stripped block there reads, and one with a bad record stops the replay.
+#[test]
+fn the_replay_mtp_window_reads_a_stripped_block_through_its_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let plan = crate::chain::replay_plan::plan_replay_from_block_index(
+        &*cs.store,
+        bitcoin::constants::genesis_block(Network::Regtest).block_hash(),
+        None,
+    )
+    .unwrap();
+    cs.verify_replay_mtp_window(&plan, 105).expect("the window reads");
+    misname_first_stripped_tx(&cs, &hash);
+    match cs.verify_replay_mtp_window(&plan, 105) {
+        Err(ChainError::FlatFile(msg)) => assert!(msg.contains("strip record"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `-reindex` indexes a stripped side-chain block through its record rather
+/// than skipping it as a block that fails `check_block`.
+#[test]
+fn a_reindex_indexes_a_stripped_side_chain_block() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let entry = cs.store.get_block_index(&hash).unwrap();
+    let pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+    let headers = std::collections::HashMap::from([(
+        hash,
+        super::super::ReindexHeaderRef { header: entry.header, pos },
+    )]);
+    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers).unwrap();
+    let indexed = cs.store.get_block_index(&hash).unwrap();
+    assert_eq!(indexed.status, BlockStatus::DataStored, "indexed, not skipped");
+    assert_eq!(indexed.num_tx, 3);
+
+    misname_first_stripped_tx(&cs, &hash);
+    let mut valid = indexed;
+    valid.status = BlockStatus::Valid;
+    cs.store
+        .write_batch(StoreBatch { block_index_puts: vec![(hash, valid)], ..Default::default() })
+        .unwrap();
+    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers).unwrap();
+    assert_eq!(
+        cs.store.get_block_index(&hash).unwrap().status,
+        BlockStatus::Valid,
+        "a bad record is skipped, not indexed"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

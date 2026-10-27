@@ -267,6 +267,27 @@ fn ser_outpoint(op: &OutPoint) -> Vec<u8> {
 /// future-SegWit output; no contributing inputs; input pubkey sum is the
 /// point at infinity; `input_hash` is zero or ≥ the curve order.
 pub fn compute_tweak(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Option<TweakEntry> {
+    tweak_with_txid(tx, prevout_spks, || tx.compute_txid())
+}
+
+/// [`compute_tweak`] for a transaction whose txid the caller already has.
+///
+/// A block connected from an OP_RETURN-stripped copy must take this path:
+/// its transactions' bytes are the filled form, whose computed txid is not
+/// the transaction's.
+pub fn compute_tweak_with_txid(
+    tx: &Transaction,
+    prevout_spks: &[ScriptBuf],
+    txid: Txid,
+) -> Option<TweakEntry> {
+    tweak_with_txid(tx, prevout_spks, || txid)
+}
+
+fn tweak_with_txid(
+    tx: &Transaction,
+    prevout_spks: &[ScriptBuf],
+    txid: impl FnOnce() -> Txid,
+) -> Option<TweakEntry> {
     if tx.is_coinbase() {
         return None;
     }
@@ -302,7 +323,7 @@ pub fn compute_tweak(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Option<Twe
     let tweak = a_sum.mul_tweak(secp(), &scalar).ok()?;
 
     Some(TweakEntry {
-        txid: tx.compute_txid(),
+        txid: txid(),
         tweak,
         max_taproot_value,
         taproot_outputs,

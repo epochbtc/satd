@@ -13,9 +13,9 @@
 
 use std::collections::HashMap;
 
-use bitcoin::{Block, BlockHash, OutPoint, ScriptBuf};
+use bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Txid};
 
-use node_sp_index::{SpBlockRow, SpIndexConfig, compute_tweak};
+use node_sp_index::{SpBlockRow, SpIndexConfig, compute_tweak, compute_tweak_with_txid};
 
 /// Emit error surface. A missing prev-output script is fail-closed: it
 /// would let an eligible input go unclassified and produce a wrong tweak,
@@ -41,10 +41,15 @@ pub enum EmitError {
 /// `prev_output_scripts` must map every non-coinbase input's `OutPoint`
 /// to its resolved prev-output `scriptPubKey`; a missing entry is an
 /// error (see [`EmitError`]).
+///
+/// `txids`, one per transaction, names each entry. `None` computes them from
+/// the block, which is wrong for a block read from an OP_RETURN-stripped
+/// copy: those come from its strip record.
 pub fn build_sp_row(
     cfg: &SpIndexConfig,
     block: &Block,
     block_hash: BlockHash,
+    txids: Option<&[Txid]>,
     prev_output_scripts: &HashMap<OutPoint, ScriptBuf>,
 ) -> Result<Option<SpBlockRow>, EmitError> {
     if !cfg.enabled {
@@ -52,7 +57,7 @@ pub fn build_sp_row(
     }
 
     let mut entries = Vec::new();
-    for tx in &block.txdata {
+    for (i, tx) in block.txdata.iter().enumerate() {
         if tx.is_coinbase() {
             continue;
         }
@@ -66,7 +71,11 @@ pub fn build_sp_row(
                 None => return Err(EmitError::MissingPrevOutput(txin.previous_output)),
             }
         }
-        if let Some(entry) = compute_tweak(tx, &spks) {
+        let entry = match txids {
+            Some(txids) => compute_tweak_with_txid(tx, &spks, txids[i]),
+            None => compute_tweak(tx, &spks),
+        };
+        if let Some(entry) = entry {
             entries.push(entry);
         }
     }
@@ -127,7 +136,7 @@ mod tests {
         let block = synth_block(vec![coinbase_tx()]);
         let map = HashMap::new();
         let out =
-            build_sp_row(&SpIndexConfig::default(), &block, block.block_hash(), &map).unwrap();
+            build_sp_row(&SpIndexConfig::default(), &block, block.block_hash(), None, &map).unwrap();
         assert!(out.is_none());
     }
 
@@ -137,7 +146,7 @@ mod tests {
         // block hash), so row-presence means "indexed, none".
         let block = synth_block(vec![coinbase_tx()]);
         let map = HashMap::new();
-        let row = build_sp_row(&enabled(), &block, block.block_hash(), &map)
+        let row = build_sp_row(&enabled(), &block, block.block_hash(), None, &map)
             .unwrap()
             .unwrap();
         assert_eq!(row.block_hash, block.block_hash());
@@ -169,7 +178,7 @@ mod tests {
         };
         let block = synth_block(vec![coinbase_tx(), spending]);
         let map = HashMap::new();
-        let r = build_sp_row(&enabled(), &block, block.block_hash(), &map);
+        let r = build_sp_row(&enabled(), &block, block.block_hash(), None, &map);
         assert!(matches!(r, Err(EmitError::MissingPrevOutput(_))));
     }
 }

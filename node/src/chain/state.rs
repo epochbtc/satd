@@ -1055,6 +1055,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &address_index,
             sp_index: &sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -4612,6 +4613,7 @@ impl ChainState {
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -4915,7 +4917,59 @@ impl ChainState {
 
     /// Read a block from flat files without acquiring the flat_files mutex.
     /// Safe because read_block() opens a fresh file handle each time.
+    ///
+    /// Unaware of strip records, as IBD needs: a stripped block reads as its
+    /// zeroed bytes. Replays read through [`Self::read_stored_block_direct`].
     fn read_block_direct(&self, pos: &FlatFilePos) -> Option<Block> {
+        let data = self.read_block_bytes_direct(pos)?;
+        match bitcoin::consensus::deserialize(&data) {
+            Ok(block) => Some(block),
+            Err(e) => {
+                tracing::warn!(
+                    file_number = pos.file_number,
+                    pos = pos.data_pos,
+                    size = data.len(),
+                    "read_block_direct: deserialize failed: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// [`Self::read_block_direct`] for a replay: the block `hash` as stored,
+    /// with its strip record applied if it has one, so a stripped block
+    /// comes back in its filled form with its recorded txids.
+    ///
+    /// `Ok(None)` is bytes that could not be read (already logged). A block
+    /// with no record decodes exactly as `read_block_direct` decodes it, and
+    /// whether it is the block `hash` names is left to the caller's
+    /// `require_planned_block`, as before.
+    fn read_stored_block_direct(
+        &self,
+        pos: &FlatFilePos,
+        hash: &BlockHash,
+    ) -> Result<Option<StoredBlock>, opreturn_strip::ReplayReadError> {
+        let Some(data) = self.read_block_bytes_direct(pos) else {
+            return Ok(None);
+        };
+        match opreturn_strip::decode_for_replay(&*self.store, data, hash) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(opreturn_strip::ReplayReadError::Deserialize(e)) => {
+                tracing::warn!(
+                    file_number = pos.file_number,
+                    pos = pos.data_pos,
+                    "read_stored_block_direct: deserialize failed: {}",
+                    e
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The raw bytes of the block record at `pos`, xor-decoded.
+    fn read_block_bytes_direct(&self, pos: &FlatFilePos) -> Option<Vec<u8>> {
         let path = self.blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
@@ -4946,13 +5000,7 @@ impl ChainState {
             return None;
         }
         crate::storage::flatfile::xor_in_place(&mut data, &self.blocks_xor_key, pos.data_pos as u64 + 8);
-        match bitcoin::consensus::deserialize(&data) {
-            Ok(block) => Some(block),
-            Err(e) => {
-                tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: deserialize failed: {}", e);
-                None
-            }
-        }
+        Some(data)
     }
 
     /// Core's `CheckTransaction` for every transaction, and the finality and
@@ -5597,6 +5645,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6156,17 +6205,20 @@ impl ChainState {
                 file_number: entry.file_number,
                 data_pos: entry.data_pos,
             };
-            let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
-                tracing::error!(
-                    height = h,
-                    block = %hash,
-                    file_number = flat_pos.file_number,
-                    data_pos = flat_pos.data_pos,
-                    "reindex: cannot read a block in the MTP window from the flat files"
-                );
-                ChainError::FlatFile("cannot read MTP-window block during reindex".into())
-            })?;
-            self.require_planned_block(h, hash, &block, &entry.header, flat_pos)?;
+            let stored = self
+                .read_stored_block_direct(&flat_pos, &hash)
+                .map_err(|e| unreplayable_record(h, &hash, &e))?
+                .ok_or_else(|| {
+                    tracing::error!(
+                        height = h,
+                        block = %hash,
+                        file_number = flat_pos.file_number,
+                        data_pos = flat_pos.data_pos,
+                        "reindex: cannot read a block in the MTP window from the flat files"
+                    );
+                    ChainError::FlatFile("cannot read MTP-window block during reindex".into())
+                })?;
+            self.require_planned_block(h, hash, &stored.block, &entry.header, flat_pos)?;
         }
         Ok(())
     }
@@ -6198,7 +6250,13 @@ impl ChainState {
         self.require_extends_tip(&pre.block.header, pre.height)?;
         // Normally already done by the prefetch worker, off this thread.
         if !pre.context_free_checked {
-            validation::block::check_block(&pre.block, self.network, pre.height)?;
+            validation::block::check_block_with_hashes(
+                &pre.block,
+                &pre.txids,
+                pre.wtxids.as_deref(),
+                self.network,
+                pre.height,
+            )?;
         }
         // Core's `ConnectBlock` re-runs `CheckBlock`, signet solution
         // included, on every block it connects from disk. So a chainstate
@@ -6214,6 +6272,7 @@ impl ChainState {
         } else {
             Some(&pre.script_verified_txs)
         };
+        let script_skip = (!pre.script_skip_txs.is_empty()).then_some(&pre.script_skip_txs);
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: Some(plan),
             store: &*self.store,
@@ -6227,6 +6286,7 @@ impl ChainState {
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
+            script_skip_txs: script_skip,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6260,16 +6320,21 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
-            tracing::error!(
-                height,
-                block = %hash,
-                file_number = flat_pos.file_number,
-                data_pos = flat_pos.data_pos,
-                "reindex: cannot read block from the flat files"
-            );
-            ChainError::FlatFile("cannot read block during reindex".into())
-        })?;
+        let stored = self
+            .read_stored_block_direct(&flat_pos, &hash)
+            .map_err(|e| unreplayable_record(height, &hash, &e))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    height,
+                    block = %hash,
+                    file_number = flat_pos.file_number,
+                    data_pos = flat_pos.data_pos,
+                    "reindex: cannot read block from the flat files"
+                );
+                ChainError::FlatFile("cannot read block during reindex".into())
+            })?;
+        let replay = ReplayHashes::of(&stored);
+        let block = &stored.block;
         // Validate the record BEFORE anything reads a header, then work from
         // `block.header` alone. The indexed header was the sole input to the
         // extends-tip guard and the parent lookup, and it is not trustworthy
@@ -6281,16 +6346,16 @@ impl ChainState {
         // `connect_block` received a differently-parented block, and the
         // cumulative chainwork would be measured from whatever entry that
         // forged link named.
-        self.require_planned_block(height, hash, &block, &entry.header, flat_pos)?;
+        self.require_planned_block(height, hash, block, &entry.header, flat_pos)?;
         self.require_extends_tip(&block.header, height)?;
         // The flat-file record framing carries no checksum, so a bit flipped
         // inside a transaction payload survives every check above: the 80-byte
         // header still hashes to the planned block. Only re-deriving the block
         // from its own bytes catches it (issue #505).
-        validation::block::check_block(&block, self.network, height)?;
+        replay.check_block(block, self.network, height)?;
         // As on the prefetched path: Core verifies a signet solution on every
         // connect from disk.
-        self.check_signet_solution(&block)?;
+        self.check_signet_solution(block)?;
         let parent = self
             .store
             .get_block_index(&block.header.prev_blockhash)
@@ -6316,7 +6381,7 @@ impl ChainState {
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: Some(plan),
             store: &*self.store,
-            block: &block,
+            block,
             height,
             parent_chainwork: &parent.chainwork,
             flat_pos,
@@ -6325,7 +6390,8 @@ impl ChainState {
             network: self.network,
             pre_verified_txs: None,
             num_threads: self.num_threads,
-            precomputed_txids: None,
+            precomputed_txids: replay.txids(),
+            script_skip_txs: replay.script_skip_txs(),
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6944,11 +7010,21 @@ impl ChainState {
             let height = parent.height + 1;
 
             // Re-read the raw block from disk; we only kept the header during
-            // phase 1.
-            let Some(block) = self.read_block_direct(&entry.pos) else {
-                halted = Some((hash, height, "block data unreadable on disk".to_string()));
-                break;
+            // phase 1. A stripped block comes back in its filled form, with
+            // the txids its strip record holds.
+            let stored = match self.read_stored_block_direct(&entry.pos, &hash) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    halted = Some((hash, height, "block data unreadable on disk".to_string()));
+                    break;
+                }
+                Err(e) => {
+                    halted = Some((hash, height, e.to_string()));
+                    break;
+                }
             };
+            let replay = ReplayHashes::of(&stored);
+            let block = &stored.block;
             // `plan_reindex_chain` builds the path by walking parent pointers,
             // so this holds by construction — which is exactly why it is worth
             // asserting: it is the guard that keeps a future change to the
@@ -6959,13 +7035,13 @@ impl ChainState {
             // carries no checksum, and the scan read only the header and
             // checked that the length fits the file; this is what validates
             // the payload (issue #505).
-            if let Err(e) = validation::block::check_block(&block, self.network, height) {
+            if let Err(e) = replay.check_block(block, self.network, height) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
             }
             // Core's `-reindex` runs `CheckBlock` on every block it loads, so
             // a signet solution is verified here as on every other path.
-            if let Err(e) = self.check_signet_solution(&block) {
+            if let Err(e) = self.check_signet_solution(block) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
             }
@@ -6979,7 +7055,7 @@ impl ChainState {
             let batch = match connect::connect_block(&connect::ConnectParams {
                 replay_plan: None,
                 store: &*self.store,
-                block: &block,
+                block,
                 height,
                 parent_chainwork: &parent.chainwork,
                 flat_pos: entry.pos,
@@ -6988,7 +7064,8 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
-                precomputed_txids: None,
+                precomputed_txids: replay.txids(),
+                script_skip_txs: replay.script_skip_txs(),
                 address_index: &self.address_index,
                 sp_index: &self.sp_index,
                 #[cfg(feature = "block-filter-index")]
@@ -7346,15 +7423,30 @@ impl ChainState {
             // `num_tx` is not derivable from the 80-byte header phase 1 kept,
             // so read the block back. Side-chain blocks are a handful even on a
             // long-lived mainnet node, so this stays cheap.
-            let Some(block) = self.read_block_direct(&entry.pos) else {
-                tracing::warn!(
-                    block = %hash,
-                    height,
-                    "reindex: side-chain block unreadable from flat file; not indexing"
-                );
-                skipped += 1;
-                continue;
+            let stored = match self.read_stored_block_direct(&entry.pos, hash) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    tracing::warn!(
+                        block = %hash,
+                        height,
+                        "reindex: side-chain block unreadable from flat file; not indexing"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block = %hash,
+                        height,
+                        error = %e,
+                        "reindex: side-chain block's strip record does not verify; not indexing"
+                    );
+                    skipped += 1;
+                    continue;
+                }
             };
+            let replay = ReplayHashes::of(&stored);
+            let block = &stored.block;
             if block.block_hash() != *hash || block.header != entry.header {
                 tracing::warn!(
                     block = %hash,
@@ -7367,7 +7459,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = validation::block::check_block(&block, self.network, *height) {
+            if let Err(e) = replay.check_block(block, self.network, *height) {
                 tracing::warn!(
                     block = %hash,
                     height,
@@ -7377,7 +7469,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = self.check_signet_solution(&block) {
+            if let Err(e) = self.check_signet_solution(block) {
                 tracing::warn!(
                     block = %hash,
                     height,
@@ -7580,6 +7672,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &no_address_index,
             sp_index: &no_sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -8067,6 +8160,7 @@ impl ChainState {
                         pre_verified_txs: None,
                         num_threads: 1,
                         precomputed_txids: None,
+                        script_skip_txs: None,
                         address_index: &self.address_index,
                         sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -8229,6 +8323,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -9973,6 +10068,7 @@ impl ChainState {
                     pre_verified_txs: None,
                     num_threads: 1,
                     precomputed_txids: None,
+                    script_skip_txs: None,
                     address_index: &self.address_index,
                     sp_index: &self.sp_index,
                     #[cfg(feature = "block-filter-index")]
@@ -10481,6 +10577,79 @@ struct ReindexPlan {
     /// Genesis-reachable blocks off that branch, as `(hash, height,
     /// chainwork-relative-to-genesis)`. Indexed but never connected.
     side: Vec<(BlockHash, u32, [u8; 32])>,
+}
+
+/// The hashes a replay gives `check_block` and `connect_block` for one
+/// block read through `read_stored_block_direct`.
+///
+/// An intact block gets none: `check_block` and `connect_block` compute them
+/// from the block, exactly as before. A stripped block gets its recorded
+/// txids and wtxids, and the indices of its stripped transactions, whose
+/// scripts `connect_block` skips.
+struct ReplayHashes {
+    stripped: Option<StrippedHashes>,
+}
+
+struct StrippedHashes {
+    txids: Vec<bitcoin::Txid>,
+    wtxids: Vec<bitcoin::Wtxid>,
+    script_skip_txs: std::collections::HashSet<usize>,
+}
+
+impl ReplayHashes {
+    fn of(stored: &StoredBlock) -> Self {
+        let stripped = stored.is_stripped().then(|| StrippedHashes {
+            txids: stored.txids(),
+            wtxids: stored.wtxids(),
+            script_skip_txs: stored.stripped_tx_indices(),
+        });
+        Self { stripped }
+    }
+
+    fn check_block(
+        &self,
+        block: &Block,
+        network: Network,
+        height: u32,
+    ) -> Result<(), crate::validation::ValidationError> {
+        match &self.stripped {
+            Some(s) => validation::block::check_block_with_hashes(
+                block,
+                &s.txids,
+                Some(&s.wtxids),
+                network,
+                height,
+            ),
+            None => validation::block::check_block(block, network, height),
+        }
+    }
+
+    fn txids(&self) -> Option<&[bitcoin::Txid]> {
+        self.stripped.as_ref().map(|s| s.txids.as_slice())
+    }
+
+    fn script_skip_txs(&self) -> Option<&std::collections::HashSet<usize>> {
+        self.stripped.as_ref().map(|s| &s.script_skip_txs)
+    }
+}
+
+/// The error a replay stops with on a block whose strip record does not
+/// verify. It never connects such a block: without the record its txids are
+/// unknown.
+fn unreplayable_record(
+    height: u32,
+    hash: &BlockHash,
+    e: &opreturn_strip::ReplayReadError,
+) -> ChainError {
+    tracing::error!(
+        height,
+        block = %hash,
+        error = %e,
+        "reindex: cannot replay a block whose OP_RETURN data is stripped"
+    );
+    ChainError::FlatFile(format!(
+        "block {hash} at height {height}: {e}; re-download it with getblockfrompeer"
+    ))
 }
 
 /// Compare two big-endian U256 values. Returns -1, 0, or 1.
@@ -12784,6 +12953,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -13807,6 +13978,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -14544,6 +14717,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b3.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -18916,6 +19091,8 @@ pub(crate) mod tests {
             mtp: cs.get_median_time_past(6),
             txids: Vec::new(),
             script_verified_txs: HashSet::new(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: false,
         };
 
@@ -20215,6 +20392,8 @@ pub(crate) mod tests {
             flat_pos,
             mtp: cs.get_median_time_past(1),
             script_verified_txs: std::collections::HashSet::new(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: false,
         };
 

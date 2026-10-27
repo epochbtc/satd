@@ -265,6 +265,7 @@ pub fn repair_lost_connect_delta(
         pre_verified_txs: None,
         num_threads,
         precomputed_txids: None,
+        script_skip_txs: None,
         address_index,
         sp_index: &Default::default(),
         #[cfg(feature = "block-filter-index")]

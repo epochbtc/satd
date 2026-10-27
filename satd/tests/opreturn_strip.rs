@@ -506,3 +506,211 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
     assert!(!has_corrupt_warning(&node));
     node.stop();
 }
+
+/// A chainstate's rows, by column family.
+type Dump = std::collections::BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>;
+
+/// Every column family of a cleanly stopped node's chainstate, as sorted
+/// `(key, value)` rows, except the strip records themselves.
+fn dump_chainstate(datadir: &Path) -> Dump {
+    use rocksdb::{DB, IteratorMode, Options};
+
+    let net_dir = datadir.join("regtest");
+    assert!(net_dir.join(".clean_shutdown").exists(), "dump needs a clean stop");
+    let path = net_dir.join("chainstate");
+    let opts = Options::default();
+    let cfs = DB::list_cf(&opts, &path).expect("list column families");
+    let db = DB::open_cf_for_read_only(&opts, &path, &cfs, false).expect("open chainstate");
+    let mut out = std::collections::BTreeMap::new();
+    for name in cfs.iter().filter(|n| *n != "opreturn_strip") {
+        let cf = db.cf_handle(name).unwrap();
+        let rows = db
+            .iterator_cf(&cf, IteratorMode::Start)
+            .map(|item| {
+                let (k, v) = item.expect("iterate");
+                (k.to_vec(), v.to_vec())
+            })
+            .collect();
+        out.insert(name.clone(), rows);
+    }
+    out
+}
+
+/// The first difference between two dumps, for a readable failure.
+fn first_difference(
+    a: &Dump,
+    b: &Dump,
+) -> Option<String> {
+    let names: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+    for name in names {
+        let (ra, rb) = (a.get(name), b.get(name));
+        if ra == rb {
+            continue;
+        }
+        let (ra, rb) = (ra.cloned().unwrap_or_default(), rb.cloned().unwrap_or_default());
+        for i in 0..ra.len().max(rb.len()) {
+            if ra.get(i) != rb.get(i) {
+                let show = |r: Option<&(Vec<u8>, Vec<u8>)>| {
+                    r.map(|(k, v)| format!("{} => {}", hex::encode(k), hex::encode(v)))
+                };
+                return Some(format!(
+                    "column family {name}: {} vs {} rows; row {i}: {:?} vs {:?}",
+                    ra.len(),
+                    rb.len(),
+                    show(ra.get(i)),
+                    show(rb.get(i))
+                ));
+            }
+        }
+    }
+    None
+}
+
+const INDEXES: &[&str] = &["--txindex", "--addressindex", "--blockfilterindex", "--silentpaymentindex=1"];
+
+fn start_indexed(datadir: &Path, rpcport: u16, extra: &[&str]) -> TestNode {
+    let mut args: Vec<&str> = vec!["--allowteststrip"];
+    args.extend_from_slice(INDEXES);
+    args.extend_from_slice(extra);
+    let node = TestNode::start_with_datadir(datadir, rpcport, &args);
+    common::poll_until(
+        || {
+            let info = node.rpc_ok("getindexinfo", vec![]);
+            info.as_object().is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
+        },
+        test_timeout(60),
+        "indexes never synced",
+    );
+    node
+}
+
+/// Replay the chain with `flag`, stop, and dump it.
+fn replay_and_dump(
+    datadir: &Path,
+    rpcport: u16,
+    flag: &str,
+    tip: &str,
+) -> Dump {
+    let mut node = start_indexed(datadir, rpcport, &[flag]);
+    assert_eq!(node.rpc_ok("getbestblockhash", vec![]), serde_json::json!(tip), "{flag} reached the tip");
+    assert!(!has_corrupt_warning(&node));
+    let warnings = node.rpc_call("getwarnings").unwrap().to_string();
+    assert!(!warnings.contains("reindex.halted"), "{flag} halted: {warnings}");
+    node.stop();
+    // Dropping a node removes its datadir; this one is reused.
+    node.datadir = PathBuf::new();
+    dump_chainstate(datadir)
+}
+
+/// The acceptance test for replaying stripped blocks (plan §2.11 step 5).
+///
+/// A chain with every index on carries two blocks of big OP_RETURNs. One of
+/// the stripped transactions is silent-payment eligible, and a later block
+/// spends outputs of both. The chain is replayed with `-reindex-chainstate`
+/// and with `-reindex` before the strip and again after it, and every column
+/// family but the strip records must come out byte-identical: the coins,
+/// undo data, block index, txindex, address, filter and silent-payment rows.
+#[test]
+fn a_stripped_chain_replays_to_the_same_chainstate() {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::script::{Builder, PushBytesBuf};
+    use serde_json::json;
+
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-strip-replay");
+    let mut node = start_indexed(&datadir, rpcport, &[]);
+    let wallet = DeterministicWallet::from_secret([0x5d; 32]);
+    let addr = wallet.address.to_string();
+    mine(&node, 104, &addr);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (kp, p2tr) = common::p2tr_keypath_output(&secp, [0x3e; 32]);
+    let data = |byte: u8| {
+        Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(PushBytesBuf::try_from(vec![byte; PAYLOAD - 4]).unwrap())
+            .into_script()
+    };
+    let send = |raw: &str| {
+        node.rpc_ok("sendrawtransaction", vec![json!(raw), json!(0.1), json!(50)]);
+    };
+    const FEE: u64 = 100_000;
+
+    // Block X: two stripped transactions. `sp` is silent-payment eligible
+    // (a P2WPKH input and a taproot output); `plain` pays the wallet.
+    let (sp_raw, sp) = common::build_signed_p2wpkh_spend_of_coinbases(
+        &node,
+        &[(1, &wallet)],
+        &[p2tr.clone(), data(PAYLOAD_BYTE)],
+        FEE,
+    );
+    let (plain_raw, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+        &node,
+        &[(2, &wallet)],
+        &[wallet.address.script_pubkey(), data(PAYLOAD_BYTE ^ 0xff)],
+        FEE,
+    );
+    send(&sp_raw);
+    send(&plain_raw);
+    let x = mine(&node, 1, &addr).remove(0);
+
+    // Block Y: spends the taproot output of `sp`, and a third stripped
+    // transaction.
+    let sp_value = (50 * 100_000_000 - FEE) / 2;
+    let (spend_raw, spend) = common::build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: sp.parse().unwrap(), vout: 0 },
+        p2tr.clone(),
+        sp_value,
+        wallet.address.script_pubkey(),
+        FEE,
+    );
+    let (third_raw, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+        &node,
+        &[(3, &wallet)],
+        &[wallet.address.script_pubkey(), data(0x33)],
+        FEE,
+    );
+    send(&spend_raw);
+    send(&third_raw);
+    let y = mine(&node, 1, &addr).remove(0);
+    let tip = mine(&node, 10, &addr).pop().unwrap();
+    let sp_rows = node.rpc_ok("getblock", vec![json!(x), json!(1)]);
+    assert!(sp_rows["tx"].as_array().unwrap().iter().any(|t| t == &json!(sp)));
+    assert!(
+        node.rpc_ok("getblock", vec![json!(y), json!(1)])["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == &json!(spend)),
+        "premise: the spend of a to-be-stripped output is mined"
+    );
+    node.stop();
+
+    let chainstate_unstripped = replay_and_dump(&datadir, rpcport, "--reindex-chainstate", &tip);
+    let reindex_unstripped = replay_and_dump(&datadir, rpcport, "--reindex", &tip);
+
+    let mut node = start_indexed(&datadir, rpcport, &[]);
+    for hash in [&x, &y] {
+        let out = strip(&node, hash).expect("strip");
+        assert_eq!(out["outcome"], "stripped", "{out}");
+    }
+    assert!(!payload_on_disk(&node), "premise: the payloads are gone");
+    node.stop();
+
+    let chainstate_stripped = replay_and_dump(&datadir, rpcport, "--reindex-chainstate", &tip);
+    if let Some(diff) = first_difference(&chainstate_unstripped, &chainstate_stripped) {
+        panic!("-reindex-chainstate over stripped blocks differs: {diff}");
+    }
+    let reindex_stripped = replay_and_dump(&datadir, rpcport, "--reindex", &tip);
+    if let Some(diff) = first_difference(&reindex_unstripped, &reindex_stripped) {
+        panic!("-reindex over stripped blocks differs: {diff}");
+    }
+
+    // The records survived both replays: the blocks still read stripped.
+    let mut node = start_indexed(&datadir, rpcport, &[]);
+    assert_raw_block_unavailable(&node, &x);
+    assert!(!payload_on_disk(&node));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}

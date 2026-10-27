@@ -27,8 +27,8 @@ pub mod trait_def;
 pub mod types;
 
 pub use compute::{
-    K_MAX, SpMatch, TaprootOutput, TweakEntry, compute_tweak, eligible_inputs, scan_outputs,
-    taproot_outputs,
+    K_MAX, SpMatch, TaprootOutput, TweakEntry, compute_tweak, compute_tweak_with_txid,
+    eligible_inputs, scan_outputs, taproot_outputs,
 };
 pub use config::SpIndexConfig;
 pub use cursor::{BackfillCursor, BackfillState};

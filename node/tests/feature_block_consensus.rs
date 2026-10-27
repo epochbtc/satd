@@ -271,6 +271,7 @@ fn connect(store: &dyn Store, block: &Block, height: u32, mtp: u32) -> Satd {
         pre_verified_txs: None,
         num_threads: 1,
         precomputed_txids: None,
+        script_skip_txs: None,
         address_index: &Default::default(),
         #[cfg(feature = "block-filter-index")]
         filter_index: &Default::default(),

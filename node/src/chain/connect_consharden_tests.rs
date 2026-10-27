@@ -143,6 +143,7 @@ fn connect_time_locked_spend(store: &InMemoryStore, outpoint: OutPoint, block_mt
         pre_verified_txs: None,
         num_threads: 1,
         precomputed_txids: None,
+        script_skip_txs: None,
         address_index: &address_index,
         sp_index: &sp_index,
         #[cfg(feature = "block-filter-index")]
