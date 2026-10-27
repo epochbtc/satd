@@ -405,11 +405,16 @@ pub fn scripthash_get_balance(
                 height: u32::MAX,
                 ..*pin
             };
-            attempt += 1;
-            if confirmed_balance_at(&history, &everything) == confirmed
-                || attempt >= node::chain::pin::VIEW_ATTEMPTS
-            {
+            if confirmed_balance_at(&history, &everything) == confirmed {
                 break (confirmed, unconfirmed, confirmed_balance_at(&history, pin));
+            }
+            // The two disagree only when a block connected between them:
+            // unspendable outputs are in neither, and every funding row the
+            // history holds is one the balance walks. Blocks connecting
+            // under every attempt are a chain view that would not settle.
+            attempt += 1;
+            if attempt >= node::chain::pin::VIEW_ATTEMPTS {
+                return Err(JsonRpcError::bad_request(node::chain::pin::CHAIN_VIEW_MOVED));
             }
         }
     };

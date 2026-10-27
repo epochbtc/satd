@@ -311,6 +311,38 @@ mod races {
         assert_eq!(index.balance_reads.load(Ordering::SeqCst), 2);
     }
 
+    /// [`FixedIndex`], except that every `balance` read is a stale one.
+    #[derive(Default)]
+    struct AlwaysStaleBalance(FixedIndex);
+
+    impl AddressIndex for AlwaysStaleBalance {
+        fn confirmed_history(&self, sh: &Scripthash) -> Result<Vec<HistoryEntry>, IndexError> {
+            self.0.confirmed_history(sh)
+        }
+        fn mempool_history(&self, sh: &Scripthash) -> Vec<MempoolHistoryEntry> {
+            self.0.mempool_history(sh)
+        }
+        fn balance(&self, _sh: &Scripthash) -> Result<(u64, i64), IndexError> {
+            Ok((5_000, 0))
+        }
+        fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
+            self.0.utxos(sh)
+        }
+        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+            self.0.subscribe(sh)
+        }
+    }
+
+    /// A balance that never matches its history is refused like a chain view
+    /// that never settles, not answered from a split pair.
+    #[test]
+    fn a_balance_split_on_every_read_is_refused() {
+        let (mut state, _dir) = electrum_state(100);
+        state.address_index = Arc::new(AlwaysStaleBalance::default());
+        let err = scripthash_get_balance(&state, params(), &pin_at(5)).unwrap_err();
+        assert_eq!(err.message, node::chain::pin::CHAIN_VIEW_MOVED);
+    }
+
     /// [`FixedIndex`] plus `tx`, which is in the mempool until the index's
     /// first read of either part, and confirmed at 10 for every read after.
     struct ConfirmsOnFirstRead {
