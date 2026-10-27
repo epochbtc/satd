@@ -115,10 +115,21 @@ pub(crate) struct StripState {
     /// `-allowteststrip` on a regtest node: the `stripopreturns` RPC is
     /// registered.
     test_rpc: std::sync::atomic::AtomicBool,
+    /// Runs between the plan's index read and its read of the bytes.
+    #[cfg(test)]
+    pub(crate) before_read_hook: Mutex<Option<StripHook>>,
     /// Runs between the plan and the record write, where anything that
     /// moves the block lands before the punch re-checks it.
     #[cfg(test)]
     pub(crate) after_plan_hook: Mutex<Option<StripHook>>,
+}
+
+/// What [`ChainState::plan_strip`] found to do.
+enum Planned {
+    Nothing,
+    /// The block moved or went away while it was being read.
+    Raced,
+    Strip(Plan),
 }
 
 /// The plan for punching one block.
@@ -165,8 +176,10 @@ impl ChainState {
         // bytes are touched, so crash recovery never reconnects it from disk.
         self.flush_durable()?;
 
-        let Some(plan) = self.plan_strip(hash, threshold)? else {
-            return Ok(StripOutcome::NothingEligible);
+        let plan = match self.plan_strip(hash, threshold)? {
+            Planned::Nothing => return Ok(StripOutcome::NothingEligible),
+            Planned::Raced => return Ok(StripOutcome::Raced),
+            Planned::Strip(plan) => plan,
         };
         #[cfg(test)]
         if let Some(hook) = self.strip.after_plan_hook.lock().take() {
@@ -283,8 +296,8 @@ impl ChainState {
     }
 
     /// Steps 1 and 4 of the strip: read and check the block, and work out
-    /// what to commit and punch. `None` when nothing is eligible.
-    fn plan_strip(&self, hash: &BlockHash, threshold: u64) -> Result<Option<Plan>, StripError> {
+    /// what to commit and punch.
+    fn plan_strip(&self, hash: &BlockHash, threshold: u64) -> Result<Planned, StripError> {
         let entry = self.store.get_block_index(hash).ok_or(StripError::UnknownBlock(*hash))?;
         if entry.status != BlockStatus::Valid {
             return Err(StripError::NotValid {
@@ -295,14 +308,46 @@ impl ChainState {
         if !self.active_chain_contains(hash, entry.height) {
             return Err(StripError::NotActive(*hash));
         }
+        match self.plan_from(hash, threshold, &entry) {
+            Err(StripError::Corrupt { hash, detail }) => {
+                // The entry is read without locks, so a prune or a repair
+                // can land between it and the bytes: a read that fails, or
+                // finds another record, because the block went away or moved.
+                // That is a race, not corruption, and must not raise a
+                // warning nothing clears.
+                let unchanged = self.store.get_block_index(&hash).is_some_and(|now| {
+                    now.status == BlockStatus::Valid
+                        && now.file_number == entry.file_number
+                        && now.data_pos == entry.data_pos
+                });
+                if !unchanged {
+                    return Ok(Planned::Raced);
+                }
+                let pos = FlatFilePos {
+                    file_number: entry.file_number,
+                    data_pos: entry.data_pos,
+                };
+                self.report_corrupt_block_data(&hash, &entry, &pos, &detail);
+                Err(StripError::Corrupt { hash, detail })
+            }
+            other => other,
+        }
+    }
+
+    /// [`Self::plan_strip`] once the entry passes its checks. A
+    /// [`StripError::Corrupt`] here is not reported yet: the caller first
+    /// rules out a race.
+    fn plan_from(&self, hash: &BlockHash, threshold: u64, entry: &BlockIndexEntry) -> Result<Planned, StripError> {
+        let entry = entry.clone();
         let pos = FlatFilePos {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let corrupt = |detail: String| {
-            self.report_corrupt_block_data(hash, &entry, &pos, &detail);
-            StripError::Corrupt { hash: *hash, detail }
-        };
+        let corrupt = |detail: String| StripError::Corrupt { hash: *hash, detail };
+        #[cfg(test)]
+        if let Some(hook) = self.strip.before_read_hook.lock().take() {
+            hook(self);
+        }
         let bytes = self
             .flat_files
             .lock()
@@ -328,11 +373,11 @@ impl ChainState {
                 let Some((record, _filled)) = StripRecord::build(&bytes, &block, threshold)
                     .map_err(|e| corrupt(format!("strip record cannot be built: {e}")))?
                 else {
-                    return Ok(None);
+                    return Ok(Planned::Nothing);
                 };
                 let ranges = opreturn_strip::strip_ranges(&bytes, &record, &spans)
                     .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                Ok(Some(Plan {
+                Ok(Planned::Strip(Plan {
                     entry,
                     txs: record.txs.len() as u64,
                     commit: Some(record),
@@ -350,7 +395,7 @@ impl ChainState {
                 if extended == record {
                     let ranges = opreturn_strip::strip_ranges(&bytes, &record, &spans)
                         .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                    return Ok(Some(Plan {
+                    return Ok(Planned::Strip(Plan {
                         entry,
                         txs: record.txs.len() as u64,
                         commit: None,
@@ -374,7 +419,7 @@ impl ChainState {
                 let new_only = only_new(&extended, &record);
                 let ranges = opreturn_strip::strip_ranges(&bytes, &new_only, &spans)
                     .map_err(|e| corrupt(format!("strip record does not fit: {e}")))?;
-                Ok(Some(Plan {
+                Ok(Planned::Strip(Plan {
                     entry,
                     txs: new_only.txs.len() as u64,
                     commit: Some(extended),

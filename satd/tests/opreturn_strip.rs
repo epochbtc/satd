@@ -300,3 +300,21 @@ fn a_corrupt_stored_copy_is_refused_with_a_warning() {
     assert!(payload_run_on_disk(&node, PAYLOAD - 20), "nothing was punched");
     node.stop();
 }
+
+/// The same strip on a datadir with a blocks-dir xor key (`-blocksxor=1`),
+/// where a punched span decodes to the key rather than to zeros.
+#[test]
+fn a_strip_under_blocksxor_reads_through_its_record() {
+    let mut node = TestNode::start(&["--allowteststrip", "--blocksxor=1"]);
+    let key = std::fs::read(blocks_dir(&node).join("xor.dat")).unwrap();
+    assert_ne!(key, vec![0u8; 8], "premise: a nonzero key");
+    let hash = block_with_a_big_op_return(&node);
+    let out = strip(&node, &hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    assert!(!payload_on_disk(&node));
+    assert_raw_block_unavailable(&node, &hash);
+    let out = strip(&node, &hash).expect("a repeat verifies the record");
+    assert_eq!(out["outcome"], "redone", "{out}");
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+}

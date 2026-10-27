@@ -608,3 +608,92 @@ fn a_block_reorged_out_before_the_punch_is_not_stripped() {
     assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A chainstate whose blocks dir is obfuscated with a random `xor.dat` key,
+/// as `-blocksxor=1` makes it.
+fn make_xor_chain_state() -> (ChainState, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "satd-strip-xor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let flat_files = crate::storage::flatfile::FlatFileManager::with_xor_mode(
+        &dir.join("blocks"),
+        crate::storage::flatfile::XorMode::Enabled,
+    )
+    .unwrap();
+    assert_ne!(flat_files.xor_key(), [0; 8], "premise: a nonzero key");
+    let cs = ChainState::new(
+        Box::new(crate::storage::db::InMemoryStore::new()),
+        flat_files,
+        Network::Regtest,
+        Box::new(crate::validation::script::NoopVerifier),
+        crate::chain::state::AssumeValid::Disabled,
+        450,
+        4,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    (cs, dir)
+}
+
+/// Under a blocks-dir xor key a punched span reads back as the key, not as
+/// zeros. The strip still reads through its record, and a lost record is
+/// still caught: the payload is recognised as punched and the merkle check
+/// fails, rather than the block being served with txids computed from the
+/// key bytes.
+#[test]
+fn under_a_blocks_xor_key_a_lost_record_is_still_caught() {
+    let (cs, dir) = make_xor_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let key = cs.flat_files.lock().xor_key();
+    let payload = payload_on_disk(&cs, &hash, 1, 1);
+    assert!(payload.iter().any(|b| *b != 0), "premise: the punch decodes to the key, not zeros");
+    assert!(
+        (0..8).any(|p| payload.iter().enumerate().all(|(j, b)| *b == key[(p + j) % 8])),
+        "premise: the punch decodes to the key"
+    );
+    assert_reads_as(&cs, &blocks[101]);
+
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(cs.get_stored_block(&hash).is_none(), "never served with wrong txids");
+    assert!(cs.get_block(&hash).is_none());
+    let warning = corrupt_warning(&cs, &hash).expect("the lost record is reported");
+    assert!(warning.contains("lost strip record"), "{warning}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prune that lands between the plan's index read and its read of the
+/// bytes makes the read fail. That is a race, not corruption: no warning.
+#[test]
+fn a_prune_during_the_plan_is_a_race_not_corruption() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    *cs.strip.before_read_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        // The entry goes Pruned and its record is gone from where the plan
+        // will look for it.
+        let mut entry = cs.store.get_block_index(&hash).unwrap();
+        entry.status = BlockStatus::Pruned;
+        entry.data_pos = u32::MAX - 16;
+        cs.store
+            .write_batch(StoreBatch {
+                block_index_puts: vec![(hash, entry)],
+                ..Default::default()
+            })
+            .unwrap();
+    }));
+    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    assert_eq!(record(&cs, &hash), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
