@@ -583,3 +583,28 @@ fn an_extension_refuses_bytes_changed_since_the_first_strip() {
     assert_eq!(record(&cs, &hash).unwrap().txs.len(), 1, "the record is unchanged");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A reorg between the plan and the punch takes the block off the active
+/// chain, still `Valid` and in place. It must not be stripped: a reorg back
+/// would need its bytes.
+#[test]
+fn a_block_reorged_out_before_the_punch_is_not_stripped() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    let fork_from = blocks[100].block_hash();
+    *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
+        let mut parent = fork_from;
+        for h in 102..=107 {
+            let b = build_test_block(parent, h, time(h) + 1);
+            cs.accept_block(&b).expect("accept fork block");
+            parent = b.block_hash();
+        }
+        assert_eq!(cs.tip_hash(), parent, "premise: the fork is active");
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Valid);
+    }));
+    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(record(&cs, &hash), None);
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
+    let _ = std::fs::remove_dir_all(dir);
+}
