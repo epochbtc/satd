@@ -20,7 +20,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{OutPoint, Transaction, Txid};
 use node::chain::pin::Pin;
 use node_index::{
-    HistoryEntry, HistoryRow, mempool_history_rows, scripthash_of,
+    HistoryEntry, HistoryRow, MempoolTxFacts, mempool_history_rows, scripthash_of,
     sort_mempool_rows,
 };
 use serde_json::{Value, json};
@@ -181,22 +181,18 @@ fn pinned_history_rows(
     let mempool = state.mempool.as_ref();
     idx.check_history_cap(sh, cap)
         .map_err(JsonRpcError::from_index)?;
-    let mut mempool_rows = mempool_history_rows(idx, sh, |txid| mempool_facts(mempool, txid));
     // `-1` as of the pin, not as of now: a parent that confirmed above the
-    // pin was unconfirmed then.
-    let mut moved = false;
-    for row in mempool_rows.iter_mut().filter(|r| r.height == 0) {
-        if mempool
-            .get(&row.txid)
-            .is_some_and(|entry| spends_above_pin(state, &entry.tx, pin))
-        {
-            row.height = -1;
-            moved = true;
-        }
-    }
-    if moved {
-        sort_mempool_rows(&mut mempool_rows);
-    }
+    // pin was unconfirmed then. Worked out in the same mempool read as the
+    // rest of the row, so a transaction leaving the pool cannot keep a
+    // height read before it left.
+    let mempool_rows = mempool_history_rows(idx, sh, |txid| {
+        let entry = mempool.get(txid)?;
+        Some(MempoolTxFacts {
+            has_unconfirmed_inputs: mempool_tx_has_unconfirmed_inputs(&entry.tx, mempool)
+                || spends_above_pin(state, &entry.tx, pin),
+            fee_sat: entry.fee,
+        })
+    });
     let mut rows: Vec<HistoryRow> = idx
         .confirmed_txs_in_chain_order(sh, cap.saturating_add(1))
         .map_err(JsonRpcError::from_index)?
