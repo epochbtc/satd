@@ -306,8 +306,8 @@ fn prune_drops_the_strip_records_of_the_blocks_it_deletes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// `getblockfrompeer`'s repair appends a full copy and points the entry at
-/// it; the record of the old copy goes in the same batch.
+/// `getblockfrompeer`'s repair writes the full copy back (in place, see
+/// `a_repair_restores_a_stripped_block_in_place`) and drops the record.
 #[test]
 fn repairing_a_stripped_block_with_a_full_copy_drops_the_record() {
     let (cs, dir) = make_chain_state();

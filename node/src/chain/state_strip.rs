@@ -23,7 +23,7 @@ use std::fs::OpenOptions;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
-use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::{Block, BlockHash, Network};
 use parking_lot::Mutex;
@@ -431,6 +431,95 @@ impl ChainState {
                 })))
             }
         }
+    }
+}
+
+impl ChainState {
+    /// Restore an OP_RETURN-stripped block in place from `block`, a full copy
+    /// that [`Self::repair_block_data`] has already checked at `height`
+    /// (plan §2.12). The whole body is rewritten over the stripped one, then
+    /// the record is removed: no second copy, no new slack, and the punched
+    /// spans are allocated again.
+    ///
+    /// `None` when the block has no record, or when the copy cannot go back
+    /// where the stripped one is: the stored length does not match, or the
+    /// record does not describe this block. The caller then appends a copy,
+    /// as for any other damaged block, and drops the record with it.
+    ///
+    /// Takes the strip lock first, so no strip of this block runs between the
+    /// write and the record's removal: a redo, which writes no record, would
+    /// otherwise punch bytes whose record had just gone.
+    pub(super) fn restore_stripped_in_place(
+        &self,
+        block: &Block,
+        height: u32,
+    ) -> Result<Option<super::BlockDataRepair>, super::ChainError> {
+        let hash = block.block_hash();
+        let _strip = self.strip.lock.lock();
+        let Some(record_bytes) = self.store.get_opreturn_strip(&hash)? else {
+            return Ok(None);
+        };
+        let Ok(record) = StripRecord::decode(&record_bytes) else {
+            return Ok(None);
+        };
+        let body = serialize(block);
+        // The record's filled hash pins every byte outside the spans, and its
+        // txids must reproduce the merkle root: this is the block the record
+        // describes, so writing it over the stripped bytes changes only the
+        // spans.
+        if StoredBlock::from_bytes(body.clone(), Some(record.clone()), &hash).is_err()
+            || record.txs.iter().any(|t| {
+                block.txdata.get(t.tx_index as usize).map(|tx| tx.compute_txid()) != Some(t.txid)
+            })
+        {
+            return Ok(None);
+        }
+
+        let _accept = self.accept_lock.lock();
+        let mut flat_files = self.flat_files.lock();
+        let Some(entry) = self.store.get_block_index(&hash) else {
+            return Ok(None);
+        };
+        if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid)
+            || entry.height != height
+            || self.store.get_opreturn_strip(&hash)?.as_deref() != Some(record_bytes.as_slice())
+        {
+            return Ok(None);
+        }
+        let pos = FlatFilePos {
+            file_number: entry.file_number,
+            data_pos: entry.data_pos,
+        };
+        // The length prefix of the stored record: the copy must fill exactly
+        // the space the stripped one takes.
+        match flat_files.read_block(&pos) {
+            Ok(stored) if stored.len() == body.len() => {}
+            _ => return Ok(None),
+        }
+        let offset = u64::from(pos.data_pos) + 8;
+        let mut encoded = body;
+        crate::storage::flatfile::xor_in_place(&mut encoded, &flat_files.xor_key(), offset);
+        let path = flat_files.blocks_dir().join(format!("blk{:05}.dat", pos.file_number));
+        // A write that fails part way leaves the same block's bytes, partly
+        // intact, under the record: readers still zero-fill the spans.
+        let io = |e: std::io::Error| super::ChainError::FlatFile(format!("restoring {hash} in place: {e}"));
+        let file = OpenOptions::new().write(true).open(&path).map_err(io)?;
+        std::os::unix::fs::FileExt::write_all_at(&file, &encoded, offset).map_err(io)?;
+        // The bytes are durable before the record goes. A crash between the
+        // two leaves a full copy under a record, which reads as the filled
+        // form; the next restore finishes it.
+        file.sync_data().map_err(io)?;
+        drop(flat_files);
+        self.store.write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })?;
+        self.flush_durable()?;
+        // Readable data where there was none can unblock a reorg that failed
+        // on it.
+        self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
+        tracing::info!(%hash, height, "Restored an OP_RETURN-stripped block in place from a peer-supplied copy");
+        Ok(Some(super::BlockDataRepair::Repaired { height }))
     }
 }
 

@@ -5480,6 +5480,24 @@ impl ChainState {
             return Ok(BlockDataRepair::AlreadyPresent { height });
         }
 
+        // An OP_RETURN-stripped copy is restored in place when the peer's
+        // block is the one its strip record describes (plan §2.12): no second
+        // copy, no new slack.
+        if let Some(restored) = self.restore_stripped_in_place(block, height)? {
+            return Ok(restored);
+        }
+        self.repair_block_data_by_append(block, height)
+    }
+
+    /// The general half of [`Self::repair_block_data`], once `block` has
+    /// passed its checks at `height`: append a fresh copy and point the entry
+    /// at it.
+    pub(super) fn repair_block_data_by_append(
+        &self,
+        block: &Block,
+        height: u32,
+    ) -> Result<BlockDataRepair, ChainError> {
+        let hash = block.block_hash();
         // Append the record BEFORE taking `accept_lock`. `write_block_durable`
         // takes the flat-file mutex, and `store_block` holds `accept_lock`
         // while writing its batch *after* releasing that mutex — acquiring
