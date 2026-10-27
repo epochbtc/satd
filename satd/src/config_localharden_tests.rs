@@ -16,7 +16,7 @@ fn config_from(dir: &tempfile::TempDir, body: &str, extra: &[&str]) -> Result<Co
         conf.to_str().unwrap(),
     ];
     args.extend_from_slice(extra);
-    Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+    Config::from_cli(parse_cli(args).unwrap())
 }
 
 fn global(cf: &ConfigFile, key: &str) -> Vec<String> {
@@ -215,7 +215,7 @@ fn trace_logging_leaves_out_the_request_dumps() {
     ];
 
     let cfg = Config::from_cli(
-        CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=trace"]).unwrap(),
+        parse_cli(["satd", "--regtest", "--loglevel=trace"]).unwrap(),
     )
     .unwrap();
     for target in dumps {
