@@ -694,6 +694,15 @@ impl StoredBlock {
         (0..self.block.txdata.len()).map(|i| self.wtxid(i)).collect()
     }
 
+    /// The indices of the stripped transactions, whose scripts a replay
+    /// cannot verify: their signatures commit to the bytes that are gone.
+    pub fn stripped_tx_indices(&self) -> std::collections::HashSet<usize> {
+        self.strip
+            .iter()
+            .flat_map(|r| r.txs.iter().map(|t| t.tx_index as usize))
+            .collect()
+    }
+
     /// `(vout, original script length)` of each stripped output of tx `i`.
     pub fn stripped_outputs(&self, i: usize) -> Vec<(u32, u64)> {
         self.stripped_tx(i)
@@ -712,6 +721,62 @@ impl StoredBlock {
         bitcoin::merkle_tree::calculate_root(hashes)
             .is_some_and(|root| root == self.block.header.merkle_root.to_raw_hash())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replay reads
+// ---------------------------------------------------------------------------
+
+/// Why [`decode_for_replay`] produced no block.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayReadError {
+    #[error("block bytes do not deserialize: {0}")]
+    Deserialize(String),
+    /// The block has a strip record that cannot be read or does not match
+    /// its bytes. A replay cannot connect it: the record is the only source
+    /// of its txids.
+    #[error("its OP_RETURN strip record {0}")]
+    Record(String),
+}
+
+/// Decode block bytes that a replay read straight from its block file,
+/// applying the block's strip record if it has one.
+///
+/// The bytes are read before the record is looked up, as in
+/// `ChainState::get_stored_block`, and for the same reason. With no record
+/// this is a plain deserialize, and checking that the bytes are the block
+/// `hash` names is left to the caller, as it was, except for the lost-record
+/// check `get_stored_block` also makes: an OP_RETURN payload that reads as
+/// punched through `xor_key`, and txids that miss the merkle root, are a
+/// record error rather than a block that fails validation. With a record the
+/// zero-filled bytes must hash to the recorded value and the txids must
+/// reproduce the merkle root, which ties the record to these bytes.
+pub fn decode_for_replay(
+    store: &dyn super::Store,
+    bytes: Vec<u8>,
+    hash: &BlockHash,
+    xor_key: &[u8; 8],
+) -> Result<StoredBlock, ReplayReadError> {
+    let record = match store.get_opreturn_strip(hash) {
+        Ok(None) => {
+            let stored = deserialize(&bytes)
+                .map(StoredBlock::intact)
+                .map_err(|e| ReplayReadError::Deserialize(e.to_string()))?;
+            if has_punched_op_return(&stored.block, xor_key) && !stored.verify_merkle() {
+                return Err(ReplayReadError::Record(
+                    "is missing: an OP_RETURN payload reads as punched and the txids miss the \
+                     merkle root"
+                        .to_string(),
+                ));
+            }
+            return Ok(stored);
+        }
+        Ok(Some(raw)) => StripRecord::decode(&raw)
+            .map_err(|e| ReplayReadError::Record(format!("does not decode: {e}")))?,
+        Err(e) => return Err(ReplayReadError::Record(format!("could not be read: {e}"))),
+    };
+    StoredBlock::from_bytes(bytes, Some(record), hash)
+        .map_err(|e| ReplayReadError::Record(format!("does not match the stored bytes: {e}")))
 }
 
 #[cfg(test)]

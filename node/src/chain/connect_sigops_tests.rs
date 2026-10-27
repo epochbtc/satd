@@ -123,6 +123,7 @@ fn connect_at_height_1(store: &InMemoryStore, block: &Block) -> Result<StoreBatc
         pre_verified_txs: None,
         num_threads: 1,
         precomputed_txids: None,
+        script_skip_txs: None,
         address_index: &Default::default(),
         sp_index: &Default::default(),
         #[cfg(feature = "block-filter-index")]

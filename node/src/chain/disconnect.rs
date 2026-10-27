@@ -486,6 +486,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -568,6 +569,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
                 precomputed_txids: None,
+                script_skip_txs: None,
                 address_index: &Default::default(),
                 sp_index: sp,
                 #[cfg(feature = "block-filter-index")]
@@ -641,6 +643,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -697,6 +700,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -780,6 +784,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -967,6 +972,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1103,6 +1109,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1186,6 +1193,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1252,6 +1260,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1323,6 +1332,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1399,6 +1409,7 @@ mod tests {
                 pre_verified_txs: None,
                 num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1515,6 +1526,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &cfg,
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1600,6 +1612,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &cfg,
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1700,6 +1713,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &disabled,
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
@@ -1817,6 +1831,7 @@ mod tests {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &Default::default(),
             sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]

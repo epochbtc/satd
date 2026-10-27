@@ -1,5 +1,5 @@
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, Network};
+use bitcoin::{Block, Network, Txid, Wtxid};
 
 use crate::validation::script::activation_heights;
 use crate::validation::ValidationError;
@@ -67,6 +67,37 @@ pub fn check_block(
     network: Network,
     height: u32,
 ) -> Result<(), ValidationError> {
+    let txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    check_block_with_hashes(block, &txids, None, network, height)
+}
+
+/// [`check_block`], with each transaction's txid, and optionally its wtxid,
+/// supplied by the caller rather than computed from the block.
+///
+/// This is for a block stored with its OP_RETURN payloads stripped. Its
+/// filled form has the original's sizes, weight, inputs, output values and
+/// witnesses, but not its hashes, which the strip record holds. The hashes
+/// feed the merkle root, the CVE-2012-2459 mutation test and the witness
+/// commitment; every other check reads the filled form, and none of them can
+/// fail on it where it passed on the original:
+/// - sizes and weight are equal;
+/// - a zeroed payload is `OP_RETURN` followed by `OP_0`s, which count no
+///   legacy sigops, so the count can only fall;
+/// - the coinbase is never stripped.
+///
+/// `wtxids` of `None` computes them from the block, and only when a witness
+/// commitment needs them, as [`check_block`] always has. `txids` (and
+/// `wtxids`) must have one entry per transaction.
+pub fn check_block_with_hashes(
+    block: &Block,
+    txids: &[Txid],
+    wtxids: Option<&[Wtxid]>,
+    network: Network,
+    height: u32,
+) -> Result<(), ValidationError> {
+    if txids.len() != block.txdata.len() || wtxids.is_some_and(|w| w.len() != block.txdata.len()) {
+        return Err(ValidationError::BadMerkleRoot);
+    }
     // Check merkle root. Core runs `CheckMerkleRoot` FIRST, ahead of the size
     // limits and the coinbase-position tests (`validation.cpp`, `CheckBlock`),
     // because "all potential-corruption validation must be done before we do
@@ -80,10 +111,7 @@ pub fn check_block(
     // sent for a real header is `bad-txnmrklroot` (`BLOCK_MUTATED`): it says
     // nothing about the block the header names. Only an empty body under an
     // all-zero merkle root reaches the size limits below.
-    let computed = block
-        .compute_merkle_root()
-        .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
-    if computed != block.header.merkle_root {
+    if merkle_root_of(txids) != block.header.merkle_root {
         return Err(ValidationError::BadMerkleRoot);
     }
 
@@ -93,7 +121,7 @@ pub fn check_block(
     // `mutated` flag inside ComputeMerkleRoot and rejects `bad-txns-duplicate`;
     // we mirror that flag here so the malleated copy is rejected cheaply, at the
     // right stage, rather than later in connect_block as a double-spend.
-    if merkle_tree_mutated(block) {
+    if merkle_tree_mutated(txids) {
         return Err(ValidationError::BadTxDuplicate);
     }
 
@@ -148,7 +176,7 @@ pub fn check_block(
     }
 
     // Witness commitment (BIP 141), height-gated as Core gates it.
-    check_witness_rules(block, segwit_active_at(network, height))?;
+    check_witness_rules(block, wtxids, segwit_active_at(network, height))?;
 
     // 2. `ContextualCheckBlock`'s full-weight test rejects `bad-blk-weight`,
     //    and Core runs it AFTER the witness rules above: an attacker who pads
@@ -224,7 +252,11 @@ pub fn segwit_active_at(network: Network, height: u32) -> bool {
 /// carry a commitment-shaped `OP_RETURN` — mainnet has these, from miners
 /// running segwit-ready software before lock-in — is judged by the second rule
 /// and is not spuriously rejected.
-fn check_witness_rules(block: &Block, segwit_active: bool) -> Result<(), ValidationError> {
+fn check_witness_rules(
+    block: &Block,
+    wtxids: Option<&[Wtxid]>,
+    segwit_active: bool,
+) -> Result<(), ValidationError> {
     let mut commits_to_witnesses = false;
 
     if segwit_active && has_witness_commitment_output(block) {
@@ -236,7 +268,7 @@ fn check_witness_rules(block: &Block, segwit_active: bool) -> Result<(), Validat
             .and_then(|w| w.nth(0))
             .and_then(|item| <[u8; 32]>::try_from(item).ok())
             .ok_or(ValidationError::BadWitnessNonceSize)?;
-        verify_witness_commitment(block, nonce)?;
+        verify_witness_commitment(block, wtxids, nonce)?;
         commits_to_witnesses = true;
     }
 
@@ -282,6 +314,7 @@ pub fn has_witness_commitment_output(block: &Block) -> bool {
 /// txid, so the commitment recomputes and matches.
 fn verify_witness_commitment(
     block: &Block,
+    wtxids: Option<&[Wtxid]>,
     witness_nonce: [u8; 32],
 ) -> Result<(), ValidationError> {
     // Find the witness commitment in coinbase outputs (last matching one wins)
@@ -306,8 +339,12 @@ fn verify_witness_commitment(
     // Compute witness root from wtxids (coinbase wtxid = 0x00...00)
     let mut wtxid_hashes: Vec<[u8; 32]> = Vec::new();
     wtxid_hashes.push([0u8; 32]); // coinbase
-    for tx in &block.txdata[1..] {
-        wtxid_hashes.push(tx.compute_wtxid().to_raw_hash().to_byte_array());
+    for (i, tx) in block.txdata.iter().enumerate().skip(1) {
+        let wtxid = match wtxids {
+            Some(w) => w[i],
+            None => tx.compute_wtxid(),
+        };
+        wtxid_hashes.push(wtxid.to_raw_hash().to_byte_array());
     }
 
     let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
@@ -332,12 +369,9 @@ fn verify_witness_commitment(
 /// tail is duplicated for that level, so the honest odd-node padding is not
 /// itself counted — only a transaction list that already contains the duplicate
 /// (the malleated copy of a valid block) trips it.
-fn merkle_tree_mutated(block: &Block) -> bool {
-    let mut current: Vec<[u8; 32]> = block
-        .txdata
-        .iter()
-        .map(|tx| tx.compute_txid().to_raw_hash().to_byte_array())
-        .collect();
+fn merkle_tree_mutated(txids: &[Txid]) -> bool {
+    let mut current: Vec<[u8; 32]> =
+        txids.iter().map(|txid| txid.to_raw_hash().to_byte_array()).collect();
     if current.is_empty() {
         return false;
     }
@@ -417,14 +451,12 @@ pub fn is_block_mutated(block: &Block, check_witness_root: bool) -> bool {
     // `None` only for an empty transaction list, where Core's `BlockMerkleRoot`
     // yields all-zero — so an empty block is judged against that, exactly as
     // Core judges it, rather than being special-cased here.
-    let computed = block
-        .compute_merkle_root()
-        .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
-    if computed != block.header.merkle_root {
+    let txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    if merkle_root_of(&txids) != block.header.merkle_root {
         tracing::debug!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
         return true;
     }
-    if merkle_tree_mutated(block) {
+    if merkle_tree_mutated(&txids) {
         tracing::debug!("Block mutated: bad-txns-duplicate, duplicate transaction");
         return true;
     }
@@ -435,13 +467,22 @@ pub fn is_block_mutated(block: &Block, check_witness_root: bool) -> bool {
     }
 
     // 3. `CheckWitnessMalleation`.
-    match check_witness_rules(block, check_witness_root) {
+    match check_witness_rules(block, None, check_witness_root) {
         Ok(()) => false,
         Err(e) => {
             tracing::debug!("Block mutated: {e}");
             true
         }
     }
+}
+
+/// The merkle root over `txids`, as `Block::compute_merkle_root` computes it
+/// from the transactions; all-zero for none, Core's `BlockMerkleRoot` of an
+/// empty list.
+fn merkle_root_of(txids: &[Txid]) -> bitcoin::TxMerkleNode {
+    bitcoin::merkle_tree::calculate_root(txids.iter().map(|t| t.to_raw_hash()))
+        .map(bitcoin::TxMerkleNode::from_raw_hash)
+        .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros)
 }
 
 fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
@@ -1099,7 +1140,8 @@ mod tests {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         block.txdata = vec![coinbase, dummy_spend(0x11), dummy_spend(0x22)];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        assert!(!merkle_tree_mutated(&block));
+        let txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        assert!(!merkle_tree_mutated(&txids));
         assert!(check_block(&block, Network::Regtest, 0).is_ok());
     }
 

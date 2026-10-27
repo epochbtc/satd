@@ -412,7 +412,7 @@ impl BackfillRunner {
 
             let mut batch = StoreBatch::default();
             if let Some(row) =
-                build_sp_row(&self.cfg, &block, block_hash, &prev_map).map_err(|e| {
+                build_sp_row(&self.cfg, &block, block_hash, None, &prev_map).map_err(|e| {
                     BackfillError::Emit {
                         height: h,
                         detail: e.to_string(),
