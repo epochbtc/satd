@@ -1483,6 +1483,13 @@ impl Store for CoinCache {
         self.inner.opreturn_strip_meta()
     }
 
+    /// Straight to the inner store: strip records travel in coin-free
+    /// batches, which skip the pending batch, so nothing is held back here
+    /// but the odd removal riding a coin batch, for at most a flush.
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        self.inner.for_each_opreturn_strip(f)
+    }
+
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         // Snapshot the invalidation generation BEFORE the dirty check: if
         // a batch pops this outpoint from `clean` after this load, the
@@ -5506,6 +5513,9 @@ mod tests {
         }
         fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
             self.inner.opreturn_strip_meta()
+        }
+        fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+            self.inner.for_each_opreturn_strip(f)
         }
         fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
             self.inner.get_undo(hash)

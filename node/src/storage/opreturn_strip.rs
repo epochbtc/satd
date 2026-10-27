@@ -592,6 +592,109 @@ pub fn strip_ranges(
 }
 
 // ---------------------------------------------------------------------------
+// Configuration and the worker's cursor
+// ---------------------------------------------------------------------------
+
+/// The shallowest `-pruneopreturn` depth: Core's `MIN_BLOCKS_TO_KEEP` and
+/// `NODE_NETWORK_LIMITED_MIN_BLOCKS`. `-pruneopreturn=1` (or `all`) means
+/// this.
+pub const MIN_STRIP_DEPTH: u32 = 288;
+
+/// The default `-pruneopreturnsize`: one common filesystem block. Smaller
+/// payloads free little or no disk under hole punching.
+pub const DEFAULT_STRIP_SIZE: u64 = 4096;
+
+/// What a node with stripped blocks serves to peers (`-pruneopreturnpeers`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrunePeers {
+    /// As a pruned Core node: only the last 288 blocks.
+    #[default]
+    Limited,
+    /// Any block still held intact, at any depth; `notfound` for a stripped
+    /// one. Advertises `NODE_INTACT_BLOCKS`.
+    Intact,
+}
+
+impl PrunePeers {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Limited => "limited",
+            Self::Intact => "intact",
+        }
+    }
+}
+
+/// The strip worker's cursor, stored under the `meta` key of the strip CF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripMeta {
+    /// Every active height below this has been examined under `size_threshold`.
+    pub next_height: u32,
+    pub size_threshold: u64,
+    pub depth: u32,
+}
+
+const META_VERSION: u8 = 1;
+
+impl StripMeta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(17);
+        out.push(META_VERSION);
+        out.extend_from_slice(&self.next_height.to_le_bytes());
+        out.extend_from_slice(&self.size_threshold.to_le_bytes());
+        out.extend_from_slice(&self.depth.to_le_bytes());
+        out
+    }
+
+    /// Strict: an unknown version or a wrong length is `None`, and the worker
+    /// then starts its scan over, which only costs time.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 17 || bytes[0] != META_VERSION {
+            return None;
+        }
+        Some(Self {
+            next_height: u32::from_le_bytes(bytes[1..5].try_into().ok()?),
+            size_threshold: u64::from_le_bytes(bytes[5..13].try_into().ok()?),
+            depth: u32::from_le_bytes(bytes[13..17].try_into().ok()?),
+        })
+    }
+}
+
+/// What the strip records add up to (`getopreturnpruneinfo`,
+/// `getblockchaininfo`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StripSummary {
+    pub blocks: u64,
+    pub transactions: u64,
+    pub outputs: u64,
+    /// Bytes zeroed: each stripped script's length less its `0x6a`.
+    pub bytes_zeroed: u64,
+    /// The whole filesystem blocks every span is sure to contain, wherever it
+    /// starts: a cautious minimum of what the punches gave back. The records
+    /// do not keep file offsets, so the exact figure cannot be rebuilt from
+    /// them; the block files' allocated size is the measurement.
+    pub bytes_freed_estimate: u64,
+}
+
+impl StripSummary {
+    /// Add one record, for a filesystem block of `fs_block` bytes.
+    pub fn add(&mut self, record: &StripRecord, fs_block: u64) {
+        let bs = fs_block.max(1);
+        self.blocks += 1;
+        self.transactions += record.txs.len() as u64;
+        for tx in &record.txs {
+            self.outputs += tx.outputs.len() as u64;
+            for o in &tx.outputs {
+                let span = o.script_len.saturating_sub(1);
+                self.bytes_zeroed += span;
+                // A span of `span` bytes holds at least this many whole
+                // blocks at its worst alignment.
+                self.bytes_freed_estimate += span.saturating_sub(bs - 1) / bs * bs;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StoredBlock
 // ---------------------------------------------------------------------------
 

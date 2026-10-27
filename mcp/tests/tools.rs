@@ -943,13 +943,13 @@ mod tool_router {
     fn test_tool_router_lists_expected_tools() {
         // 27 original + 8 ergonomics-backfill (#68) + 4 policy observability
         // (PR 7c: get_policy_info / get_quarantine_info / list_quarantine /
-        // get_quarantine_entry) = 39
+        // get_quarantine_entry) + get_opreturn_prune_info = 40
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            39,
-            "Expected 39 tools, got {}. Tools: {:?}",
+            40,
+            "Expected 40 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -964,6 +964,7 @@ mod tool_router {
         let expected = [
             "get_node_status",
             "get_system_info",
+            "get_opreturn_prune_info",
             "get_block",
             "get_block_header",
             "get_block_stats",

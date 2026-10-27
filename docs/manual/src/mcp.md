@@ -175,6 +175,7 @@ The server registers the following tools. Each returns a text result.
 ### Node status / ops
 - `get_node_status`: chain height, sync progress, mempool summary, peers, difficulty, uptime.
 - `get_system_info`: process RSS, UTXO-cache stats, DB info.
+- `get_opreturn_prune_info`: OP_RETURN pruning status (`getopreturnpruneinfo`).
 - `get_config`: effective post-merge config (secrets redacted).
 - `get_metrics_snapshot`: current Prometheus metrics as text.
 - `get_health` / `get_readiness`: liveness and readiness (mirror `/healthz` and `/readyz`).

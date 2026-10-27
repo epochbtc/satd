@@ -387,6 +387,14 @@ backend.
   is rbitcoin's `1.4.2-asof` ([Chain-tip stamps](#chain-tip-stamps)).
 - `server.peers.subscribe` returns an empty list: satd does not participate
   in Electrum peer gossip.
+- **OP_RETURN-pruned blocks** (`pruneopreturn`, see
+  [OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning)):
+  `blockchain.transaction.get` without `verbose` refuses a stripped
+  transaction with `transaction data not available (OP_RETURN data
+  stripped)`. With `verbose` it reads as satd's `getrawtransaction` does: no
+  `hex`, `"opreturn_stripped": true`, and each stripped output's
+  `scriptPubKey` reduced to the bare `OP_RETURN` plus `stripped_size`.
+  `get_merkle`, `id_from_pos` and `blockchain.tweaks.subscribe` are unchanged.
 - The protocol layer is vendored from `romanz/electrs` (MIT; attribution in
   `electrum-proto/vendor/electrs.MIT`) and adapted to satd's `AddressIndex`
   trait over the shared RocksDB.

@@ -1243,3 +1243,326 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     b.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// A transaction paying `wallet` back with one OP_RETURN of `len` bytes (the
+/// whole scriptPubKey), spending coinbase `coinbase`. Returns its txid.
+fn send_op_return(node: &TestNode, wallet: &DeterministicWallet, coinbase: u64, len: usize, byte: u8) -> String {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::script::{Builder, PushBytesBuf};
+
+    // OP_RETURN, the push opcode and its length bytes, then the data.
+    let header = match len {
+        0..=77 => 2,
+        78..=258 => 3,
+        259..=65538 => 4,
+        _ => 6,
+    };
+    let data = Builder::new()
+        .push_opcode(OP_RETURN)
+        .push_slice(PushBytesBuf::try_from(vec![byte; len - header]).unwrap())
+        .into_script();
+    assert_eq!(data.len(), len, "premise: the script is {len} bytes");
+    let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbases(
+        node,
+        &[(coinbase, wallet)],
+        &[wallet.address.script_pubkey(), data],
+        100_000,
+    );
+    node.rpc_ok(
+        "sendrawtransaction",
+        vec![serde_json::json!(raw), serde_json::json!(0.1), serde_json::json!(50)],
+    );
+    txid
+}
+
+fn wait_for_the_worker(node: &TestNode, below: u64) -> serde_json::Value {
+    common::poll_until(
+        || node.rpc_ok("getopreturnpruneinfo", vec![])["examined_below_height"].as_u64().unwrap_or(0) >= below,
+        test_timeout(120),
+        "the strip worker never examined the chain",
+    );
+    node.rpc_ok("getopreturnpruneinfo", vec![])
+}
+
+/// `getrawtransaction <txid>`'s whole response.
+fn raw_tx(node: &TestNode, txid: &str) -> serde_json::Value {
+    node.rpc_call_with_params("getrawtransaction", vec![serde_json::json!(txid)]).unwrap()
+}
+
+/// `-pruneopreturn` end to end (plan PR 8): the worker strips what is deep and
+/// large enough, the surfaces read it through its records, the node advertises
+/// only `NODE_NETWORK_LIMITED`, and the state survives restarts: with the
+/// option on, with it off (still limited, still reported), and with a lower
+/// threshold (newly eligible outputs stripped on the rescan).
+#[test]
+fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
+    use serde_json::json;
+
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-pruneopreturn-e2e");
+    let on: &[&str] = &["--pruneopreturn=288", "--pruneopreturnsize=1000", "--txindex"];
+    // The chain is built with the option off, so the block files' allocated
+    // size can be taken before anything is stripped; then it is turned on.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex"]);
+    let wallet = DeterministicWallet::from_secret([0x64; 32]);
+    let addr = wallet.address.to_string();
+    mine(&node, 110, &addr);
+    // 1 KB, 10 KB and 90 KB payloads, stripped; 500 bytes, kept until the
+    // threshold drops; 80 bytes, never stripped.
+    let big = [
+        send_op_return(&node, &wallet, 1, 1_000, 0x51),
+        send_op_return(&node, &wallet, 2, 10_000, 0x52),
+        send_op_return(&node, &wallet, 3, 90_000, 0x53),
+    ];
+    let medium = send_op_return(&node, &wallet, 4, 500, 0x54);
+    let small = send_op_return(&node, &wallet, 5, 80, 0x55);
+    let block = mine(&node, 1, &addr).remove(0);
+    let height = node.rpc_ok("getblockheader", vec![json!(block)])["height"].as_u64().unwrap();
+    let raw_before = node.rpc_ok("getblock", vec![json!(block), json!(0)]);
+    assert_eq!(
+        node.rpc_ok("getblock", vec![json!(block), json!(1)])["tx"].as_array().unwrap().len(),
+        6,
+        "premise: all five are in one block"
+    );
+    // Deep enough: more than 288 + 2 below the tip.
+    mine(&node, 300, &addr);
+    assert!(
+        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].as_array().unwrap().contains(&json!("NETWORK")),
+        "premise: a full node before the option"
+    );
+    let allocated_before = allocated(&node);
+    node.stop();
+    node.datadir = PathBuf::new();
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, on);
+
+    let info = wait_for_the_worker(&node, height + 1);
+    assert_eq!(info["enabled"], true, "{info}");
+    assert_eq!(info["depth"], 288);
+    assert_eq!(info["min_size"], 1000);
+    assert_eq!(info["probe"], "ok", "{info}");
+    assert_eq!(info["blocks"], 1, "{info}");
+    assert_eq!(info["transactions"], 3, "{info}");
+    assert_eq!(info["outputs"], 3, "{info}");
+    assert_eq!(info["bytes_zeroed"], 101_000 - 3, "{info}");
+    let freed = info["bytes_freed_estimate"].as_u64().unwrap();
+    assert!(freed >= 90_000 - 2 * 4096, "{info}");
+    assert!(
+        info["blocks_dir_allocated_bytes"].as_u64().unwrap() + freed <= allocated_before,
+        "the punches gave back at least the estimate: {info} (before: {allocated_before})"
+    );
+    let chain = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(chain["pruned"], false, "-prune's field keeps its meaning");
+    assert_eq!(chain["opreturn_prune"]["blocks"], 1, "{chain}");
+
+    // The surfaces: the large ones are stripped, the small ones intact.
+    for txid in &big {
+        assert_eq!(raw_tx(&node, txid)["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+        let verbose = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(1)]);
+        assert_eq!(verbose["opreturn_stripped"], true, "{verbose}");
+    }
+    for txid in [&medium, &small] {
+        assert!(raw_tx(&node, txid)["result"].is_string(), "{txid} is intact");
+    }
+    assert_raw_block_unavailable(&node, &block);
+    let services = node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].clone();
+    assert!(!services.as_array().unwrap().contains(&json!("NETWORK")), "{services}");
+    assert!(services.as_array().unwrap().contains(&json!("NETWORK_LIMITED")), "{services}");
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    // A restart keeps it all.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, on);
+    let again = node.rpc_ok("getopreturnpruneinfo", vec![]);
+    assert_eq!((again["blocks"].clone(), again["bytes_zeroed"].clone()), (json!(1), json!(101_000 - 3)));
+    assert_raw_block_unavailable(&node, &block);
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    // Off: nothing is restored, the node stays limited, and it still reports.
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex"]);
+    let chain = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(chain["opreturn_prune"]["enabled"], false, "{chain}");
+    assert_eq!(chain["opreturn_prune"]["blocks"], 1, "{chain}");
+    let services = node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].clone();
+    assert!(!services.as_array().unwrap().contains(&json!("NETWORK")), "still limited: {services}");
+    assert_raw_block_unavailable(&node, &block);
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    // A lower threshold: the 500-byte output is stripped on the rescan; the
+    // 80-byte one never is.
+    let lower: &[&str] = &["--pruneopreturn=288", "--pruneopreturnsize=400", "--txindex"];
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, lower);
+    common::poll_until(
+        || node.rpc_ok("getopreturnpruneinfo", vec![])["transactions"] == json!(4),
+        test_timeout(120),
+        "the rescan never stripped the newly eligible output",
+    );
+    assert_eq!(
+        raw_tx(&node, &medium)["error"]["message"],
+        "Transaction data not available (OP_RETURN data stripped)"
+    );
+    assert!(raw_tx(&node, &small)["result"].is_string(), "the 80-byte one is never stripped");
+    assert_ne!(node.rpc_call_with_params("getblock", vec![json!(block), json!(0)]).unwrap()["result"], raw_before);
+    assert!(!has_corrupt_warning(&node));
+    node.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// A raw inbound peer, read on the test's own thread.
+struct RawPeer {
+    stream: std::net::TcpStream,
+}
+
+impl RawPeer {
+    fn connect(port: u16) -> Self {
+        use bitcoin::p2p::message::NetworkMessage;
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_nodelay(true).unwrap();
+        let mut peer = Self { stream };
+        let zero: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let services = bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS;
+        peer.send(NetworkMessage::Version(bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services,
+            timestamp: 1_760_000_000,
+            receiver: bitcoin::p2p::Address::new(&zero, bitcoin::p2p::ServiceFlags::NONE),
+            sender: bitcoin::p2p::Address::new(&zero, services),
+            nonce: 0x5a5a_0001,
+            user_agent: "/opreturn-strip-test/".into(),
+            start_height: 0,
+            relay: false,
+        }));
+        let mut got_version = false;
+        loop {
+            match peer.recv(Duration::from_secs(30)) {
+                Ok(NetworkMessage::Version(_)) => got_version = true,
+                Ok(NetworkMessage::Verack) if got_version => break,
+                Ok(_) => {}
+                Err(e) => panic!("handshake: {e}"),
+            }
+        }
+        peer.send(NetworkMessage::Verack);
+        peer
+    }
+
+    fn send(&mut self, msg: bitcoin::p2p::message::NetworkMessage) {
+        use std::io::Write;
+        let raw = bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg);
+        let _ = self.stream.write_all(&bitcoin::consensus::serialize(&raw));
+    }
+
+    fn recv(&mut self, timeout: Duration) -> std::io::Result<bitcoin::p2p::message::NetworkMessage> {
+        use std::io::Read;
+        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        let mut header = [0u8; 24];
+        self.stream.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut buf = header.to_vec();
+        buf.resize(24 + len, 0);
+        self.stream.read_exact(&mut buf[24..])?;
+        let raw: bitcoin::p2p::message::RawNetworkMessage = bitcoin::consensus::deserialize(&buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(raw.into_payload())
+    }
+
+    /// How many blocks the node invs for a `getblocks` from genesis. A
+    /// `getheaders` sent after it, which the node always answers, marks where
+    /// its answer ends (a ping would not: the connection answers it first).
+    fn getblocks_from_genesis(&mut self) -> usize {
+        use bitcoin::hashes::Hash;
+        use bitcoin::p2p::message::NetworkMessage;
+        use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let zero = bitcoin::BlockHash::all_zeros();
+        self.send(NetworkMessage::GetBlocks(GetBlocksMessage::new(vec![genesis], zero)));
+        self.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(vec![genesis], zero)));
+        let mut blocks = 0;
+        loop {
+            match self.recv(Duration::from_secs(30)).expect("an answer") {
+                NetworkMessage::Inv(inv) => blocks += inv.iter().filter(|i| matches!(i, Inventory::Block(_))).count(),
+                NetworkMessage::Headers(_) => return blocks,
+                NetworkMessage::Ping(n) => self.send(NetworkMessage::Pong(n)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The node's answer to a `getdata` for `hash`: the block, `notfound`, or
+    /// `None` when it closed the connection. Pings are answered on the way.
+    fn get_block(&mut self, hash: bitcoin::BlockHash) -> Option<Result<bitcoin::Block, ()>> {
+        use bitcoin::p2p::message::NetworkMessage;
+        use bitcoin::p2p::message_blockdata::Inventory;
+        self.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.recv(left) {
+                Ok(NetworkMessage::Block(b)) if b.block_hash() == hash => return Some(Ok(b)),
+                Ok(NetworkMessage::NotFound(inv)) if inv.iter().any(|i| i == &Inventory::WitnessBlock(hash)) => {
+                    return Some(Err(()));
+                }
+                Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    panic!("no answer for {hash}")
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// `-pruneopreturnpeers` (plan §2.9.1). Under `intact` a peer gets an intact
+/// block at depth 500, `notfound` for a stripped one at about the same depth,
+/// and stays connected; the node advertises `NODE_NETWORK_LIMITED` and
+/// `NODE_INTACT_BLOCKS`, never `NODE_NETWORK`. Under `limited`, the default,
+/// the same request for the intact block disconnects the peer, as a pruned
+/// Core node does, and `getblocks` invs no deep block.
+#[test]
+fn pruneopreturnpeers_intact_serves_deep_intact_blocks_and_notfound_for_stripped() {
+    use serde_json::json;
+
+    for intact in [true, false] {
+        let mut args = vec!["--pruneopreturn=288"];
+        if intact {
+            args.push("--pruneopreturnpeers=intact");
+        }
+        let mut node = TestNode::start(&args);
+        let stripped = block_with_a_big_op_return(&node);
+        let height = node.rpc_ok("getblockheader", vec![json!(stripped)])["height"].as_u64().unwrap();
+        let addr = DeterministicWallet::from_secret([0x65; 32]).address.to_string();
+        mine(&node, 500, &addr);
+        common::poll_until(
+            || node.rpc_ok("getopreturnpruneinfo", vec![])["blocks"] == json!(1),
+            test_timeout(120),
+            "the worker never stripped the block",
+        );
+        let deep: bitcoin::BlockHash =
+            node.rpc_ok("getblockhash", vec![json!(height + 1)]).as_str().unwrap().parse().unwrap();
+
+        let services = u64::from_str_radix(
+            node.rpc_ok("getnetworkinfo", vec![])["localservices"].as_str().unwrap(),
+            16,
+        )
+        .unwrap();
+        assert_eq!(services & 1, 0, "never NODE_NETWORK");
+        assert_ne!(services & (1 << 10), 0, "NODE_NETWORK_LIMITED");
+        assert_eq!(services & (1 << 28) != 0, intact, "NODE_INTACT_BLOCKS only under intact");
+
+        let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+        // `getblocks` invs only what the node would serve.
+        assert_eq!(peer.getblocks_from_genesis(), if intact { 500 } else { 0 });
+        if intact {
+            let got = peer.get_block(deep).expect("still connected");
+            assert_eq!(got.expect("the intact block").block_hash(), deep);
+            let stripped: bitcoin::BlockHash = stripped.parse().unwrap();
+            assert_eq!(peer.get_block(stripped), Some(Err(())), "notfound, and the peer stays");
+            assert!(peer.get_block(deep).is_some_and(|b| b.is_ok()), "still served after the notfound");
+        } else {
+            assert_eq!(peer.get_block(deep), None, "a limited node disconnects a deep request");
+        }
+        node.stop();
+    }
+}

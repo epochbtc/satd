@@ -1364,6 +1364,57 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             if config.allow_test_strip {
                 cs.allow_test_strip();
             }
+            // OP_RETURN pruning (plan §2.1). The peers mode is set either
+            // way: it governs a node that still holds stripped blocks after
+            // the option is turned off.
+            cs.set_opreturn_prune_peers(config.opreturn_prune_peers);
+            if config.opreturn_prune_depth > 0 {
+                cs.configure_opreturn_prune(node::chain::state::StripConfig {
+                    depth: config.opreturn_prune_depth,
+                    size_threshold: config.opreturn_prune_size,
+                });
+                if let Err(e) = cs.probe_opreturn_strip() {
+                    eprintln!(
+                        "Error: -pruneopreturn needs a filesystem with hole-punch support (ext4, XFS, \
+                         btrfs, ZFS, tmpfs, APFS); the probe in {} failed: {e}",
+                        cs.blocks_dir().display()
+                    );
+                    auth.cleanup();
+                    node::shutdown::exit_now(1);
+                }
+            }
+            if let Err(e) = cs.load_opreturn_strip_state() {
+                eprintln!("Error reading the OP_RETURN strip records: {e}");
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+            if config.opreturn_prune_depth > 0 {
+                tracing::info!(
+                    depth = config.opreturn_prune_depth,
+                    min_size = config.opreturn_prune_size,
+                    peers = config.opreturn_prune_peers.as_str(),
+                    fs_block = cs.opreturn_strip_fs_block(),
+                    "OP_RETURN pruning on: payloads of OP_RETURN outputs of at least min_size bytes \
+                     are stripped from blocks more than depth blocks deep"
+                );
+                if config.opreturn_prune_size < cs.opreturn_strip_fs_block().unwrap_or(4096) {
+                    tracing::warn!(
+                        min_size = config.opreturn_prune_size,
+                        "-pruneopreturnsize is below one filesystem block: outputs this small free \
+                         little or no disk, and each costs ~100 bytes of index"
+                    );
+                }
+            } else if cs.opreturn_prune_active() {
+                tracing::info!(
+                    "-pruneopreturn is off, but stripped blocks remain: the node stays \
+                     NODE_NETWORK_LIMITED (getblockfrompeer restores a block)"
+                );
+            } else if config.opreturn_prune_peers != node::storage::opreturn_strip::PrunePeers::default() {
+                tracing::warn!(
+                    "-pruneopreturnpeers={} is ignored: -pruneopreturn is off and no block is stripped",
+                    config.opreturn_prune_peers.as_str()
+                );
+            }
             if cs.network == bitcoin::Network::Signet {
                 tracing::info!(
                     "Signet derived magic (message start): {}",
@@ -3151,6 +3202,26 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // once. Until it lands, the RPC reports the young buckets as an
     // estimate (`exact: false`). A failed scan is retried a few times with
     // growing waits, then left until the next start.
+    // The OP_RETURN strip worker (plan §2.6), when -pruneopreturn is on. A
+    // thread of its own: every pass is blocking I/O, paced by the tip.
+    let strip_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let strip_thread = if config.opreturn_prune_depth > 0 {
+        let chain = chain_state.clone();
+        let stop = strip_stop.clone();
+        match std::thread::Builder::new()
+            .name("opreturn-strip".into())
+            .spawn(move || node::chain::state::run_strip_worker(chain, stop))
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!(error = %e, "could not start the OP_RETURN strip worker; nothing will be stripped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let recent_window_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let recent_window_thread = {
         let chain = chain_state.clone();
@@ -4919,6 +4990,21 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // bounded anyway, and a scan that somehow outlives it holds nothing the
     // flush below needs (it reads a snapshot and persists nothing when
     // cancelled).
+    // Stop the strip worker. It checks the flag between blocks and every
+    // 500 ms of its idle wait; a block in hand finishes its punch first.
+    strip_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = strip_thread {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            tracing::warn!("OP_RETURN strip worker did not stop within 10s; continuing shutdown");
+        }
+    }
+
     recent_window_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(handle) = recent_window_thread {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

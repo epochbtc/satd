@@ -21,7 +21,7 @@ use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
 #[path = "state_strip.rs"]
 mod strip;
-pub use strip::{FAILPOINT_ENV, StripError, StripOutcome, StripStats};
+pub use strip::{FAILPOINT_ENV, PassReport, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus, run_strip_worker};
 
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
@@ -8999,7 +8999,7 @@ impl ChainState {
     /// `get_block` reads as unavailable, and `generic` otherwise.
     fn reorg_read_error(&self, hash: &BlockHash, height: u32, generic: &str) -> ChainError {
         if self.has_strip_record(hash) {
-            ChainError::FlatFile(stripped_block_message(hash, height))
+            ChainError::FlatFile(stripped_block_message_for(self, hash, height))
         } else {
             ChainError::FlatFile(generic.to_string())
         }
@@ -9072,7 +9072,7 @@ impl ChainState {
                 // A record that cannot be read refuses too: the marks would
                 // otherwise land before the disconnect hit the same fault.
                 if self.store.get_opreturn_strip(&cursor)?.is_some() {
-                    return Err(ChainError::InvalidArgument(stripped_block_message(&cursor, e.height)));
+                    return Err(ChainError::InvalidArgument(stripped_block_message_for(self, &cursor, e.height)));
                 }
                 cursor = e.header.prev_blockhash;
             }
@@ -10808,6 +10808,20 @@ fn stripped_block_message(hash: &BlockHash, height: u32) -> String {
          disconnects or reconnects it is not possible without re-downloading it \
          (getblockfrompeer)"
     )
+}
+
+/// [`stripped_block_message`], naming the depth when `-pruneopreturn` is on:
+/// a reorg deeper than it cannot go through without the full blocks.
+fn stripped_block_message_for(chain: &ChainState, hash: &BlockHash, height: u32) -> String {
+    match chain.opreturn_prune_config() {
+        Some(c) => format!(
+            "block {hash} at height {height} has stripped OP_RETURN data; a reorg deeper than \
+             -pruneopreturn={} blocks is not possible without re-downloading it \
+             (getblockfrompeer)",
+            c.depth
+        ),
+        None => stripped_block_message(hash, height),
+    }
 }
 
 fn unreplayable_record(

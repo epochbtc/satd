@@ -677,6 +677,20 @@ preserved; the satd extension is opt-in per request or per flag.
   `nap-pull`, a type Core does not have. See the manual's
   [Node Attestation](https://epochbtc.github.io/satd/nap.html) chapter.
 
+- **`-pruneopreturn`, `-pruneopreturnsize`, `-pruneopreturnpeers`** — strip
+  the payloads of large OP_RETURN outputs (at least `-pruneopreturnsize`
+  bytes, default 4096) from stored blocks more than N blocks deep (at least
+  288), punching the bytes out of the block files. Off by default. Blocks are
+  fully validated either way. A node that strips, or still holds stripped
+  blocks, drops `NODE_NETWORK` and serves as a pruned Core node does
+  (`limited`), or serves its intact blocks at any depth and answers
+  `notfound` for stripped ones (`intact`, which also advertises the
+  experimental `NODE_INTACT_BLOCKS`, bit 28). `getblockchaininfo.pruned`
+  keeps Core's meaning (`-prune` only); a new `opreturn_prune` object and
+  `getopreturnpruneinfo` describe the stripping. One-way: 0.6.x and earlier
+  refuse a datadir that has stripped a block. See the manual's
+  [OP_RETURN data pruning](https://epochbtc.github.io/satd/disk-footprint.html#opreturn-data-pruning).
+
 ---
 
 ## Intentional exclusions
@@ -716,6 +730,20 @@ These surfaces will not ship. Each is a deliberate scope decision.
 Core methods satd implements over a narrower input domain than Core does.
 Each rejects what it does not cover with an error naming the gap, rather than
 silently returning an empty or wrong answer.
+
+- **OP_RETURN-stripped transactions** (`-pruneopreturn` only) — their raw
+  bytes are gone, so every surface that serves raw bytes refuses them:
+  `getblock` verbosity 0 with Core's `-1 Block not available (pruned data)`,
+  `getrawtransaction` hex and `gettxspendingprevout`'s `spendingtx` with `-1
+  Transaction data not available (OP_RETURN data stripped)`, Esplora's
+  `/block/:hash/raw`, `/tx/:txid/hex` and `/tx/:txid/raw` with 404, Electrum's
+  non-verbose `blockchain.transaction.get` with an error, and streaming
+  `raw_tx` with `raw_tx_stripped`. Their JSON views keep the real txid, sizes
+  and values, add `opreturn_stripped: true`, and show each stripped output as
+  a bare `OP_RETURN` with `stripped_size` (Esplora:
+  `scriptpubkey_stripped_size`). `getblock` 1+ adds an `opreturn_stripped`
+  summary on a stripped block. A reorg or `invalidateblock` across a stripped
+  block fails naming it, as Core does across pruned data.
 
 - **Output descriptors** — satd implements the key-free forms, `raw(<hex
   script>)` and `addr(<address>)`, with BIP 380 checksums (optional on input,

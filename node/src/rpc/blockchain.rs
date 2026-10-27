@@ -136,6 +136,52 @@ impl PruneMode {
 }
 
 /// Build the `getblockchaininfo` response from real chain state.
+/// The OP_RETURN pruning report: `getblockchaininfo.opreturn_prune`, and with
+/// `detailed` the whole of `getopreturnpruneinfo` (plan §2.13). `detailed`
+/// stats the block files, so it belongs off the async workers.
+pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
+    let config = chain_state.opreturn_prune_config();
+    let meta = chain_state.opreturn_strip_meta();
+    let summary = chain_state.opreturn_strip_summary().unwrap_or_default();
+    let mut out = json!({
+        "enabled": config.is_some(),
+        "depth": config.map(|c| c.depth).or(meta.map(|m| m.depth)),
+        "min_size": config.map(|c| c.size_threshold).or(meta.map(|m| m.size_threshold)),
+        "examined_below_height": meta.map_or(0, |m| m.next_height),
+        "blocks": summary.blocks,
+        "transactions": summary.transactions,
+        "outputs": summary.outputs,
+        "bytes_zeroed": summary.bytes_zeroed,
+        "bytes_freed_estimate": summary.bytes_freed_estimate,
+    });
+    if detailed {
+        out["peers"] = json!(chain_state.opreturn_prune_peers().as_str());
+        out["worker"] = json!(chain_state.opreturn_strip_worker_status().label());
+        // The height the worker's scan is heading for: every block below it
+        // is past the strip depth.
+        out["examine_target_height"] = json!(config.map(|c| {
+            chain_state.tip_height().saturating_sub(c.depth.saturating_add(2))
+        }));
+        out["filesystem_block_size"] = json!(chain_state.opreturn_strip_fs_block());
+        out["probe"] = match (config, chain_state.opreturn_strip_fs_block()) {
+            (_, Some(_)) => json!("ok"),
+            (None, None) => json!("not run"),
+            (Some(_), None) => match chain_state.probe_opreturn_strip() {
+                Ok(_) => json!("ok"),
+                Err(e) => json!(e.to_string()),
+            },
+        };
+        match chain_state.blocks_dir_usage() {
+            Ok((apparent, allocated)) => {
+                out["blocks_dir_apparent_bytes"] = json!(apparent);
+                out["blocks_dir_allocated_bytes"] = json!(allocated);
+            }
+            Err(e) => out["blocks_dir_error"] = json!(e.to_string()),
+        }
+    }
+    out
+}
+
 pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value {
     let chain = match chain_state.network {
         Network::Regtest => "regtest",
@@ -217,6 +263,11 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
         // `PRUNE_TARGET_MANUAL`, and `prune_target_size` is emitted only
         // alongside a true one.
         out["automatic_pruning"] = json!(prune.target_mb().is_some());
+    }
+    // satd extension (plan §2.13): OP_RETURN pruning, only on a node that
+    // strips or still holds stripped blocks. `pruned` keeps its Core meaning.
+    if chain_state.opreturn_prune_active() {
+        out["opreturn_prune"] = opreturn_prune_json(chain_state, false);
     }
     if let Some(mib) = prune.target_mb() {
         // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes

@@ -368,6 +368,13 @@ impl Store for InMemoryStore {
         Ok(self.opreturn_strip_meta.read().clone())
     }
 
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        for (hash, record) in self.opreturn_strip.read().iter() {
+            f(hash, record);
+        }
+        Ok(())
+    }
+
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         self.undo.read().get(hash).cloned()
     }

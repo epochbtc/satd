@@ -114,6 +114,9 @@ impl Store for GatedStore {
     fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
         self.inner.opreturn_strip_meta()
     }
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        self.inner.for_each_opreturn_strip(f)
+    }
     fn coin_count(&self) -> u64 {
         self.inner.coin_count()
     }

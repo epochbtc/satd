@@ -1038,3 +1038,86 @@ fn an_in_place_restore_waits_for_a_strip_in_progress() {
     assert_eq!(record(&cs, &blocks[101].block_hash()), None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn pass(cs: &ChainState, max_blocks: u32) -> PassReport {
+    cs.strip_pass(max_blocks, &std::sync::atomic::AtomicBool::new(false)).unwrap()
+}
+
+/// The worker strips only below `tip - depth - 2`: a block a limited peer
+/// may still ask for keeps its bytes.
+#[test]
+fn a_pass_strips_only_below_tip_minus_depth_minus_two() {
+    let (cs, dir) = make_chain_state();
+    let mut blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 1,
+        size_threshold: THRESHOLD,
+    });
+
+    // Tip 105, depth 1: heights up to 101 only.
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped, r.more), (102, 0, false));
+    assert_eq!(record(&cs, &hash), None, "102 is not yet deep enough");
+    assert_eq!(cs.opreturn_strip_meta().unwrap().next_height, 102);
+
+    let b = build_test_block(blocks.last().unwrap().block_hash(), 106, time(106));
+    connect(&cs, &b);
+    blocks.push(b);
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (1, 1));
+    assert!(record(&cs, &hash).is_some());
+    assert_reads_as(&cs, &blocks[101]);
+    let s = cs.opreturn_strip_summary().unwrap();
+    assert_eq!((s.blocks, s.transactions, s.outputs), (1, 1, 1));
+    assert!(cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The cursor carries a pass on where the last one stopped, and a lower
+/// threshold than the one it was reached under starts the scan over.
+#[test]
+fn a_lowered_threshold_rescans_from_the_bottom() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 0,
+        size_threshold: THRESHOLD,
+    });
+    let at = |next_height, size_threshold| opreturn_strip::StripMeta {
+        next_height,
+        size_threshold,
+        depth: 0,
+    };
+
+    // A pass at most 10 blocks long stops with more to do.
+    let r = pass(&cs, 10);
+    assert_eq!((r.examined, r.more), (10, true));
+    assert_eq!(cs.opreturn_strip_meta(), Some(at(10, THRESHOLD)));
+
+    // Past 102 under the same threshold: nothing to do there again.
+    cs.write_strip_meta(&at(103, THRESHOLD)).unwrap();
+    assert_eq!(pass(&cs, 1000).stripped, 0);
+    assert_eq!(record(&cs, &hash), None);
+
+    // Past 102 under a higher one: 102 was never examined at 4096.
+    cs.write_strip_meta(&at(103, 2 * THRESHOLD)).unwrap();
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (103, 1));
+    assert!(record(&cs, &hash).is_some());
+    assert_eq!(cs.opreturn_strip_meta(), Some(at(103, THRESHOLD)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Off, the worker does nothing and says so.
+#[test]
+fn a_pass_without_the_option_does_nothing() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    assert_eq!(pass(&cs, 1000), PassReport::default());
+    assert_eq!(cs.opreturn_strip_worker_status(), WorkerStatus::Off);
+    assert_eq!(record(&cs, &blocks[101].block_hash()), None);
+    assert!(!cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -56,6 +56,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getblockchaininfo", "Blockchain"),
     ("getblockcount", "Blockchain"),
     ("getblockfileaudit", "Blockchain"),
+    ("getopreturnpruneinfo", "Blockchain"),
     ("getblockfilter", "Blockchain"),
     ("getblockfrompeer", "Blockchain"),
     ("getblockhash", "Blockchain"),
@@ -3897,6 +3898,16 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
             "warnings": warnings,
         }))
+    })?;
+
+    // `getopreturnpruneinfo` (satd extension, plan §2.13): OP_RETURN pruning
+    // in full. Off the async workers: it stats the block files.
+    module.register_async_method("getopreturnpruneinfo", |params, ctx, _extensions| async move {
+        Args::new(&params).check()?;
+        let chain_state = ctx.chain_state.clone();
+        tokio::task::spawn_blocking(move || crate::rpc::blockchain::opreturn_prune_json(&chain_state, true))
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("task join error: {e}"), None::<()>))
     })?;
 
     module.register_async_method(

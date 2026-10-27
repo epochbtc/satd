@@ -170,6 +170,10 @@ impl Store for SplitStore {
         self.block_store.opreturn_strip_meta()
     }
 
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        self.block_store.for_each_opreturn_strip(f)
+    }
+
     fn chain_tx_backfill_complete(&self) -> bool {
         self.block_store.chain_tx_backfill_complete()
     }
