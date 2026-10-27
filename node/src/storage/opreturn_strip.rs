@@ -631,30 +631,39 @@ pub struct StripMeta {
     pub next_height: u32,
     pub size_threshold: u64,
     pub depth: u32,
+    /// The block examined last, at `next_height - 1`; `None` when
+    /// `next_height` is 0. A reorg that replaces it is how the worker knows
+    /// heights below the cursor hold blocks it has not examined.
+    pub last_hash: Option<BlockHash>,
 }
 
 const META_VERSION: u8 = 1;
+const META_LEN: usize = 49;
 
 impl StripMeta {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(17);
+        let mut out = Vec::with_capacity(META_LEN);
         out.push(META_VERSION);
         out.extend_from_slice(&self.next_height.to_le_bytes());
         out.extend_from_slice(&self.size_threshold.to_le_bytes());
         out.extend_from_slice(&self.depth.to_le_bytes());
+        // All zeros for none: no block hashes to zero.
+        out.extend_from_slice(&self.last_hash.map_or([0; 32], |h| h.to_byte_array()));
         out
     }
 
     /// Strict: an unknown version or a wrong length is `None`, and the worker
     /// then starts its scan over, which only costs time.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 17 || bytes[0] != META_VERSION {
+        if bytes.len() != META_LEN || bytes[0] != META_VERSION {
             return None;
         }
+        let last: [u8; 32] = bytes[17..49].try_into().ok()?;
         Some(Self {
             next_height: u32::from_le_bytes(bytes[1..5].try_into().ok()?),
             size_threshold: u64::from_le_bytes(bytes[5..13].try_into().ok()?),
             depth: u32::from_le_bytes(bytes[13..17].try_into().ok()?),
+            last_hash: (last != [0; 32]).then(|| BlockHash::from_byte_array(last)),
         })
     }
 }

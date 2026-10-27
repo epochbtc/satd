@@ -478,14 +478,21 @@ fn strip_meta_round_trips_and_refuses_what_it_does_not_know() {
         next_height: 912_345,
         size_threshold: 10_240,
         depth: 4320,
+        last_hash: Some(BlockHash::from_byte_array([7; 32])),
     };
     let bytes = meta.encode();
-    assert_eq!(bytes.len(), 17);
+    assert_eq!(bytes.len(), 49);
     assert_eq!(StripMeta::decode(&bytes), Some(meta));
+    let fresh = StripMeta {
+        next_height: 0,
+        last_hash: None,
+        ..meta
+    };
+    assert_eq!(StripMeta::decode(&fresh.encode()), Some(fresh));
     let mut v2 = bytes.clone();
     v2[0] = 2;
     assert_eq!(StripMeta::decode(&v2), None);
-    assert_eq!(StripMeta::decode(&bytes[..16]), None);
+    assert_eq!(StripMeta::decode(&bytes[..48]), None);
 }
 
 /// `bytes_freed_estimate` counts only the whole filesystem blocks a span holds

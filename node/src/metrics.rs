@@ -628,7 +628,8 @@ impl MetricsContext {
         // holds stripped blocks, so a node that never used it exports none.
         if self.chain_state.opreturn_prune_active() {
             let examined = self.chain_state.opreturn_strip_meta().map_or(0, |m| m.next_height);
-            let summary = self.chain_state.opreturn_strip_summary().unwrap_or_default();
+            // On the HTTP task: the totals as last added up, never a CF scan.
+            let summary = self.chain_state.opreturn_strip_summary_last();
             metric(
                 &mut out,
                 "satd_opreturn_strip_examined_height",

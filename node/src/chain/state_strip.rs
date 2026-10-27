@@ -678,10 +678,13 @@ impl ChainState {
             next_height: 0,
             size_threshold: config.size_threshold,
             depth: config.depth,
+            last_hash: None,
         });
         if meta.size_threshold > config.size_threshold {
             meta.next_height = 0;
+            meta.last_hash = None;
         }
+        self.rewind_strip_cursor(&mut meta);
         meta.size_threshold = config.size_threshold;
         meta.depth = config.depth;
 
@@ -702,27 +705,31 @@ impl ChainState {
                     return Ok(());
                 }
                 let h = meta.next_height;
-                if let Some(hash) = self.active_chain_hash_at_height_indexed(h) {
-                    match self.strip_block_inner(&hash, config.size_threshold, true) {
-                        Ok(StripOutcome::Stripped(_) | StripOutcome::Extended(_)) => report.stripped += 1,
-                        Ok(_) => {}
-                        Err(StripError::NotQuiet(why)) => {
-                            *self.strip.worker.lock() = WorkerStatus::Paused(why);
-                            return Ok(());
-                        }
-                        // Not a block to strip (yet), or a stored copy that
-                        // does not verify, which has raised its warning: move
-                        // on rather than wedge the scan on it.
-                        Err(e @ (StripError::UnknownBlock(_)
-                        | StripError::NotActive(_)
-                        | StripError::NotValid { .. }
-                        | StripError::Corrupt { .. })) => {
-                            tracing::debug!(height = h, error = %e, "OP_RETURN strip: skipping block");
-                        }
-                        Err(e) => return Err(e),
+                // The tip fell below `h` since `last` was read: stop, and
+                // examine the block that replaces it on a later pass.
+                let Some(hash) = self.active_chain_hash_at_height_indexed(h) else {
+                    return Ok(());
+                };
+                match self.strip_block_inner(&hash, config.size_threshold, true) {
+                    Ok(StripOutcome::Stripped(_) | StripOutcome::Extended(_)) => report.stripped += 1,
+                    Ok(_) => {}
+                    Err(StripError::NotQuiet(why)) => {
+                        *self.strip.worker.lock() = WorkerStatus::Paused(why);
+                        return Ok(());
                     }
+                    // Not a block to strip (yet), or a stored copy that
+                    // does not verify, which has raised its warning: move
+                    // on rather than wedge the scan on it.
+                    Err(e @ (StripError::UnknownBlock(_)
+                    | StripError::NotActive(_)
+                    | StripError::NotValid { .. }
+                    | StripError::Corrupt { .. })) => {
+                        tracing::debug!(height = h, error = %e, "OP_RETURN strip: skipping block");
+                    }
+                    Err(e) => return Err(e),
                 }
                 meta.next_height = h + 1;
+                meta.last_hash = Some(hash);
                 report.examined += 1;
                 if report.examined % META_EVERY == 0 {
                     self.write_strip_meta(&meta)?;
@@ -737,6 +744,45 @@ impl ChainState {
             let _ = self.opreturn_strip_summary();
         }
         result.map(|()| report)
+    }
+
+    /// Move the cursor back to the fork point when the block it examined last
+    /// is no longer on the active chain: a reorg replaced blocks below it,
+    /// and the ones now at those heights have not been examined. Such a reorg
+    /// never crosses a stripped block (it would be refused), so it only
+    /// costs a rescan of the replaced heights.
+    fn rewind_strip_cursor(&self, meta: &mut opreturn_strip::StripMeta) {
+        let Some(mut hash) = meta.last_hash else {
+            meta.next_height = 0;
+            return;
+        };
+        let Some(mut height) = meta.next_height.checked_sub(1) else {
+            meta.last_hash = None;
+            return;
+        };
+        while !self.active_chain_contains(&hash, height) {
+            match self.get_block_index(&hash) {
+                Some(entry) if height > 0 => {
+                    hash = entry.header.prev_blockhash;
+                    height -= 1;
+                }
+                // Not in the index, or a genesis that is not ours: start over.
+                _ => {
+                    meta.next_height = 0;
+                    meta.last_hash = None;
+                    return;
+                }
+            }
+        }
+        if height + 1 != meta.next_height {
+            tracing::info!(
+                from = meta.next_height,
+                to = height + 1,
+                "OP_RETURN strip: a reorg replaced examined blocks; rescanning from the fork"
+            );
+        }
+        meta.next_height = height + 1;
+        meta.last_hash = Some(hash);
     }
 
     fn write_strip_meta(&self, meta: &opreturn_strip::StripMeta) -> Result<(), StoreError> {

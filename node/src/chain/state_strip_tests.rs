@@ -1088,10 +1088,11 @@ fn a_lowered_threshold_rescans_from_the_bottom() {
         depth: 0,
         size_threshold: THRESHOLD,
     });
-    let at = |next_height, size_threshold| opreturn_strip::StripMeta {
+    let at = |next_height: u32, size_threshold| opreturn_strip::StripMeta {
         next_height,
         size_threshold,
         depth: 0,
+        last_hash: cs.active_chain_hash_at_height_indexed(next_height - 1),
     };
 
     // A pass at most 10 blocks long stops with more to do.
@@ -1140,5 +1141,49 @@ fn an_unreadable_record_still_counts_as_stripped() {
     cs.load_opreturn_strip_state().unwrap();
     assert!(cs.opreturn_prune_active());
     assert_eq!(cs.opreturn_strip_summary().unwrap().blocks, 0, "not counted in the totals");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reorg that replaces blocks below the cursor, none of them stripped,
+/// moves the cursor back to the fork: the blocks now at those heights are
+/// examined, and a large OP_RETURN in one of them is stripped.
+#[test]
+fn a_reorg_below_the_cursor_rescans_from_the_fork() {
+    let (cs, dir) = make_chain_state();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let mut a = Vec::new();
+    for h in 1..=104 {
+        let b = build_test_block(a.last().map_or(genesis, Block::block_hash), h, time(h));
+        connect(&cs, &b);
+        a.push(b);
+    }
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 0,
+        size_threshold: THRESHOLD,
+    });
+    // Tip 104: heights up to 101 examined, nothing to strip.
+    assert_eq!(pass(&cs, 1000).examined, 102);
+    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(a[100].block_hash()));
+
+    // A heavier branch from 100 replaces 101 to 104; its 101 carries a large
+    // OP_RETURN.
+    let mut b = vec![block_on(
+        a[99].block_hash(),
+        101,
+        vec![spend(coinbase_of(&a[0]), vec![ScriptBuf::new(), op_return(BIG, 1)])],
+    )];
+    for h in 102..=106 {
+        b.push(build_test_block(b.last().unwrap().block_hash(), h, time(h) + 1));
+    }
+    for blk in &b {
+        cs.accept_block(blk).expect("accept");
+    }
+    assert_eq!(cs.tip_hash(), b[5].block_hash(), "premise: the branch is active");
+
+    // Tip 106: the pass goes back to 101, examines 101 to 103, strips 101.
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (3, 1));
+    assert!(record(&cs, &b[0].block_hash()).is_some());
+    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(b[2].block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
