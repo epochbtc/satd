@@ -109,19 +109,23 @@ pub struct PinnedRoutes {
     pub asof: AsOf,
 }
 
-/// The `asof` query parameter: `Ok(None)` when absent, `Err` when present
-/// but not a block hash (empty, or not 64 hex characters).
+/// The `asof` query parameter, decoded as a form (`%61sof` is `asof`):
+/// `Ok(None)` when absent, `Err` when present but not a block hash (empty,
+/// or not 64 hex characters) or given more than once.
 fn asof_param(uri: &axum::http::Uri) -> Result<Option<BlockHash>, ()> {
     let Some(query) = uri.query() else {
         return Ok(None);
     };
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key == "asof" {
-            return value.parse::<BlockHash>().map(Some).map_err(|_| ());
-        }
+    let mut values = form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == "asof")
+        .map(|(_, value)| value);
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
     }
-    Ok(None)
+    value.parse::<BlockHash>().map(Some).map_err(|_| ())
 }
 
 fn not_found() -> Response {
@@ -139,9 +143,16 @@ pub async fn refuse_asof(req: Request, next: Next) -> Response {
 
 /// The pin for `?asof=<hash>`: the block, if it is on the best chain at or
 /// below `view`'s tip.
+///
+/// Membership is the height index row alone, two point reads, as
+/// [`Pin::hash_at_height`] reads it. `ChainState::active_chain_contains`
+/// would walk parent pointers back from the tip for a hash the row does not
+/// name, and this runs on the async worker for any hash a client sends: a
+/// stale block deep in the chain would cost one read per block above it.
 fn asof_pin(chain: &ChainState, view: &ChainView, hash: BlockHash) -> Option<Pin> {
     let entry = chain.get_block_index(&hash)?;
-    if entry.height > view.tip_height || !chain.active_chain_contains(&hash, entry.height) {
+    if entry.height > view.tip_height || chain.get_block_hash_by_height(entry.height) != Some(hash)
+    {
         return None;
     }
     Some(Pin {
@@ -454,6 +465,10 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], format!("{one} 1 false").as_bytes());
 
+        // The key is decoded as a form decodes it.
+        let resp = get_path(&pins, &format!("/probe?%61sof={one}")).await;
+        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(one.to_string().as_str()));
+
         let resp = get_path(&pins, "/probe?other=1").await;
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], format!("{two} 2 true").as_bytes(), "no asof: the live tip");
@@ -467,6 +482,7 @@ mod tests {
             format!("asof={}", side.block_hash()),
             "asof=".to_string(),
             "asof=nothex".to_string(),
+            format!("asof={one}&asof={one}"),
         ] {
             let resp = get_path(&pins, &format!("/probe?{query}")).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{query}");

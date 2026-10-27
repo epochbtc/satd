@@ -1558,6 +1558,7 @@ dependencies = [
  "axum-test",
  "base64 0.22.1",
  "bitcoin",
+ "form_urlencoded",
  "futures-util",
  "hex",
  "hyper",

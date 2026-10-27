@@ -14,6 +14,7 @@ hyper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+form_urlencoded = "1"
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
