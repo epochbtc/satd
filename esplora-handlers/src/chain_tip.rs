@@ -51,49 +51,8 @@ pub const CHAIN_TIP_HEADER: HeaderName = HeaderName::from_static("x-bitcoin-chai
 pub const CHAIN_TIP_HEIGHT_HEADER: HeaderName =
     HeaderName::from_static("x-bitcoin-chain-tip-height");
 
-/// How many runs a request gets before a chain that retreated under every
-/// one is answered with 503. The same budget as `ChainState::coherent_read`.
-pub const VIEW_ATTEMPTS: usize = 8;
-
-/// How long to wait for a chain mutation in flight to finish, before a run
-/// and after one, as `ChainState::coherent_read` waits.
-const VIEW_WAIT: Duration = Duration::from_millis(500);
-
-/// The body of the 503 for a chain that retreated under every run.
-pub const CHAIN_VIEW_MOVED: &str = "chain view moved";
-
-/// The block a chain route answers for. Every chain read the handler makes
-/// is bounded to it: nothing above `height` is confirmed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pin {
-    pub hash: BlockHash,
-    pub height: u32,
-    /// The answer includes the mempool: a live request pinned to the tip.
-    /// `false` for `?asof=`, which answers with confirmed data only, and
-    /// treats a transaction confirmed above the pin as unknown rather than
-    /// unconfirmed.
-    pub mempool: bool,
-}
-
-impl Pin {
-    /// A block at `height` is confirmed as of this pin.
-    pub fn covers(&self, height: u32) -> bool {
-        height <= self.height
-    }
-
-    /// The pinned chain's block at `height`, from the height index. The
-    /// index row for a height at or below the pin is the pinned chain's
-    /// until a disconnect, which reruns the request.
-    pub fn hash_at_height(&self, chain: &ChainState, height: u32) -> Option<BlockHash> {
-        if !self.covers(height) {
-            return None;
-        }
-        if height == self.height {
-            return Some(self.hash);
-        }
-        chain.get_block_hash_by_height(height)
-    }
-}
+pub use node::chain::pin::{CHAIN_VIEW_MOVED, Pin, VIEW_ATTEMPTS, VIEW_WAIT};
+use node::chain::pin::asof_pin;
 
 /// Whether a pinned route takes `?asof=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,27 +100,6 @@ pub async fn refuse_asof(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// The pin for `?asof=<hash>`: the block, if it is on the best chain at or
-/// below `view`'s tip.
-///
-/// Membership is the height index row alone, two point reads, as
-/// [`Pin::hash_at_height`] reads it. `ChainState::active_chain_contains`
-/// would walk parent pointers back from the tip for a hash the row does not
-/// name, and this runs on the async worker for any hash a client sends: a
-/// stale block deep in the chain would cost one read per block above it.
-fn asof_pin(chain: &ChainState, view: &ChainView, hash: BlockHash) -> Option<Pin> {
-    let entry = chain.get_block_index(&hash)?;
-    if entry.height > view.tip_height || chain.get_block_hash_by_height(entry.height) != Some(hash)
-    {
-        return None;
-    }
-    Some(Pin {
-        hash,
-        height: entry.height,
-        mempool: false,
-    })
-}
-
 /// Run the request pinned to the current tip, or to its `?asof=` block, and
 /// stamp the block it was pinned to.
 pub async fn stamp_chain_tip(
@@ -189,11 +127,7 @@ pub async fn stamp_chain_tip(
                 Some(pin) => pin,
                 None => return not_found(),
             },
-            None => Pin {
-                hash: view.tip_hash,
-                height: view.tip_height,
-                mempool: true,
-            },
+            None => Pin::at_tip(&view),
         };
         // Every pinned route is a GET, whose handler reads no body. A rerun
         // gets an empty one; the first run keeps whatever was sent.

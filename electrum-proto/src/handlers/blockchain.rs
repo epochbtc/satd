@@ -14,10 +14,13 @@
 //! response. The push-notification side lives in PR-4
 //! ([`crate::subscribe`]).
 
-use bitcoin::OutPoint;
-use bitcoin::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use node_index::{capped_history_rows, mempool_history_rows, scripthash_of};
+use bitcoin::{OutPoint, Transaction, Txid};
+use node::chain::pin::Pin;
+use node_index::{
+    HistoryEntry, HistoryRow, capped_history_rows, mempool_history_rows, scripthash_of,
+    sort_mempool_rows,
+};
 use serde_json::{Value, json};
 
 use crate::dispatch::{require_array, require_array_range};
@@ -26,8 +29,8 @@ use crate::merkle::compute_merkle_branch;
 use crate::state::ElectrumState;
 use crate::status::{compute_status_hash, mempool_facts, status_hash_to_json};
 use crate::types::{
-    BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
-    ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
+    BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse,
+    HistoryEntry as WireHistoryEntry, ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
 };
 
 // ── blockchain.headers.* ──────────────────────────────────────────
@@ -122,7 +125,11 @@ pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, Json
 
 // ── blockchain.scripthash.* ───────────────────────────────────────
 
-pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+pub fn scripthash_get_history(
+    state: &ElectrumState,
+    params: Value,
+    pin: &Pin,
+) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_history")?;
     let cap = state.config.max_history_entries;
 
@@ -143,12 +150,13 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
         mempool_facts(mempool, txid)
     })
     .map_err(JsonRpcError::from_index)?;
+    let rows = unconfirm_late_rows(state, rows, pin);
 
     // `fee` (sats) is set on mempool rows only, from the live mempool
     // entry, which pre-computes it at admission.
-    let out: Vec<HistoryEntry> = rows
+    let out: Vec<WireHistoryEntry> = rows
         .into_iter()
-        .map(|r| HistoryEntry {
+        .map(|r| WireHistoryEntry {
             height: r.height,
             tx_hash: TxidHex(r.txid),
             fee: r.fee_sat,
@@ -158,7 +166,128 @@ pub fn scripthash_get_history(state: &ElectrumState, params: Value) -> Result<Va
     Ok(serde_json::to_value(&out).unwrap())
 }
 
-pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+/// `rows` as of the pin: a transaction confirmed above it was unconfirmed
+/// when the request started, so it leaves the confirmed part and joins the
+/// mempool part, in that part's order, with the height and fee
+/// [`late_tx_facts`] gives it.
+///
+/// `capped_history_rows` lists confirmed rows (no fee) then mempool rows
+/// (each with its fee), so the fee tells the two apart.
+fn unconfirm_late_rows(state: &ElectrumState, rows: Vec<HistoryRow>, pin: &Pin) -> Vec<HistoryRow> {
+    let (mut mempool, confirmed): (Vec<HistoryRow>, Vec<HistoryRow>) =
+        rows.into_iter().partition(|r| r.fee_sat.is_some());
+    let (late, mut out): (Vec<HistoryRow>, Vec<HistoryRow>) = confirmed
+        .into_iter()
+        .partition(|r| r.height > i64::from(pin.height));
+    if late.is_empty() {
+        out.extend(mempool);
+        return out;
+    }
+    for row in late {
+        // A transaction leaves the mempool as it confirms, but the mempool
+        // part was read after the confirmed part.
+        if mempool.iter().any(|m| m.txid == row.txid) {
+            continue;
+        }
+        let (height, fee_sat) = late_tx_facts(state, &row.txid, pin);
+        mempool.push(HistoryRow {
+            height,
+            txid: row.txid,
+            fee_sat,
+        });
+    }
+    sort_mempool_rows(&mut mempool);
+    out.extend(mempool);
+    out
+}
+
+/// What a transaction confirmed above the pin was as of the pin: its
+/// Electrum mempool height, `-1` when it spends a transaction that was also
+/// unconfirmed then (in the mempool, or confirmed above the pin too) and
+/// `0` otherwise, and its fee when every parent can be read. A transaction
+/// the txindex cannot return is height `0` with no fee.
+fn late_tx_facts(state: &ElectrumState, txid: &Txid, pin: &Pin) -> (i64, Option<u64>) {
+    let read = |txid: &Txid| -> Option<Transaction> {
+        deserialize(&state.electrum_extras.raw_tx(txid)?).ok()
+    };
+    let Some(tx) = read(txid) else {
+        return (0, None);
+    };
+    if tx.is_coinbase() {
+        return (0, None);
+    }
+    let mut unconfirmed_parent = false;
+    let mut input_sum = Some(0u64);
+    for input in &tx.input {
+        let prev = input.previous_output;
+        if state.mempool.get(&prev.txid).is_some() {
+            unconfirmed_parent = true;
+        } else if let Some(c) = state.electrum_extras.confirmation(&prev.txid)
+            && !pin.covers(c.height)
+        {
+            unconfirmed_parent = true;
+        }
+        let value = read(&prev.txid)
+            .and_then(|parent| parent.output.get(prev.vout as usize).map(|o| o.value.to_sat()));
+        input_sum = input_sum.zip(value).and_then(|(sum, v)| sum.checked_add(v));
+    }
+    let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = input_sum.and_then(|sum| sum.checked_sub(output_sum));
+    (if unconfirmed_parent { -1 } else { 0 }, fee)
+}
+
+/// Whether `sh` has a transaction confirmed above the pin: one read of the
+/// newest confirmed transaction.
+fn confirmed_above(state: &ElectrumState, sh: &node_index::Scripthash, pin: &Pin) -> Result<bool, JsonRpcError> {
+    let newest = state
+        .address_index
+        .confirmed_txs_newest_first(sh, None, 1)
+        .map_err(JsonRpcError::from_index)?;
+    Ok(newest
+        .and_then(|page| page.first().copied())
+        .is_some_and(|(height, _)| !pin.covers(height)))
+}
+
+/// The confirmed balance as of the pin, from the history: what was funded
+/// at or below it and not spent at or below it.
+fn confirmed_balance_at(history: &[HistoryEntry], pin: &Pin) -> u64 {
+    let spent: std::collections::HashSet<OutPoint> = history
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Spending {
+                height,
+                prev_outpoint,
+                ..
+            } if pin.covers(*height) => Some(*prev_outpoint),
+            _ => None,
+        })
+        .collect();
+    history
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Funding {
+                height,
+                txid,
+                vout,
+                amount_sat,
+            } if pin.covers(*height)
+                && !spent.contains(&OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                }) =>
+            {
+                Some(*amount_sat)
+            }
+            _ => None,
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+pub fn scripthash_get_balance(
+    state: &ElectrumState,
+    params: Value,
+    pin: &Pin,
+) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_balance")?;
     // The confirmed balance is summed over every funding row, so its cost
     // follows the history. Refuse a history over the cap first, as Fulcrum
@@ -172,6 +301,29 @@ pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Va
         .address_index
         .balance(&sh.0)
         .map_err(JsonRpcError::from_index)?;
+    // Read after the balance, so a block that connected before it shows up
+    // here. Normally nothing has confirmed above the pin, and the live
+    // balance is the answer.
+    if !confirmed_above(state, &sh.0, pin)? {
+        return Ok(serde_json::to_value(BalanceResponse {
+            confirmed,
+            unconfirmed,
+        })
+        .unwrap());
+    }
+    // What confirmed above the pin was unconfirmed as of it: the confirmed
+    // balance is the history's at the pin, and the difference moves to the
+    // unconfirmed delta. A transaction counted in the live balance as
+    // either confirmed or unconfirmed is counted once either way.
+    let history = state
+        .address_index
+        .confirmed_history(&sh.0)
+        .map_err(JsonRpcError::from_index)?;
+    let at_pin = confirmed_balance_at(&history, pin);
+    let unconfirmed = unconfirmed
+        .saturating_add(i64::try_from(confirmed).unwrap_or(i64::MAX))
+        .saturating_sub(i64::try_from(at_pin).unwrap_or(i64::MAX));
+    let confirmed = at_pin;
     Ok(serde_json::to_value(BalanceResponse {
         confirmed,
         unconfirmed,
@@ -179,7 +331,11 @@ pub fn scripthash_get_balance(state: &ElectrumState, params: Value) -> Result<Va
     .unwrap())
 }
 
-pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+pub fn scripthash_listunspent(
+    state: &ElectrumState,
+    params: Value,
+    pin: &Pin,
+) -> Result<Value, JsonRpcError> {
     let sh = parse_scripthash(&params, "blockchain.scripthash.listunspent")?;
     // Round-1 review M4: bound the index walk at cap + 1 UTXOs.
     let cap = state.config.max_history_entries;
@@ -208,26 +364,42 @@ pub fn scripthash_listunspent(state: &ElectrumState, params: Value) -> Result<Va
     // start with confirmed UTXOs, drop any that are spent by a mempool
     // tx, then add mempool tx outputs that fund this scripthash and
     // aren't themselves yet spent in the mempool.
+    //
+    // A UTXO created above the pin was an unconfirmed output as of it, and
+    // is listed after the confirmed ones with its creating transaction's
+    // mempool height. One spent above the pin is gone from the coin set: as
+    // of the pin it had an unconfirmed spend, and a confirmed output with a
+    // mempool spend is not listed.
     let mempool = state.mempool.as_ref();
-    let mut out: Vec<ListUnspentEntry> = utxos
-        .into_iter()
-        .filter(|u| {
-            // Drop confirmed UTXOs whose outpoint is consumed by a
-            // mempool spend — wallets shouldn't see them as spendable.
-            mempool
-                .spending_tx(&OutPoint {
-                    txid: u.txid,
-                    vout: u.vout,
-                })
-                .is_none()
-        })
-        .map(|u| ListUnspentEntry {
+    let (mut out, mut late): (Vec<ListUnspentEntry>, Vec<ListUnspentEntry>) = (Vec::new(), Vec::new());
+    for u in utxos {
+        // Drop confirmed UTXOs whose outpoint is consumed by a
+        // mempool spend — wallets shouldn't see them as spendable.
+        if mempool
+            .spending_tx(&OutPoint {
+                txid: u.txid,
+                vout: u.vout,
+            })
+            .is_some()
+        {
+            continue;
+        }
+        let entry = ListUnspentEntry {
             height: u.height as i64,
             tx_hash: TxidHex(u.txid),
             tx_pos: u.vout,
             value: u.amount_sat,
-        })
-        .collect();
+        };
+        if pin.covers(u.height) {
+            out.push(entry);
+        } else {
+            late.push(ListUnspentEntry {
+                height: late_tx_facts(state, &u.txid, pin).0,
+                ..entry
+            });
+        }
+    }
+    out.extend(late);
 
     // Mempool funding additions. Round-2 review M2: cap-check on
     // every push so a single unconfirmed tx with many outputs to
@@ -273,12 +445,12 @@ pub fn scripthash_get_mempool(state: &ElectrumState, params: Value) -> Result<Va
     let sh = parse_scripthash(&params, "blockchain.scripthash.get_mempool")?;
     // The mempool part of `get_history`, in the same order.
     let mempool = state.mempool.as_ref();
-    let out: Vec<HistoryEntry> =
+    let out: Vec<WireHistoryEntry> =
         mempool_history_rows(state.address_index.as_ref(), &sh.0, |txid| {
             mempool_facts(mempool, txid)
         })
         .into_iter()
-        .map(|r| HistoryEntry {
+        .map(|r| WireHistoryEntry {
             height: r.height,
             tx_hash: TxidHex(r.txid),
             fee: r.fee_sat,
@@ -343,7 +515,7 @@ pub fn scripthash_unsubscribe(
 
 // ── blockchain.transaction.* ──────────────────────────────────────
 
-pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Result<Value, JsonRpcError> {
     // `(txid, [verbose])` — `verbose=false` (default) returns the hex
     // string. `verbose=true` returns the full JSON shape Bitcoin Core
     // produces for `getrawtransaction <txid> 1`, which is what
@@ -365,13 +537,17 @@ pub fn transaction_get(state: &ElectrumState, params: Value) -> Result<Value, Js
         } else if let Some(raw) = state.electrum_extras.raw_tx(&txid) {
             let parsed: Transaction = deserialize(&raw)
                 .map_err(|e| JsonRpcError::internal(format!("stored tx decode failed: {e}")))?;
-            let confirmation = state.electrum_extras.confirmation(&txid);
-            let tip = state.chain.tip_height();
+            // A transaction confirmed above the pin was unconfirmed as of it,
+            // and has no block yet.
+            let confirmation = state
+                .electrum_extras
+                .confirmation(&txid)
+                .filter(|c| pin.covers(c.height));
             let location = confirmation.map(|c| TxLocation {
                 block_hash: c.block_hash,
                 height: c.height,
                 block_time: c.block_time,
-                confirmations: tip.saturating_sub(c.height).saturating_add(1),
+                confirmations: pin.height.saturating_sub(c.height).saturating_add(1),
             });
             (parsed, location)
         } else {
@@ -538,14 +714,23 @@ fn script_type_label(script: &bitcoin::Script) -> &'static str {
     }
 }
 
-pub fn transaction_get_merkle(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+pub fn transaction_get_merkle(
+    state: &ElectrumState,
+    params: Value,
+    pin: &Pin,
+) -> Result<Value, JsonRpcError> {
     // `(txid, [height])` — `height` is optional and used only as a
     // sanity hint by some clients; we recompute the proof anyway.
     let arr = require_array_range(&params, 1, 2, "blockchain.transaction.get_merkle")?;
     let txid = parse_txid_hex(&arr[0])?;
-    let proof = state.electrum_extras.tx_merkle(&txid).ok_or_else(|| {
-        JsonRpcError::bad_request(format!("tx {txid} is not confirmed or not indexed"))
-    })?;
+    // A transaction confirmed above the pin was not confirmed as of it.
+    let proof = state
+        .electrum_extras
+        .tx_merkle(&txid)
+        .filter(|p| pin.covers(p.height))
+        .ok_or_else(|| {
+            JsonRpcError::bad_request(format!("tx {txid} is not confirmed or not indexed"))
+        })?;
     let resp = GetMerkleResponse {
         merkle: proof
             .branch
@@ -682,15 +867,18 @@ pub fn transaction_broadcast_package(
 pub fn transaction_id_from_pos(
     state: &ElectrumState,
     params: Value,
+    pin: &Pin,
 ) -> Result<Value, JsonRpcError> {
     // `(height, tx_pos, [merkle])` — `merkle=true` adds the proof.
     let arr = require_array_range(&params, 2, 3, "blockchain.transaction.id_from_pos")?;
     let height = parse_height(&arr[0])?;
     let tx_pos = parse_u32(&arr[1], "tx_pos")?;
     let merkle = arr.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
-    let txid = state
-        .electrum_extras
-        .txid_at_pos(height, tx_pos)
+    // A block above the pin had not connected as of it.
+    let txid = pin
+        .covers(height)
+        .then(|| state.electrum_extras.txid_at_pos(height, tx_pos))
+        .flatten()
         .ok_or_else(|| {
             JsonRpcError::bad_request(format!("no tx at height={height} pos={tx_pos}"))
         })?;
@@ -698,9 +886,8 @@ pub fn transaction_id_from_pos(
         return Ok(Value::String(txid.to_string()));
     }
     // merkle=true: include the branch alongside the txid.
-    let block_hash = state
-        .chain
-        .get_block_hash_by_height(height)
+    let block_hash = pin
+        .hash_at_height(&state.chain, height)
         .ok_or_else(|| JsonRpcError::internal("height resolved txid but not block hash"))?;
     let block = state
         .chain
@@ -840,6 +1027,10 @@ pub(crate) fn fee_histogram_buckets(
 #[cfg(test)]
 #[path = "blockchain_historycap_tests.rs"]
 mod historycap_tests;
+
+#[cfg(test)]
+#[path = "blockchain_pin_tests.rs"]
+mod pin_tests;
 
 #[cfg(test)]
 mod tests {

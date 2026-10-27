@@ -136,6 +136,12 @@ item below is (or will be) written up in full in the in-development
   routes: the answer as of a block still on the best chain, with no mempool.
   Same parameter and rules as rbitcoin.
 
+- Electrum `blockchain.scripthash.get_history`, `get_balance`,
+  `listunspent` and `blockchain.transaction.get`, `get_merkle`,
+  `id_from_pos` answer for the tip each request started at, and name it in
+  `chain_tip` / `chain_tip_height` members, as rbitcoin does.
+  `server.version` also accepts rbitcoin's `1.4.2-asof`.
+
 ### Fixed
 
 - The address index built by a backfill (`-addressindex` turned on for an

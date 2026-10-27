@@ -10,6 +10,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use node::chain::pin::{Pin, Pinned};
+
 use crate::error::JsonRpcError;
 use crate::extras::ElectrumExtras;
 use crate::handlers;
@@ -102,6 +104,17 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// The block the answer was read at, display hex: rbitcoin's
+    /// `chain_tip` member. Set on every answer of a
+    /// [stamped](STAMPED_METHODS) method, on every connection, as rbitcoin
+    /// sets it; absent on errors and on every other method. A client that
+    /// does not know the member ignores it, as JSON-RPC clients ignore
+    /// members they do not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_tip: Option<String>,
+    /// That block's height (`chain_tip_height`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_tip_height: Option<u32>,
 }
 
 impl Response {
@@ -111,6 +124,8 @@ impl Response {
             id,
             result: Some(result),
             error: None,
+            chain_tip: None,
+            chain_tip_height: None,
         }
     }
 
@@ -120,7 +135,16 @@ impl Response {
             id,
             result: None,
             error: Some(err),
+            chain_tip: None,
+            chain_tip_height: None,
         }
+    }
+
+    /// Name the block the answer was read at.
+    fn stamped(mut self, pin: &Pin) -> Self {
+        self.chain_tip = Some(pin.hash.to_string());
+        self.chain_tip_height = Some(pin.height);
+        self
     }
 }
 
@@ -156,7 +180,69 @@ impl Notification {
 pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
     let params = req.params.unwrap_or(Value::Array(Vec::new()));
-    let outcome: Result<Value, JsonRpcError> = match req.method.as_str() {
+    if STAMPED_METHODS.contains(&req.method.as_str()) {
+        return dispatch_pinned(state, id, &req.method, &params);
+    }
+    dispatch_unpinned(state, id, &req.method, params)
+}
+
+/// The methods whose answers read the chain at one block: each runs pinned
+/// to the tip it starts at (see [`node::chain::pin`]), and its answer names
+/// that block in `chain_tip` / `chain_tip_height`. rbitcoin stamps the same
+/// methods, plus `id_from_pos` here.
+pub const STAMPED_METHODS: &[&str] = &[
+    "blockchain.scripthash.get_history",
+    "blockchain.scripthash.get_balance",
+    "blockchain.scripthash.listunspent",
+    "blockchain.transaction.get",
+    "blockchain.transaction.get_merkle",
+    "blockchain.transaction.id_from_pos",
+];
+
+/// The error for a chain that retreated under every run of a pinned method.
+fn chain_view_moved() -> JsonRpcError {
+    JsonRpcError::bad_request(node::chain::pin::CHAIN_VIEW_MOVED)
+}
+
+/// Run a [stamped](STAMPED_METHODS) method pinned to the tip it starts at:
+/// the answer reads nothing confirmed above that tip, and a disconnect
+/// while it runs reruns it. The response names the pinned block.
+fn dispatch_pinned(state: &ElectrumState, id: Value, method: &str, params: &Value) -> Response {
+    let run = node::chain::pin::run_pinned(&state.chain, None, |pin| {
+        let params = params.clone();
+        match method {
+            "blockchain.scripthash.get_history" => {
+                handlers::blockchain::scripthash_get_history(state, params, pin)
+            }
+            "blockchain.scripthash.get_balance" => {
+                handlers::blockchain::scripthash_get_balance(state, params, pin)
+            }
+            "blockchain.scripthash.listunspent" => {
+                handlers::blockchain::scripthash_listunspent(state, params, pin)
+            }
+            "blockchain.transaction.get" => {
+                handlers::blockchain::transaction_get(state, params, pin)
+            }
+            "blockchain.transaction.get_merkle" => {
+                handlers::blockchain::transaction_get_merkle(state, params, pin)
+            }
+            "blockchain.transaction.id_from_pos" => {
+                handlers::blockchain::transaction_id_from_pos(state, params, pin)
+            }
+            other => unreachable!("{other} is not a stamped method"),
+        }
+    });
+    match run {
+        Pinned::Answered(Ok(result), pin) => Response::success(id, result).stamped(&pin),
+        Pinned::Answered(Err(err), _) => Response::error(id, err),
+        // A live run has no asof block to lose.
+        Pinned::NotOnChain | Pinned::Moved => Response::error(id, chain_view_moved()),
+    }
+}
+
+/// The rest of [`dispatch`]: the methods that are not pinned.
+fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Value) -> Response {
+    let outcome: Result<Value, JsonRpcError> = match method {
         // server.*
         "server.version" => handlers::server_methods::version(state, params),
         "server.ping" => handlers::server_methods::ping(),
@@ -174,15 +260,6 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         "blockchain.block.headers" => handlers::blockchain::block_headers(state, params),
 
         // blockchain.scripthash.*
-        "blockchain.scripthash.get_history" => {
-            handlers::blockchain::scripthash_get_history(state, params)
-        }
-        "blockchain.scripthash.get_balance" => {
-            handlers::blockchain::scripthash_get_balance(state, params)
-        }
-        "blockchain.scripthash.listunspent" => {
-            handlers::blockchain::scripthash_listunspent(state, params)
-        }
         "blockchain.scripthash.get_mempool" => {
             handlers::blockchain::scripthash_get_mempool(state, params)
         }
@@ -206,18 +283,11 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         }
 
         // blockchain.transaction.*
-        "blockchain.transaction.get" => handlers::blockchain::transaction_get(state, params),
-        "blockchain.transaction.get_merkle" => {
-            handlers::blockchain::transaction_get_merkle(state, params)
-        }
         "blockchain.transaction.broadcast" => {
             handlers::blockchain::transaction_broadcast(state, params)
         }
         "blockchain.transaction.broadcast_package" => {
             handlers::blockchain::transaction_broadcast_package(state, params)
-        }
-        "blockchain.transaction.id_from_pos" => {
-            handlers::blockchain::transaction_id_from_pos(state, params)
         }
 
         // fees
