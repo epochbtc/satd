@@ -219,8 +219,9 @@ fn unconfirm_late_rows(state: &ElectrumState, rows: Vec<HistoryRow>, pin: &Pin) 
     }
     let mut facts = LateFacts::new(state, pin);
     for row in late {
-        // A transaction leaves the mempool as it confirms, but the mempool
-        // part was read after the confirmed part.
+        // The mempool part was read first (`pinned_history_rows`), so a
+        // transaction that confirmed between the two reads is in both: it
+        // keeps its mempool row, which has its fee.
         if mempool.iter().any(|m| m.txid == row.txid) {
             continue;
         }
