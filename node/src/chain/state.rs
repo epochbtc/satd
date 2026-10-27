@@ -4953,7 +4953,7 @@ impl ChainState {
         let Some(data) = self.read_block_bytes_direct(pos) else {
             return Ok(None);
         };
-        match opreturn_strip::decode_for_replay(&*self.store, data, hash) {
+        match opreturn_strip::decode_for_replay(&*self.store, data, hash, &self.blocks_xor_key) {
             Ok(stored) => Ok(Some(stored)),
             Err(opreturn_strip::ReplayReadError::Deserialize(e)) => {
                 tracing::warn!(
@@ -10647,8 +10647,14 @@ fn unreplayable_record(
         error = %e,
         "reindex: cannot replay a block whose OP_RETURN data is stripped"
     );
+    // `getblockfrompeer` needs a running node, which a failed
+    // `-reindex-chainstate` leaves behind it: its rebuild marker refuses a
+    // plain start. `-reindex` stops at this block instead, and the node then
+    // fetches it again from peers; a fresh copy supersedes the record.
     ChainError::FlatFile(format!(
-        "block {hash} at height {height}: {e}; re-download it with getblockfrompeer"
+        "block {hash} at height {height}: {e}. Restart with -reindex, which stops at \
+         this block and fetches it again from peers, or restore it with getblockfrompeer \
+         on a running node"
     ))
 }
 

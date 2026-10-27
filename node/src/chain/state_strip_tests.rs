@@ -873,3 +873,30 @@ fn a_reindex_indexes_a_stripped_side_chain_block() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A stripped block whose record was lost is a strip-record error on
+/// replay, not a block that fails validation.
+#[test]
+fn a_replay_names_a_lost_strip_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+    let plan = rewind(&cs);
+    for height in 1..=101u32 {
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+    }
+    match cs.reindex_connect_direct(&plan, 102, hash) {
+        Err(ChainError::FlatFile(msg)) => {
+            assert!(msg.contains("strip record is missing") && msg.contains("-reindex"), "{msg}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

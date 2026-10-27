@@ -129,7 +129,7 @@ pub fn prefetch_block(
     // read, which stops the replay with the error.
     let stored = if plan.is_some() {
         let bytes = read_bytes_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
-        match opreturn_strip::decode_for_replay(store, bytes, &hash) {
+        match opreturn_strip::decode_for_replay(store, bytes, &hash, blocks_xor_key) {
             Ok(stored) => stored,
             Err(e) => {
                 tracing::debug!(height, block = %hash, error = %e, "prefetch: deferring to the direct read");
