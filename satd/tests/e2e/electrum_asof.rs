@@ -167,6 +167,17 @@ fn test_e2e_electrum_trailing_asof_answers_as_of_an_ancestor() {
     assert_eq!(v["error"]["message"], "asof not on chain", "{v}");
     let v = call(&mut cli, 11, "blockchain.scripthash.get_mempool", json!([sh_w, tag]));
     assert!(v.get("error").is_some(), "{v}");
+    // A transaction only in the mempool: found live, not as of any block.
+    let (raw, pending) =
+        build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &w, 2, dest.script_pubkey(), 1_000);
+    let v = call(&mut cli, 13, "blockchain.transaction.broadcast", json!([raw]));
+    assert_eq!(v["result"], pending.as_str(), "{v}");
+    let v = call(&mut cli, 14, "blockchain.transaction.get", json!([pending]));
+    assert!(v["result"].is_string(), "{v}");
+    let now = format!("asof:{}", best(&e2e));
+    let v = call(&mut cli, 15, "blockchain.transaction.get", json!([pending, now]));
+    assert!(v.get("error").is_some(), "the mempool is not part of an asof answer: {v}");
+
     let v = call(&mut cli, 12, "server.features", json!([]));
     assert_eq!(v["result"]["asof"], true);
     assert_eq!(v["result"]["asof_protocol"], "1.4.2-asof");
