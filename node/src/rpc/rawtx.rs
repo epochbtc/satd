@@ -7,6 +7,7 @@ use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use crate::storage::Store;
+use crate::storage::opreturn_strip::StoredBlock;
 use serde_json::{json, Value};
 
 /// Parse a JSON value as f64, handling both float and integer representations.
@@ -121,12 +122,13 @@ pub fn get_raw_transaction(
             .get_block_index(&block_hash)
             .ok_or((-5, "Block hash not found".to_string()))?;
 
-        let block = chain_state
-            .get_block(&block_hash)
+        let stored = chain_state
+            .get_stored_block(&block_hash)
             .ok_or((-1, "Block not available (pruned data)".to_string()))?;
 
-        for (tx_idx, tx) in block.txdata.iter().enumerate() {
-            if tx.compute_txid() == txid {
+        // Stored txids: a stripped transaction's are in its strip record.
+        for (tx_idx, stored_txid) in stored.txids().into_iter().enumerate() {
+            if stored_txid == txid {
                 return if verbose {
                     let confirmations = confirmations_for(chain_state, &block_hash, entry.height);
                     let ctx = TxBlockContext {
@@ -134,14 +136,13 @@ pub fn get_raw_transaction(
                         active: (confirmations > 0).then_some((confirmations, entry.header.time)),
                     };
                     let mut result =
-                        confirmed_tx_verbose(chain_state, tx, tx_idx, &block, &ctx, verbosity)?;
+                        confirmed_tx_verbose(chain_state, &stored, tx_idx, &ctx, verbosity)?;
                     // `in_active_chain` is only present when the caller
                     // explicitly provided a blockhash.
                     result["in_active_chain"] = json!(ctx.active.is_some());
                     Ok(result)
                 } else {
-                    let raw = bitcoin::consensus::serialize(tx);
-                    Ok(Value::String(hex::encode(raw)))
+                    stored_tx_hex(&stored, tx_idx)
                 };
             }
         }
@@ -163,20 +164,24 @@ pub fn get_raw_transaction(
     // warning (same shape, same `getblockfrompeer` remedy as an unreadable
     // block) and answer "not found" rather than returning the wrong
     // transaction under the requested txid.
+    //
+    // The check compares against the stored txid, so a stripped
+    // transaction, whose filled bytes hash to something else, is not
+    // reported as a mismatch.
     if chain_state.store_ref().has_txindex()
         && let Some((block_hash, tx_idx)) = chain_state.locate_tx(&txid)
-        && let Some(block) = chain_state.get_block(&block_hash)
+        && let Some(stored) = chain_state.get_stored_block(&block_hash)
     {
-        match block.txdata.get(tx_idx) {
-            Some(tx) if tx.compute_txid() == txid => {
+        let at = (tx_idx < stored.block.txdata.len()).then(|| stored.txid(tx_idx));
+        match at {
+            Some(found) if found == txid => {
                 return if verbose {
                     match TxBlockContext::new(chain_state, block_hash) {
-                        Some(ctx) => confirmed_tx_verbose(chain_state, tx, tx_idx, &block, &ctx, verbosity),
-                        None => Ok(decode_transaction_verbose_net(tx, None, None, false, true, chain_state.network)),
+                        Some(ctx) => confirmed_tx_verbose(chain_state, &stored, tx_idx, &ctx, verbosity),
+                        None => Ok(stored_tx_verbose(&stored, tx_idx, None, None, false, chain_state.network)),
                     }
                 } else {
-                    let raw = bitcoin::consensus::serialize(tx);
-                    Ok(Value::String(hex::encode(raw)))
+                    stored_tx_hex(&stored, tx_idx)
                 };
             }
             other => {
@@ -186,8 +191,8 @@ pub fn get_raw_transaction(
                         "transaction index places {txid} at position {tx_idx}, where the \
                          block holds {}",
                         match other {
-                            Some(tx) => tx.compute_txid().to_string(),
-                            None => format!("nothing ({} transactions)", block.txdata.len()),
+                            Some(found) => found.to_string(),
+                            None => format!("nothing ({} transactions)", stored.block.txdata.len()),
                         }
                     ),
                 );
@@ -544,28 +549,83 @@ pub(crate) fn decode_transaction_verbose_net(
     result
 }
 
-/// `getrawtransaction` at `verbosity` for `tx`, found in `block`: verbosity
-/// 2 adds the fee and the prevouts from the block's undo data, as Core's
-/// does. Errs when the undo data is there but does not match the block.
+/// `getrawtransaction` at `verbosity` for transaction `tx_idx` of `stored`:
+/// verbosity 2 adds the fee and the prevouts from the block's undo data, as
+/// Core's does. Errs when the undo data is there but does not match the
+/// block.
 fn confirmed_tx_verbose(
     chain_state: &ChainState,
-    tx: &bitcoin::Transaction,
+    stored: &StoredBlock,
     tx_idx: usize,
-    block: &bitcoin::Block,
     ctx: &TxBlockContext,
     verbosity: u32,
 ) -> Result<Value, (i32, String)> {
-    let undo = if verbosity >= 2 && !tx.is_coinbase() {
+    let undo = if verbosity >= 2 && !stored.block.txdata[tx_idx].is_coinbase() {
         chain_state.read_undo(&ctx.blockhash).map_err(|_| (-32603, UNDO_UNREADABLE.to_string()))?
     } else {
         None
     };
     let per_tx = match &undo {
-        Some(u) => Some(undo_by_tx(block, u).map_err(|e| (-32603, e))?),
+        Some(u) => Some(undo_by_tx(&stored.block, u).map_err(|e| (-32603, e))?),
         None => None,
     };
     let spent = per_tx.as_ref().and_then(|p| p.get(tx_idx).copied().flatten());
-    Ok(decode_transaction_verbose_net(tx, Some(ctx), spent, true, true, chain_state.network))
+    Ok(stored_tx_verbose(stored, tx_idx, Some(ctx), spent, true, chain_state.network))
+}
+
+/// The error for a request that needs a stripped transaction's bytes.
+pub(crate) const TX_DATA_STRIPPED: &str = "Transaction data not available (OP_RETURN data stripped)";
+
+/// Transaction `i` of `stored` as raw hex, or [`TX_DATA_STRIPPED`] (-1) when
+/// it is stripped: its filled bytes are not the transaction.
+fn stored_tx_hex(stored: &StoredBlock, i: usize) -> Result<Value, (i32, String)> {
+    if stored.tx_is_stripped(i) {
+        return Err((-1, TX_DATA_STRIPPED.to_string()));
+    }
+    Ok(Value::String(hex::encode(bitcoin::consensus::serialize(&stored.block.txdata[i]))))
+}
+
+/// [`decode_transaction_verbose_net`] for transaction `i` of a stored block.
+///
+/// An intact transaction renders exactly as before. A stripped one renders
+/// from its filled form, whose size, weight, inputs and output values are the
+/// original's, with these differences:
+/// - `txid` and `hash` come from the strip record;
+/// - there is no `hex`, since the filled bytes are not the transaction;
+/// - `opreturn_stripped` is `true`;
+/// - each stripped output's `scriptPubKey` is that of the bare `OP_RETURN`
+///   it keeps, plus `stripped_size`, the original script length.
+pub(crate) fn stored_tx_verbose(
+    stored: &StoredBlock,
+    i: usize,
+    block: Option<&TxBlockContext>,
+    undo: Option<&[crate::storage::coinview::Coin]>,
+    show_prevout: bool,
+    network: bitcoin::Network,
+) -> Value {
+    let mut result =
+        decode_transaction_verbose_net(&stored.block.txdata[i], block, undo, show_prevout, true, network);
+    if !stored.tx_is_stripped(i) {
+        return result;
+    }
+    result["txid"] = json!(stored.txid(i).to_string());
+    result["hash"] = json!(stored.wtxid(i).to_string());
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("hex");
+    }
+    result["opreturn_stripped"] = json!(true);
+    let bare = bitcoin::ScriptBuf::from_bytes(vec![bitcoin::opcodes::all::OP_RETURN.to_u8()]);
+    for (vout, script_len) in stored.stripped_outputs(i) {
+        if let Some(out) = result["vout"].get_mut(vout as usize) {
+            out["scriptPubKey"] = json!({
+                "asm": format!("{}", bare),
+                "hex": hex::encode(bare.as_bytes()),
+                "type": script_type(&bare),
+                "stripped_size": script_len,
+            });
+        }
+    }
+    result
 }
 
 /// A scriptPubKey as Core's `ScriptToUniv(include_hex, include_address)`
@@ -1863,14 +1923,14 @@ pub fn get_tx_out_proof(
         return Err((-1, "Block not available (not fully downloaded)".into()));
     }
 
-    // Load the full block.
-    let block = chain_state
-        .get_block(&block_hash)
+    // Load the block. A stripped one still proves: the proof needs only the
+    // header and the txids, which its strip record holds.
+    let stored = chain_state
+        .get_stored_block(&block_hash)
         .ok_or((-1i32, "Block not available (not fully downloaded)".to_string()))?;
 
     // Build a set of the block's txids for the predicate.
-    let block_txids: Vec<bitcoin::Txid> =
-        block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    let block_txids: Vec<bitcoin::Txid> = stored.txids();
 
     // Verify all requested txids are in this block.
     let block_txid_set: HashSet<bitcoin::Txid> = block_txids.iter().copied().collect();
@@ -1885,7 +1945,7 @@ pub fn get_tx_out_proof(
 
     let target_set: HashSet<bitcoin::Txid> = parsed_txids.iter().copied().collect();
     let merkle_block = bitcoin::MerkleBlock::from_header_txids_with_predicate(
-        &block.header,
+        &stored.block.header,
         &block_txids,
         |txid| target_set.contains(txid),
     );
@@ -1942,12 +2002,12 @@ pub fn verify_tx_out_proof(
     // Without this, a crafted proof that sets nTransactions=1 and
     // vHash=[merkleRoot] would claim the merkle root itself is a
     // transaction — a tree-climbing attack.
-    let block = match chain_state.get_block(&block_hash) {
+    let stored = match chain_state.get_stored_block(&block_hash) {
         Some(b) => b,
         None => return Ok(json!([])),
     };
     let block_txid_set: std::collections::HashSet<bitcoin::Txid> =
-        block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        stored.txids().into_iter().collect();
     let verified: Vec<String> = matches
         .iter()
         .filter(|txid| block_txid_set.contains(*txid))
