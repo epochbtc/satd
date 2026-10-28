@@ -129,6 +129,12 @@ pub(crate) struct StripState {
     has_records: std::sync::atomic::AtomicBool,
     /// What the worker is doing, for `getopreturnpruneinfo`.
     worker: Mutex<WorkerStatus>,
+    /// Bumped by [`ChainState::forget_strip_summary`], so by every record
+    /// write and removal.
+    changes: std::sync::atomic::AtomicU64,
+    /// One more than the value of `changes` read before the option-off pass's
+    /// last flush and recount; 0 before the first.
+    counted: std::sync::atomic::AtomicU64,
     /// The records' totals and when they were added up.
     summary: Mutex<Option<(std::time::Instant, opreturn_strip::StripSummary)>>,
     /// The totals as last added up, however long ago: what `getblockchaininfo`
@@ -673,6 +679,7 @@ impl ChainState {
     /// Drop the cached totals and the blocks directory's stat: a record was
     /// written or removed, and a span punched or filled in.
     pub(super) fn forget_strip_summary(&self) {
+        self.strip.changes.fetch_add(1, Ordering::AcqRel);
         *self.strip.summary.lock() = None;
         *self.strip.usage.lock() = None;
     }
@@ -710,15 +717,21 @@ impl ChainState {
         let Some(config) = self.opreturn_prune_config() else {
             // The option is off on a node that holds stripped blocks: nothing
             // to strip, but records go (`-prune`, `getblockfrompeer`, a fresh
-            // copy), and the last one going finishes the job. Recount every
-            // pass, after a flush: a remove that rides a coin batch waits in
-            // the cache until one, and a count taken meanwhile still sees its
-            // record, so a count cached only after a removal could stay one
-            // too high for good.
+            // copy), and the last one going finishes the job. After any
+            // change since the last count: flush, then count. A remove that
+            // rides a coin batch waits in the cache until a flush, and a
+            // count taken before it still sees its record. The change counter
+            // is read before the flush, so a removal that lands during this
+            // pass is counted on the next.
             *self.strip.worker.lock() = WorkerStatus::Off;
-            self.flush_durable()?;
-            if self.opreturn_strip_summary_records()? == 0 {
-                self.finish_opreturn_unstrip()?;
+            let changes = self.strip.changes.load(Ordering::Acquire);
+            if self.strip.counted.load(Ordering::Acquire) != changes + 1 {
+                self.flush_durable()?;
+                let records = self.opreturn_strip_summary_records()?;
+                self.strip.counted.store(changes + 1, Ordering::Release);
+                if records == 0 {
+                    self.finish_opreturn_unstrip()?;
+                }
             }
             return Ok(PassReport::default());
         };

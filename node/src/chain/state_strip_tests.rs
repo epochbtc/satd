@@ -1335,26 +1335,63 @@ fn the_worker_stops_when_nothing_is_left_to_count() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A count cached while the last record's remove still waited for a flush
-/// says one record is left after the record has gone. The next pass must not
-/// trust it: it recounts, finds none, and finishes.
+/// The last record's remove can ride a coin batch, and wait in the coin cache
+/// for a flush. The pass after it must flush before it counts: a count of the
+/// store behind the cache would still find the record, and nothing would
+/// make a later pass count again.
 #[test]
-fn a_stale_count_does_not_keep_the_node_stripping() {
-    let (cs, dir) = make_chain_state();
+fn a_remove_waiting_in_the_coin_cache_still_finishes() {
+    let store = crate::storage::coin_cache::CoinCache::new(Box::new(crate::storage::db::InMemoryStore::new()), 1 << 20);
+    let (cs, dir) = super::super::tests::make_chain_state_with_store(Box::new(store));
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     cs.strip_block(&hash, THRESHOLD).unwrap();
     cs.load_opreturn_strip_state().unwrap();
-    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1, "premise: the cached count");
-    // The remove lands without dropping the cached totals, as a flush of a
-    // buffered remove does after a pass already counted.
+    pass(&cs, 1000);
+    assert!(cs.opreturn_prune_active(), "premise: a record is left");
+
+    // As a connect removes it: in a batch with coins, then the totals dropped.
     cs.store
         .write_batch(StoreBatch {
+            coin_puts: vec![(
+                OutPoint { txid: <bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([7; 32]), vout: 0 },
+                crate::storage::coinview::Coin {
+                    amount: 1,
+                    script_pubkey: ScriptBuf::new(),
+                    height: 1,
+                    coinbase: false,
+                    txseq: node_index::TXSEQ_UNKNOWN,
+                },
+            )],
             opreturn_strip_removes: vec![hash],
             ..Default::default()
         })
         .unwrap();
+    cs.forget_strip_summary();
+    let mut seen = 0;
+    cs.store.for_each_opreturn_strip(&mut |_, _| seen += 1).unwrap();
+    assert_eq!(seen, 1, "premise: the remove waits in the cache");
+
     pass(&cs, 1000);
-    assert!(!cs.opreturn_prune_active(), "the pass trusted a count taken before the flush");
+    assert!(!cs.opreturn_prune_active(), "the pass counted the store behind the cache");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// With nothing changed since its last count, a pass neither flushes nor
+/// counts again: on a node with stripped blocks left and the option off, that
+/// would be a durability flush and a full read of the records every minute.
+#[test]
+fn an_idle_pass_does_not_count_again() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    cs.strip_block(&blocks[101].block_hash(), THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    pass(&cs, 1000);
+    let counted_at = cs.strip.summary.lock().unwrap().0;
+    pass(&cs, 1000);
+    assert_eq!(cs.strip.summary.lock().unwrap().0, counted_at, "an idle pass counted again");
+    cs.forget_strip_summary();
+    pass(&cs, 1000);
+    assert!(cs.strip.summary.lock().is_some(), "a change is counted on the next pass");
     let _ = std::fs::remove_dir_all(dir);
 }
