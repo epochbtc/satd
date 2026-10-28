@@ -1426,7 +1426,8 @@ pub struct PeerManager {
     /// What the node knows of each onion host on `connect_peer_addrs` that
     /// it learned for itself (gossip or a seed), keyed by host: where it
     /// came from and how its dials went, Core's `AddrInfo` fields that
-    /// `IsTerrible` reads. Lock order: after `connect_peer_addrs`.
+    /// `IsTerrible` reads. Lock order: `connect_peer_addrs`, then this, then
+    /// `onion_reconnect_backoff`.
     onion_candidates: RwLock<HashMap<String, OnionCandidate>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
     max_ahead: u32,
@@ -5361,9 +5362,12 @@ impl PeerManager {
                 }
                 // Likewise for an onion that left the list while the dial ran
                 // (a full list dropped it, or `addnode … remove`).
+                // The list first: `add_onion_candidate` holds it while it
+                // drops a backoff entry, so the other order deadlocks.
                 PeerAddr::Onion { .. } => {
+                    let listed = pm.connect_peer_addrs.read();
                     let mut backoff = pm.onion_reconnect_backoff.write();
-                    if pm.connect_peer_addrs.read().contains(&target) {
+                    if listed.contains(&target) {
                         update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
                     }
                 }
