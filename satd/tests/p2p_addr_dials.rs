@@ -460,3 +460,32 @@ fn a_seednode_name_under_a_proxy_is_fetched_by_name_through_it() {
         "the connection is dropped once it has answered"
     );
 }
+
+/// Under `-connect` no `-seednode` name is fetched, as Core uses none
+/// there, and the node says so rather than dropping it silently.
+/// Perturbation: remove the warning in main.rs and the log line is missing.
+#[test]
+fn a_seednode_name_under_a_proxy_and_connect_is_reported_unused() {
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let node = TestNode::start(&[
+        "--v2transport=0",
+        &format!("--proxy={proxy_addr}"),
+        "--connect=127.0.0.1:1",
+        "--seednode=seed.invalid",
+        "--loglevel=warn",
+    ]);
+    poll_until(
+        || {
+            std::fs::read_to_string(&node.stderr_log)
+                .is_ok_and(|log| log.contains("-seednode seed.invalid is not used"))
+        },
+        test_timeout(30),
+        "the unused -seednode name is reported",
+    );
+    proxy.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(proxy.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "nothing is fetched through the proxy under -connect"
+    );
+}

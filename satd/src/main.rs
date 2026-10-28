@@ -4694,9 +4694,17 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // by name, as an `addr-fetch` connection the proxy resolves, as Core
         // opens every `-seednode` (`AddAddrFetch`; its `ConnectNode` hands
         // the name to the proxy). Core uses none under -connect.
-        if config.proxy.is_some() && config.automatic_outbound {
+        if config.proxy.is_some() {
             for (host, port) in node::net::dns::operator_seed_names(&config.seednode, config.network) {
-                peer_manager.add_addr_fetch(host, port);
+                if config.automatic_outbound {
+                    peer_manager.add_addr_fetch(host, port);
+                } else {
+                    // Core logs "-seednode is ignored when -connect is used".
+                    tracing::warn!(
+                        "-seednode {host} is not used: under -proxy a seed host name is fetched \
+                         through the proxy as an addr-fetch connection, and -connect uses none"
+                    );
+                }
             }
         }
         let seed_addrs = node::net::dns::resolve_operator_seeds(
