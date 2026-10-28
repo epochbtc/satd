@@ -1096,7 +1096,7 @@ pub struct PeerManager {
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
-    /// Track the highest header height we've stored.
+    /// Mirror of `ChainState::headers_tip_height`: the best header's height.
     headers_tip: AtomicU64,
     /// Blocks we asked a peer for outside the IBD scheduler (a `getdata`
     /// sent while following the tip): peer → the hashes asked of it, when,
@@ -14355,6 +14355,10 @@ mod chainsel_tests;
 #[cfg(test)]
 #[path = "manager_txrequest_tests.rs"]
 mod txrequest_tests;
+
+#[cfg(test)]
+#[path = "manager_lowwork_tests.rs"]
+mod lowwork_tests;
 
 #[cfg(test)]
 #[path = "manager_1p1c_tests.rs"]

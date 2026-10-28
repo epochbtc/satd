@@ -384,15 +384,21 @@ pub struct ChainState {
     /// Whether the checkpoint set is enforced (Core `-checkpoints`, default
     /// true). Set to false by `-checkpoints=0` to skip checkpoint validation.
     enforce_checkpoints: bool,
-    /// Highest header height stored (may be ahead of connected block tip during IBD).
+    /// Height of [`Self::best_header`], the most-work header (Core's
+    /// `m_best_header->nHeight`); may be ahead of the connected tip during
+    /// IBD. Written only together with `best_header`, never as a height
+    /// high-water mark: a tall chain of low-work headers is stored (there is
+    /// no presync yet) but must not raise this, or every reader of the
+    /// header lag — `is_ibd`, `getblockchaininfo.headers`, readiness — takes
+    /// the node to be far behind a chain it will never follow.
     headers_tip_height: AtomicU32,
     /// Most-work header chain tip seen so far — `(hash, chainwork)` — analogous
     /// to Bitcoin Core's `pindexBestHeader`. Updated by `accept_header` /
     /// `accept_headers` whenever a header carries strictly more work. Used to
-    /// drive fork-aware block requests: unlike `headers_tip_height` (a height,
-    /// monotonic via `fetch_max`) and `get_block_hash_by_height` (the pollutable
-    /// "best-known-at-height" index), this names the actual most-work chain, so
-    /// a competing chain that is heavier-but-shorter is still pursued.
+    /// drive fork-aware block requests: unlike `get_block_hash_by_height` (the
+    /// pollutable "best-known-at-height" index), this names the actual
+    /// most-work chain, so a competing chain that is heavier-but-shorter is
+    /// still pursued.
     best_header: RwLock<(BlockHash, [u8; 32])>,
     /// Height-index rows above the tip that the last best-header change
     /// rewrote (`Some(hash)`) or dropped (`None`), waiting for the IBD
@@ -885,28 +891,6 @@ impl ChainState {
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
             && let Some(entry) = store.get_block_index(&tip_hash) {
-                // Find the highest stored header via binary search.
-                // Headers may be ahead of blocks if we crashed during IBD.
-                let mut htip = entry.height;
-                // First, probe exponentially to find an upper bound
-                let mut probe = 1u32;
-                while store.get_block_hash_by_height(htip + probe).is_some() {
-                    htip += probe;
-                    probe *= 2;
-                }
-                // Binary search between htip and htip + probe
-                let mut lo = htip;
-                let mut hi = htip + probe;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if store.get_block_hash_by_height(mid + 1).is_some() {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                htip = lo;
-
                 // Seed the best-header pointer from the highest-CHAINWORK
                 // header in the index — NOT the highest-height header, which
                 // the pollutable best-known-at-height index would give and
@@ -944,6 +928,12 @@ impl ChainState {
                 })?;
                 let tips: std::collections::HashSet<BlockHash> =
                     all.difference(&parents).copied().collect();
+                // The header tip is the best header's height, as it is at
+                // run time (Core's `m_best_header->nHeight`). Headers may be
+                // ahead of blocks if we crashed during IBD.
+                let htip = store
+                    .get_block_index(&best_header.0)
+                    .map_or(entry.height, |e| e.height);
                 // Rows dropped mid-scan (bad key / bad value) don't return
                 // Err but DO mean the best-header seed may have missed a
                 // heavier branch — surface them instead of masking.
@@ -1648,8 +1638,9 @@ impl ChainState {
         {
             self.set_tip(anchor.blockhash, anchor.height);
         }
-        self.headers_tip_height
-            .fetch_max(anchor.height, Ordering::Relaxed);
+        // The base header is in the index (checked above), so the best
+        // header already out-works it; this only covers a pointer that lags.
+        self.refresh_best_header_to_tip();
 
         // A snapshot brings a UTXO set with no history behind it. The
         // address and spend indexes hold nothing for anything below the
@@ -2686,7 +2677,7 @@ impl ChainState {
         let batch_index = std::collections::HashMap::from([(hash, entry)]);
         // The height->hash rows this header may earn are decided in one
         // place for both acceptance paths; see `commit_accepted_headers`.
-        self.commit_accepted_headers(batch, &batch_index, Some((hash, chainwork)), new_height)?;
+        self.commit_accepted_headers(batch, &batch_index, Some((hash, chainwork)))?;
 
         Ok(hash)
     }
@@ -2721,10 +2712,9 @@ impl ChainState {
         batch: crate::storage::StoreBatch,
         batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
         best_in_batch: Option<(BlockHash, [u8; 32])>,
-        max_height: u32,
     ) -> Result<(), StoreError> {
         let _accept_guard = self.accept_lock.lock();
-        self.commit_accepted_headers_locked(batch, batch_index, best_in_batch, max_height)
+        self.commit_accepted_headers_locked(batch, batch_index, best_in_batch)
     }
 
     /// [`Self::commit_accepted_headers`] for a caller that already holds
@@ -2735,7 +2725,6 @@ impl ChainState {
         mut batch: crate::storage::StoreBatch,
         batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
         best_in_batch: Option<(BlockHash, [u8; 32])>,
-        max_height: u32,
     ) -> Result<(), StoreError> {
         // Stands in for `AssertLockHeld`, as in `recalculate_best_header`.
         debug_assert!(
@@ -2762,10 +2751,13 @@ impl ChainState {
             }
         }
         self.write_chain_batch(batch)?;
-        // Track highest header for locator construction.
-        self.headers_tip_height.fetch_max(max_height, Ordering::Relaxed);
-        if let Some((h, w)) = new_best {
-            self.update_best_header(h, w);
+        // `headers_tip_height` moves with `best_header` and nothing else: a
+        // header that is merely higher, on a chain with less work, must not
+        // raise it (see the field).
+        if let Some((h, w)) = new_best
+            && let Some(height) = batch_index.get(&h).map(|e| e.height)
+        {
+            self.update_best_header(h, w, height);
         }
         // Publish the re-keyed rows last: only after the write that made them
         // true, and after `best_header` names the chain they were derived
@@ -2888,13 +2880,12 @@ impl ChainState {
                 None => break,
             }
         }
-        // `headers_tip_height` is a high-water mark, so it bounds where a
-        // heavier-but-shorter switch can have left rows behind.
-        let ceiling = self.headers_tip_height().max(best_height);
-        for h in (best_height + 1)..=ceiling {
-            if self.store.get_block_hash_by_height(h).is_some() {
-                batch.height_hash_removes.push(h);
-            }
+        // Rows above the best header that a heavier-but-shorter switch left
+        // behind form a contiguous run from just above it.
+        let mut h = best_height + 1;
+        while self.store.get_block_hash_by_height(h).is_some() {
+            batch.height_hash_removes.push(h);
+            h += 1;
         }
         let counts = (batch.height_hash_puts.len(), batch.height_hash_removes.len());
         if counts != (0, 0) {
@@ -2919,7 +2910,6 @@ impl ChainState {
         let mut batch_index: std::collections::HashMap<BlockHash, BlockIndexEntry> =
             std::collections::HashMap::new();
         let mut accepted = 0u32;
-        let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
         let now = unix_now_secs();
         // The first header refused. The headers before it in the batch are
@@ -2948,7 +2938,6 @@ impl ChainState {
                     && self.store.get_block_hash_by_height(existing.height).is_none()
                 {
                     batch.height_hash_puts.push((existing.height, hash));
-                    max_height = max_height.max(existing.height);
                 }
                 continue; // skip block_index write — entry already exists
             }
@@ -3036,7 +3025,6 @@ impl ChainState {
             // height->hash row is decided once, from the best-header chain, in
             // `commit_accepted_headers`.
             accepted += 1;
-            max_height = max_height.max(new_height);
             if best_in_batch
                 .as_ref()
                 .is_none_or(|(_, w)| compare_u256(&chainwork, w) > 0)
@@ -3047,7 +3035,7 @@ impl ChainState {
 
         if (accepted > 0 || !batch.height_hash_puts.is_empty())
             && let Err(e) =
-                self.commit_accepted_headers(batch, &batch_index, best_in_batch, max_height)
+                self.commit_accepted_headers(batch, &batch_index, best_in_batch)
         {
             return (0, Some(e.into()));
         }
@@ -3130,22 +3118,52 @@ impl ChainState {
     }
 
     /// Advance the best-header pointer if `chainwork` is strictly more than the
-    /// current best (first-seen wins ties, matching consensus).
-    fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32]) {
+    /// current best (first-seen wins ties, matching consensus), and the header
+    /// tip height with it. `height` is `hash`'s height; it may be lower than
+    /// the previous header tip (a heavier-but-shorter chain), and the tip
+    /// follows it down, as Core's `m_best_header->nHeight` does.
+    fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32], height: u32) {
         let mut best = self.best_header.write();
         if compare_u256(&chainwork, &best.1) > 0 {
             *best = (hash, chainwork);
+            // Under the pointer's write lock, so two racing advances cannot
+            // leave the height of the one that lost.
+            self.headers_tip_height.store(height, Ordering::Relaxed);
         }
+    }
+
+    /// Give every block of the active chain `factor` times its own work, as
+    /// if each had been mined at a higher difficulty. Regtest mints every
+    /// header at the same work, so a test that needs a shorter chain to
+    /// out-work a taller one rewrites the index rows the work is read from.
+    /// Leaves `best_header` alone; [`Self::refresh_best_header_to_tip`]
+    /// moves it onto the reweighted tip.
+    #[cfg(test)]
+    pub(crate) fn scale_active_chain_work_for_test(&self, factor: u32) {
+        use crate::storage::blockindex::{add_u256, work_for_bits};
+        let genesis = self.get_block_hash_by_height(0).expect("genesis row");
+        let mut work = self.get_block_index(&genesis).expect("genesis entry").chainwork;
+        let mut batch = crate::storage::StoreBatch::default();
+        for h in 1..=self.tip_height() {
+            let hash = self.get_block_hash_by_height(h).expect("active row");
+            let mut entry = self.get_block_index(&hash).expect("active entry");
+            let block_work = work_for_bits(entry.header.bits);
+            for _ in 0..factor {
+                work = add_u256(&work, &block_work);
+            }
+            entry.chainwork = work;
+            batch.block_index_puts.push((hash, entry));
+        }
+        self.store.write_batch(batch).expect("reweighted rows written");
     }
 
     /// Core's `ChainstateManager::RecalculateBestHeader`: rescan the block
     /// index for the highest-work entry that is not on a failed branch and
     /// move the header tip to it.
     ///
-    /// Both halves of that tip only ever move *up* in normal operation —
-    /// `best_header` takes the higher chainwork, `headers_tip_height` is a
-    /// `fetch_max` high-water mark — which is right while headers only ever
-    /// arrive. Invalidating a branch is the one event that can move it down,
+    /// That tip's chainwork only ever moves *up* in normal operation —
+    /// `best_header` takes the higher chainwork, and `headers_tip_height`
+    /// follows it — which is right while headers only ever arrive. Invalidating a branch is the one event that can move it down,
     /// and it has to: `getblockchaininfo.headers`, the initial-block-download
     /// heuristic, the scheduler's target height and the stall detector all
     /// read the distance between this and the active tip, and leaving it on
@@ -3170,8 +3188,8 @@ impl ChainState {
     /// **Caller must hold `accept_lock`**, which is Core's `AssertLockHeld(
     /// cs_main)` on `RecalculateBestHeader`. Both halves of the header tip
     /// are published here as a plain overwrite, because lowering them is the
-    /// whole point — a chainwork-guarded write or a `fetch_max` would leave
-    /// the tip on the branch just invalidated. That makes the scan and the
+    /// whole point — a chainwork-guarded write would leave the tip on the
+    /// branch just invalidated. That makes the scan and the
     /// publish a read-modify-write that must not interleave with
     /// `commit_accepted_headers`, the only other writer of either half:
     /// a batch landing in the window would be clobbered back to the stale
@@ -3223,8 +3241,11 @@ impl ChainState {
         // Both an unguarded overwrite: this is the one path allowed to move
         // the header tip *down*, and `accept_lock` (held by the caller) keeps
         // a `headers` batch from landing between the scan and here.
-        *self.best_header.write() = (best.0, best.1);
-        self.headers_tip_height.store(best.2, Ordering::Relaxed);
+        {
+            let mut pointer = self.best_header.write();
+            *pointer = (best.0, best.1);
+            self.headers_tip_height.store(best.2, Ordering::Relaxed);
+        }
         tracing::debug!(
             "recalculate_best_header: header tip is now {} at height {}",
             best.0,
@@ -3308,7 +3329,7 @@ impl ChainState {
     pub fn refresh_best_header_to_tip(&self) {
         let tip_hash = self.tip_hash();
         if let Some(entry) = self.get_block_index(&tip_hash) {
-            self.update_best_header(tip_hash, entry.chainwork);
+            self.update_best_header(tip_hash, entry.chainwork, entry.height);
         }
     }
 
@@ -8056,7 +8077,6 @@ impl ChainState {
                 batch,
                 &batch_index,
                 Some((block_hash, new_chainwork)),
-                new_height,
             )?;
             if had_record {
                 self.forget_strip_summary();
@@ -8129,7 +8149,7 @@ impl ChainState {
                 // As at the end of the connect below: a block that arrived
                 // without its header announced first (`submitblock`) must not
                 // leave the tip out-working the best header.
-                self.update_best_header(target.header.block_hash(), target.chainwork);
+                self.update_best_header(target.header.block_hash(), target.chainwork, target.height);
                 return Ok(
                     if self.active_chain_hash_at_height(new_height) == Some(block_hash) {
                         BlockAcceptance::Connected(block_hash)
@@ -8718,7 +8738,7 @@ impl ChainState {
         // `accept_header`, so without this the pointer would lag the tip after
         // mining and `missing_blocks_for_best_header_chain` would compare
         // against a stale work value.
-        self.update_best_header(block_hash, new_chainwork);
+        self.update_best_header(block_hash, new_chainwork, new_height);
 
         Ok(BlockAcceptance::Connected(block_hash))
     }
@@ -12221,6 +12241,84 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1119: the header tip is the best header's height, not the highest
+    /// header stored. A taller chain with less work is stored (there is no
+    /// presync yet) but leaves the tip alone; a shorter chain with more work
+    /// takes the tip down to its own height, as Core's
+    /// `m_best_header->nHeight` does.
+    ///
+    /// Fails with the height high-water mark: the tip read 10 after the
+    /// low-work headers, and stayed there after the heavier switch.
+    #[test]
+    fn the_header_tip_is_the_most_work_header_not_the_highest() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        cs.scale_active_chain_work_for_test(100);
+        cs.refresh_best_header_to_tip();
+        assert_eq!(cs.best_header_hash(), tip);
+        assert_eq!(cs.headers_tip_height(), 3);
+
+        // Ten headers from genesis: taller than the tip, far less work.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        let fork: Vec<bitcoin::block::Header> = (1..=10)
+            .map(|h| {
+                let b = build_test_block(parent, h, 1_400_000_000 + h);
+                parent = b.block_hash();
+                b.header
+            })
+            .collect();
+        let (accepted, err) = cs.accept_headers(&fork);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(accepted, 10);
+        assert!(cs.get_block_index(&parent).is_some(), "stored: no work threshold in this PR");
+        assert_eq!(cs.best_header_hash(), tip);
+        assert_eq!(cs.headers_tip_height(), 3, "a low-work header chain raised the header tip");
+
+        // One header on the reweighted tip out-works the fork.
+        let b4 = build_test_block(tip, 4, 1_500_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        assert_eq!(cs.best_header_hash(), b4.block_hash());
+        assert_eq!(cs.headers_tip_height(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: a header tip on a taller chain follows the best
+    /// header down when a shorter chain overtakes it in work.
+    ///
+    /// Fails with the height high-water mark: the tip stayed at 8.
+    #[test]
+    fn a_heavier_but_shorter_header_chain_lowers_the_header_tip() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        let mut parent = tip;
+        let tall: Vec<bitcoin::block::Header> = (4..=8)
+            .map(|h| {
+                let b = build_test_block(parent, h, 1_400_000_000 + h);
+                parent = b.block_hash();
+                b.header
+            })
+            .collect();
+        let (accepted, err) = cs.accept_headers(&tall);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(accepted, 5);
+        assert_eq!(cs.headers_tip_height(), 8);
+
+        // Reweight the connected chain: anything built on its tip now
+        // out-works the five lighter headers above it.
+        cs.scale_active_chain_work_for_test(100);
+        let b4 = build_test_block(tip, 4, 1_500_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        assert_eq!(cs.best_header_hash(), b4.block_hash());
+        assert_eq!(cs.headers_tip_height(), 4, "the header tip stayed on the lighter, taller chain");
+        assert_eq!(cs.get_block_hash_by_height(5), None, "rows above the new best are dropped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A datadir written by a satd that mapped every accepted header carries
     /// rows above the tip that name fork blocks. The startup pass puts the
     /// best header's ancestry back, and is a no-op once it has.
@@ -13515,7 +13613,7 @@ pub(crate) mod tests {
     /// while the lock is held.
     /// Core's `InvalidateBlock` ends with `RecalculateBestHeader()`, and
     /// `ResetBlockFailureFlags` mirrors it. satd's header tip only ever moved
-    /// up — `best_header` takes the higher chainwork, `headers_tip_height` is
+    /// up — `best_header` took the higher chainwork, `headers_tip_height` was
     /// a `fetch_max` high-water mark — so after an `invalidateblock` it stayed
     /// on the branch that had just been refused, and `getblockchaininfo`
     /// reported a `headers` figure the node would never reach. It then grew
