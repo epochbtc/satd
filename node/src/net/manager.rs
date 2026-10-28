@@ -7757,7 +7757,7 @@ impl PeerManager {
             return;
         }
         if restore.is_idle() {
-            if !restore.may_start_pass(now) {
+            if !restore.may_start_pass(now, &peers) {
                 report(restore, WorkerStatus::Restoring);
                 return;
             }

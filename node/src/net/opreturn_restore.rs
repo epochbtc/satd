@@ -14,7 +14,9 @@
 //! costs the slow one a slot; a delivery earns one back. A peer that answers
 //! `notfound`, or sends a copy that does not restore, is not asked for that
 //! block again in the pass. A block every connected peer has refused is left
-//! for the next pass, which reads the records again.
+//! for the next pass, which reads the records again: straight away when the
+//! pass restored something or a new peer has connected since, else after a
+//! minute.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -33,7 +35,8 @@ pub const WINDOW: usize = 1024;
 /// How long a request may go unanswered before it is given to another
 /// peer: the IBD scheduler's stall timeout.
 pub const STALL: Duration = crate::net::ibd::STALL_TIMEOUT_BASE;
-/// How long after a pass that restored nothing the next one starts.
+/// How long after a pass that restored nothing the next one starts, unless
+/// a new peer connects first.
 const FRUITLESS_PASS_WAIT: Duration = Duration::from_secs(60);
 
 pub struct RestoreDownloader {
@@ -62,8 +65,10 @@ pub struct RestoreDownloader {
     restored_blocks: u64,
     bytes_downloaded: u64,
     restored_this_pass: u64,
-    /// When the last pass ended without restoring anything.
-    fruitless_at: Option<Instant>,
+    /// When the last pass ended without restoring anything, and the peers
+    /// connected then: `None` for a pass that had nothing to fetch, which a
+    /// new peer does not change.
+    fruitless_at: Option<(Instant, Option<HashSet<PeerId>>)>,
     /// When the first pass started, for the rate.
     started: Option<Instant>,
     /// Since when the free-space check has held the download back.
@@ -106,10 +111,14 @@ impl RestoreDownloader {
         self.queue.is_empty() && self.window.is_empty()
     }
 
-    /// Whether a new pass may start now: not within a minute of a pass that
-    /// restored nothing, which would only ask the same peers again.
-    pub fn may_start_pass(&self, now: Instant) -> bool {
-        self.fruitless_at.is_none_or(|at| now.duration_since(at) >= FRUITLESS_PASS_WAIT)
+    /// Whether a new pass may start now, with `peers` connected: not within a
+    /// minute of a pass that restored nothing, which would only ask the same
+    /// peers again, unless one of `peers` was not connected then.
+    pub fn may_start_pass(&self, now: Instant, peers: &[PeerId]) -> bool {
+        self.fruitless_at.as_ref().is_none_or(|(at, then)| {
+            now.duration_since(*at) >= FRUITLESS_PASS_WAIT
+                || then.as_ref().is_some_and(|then| peers.iter().any(|p| !then.contains(p)))
+        })
     }
 
     /// Start a pass over `work`, the stripped blocks in the order to fetch
@@ -126,7 +135,7 @@ impl RestoreDownloader {
         self.restored_this_pass = 0;
         self.fruitless_at = None;
         self.started.get_or_insert(now);
-        self.end_pass_if_idle(now);
+        self.end_pass_if_idle(now, None);
     }
 
     /// The bytes the pass has left to download.
@@ -197,7 +206,7 @@ impl RestoreDownloader {
             self.drop_from_window(&hash);
             self.skipped += 1;
         }
-        self.end_pass_if_idle(now);
+        self.end_pass_if_idle(now, Some(peers));
         peers.iter().copied().zip(out).filter(|(_, hashes)| !hashes.is_empty()).collect()
     }
 
@@ -209,9 +218,9 @@ impl RestoreDownloader {
         Some(self.window.remove(at))
     }
 
-    fn end_pass_if_idle(&mut self, now: Instant) {
-        if self.is_idle() && self.restored_this_pass == 0 {
-            self.fruitless_at = Some(now);
+    fn end_pass_if_idle(&mut self, now: Instant, peers: Option<&[PeerId]>) {
+        if self.is_idle() && self.restored_this_pass == 0 && self.fruitless_at.is_none() {
+            self.fruitless_at = Some((now, peers.map(|p| p.iter().copied().collect())));
         }
     }
 
@@ -397,8 +406,12 @@ mod tests {
         assert!(dl.assign(&[1, 2], Instant::now()).is_empty());
         assert!(dl.is_idle(), "refused by every peer: left for the next pass");
         assert_eq!(dl.progress(2).remaining_blocks, 1, "still counted as remaining");
-        assert!(!dl.may_start_pass(Instant::now()), "a pass that restored nothing waits");
-        assert!(dl.may_start_pass(Instant::now() + FRUITLESS_PASS_WAIT));
+        assert!(!dl.may_start_pass(Instant::now(), &[1, 2]), "a pass that restored nothing waits");
+        assert!(dl.may_start_pass(Instant::now() + FRUITLESS_PASS_WAIT, &[1, 2]));
+        assert!(dl.may_start_pass(Instant::now(), &[1, 2, 3]), "unless a new peer has connected");
+        dl.start_pass(vec![item(0)], Instant::now());
+        dl.next_window();
+        assert_eq!(dl.assign(&[1, 2], Instant::now()).len(), 1, "a new pass asks the same peers again");
     }
 
     #[test]
@@ -436,6 +449,8 @@ mod tests {
         assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3));
         assert_eq!((p.bytes_downloaded, p.remaining_bytes, p.in_flight), (3600, 0, 0));
         assert!(dl.is_idle());
-        assert!(dl.may_start_pass(Instant::now()), "a pass that restored something does not wait");
+        assert!(dl.may_start_pass(Instant::now(), &[7]), "a pass that restored something does not wait");
+        dl.start_pass(Vec::new(), Instant::now());
+        assert!(!dl.may_start_pass(Instant::now(), &[7]), "an empty pass waits too");
     }
 }
