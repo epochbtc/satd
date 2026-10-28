@@ -363,3 +363,29 @@ fn every_layer_drops_the_strip_family() {
     assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap(), None, "through a SplitStore");
 }
 
+
+/// A durability flush racing the drop must not fail either: RocksDB refuses
+/// a flush that lists a family dropped after its handle was taken.
+#[test]
+fn flushes_racing_the_family_drop_never_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flusher = {
+        let (store, stop) = (store.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut flushes = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                store.flush_durable().expect("a flush racing the drop");
+                flushes += 1;
+            }
+            flushes
+        })
+    };
+    for _ in 0..300 {
+        store.write_batch(put(hash(1), b"record")).unwrap();
+        store.drop_opreturn_strip_cf().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(flusher.join().unwrap() > 0, "premise: the flusher ran");
+}

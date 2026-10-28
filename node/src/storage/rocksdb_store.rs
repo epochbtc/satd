@@ -650,11 +650,13 @@ pub struct RocksDbStore {
     /// never neither and never both.
     recent_window: parking_lot::Mutex<RecentWindowState>,
     /// Held shared by every batch write that touches the strip family, from
-    /// its handle lookup to its `db.write`, and exclusively by
-    /// `drop_opreturn_strip_cf`. A batch built against the family's handle
-    /// and written after the drop would fail with RocksDB's "invalid column
-    /// family", and most batches carrying a strip remove are a block's
-    /// connect.
+    /// its handle lookup to its `db.write`, and by `flush_durable` across its
+    /// flush; exclusively by `drop_opreturn_strip_cf`. A batch built against
+    /// the family's handle and written after the drop fails with RocksDB's
+    /// "invalid column family", and a flush listing it with "Column family
+    /// dropped"; most batches carrying a strip remove, and many flushes, are
+    /// a block's connect. Reads need no gate: a dropped family's handle still
+    /// reads what it held.
     strip_cf_gate: parking_lot::RwLock<()>,
     /// Test hook: when set, a build signals the sender once its snapshot is
     /// taken and waits on the receiver before scanning, so a test can land
@@ -2730,6 +2732,9 @@ impl Store for RocksDbStore {
         // `wait(true)` returns only once the flush is durable on disk.
         let mut fopts = FlushOptions::default();
         fopts.set_wait(true);
+        // RocksDB fails a flush that lists a family dropped after its handle
+        // was taken ("Column family dropped"), as it fails a batch write.
+        let _strip_cf = self.strip_cf_gate.read();
         let handles: Vec<_> = ALL_CFS
             .iter()
             .filter_map(|name| self.db.cf_handle(name))
