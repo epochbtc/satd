@@ -4625,7 +4625,37 @@ impl PeerManager {
         }
         self.redial_manual_peers(now);
         self.evict_extra_outbound_peer();
+        self.resolve_tried_collisions();
         self.dial_automatic_peers(now);
+    }
+
+    /// Settle the promotions waiting on a taken tried slot, as Core's
+    /// connection thread calls `ResolveCollisions` before each pass. An
+    /// incumbent the node is connected to has passed its test, and is marked
+    /// good first, as Core marks a collision's incumbent good rather than
+    /// open a feeler to a peer it already has (`ThreadOpenConnections`,
+    /// v31.1 `src/net.cpp:2811`). An address the resolution drops from the
+    /// book leaves the dial list with it.
+    fn resolve_tried_collisions(&self) {
+        let now = now_unix_secs();
+        let incumbents = self.addrman.read().tried_collision_incumbents();
+        let connected: Vec<SocketAddr> =
+            incumbents.into_iter().filter(|a| self.is_addr_connected(a)).collect();
+        let dropped = {
+            let mut book = self.addrman.write();
+            // Only one the book still holds: one dropped since the read
+            // above would be put back, and perhaps straight into tried.
+            for a in connected {
+                if book.contains(&a) {
+                    book.mark_good(a, now);
+                }
+            }
+            book.resolve_collisions(now)
+        };
+        for gone in dropped {
+            self.learned_addrs.write().remove(&gone);
+            self.reconnect_backoff.write().remove(&gone);
+        }
     }
 
     /// Whether `target` is a peer the operator named.
@@ -4841,19 +4871,53 @@ impl PeerManager {
     /// address not in the book counts as new). satd walked the list in the
     /// order it learned the addresses, so the ones it loaded from
     /// `peers.dat` at startup were first on every pass.
+    ///
+    /// Within the tried table, a bucket is drawn first and then an entry in
+    /// it, as Core's `Select_` picks a bucket and a position: one network
+    /// group's entries share at most eight buckets, so its share of the
+    /// tried draws is bounded by its buckets, not by how many entries it has.
+    ///
+    /// The incumbent of a promotion waiting on its tried slot comes first,
+    /// for the dial to test it (Core's `SelectTriedCollision`, which Core
+    /// tests over a feeler; satd opens no feelers of its own).
     fn automatic_dial_order(&self, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
         use rand::seq::SliceRandom as _;
         let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
-        let (mut tried, mut new): (Vec<SocketAddr>, Vec<SocketAddr>) = {
+        let mut buckets: std::collections::BTreeMap<u64, Vec<SocketAddr>> = Default::default();
+        let mut new = Vec::new();
+        let incumbent = {
             let book = self.addrman.read();
-            learned.into_iter().partition(|a| book.is_tried(a))
+            for a in learned {
+                match book.tried_bucket(&a) {
+                    Some(b) => buckets.entry(b).or_default().push(a),
+                    None => new.push(a),
+                }
+            }
+            book.select_tried_collision()
         };
-        tried.shuffle(rng);
+        let mut tried: Vec<Vec<SocketAddr>> = buckets.into_values().collect();
+        for bucket in &mut tried {
+            bucket.shuffle(rng);
+        }
         new.shuffle(rng);
-        let mut order = Vec::with_capacity(tried.len() + new.len());
+        let mut order = Vec::with_capacity(tried.iter().map(Vec::len).sum::<usize>() + new.len() + 1);
+        order.extend(incumbent);
         while !tried.is_empty() || !new.is_empty() {
             let from_tried = new.is_empty() || (!tried.is_empty() && rng.r#gen::<bool>());
-            order.extend(if from_tried { tried.pop() } else { new.pop() });
+            if from_tried {
+                let i = rng.gen_range(0..tried.len());
+                order.extend(tried[i].pop());
+                if tried[i].is_empty() {
+                    tried.swap_remove(i);
+                }
+            } else {
+                order.extend(new.pop());
+            }
+        }
+        if let Some(first) = incumbent
+            && let Some(dup) = order.iter().skip(1).position(|a| *a == first)
+        {
+            order.remove(dup + 1);
         }
         order
     }
@@ -5067,7 +5131,7 @@ impl PeerManager {
                 // What makes an address terrible, and so replaceable once
                 // the book is full (Core's `Attempt`).
                 if let PeerAddr::Socket(sa) = &target {
-                    pm.addrman.write().mark_attempt(*sa);
+                    pm.addrman.write().mark_attempt(*sa, now_unix_secs());
                 }
             }
             let connected = result.is_ok();
