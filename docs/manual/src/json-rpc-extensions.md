@@ -229,8 +229,12 @@ counts, and `worker` is one of `restoring`, `waiting_for_peers`,
 }
 ```
 
-`progress_ratio` is over the current pass; `estimated_remaining_seconds` is
-`null` until the first block is restored.
+`progress_ratio` is over the current pass. `estimated_remaining_seconds` is
+`null` until the first block is restored, then the longer of two estimates:
+the blocks left at the block rate so far, and the bytes left at the byte rate
+so far. Block sizes change along the chain, so neither alone holds for the
+whole download. Once the last block is restored, `restore` keeps the last
+pass's counts until the node finishes.
 
 `getblockchaininfo` carries the first nine of these, `worker` and `restore`
 under `opreturn_prune`, only on a node that strips or still holds stripped

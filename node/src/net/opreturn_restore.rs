@@ -128,8 +128,15 @@ impl RestoreDownloader {
     }
 
     /// Start a pass over `work`, the stripped blocks in the order to fetch
-    /// them.
+    /// them. An empty `work` starts nothing: the last pass's counts stay,
+    /// and the next read waits a minute. The records are all gone, and the
+    /// strip worker's finish step has yet to notice.
     pub fn start_pass(&mut self, work: Vec<RestoreItem>, now: Instant) {
+        if work.is_empty() {
+            self.skipped = 0;
+            self.fruitless_at = Some((now, None));
+            return;
+        }
         self.total_blocks = work.len() as u64;
         self.remaining_bytes = work.iter().map(|i| i.len).sum();
         self.queue = work.into();
@@ -341,10 +348,32 @@ impl RestoreDownloader {
         if secs > 0.0 { self.restored_blocks as f64 / secs } else { 0.0 }
     }
 
+    /// Seconds left: the later of the block count's and the byte count's
+    /// estimate, each at its rate so far. Neither alone holds over a whole
+    /// chain: early blocks are small, so the block rate falls and the byte
+    /// rate rises as heights go up, and a run of small blocks costs time a
+    /// byte count misses. `None` before anything is restored.
+    fn estimate_remaining_secs(&self, remaining_blocks: u64, now: Instant) -> Option<u64> {
+        let secs = self.started.map_or(0.0, |s| now.duration_since(s).as_secs_f64());
+        if remaining_blocks == 0 {
+            return Some(0);
+        }
+        if secs <= 0.0 || self.restored_blocks == 0 {
+            return None;
+        }
+        let by_blocks = remaining_blocks as f64 * secs / self.restored_blocks as f64;
+        let by_bytes = if self.bytes_downloaded > 0 {
+            self.remaining_bytes as f64 * secs / self.bytes_downloaded as f64
+        } else {
+            0.0
+        };
+        Some(by_blocks.max(by_bytes) as u64)
+    }
+
     /// The counts for `getopreturnpruneinfo`.
     pub fn progress(&self) -> RestoreProgress {
         let remaining_blocks = self.queue.len() as u64 + self.window.len() as u64 + self.skipped;
-        let rate = self.rate(Instant::now());
+        let estimated_remaining_seconds = self.estimate_remaining_secs(remaining_blocks, Instant::now());
         RestoreProgress {
             total_blocks: self.total_blocks,
             remaining_blocks,
@@ -353,7 +382,7 @@ impl RestoreDownloader {
             remaining_bytes: self.remaining_bytes,
             in_flight: self.in_flight.len() as u64,
             peers: self.peers as u64,
-            estimated_remaining_seconds: (rate > 0.0).then(|| (remaining_blocks as f64 / rate) as u64),
+            estimated_remaining_seconds,
         }
     }
 }
@@ -499,5 +528,41 @@ mod tests {
         assert!(dl.may_start_pass(Instant::now(), &[7]), "a pass that restored something does not wait");
         dl.start_pass(Vec::new(), Instant::now());
         assert!(!dl.may_start_pass(Instant::now(), &[7]), "an empty pass waits too");
+        // The records are gone before the strip worker's finish step sees
+        // it: the report still describes the pass that restored them.
+        let p = dl.progress();
+        assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3), "{p:?}");
+        assert_eq!(p.estimated_remaining_seconds, Some(0));
+    }
+
+    /// The estimate is the later of the block and byte rates': small blocks
+    /// done and big ones left make the block count promise too soon, and
+    /// the reverse fools the byte count.
+    #[test]
+    fn the_estimate_takes_the_slower_of_the_block_and_byte_rates() {
+        let item_of = |n: u32, len: u64| RestoreItem { len, ..item(n) };
+        let mut dl = RestoreDownloader::new();
+        // Ten small blocks, then ten a hundred times bigger.
+        let work: Vec<_> = (0..10).map(|n| item_of(n, 1_000)).chain((10..20).map(|n| item_of(n, 100_000))).collect();
+        let t0 = Instant::now();
+        dl.start_pass(work, t0);
+        dl.next_window();
+        for n in 0..10 {
+            assert!(dl.note_restored(&item(n).hash, 1, 1_000));
+        }
+        // Ten blocks (10 kB) in 10 s: ten blocks left says 10 s, 1 MB says 1000 s.
+        let p = dl.estimate_remaining_secs(10, t0 + Duration::from_secs(10));
+        assert_eq!(p, Some(1000), "the bytes left set it");
+
+        let mut dl = RestoreDownloader::new();
+        let work: Vec<_> = (0..10).map(|n| item_of(n, 100_000)).chain((10..30).map(|n| item_of(n, 1_000))).collect();
+        dl.start_pass(work, t0);
+        dl.next_window();
+        for n in 0..10 {
+            assert!(dl.note_restored(&item(n).hash, 1, 100_000));
+        }
+        // Ten blocks (1 MB) in 10 s: 20 kB left says 0.2 s, twenty blocks 20 s.
+        assert_eq!(dl.estimate_remaining_secs(20, t0 + Duration::from_secs(10)), Some(20), "the blocks left set it");
+        assert_eq!(RestoreDownloader::new().estimate_remaining_secs(5, t0), None, "nothing restored yet");
     }
 }

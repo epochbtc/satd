@@ -1094,7 +1094,13 @@ impl ChainState {
         // Readable data where there was none can unblock a reorg that failed
         // on it.
         self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
-        tracing::info!(%hash, height, "Restored an OP_RETURN-stripped block in place from a peer-supplied copy");
+        // One line per block suits a lone repair; `-restoreopreturns` runs
+        // this for every stripped block and logs its progress itself.
+        if self.opreturn_restore_pending() {
+            tracing::debug!(%hash, height, "Restored an OP_RETURN-stripped block in place from a peer-supplied copy");
+        } else {
+            tracing::info!(%hash, height, "Restored an OP_RETURN-stripped block in place from a peer-supplied copy");
+        }
         Ok(Some(super::BlockDataRepair::Repaired { height }))
     }
 }
