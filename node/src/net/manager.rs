@@ -2655,17 +2655,19 @@ impl PeerManager {
 
     /// The source an onion announced by peer `id` counts against: the
     /// network group of a clearnet peer, or the host of an onion peer,
-    /// whose address is the unspecified placeholder. `None` for an unknown
-    /// peer.
-    fn onion_source(&self, id: PeerId) -> Option<Vec<u8>> {
+    /// whose address is the unspecified placeholder. A peer that is no
+    /// longer connected, or has neither, is a source of its own: the share
+    /// bounds it as well.
+    fn onion_source(&self, id: PeerId) -> Vec<u8> {
         if let Some(ip) = self.peer_ip(id) {
             let mut key = b"g".to_vec();
             key.extend(self.addrman.read().group_key(ip));
-            return Some(key);
+            return key;
         }
-        let peers = self.peers.read();
-        let host = peers.get(&id)?.info.onion_host.as_ref()?;
-        Some([b"o".as_slice(), host.as_bytes()].concat())
+        if let Some(host) = self.peers.read().get(&id).and_then(|h| h.info.onion_host.clone()) {
+            return [b"o".as_slice(), host.as_bytes()].concat();
+        }
+        [b"p".as_slice(), &id.to_le_bytes()].concat()
     }
 
     /// Record how a dial to a learned onion candidate went, for
@@ -3115,7 +3117,10 @@ impl PeerManager {
                 let mut addrs = self.connect_peer_addrs.write();
                 let before = addrs.len();
                 addrs.retain(|a| a != addr);
-                if addrs.len() < before {
+                // The record is the host's; another port of it may remain.
+                let host_listed =
+                    addrs.iter().any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if h == host));
+                if addrs.len() < before && !host_listed {
                     self.onion_candidates.write().remove(host);
                 }
                 addrs.len() < before
@@ -5354,12 +5359,14 @@ impl PeerManager {
                         update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
                     }
                 }
-                PeerAddr::Onion { .. } => update(
-                    pm.onion_reconnect_backoff
-                        .write()
-                        .entry(target.to_string())
-                        .or_insert_with(ReconnectState::new),
-                ),
+                // Likewise for an onion that left the list while the dial ran
+                // (a full list dropped it, or `addnode … remove`).
+                PeerAddr::Onion { .. } => {
+                    let mut backoff = pm.onion_reconnect_backoff.write();
+                    if pm.connect_peer_addrs.read().contains(&target) {
+                        update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
+                    }
+                }
             }
         });
     }
@@ -6207,6 +6214,10 @@ impl PeerManager {
                 let count = addrs.len();
                 let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
                 let source = self.peer_ip(id);
+                // Read once for the whole message: the announcer can leave `peers`
+                // while it is processed, and its later onions must still count
+                // against its share.
+                let onion_source = self.onion_source(id);
                 let mut processed = 0u64;
                 for addr_msg in &admitted {
                     match &addr_msg.addr {
@@ -6220,7 +6231,7 @@ impl PeerManager {
                                 continue;
                             }
                             processed += 1;
-                            self.add_onion_candidate(host, addr_msg.port, self.onion_source(id));
+                            self.add_onion_candidate(host, addr_msg.port, Some(onion_source.clone()));
                         }
                         // IPv4 / IPv6 (and, under a proxy, anything else with a
                         // socket form) flow through the clearnet address book.

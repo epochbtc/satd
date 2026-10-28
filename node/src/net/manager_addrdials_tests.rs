@@ -980,10 +980,11 @@ fn an_onions_source_is_the_announcers_group_or_its_host() {
     via_tor.onion_host = Some(onion_host(7));
     add_peer(&pm, via_tor);
     assert_eq!(pm.onion_source(1), pm.onion_source(2), "one /16, one source");
-    assert!(pm.onion_source(1).is_some());
     assert_ne!(pm.onion_source(3), pm.onion_source(1));
-    assert_eq!(pm.onion_source(3), Some([b"o".as_slice(), onion_host(7).as_bytes()].concat()));
-    assert_eq!(pm.onion_source(42), None);
+    assert_eq!(pm.onion_source(3), [b"o".as_slice(), onion_host(7).as_bytes()].concat());
+    // A peer gone mid-message is a source of its own, not an unbounded one.
+    assert_ne!(pm.onion_source(42), pm.onion_source(43));
+    assert_eq!(pm.onion_source(42), pm.onion_source(42));
 }
 
 /// The reconnect loop's onion dials feed the record that decides whether an
@@ -1000,4 +1001,40 @@ async fn a_failed_onion_dial_counts_against_the_onion() {
     settle(&pm).await;
     assert_eq!(pm.onion_candidates.read()[&host].attempts, 1);
     assert_eq!(pm.onion_candidates.read()[&host].last_success, 0);
+}
+
+/// A manual onion on another port of a learned host shares the host's
+/// record; removing it must leave the learned entry's record, or that entry
+/// could never become terrible and would hold its place for good.
+#[test]
+fn removing_a_manual_twin_keeps_the_learned_onions_record() {
+    let (pm, _dir) = mk_pm();
+    let host = onion_host(3);
+    pm.add_onion_candidate(host.clone(), 9333, Some(b"g\x2c\x01".to_vec()));
+    let twin = PeerAddr::Onion { host: host.clone(), port: 9444 };
+    assert!(pm.add_peer_addr(twin.clone()));
+    assert!(pm.remove_peer_addr(&twin));
+    assert!(pm.onion_candidates.read().contains_key(&host));
+    // With the last entry for the host gone, the record goes too.
+    assert!(pm.remove_peer_addr(&PeerAddr::Onion { host: host.clone(), port: 9333 }));
+    assert!(!pm.onion_candidates.read().contains_key(&host));
+}
+
+/// A dial to an onion that left the list while it ran leaves no backoff
+/// behind, as for a clearnet address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_onion_dropped_mid_dial_leaves_no_backoff() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let gone = PeerAddr::Onion { host: onion_host(8), port: 9333 };
+    let slot = pm.reserve_dial(DialBudget::Automatic).unwrap();
+    pm.spawn_redial(gone.clone(), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+    settle(&pm).await;
+    assert!(!pm.onion_reconnect_backoff.read().contains_key(&gone.to_string()));
+    // A listed one gets its backoff, as before.
+    let listed = onion_host(9);
+    pm.add_onion_candidate(listed.clone(), 9333, None);
+    pm.reconnect_tick();
+    let key = format!("{listed}:9333");
+    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the listed onion backs off").await;
 }
