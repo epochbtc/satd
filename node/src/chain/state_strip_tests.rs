@@ -1448,3 +1448,20 @@ fn the_restore_work_list_is_the_stored_records_in_height_order() {
         assert_eq!(item.len, serialize(block).len() as u64, "the stored length");
     }
 }
+
+/// The restore waits for the tip (plan §11.4, R-3): during IBD, and while
+/// the best header is ahead of the tip; not on a node at its best header.
+#[test]
+fn the_restore_waits_while_the_tip_is_behind() {
+    let (cs, dir) = make_chain_state();
+    assert_eq!(cs.opreturn_restore_held_by_tip(), Some("initial block download"));
+    let blocks = chain(&cs);
+    assert_eq!(cs.opreturn_restore_held_by_tip(), None, "caught up");
+    let tip = blocks.last().unwrap();
+    let next = block_on(tip.block_hash(), 106, Vec::new());
+    cs.accept_header(&next.header).expect("header");
+    assert_eq!(cs.opreturn_restore_held_by_tip(), Some("the tip is behind the best header"));
+    connect(&cs, &next);
+    assert_eq!(cs.opreturn_restore_held_by_tip(), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
