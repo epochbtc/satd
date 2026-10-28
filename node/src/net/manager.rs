@@ -372,6 +372,20 @@ const BG_CATCHUP_STALE_SECS: u64 = 30;
 /// A peer that has not answered gets no more until it does or its requests
 /// time out.
 const BG_CATCHUP_PER_PEER: usize = 16;
+/// [`PeerManager::missing_desirable_services`] for a tip `tip_depth` blocks'
+/// worth of time behind now. A pending OP_RETURN restore downloads only from
+/// peers that keep every block (plan §11.4), so while one is pending the
+/// outbound slots keep looking for those, as they do while the tip is old.
+fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pending: bool) -> Option<ServiceFlags> {
+    let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    if services.has(ServiceFlags::NETWORK_LIMITED)
+        && tip_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+        && !restore_pending
+    {
+        wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    }
+    (!services.has(wanted)).then_some(wanted)
+}
 /// Most blocks in one restore `getdata`.
 const PER_GETDATA_BLOCKS: usize = 128;
 /// A restore progress line every this many blocks restored, as the strip
@@ -13402,21 +13416,12 @@ impl PeerManager {
     /// is used for old blocks only when we are connected to it anyway, so the
     /// outbound slots keep finding peers that hold every block.
     fn missing_desirable_services(&self, services: ServiceFlags) -> Option<ServiceFlags> {
-        let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        // A restore downloads only from peers that keep every block (plan
-        // §11.4), so while one is pending the outbound slots keep looking
-        // for those, as they do while the tip is old.
-        if services.has(ServiceFlags::NETWORK_LIMITED) && !self.chain_state.opreturn_restore_pending() {
-            let tip_time = self
-                .chain_state
-                .get_block_index(&self.chain_state.tip_hash())
-                .map_or(0, |e| e.header.time as u64);
-            let depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
-            if depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS {
-                wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-            }
-        }
-        (!services.has(wanted)).then_some(wanted)
+        let tip_time = self
+            .chain_state
+            .get_block_index(&self.chain_state.tip_hash())
+            .map_or(0, |e| e.header.time as u64);
+        let tip_depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
+        missing_desirable_services(services, tip_depth, self.chain_state.opreturn_restore_pending())
     }
 
     /// Perform the version/verack handshake, bounded by `-peertimeout`.

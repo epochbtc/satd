@@ -1919,6 +1919,15 @@ fn restoreopreturns_moves_on_from_a_peer_that_withholds_blocks() {
         let (withholding, asked) = withhold_blocks(RawPeer::connect(a_port), mode, stop.clone());
         common::poll_until(|| asked.lock().unwrap().len() >= blocks.len(), test_timeout(30), "the withholding peer was never asked");
         a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+        if mode == Withhold::NotFound {
+            // At once: a `notfound` does not wait out the 15-second stall
+            // timeout.
+            common::poll_until(
+                || blocks.iter().all(|(h, raw)| a.rpc_call_with_params("getblock", vec![json!(h), json!(0)]).unwrap()["result"] == *raw),
+                test_timeout(10),
+                "a notfound did not move the blocks on at once",
+            );
+        }
         // A stalled request moves after the 15-second stall timeout.
         wait_for_the_restore(&a, &blocks, 120);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);

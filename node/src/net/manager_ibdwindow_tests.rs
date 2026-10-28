@@ -330,6 +330,32 @@ fn an_intact_peer_does_not_stand_in_for_network_while_catching_up() {
     assert_eq!(pm.missing_desirable_services(full), None);
 }
 
+/// The OP_RETURN restore asks only NODE_NETWORK peers: never a limited one,
+/// intact or not (plan §11.4).
+#[test]
+fn the_opreturn_restore_asks_only_full_peers() {
+    let (pm, _dir) = mk_pm();
+    let _intact = add_peer(&pm, 1, intact(), 300);
+    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    let _no_witness = add_peer(&pm, 3, ServiceFlags::NETWORK, 300);
+    assert_eq!(pm.opreturn_restore_peer_ids(), Vec::<PeerId>::new());
+    let _full = add_peer(&pm, 4, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
+    assert_eq!(pm.opreturn_restore_peer_ids(), vec![4]);
+}
+
+/// With a recent tip a limited outbound peer is enough, except while an
+/// OP_RETURN restore is pending: then the outbound slots keep looking for
+/// peers that keep every block.
+#[test]
+fn a_pending_restore_wants_full_outbound_peers() {
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    assert_eq!(super::missing_desirable_services(limited, 0, false), None, "a recent tip");
+    assert_eq!(super::missing_desirable_services(limited, 0, true), Some(full), "restoring");
+    assert_eq!(super::missing_desirable_services(full, 0, true), None);
+    assert_eq!(super::missing_desirable_services(limited, 10_000, false), Some(full), "an old tip");
+}
+
 /// A peer's `notfound` record for the sweep goes when the peer disconnects,
 /// and a block's record goes once the sweep no longer misses the block.
 #[test]
