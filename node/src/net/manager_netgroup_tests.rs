@@ -177,7 +177,9 @@ fn outbound_peers_hold_their_group_and_inbound_peers_and_feelers_do_not() {
     let candidates: Vec<SocketAddr> =
         [44u8, 45, 46, 47, 48].iter().map(|b| SocketAddr::from(([*b, 1, 1, 1], 8333))).collect();
     learn(&pm, &candidates);
-    let dials = dialled(&pm);
+    // Automatic dials are drawn at random from the book, so compare sets.
+    let mut dials = dialled(&pm);
+    dials.sort();
     assert_eq!(dials, candidates[3..].to_vec(), "only the inbound and feeler groups are free");
 }
 
