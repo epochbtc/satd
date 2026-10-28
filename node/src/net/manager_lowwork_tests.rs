@@ -106,3 +106,45 @@ fn a_tall_low_work_header_chain_leaves_the_node_out_of_ibd() {
         .collect();
     assert_eq!(asked, vec![Inventory::WTx(w)], "the announced transaction was not requested");
 }
+
+/// A heavier-but-shorter switch that arrives as a block, not as headers:
+/// the chain state's header tip drops, and the manager's mirror must follow
+/// it on the next maintenance pass, or the node stays in IBD until a peer
+/// next sends headers.
+///
+/// Fails without `refresh_headers_tip`: the mirror stayed at 60.
+#[test]
+fn a_block_that_lowers_the_header_tip_takes_the_node_out_of_ibd() {
+    let (pm, _dir) = mk_pm();
+    let cs = Arc::clone(&pm.chain_state);
+    let now = crate::time::now_secs() as u32;
+    let mut parent = cs.tip_hash();
+    for h in 1..=5 {
+        let b = crate::chain::state::tests::build_test_block(parent, h, now - 3_000 + 60 * h);
+        parent = cs.accept_block(&b).expect("connect fixture block").hash();
+    }
+    let tip = parent;
+    // 55 light headers above the tip, sent as headers.
+    let mut above = Vec::new();
+    let mut p = tip;
+    for h in 6..=60 {
+        let b = crate::chain::state::tests::build_test_block(p, h, now - 2_000 + h);
+        p = b.block_hash();
+        above.push(b.header);
+    }
+    let _rx = add_peer(&pm, 1, Direction::Outbound);
+    pm.handle_headers(1, above);
+    assert_eq!(pm.headers_tip.load(Ordering::Relaxed), 60);
+    assert!(pm.is_ibd(), "fixture: 55 headers ahead of the tip");
+
+    // The connected chain turns out heavier, and a block on it out-works
+    // the 55 headers: the best header is that block, at height 6.
+    cs.scale_active_chain_work_for_test(1_000);
+    let b6 = crate::chain::state::tests::build_test_block(tip, 6, now - 1_000);
+    cs.accept_block(&b6).expect("the heavier block connects");
+    assert_eq!(cs.headers_tip_height(), 6);
+
+    pm.refresh_headers_tip();
+    assert_eq!(pm.headers_tip.load(Ordering::Relaxed), 6);
+    assert!(!pm.is_ibd());
+}
