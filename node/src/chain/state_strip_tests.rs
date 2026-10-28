@@ -443,8 +443,12 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
 
     // No prior record: none is left.
     *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
+    let changes = cs.strip.changes.load(Ordering::Acquire);
     assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
     assert_eq!(record(&cs, &hash), None);
+    // The raced write counts as a change, as every record write does, so an
+    // option-off pass counts again after it.
+    assert_ne!(cs.strip.changes.load(Ordering::Acquire), changes, "the raced write was not counted as a change");
     assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
     let _ = std::fs::remove_dir_all(dir);
@@ -1393,5 +1397,26 @@ fn an_idle_pass_does_not_count_again() {
     cs.forget_strip_summary();
     pass(&cs, 1000);
     assert!(cs.strip.summary.lock().is_some(), "a change is counted on the next pass");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A finish that fails (here the family drop) is retried by the next pass,
+/// though nothing has changed since: no later change would come to prompt
+/// one, and the node would stay limited until a restart.
+#[test]
+fn a_failed_finish_is_retried_by_the_next_pass() {
+    let store = crate::storage::test_store::ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = super::super::tests::make_chain_state_with_store(Box::new(store));
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    cs.strip_block(&b.block_hash(), THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    cs.repair_block_data(b).unwrap();
+    controls.fail_next_strip_drop();
+    assert!(cs.strip_pass(1000, &std::sync::atomic::AtomicBool::new(false)).is_err(), "premise: the finish failed");
+    assert!(cs.opreturn_prune_active());
+    pass(&cs, 1000);
+    assert!(!cs.opreturn_prune_active(), "the failed finish was never retried");
     let _ = std::fs::remove_dir_all(dir);
 }

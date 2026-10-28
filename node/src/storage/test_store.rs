@@ -84,6 +84,8 @@ pub(crate) struct StoreControls {
     before_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
     /// Strip-record reads fail, as a corrupt RocksDB row does.
     strip_unreadable: Arc<AtomicBool>,
+    /// The next drop of the strip family fails, once.
+    fail_next_strip_drop: Arc<AtomicBool>,
 }
 
 type StripLookupHook = Box<dyn FnOnce(&InMemoryStore) + Send>;
@@ -184,6 +186,11 @@ impl StoreControls {
     /// strip-record lookup reads it.
     pub(crate) fn before_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
         *self.before_strip_lookup.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Fail the next `drop_opreturn_strip_cf`, once, as a RocksDB error would.
+    pub(crate) fn fail_next_strip_drop(&self) {
+        self.fail_next_strip_drop.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn set_strip_unreadable(&self, yes: bool) {
@@ -309,6 +316,7 @@ impl ControllableStore {
                 after_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
                 before_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
                 strip_unreadable: Arc::new(AtomicBool::new(false)),
+                fail_next_strip_drop: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -377,6 +385,9 @@ impl Store for ControllableStore {
         self.inner.for_each_opreturn_strip(f)
     }
     fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        if self.controls.fail_next_strip_drop.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Database("injected strip-family drop fault".into()));
+        }
         self.inner.drop_opreturn_strip_cf()
     }
     fn flush_durable(&self) -> Result<(), StoreError> {

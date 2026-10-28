@@ -265,6 +265,7 @@ impl ChainState {
                         None => batch.opreturn_strip_removes.push(*hash),
                     }
                     self.store.write_batch(batch)?;
+                    self.forget_strip_summary();
                 }
                 return Ok(StripOutcome::Raced);
             }
@@ -727,11 +728,13 @@ impl ChainState {
             let changes = self.strip.changes.load(Ordering::Acquire);
             if self.strip.counted.load(Ordering::Acquire) != changes + 1 {
                 self.flush_durable()?;
-                let records = self.opreturn_strip_summary_records()?;
-                self.strip.counted.store(changes + 1, Ordering::Release);
-                if records == 0 {
+                // Marked counted only once the finish, when due, has run: a
+                // finish that fails is retried by the next pass, since no
+                // later change would come to prompt one.
+                if self.opreturn_strip_summary_records()? == 0 {
                     self.finish_opreturn_unstrip()?;
                 }
+                self.strip.counted.store(changes + 1, Ordering::Release);
             }
             return Ok(PassReport::default());
         };
