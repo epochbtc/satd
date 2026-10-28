@@ -66,7 +66,7 @@ work, authenticated or not. Every connection and socket cap is clamped to
 | streaming WS/SSE sockets | `--streamws-max-sockets` | 1024 | connection closed at accept |
 | Esplora | `-esploramaxconns`, `-esplorasseconns` | 256 / = maxconns | HTTP 429 |
 | Esplora sockets (plain + TLS) | `-esploramaxsockets` | 1024 | connection closed at accept |
-| Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 1000 | connection refused |
+| Electrum | `-electrummaxconns`, `-electrummaxsubsperconn` | 64 / 10000 | connection refused |
 | JSON-RPC sockets (each listener: main, read-only, and their TLS binds) | none (fixed) | 100 per listener | connection closed at accept |
 
 A socket cap counts every open connection on a listener, idle keep-alive

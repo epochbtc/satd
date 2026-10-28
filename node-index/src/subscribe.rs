@@ -99,19 +99,20 @@ impl SubscriptionRegistry {
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         let mut channels = self.channels.lock();
-        match channels.get(&sh) {
-            Some(tx) if tx.receiver_count() > 0 => return Ok(tx.subscribe()),
-            // An abandoned channel for this very scripthash is replaced
-            // below, so its dedup entry goes now. A re-subscribe is supposed
-            // to recompute status_hash from current state; a stale entry
-            // from the prior incarnation could match the recomputed hash and
-            // silently swallow the first notification.
-            Some(_) => {
-                channels.remove(&sh);
-                self.last_status.lock().remove(&sh);
-            }
-            None => {}
+        if let Some(tx) = channels.get(&sh)
+            && tx.receiver_count() > 0
+        {
+            return Ok(tx.subscribe());
         }
+        // A new channel starts with no dedup entry, whether an abandoned one
+        // for this scripthash is being replaced or none is left. A
+        // re-subscribe is supposed to recompute status_hash from current
+        // state; a stale entry from a prior incarnation could match the
+        // recomputed hash and silently swallow the first notification. One
+        // can outlive its channel's sweep: `maybe_notify` writes it after
+        // dropping the `channels` lock.
+        channels.remove(&sh);
+        self.last_status.lock().remove(&sh);
         let max_subs = self.max_subs.load(Ordering::Relaxed);
         if channels.len() >= max_subs {
             // Sweep abandoned channels under the same lock so the cap check
@@ -485,6 +486,32 @@ mod tests {
         assert_eq!(reg.channels.lock().len(), 3);
         reg.prune_empty();
         assert_eq!(reg.channels.lock().len(), 3);
+    }
+
+    /// A dedup entry with no channel (a `maybe_notify` that wrote it after
+    /// the sweep removed the channel) does not carry into a new subscriber's
+    /// channel: its first push of that same status still arrives.
+    /// Perturbation: clear `last_status` only when replacing a dead channel
+    /// and the push is swallowed.
+    #[tokio::test]
+    async fn an_orphaned_dedup_entry_does_not_swallow_a_new_subscribers_push() {
+        use tokio::time::{Duration, timeout};
+        let reg = SubscriptionRegistry::new(100, 32);
+        let sh = [0x77; 32];
+        let x = [0x88; 32];
+        drop(reg.subscribe(sh).unwrap());
+        reg.prune_empty();
+        assert!(reg.channels.lock().is_empty());
+        // The late write of an in-flight `maybe_notify`.
+        reg.last_status.lock().insert(sh, x);
+
+        let mut rx = reg.subscribe(sh).unwrap();
+        reg.maybe_notify(sh, x);
+        let got = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("the first push to a new subscriber was swallowed")
+            .expect("recv ok");
+        assert_eq!(got.status_hash, x);
     }
 
     #[test]
