@@ -127,7 +127,8 @@ fn services_line(state: &AppState) -> Line<'static> {
         sp_index_spans(&mut spans, sp);
     }
     // Only on a node that strips, holds stripped blocks or is restoring them.
-    if let Some(op) = state.opreturn.as_ref() {
+    // `restored` can show for one poll while the object is going away.
+    if let Some(op) = state.opreturn.as_ref().filter(|o| o.worker != "restored") {
         spans.push(Span::raw("  "));
         opreturn_spans(&mut spans, op);
     }
@@ -348,7 +349,7 @@ fn listener_spans(
 /// restored of the pass's total, and its ETA. Otherwise `op-strip <state>`:
 /// how many blocks are stripped, and whether the worker is running.
 fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnProgress) {
-    if let Some(r) = op.restore.as_ref().filter(|_| op.worker != "restored") {
+    if let Some(r) = op.restore.as_ref() {
         let label = "op-restore";
         let done = format_num(r.total_blocks.saturating_sub(r.remaining_blocks));
         let total = format_num(r.total_blocks);
@@ -377,7 +378,11 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
         "running" => (Color::Green, blocks),
         "ibd" | "reindex" | "background_validation" => (Color::Yellow, format!("{blocks}, paused ({})", op.worker)),
         // The option is off; stripped blocks remain until restored.
-        _ => (Color::DarkGray, format!("{blocks}, off")),
+        "off" => (Color::DarkGray, format!("{blocks}, off")),
+        // A daemon that does not say (older than the field), or a state
+        // this build does not know: the count, and no claim about the
+        // worker.
+        _ => (Color::DarkGray, blocks),
     };
     spans.push(dot(color));
     spans.push(Span::styled(label, Style::default().fg(Color::White)));
@@ -1189,6 +1194,24 @@ mod tests {
             st.opreturn = Some(opreturn(worker, None));
             let r = row(&st);
             assert!(r.contains(want), "{worker}: {r}");
+        }
+    }
+
+    /// A daemon too old to report the worker, or a state this build does not
+    /// know, shows the count without claiming the worker is off; `restored`,
+    /// briefly reported as the object goes away, shows no column.
+    #[test]
+    fn services_row_claims_no_worker_state_it_was_not_told() {
+        for worker in ["", "something_new"] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn(worker, None));
+            let r = row(&st);
+            assert!(r.contains("op-strip 1,234 blocks") && !r.contains("off") && !r.contains("paused"), "{worker:?}: {r}");
+        }
+        for restore in [None, Some(restore_view())] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn("restored", restore));
+            assert!(!row(&st).contains("op-"), "{}", row(&st));
         }
     }
 

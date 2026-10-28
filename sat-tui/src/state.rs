@@ -281,7 +281,6 @@ impl IbdBitmap {
     }
 }
 
-/// Snapshot of the address-index backfill from `getsatdindexinfo`. Only
 /// OP_RETURN pruning, from `getblockchaininfo.opreturn_prune`: present only
 /// on a node that strips or still holds stripped blocks, so a node that
 /// never used it shows no column.
@@ -333,6 +332,7 @@ impl OpReturnProgress {
     }
 }
 
+/// Snapshot of the address-index backfill from `getsatdindexinfo`. Only
 /// surfaced in the UI when state is one of `running`, `paused`, or
 /// `failed` — `idle`, `completed`, `cancelled`, `rejected` are quiet.
 #[derive(Debug, Clone)]
