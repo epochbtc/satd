@@ -655,6 +655,36 @@ impl MetricsContext {
                 summary.blocks,
             );
         }
+        // `-restoreopreturns` (plan §11.6), once a restore pass has started.
+        if self.chain_state.opreturn_restore_requested()
+            && let Some(p) = self.chain_state.opreturn_restore_progress()
+        {
+            let pending = self.chain_state.opreturn_restore_pending();
+            metric(
+                &mut out,
+                "satd_opreturn_restore_remaining_blocks",
+                "Stripped blocks the OP_RETURN restore has left to download",
+                "gauge",
+                &[],
+                if pending { p.remaining_blocks } else { 0 },
+            );
+            metric(
+                &mut out,
+                "satd_opreturn_restore_restored_blocks_total",
+                "Stripped blocks restored from peers since the node started",
+                "counter",
+                &[],
+                p.restored_blocks,
+            );
+            metric(
+                &mut out,
+                "satd_opreturn_restore_downloaded_bytes_total",
+                "Bytes of block data the OP_RETURN restore has downloaded since the node started",
+                "counter",
+                &[],
+                p.bytes_downloaded,
+            );
+        }
 
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());

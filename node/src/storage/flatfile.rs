@@ -686,28 +686,42 @@ impl FlatFileManager {
         Ok(())
     }
 
-    /// Read a block from the flat files at the given position.
-    /// Uses cached file handles to avoid repeated open() syscalls.
-    pub fn read_block(&mut self, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
-        let file = if let Some(f) = self.read_cache.get_mut(&pos.file_number) {
-            f
-        } else {
+    /// The length of the block stored at `pos`, from its record header alone.
+    pub fn read_block_len(&mut self, pos: &FlatFilePos) -> std::io::Result<u32> {
+        let file = self.reader(pos.file_number)?;
+        file.seek(SeekFrom::Start(pos.data_pos as u64))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+        xor_in_place(&mut header, &self.xor_key, pos.data_pos as u64);
+        Ok(u32::from_le_bytes([header[4], header[5], header[6], header[7]]))
+    }
+
+    /// A cached reader for `file_number`.
+    fn reader(&mut self, file_number: u32) -> std::io::Result<&mut File> {
+        if !self.read_cache.contains_key(&file_number) {
             // Evict oldest if cache is large (keep at most 8 open readers)
             if self.read_cache.len() >= 8 {
                 let oldest = *self.read_cache.keys().next().unwrap();
                 self.read_cache.remove(&oldest);
             }
-            let path = self.file_path(pos.file_number);
-            let f = File::open(&path)?;
-            self.read_cache.entry(pos.file_number).or_insert(f)
-        };
+            let f = File::open(self.file_path(file_number))?;
+            self.read_cache.insert(file_number, f);
+        }
+        Ok(self.read_cache.get_mut(&file_number).expect("inserted above"))
+    }
+
+    /// Read a block from the flat files at the given position.
+    /// Uses cached file handles to avoid repeated open() syscalls.
+    pub fn read_block(&mut self, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
+        let xor_key = self.xor_key;
+        let file = self.reader(pos.file_number)?;
 
         file.seek(SeekFrom::Start(pos.data_pos as u64))?;
 
         // Read magic (4 bytes) + size (4 bytes)
         let mut header = [0u8; 8];
         file.read_exact(&mut header)?;
-        xor_in_place(&mut header, &self.xor_key, pos.data_pos as u64);
+        xor_in_place(&mut header, &xor_key, pos.data_pos as u64);
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
         // A record never exceeds one flat file (write_block rolls over).
@@ -730,7 +744,7 @@ impl FlatFileManager {
 
         let mut data = vec![0u8; size];
         file.read_exact(&mut data)?;
-        xor_in_place(&mut data, &self.xor_key, pos.data_pos as u64 + 8);
+        xor_in_place(&mut data, &xor_key, pos.data_pos as u64 + 8);
         Ok(data)
     }
 

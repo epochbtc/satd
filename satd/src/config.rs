@@ -1003,6 +1003,10 @@ pub struct Config {
     /// satd extension `-pruneopreturnpeers`: what a node with stripped
     /// blocks serves to peers.
     pub opreturn_prune_peers: node::storage::opreturn_strip::PrunePeers,
+    /// satd extension `-restoreopreturns`: download the stripped blocks again
+    /// until none is left (plan §11). Refused with any OP_RETURN pruning
+    /// option.
+    pub restore_opreturns: bool,
     pub check_block_index: bool,
     /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
     /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
@@ -3864,6 +3868,7 @@ impl Config {
 
         let (opreturn_prune_depth, opreturn_prune_size, opreturn_prune_peers) =
             resolve_opreturn_prune(&cli.opreturn_prune_args, &file_get)?;
+        let restore_opreturns = resolve_opreturn_restore(&cli.opreturn_prune_args, &file_get)?;
 
         let prune = cli
             .prune
@@ -4320,6 +4325,7 @@ impl Config {
             opreturn_prune_depth,
             opreturn_prune_size,
             opreturn_prune_peers,
+            restore_opreturns,
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -4825,6 +4831,7 @@ impl Config {
             "pruneopreturn": self.opreturn_prune_depth,
             "pruneopreturnsize": self.opreturn_prune_size,
             "pruneopreturnpeers": self.opreturn_prune_peers.as_str(),
+            "restoreopreturns": self.restore_opreturns,
             "dbcache": self.dbcache,
             "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
             "signet_seed_nodes": self.signet_seed_nodes,
@@ -4908,6 +4915,7 @@ impl Config {
                 "opreturn_prune_depth": self.opreturn_prune_depth,
                 "opreturn_prune_size": self.opreturn_prune_size,
                 "opreturn_prune_peers": self.opreturn_prune_peers.as_str(),
+                "restore_opreturns": self.restore_opreturns,
                 "dbcache_mb": self.dbcache,
                 "dbcache_mode": format!("{:?}", self.dbcache_mode),
             },
@@ -6037,8 +6045,8 @@ pub struct CliArgs {
     #[command(flatten)]
     pub zmq_pub_args: ZmqPubArgs,
 
-    /// `-pruneopreturn`, `-pruneopreturnsize`, `-pruneopreturnpeers` and the
-    /// hidden `-allowteststrip`, hand-built for the same stack-frame reason as
+    /// `-pruneopreturn`, `-pruneopreturnsize`, `-pruneopreturnpeers`,
+    /// `-restoreopreturns` and the hidden `-allowteststrip`, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub opreturn_prune_args: OpReturnPruneArgs,
@@ -7628,7 +7636,8 @@ impl clap::FromArgMatches for TxAnnounceArgs {
 /// `-pruneopreturn`, `-pruneopreturnsize` and `-pruneopreturnpeers` (see
 /// [`CliArgs::opreturn_prune_args`]), satd extensions. Taken as text and
 /// parsed by [`resolve_opreturn_prune`], so a bad value on the command line
-/// and in the config file fail with the same message.
+/// and in the config file fail with the same message. `-restoreopreturns`,
+/// which undoes them, rides in the same group ([`resolve_opreturn_restore`]).
 ///
 /// The group also carries `-allowteststrip`, which registers the test-only
 /// `stripopreturns` RPC on regtest: hidden from `--help`, never documented,
@@ -7639,6 +7648,7 @@ pub struct OpReturnPruneArgs {
     pub pruneopreturn: Option<String>,
     pub pruneopreturnsize: Option<String>,
     pub pruneopreturnpeers: Option<String>,
+    pub restoreopreturns: Option<bool>,
     pub allowteststrip: Option<bool>,
 }
 
@@ -7672,12 +7682,18 @@ const OPRETURN_PRUNE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
     ),
 ];
 
+const RESTORE_OPRETURNS_HELP: &str = "Download the blocks OP_RETURN pruning stripped again, from peers that \
+     keep every block, until none is left; the node then serves the full chain (NODE_NETWORK) without a \
+     restart (satd extension; default: 0). Refused with -pruneopreturn, -pruneopreturnsize or \
+     -pruneopreturnpeers. Does nothing on a node with no stripped block, so it may stay set.";
+
 impl clap::Args for OpReturnPruneArgs {
     fn augment_args(mut cmd: clap::Command) -> clap::Command {
         for spec in OPRETURN_PRUNE_ARG_SPECS {
             cmd = cmd.arg(stratum_arg(spec));
         }
-        cmd.arg(
+        cmd.arg(stratum_arg(&("restoreopreturns", "BOOL", StratumArgKind::Bool, RESTORE_OPRETURNS_HELP)))
+            .arg(
             stratum_arg(&("allowteststrip", "BOOL", StratumArgKind::Bool, "Register the test-only stripopreturns RPC (regtest only)"))
                 .hide(true),
         )
@@ -7698,6 +7714,7 @@ impl clap::FromArgMatches for OpReturnPruneArgs {
             pruneopreturn: m.remove_one("pruneopreturn"),
             pruneopreturnsize: m.remove_one("pruneopreturnsize"),
             pruneopreturnpeers: m.remove_one("pruneopreturnpeers"),
+            restoreopreturns: m.remove_one("restoreopreturns"),
             allowteststrip: m.remove_one("allowteststrip"),
         })
     }
@@ -7791,6 +7808,45 @@ fn resolve_opreturn_prune(
         .transpose()?
         .unwrap_or_default();
     Ok((depth, size, peers))
+}
+
+/// `-restoreopreturns` (plan §11.3), command line first, then the config
+/// file. Refused, naming both options, alongside any OP_RETURN pruning
+/// option at any value, `pruneopreturn=0` included, and alongside
+/// `-allowteststrip`: a node told both to strip and to restore has no
+/// meaning to settle on.
+#[inline(never)]
+fn resolve_opreturn_restore(
+    cli: &OpReturnPruneArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool, String> {
+    let restore = match (cli.restoreopreturns, file_get("restoreopreturns")) {
+        (Some(on), _) => on,
+        (None, Some(v)) => {
+            parse_bool(&v).ok_or_else(|| format!("-restoreopreturns must be 0 or 1, not \"{v}\""))?
+        }
+        (None, None) => false,
+    };
+    if !restore {
+        return Ok(false);
+    }
+    let given = |cli: &Option<String>, key: &str| cli.is_some() || file_get(key).is_some();
+    for (cli, key) in [
+        (&cli.pruneopreturn, "pruneopreturn"),
+        (&cli.pruneopreturnsize, "pruneopreturnsize"),
+        (&cli.pruneopreturnpeers, "pruneopreturnpeers"),
+    ] {
+        if given(cli, key) {
+            return Err(format!(
+                "-restoreopreturns cannot be combined with -{key}: one downloads the stripped blocks \
+                 again, the other strips them. Remove -{key} to restore, or -restoreopreturns to keep pruning"
+            ));
+        }
+    }
+    if cli.allowteststrip == Some(true) {
+        return Err("-restoreopreturns cannot be combined with -allowteststrip".to_string());
+    }
+    Ok(true)
 }
 
 /// `-nap`, `-napstorerecover` and `-napaggregator`, satd extensions, out of
@@ -8838,6 +8894,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "pruneopreturn",
         "pruneopreturnsize",
         "pruneopreturnpeers",
+        "restoreopreturns",
         "reindex",
         "reindex-chainstate",
         "checkblockindex",
@@ -9657,6 +9714,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "pruneopreturn",
     "pruneopreturnsize",
     "pruneopreturnpeers",
+    "restoreopreturns",
     "reindex",
     "reindexchainstate",
     "checkblockindex",
@@ -10779,6 +10837,40 @@ mod tests {
         assert!(build("pruneopreturn=100\n", &[]).unwrap_err().contains("at least 288"));
         assert!(build("", &["--pruneopreturnsize=1.5k"]).unwrap_err().contains("KiB or MiB"));
         assert!(build("pruneopreturnpeers=open\n", &[]).unwrap_err().contains("limited or intact"));
+    }
+
+    /// Plan §11.3: `-restoreopreturns` with any OP_RETURN pruning option, at
+    /// any value and from either source, fails naming both; alone it starts.
+    #[test]
+    fn restoreopreturns_conflicts_with_every_pruning_option() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build = |body: &str, extra: &[&str]| {
+            let conf = dir.path().join("restore.conf");
+            std::fs::write(&conf, body).unwrap();
+            let mut args = vec!["satd", "--datadir", dir.path().to_str().unwrap(), "--conf", conf.to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(args).unwrap())
+        };
+        assert!(!build("", &[]).unwrap().restore_opreturns, "off by default");
+        assert!(build("", &["--restoreopreturns"]).unwrap().restore_opreturns, "alone, from the CLI");
+        assert!(build("restoreopreturns=1\n", &[]).unwrap().restore_opreturns, "alone, from the file");
+        for option in ["pruneopreturn=0", "pruneopreturn=all", "pruneopreturnsize=0", "pruneopreturnpeers=limited"] {
+            let key = option.split('=').next().unwrap();
+            for (body, cli) in [
+                (format!("restoreopreturns=1\n{option}\n"), vec![]),
+                (String::new(), vec!["--restoreopreturns".to_string(), format!("--{option}")]),
+                (format!("{option}\n"), vec!["--restoreopreturns=1".to_string()]),
+            ] {
+                let cli: Vec<&str> = cli.iter().map(String::as_str).collect();
+                let err = build(&body, &cli).expect_err(option);
+                assert!(err.contains("-restoreopreturns") && err.contains(&format!("-{key}")), "{option}: {err}");
+            }
+        }
+        // Turned off, it conflicts with nothing.
+        assert!(!build("restoreopreturns=0\npruneopreturn=all\n", &[]).unwrap().restore_opreturns);
+        let err = build("", &["--restoreopreturns", "--allowteststrip"]).unwrap_err();
+        assert!(err.contains("-allowteststrip"), "{err}");
+        assert!(build("restoreopreturns=maybe\n", &[]).unwrap_err().contains("0 or 1"));
     }
 
     #[test]

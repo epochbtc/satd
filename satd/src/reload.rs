@@ -1031,6 +1031,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("pruneopreturn", opreturn_prune_depth),
         restart!("pruneopreturnsize", opreturn_prune_size),
         restart!("pruneopreturnpeers", opreturn_prune_peers),
+        restart!("restoreopreturns", restore_opreturns),
         restart!("fastprune", fastprune),
         restart!("reindex", reindex),
         restart!("reindexchainstate", reindex_chainstate),

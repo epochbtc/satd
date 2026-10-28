@@ -372,6 +372,48 @@ const BG_CATCHUP_STALE_SECS: u64 = 30;
 /// A peer that has not answered gets no more until it does or its requests
 /// time out.
 const BG_CATCHUP_PER_PEER: usize = 16;
+/// [`PeerManager::missing_desirable_services`] for a tip `tip_depth` blocks'
+/// worth of time behind now. A pending OP_RETURN restore downloads only from
+/// peers that keep every block (plan §11.4), so while one is pending the
+/// outbound slots keep looking for those, as they do while the tip is old.
+fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pending: bool) -> Option<ServiceFlags> {
+    let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    if services.has(ServiceFlags::NETWORK_LIMITED)
+        && tip_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+        && !restore_pending
+    {
+        wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    }
+    (!services.has(wanted)).then_some(wanted)
+}
+/// A restore pass's work list as read on the blocking pool.
+type RestoreWork = Result<Vec<crate::chain::state::RestoreItem>, String>;
+
+/// Run `load`, a restore pass's work-list read, turning a panic into an
+/// error: the slot it fills is what clears the download's `loading`, so a
+/// read that never reports would hold the restore until a restart.
+fn load_restore_work(load: impl FnOnce() -> RestoreWork + std::panic::UnwindSafe) -> RestoreWork {
+    std::panic::catch_unwind(load).unwrap_or_else(|_| Err("the work-list read panicked".to_string()))
+}
+
+/// What became of a block the restore asked for.
+#[derive(Clone, Copy)]
+enum RestoreArrival {
+    Restored,
+    /// The copy failed to authenticate: the peer's fault.
+    BadCopy,
+    /// A failure of ours, or an index entry that changed meanwhile.
+    NotOurs,
+}
+
+/// Most blocks in one restore `getdata`.
+const PER_GETDATA_BLOCKS: usize = 128;
+/// A restore progress line every this many blocks restored, as the strip
+/// pass logs every thousand blocks.
+const RESTORE_PROGRESS_EVERY: u64 = 1000;
+/// Regtest only: a file holding the free space, in bytes, that the restore's
+/// disk check sees in place of the blocks volume's.
+pub const RESTORE_TEST_FREE_SPACE_ENV: &str = "SATD_TEST_FREE_SPACE_FILE";
 /// Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`: the depth a pruned node
 /// promises to serve (BIP 159).
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
@@ -1263,6 +1305,12 @@ pub struct PeerManager {
     /// historical block data (genesis→`snapshot_height`) for the
     /// background validator. Idle (empty) unless a snapshot is loaded.
     bg_downloader: RwLock<BgDownloader>,
+    /// The `-restoreopreturns` download (plan §11.4): `None` until a
+    /// restore is pending, and again once it is done.
+    opreturn_restore: parking_lot::Mutex<Option<crate::net::opreturn_restore::RestoreDownloader>>,
+    /// A restore pass's work list, read on the blocking pool and picked up
+    /// by the next tick.
+    opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<RestoreWork>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// The block processor and background catch-up threads, named. Both
@@ -1524,6 +1572,8 @@ impl PeerManager {
                 BG_CATCHUP_WINDOW,
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
             )),
+            opreturn_restore: parking_lot::Mutex::new(None),
+            opreturn_restore_loaded: Arc::new(parking_lot::Mutex::new(None)),
             bg_connect_signal: bg_connect_signal.clone(),
             connector_threads: parking_lot::Mutex::new(Vec::new()),
             proxy,
@@ -5293,6 +5343,7 @@ impl PeerManager {
             // handoff completes.
             if ticks.is_multiple_of(4) {
                 self.drive_bg_catchup_download();
+                self.drive_opreturn_restore();
             }
 
             // Request blocks: immediately on tip advance, or every 10 ticks as fallback
@@ -5499,6 +5550,9 @@ impl PeerManager {
         // Return the peer's background-range requests to the pool so they
         // re-request promptly rather than waiting out the stale timeout.
         self.bg_downloader.write().note_peer_gone(id);
+        if let Some(restore) = self.opreturn_restore.lock().as_mut() {
+            restore.note_peer_gone(id);
+        }
         // A departed peer's partial compact block can never be completed,
         // and its requests will never be answered.
         self.pending_compact.write().remove(&id);
@@ -5853,6 +5907,19 @@ impl PeerManager {
                                 }
                             }
                         }
+                    }
+                    // A restore request (plan §11.4): another peer is asked,
+                    // and this one not again for that block this pass.
+                    let refused: Vec<bitcoin::BlockHash> = match self.opreturn_restore.lock().as_mut() {
+                        Some(restore) => block_hashes.iter().copied().filter(|h| restore.note_not_found(h, id)).collect(),
+                        None => Vec::new(),
+                    };
+                    if !refused.is_empty() {
+                        let mut pending = self.block_refetch.write();
+                        for h in &refused {
+                            pending.remove(&(*h, id));
+                        }
+                        tracing::debug!(id, count = refused.len(), "OP_RETURN restore: notfound, asking another peer");
                     }
                     // The background download's heights too, so the next
                     // pass asks a different peer instead of waiting out
@@ -7179,6 +7246,7 @@ impl PeerManager {
                 %hash, id,
                 "getblockfrompeer: not a data hole; handing to the normal block path"
             );
+            self.note_opreturn_restore_arrival(&hash, id, block, RestoreArrival::NotOurs);
             return false;
         }
 
@@ -7188,6 +7256,16 @@ impl PeerManager {
             // ordinary duplicates.
             self.block_refetch.write().retain(|(h, _), _| *h != hash);
         }
+        self.note_opreturn_restore_arrival(
+            &hash,
+            id,
+            block,
+            match &outcome {
+                Ok(_) => RestoreArrival::Restored,
+                Err(crate::chain::state::ChainError::Validation(_)) => RestoreArrival::BadCopy,
+                Err(_) => RestoreArrival::NotOurs,
+            },
+        );
         match outcome {
             Ok(crate::chain::state::BlockDataRepair::Repaired { height }) => {
                 tracing::info!(
@@ -7674,6 +7752,244 @@ impl PeerManager {
             for chunk in hashes.chunks(128) {
                 self.send_to_peer(pid, sync::make_getdata_blocks(chunk));
             }
+        }
+    }
+
+    /// The peers a restore may ask (plan §11.4): connected, keeping every
+    /// block (`NODE_NETWORK`) and serving witnesses. Never a limited peer,
+    /// `NODE_INTACT_BLOCKS` or not: it may have stripped the same block.
+    fn opreturn_restore_peer_ids(&self) -> Vec<PeerId> {
+        let peers = self.peers.read();
+        let mut ids: Vec<PeerId> = peers
+            .iter()
+            .filter(|(_, h)| {
+                h.info.state == PeerState::Connected
+                    && h.info.serves_blocks()
+                    && h.info.services.has(ServiceFlags::NETWORK | ServiceFlags::WITNESS)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Drive the `-restoreopreturns` download (plan §11.4): start a pass over
+    /// the strip records, check the free space before each window, and ask
+    /// peers for the window's blocks. The tip comes first: nothing new is
+    /// asked while the node is behind. Each arrival takes the repair route
+    /// (`handle_refetched_block`), which restores the block in place.
+    fn drive_opreturn_restore(&self) {
+        use crate::chain::state::WorkerStatus;
+        let cs = &self.chain_state;
+        if !cs.opreturn_restore_pending() {
+            *self.opreturn_restore_loaded.lock() = None;
+            if self.opreturn_restore.lock().take().is_some() {
+                tracing::info!("OP_RETURN restore: no stripped block left to download");
+            }
+            return;
+        }
+        let now = Instant::now();
+        let peers = self.opreturn_restore_peer_ids();
+        let mut guard = self.opreturn_restore.lock();
+        let restore = guard.get_or_insert_with(Default::default);
+        restore.peers = peers.len();
+        let stalled = restore.release_stale(now);
+        if stalled > 0 {
+            tracing::debug!(stalled, "OP_RETURN restore: stalled requests given to other peers");
+        }
+        let report = |restore: &crate::net::opreturn_restore::RestoreDownloader, status| {
+            cs.set_opreturn_restore_status(status, Some(restore.progress()));
+        };
+        if let Some(why) = cs.opreturn_restore_held_by_tip() {
+            tracing::trace!(why, "OP_RETURN restore: waiting for the tip");
+            report(restore, WorkerStatus::WaitingForTip);
+            return;
+        }
+        if restore.is_idle() {
+            let loaded = self.opreturn_restore_loaded.lock().take();
+            match loaded {
+                Some(Ok(work)) => {
+                    restore.loading = false;
+                    let bytes: u64 = work.iter().map(|i| i.len).sum();
+                    tracing::info!(
+                        blocks = work.len(),
+                        bytes,
+                        "OP_RETURN restore: downloading the stripped blocks again from peers that keep \
+                         every block"
+                    );
+                    restore.start_pass(work, now);
+                }
+                Some(Err(e)) => {
+                    restore.loading = false;
+                    tracing::warn!(error = %e, "OP_RETURN restore: reading the strip records failed; retrying in a minute");
+                    restore.hold_off(now);
+                    report(restore, WorkerStatus::Restoring);
+                    return;
+                }
+                None => {
+                    if peers.is_empty() {
+                        report(restore, WorkerStatus::WaitingForPeers);
+                        return;
+                    }
+                    if !restore.loading && restore.may_start_pass(now, &peers) {
+                        // The records, an index read and a file read for each:
+                        // too much for the event loop on a node that stripped a
+                        // lot. On a pruning node, newest first (R-6): those are
+                        // the blocks pruning keeps longest.
+                        restore.loading = true;
+                        let chain = Arc::clone(&self.chain_state);
+                        let slot = Arc::clone(&self.opreturn_restore_loaded);
+                        let descending = self.is_pruning();
+                        tokio::task::spawn_blocking(move || {
+                            // A read only: nothing it could leave half done.
+                            *slot.lock() = Some(load_restore_work(std::panic::AssertUnwindSafe(|| {
+                                chain.opreturn_restore_work(descending).map_err(|e| e.to_string())
+                            })));
+                        });
+                    }
+                    report(restore, WorkerStatus::Restoring);
+                    return;
+                }
+            }
+        }
+        if restore.window_is_empty() {
+            if !self.opreturn_restore_disk_ok(restore, now) {
+                report(restore, WorkerStatus::WaitingForDisk);
+                return;
+            }
+            restore.next_window();
+        }
+        if peers.is_empty() {
+            report(restore, WorkerStatus::WaitingForPeers);
+            return;
+        }
+        let assignments = restore.assign(&peers, now);
+        report(restore, WorkerStatus::Restoring);
+        drop(guard);
+
+        for (peer, hashes) in assignments {
+            // Registered before sending, as `request_block_from_peer` does: the
+            // reply can land before the send returns.
+            {
+                let mut pending = self.block_refetch.write();
+                pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+                for hash in &hashes {
+                    pending.insert((*hash, peer), now);
+                }
+            }
+            for chunk in hashes.chunks(PER_GETDATA_BLOCKS) {
+                if !self.send_to_peer(peer, sync::make_getdata_blocks(chunk)) {
+                    let mut pending = self.block_refetch.write();
+                    for hash in chunk {
+                        pending.remove(&(*hash, peer));
+                    }
+                    if let Some(restore) = self.opreturn_restore.lock().as_mut() {
+                        for hash in chunk {
+                            restore.note_failed(hash, peer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The free-space check before each restore window (plan §11.4): the
+    /// blocks volume needs room for what the holes still lack, plus 1 GiB.
+    /// Warns once when it does not, and rechecks every minute. On regtest the
+    /// figure for free space can come from the file `SATD_TEST_FREE_SPACE_FILE`
+    /// names, read on every check.
+    fn opreturn_restore_disk_ok(
+        &self,
+        restore: &mut crate::net::opreturn_restore::RestoreDownloader,
+        now: Instant,
+    ) -> bool {
+        const RESERVE: u64 = 1 << 30;
+        const RECHECK: Duration = Duration::from_secs(60);
+        let cs = &self.chain_state;
+        let test_free = (cs.network == bitcoin::Network::Regtest)
+            .then(|| std::env::var_os(RESTORE_TEST_FREE_SPACE_ENV))
+            .flatten()
+            .map(|path| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok()));
+        if test_free.is_none()
+            && restore.disk_checked_at.is_some_and(|at| now.duration_since(at) < RECHECK)
+        {
+            return false;
+        }
+        let free = match test_free {
+            Some(free) => free,
+            None => crate::diskspace::free_disk_bytes(cs.blocks_dir()),
+        };
+        let Some(free) = free else {
+            // Free space unknown: nothing to judge by, so do not hold the
+            // restore back.
+            return true;
+        };
+        let (apparent, allocated) = cs.blocks_dir_usage().unwrap_or((0, 0));
+        let needed = apparent.saturating_sub(allocated).min(restore.remaining_bytes());
+        if free >= needed.saturating_add(RESERVE) {
+            if restore.disk_wait_since.take().is_some() {
+                tracing::info!(free, needed, "OP_RETURN restore: enough free space again; resuming");
+            }
+            restore.disk_checked_at = None;
+            return true;
+        }
+        if restore.disk_wait_since.is_none() {
+            tracing::warn!(
+                free,
+                needed,
+                "OP_RETURN restore: the blocks volume has too little free space for the stripped \
+                 blocks (what they need, plus 1 GiB); waiting, and checking again every minute"
+            );
+            restore.disk_wait_since = Some(now);
+        }
+        restore.disk_checked_at = Some(now);
+        false
+    }
+
+    /// Tell the restore what became of a block it asked `peer` for.
+    fn note_opreturn_restore_arrival(
+        &self,
+        hash: &bitcoin::BlockHash,
+        peer: PeerId,
+        block: &bitcoin::Block,
+        arrival: RestoreArrival,
+    ) {
+        let mut guard = self.opreturn_restore.lock();
+        let Some(restore) = guard.as_mut() else {
+            return;
+        };
+        match arrival {
+            RestoreArrival::Restored => {}
+            // The peer's copy does not match the header: ask someone else.
+            RestoreArrival::BadCopy => {
+                restore.note_failed(hash, peer);
+                return;
+            }
+            // Ours, not the peer's: a local error, or the entry changed. Left
+            // for the next pass, held against no peer.
+            RestoreArrival::NotOurs => {
+                restore.skip(hash, Instant::now());
+                return;
+            }
+        }
+        if !restore.note_restored(hash, peer, block.total_size() as u64) {
+            return;
+        }
+        let progress = restore.progress();
+        self.chain_state.set_opreturn_restore_status(crate::chain::state::WorkerStatus::Restoring, Some(progress));
+        let done = restore.restored_blocks();
+        if done.is_multiple_of(RESTORE_PROGRESS_EVERY) {
+            let now = Instant::now();
+            let rate = restore.rate(now);
+            let eta_secs = (rate > 0.0).then(|| (progress.remaining_blocks as f64 / rate) as u64);
+            tracing::info!(
+                restored = done,
+                remaining = progress.remaining_blocks,
+                remaining_bytes = progress.remaining_bytes,
+                blocks_per_sec = format!("{rate:.1}"),
+                eta_secs,
+                "OP_RETURN restore progress"
+            );
         }
     }
 
@@ -13173,18 +13489,12 @@ impl PeerManager {
     /// is used for old blocks only when we are connected to it anyway, so the
     /// outbound slots keep finding peers that hold every block.
     fn missing_desirable_services(&self, services: ServiceFlags) -> Option<ServiceFlags> {
-        let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        if services.has(ServiceFlags::NETWORK_LIMITED) {
-            let tip_time = self
-                .chain_state
-                .get_block_index(&self.chain_state.tip_hash())
-                .map_or(0, |e| e.header.time as u64);
-            let depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
-            if depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS {
-                wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-            }
-        }
-        (!services.has(wanted)).then_some(wanted)
+        let tip_time = self
+            .chain_state
+            .get_block_index(&self.chain_state.tip_hash())
+            .map_or(0, |e| e.header.time as u64);
+        let tip_depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
+        missing_desirable_services(services, tip_depth, self.chain_state.opreturn_restore_pending())
     }
 
     /// Perform the version/verack handshake, bounded by `-peertimeout`.

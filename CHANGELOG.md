@@ -29,6 +29,14 @@ item below is (or will be) written up in full in the in-development
   the option off, restoring the last one makes the node `NODE_NETWORK` again
   without a restart.
 
+- `-restoreopreturns` undoes OP_RETURN pruning: it downloads every stripped
+  block again from `NODE_NETWORK` peers (16 per peer, 1024 at a time, with
+  stall and `notfound` handling, paused while the tip is behind or the disk is
+  short), restores each in place, and makes the node `NODE_NETWORK` again
+  once none is left. Refused with any `-pruneopreturn*` option;
+  `getopreturnpruneinfo.restore` and three `satd_opreturn_restore_*` metrics
+  report it.
+
 - Streaming matches read from a stripped block carry `raw_tx_stripped`, and
   `PrefixMatched` now carries the matching `txid`; the Rust and Go SDKs
   surface both and flag the prefix hits they could not filter

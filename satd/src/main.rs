@@ -1368,6 +1368,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // way: it governs a node that still holds stripped blocks after
             // the option is turned off.
             cs.set_opreturn_prune_peers(config.opreturn_prune_peers);
+            if config.restore_opreturns {
+                cs.request_opreturn_restore();
+            }
             if config.opreturn_prune_depth > 0 {
                 cs.configure_opreturn_prune(node::chain::state::StripConfig {
                     depth: config.opreturn_prune_depth,
@@ -1404,12 +1407,22 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                          little or no disk, and each costs ~100 bytes of index"
                     );
                 }
+            } else if cs.opreturn_restore_pending() {
+                let summary = cs.opreturn_strip_summary_last();
+                tracing::info!(
+                    blocks = summary.blocks,
+                    "-restoreopreturns: the stripped blocks are downloaded again from peers that keep \
+                     every block, once the tip is caught up; the node stays NODE_NETWORK_LIMITED until \
+                     the last one is restored"
+                );
             } else if cs.opreturn_prune_active() {
                 tracing::info!(
                     "-pruneopreturn is off, but stripped blocks remain: the node stays \
-                     NODE_NETWORK_LIMITED until the last one is restored (getblockfrompeer \
-                     restores a block)"
+                     NODE_NETWORK_LIMITED until the last one is restored (-restoreopreturns downloads \
+                     them all again; getblockfrompeer restores one)"
                 );
+            } else if config.restore_opreturns {
+                tracing::info!("-restoreopreturns: no block is stripped, nothing to restore");
             } else if config.opreturn_prune_peers != node::storage::opreturn_strip::PrunePeers::default() {
                 tracing::warn!(
                     "-pruneopreturnpeers={} is ignored: -pruneopreturn is off and no block is stripped",

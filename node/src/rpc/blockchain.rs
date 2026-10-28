@@ -169,6 +169,20 @@ pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
             chain_state.tip_height().saturating_sub(c.depth.saturating_add(2))
         }));
         out["filesystem_block_size"] = json!(chain_state.opreturn_strip_fs_block());
+        // `-restoreopreturns` (plan §11.6): the download's counts, once a
+        // pass has started; zeros before.
+        if chain_state.opreturn_restore_requested() {
+            let p = chain_state.opreturn_restore_progress().unwrap_or_default();
+            out["restore"] = json!({
+                "total_blocks": p.total_blocks,
+                "remaining_blocks": if chain_state.opreturn_restore_pending() { p.remaining_blocks } else { 0 },
+                "restored_blocks": p.restored_blocks,
+                "bytes_downloaded": p.bytes_downloaded,
+                "remaining_bytes": if chain_state.opreturn_restore_pending() { p.remaining_bytes } else { 0 },
+                "in_flight": p.in_flight,
+                "peers": p.peers,
+            });
+        }
         out["probe"] = match (config, chain_state.opreturn_strip_fs_block()) {
             (_, Some(_)) => json!("ok"),
             (None, None) => json!("not run"),
