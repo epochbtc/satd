@@ -408,7 +408,7 @@ mod tests {
         fn tip(&self) -> (u32, Header) {
             (0, self.header)
         }
-        fn raw_tx(&self, _t: &Txid) -> Option<Vec<u8>> {
+        fn stored_tx(&self, _t: &Txid) -> Option<crate::extras::StoredTx> {
             None
         }
         fn confirmation(&self, _t: &Txid) -> Option<crate::extras::TxConfirmation> {

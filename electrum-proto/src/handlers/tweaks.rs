@@ -327,7 +327,9 @@ fn txs_object(
     // measured difference between this stream and a bare tweak list. The lean
     // index stores none, so they are re-derived here from the block the row
     // itself names (never a height→hash lookup, which is last-writer-wins).
-    let Some(block) = src.chain.get_block(&row.block_hash) else {
+    // A stored read: an OP_RETURN-stripped block joins by the txids its strip
+    // record holds, and its taproot outputs are intact.
+    let Some(block) = src.chain.get_stored_block(&row.block_hash) else {
         // Pruned or otherwise unreadable. Serving tweak-only entries would look
         // like transactions with no outputs, which a client reads as "not mine";
         // an error is the honest answer.

@@ -13,12 +13,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bitcoin::{Block, OutPoint, Txid};
+use bitcoin::{OutPoint, Txid};
 
 use crate::events::SpTaprootOutput;
+use crate::storage::opreturn_strip::StoredBlock;
 
 /// Enumerate the taproot outputs of each transaction named in `wanted`, as they
 /// appear in `block`.
+///
+/// Transactions are named by their stored txids, so one in an OP_RETURN-
+/// stripped block joins under the txid its strip record holds, not the hash
+/// of its filled bytes. Its taproot outputs are intact: only OP_RETURN
+/// outputs are ever stripped.
 ///
 /// The set is always complete — every taproot output of the transaction, spent
 /// or not. Cut-through is expressed by dropping whole entries via
@@ -34,12 +40,11 @@ use crate::events::SpTaprootOutput;
 ///   taproot outputs in vout order (empty only if it has none, which the index
 ///   never writes an entry for).
 pub fn taproot_outputs_by_txid(
-    block: &Block,
+    block: &StoredBlock,
     wanted: &HashSet<Txid>,
 ) -> HashMap<Txid, Vec<SpTaprootOutput>> {
     let mut by_txid: HashMap<Txid, Vec<SpTaprootOutput>> = HashMap::new();
-    for tx in &block.txdata {
-        let txid = tx.compute_txid();
+    for (tx, txid) in block.block.txdata.iter().zip(block.txids()) {
         if !wanted.contains(&txid) {
             continue;
         }
@@ -76,7 +81,7 @@ pub fn any_unspent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
+    use bitcoin::{Amount, Block, ScriptBuf, Transaction, TxOut};
 
     /// A raw `OP_1 <32-byte push>` scriptPubKey. The join slices the push out
     /// verbatim and never lifts it to a curve point, so any 32 bytes will do.
@@ -86,15 +91,23 @@ mod tests {
         ScriptBuf::from(spk)
     }
 
-    fn block_with(outs: Vec<TxOut>) -> (Block, Txid) {
-        let tx = Transaction {
+    fn tx_with(outs: Vec<TxOut>) -> Transaction {
+        Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![],
             output: outs,
-        };
+        }
+    }
+
+    fn block_with(outs: Vec<TxOut>) -> (StoredBlock, Txid) {
+        let tx = tx_with(outs);
         let txid = tx.compute_txid();
-        let block = Block {
+        (StoredBlock::intact(block_of(vec![tx])), txid)
+    }
+
+    fn block_of(txdata: Vec<Transaction>) -> Block {
+        let mut block = Block {
             header: bitcoin::block::Header {
                 version: bitcoin::block::Version::TWO,
                 prev_blockhash: bitcoin::BlockHash::from_raw_hash(
@@ -107,12 +120,13 @@ mod tests {
                 bits: bitcoin::CompactTarget::from_consensus(0),
                 nonce: 0,
             },
-            txdata: vec![tx],
+            txdata,
         };
-        (block, txid)
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
     }
 
-    fn sample() -> (Block, Txid) {
+    fn sample() -> (StoredBlock, Txid) {
         block_with(vec![
             TxOut { value: Amount::from_sat(4_000), script_pubkey: p2tr([0x02; 32]) },
             // Non-taproot: never enumerated, and must not shift the vout of
@@ -181,5 +195,31 @@ mod tests {
         let (block, _txid) = sample();
         let got = taproot_outputs_by_txid(&block, &HashSet::new());
         assert!(got.is_empty(), "only the named transactions are walked");
+    }
+
+    #[test]
+    fn a_stripped_transaction_joins_under_its_recorded_txid() {
+        use crate::storage::opreturn_strip::StripRecord;
+
+        // An eligible transaction with a big OP_RETURN, after a stand-in
+        // coinbase (a coinbase is never stripped).
+        let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
+        data.extend(std::iter::repeat_n(0x5a, 4000));
+        let tx = tx_with(vec![
+            TxOut { value: Amount::from_sat(4_000), script_pubkey: p2tr([0x02; 32]) },
+            TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) },
+        ]);
+        let txid = tx.compute_txid();
+        let block = block_of(vec![tx_with(vec![]), tx]);
+        let bytes = bitcoin::consensus::encode::serialize(&block);
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
+        assert!(stored.tx_is_stripped(1), "premise: stripped");
+        assert_ne!(stored.block.txdata[1].compute_txid(), txid, "premise: the filled bytes hash elsewhere");
+
+        let got = taproot_outputs_by_txid(&stored, &[txid].into_iter().collect());
+        let outs = got.get(&txid).expect("joined under the recorded txid");
+        assert_eq!(outs.len(), 1);
+        assert_eq!((outs[0].vout, outs[0].value), (0, 4_000));
     }
 }
