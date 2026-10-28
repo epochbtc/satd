@@ -301,6 +301,137 @@ the eligible-transaction count, not the block size, and roughly 70% of that
 > thirds. The limit reduces the bandwidth a subscription uses. It does not
 > reduce the index on disk.
 
+## OP_RETURN data pruning
+
+> **This is one-way.**
+>
+> - Turning `pruneopreturn` off restores nothing. Only `getblockfrompeer`
+>   brings a block back, one block at a time.
+> - Once anything is stripped, satd 0.6.x and earlier refuse to open the
+>   datadir (RocksDB reports `Column families not opened: opreturn_strip`), so
+>   there is no rollback to them. This is deliberate: they would misread the
+>   zeroed data.
+> - The node stops serving old blocks to peers, like a pruned node.
+
+**What it costs the network.** A stripping node is no longer an archive peer.
+It drops `NODE_NETWORK` and advertises only `NODE_NETWORK_LIMITED`, so new
+nodes cannot sync the chain from it. It serves only the last 288 blocks: a
+peer asking for an older one is disconnected, as Core does for a pruned node,
+and a `noban` peer asking for a stripped block gets `notfound`. Headers and
+BIP 157 filters are still served for the whole chain. It stays limited for as
+long as any stripped block exists, so turning the option off does not bring
+`NODE_NETWORK` back. An operator who wants to help the network with initial
+block download should leave the option off.
+
+`pruneopreturnpeers=intact` serves the blocks the node still holds intact at
+any depth (and advertises `NODE_INTACT_BLOCKS`, experimental service bit 28),
+but Bitcoin Core and most other nodes do not ask a limited peer for old
+blocks, so it mainly helps `getblockfrompeer` callers and nodes such as
+rbitcoin that do.
+
+### How it works
+
+With `pruneopreturn=N`, a background worker walks the active chain below
+`tip − N − 2`. In each block it zeroes the payload of every non-coinbase
+OP_RETURN output whose scriptPubKey is at least `pruneopreturnsize` bytes long
+(default 4096), keeping the leading `OP_RETURN` byte and every length, and
+punches the zeroed range out of the block file (`fallocate(PUNCH_HOLE)` on
+Linux, `F_PUNCHHOLE` on macOS). No offset moves. Before it touches a byte it
+stores the block's original txids and a hash of its zeroed form, so every
+surface still names each transaction by its real txid, and `-reindex` and
+`-reindex-chainstate` replay the block from that record.
+
+```ini
+pruneopreturn=4320       # about 30 days; 52560 is about a year; 1 or all = 288
+pruneopreturnsize=10KiB  # 10k is 10,000 bytes, 10KiB is 10,240
+```
+
+The worker runs only on a quiet node: never during initial block download, a
+reindex or an AssumeUTXO background validation. Blocks are fully validated
+whatever the setting; only what is kept on disk afterwards changes. It works
+alongside `prune`, the indexes, Esplora and Electrum.
+
+**Filesystem support.** The blocks directory's filesystem must support hole
+punching (ext4, XFS, btrfs, ZFS, tmpfs, APFS). satd probes it at startup and
+refuses to start, naming the error, when it does not.
+
+### What it saves
+
+Hole punching frees only the whole filesystem blocks inside each payload,
+usually 4 KiB.
+
+| scriptPubKey size | freed on a 4 KiB-block filesystem |
+|---|---|
+| ≤ 83 B (Runes, Omni, OpenTimestamps, most of today's) | 0 |
+| 210 B (median of today's >83 B outputs) | 0 |
+| 4 KiB | 0 to 4 KiB depending on alignment, average ~0.5 KiB |
+| 10 KiB | ~6 KiB on average |
+| 100 KB (Core v30 standard maximum) | ~96 KB |
+
+Today's chain gives back almost nothing: most OP_RETURN outputs are far
+smaller than a filesystem block. The option bounds what large data-carrier
+outputs cost if their use grows. A threshold below one filesystem block is
+accepted, with a startup note: such outputs free little or no disk, and each
+stripped transaction costs about 100 bytes of index.
+
+This removes the data from the node's block files; it is not a secure erase, and copies, snapshots, backups and the last 288 blocks keep the original bytes.
+
+### What you lose
+
+Every other surface keeps working ([Esplora](esplora.md), [Electrum](electrum.md),
+the [JSON-RPC extensions](json-rpc-extensions.md#opreturn-pruned-blocks),
+streaming).
+
+1. **An archival peer**, as above.
+2. **The raw bytes of stripped transactions**, on every surface: `getblock` at
+   verbosity 0 (Core's `Block not available (pruned data)`, which LND's
+   pruned-node fallback recognizes), `getrawtransaction` hex, Esplora `/raw`
+   and `/hex`, Electrum `blockchain.transaction.get` without `verbose`, and
+   `raw_tx` in streaming rescans. Their JSON views still work, with each
+   stripped script shown as a bare `OP_RETURN` and its original size.
+3. **Watches on OP_RETURN script content** cannot match a stripped output in a
+   rescan. Live matching, as blocks connect, is unaffected.
+4. **Deep reorgs.** A reorg or `invalidateblock` that would disconnect a
+   stripped block fails with an error naming it; nothing changes.
+5. **Script re-verification on reindex.** The input scripts of stripped
+   transactions are not verified again on `-reindex`; they were when the
+   block first connected. Everything else is.
+6. **The `blk*.dat` files.** Tools that parse them directly see zeroed
+   payloads. Copying them with tools that are not sparse-aware (plain `cp`
+   without `--sparse=always`, `rsync` without `-S`) fills the holes back in on
+   the copy.
+
+### Restoring a block
+
+`getblockfrompeer <blockhash> <peer_id>` fetches a stripped block from a peer
+that holds it and writes it back in place. The record goes, the raw block is
+served again, and the space is allocated again. The worker strips it again on
+a later pass if the option is still on; restoring is for a node that has
+turned it off.
+
+### Watching it
+
+`getopreturnpruneinfo` reports the configuration, the worker's state
+(`running`, `ibd`, `reindex`, `background_validation` or `off`), how far its
+scan has reached, and what is stripped:
+
+- `blocks`, `transactions`, `outputs` and `bytes_zeroed`, added up from the
+  strip records;
+- `bytes_freed_estimate`, the whole filesystem blocks every span is sure to
+  contain: a cautious minimum;
+- `blocks_dir_apparent_bytes` and `blocks_dir_allocated_bytes`, a stat of the
+  block files (cached for a minute). Their difference is the measurement of
+  what the holes save.
+
+`getblockchaininfo` carries the same totals under `opreturn_prune`, only on a
+node that strips or holds stripped blocks. Its `pruned` field still means
+`-prune` only. Prometheus gets `satd_opreturn_strip_examined_height`,
+`satd_opreturn_stripped_bytes_total` and `satd_opreturn_stripped_blocks_total`.
+
+`size_on_disk` does not move: it counts the files' apparent size, as Core's
+does. Holes do not show in `getblockfileaudit` either, whose referenced bytes
+are apparent bytes.
+
 ## Repairing lost block data
 
 Block bodies live in the flat files under `blocks/` (`blk*.dat`), not in

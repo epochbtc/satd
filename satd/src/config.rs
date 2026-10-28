@@ -993,6 +993,16 @@ pub struct Config {
     /// satd's hidden `-allowteststrip`: register the test-only
     /// `stripopreturns` RPC. Regtest only; refused on any other chain.
     pub allow_test_strip: bool,
+    /// satd extension `-pruneopreturn`: strip the payloads of large OP_RETURN
+    /// outputs from stored blocks more than this many blocks deep. 0 is off;
+    /// otherwise at least 288.
+    pub opreturn_prune_depth: u32,
+    /// satd extension `-pruneopreturnsize`: the scriptPubKey length, in bytes,
+    /// at or above which an OP_RETURN output is stripped.
+    pub opreturn_prune_size: u64,
+    /// satd extension `-pruneopreturnpeers`: what a node with stripped
+    /// blocks serves to peers.
+    pub opreturn_prune_peers: node::storage::opreturn_strip::PrunePeers,
     pub check_block_index: bool,
     /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
     /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
@@ -3852,6 +3862,9 @@ impl Config {
             return Err("--electrummtlsclientallow requires --electrummtls=1".to_string());
         }
 
+        let (opreturn_prune_depth, opreturn_prune_size, opreturn_prune_peers) =
+            resolve_opreturn_prune(&cli.opreturn_prune_args, &file_get)?;
+
         let prune = cli
             .prune
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
@@ -4303,7 +4316,10 @@ impl Config {
                 .or_else(|| file_get("fastprune").and_then(|v| parse_bool(&v)))
                 .unwrap_or(false),
             // Command line only: a test tool has no business in a config file.
-            allow_test_strip: cli.test_strip_args.allowteststrip.unwrap_or(false),
+            allow_test_strip: cli.opreturn_prune_args.allowteststrip.unwrap_or(false),
+            opreturn_prune_depth,
+            opreturn_prune_size,
+            opreturn_prune_peers,
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -4806,6 +4822,9 @@ impl Config {
             "datadir": self.datadir.display().to_string(),
             "prune": self.prune,
             "prune_manual": self.prune_manual,
+            "pruneopreturn": self.opreturn_prune_depth,
+            "pruneopreturnsize": self.opreturn_prune_size,
+            "pruneopreturnpeers": self.opreturn_prune_peers.as_str(),
             "dbcache": self.dbcache,
             "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
             "signet_seed_nodes": self.signet_seed_nodes,
@@ -4886,6 +4905,9 @@ impl Config {
             "storage": {
                 "txindex": self.txindex,
                 "prune_mb": self.prune,
+                "opreturn_prune_depth": self.opreturn_prune_depth,
+                "opreturn_prune_size": self.opreturn_prune_size,
+                "opreturn_prune_peers": self.opreturn_prune_peers.as_str(),
                 "dbcache_mb": self.dbcache,
                 "dbcache_mode": format!("{:?}", self.dbcache_mode),
             },
@@ -6015,10 +6037,11 @@ pub struct CliArgs {
     #[command(flatten)]
     pub zmq_pub_args: ZmqPubArgs,
 
-    /// The hidden `-allowteststrip`, hand-built for the same stack-frame
-    /// reason as [`StratumArgs`].
+    /// `-pruneopreturn`, `-pruneopreturnsize`, `-pruneopreturnpeers` and the
+    /// hidden `-allowteststrip`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
     #[command(flatten)]
-    pub test_strip_args: TestStripArgs,
+    pub opreturn_prune_args: OpReturnPruneArgs,
 
     #[arg(
         long,
@@ -7602,16 +7625,58 @@ impl clap::FromArgMatches for TxAnnounceArgs {
     }
 }
 
-/// `-allowteststrip` (see [`CliArgs::test_strip_args`]): register the
-/// test-only `stripopreturns` RPC on regtest. Hidden from `--help` and never
-/// documented; command line only.
+/// `-pruneopreturn`, `-pruneopreturnsize` and `-pruneopreturnpeers` (see
+/// [`CliArgs::opreturn_prune_args`]), satd extensions. Taken as text and
+/// parsed by [`resolve_opreturn_prune`], so a bad value on the command line
+/// and in the config file fail with the same message.
+///
+/// The group also carries `-allowteststrip`, which registers the test-only
+/// `stripopreturns` RPC on regtest: hidden from `--help`, never documented,
+/// command line only. One group, not two: each flattened group adds to
+/// `CliArgs`'s derived builder frame.
 #[derive(Debug, Clone, Default)]
-pub struct TestStripArgs {
+pub struct OpReturnPruneArgs {
+    pub pruneopreturn: Option<String>,
+    pub pruneopreturnsize: Option<String>,
+    pub pruneopreturnpeers: Option<String>,
     pub allowteststrip: Option<bool>,
 }
 
-impl clap::Args for TestStripArgs {
-    fn augment_args(cmd: clap::Command) -> clap::Command {
+const OPRETURN_PRUNE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "pruneopreturn",
+        "N",
+        StratumArgKind::Text,
+        "Strip the payloads of large OP_RETURN outputs from stored blocks more than N blocks deep \
+         (satd extension; default: 0, off). At least 288; 1 or all mean 288. 4320 is about 30 days, \
+         52560 about a year. Blocks are still fully validated, but the node stops serving old blocks \
+         to peers (NODE_NETWORK_LIMITED). Turning it off restores nothing. Needs a filesystem with \
+         hole-punch support.",
+    ),
+    (
+        "pruneopreturnsize",
+        "BYTES",
+        StratumArgKind::Text,
+        "Strip only OP_RETURN outputs whose scriptPubKey is at least this size (satd extension; \
+         default: 4096). Bytes, or with a suffix: k/M (1000s) or KiB/MiB (1024s). 0 strips every \
+         non-coinbase OP_RETURN output.",
+    ),
+    (
+        "pruneopreturnpeers",
+        "limited|intact",
+        StratumArgKind::Text,
+        "What a node with stripped blocks serves to peers (satd extension; default: limited). \
+         limited: only the last 288 blocks, as a pruned Core node. intact: any block it still holds \
+         intact, at any depth, and notfound for stripped ones. Both advertise only \
+         NODE_NETWORK_LIMITED.",
+    ),
+];
+
+impl clap::Args for OpReturnPruneArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in OPRETURN_PRUNE_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
         cmd.arg(
             stratum_arg(&("allowteststrip", "BOOL", StratumArgKind::Bool, "Register the test-only stripopreturns RPC (regtest only)"))
                 .hide(true),
@@ -7623,13 +7688,18 @@ impl clap::Args for TestStripArgs {
     }
 }
 
-impl clap::FromArgMatches for TestStripArgs {
+impl clap::FromArgMatches for OpReturnPruneArgs {
     fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Self::from_arg_matches_mut(&mut matches.clone())
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { allowteststrip: m.remove_one("allowteststrip") })
+        Ok(Self {
+            pruneopreturn: m.remove_one("pruneopreturn"),
+            pruneopreturnsize: m.remove_one("pruneopreturnsize"),
+            pruneopreturnpeers: m.remove_one("pruneopreturnpeers"),
+            allowteststrip: m.remove_one("allowteststrip"),
+        })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -7640,6 +7710,87 @@ impl clap::FromArgMatches for TestStripArgs {
         *self = Self::from_arg_matches_mut(m)?;
         Ok(())
     }
+}
+
+/// `-pruneopreturn` (plan §2.1): `0` is off, `1` and `all` are the minimum
+/// depth, and any other value must be a block count at or above it.
+fn parse_opreturn_prune_depth(v: &str) -> Result<u32, String> {
+    use node::storage::opreturn_strip::MIN_STRIP_DEPTH;
+    let refuse = || {
+        format!(
+            "-pruneopreturn={v}: must be 0 (off), 1 or all (as soon as allowed, {MIN_STRIP_DEPTH} \
+             blocks), or a depth of at least {MIN_STRIP_DEPTH} blocks"
+        )
+    };
+    match v {
+        "0" => Ok(0),
+        "1" | "all" => Ok(MIN_STRIP_DEPTH),
+        _ => match v.parse::<u32>() {
+            Ok(n) if n >= MIN_STRIP_DEPTH => Ok(n),
+            _ => Err(refuse()),
+        },
+    }
+}
+
+/// A byte count with an optional SI or IEC suffix (plan §2.1, D7): `10k` is
+/// 10,000 and `10KiB` 10,240. Whole numbers only, no space. The ceiling is the
+/// consensus block weight limit, past which no scriptPubKey can reach.
+fn parse_opreturn_prune_size(v: &str) -> Result<u64, String> {
+    const MAX: u64 = 4_000_000;
+    let refuse = |why: &str| {
+        format!(
+            "-pruneopreturnsize={v}: {why}; use a whole number of bytes, optionally with k, kB, M, MB \
+             (1000s), KiB or MiB (1024s), at most {MAX} bytes"
+        )
+    };
+    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let (number, suffix) = v.split_at(digits);
+    if number.is_empty() {
+        return Err(refuse("not a number"));
+    }
+    let n: u64 = number.parse().map_err(|_| refuse("not a number"))?;
+    let multiplier = match suffix {
+        "" | "B" => 1,
+        "k" | "K" | "kB" | "KB" => 1_000,
+        "M" | "MB" => 1_000_000,
+        "KiB" => 1_024,
+        "MiB" => 1_048_576,
+        _ => return Err(refuse("unknown unit")),
+    };
+    let bytes = n.checked_mul(multiplier).filter(|b| *b <= MAX).ok_or_else(|| refuse("too large"))?;
+    Ok(bytes)
+}
+
+fn parse_opreturn_prune_peers(v: &str) -> Result<node::storage::opreturn_strip::PrunePeers, String> {
+    use node::storage::opreturn_strip::PrunePeers;
+    match v {
+        "limited" => Ok(PrunePeers::Limited),
+        "intact" => Ok(PrunePeers::Intact),
+        _ => Err(format!("-pruneopreturnpeers={v}: must be limited or intact")),
+    }
+}
+
+/// The three OP_RETURN pruning options, command line first, then the config
+/// file. Out of `CliArgs` for the same reason as [`resolve_bytes_per_sigop`].
+#[inline(never)]
+fn resolve_opreturn_prune(
+    cli: &OpReturnPruneArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<(u32, u64, node::storage::opreturn_strip::PrunePeers), String> {
+    let get = |cli: &Option<String>, key: &str| cli.clone().or_else(|| file_get(key));
+    let depth = get(&cli.pruneopreturn, "pruneopreturn")
+        .map(|v| parse_opreturn_prune_depth(&v))
+        .transpose()?
+        .unwrap_or(0);
+    let size = get(&cli.pruneopreturnsize, "pruneopreturnsize")
+        .map(|v| parse_opreturn_prune_size(&v))
+        .transpose()?
+        .unwrap_or(node::storage::opreturn_strip::DEFAULT_STRIP_SIZE);
+    let peers = get(&cli.pruneopreturnpeers, "pruneopreturnpeers")
+        .map(|v| parse_opreturn_prune_peers(&v))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((depth, size, peers))
 }
 
 /// `-nap`, `-napstorerecover` and `-napaggregator`, satd extensions, out of
@@ -8684,6 +8835,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "stratumv2maxchannels",
         "stratumv2jd",
         "prune",
+        "pruneopreturn",
+        "pruneopreturnsize",
+        "pruneopreturnpeers",
         "reindex",
         "reindex-chainstate",
         "checkblockindex",
@@ -9500,6 +9654,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stratumv2jd",
     // Storage / pruning / reindex
     "prune",
+    "pruneopreturn",
+    "pruneopreturnsize",
+    "pruneopreturnpeers",
     "reindex",
     "reindexchainstate",
     "checkblockindex",
@@ -10548,6 +10705,82 @@ mod tests {
     /// comes from the command line or the file, and an unparseable file value
     /// stops the node instead of becoming the default. A value below the
     /// coinbase reserve is accepted here; the block assembler raises it.
+    /// `-pruneopreturnsize`'s units (plan §2.1, D7): every accepted form, and
+    /// every rejected one named by the plan.
+    #[test]
+    fn opreturn_prune_size_takes_si_and_iec_suffixes() {
+        for (v, want) in [
+            ("0", 0),
+            ("4096", 4096),
+            ("100B", 100),
+            ("10k", 10_000),
+            ("10K", 10_000),
+            ("10kB", 10_000),
+            ("10KB", 10_000),
+            ("2M", 2_000_000),
+            ("2MB", 2_000_000),
+            ("10KiB", 10_240),
+            ("3MiB", 3_145_728),
+            ("4000000", 4_000_000),
+        ] {
+            assert_eq!(parse_opreturn_prune_size(v), Ok(want), "{v}");
+        }
+        for v in ["", "1.5k", "10 k", "10kib", "-5", "5G", "1GiB", "4000001", "5MiB", "k", "10KiBs"] {
+            let err = parse_opreturn_prune_size(v).expect_err(v);
+            assert!(err.contains("KiB or MiB"), "{v}: lists the accepted forms: {err}");
+        }
+    }
+
+    /// `-pruneopreturn` (plan §2.1): 0 is off, 1 and all are 288, a depth of
+    /// 288 or more is taken as is, and anything else is refused naming the
+    /// minimum.
+    #[test]
+    fn opreturn_prune_depth_has_a_288_block_floor() {
+        assert_eq!(parse_opreturn_prune_depth("0"), Ok(0));
+        assert_eq!(parse_opreturn_prune_depth("1"), Ok(288));
+        assert_eq!(parse_opreturn_prune_depth("all"), Ok(288));
+        assert_eq!(parse_opreturn_prune_depth("288"), Ok(288));
+        assert_eq!(parse_opreturn_prune_depth("4320"), Ok(4320));
+        for v in ["2", "287", "-1", "yes", "", "ALL"] {
+            let err = parse_opreturn_prune_depth(v).expect_err(v);
+            assert!(err.contains("at least 288"), "{v}: {err}");
+        }
+        assert!(parse_opreturn_prune_peers("limited").is_ok());
+        assert!(parse_opreturn_prune_peers("intact").is_ok());
+        assert!(parse_opreturn_prune_peers("all").is_err());
+    }
+
+    /// The three options resolve command line first, then the config file,
+    /// with a bad value in either a startup error and not a default.
+    #[test]
+    fn opreturn_prune_options_resolve_from_the_cli_and_the_file() {
+        use node::storage::opreturn_strip::PrunePeers;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build = |body: &str, extra: &[&str]| {
+            let conf = dir.path().join("strip.conf");
+            std::fs::write(&conf, body).unwrap();
+            let mut args = vec!["satd", "--datadir", dir.path().to_str().unwrap(), "--conf", conf.to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(args).unwrap())
+        };
+        let off = build("", &[]).unwrap();
+        assert_eq!(
+            (off.opreturn_prune_depth, off.opreturn_prune_size, off.opreturn_prune_peers),
+            (0, 4096, PrunePeers::Limited),
+            "defaults: off, 4096, limited"
+        );
+        let file = build("pruneopreturn=all\npruneopreturnsize=10KiB\npruneopreturnpeers=intact\n", &[]).unwrap();
+        assert_eq!(
+            (file.opreturn_prune_depth, file.opreturn_prune_size, file.opreturn_prune_peers),
+            (288, 10_240, PrunePeers::Intact)
+        );
+        let cli = build("pruneopreturn=4320\n", &["--pruneopreturn=52560", "--pruneopreturnsize=1k"]).unwrap();
+        assert_eq!((cli.opreturn_prune_depth, cli.opreturn_prune_size), (52560, 1000), "the CLI wins");
+        assert!(build("pruneopreturn=100\n", &[]).unwrap_err().contains("at least 288"));
+        assert!(build("", &["--pruneopreturnsize=1.5k"]).unwrap_err().contains("KiB or MiB"));
+        assert!(build("pruneopreturnpeers=open\n", &[]).unwrap_err().contains("limited or intact"));
+    }
+
     #[test]
     fn blockmaxweight_is_refused_above_the_consensus_maximum_and_when_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -12172,7 +12405,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
-            test_strip_args: TestStripArgs::default(),
+            opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
@@ -12491,7 +12724,7 @@ testactivationheight=bip34@2
             policy_size_args: PolicySizeArgs::default(),
             addrindex_args: AddrIndexArgs::default(),
             tx_announce_args: TxAnnounceArgs::default(),
-            test_strip_args: TestStripArgs::default(),
+            opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,

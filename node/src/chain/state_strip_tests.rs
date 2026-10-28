@@ -1038,3 +1038,179 @@ fn an_in_place_restore_waits_for_a_strip_in_progress() {
     assert_eq!(record(&cs, &blocks[101].block_hash()), None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn pass(cs: &ChainState, max_blocks: u32) -> PassReport {
+    cs.strip_pass(max_blocks, &std::sync::atomic::AtomicBool::new(false)).unwrap()
+}
+
+/// The worker strips only below `tip - depth - 2`: a block a limited peer
+/// may still ask for keeps its bytes.
+#[test]
+fn a_pass_strips_only_below_tip_minus_depth_minus_two() {
+    let (cs, dir) = make_chain_state();
+    let mut blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 1,
+        size_threshold: THRESHOLD,
+    });
+
+    // Tip 105, depth 1: heights up to 101 only.
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped, r.more), (102, 0, false));
+    assert_eq!(record(&cs, &hash), None, "102 is not yet deep enough");
+    assert_eq!(cs.opreturn_strip_meta().unwrap().next_height, 102);
+
+    let b = build_test_block(blocks.last().unwrap().block_hash(), 106, time(106));
+    connect(&cs, &b);
+    blocks.push(b);
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (1, 1));
+    assert!(record(&cs, &hash).is_some());
+    // The pass added the totals up for `getblockchaininfo`, which never
+    // reads the store itself.
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1);
+    assert_reads_as(&cs, &blocks[101]);
+    let s = cs.opreturn_strip_summary().unwrap();
+    assert_eq!((s.blocks, s.transactions, s.outputs), (1, 1, 1));
+    assert!(cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The cursor carries a pass on where the last one stopped, and a lower
+/// threshold than the one it was reached under starts the scan over.
+#[test]
+fn a_lowered_threshold_rescans_from_the_bottom() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 0,
+        size_threshold: THRESHOLD,
+    });
+    let at = |next_height: u32, size_threshold| opreturn_strip::StripMeta {
+        next_height,
+        size_threshold,
+        depth: 0,
+        last_hash: cs.active_chain_hash_at_height_indexed(next_height - 1),
+    };
+
+    // A pass at most 10 blocks long stops with more to do.
+    let r = pass(&cs, 10);
+    assert_eq!((r.examined, r.more), (10, true));
+    assert_eq!(cs.opreturn_strip_meta(), Some(at(10, THRESHOLD)));
+
+    // Past 102 under the same threshold: nothing to do there again.
+    cs.write_strip_meta(&at(103, THRESHOLD)).unwrap();
+    assert_eq!(pass(&cs, 1000).stripped, 0);
+    assert_eq!(record(&cs, &hash), None);
+
+    // Past 102 under a higher one: 102 was never examined at 4096.
+    cs.write_strip_meta(&at(103, 2 * THRESHOLD)).unwrap();
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (103, 1));
+    assert!(record(&cs, &hash).is_some());
+    assert_eq!(cs.opreturn_strip_meta(), Some(at(103, THRESHOLD)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Off, the worker does nothing and says so.
+#[test]
+fn a_pass_without_the_option_does_nothing() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    assert_eq!(pass(&cs, 1000), PassReport::default());
+    assert_eq!(cs.opreturn_strip_worker_status(), WorkerStatus::Off);
+    assert_eq!(record(&cs, &blocks[101].block_hash()), None);
+    assert!(!cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record that does not read back still marks the node as holding
+/// stripped blocks: its block is stripped on disk either way.
+#[test]
+fn an_unreadable_record_still_counts_as_stripped() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: vec![(blocks[101].block_hash(), vec![0xff, 0x00])],
+            ..Default::default()
+        })
+        .unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert!(cs.opreturn_prune_active());
+    assert_eq!(cs.opreturn_strip_summary().unwrap().blocks, 0, "not counted in the totals");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reorg that replaces blocks below the cursor, none of them stripped,
+/// moves the cursor back to the fork: the blocks now at those heights are
+/// examined, and a large OP_RETURN in one of them is stripped.
+#[test]
+fn a_reorg_below_the_cursor_rescans_from_the_fork() {
+    let (cs, dir) = make_chain_state();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let mut a = Vec::new();
+    for h in 1..=104 {
+        let b = build_test_block(a.last().map_or(genesis, Block::block_hash), h, time(h));
+        connect(&cs, &b);
+        a.push(b);
+    }
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 0,
+        size_threshold: THRESHOLD,
+    });
+    // Tip 104: heights up to 101 examined, nothing to strip.
+    assert_eq!(pass(&cs, 1000).examined, 102);
+    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(a[100].block_hash()));
+
+    // A heavier branch from 100 replaces 101 to 104; its 101 carries a large
+    // OP_RETURN.
+    let mut b = vec![block_on(
+        a[99].block_hash(),
+        101,
+        vec![spend(coinbase_of(&a[0]), vec![ScriptBuf::new(), op_return(BIG, 1)])],
+    )];
+    for h in 102..=106 {
+        b.push(build_test_block(b.last().unwrap().block_hash(), h, time(h) + 1));
+    }
+    for blk in &b {
+        cs.accept_block(blk).expect("accept");
+    }
+    assert_eq!(cs.tip_hash(), b[5].block_hash(), "premise: the branch is active");
+
+    // Tip 106: the pass goes back to 101, examines 101 to 103, strips 101.
+    let r = pass(&cs, 1000);
+    assert_eq!((r.examined, r.stripped), (3, 1));
+    assert!(record(&cs, &b[0].block_hash()).is_some());
+    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(b[2].block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record removed by another write (here the append repair; `-prune` and a
+/// fresh full copy go the same way) drops the cached totals, and the
+/// worker's pass adds them up again even with the option off, so
+/// `getblockchaininfo` and `/metrics` stop counting it.
+#[test]
+fn a_record_removed_elsewhere_leaves_the_totals_after_the_next_pass() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1);
+    // A record that does not describe the block, so the repair appends.
+    let mut wrong = record(&cs, &hash).unwrap();
+    wrong.filled_sha256[0] ^= 1;
+    cs.store
+        .write_batch(StoreBatch { opreturn_strip_puts: vec![(hash, wrong.encode())], ..Default::default() })
+        .unwrap();
+    cs.repair_block_data(b).unwrap();
+    assert_eq!(record(&cs, &hash), None, "premise: the append removed the record");
+
+    assert_eq!(pass(&cs, 1000), PassReport::default(), "the option is off");
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

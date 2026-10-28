@@ -2592,6 +2592,21 @@ impl Store for RocksDbStore {
             .map_err(|e| StoreError::Database(format!("read {CF_OPRETURN_STRIP} meta: {e}")))
     }
 
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
+            return Ok(());
+        };
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item
+                .map_err(|e| StoreError::Database(format!("iterate {CF_OPRETURN_STRIP}: {e}")))?;
+            // The `meta` key is 4 bytes; a block's is its 32-byte hash.
+            if let Ok(bytes) = <[u8; 32]>::try_from(key.as_ref()) {
+                f(&BlockHash::from_byte_array(bytes), &value);
+            }
+        }
+        Ok(())
+    }
+
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;

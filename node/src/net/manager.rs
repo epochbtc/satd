@@ -1978,6 +1978,15 @@ impl PeerManager {
         self.prune_target_mb > 0 || self.prune_manual.load(Ordering::Relaxed)
     }
 
+    /// `-pruneopreturnpeers=intact` on a node that strips: serve any block
+    /// still held intact, at any depth (plan §2.9.1). Never on a node that
+    /// also prunes, which deletes whole files and keeps Core's limits.
+    fn serves_intact_blocks(&self) -> bool {
+        !self.is_pruning()
+            && self.chain_state.opreturn_prune_active()
+            && self.chain_state.opreturn_prune_peers() == crate::storage::opreturn_strip::PrunePeers::Intact
+    }
+
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
     /// when randomization is off. Tor uses the username/password as its
     /// stream-isolation key (`IsolateSOCKSAuth`), so a unique pair per dial
@@ -10627,7 +10636,11 @@ impl PeerManager {
                 // held is Core's `BLOCK_HAVE_DATA`, read from the block
                 // index: loading each block to find out would read up to 282
                 // of them from disk to answer one small request.
-                if self.is_pruning()
+                // A node limited by OP_RETURN stripping invs no deep block
+                // either: it would disconnect the peer that asked for it.
+                let limited = self.is_pruning()
+                    || (self.chain_state.opreturn_prune_active() && !self.serves_intact_blocks());
+                if limited
                     && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || !self.chain_state.has_block_data(&hash))
                 {
                     break;
@@ -10774,9 +10787,12 @@ impl PeerManager {
         }
         let services = self.local_services();
         let below_limit = self.chain_state.tip_height().saturating_sub(entry.height) > NODE_NETWORK_LIMITED_MIN_BLOCKS + 2;
+        // `-pruneopreturnpeers=intact` serves deep blocks: a stripped one
+        // reads as unavailable below and gets `notfound`, the peer staying.
         if !services.has(ServiceFlags::NETWORK)
             && services.has(ServiceFlags::NETWORK_LIMITED)
             && below_limit
+            && !self.serves_intact_blocks()
             && !self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban)
         {
             tracing::debug!("Ignore block request below NODE_NETWORK_LIMITED threshold, disconnecting peer={id}");
@@ -13454,10 +13470,19 @@ impl PeerManager {
     /// fetching history behind an AssumeUTXO snapshot (`init.cpp`). satd
     /// claimed `NODE_NETWORK` when pruned too, so peers asked it for blocks
     /// it had deleted, and dropped `NODE_NETWORK_LIMITED` on every node.
+    ///
+    /// OP_RETURN stripping counts as pruning here (plan §2.9): a node that
+    /// strips, or still holds stripped blocks, does not hold every block as
+    /// it was mined. Under `-pruneopreturnpeers=intact` it also advertises
+    /// `NODE_INTACT_BLOCKS`.
     pub fn local_services(&self) -> ServiceFlags {
         let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-        if !self.is_pruning() && !self.chain_state.has_background() {
+        let stripping = self.chain_state.opreturn_prune_active();
+        if !self.is_pruning() && !self.chain_state.has_background() && !stripping {
             services |= ServiceFlags::NETWORK;
+        }
+        if stripping && self.serves_intact_blocks() {
+            services |= crate::net::peer::node_intact_blocks();
         }
         // BIP 324 NODE_P2P_V2 (bit 11), which Core sets with -v2transport.
         if self.v2_transport_enabled() {

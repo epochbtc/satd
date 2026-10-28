@@ -117,6 +117,25 @@ pub(crate) struct StripState {
     /// `-allowteststrip` on a regtest node: the `stripopreturns` RPC is
     /// registered.
     test_rpc: std::sync::atomic::AtomicBool,
+    /// `-pruneopreturn` and its companions, set once at startup when the
+    /// option is on.
+    config: std::sync::OnceLock<StripConfig>,
+    /// `-pruneopreturnpeers`. Set whether or not the option is on: it applies
+    /// to a node with stripped blocks even after the option is turned off.
+    peers: std::sync::OnceLock<opreturn_strip::PrunePeers>,
+    /// Some block has a strip record. Set at startup from the store and by
+    /// every strip; never cleared while running, so a node that restored its
+    /// last stripped block stays limited until a restart rechecks.
+    has_records: std::sync::atomic::AtomicBool,
+    /// What the worker is doing, for `getopreturnpruneinfo`.
+    worker: Mutex<WorkerStatus>,
+    /// The records' totals and when they were added up.
+    summary: Mutex<Option<(std::time::Instant, opreturn_strip::StripSummary)>>,
+    /// The totals as last added up, however long ago: what `getblockchaininfo`
+    /// reports, so it never reads the whole CF on the RPC executor.
+    last_summary: Mutex<opreturn_strip::StripSummary>,
+    /// [`ChainState::blocks_dir_usage`] and when it was taken.
+    usage: Mutex<Option<(std::time::Instant, (u64, u64))>>,
     /// Runs between the plan's index read and its read of the bytes.
     #[cfg(test)]
     pub(crate) before_read_hook: Mutex<Option<StripHook>>,
@@ -171,12 +190,21 @@ impl ChainState {
     /// on the active chain, and its stored copy passes `check_block`. Its
     /// depth is not checked: that is the caller's to judge.
     pub fn strip_block(&self, hash: &BlockHash, threshold: u64) -> Result<StripOutcome, StripError> {
+        self.strip_block_inner(hash, threshold, false)
+    }
+
+    /// [`Self::strip_block`]. `flushed`: the caller made the store durable
+    /// after the block connected (the worker does once per pass, and every
+    /// block it strips connected long before), so the first flush is skipped.
+    fn strip_block_inner(&self, hash: &BlockHash, threshold: u64, flushed: bool) -> Result<StripOutcome, StripError> {
         let _strip = self.strip.lock.lock();
         self.check_quiet()?;
         let caps = self.punch_caps()?;
         // Everything the block's connect wrote is durable before any of its
         // bytes are touched, so crash recovery never reconnects it from disk.
-        self.flush_durable()?;
+        if !flushed {
+            self.flush_durable()?;
+        }
 
         let plan = match self.plan_strip(hash, threshold)? {
             Planned::Nothing => return Ok(StripOutcome::NothingEligible),
@@ -257,6 +285,10 @@ impl ChainState {
         // Outside the locks. A punch lost to a crash is redone by the next
         // call: the record names the spans and the reader zero-fills them.
         file.sync_data()?;
+        if plan.commit.is_some() {
+            self.strip.has_records.store(true, Ordering::Release);
+            self.forget_strip_summary();
+        }
         Ok((plan.kind)(stats))
     }
 
@@ -367,6 +399,11 @@ impl ChainState {
                         block.block_hash()
                     )));
                 }
+                // Most blocks have nothing to strip: say so before the cost
+                // of checking the whole block.
+                if opreturn_strip::eligible_outputs(&block, threshold).is_empty() {
+                    return Ok(Planned::Nothing);
+                }
                 // Never strip a copy that does not verify: the record's
                 // txids would come from bytes that do not match the header.
                 // This also refuses punched bytes whose record was lost.
@@ -434,7 +471,341 @@ impl ChainState {
     }
 }
 
+/// `-pruneopreturn` and its companions, as the node runs with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripConfig {
+    /// Blocks more than this deep are stripped; at least 288.
+    pub depth: u32,
+    /// Outputs whose scriptPubKey is at least this long are stripped.
+    pub size_threshold: u64,
+}
+
+/// What the strip worker is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// `-pruneopreturn` is off, or the worker has not started.
+    #[default]
+    Off,
+    Running,
+    /// Waiting for the node to go quiet; the reason names what it waits for.
+    Paused(&'static str),
+}
+
+impl WorkerStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Running => "running",
+            Self::Paused("initial block download") => "ibd",
+            Self::Paused("an AssumeUTXO background chainstate is validating") => "background_validation",
+            Self::Paused(_) => "reindex",
+        }
+    }
+}
+
+/// What one [`ChainState::strip_pass`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PassReport {
+    /// Heights examined.
+    pub examined: u32,
+    /// Blocks newly stripped or extended.
+    pub stripped: u32,
+    /// The pass stopped at its block limit with more to do.
+    pub more: bool,
+}
+
+/// How long the records' totals are reused before they are added up again.
+const SUMMARY_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Meta is written at least this often during a pass, so a crash loses
+/// little of the scan.
+const META_EVERY: u32 = 64;
+
 impl ChainState {
+    /// Turn `-pruneopreturn` on with `config`. Call once, at startup.
+    pub fn configure_opreturn_prune(&self, config: StripConfig) {
+        let _ = self.strip.config.set(config);
+    }
+
+    /// Set `-pruneopreturnpeers`. Call once, at startup.
+    pub fn set_opreturn_prune_peers(&self, peers: opreturn_strip::PrunePeers) {
+        let _ = self.strip.peers.set(peers);
+    }
+
+    /// What a node with stripped blocks serves to peers.
+    pub fn opreturn_prune_peers(&self) -> opreturn_strip::PrunePeers {
+        self.strip.peers.get().copied().unwrap_or_default()
+    }
+
+    /// The `-pruneopreturn` configuration, when the option is on.
+    pub fn opreturn_prune_config(&self) -> Option<StripConfig> {
+        self.strip.config.get().copied()
+    }
+
+    /// Plan §2.9's predicate: the option is on, or some block is stripped.
+    /// Records outlive the option, so a node with stripped blocks stays
+    /// `NODE_NETWORK_LIMITED` after it is turned off.
+    pub fn opreturn_prune_active(&self) -> bool {
+        self.strip.config.get().is_some() || self.strip.has_records.load(Ordering::Acquire)
+    }
+
+    /// Read the store once at startup for whether any block is stripped.
+    pub fn load_opreturn_strip_state(&self) -> Result<(), StoreError> {
+        let (summary, records) = self.compute_strip_summary()?;
+        // Every record counts here, read back or not: its block is stripped
+        // on disk either way.
+        self.strip.has_records.store(records > 0, Ordering::Release);
+        *self.strip.summary.lock() = Some((std::time::Instant::now(), summary));
+        Ok(())
+    }
+
+    /// The records' totals, and how many records there are, decodable or not.
+    fn compute_strip_summary(&self) -> Result<(opreturn_strip::StripSummary, u64), StoreError> {
+        let fs_block = self.opreturn_strip_fs_block().unwrap_or(4096);
+        let mut summary = opreturn_strip::StripSummary::default();
+        let mut records = 0u64;
+        self.store.for_each_opreturn_strip(&mut |_, bytes| {
+            records += 1;
+            // An unreadable record is not counted; reading its block reports it.
+            if let Ok(record) = StripRecord::decode(bytes) {
+                summary.add(&record, fs_block);
+            }
+        })?;
+        *self.strip.last_summary.lock() = summary;
+        Ok((summary, records))
+    }
+
+    /// The block files' apparent and allocated bytes, `(st_size,
+    /// st_blocks × 512)` summed over `blk*.dat`, from a stat walk cached for a
+    /// minute. The difference is what holes (and filesystem compression) save.
+    pub fn blocks_dir_usage(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut cached = self.strip.usage.lock();
+        if let Some((at, usage)) = *cached
+            && at.elapsed() < std::time::Duration::from_secs(60)
+        {
+            return Ok(usage);
+        }
+        let (mut apparent, mut allocated) = (0u64, 0u64);
+        for entry in std::fs::read_dir(self.blocks_dir())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("blk") && name.ends_with(".dat")) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            apparent += meta.len();
+            allocated += meta.blocks() * 512;
+        }
+        *cached = Some((std::time::Instant::now(), (apparent, allocated)));
+        Ok((apparent, allocated))
+    }
+
+    /// The strip records' totals, added up at most every ten seconds.
+    pub fn opreturn_strip_summary(&self) -> Result<opreturn_strip::StripSummary, StoreError> {
+        let mut cached = self.strip.summary.lock();
+        if let Some((at, summary)) = *cached
+            && at.elapsed() < SUMMARY_TTL
+        {
+            return Ok(summary);
+        }
+        let (summary, _) = self.compute_strip_summary()?;
+        *cached = Some((std::time::Instant::now(), summary));
+        Ok(summary)
+    }
+
+    /// The totals as last added up, without reading the store: at startup,
+    /// after each worker pass that changed them, and by
+    /// [`Self::opreturn_strip_summary`].
+    pub fn opreturn_strip_summary_last(&self) -> opreturn_strip::StripSummary {
+        *self.strip.last_summary.lock()
+    }
+
+    /// Whether `hash` has a strip record, for a caller about to remove it
+    /// with other writes: it calls [`Self::forget_strip_summary`] after the
+    /// write when so. One point read, and none on a node that has never
+    /// stripped.
+    pub(super) fn holds_strip_record(&self, hash: &BlockHash) -> bool {
+        self.strip.has_records.load(Ordering::Acquire) && matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
+    }
+
+    /// Drop the cached totals and the blocks directory's stat: a record was
+    /// written or removed, and a span punched or filled in.
+    pub(super) fn forget_strip_summary(&self) {
+        *self.strip.summary.lock() = None;
+        *self.strip.usage.lock() = None;
+    }
+
+    /// The worker's stored cursor.
+    pub fn opreturn_strip_meta(&self) -> Option<opreturn_strip::StripMeta> {
+        self.store
+            .opreturn_strip_meta()
+            .ok()
+            .flatten()
+            .and_then(|b| opreturn_strip::StripMeta::decode(&b))
+    }
+
+    pub fn opreturn_strip_worker_status(&self) -> WorkerStatus {
+        *self.strip.worker.lock()
+    }
+
+    /// The fs block size the punch probe found, once a strip or the startup
+    /// probe has run.
+    pub fn opreturn_strip_fs_block(&self) -> Option<u64> {
+        self.strip.caps.lock().map(|c| c.fs_block)
+    }
+
+    /// Probe the blocks directory for hole punching (plan §2.5).
+    pub fn probe_opreturn_strip(&self) -> Result<PunchCaps, StripError> {
+        self.punch_caps()
+    }
+
+    /// One pass of the strip worker (plan §2.6): examine up to `max_blocks`
+    /// heights from the stored cursor, strip what is eligible, and move the
+    /// cursor. A lowered size threshold starts the scan over, since outputs
+    /// between the two sizes are newly eligible in blocks already examined; a
+    /// raised one keeps it, and what is stripped stays stripped.
+    pub fn strip_pass(&self, max_blocks: u32, stop: &std::sync::atomic::AtomicBool) -> Result<PassReport, StripError> {
+        let Some(config) = self.opreturn_prune_config() else {
+            // The option is off on a node that holds stripped blocks: nothing
+            // to strip, but a record removed since the last pass (`-prune`,
+            // `getblockfrompeer`, a fresh copy) dropped the totals.
+            *self.strip.worker.lock() = WorkerStatus::Off;
+            if self.strip.summary.lock().is_none() {
+                let _ = self.opreturn_strip_summary();
+            }
+            return Ok(PassReport::default());
+        };
+        if let Err(StripError::NotQuiet(why)) = self.check_quiet() {
+            *self.strip.worker.lock() = WorkerStatus::Paused(why);
+            return Ok(PassReport::default());
+        }
+        *self.strip.worker.lock() = WorkerStatus::Running;
+        // Every block a pass reaches connected long before it: once makes all
+        // of them durable.
+        self.flush_durable()?;
+
+        // A store error ends the pass rather than reading as "no cursor",
+        // which would start the scan over from genesis.
+        let stored = self.store.opreturn_strip_meta()?.and_then(|b| opreturn_strip::StripMeta::decode(&b));
+        let mut meta = stored.unwrap_or(opreturn_strip::StripMeta {
+            next_height: 0,
+            size_threshold: config.size_threshold,
+            depth: config.depth,
+            last_hash: None,
+        });
+        if meta.size_threshold > config.size_threshold {
+            meta.next_height = 0;
+            meta.last_hash = None;
+        }
+        self.rewind_strip_cursor(&mut meta);
+        meta.size_threshold = config.size_threshold;
+        meta.depth = config.depth;
+
+        let mut report = PassReport::default();
+        // Strip only below `tip - N - 2` (plan §2.4): never a block a limited
+        // peer may still ask for.
+        let last = self.tip_height().checked_sub(config.depth.saturating_add(3));
+        let result = (|| {
+            let Some(last) = last else {
+                return Ok(());
+            };
+            while meta.next_height <= last {
+                if report.examined == max_blocks {
+                    report.more = true;
+                    return Ok(());
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let h = meta.next_height;
+                // The tip fell below `h` since `last` was read: stop, and
+                // examine the block that replaces it on a later pass.
+                let Some(hash) = self.active_chain_hash_at_height_indexed(h) else {
+                    return Ok(());
+                };
+                match self.strip_block_inner(&hash, config.size_threshold, true) {
+                    Ok(StripOutcome::Stripped(_) | StripOutcome::Extended(_)) => report.stripped += 1,
+                    Ok(_) => {}
+                    Err(StripError::NotQuiet(why)) => {
+                        *self.strip.worker.lock() = WorkerStatus::Paused(why);
+                        return Ok(());
+                    }
+                    // Not a block to strip (yet), or a stored copy that
+                    // does not verify, which has raised its warning: move
+                    // on rather than wedge the scan on it.
+                    Err(e @ (StripError::UnknownBlock(_)
+                    | StripError::NotActive(_)
+                    | StripError::NotValid { .. }
+                    | StripError::Corrupt { .. })) => {
+                        tracing::debug!(height = h, error = %e, "OP_RETURN strip: skipping block");
+                    }
+                    Err(e) => return Err(e),
+                }
+                meta.next_height = h + 1;
+                meta.last_hash = Some(hash);
+                report.examined += 1;
+                if report.examined % META_EVERY == 0 {
+                    self.write_strip_meta(&meta)?;
+                }
+            }
+            Ok(())
+        })();
+        self.write_strip_meta(&meta)?;
+        // A strip or a restore dropped the cached totals: add them up here,
+        // off the RPC path, for `getblockchaininfo`.
+        if self.strip.summary.lock().is_none() {
+            let _ = self.opreturn_strip_summary();
+        }
+        result.map(|()| report)
+    }
+
+    /// Move the cursor back to the fork point when the block it examined last
+    /// is no longer on the active chain: a reorg replaced blocks below it,
+    /// and the ones now at those heights have not been examined. Such a reorg
+    /// never crosses a stripped block (it would be refused), so it only
+    /// costs a rescan of the replaced heights.
+    fn rewind_strip_cursor(&self, meta: &mut opreturn_strip::StripMeta) {
+        let Some(mut hash) = meta.last_hash else {
+            meta.next_height = 0;
+            return;
+        };
+        let Some(mut height) = meta.next_height.checked_sub(1) else {
+            meta.last_hash = None;
+            return;
+        };
+        while !self.active_chain_contains(&hash, height) {
+            match self.get_block_index(&hash) {
+                Some(entry) if height > 0 => {
+                    hash = entry.header.prev_blockhash;
+                    height -= 1;
+                }
+                // Not in the index, or a genesis that is not ours: start over.
+                _ => {
+                    meta.next_height = 0;
+                    meta.last_hash = None;
+                    return;
+                }
+            }
+        }
+        if height + 1 != meta.next_height {
+            tracing::info!(
+                from = meta.next_height,
+                to = height + 1,
+                "OP_RETURN strip: a reorg replaced examined blocks; rescanning from the fork"
+            );
+        }
+        meta.next_height = height + 1;
+        meta.last_hash = Some(hash);
+    }
+
+    fn write_strip_meta(&self, meta: &opreturn_strip::StripMeta) -> Result<(), StoreError> {
+        self.store.write_batch(StoreBatch {
+            opreturn_strip_meta: Some(meta.encode()),
+            ..Default::default()
+        })
+    }
+
     /// Restore an OP_RETURN-stripped block in place from `block`, a full copy
     /// that [`Self::repair_block_data`] has already checked at `height`
     /// (plan §2.12). The whole body is rewritten over the stripped one, then
@@ -515,6 +886,7 @@ impl ChainState {
             ..Default::default()
         })?;
         self.flush_durable()?;
+        self.forget_strip_summary();
         // Readable data where there was none can unblock a reorg that failed
         // on it.
         self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
@@ -607,3 +979,40 @@ fn only_new(extended: &StripRecord, old: &StripRecord) -> StripRecord {
 #[cfg(all(test, unix))]
 #[path = "state_strip_tests.rs"]
 mod tests;
+
+/// The strip worker (plan §2.6): a pass, then another straight away while the
+/// last stopped at its block limit, else a wait of up to a minute that ends
+/// early when the tip moves. Runs until `stop`. Spawn it on a thread of its
+/// own; every pass is blocking I/O.
+pub fn run_strip_worker(chain: std::sync::Arc<ChainState>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    const PASS_BLOCKS: u32 = 1000;
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+    while !stop.load(Ordering::Relaxed) {
+        let more = match chain.strip_pass(PASS_BLOCKS, &stop) {
+            Ok(report) => {
+                if report.stripped > 0 {
+                    tracing::info!(
+                        examined = report.examined,
+                        stripped = report.stripped,
+                        "OP_RETURN strip pass"
+                    );
+                }
+                report.more
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "OP_RETURN strip pass failed; retrying after the idle wait");
+                false
+            }
+        };
+        if more {
+            continue;
+        }
+        let tip = chain.tip_height();
+        let started = std::time::Instant::now();
+        while started.elapsed() < IDLE && !stop.load(Ordering::Relaxed) && chain.tip_height() == tip {
+            std::thread::sleep(POLL);
+        }
+    }
+    *chain.strip.worker.lock() = WorkerStatus::Off;
+}

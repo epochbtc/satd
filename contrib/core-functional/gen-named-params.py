@@ -285,6 +285,7 @@ SATD_ONLY = {
     "getblockfileaudit": [],
     "getconfig": [],
     "getibdprogress": [],
+    "getopreturnpruneinfo": [],
     "getorphaninfo": [],
     "getpolicyinfo": [],
     "getquarantineinfo": [],

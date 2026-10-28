@@ -17,6 +17,21 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- OP_RETURN data pruning (`-pruneopreturn=<N>`, off by default): a
+  background worker zeroes large OP_RETURN payloads in blocks more than N
+  blocks deep (minimum 288) and punches them out of the block files, keeping
+  each block's txids. `-pruneopreturnsize` sets the smallest scriptPubKey
+  stripped (default 4096 bytes), `-pruneopreturnpeers=limited|intact` what is
+  served to peers. A stripping node advertises `NODE_NETWORK_LIMITED` only,
+  and a datadir that has stripped a block no longer opens in 0.6.x.
+  `getopreturnpruneinfo` and a `getblockchaininfo` `opreturn_prune` object
+  report it; `getblockfrompeer` restores a stripped block in place.
+
+- Streaming matches read from a stripped block carry `raw_tx_stripped`, and
+  `PrefixMatched` now carries the matching `txid`; the Rust and Go SDKs
+  surface both and flag the prefix hits they could not filter
+  (`outputs_unavailable` / `OutputsUnavailable`).
+
 - satd downloads old blocks from a connected `NODE_NETWORK_LIMITED` peer
   that also advertises `NODE_INTACT_BLOCKS` (service bit 28), moving a
   block it answers `notfound` for to another peer.

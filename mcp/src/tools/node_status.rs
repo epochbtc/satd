@@ -2,6 +2,12 @@ use crate::context::McpContext;
 use node::rpc::{blockchain, network, rawtx};
 use serde_json::json;
 
+/// OP_RETURN pruning status, as `getopreturnpruneinfo` reports it.
+pub fn get_opreturn_prune_info(ctx: &McpContext) -> String {
+    let info = blockchain::opreturn_prune_json(&ctx.chain_state, true);
+    serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Get comprehensive node status: chain state, sync progress, mempool summary, peers, and uptime.
 pub fn get_node_status(ctx: &McpContext) -> String {
     // Same sources the JSON-RPC surface reads, so the MCP view cannot report

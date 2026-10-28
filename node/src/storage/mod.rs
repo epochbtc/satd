@@ -815,6 +815,11 @@ pub trait Store: Send + Sync {
     fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError>;
     /// The strip worker's stored cursor and counters.
     fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Every block's strip record, in no particular order (the worker's
+    /// `meta` value is not one). No default, for the reason
+    /// [`Self::get_opreturn_strip`] has none: a store that forgot it would
+    /// report nothing stripped.
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError>;
     fn clear_chainstate(&self) -> Result<(), StoreError>;
     /// Clear everything: block index, UTXO set, undo data, tx index, height index, tip.
     /// Used by `-reindex`.

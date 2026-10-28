@@ -624,6 +624,38 @@ impl MetricsContext {
             );
         }
 
+        // OP_RETURN pruning (plan §2.13), only on a node that strips or still
+        // holds stripped blocks, so a node that never used it exports none.
+        if self.chain_state.opreturn_prune_active() {
+            let examined = self.chain_state.opreturn_strip_meta().map_or(0, |m| m.next_height);
+            // On the HTTP task: the totals as last added up, never a CF scan.
+            let summary = self.chain_state.opreturn_strip_summary_last();
+            metric(
+                &mut out,
+                "satd_opreturn_strip_examined_height",
+                "Every active height below this has been examined by the OP_RETURN strip worker",
+                "gauge",
+                &[],
+                u64::from(examined),
+            );
+            metric(
+                &mut out,
+                "satd_opreturn_stripped_bytes_total",
+                "OP_RETURN payload bytes zeroed in the stored blocks, over the current strip records",
+                "gauge",
+                &[],
+                summary.bytes_zeroed,
+            );
+            metric(
+                &mut out,
+                "satd_opreturn_stripped_blocks_total",
+                "Stored blocks with OP_RETURN payloads stripped, over the current strip records",
+                "gauge",
+                &[],
+                summary.blocks,
+            );
+        }
+
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());
         self.chain_state.template_validity().render_metrics(&mut out);

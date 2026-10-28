@@ -197,6 +197,24 @@ the standard endpoints (`/address/:addr` or `/blocks/tip/{hash,height}`).
   with `block_height`, `block_hash`, and `block_time`. Mempool spends carry
   `status: { confirmed: false }`.
 
+### OP_RETURN-pruned blocks
+
+On a node running with `pruneopreturn`
+([OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning)):
+
+- **A stripped transaction** (in `/tx/:txid`, `/block/:hash/txs` and the
+  address histories) carries `"opreturn_stripped": true`. Each stripped output
+  reads as the bare `OP_RETURN` it keeps: `scriptpubkey` `"6a"`,
+  `scriptpubkey_asm` `"OP_RETURN"`, `scriptpubkey_type` `"op_return"`, plus
+  `"scriptpubkey_stripped_size"`, the original length. The `txid`, sizes,
+  values and fee are the original's.
+- **Raw bytes are refused** with 404: `/block/:hash/raw` with
+  `block data not available (OP_RETURN data stripped)`, and `/tx/:txid/hex` and
+  `/tx/:txid/raw` with `transaction data not available (OP_RETURN data
+  stripped)`.
+- Block summaries, txids, merkle proofs (both kinds), outspends and statuses
+  are unchanged.
+
 ## Chain-tip headers
 
 Every route that reads the chain answers with two extra headers:

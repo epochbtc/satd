@@ -21,7 +21,7 @@ use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
 #[path = "state_strip.rs"]
 mod strip;
-pub use strip::{FAILPOINT_ENV, StripError, StripOutcome, StripStats};
+pub use strip::{FAILPOINT_ENV, PassReport, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus, run_strip_worker};
 
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
@@ -5331,7 +5331,11 @@ impl ChainState {
             // any strip record left from an earlier copy (one a `-reindex`
             // could not find, say).
             batch.opreturn_strip_removes.push(block_hash);
+            let had_record = self.holds_strip_record(&block_hash);
             self.write_chain_batch(batch)?;
+            if had_record {
+                self.forget_strip_summary();
+            }
             // Core's `ReceivedBlockTransactions`, called under the same lock
             // that made the data durable: this block's arrival order is now
             // fixed, and so is that of any descendant it just unblocked.
@@ -5554,7 +5558,11 @@ impl ChainState {
         // The entry now points at the appended full copy; a strip record of
         // the old one no longer describes it.
         batch.opreturn_strip_removes.push(hash);
+        let had_record = self.holds_strip_record(&hash);
         self.write_chain_batch(batch)?;
+        if had_record {
+            self.forget_strip_summary();
+        }
         // Readable data where there was none can unblock a reorg that failed
         // on it, so `activate_best_stored_chain` should look again.
         self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
@@ -8039,6 +8047,7 @@ impl ChainState {
             // A fresh full copy supersedes any strip record (see
             // `commit_block_store`).
             batch.opreturn_strip_removes.push(block_hash);
+            let had_record = self.holds_strip_record(&block_hash);
             let batch_index = std::collections::HashMap::from([(block_hash, entry.clone())]);
             self.commit_accepted_headers_locked(
                 batch,
@@ -8046,6 +8055,9 @@ impl ChainState {
                 Some((block_hash, new_chainwork)),
                 new_height,
             )?;
+            if had_record {
+                self.forget_strip_summary();
+            }
             // Core's `ReceivedBlockTransactions`: fix this block's place in
             // the arrival order before anything can consult the tie-break.
             let newly_connectable = self.note_block_data_arrived(block_hash, &entry);
@@ -8487,6 +8499,7 @@ impl ChainState {
         // supersedes any strip record (see `commit_block_store`).
         let mut batch = batch;
         batch.opreturn_strip_removes.push(block_hash);
+        let had_record = self.holds_strip_record(&block_hash);
         let _chain_mutation = self.begin_chain_mutation();
         if let Err(e) = self.write_chain_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
@@ -8503,6 +8516,9 @@ impl ChainState {
                 );
             }
             return Err(e.into());
+        }
+        if had_record {
+            self.forget_strip_summary();
         }
 
         // Update in-memory tip
@@ -8999,7 +9015,7 @@ impl ChainState {
     /// `get_block` reads as unavailable, and `generic` otherwise.
     fn reorg_read_error(&self, hash: &BlockHash, height: u32, generic: &str) -> ChainError {
         if self.has_strip_record(hash) {
-            ChainError::FlatFile(stripped_block_message(hash, height))
+            ChainError::FlatFile(stripped_block_message_for(self, hash, height))
         } else {
             ChainError::FlatFile(generic.to_string())
         }
@@ -9072,7 +9088,7 @@ impl ChainState {
                 // A record that cannot be read refuses too: the marks would
                 // otherwise land before the disconnect hit the same fault.
                 if self.store.get_opreturn_strip(&cursor)?.is_some() {
-                    return Err(ChainError::InvalidArgument(stripped_block_message(&cursor, e.height)));
+                    return Err(ChainError::InvalidArgument(stripped_block_message_for(self, &cursor, e.height)));
                 }
                 cursor = e.header.prev_blockhash;
             }
@@ -10482,6 +10498,7 @@ impl ChainState {
         }
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
+        let mut removes_a_record = false;
         // The files that can hold a record the scan missed (see the plan
         // above). A `repair_block_data` writes a block below the cut into the
         // file being appended to and then repoints its entry there, out of
@@ -10549,6 +10566,7 @@ impl ChainState {
                 tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
                 batch.block_index_puts.push((*hash, entry));
                 // The bytes a strip record describes are gone with the file.
+                removes_a_record |= self.holds_strip_record(hash);
                 batch.opreturn_strip_removes.push(*hash);
             }
             deleted += 1;
@@ -10556,10 +10574,12 @@ impl ChainState {
         }
         drop(flat_files);
 
-        if !batch.block_index_puts.is_empty()
-            && let Err(e) = self.write_chain_batch(batch)
-        {
-            tracing::error!("Failed to update block index after pruning: {}", e);
+        if !batch.block_index_puts.is_empty() {
+            match self.write_chain_batch(batch) {
+                Ok(()) if removes_a_record => self.forget_strip_summary(),
+                Ok(()) => {}
+                Err(e) => tracing::error!("Failed to update block index after pruning: {}", e),
+            }
         }
 
         // Record the new floor for `getblockchaininfo`'s `pruneheight`.
@@ -10808,6 +10828,20 @@ fn stripped_block_message(hash: &BlockHash, height: u32) -> String {
          disconnects or reconnects it is not possible without re-downloading it \
          (getblockfrompeer)"
     )
+}
+
+/// [`stripped_block_message`], naming the depth when `-pruneopreturn` is on:
+/// a reorg deeper than it cannot go through without the full blocks.
+fn stripped_block_message_for(chain: &ChainState, hash: &BlockHash, height: u32) -> String {
+    match chain.opreturn_prune_config() {
+        Some(c) => format!(
+            "block {hash} at height {height} has stripped OP_RETURN data; a reorg deeper than \
+             -pruneopreturn={} blocks is not possible without re-downloading it \
+             (getblockfrompeer)",
+            c.depth
+        ),
+        None => stripped_block_message(hash, height),
+    }
 }
 
 fn unreplayable_record(

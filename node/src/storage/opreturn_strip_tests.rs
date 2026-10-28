@@ -471,3 +471,64 @@ fn a_record_that_does_not_fit_the_bytes_is_refused() {
     ));
 }
 
+
+#[test]
+fn strip_meta_round_trips_and_refuses_what_it_does_not_know() {
+    let meta = StripMeta {
+        next_height: 912_345,
+        size_threshold: 10_240,
+        depth: 4320,
+        last_hash: Some(BlockHash::from_byte_array([7; 32])),
+    };
+    let bytes = meta.encode();
+    assert_eq!(bytes.len(), 49);
+    assert_eq!(StripMeta::decode(&bytes), Some(meta));
+    let fresh = StripMeta {
+        next_height: 0,
+        last_hash: None,
+        ..meta
+    };
+    assert_eq!(StripMeta::decode(&fresh.encode()), Some(fresh));
+    let mut v2 = bytes.clone();
+    v2[0] = 2;
+    assert_eq!(StripMeta::decode(&v2), None);
+    assert_eq!(StripMeta::decode(&bytes[..48]), None);
+}
+
+/// `bytes_freed_estimate` counts only the whole filesystem blocks a span holds
+/// at its worst alignment, so it never claims more than a punch can free.
+#[test]
+fn the_freed_estimate_is_a_minimum() {
+    let out = |vout, script_len| StrippedOutput { vout, script_len };
+    let record = StripRecord {
+        filled_sha256: [0; 32],
+        txs: vec![
+            StrippedTx {
+                tx_index: 1,
+                txid: Txid::from_byte_array([1; 32]),
+                wtxid: None,
+                // Spans of 4095, 4096 and 8193 bytes.
+                outputs: vec![out(0, 4096), out(1, 4097), out(2, 8194)],
+            },
+            StrippedTx {
+                tx_index: 2,
+                txid: Txid::from_byte_array([2; 32]),
+                wtxid: None,
+                outputs: vec![out(1, 300)],
+            },
+        ],
+    };
+    let mut s = StripSummary::default();
+    s.add(&record, 4096);
+    assert_eq!(
+        s,
+        StripSummary {
+            blocks: 1,
+            transactions: 2,
+            outputs: 4,
+            bytes_zeroed: 4095 + 4096 + 8193 + 299,
+            // 4096 can sit across two blocks; 8193 holds at least one whole.
+            bytes_freed_estimate: 4096,
+        }
+    );
+}

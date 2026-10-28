@@ -219,7 +219,7 @@ struct GetReorgHistoryParams {
     since_secs: Option<u64>,
 }
 
-// --- Tool router: register all 27 tools ---
+// --- Tool router: register all tools ---
 
 #[tool_router]
 impl SatdMcpServer {
@@ -233,6 +233,11 @@ impl SatdMcpServer {
     #[tool(description = "Get system resource usage: memory (RSS), UTXO cache statistics, and database info.")]
     fn get_system_info(&self) -> String {
         tools::node_status::get_system_info(&self.ctx)
+    }
+
+    #[tool(description = "Get OP_RETURN pruning status (getopreturnpruneinfo): whether -pruneopreturn is on, its depth and size threshold, how many blocks, transactions and outputs are stripped, bytes zeroed and freed, the strip worker's state, and the block files' apparent and allocated size.")]
+    fn get_opreturn_prune_info(&self) -> String {
+        tools::node_status::get_opreturn_prune_info(&self.ctx)
     }
 
     // === Blockchain Queries ===
