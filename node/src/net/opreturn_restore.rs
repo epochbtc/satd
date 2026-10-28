@@ -262,7 +262,7 @@ impl RestoreDownloader {
     /// `peer` answered `notfound` for `hash`. Returns whether it had been
     /// asked for it.
     pub fn note_not_found(&mut self, hash: &BlockHash, peer: PeerId) -> bool {
-        if !self.in_flight.get(hash).is_some_and(|(p, _)| *p == peer) {
+        if self.in_flight.get(hash).is_none_or(|(p, _)| *p != peer) {
             return false;
         }
         self.in_flight.remove(hash);

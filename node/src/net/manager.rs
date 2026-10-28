@@ -7860,7 +7860,7 @@ impl PeerManager {
         }
         let free = match test_free {
             Some(free) => free,
-            None => crate::diskspace::free_disk_bytes(&cs.blocks_dir()),
+            None => crate::diskspace::free_disk_bytes(cs.blocks_dir()),
         };
         let Some(free) = free else {
             // Free space unknown: nothing to judge by, so do not hold the
