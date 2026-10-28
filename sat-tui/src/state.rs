@@ -294,6 +294,10 @@ pub struct OpReturnProgress {
     pub worker: String,
     /// Stripped blocks, as last added up.
     pub blocks: u64,
+    /// The worker's scan: (examined below, target), the target being the
+    /// tip less the strip depth and 2, as the daemon's
+    /// `examine_target_height`. `None` from a daemon that does not say.
+    pub scan: Option<(u64, u64)>,
     /// The `-restoreopreturns` download, when the option is set.
     pub restore: Option<RestoreView>,
 }
@@ -317,6 +321,14 @@ impl OpReturnProgress {
         Some(OpReturnProgress {
             worker: o.get("worker").and_then(|w| w.as_str()).unwrap_or("").to_string(),
             blocks: u(o, "blocks"),
+            scan: match (
+                o.get("examined_below_height").and_then(|n| n.as_u64()),
+                o.get("depth").and_then(|n| n.as_u64()),
+                v.get("blocks").and_then(|n| n.as_u64()),
+            ) {
+                (Some(examined), Some(depth), Some(tip)) => Some((examined, tip.saturating_sub(depth + 2))),
+                _ => None,
+            },
             restore: o.get("restore").map(|r| RestoreView {
                 total_blocks: u(r, "total_blocks"),
                 remaining_blocks: u(r, "remaining_blocks"),
@@ -2617,7 +2629,10 @@ mod tests {
         assert_eq!((r.total_blocks, r.remaining_blocks, r.peers), (123, 40, 3));
         assert_eq!((r.progress_ratio, r.estimated_remaining_seconds), (Some(0.675), Some(240)));
         let stripping = OpReturnProgress::from_json(&json!({"opreturn_prune": {"worker": "running", "blocks": 7}})).unwrap();
-        assert_eq!((stripping.blocks, stripping.restore), (7, None));
+        assert_eq!((stripping.blocks, stripping.restore, stripping.scan), (7, None, None));
+        let scanning = json!({"blocks": 973_593, "opreturn_prune": {
+            "worker": "running", "blocks": 4, "depth": 288, "examined_below_height": 262_640}});
+        assert_eq!(OpReturnProgress::from_json(&scanning).unwrap().scan, Some((262_640, 973_303)), "the daemon's target");
         let hostile = json!({"opreturn_prune": {"restore": {"progress_ratio": 7.5}}});
         assert_eq!(OpReturnProgress::from_json(&hostile).unwrap().restore.unwrap().progress_ratio, Some(1.0));
     }
