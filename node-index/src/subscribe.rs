@@ -40,8 +40,9 @@ use crate::types::StatusUpdate;
 /// and is expected to resync via `confirmed_history` / `mempool_history`.
 pub struct SubscriptionRegistry {
     channels: Mutex<HashMap<Scripthash, broadcast::Sender<StatusUpdate>>>,
-    /// Maximum concurrent scripthashes; default 10000 per
-    /// `--addrindexsubscriptions=N`. Past the cap, `subscribe` returns
+    /// Maximum concurrent scripthashes; default
+    /// [`DEFAULT_MAX_SUBSCRIPTIONS`](crate::config::DEFAULT_MAX_SUBSCRIPTIONS),
+    /// per `--addrindexsubscriptions=N`. Past the cap, `subscribe` returns
     /// `Err(SubscribeError::CapReached)`. Atomic so a SIGHUP reload can
     /// raise/lower the cap live via [`set_max_subs`](Self::set_max_subs);
     /// the check in `subscribe` reads it fresh. Lowering below the live
@@ -98,26 +99,30 @@ impl SubscriptionRegistry {
         sh: Scripthash,
     ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         let mut channels = self.channels.lock();
-        if let Some(tx) = channels.get(&sh)
-            && tx.receiver_count() > 0
-        {
-            return Ok(tx.subscribe());
+        match channels.get(&sh) {
+            Some(tx) if tx.receiver_count() > 0 => return Ok(tx.subscribe()),
+            // An abandoned channel for this very scripthash is replaced
+            // below, so its dedup entry goes now. A re-subscribe is supposed
+            // to recompute status_hash from current state; a stale entry
+            // from the prior incarnation could match the recomputed hash and
+            // silently swallow the first notification.
+            Some(_) => {
+                channels.remove(&sh);
+                self.last_status.lock().remove(&sh);
+            }
+            None => {}
         }
-        // Sweep abandoned channels under the same lock so the cap
-        // check below sees the live count, not the high-water mark.
-        channels.retain(|_, tx| tx.receiver_count() > 0);
-        // Drop last_status for any pruned scripthashes. A re-subscribe
-        // is supposed to recompute status_hash from current state; a
-        // stale dedup entry from a prior incarnation could match the
-        // recomputed hash and silently swallow the first notification.
-        let live_keys: std::collections::HashSet<Scripthash> = channels.keys().copied().collect();
-        self.last_status
-            .lock()
-            
-            .retain(|sh, _| live_keys.contains(sh));
         let max_subs = self.max_subs.load(Ordering::Relaxed);
         if channels.len() >= max_subs {
-            return Err(SubscribeError::CapReached(max_subs));
+            // Sweep abandoned channels under the same lock so the cap check
+            // sees the live count, not the high-water mark. Only here, at the
+            // cap: sweeping on every subscribe walked the whole registry each
+            // time, so a wallet subscribing N scripthashes cost O(N²) under
+            // the registry lock (100,000 took about five minutes).
+            Self::sweep_abandoned(&mut channels, &self.last_status);
+            if channels.len() >= max_subs {
+                return Err(SubscribeError::CapReached(max_subs));
+            }
         }
         let (tx, rx) = broadcast::channel(self.per_channel_capacity);
         channels.insert(sh, tx);
@@ -125,9 +130,11 @@ impl SubscriptionRegistry {
     }
 
     /// Number of distinct scripthashes currently subscribed. Used by
-    /// the `satd_addrindex_subscriptions_active` Prometheus gauge.
+    /// the `satd_addrindex_subscriptions_active` Prometheus gauge. Counts
+    /// live channels only: an abandoned one stays in the map until the next
+    /// sweep (at the cap, or [`prune_empty`](Self::prune_empty)).
     pub fn active_count(&self) -> usize {
-        self.channels.lock().len()
+        self.channels.lock().values().filter(|tx| tx.receiver_count() > 0).count()
     }
 
     /// Forget all per-scripthash channels with zero remaining
@@ -135,14 +142,18 @@ impl SubscriptionRegistry {
     /// abandoned channels don't accumulate forever.
     pub fn prune_empty(&self) {
         let mut channels = self.channels.lock();
+        Self::sweep_abandoned(&mut channels, &self.last_status);
+    }
+
+    /// Drop every channel with no receiver left, and its `last_status`
+    /// entry: a future re-subscribe recomputes status_hash from current
+    /// state, which a stale dedup entry could otherwise swallow.
+    fn sweep_abandoned(
+        channels: &mut HashMap<Scripthash, broadcast::Sender<StatusUpdate>>,
+        last_status: &Mutex<HashMap<Scripthash, [u8; 32]>>,
+    ) {
         channels.retain(|_, tx| tx.receiver_count() > 0);
-        // Drop matching last_status entries — a future re-subscribe
-        // recomputes status_hash from current state, which is correct.
-        let live_keys: std::collections::HashSet<Scripthash> = channels.keys().copied().collect();
-        self.last_status
-            .lock()
-            
-            .retain(|sh, _| live_keys.contains(sh));
+        last_status.lock().retain(|sh, _| channels.contains_key(sh));
     }
 
     /// All scripthashes with at least one active subscriber. Filters
@@ -454,6 +465,26 @@ mod tests {
             !active.contains(&sh_dead),
             "active_scripthashes must not include zero-receiver channels"
         );
+    }
+
+    /// A subscribe below the cap does not walk the registry: abandoned
+    /// channels wait for the cap or the periodic prune. Sweeping on every
+    /// subscribe made a wallet's N subscribes O(N²) under the registry lock
+    /// (#1121). Perturbation: sweep before the cap check on every subscribe
+    /// and the abandoned channel is gone after the second subscribe.
+    #[test]
+    fn a_subscribe_below_the_cap_leaves_the_sweep_for_later() {
+        let reg = SubscriptionRegistry::new(3, 32);
+        drop(reg.subscribe([0x01; 32]).unwrap());
+        let _b = reg.subscribe([0x02; 32]).unwrap();
+        assert_eq!(reg.channels.lock().len(), 2, "no sweep below the cap");
+        assert_eq!(reg.active_count(), 1, "the gauge counts live channels only");
+        // At the cap, the sweep reclaims the abandoned slot.
+        let _c = reg.subscribe([0x03; 32]).unwrap();
+        let _d = reg.subscribe([0x04; 32]).expect("the abandoned slot is reclaimed at the cap");
+        assert_eq!(reg.channels.lock().len(), 3);
+        reg.prune_empty();
+        assert_eq!(reg.channels.lock().len(), 3);
     }
 
     #[test]

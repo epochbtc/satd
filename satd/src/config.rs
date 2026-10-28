@@ -768,7 +768,8 @@ pub struct Config {
     pub silentpaymentindex: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.
-    /// Default 10000 — generous for typical xpub-derivation patterns.
+    /// Default [`node_index::config::DEFAULT_MAX_SUBSCRIPTIONS`] (50000):
+    /// five Electrum connections at their default cap.
     pub addrindexsubscriptions: usize,
     /// Largest scripthash history the public Electrum and Esplora
     /// surfaces will serve; a busier script is refused. `0` means no
@@ -3235,9 +3236,10 @@ impl Config {
             .or_else(|| file_get("silentpaymentindex").and_then(|v| parse_bool(&v)))
             .unwrap_or(false);
 
-        // Per-scripthash subscription cap. Default 10000 covers
-        // typical xpub-derivation patterns; operators serving public
-        // Electrum/Esplora endpoints may want to raise this.
+        // Per-scripthash subscription cap, server-wide. The default (50000)
+        // fits five Electrum connections at their own default cap;
+        // operators serving public Electrum/Esplora endpoints may want to
+        // raise this.
         // Resolved in a helper, to keep `from_cli`'s debug-build stack frame
         // from growing.
         let (addrindexsubscriptions, addrindexmaxhistory) = resolve_addrindex_limits(cli.addrindex_args, &file_get);
@@ -5953,7 +5955,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "N",
-        help = "Per-connection scripthash subscription cap (default: 100)"
+        help = "Per-connection scripthash subscription cap (default: 10000)"
     )]
     pub electrummaxsubsperconn: Option<usize>,
 
@@ -7967,7 +7969,7 @@ pub struct AddrIndexArgs {
 }
 
 const ADDRINDEX_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("addrindexsubscriptions", "N", StratumArgKind::Usize, "Maximum concurrent per-scripthash subscriptions (default: 10000)"),
+    ("addrindexsubscriptions", "N", StratumArgKind::Usize, "Maximum concurrent per-scripthash subscriptions, server-wide (default: 50000)"),
     (
         "addrindexmaxhistory",
         "N",
@@ -8298,7 +8300,7 @@ fn resolve_addrindex_limits(cli: AddrIndexArgs, file_get: &dyn Fn(&str) -> Optio
     let subscriptions = cli
         .addrindexsubscriptions
         .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
-        .unwrap_or(10_000);
+        .unwrap_or(node_index::config::DEFAULT_MAX_SUBSCRIPTIONS);
     let max_history = cli
         .addrindexmaxhistory
         .or_else(|| file_get("addrindexmaxhistory").and_then(|v| v.parse().ok()))

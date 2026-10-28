@@ -140,7 +140,7 @@ Connections receive a `:keep-alive` heartbeat every 25 seconds, so idle streams
 survive intermediate proxy timeouts (Caddy defaults to 30 s, nginx to 60 s).
 
 Per-scripthash subscriptions consume from the registry capped by
-`--addrindexsubscriptions=N` (default 10000). Over-cap subscribe attempts
+`--addrindexsubscriptions=N` (default 50000). Over-cap subscribe attempts
 return 503.
 
 Total open SSE streams across all three endpoints are capped by

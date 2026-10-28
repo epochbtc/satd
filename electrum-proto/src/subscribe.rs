@@ -657,4 +657,54 @@ mod tests {
             Ok(Some(s)) => panic!("subscriptions drop failed to abort: got {s}"),
         }
     }
+
+    /// A registry-backed index: the server-wide registry the node runs,
+    /// with nothing in any history.
+    struct RegistryIndex(node_index::SubscriptionRegistry);
+
+    impl AddressIndex for RegistryIndex {
+        fn confirmed_history(&self, _: &Scripthash) -> Result<Vec<HistoryEntry>, IndexError> {
+            Ok(Vec::new())
+        }
+        fn mempool_history(&self, _: &Scripthash) -> Vec<MempoolHistoryEntry> {
+            Vec::new()
+        }
+        fn balance(&self, _: &Scripthash) -> Result<(u64, i64), IndexError> {
+            Ok((0, 0))
+        }
+        fn utxos(&self, _: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
+            Ok(Vec::new())
+        }
+        fn subscribe(
+            &self,
+            sh: Scripthash,
+        ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+            self.0.subscribe(sh)
+        }
+    }
+
+    /// #1121: a desktop wallet subscribes every used address plus the
+    /// gap-limit windows on one connection, and passed the old default of
+    /// 1000. With default settings, on both the connection and the
+    /// server-wide registry, one connection subscribing 5,000 scripthashes
+    /// gets every one. Perturbation: the per-connection default back at
+    /// 1000 and the 1001st is refused.
+    #[tokio::test]
+    async fn one_connection_subscribes_five_thousand_scripthashes_on_defaults() {
+        let index_cfg = node_index::AddressIndexConfig::default();
+        let idx = RegistryIndex(node_index::SubscriptionRegistry::new(
+            index_cfg.max_subscriptions,
+            index_cfg.per_channel_capacity,
+        ));
+        let (tx, _rx) = mpsc::channel::<String>(NOTIFY_CHANNEL_CAP);
+        let mut subs = Subscriptions::new(tx, crate::config::ElectrumConfig::default().max_subs_per_conn);
+        for i in 0u32..5_000 {
+            let mut sh = [0u8; 32];
+            sh[..4].copy_from_slice(&i.to_le_bytes());
+            subs.add_scripthash(sh, &idx)
+                .unwrap_or_else(|e| panic!("subscription {} refused: {e:?}", i + 1));
+        }
+        assert_eq!(subs.scripthash_count(), 5_000);
+        assert_eq!(idx.0.active_count(), 5_000);
+    }
 }

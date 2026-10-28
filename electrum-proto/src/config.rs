@@ -27,13 +27,20 @@ pub const MAX_HISTORY_ENTRIES: usize = node_index::DEFAULT_MAX_HISTORY_ENTRIES;
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2016;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONNS: usize = 64;
-/// Per-connection scripthash subscription cap. A multi-account wallet
-/// (e.g. Sparrow with several loaded wallets) subscribes to every
-/// derived address on a single connection, so this must comfortably
-/// exceed a few wallets' worth of gap-limit windows. 1000 bounds
-/// per-connection memory while clearing realistic wallets; operators
-/// who serve many large wallets can raise it.
-pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 1000;
+/// Per-connection scripthash subscription cap. A desktop wallet
+/// subscribes, on one connection, to every address it has ever used plus
+/// the gap-limit window on both chains, for every wallet it has open, so a
+/// wallet with a few hundred transactions of history, or a few accounts
+/// open together, passes 1000 (the old default, which made such a sync
+/// fail partway, #1121). 10,000 covers a large single-user wallet.
+///
+/// One subscription costs about 4.6 KB (the registry's broadcast channel
+/// and status entry, this connection's forwarding task and map entry) and
+/// a history read on every block, so a connection at this cap holds about
+/// 46 MB. The server-wide registry
+/// ([`node_index::config::DEFAULT_MAX_SUBSCRIPTIONS`]) is sized to five
+/// connections at this cap; the two defaults move together.
+pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 10_000;
 /// Max requests in a single JSON-RPC batch. Real wallets batch far more
 /// than a handful at scan time: Sparrow sends its entire gap-limit
 /// window (~25+) of `blockchain.scripthash.subscribe` calls as one
@@ -180,15 +187,20 @@ pub fn connections_to_fill_registry(
 mod electrumbounds_tests {
     use super::*;
 
+    /// The two defaults move together (#1121): five connections at the
+    /// per-connection cap of 10,000 fit in the registry of 50,000. Ten
+    /// filled it when the caps were 1,000 and 10,000.
     #[test]
-    fn the_defaults_let_ten_connections_fill_the_registry() {
+    fn the_defaults_fit_five_connections_at_their_cap_in_the_registry() {
+        assert_eq!(DEFAULT_MAX_SUBS_PER_CONN, 10_000);
+        assert_eq!(node_index::config::DEFAULT_MAX_SUBSCRIPTIONS, 50_000);
         assert_eq!(
             connections_to_fill_registry(
                 DEFAULT_MAX_SUBS_PER_CONN,
                 DEFAULT_MAX_CONNS,
                 node_index::config::DEFAULT_MAX_SUBSCRIPTIONS,
             ),
-            Some(10)
+            Some(5)
         );
     }
 
