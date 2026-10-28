@@ -343,6 +343,15 @@ fn the_opreturn_restore_asks_only_full_peers() {
     assert_eq!(pm.opreturn_restore_peer_ids(), vec![4]);
 }
 
+/// A restore work-list read that panics still reports, as an error, so the
+/// download does not wait on it forever.
+#[test]
+fn a_panicking_restore_work_list_read_reports_an_error() {
+    assert_eq!(super::load_restore_work(|| Ok(Vec::new())), Ok(Vec::new()));
+    let out = super::load_restore_work(|| panic!("boom"));
+    assert!(out.is_err_and(|e| e.contains("panicked")));
+}
+
 /// With a recent tip a limited outbound peer is enough, except while an
 /// OP_RETURN restore is pending: then the outbound slots keep looking for
 /// peers that keep every block.

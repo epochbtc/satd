@@ -389,6 +389,13 @@ fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pe
 /// A restore pass's work list as read on the blocking pool.
 type RestoreWork = Result<Vec<crate::chain::state::RestoreItem>, String>;
 
+/// Run `load`, a restore pass's work-list read, turning a panic into an
+/// error: the slot it fills is what clears the download's `loading`, so a
+/// read that never reports would hold the restore until a restart.
+fn load_restore_work(load: impl FnOnce() -> RestoreWork + std::panic::UnwindSafe) -> RestoreWork {
+    std::panic::catch_unwind(load).unwrap_or_else(|_| Err("the work-list read panicked".to_string()))
+}
+
 /// What became of a block the restore asked for.
 #[derive(Clone, Copy)]
 enum RestoreArrival {
@@ -7834,8 +7841,10 @@ impl PeerManager {
                         let slot = Arc::clone(&self.opreturn_restore_loaded);
                         let descending = self.is_pruning();
                         tokio::task::spawn_blocking(move || {
-                            let work = chain.opreturn_restore_work(descending).map_err(|e| e.to_string());
-                            *slot.lock() = Some(work);
+                            // A read only: nothing it could leave half done.
+                            *slot.lock() = Some(load_restore_work(std::panic::AssertUnwindSafe(|| {
+                                chain.opreturn_restore_work(descending).map_err(|e| e.to_string())
+                            })));
                         });
                     }
                     report(restore, WorkerStatus::Restoring);
