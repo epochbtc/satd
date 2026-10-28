@@ -302,30 +302,39 @@ fn dropping_the_strip_family_makes_the_datadir_ordinary_again() {
 }
 
 /// A batch that touches the family, written while the family is dropped, must
-/// still land: most such batches are a block's connect, and RocksDB fails a
-/// write to a family dropped after the batch looked its handle up.
+/// still land: most such batches are a block's connect, and RocksDB refuses a
+/// write whose family was dropped after the batch took its handle ("Invalid
+/// column family specified in write batch"). The drop waits for the write.
 #[test]
-fn batches_racing_the_family_drop_never_fail() {
+fn a_drop_waits_for_a_batch_that_holds_the_family() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap());
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    store.write_batch(put(hash(1), b"record")).unwrap();
+    let (began_tx, began_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_strip_write(began_tx, resume_rx);
     let writer = {
-        let (store, stop) = (store.clone(), stop.clone());
+        let store = store.clone();
+        std::thread::spawn(move || store.write_batch(remove(hash(1))))
+    };
+    began_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the write reached the family");
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let dropper = {
+        let store = store.clone();
         std::thread::spawn(move || {
-            let mut writes = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                store.write_batch(remove(hash(2))).expect("a batch racing the drop");
-                writes += 1;
-            }
-            writes
+            let r = store.drop_opreturn_strip_cf();
+            dropped_tx.send(()).unwrap();
+            r
         })
     };
-    for _ in 0..200 {
-        store.write_batch(put(hash(1), b"record")).unwrap();
-        store.drop_opreturn_strip_cf().unwrap();
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(writer.join().unwrap() > 0, "premise: the writer ran");
+    assert!(
+        dropped_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "the drop ran while a write held the family"
+    );
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap().expect("the write racing the drop lands");
+    dropper.join().unwrap().unwrap();
+    assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
 }
 
 /// The in-memory store and both layers forward the drop.
@@ -353,3 +362,4 @@ fn every_layer_drops_the_strip_family() {
     split.drop_opreturn_strip_cf().unwrap();
     assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap(), None, "through a SplitStore");
 }
+

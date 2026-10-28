@@ -1259,6 +1259,11 @@ fn a_record_left_or_the_option_on_keeps_the_node_stripping() {
     assert_eq!(pass(&cs, 1000), PassReport::default());
     assert!(cs.opreturn_prune_active(), "a record is left");
     assert!(record(&cs, &b.block_hash()).is_some());
+    // The finish rechecks under the strip lock: a record written between the
+    // pass's count and the lock keeps the family.
+    assert!(!cs.finish_opreturn_unstrip().unwrap());
+    assert!(record(&cs, &b.block_hash()).is_some());
+    assert!(cs.opreturn_prune_active());
 
     cs.configure_opreturn_prune(StripConfig {
         depth: 0,

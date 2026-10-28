@@ -664,6 +664,13 @@ pub struct RocksDbStore {
     recent_window_test_pause: parking_lot::Mutex<
         Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     >,
+    /// Test hook: when set, the next batch write that touches the strip
+    /// family signals the sender once its `WriteBatch` holds the family's
+    /// handle, and waits on the receiver before writing it.
+    #[cfg(test)]
+    strip_write_test_pause: parking_lot::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    >,
 }
 
 impl RocksDbStore {
@@ -1070,6 +1077,8 @@ impl RocksDbStore {
             strip_cf_gate: parking_lot::RwLock::new(()),
             #[cfg(test)]
             recent_window_test_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            strip_write_test_pause: parking_lot::Mutex::new(None),
         };
         *store.recent_window.lock() = store.load_recent_window();
         // outpoint_spend completeness marker (review H6 round 2).
@@ -1486,6 +1495,15 @@ impl RocksDbStore {
 
     /// Create the strip family if it does not exist yet. Two writers can
     /// race here; the loser's error is harmless once the family exists.
+    #[cfg(test)]
+    pub(super) fn pause_next_strip_write(
+        &self,
+        began: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.strip_write_test_pause.lock() = Some((began, resume));
+    }
+
     fn create_opreturn_strip_cf(&self) -> Result<(), StoreError> {
         if self.db.cf_handle(CF_OPRETURN_STRIP).is_some() {
             return Ok(());
@@ -2369,6 +2387,11 @@ impl RocksDbStore {
             }
             if let Some(meta) = &batch.opreturn_strip_meta {
                 wb.put_cf(&cf_strip, OPRETURN_STRIP_META_KEY, meta);
+            }
+            #[cfg(test)]
+            if let Some((began, resume)) = self.strip_write_test_pause.lock().take() {
+                let _ = began.send(());
+                let _ = resume.recv();
             }
         }
 
