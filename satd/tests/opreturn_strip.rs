@@ -1775,6 +1775,10 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
     let info = prune_info(&a);
     assert_eq!(info["enabled"], false, "{info}");
     assert_eq!(info["worker"], "waiting_for_peers", "no peer yet: {info}");
+    // `getblockchaininfo`, which sat-tui polls, carries the same state.
+    let summary = a.rpc_ok("getblockchaininfo", vec![])["opreturn_prune"].clone();
+    assert_eq!(summary["worker"], "waiting_for_peers", "{summary}");
+    assert!(summary["restore"]["progress_ratio"].is_number(), "{summary}");
     let stripped_allocation = allocated(&a);
 
     a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
@@ -1784,6 +1788,9 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
     assert_eq!(info["restore"]["total_blocks"], 2, "{info}");
     assert_eq!(info["restore"]["restored_blocks"], 2, "{info}");
     assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
+    assert_eq!(info["restore"]["progress_ratio"], 1.0, "{info}");
+    assert_eq!(info["restore"]["estimated_remaining_seconds"], 0, "{info}");
+    assert!(a.rpc_ok("getblockchaininfo", vec![]).get("opreturn_prune").is_none(), "nothing stripped: no object");
     assert!(info["restore"]["bytes_downloaded"].as_u64().unwrap() > 2 * PAYLOAD as u64, "{info}");
     assert!(payload_on_disk(&a), "the payloads are back on disk");
     assert!(allocated(&a) > stripped_allocation, "the punched space is allocated again");

@@ -472,7 +472,9 @@ stripped:
   what the holes save;
 - under `restoreopreturns`, `restore`: `total_blocks` when the pass started,
   `remaining_blocks`, `restored_blocks`, `bytes_downloaded`,
-  `remaining_bytes`, `in_flight` and `peers` (the connected peers it can ask).
+  `remaining_bytes`, `in_flight`, `peers` (the connected peers it can ask),
+  `progress_ratio` and `estimated_remaining_seconds`. `sat-tui` shows it in
+  its services row ([TUI](tui.md)).
   A log line every 1000 blocks restored gives the rate and an estimate of the
   time left.
 

@@ -343,14 +343,17 @@ impl RestoreDownloader {
 
     /// The counts for `getopreturnpruneinfo`.
     pub fn progress(&self) -> RestoreProgress {
+        let remaining_blocks = self.queue.len() as u64 + self.window.len() as u64 + self.skipped;
+        let rate = self.rate(Instant::now());
         RestoreProgress {
             total_blocks: self.total_blocks,
-            remaining_blocks: self.queue.len() as u64 + self.window.len() as u64 + self.skipped,
+            remaining_blocks,
             restored_blocks: self.restored_blocks,
             bytes_downloaded: self.bytes_downloaded,
             remaining_bytes: self.remaining_bytes,
             in_flight: self.in_flight.len() as u64,
             peers: self.peers as u64,
+            estimated_remaining_seconds: (rate > 0.0).then(|| (remaining_blocks as f64 / rate) as u64),
         }
     }
 }
@@ -491,6 +494,7 @@ mod tests {
         let p = dl.progress();
         assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3));
         assert_eq!((p.bytes_downloaded, p.remaining_bytes, p.in_flight), (3600, 0, 0));
+        assert_eq!(p.estimated_remaining_seconds, Some(0), "nothing left, at any rate");
         assert!(dl.is_idle());
         assert!(dl.may_start_pass(Instant::now(), &[7]), "a pass that restored something does not wait");
         dl.start_pass(Vec::new(), Instant::now());

@@ -549,6 +549,9 @@ pub struct RestoreProgress {
     pub in_flight: u64,
     /// Connected peers the restore may ask.
     pub peers: u64,
+    /// The remaining blocks at the rate so far; `None` before the first is
+    /// restored.
+    pub estimated_remaining_seconds: Option<u64>,
 }
 
 /// One stripped block for the restore to fetch.

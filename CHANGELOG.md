@@ -37,6 +37,13 @@ item below is (or will be) written up in full in the in-development
   `getopreturnpruneinfo.restore` and three `satd_opreturn_restore_*` metrics
   report it.
 
+- sat-tui shows OP_RETURN pruning in its services row: `op-strip` with the
+  blocks stripped and the worker's state, or under `-restoreopreturns`
+  `op-restore` with the restore's percentage, counts, peers and ETA, laid out
+  as the index backfills are. `getblockchaininfo.opreturn_prune` now carries
+  `worker` and `restore`, which gains `progress_ratio` and
+  `estimated_remaining_seconds`.
+
 - Streaming matches read from a stripped block carry `raw_tx_stripped`, and
   `PrefixMatched` now carries the matching `txid`; the Rust and Go SDKs
   surface both and flag the prefix hits they could not filter
