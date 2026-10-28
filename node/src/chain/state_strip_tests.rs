@@ -1341,7 +1341,7 @@ fn the_worker_stops_when_nothing_is_left_to_count() {
 /// make a later pass count again.
 #[test]
 fn a_remove_waiting_in_the_coin_cache_still_finishes() {
-    let store = crate::storage::coin_cache::CoinCache::new(Box::new(crate::storage::db::InMemoryStore::new()), 1 << 20);
+    let store = crate::storage::coin_cache::CoinCache::new(Box::new(crate::storage::db::InMemoryStore::new()), 10);
     let (cs, dir) = super::super::tests::make_chain_state_with_store(Box::new(store));
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
