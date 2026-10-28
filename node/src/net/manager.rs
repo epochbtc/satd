@@ -386,6 +386,16 @@ fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pe
     }
     (!services.has(wanted)).then_some(wanted)
 }
+/// What became of a block the restore asked for.
+#[derive(Clone, Copy)]
+enum RestoreArrival {
+    Restored,
+    /// The copy failed to authenticate: the peer's fault.
+    BadCopy,
+    /// A failure of ours, or an index entry that changed meanwhile.
+    NotOurs,
+}
+
 /// Most blocks in one restore `getdata`.
 const PER_GETDATA_BLOCKS: usize = 128;
 /// A restore progress line every this many blocks restored, as the strip
@@ -1288,6 +1298,9 @@ pub struct PeerManager {
     /// The `-restoreopreturns` download (plan §11.4): `None` until a
     /// restore is pending, and again once it is done.
     opreturn_restore: parking_lot::Mutex<Option<crate::net::opreturn_restore::RestoreDownloader>>,
+    /// A restore pass's work list, read on the blocking pool and picked up
+    /// by the next tick.
+    opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<Result<Vec<crate::chain::state::RestoreItem>, String>>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// The block processor and background catch-up threads, named. Both
@@ -1550,6 +1563,7 @@ impl PeerManager {
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
             )),
             opreturn_restore: parking_lot::Mutex::new(None),
+            opreturn_restore_loaded: Arc::new(parking_lot::Mutex::new(None)),
             bg_connect_signal: bg_connect_signal.clone(),
             connector_threads: parking_lot::Mutex::new(Vec::new()),
             proxy,
@@ -7222,7 +7236,7 @@ impl PeerManager {
                 %hash, id,
                 "getblockfrompeer: not a data hole; handing to the normal block path"
             );
-            self.note_opreturn_restore_arrival(&hash, id, block, false);
+            self.note_opreturn_restore_arrival(&hash, id, block, RestoreArrival::NotOurs);
             return false;
         }
 
@@ -7232,7 +7246,16 @@ impl PeerManager {
             // ordinary duplicates.
             self.block_refetch.write().retain(|(h, _), _| *h != hash);
         }
-        self.note_opreturn_restore_arrival(&hash, id, block, outcome.is_ok());
+        self.note_opreturn_restore_arrival(
+            &hash,
+            id,
+            block,
+            match &outcome {
+                Ok(_) => RestoreArrival::Restored,
+                Err(crate::chain::state::ChainError::Validation(_)) => RestoreArrival::BadCopy,
+                Err(_) => RestoreArrival::NotOurs,
+            },
+        );
         match outcome {
             Ok(crate::chain::state::BlockDataRepair::Repaired { height }) => {
                 tracing::info!(
@@ -7749,6 +7772,7 @@ impl PeerManager {
         use crate::chain::state::WorkerStatus;
         let cs = &self.chain_state;
         if !cs.opreturn_restore_pending() {
+            *self.opreturn_restore_loaded.lock() = None;
             if self.opreturn_restore.lock().take().is_some() {
                 tracing::info!("OP_RETURN restore: no stripped block left to download");
             }
@@ -7772,14 +7796,10 @@ impl PeerManager {
             return;
         }
         if restore.is_idle() {
-            if !restore.may_start_pass(now, &peers) {
-                report(restore, WorkerStatus::Restoring);
-                return;
-            }
-            // On a pruning node, newest first (R-6): those are the blocks
-            // pruning keeps longest.
-            match cs.opreturn_restore_work(self.is_pruning()) {
-                Ok(work) => {
+            let loaded = self.opreturn_restore_loaded.lock().take();
+            match loaded {
+                Some(Ok(work)) => {
+                    restore.loading = false;
                     let bytes: u64 = work.iter().map(|i| i.len).sum();
                     tracing::info!(
                         blocks = work.len(),
@@ -7789,8 +7809,33 @@ impl PeerManager {
                     );
                     restore.start_pass(work, now);
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "OP_RETURN restore: reading the strip records failed");
+                Some(Err(e)) => {
+                    restore.loading = false;
+                    tracing::warn!(error = %e, "OP_RETURN restore: reading the strip records failed; retrying in a minute");
+                    restore.hold_off(now);
+                    report(restore, WorkerStatus::Restoring);
+                    return;
+                }
+                None => {
+                    if peers.is_empty() {
+                        report(restore, WorkerStatus::WaitingForPeers);
+                        return;
+                    }
+                    if !restore.loading && restore.may_start_pass(now, &peers) {
+                        // The records, an index read and a file read for each:
+                        // too much for the event loop on a node that stripped a
+                        // lot. On a pruning node, newest first (R-6): those are
+                        // the blocks pruning keeps longest.
+                        restore.loading = true;
+                        let chain = Arc::clone(&self.chain_state);
+                        let slot = Arc::clone(&self.opreturn_restore_loaded);
+                        let descending = self.is_pruning();
+                        tokio::task::spawn_blocking(move || {
+                            let work = chain.opreturn_restore_work(descending).map_err(|e| e.to_string());
+                            *slot.lock() = Some(work);
+                        });
+                    }
+                    report(restore, WorkerStatus::Restoring);
                     return;
                 }
             }
@@ -7890,14 +7935,30 @@ impl PeerManager {
     }
 
     /// Tell the restore what became of a block it asked `peer` for.
-    fn note_opreturn_restore_arrival(&self, hash: &bitcoin::BlockHash, peer: PeerId, block: &bitcoin::Block, restored: bool) {
+    fn note_opreturn_restore_arrival(
+        &self,
+        hash: &bitcoin::BlockHash,
+        peer: PeerId,
+        block: &bitcoin::Block,
+        arrival: RestoreArrival,
+    ) {
         let mut guard = self.opreturn_restore.lock();
         let Some(restore) = guard.as_mut() else {
             return;
         };
-        if !restored {
-            restore.note_failed(hash, peer);
-            return;
+        match arrival {
+            RestoreArrival::Restored => {}
+            // The peer's copy does not match the header: ask someone else.
+            RestoreArrival::BadCopy => {
+                restore.note_failed(hash, peer);
+                return;
+            }
+            // Ours, not the peer's: a local error, or the entry changed. Left
+            // for the next pass, held against no peer.
+            RestoreArrival::NotOurs => {
+                restore.skip(hash, Instant::now());
+                return;
+            }
         }
         if !restore.note_restored(hash, peer, block.total_size() as u64) {
             return;

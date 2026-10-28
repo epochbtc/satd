@@ -62,6 +62,8 @@ pub struct RestoreDownloader {
     next_start: usize,
     /// How many peers the download could ask when last driven.
     pub peers: usize,
+    /// A pass's work list is being read off the event loop.
+    pub loading: bool,
     total_blocks: u64,
     remaining_bytes: u64,
     restored_blocks: u64,
@@ -97,6 +99,7 @@ impl RestoreDownloader {
             skipped: 0,
             next_start: 0,
             peers: 0,
+            loading: false,
             total_blocks: 0,
             remaining_bytes: 0,
             restored_blocks: 0,
@@ -225,6 +228,25 @@ impl RestoreDownloader {
         if self.is_idle() && self.restored_this_pass == 0 && self.fruitless_at.is_none() {
             self.fruitless_at = Some((now, peers.map(|p| p.iter().copied().collect())));
         }
+    }
+
+    /// Wait a minute before the next pass, whoever connects: reading the work
+    /// list failed.
+    pub fn hold_off(&mut self, now: Instant) {
+        self.fruitless_at = Some((now, None));
+    }
+
+    /// Leave `hash` for the next pass without holding it against any peer:
+    /// it failed here, not at the peer (a local error, or its index entry
+    /// changed meanwhile). Returns whether it was this pass's.
+    pub fn skip(&mut self, hash: &BlockHash, now: Instant) -> bool {
+        if self.drop_from_window(hash).is_none() {
+            return false;
+        }
+        self.skipped += 1;
+        // A new peer would not fix it: only time might.
+        self.end_pass_if_idle(now, None);
+        true
     }
 
     /// `hash` was restored from `peer`'s copy of `bytes` bytes. Returns
@@ -426,6 +448,25 @@ mod tests {
         let out = dl.assign(&[1, 2], Instant::now());
         assert_eq!(out.len(), 1);
         assert_ne!(out[0].0, first);
+    }
+
+    /// A local failure skips the block for the pass and counts against no
+    /// peer; a pass that ends on one waits whoever connects.
+    #[test]
+    fn a_local_failure_skips_the_block_without_refusing_the_peer() {
+        let mut dl = started(2);
+        let out = dl.assign(&[1], Instant::now());
+        let (a, b) = (out[0].1[0], out[0].1[1]);
+        assert!(dl.skip(&a, Instant::now()));
+        assert!(!dl.refused.contains_key(&a), "no peer is refused");
+        assert_eq!(dl.progress().remaining_blocks, 2, "still remaining");
+        assert!(dl.skip(&b, Instant::now()));
+        assert!(dl.is_idle());
+        assert!(!dl.may_start_pass(Instant::now(), &[1, 2]), "a new peer does not cut the wait short");
+        let mut dl = started(1);
+        dl.hold_off(Instant::now());
+        assert!(!dl.may_start_pass(Instant::now(), &[9]));
+        assert!(dl.may_start_pass(Instant::now() + FRUITLESS_PASS_WAIT, &[9]));
     }
 
     #[test]
