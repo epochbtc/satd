@@ -1081,7 +1081,12 @@ impl ChainState {
             opreturn_strip_removes: vec![hash],
             ..Default::default()
         })?;
-        self.flush_durable()?;
+        // No flush: the bytes are durable already, and a removal a crash
+        // loses leaves a record over them, restored again by the next
+        // attempt. A strip-only batch reaches the store directly, so every
+        // read sees the removal at once. `-restoreopreturns` runs this for
+        // every stripped block, and a memtable flush each time would cost
+        // far more than the block.
         self.forget_strip_summary();
         // Readable data where there was none can unblock a reorg that failed
         // on it.
