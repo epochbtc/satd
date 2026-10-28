@@ -319,9 +319,10 @@ nodes cannot sync the chain from it. It serves only the last 288 blocks: a
 peer asking for an older one is disconnected, as Core does for a pruned node,
 and a `noban` peer asking for a stripped block gets `notfound`. Headers and
 BIP 157 filters are still served for the whole chain. It stays limited for as
-long as any stripped block exists, so turning the option off does not bring
-`NODE_NETWORK` back. An operator who wants to help the network with initial
-block download should leave the option off.
+long as any stripped block exists, so turning the option off does not by
+itself bring `NODE_NETWORK` back; restoring every stripped block does (see
+[Restoring a block](#restoring-a-block)). An operator who wants to help the
+network with initial block download should leave the option off.
 
 `pruneopreturnpeers=intact` serves the blocks the node still holds intact at
 any depth (and advertises `NODE_INTACT_BLOCKS`, experimental service bit 28),
@@ -408,6 +409,12 @@ that holds it and writes it back in place. The record goes, the raw block is
 served again, and the space is allocated again. The worker strips it again on
 a later pass if the option is still on; restoring is for a node that has
 turned it off.
+
+With the option off, restoring the last stripped block makes the node a full
+node again, within a minute and without a restart. It advertises
+`NODE_NETWORK` to every peer that connects from then on; peers already
+connected keep the services they saw when they connected. The strip records'
+column family is removed from the datadir with the last record.
 
 ### Watching it
 
