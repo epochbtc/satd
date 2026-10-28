@@ -7744,12 +7744,13 @@ impl PeerManager {
         let peers = self.opreturn_restore_peer_ids();
         let mut guard = self.opreturn_restore.lock();
         let restore = guard.get_or_insert_with(Default::default);
+        restore.peers = peers.len();
         let stalled = restore.release_stale(now);
         if stalled > 0 {
             tracing::debug!(stalled, "OP_RETURN restore: stalled requests given to other peers");
         }
         let report = |restore: &crate::net::opreturn_restore::RestoreDownloader, status| {
-            cs.set_opreturn_restore_status(status, Some(restore.progress(peers.len())));
+            cs.set_opreturn_restore_status(status, Some(restore.progress()));
         };
         if let Some(why) = cs.opreturn_restore_held_by_tip() {
             tracing::trace!(why, "OP_RETURN restore: waiting for the tip");
@@ -7887,10 +7888,11 @@ impl PeerManager {
         if !restore.note_restored(hash, peer, block.total_size() as u64) {
             return;
         }
+        let progress = restore.progress();
+        self.chain_state.set_opreturn_restore_status(crate::chain::state::WorkerStatus::Restoring, Some(progress));
         let done = restore.restored_blocks();
         if done.is_multiple_of(RESTORE_PROGRESS_EVERY) {
             let now = Instant::now();
-            let progress = restore.progress(0);
             let rate = restore.rate(now);
             let eta_secs = (rate > 0.0).then(|| (progress.remaining_blocks as f64 / rate) as u64);
             tracing::info!(

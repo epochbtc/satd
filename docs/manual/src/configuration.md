@@ -186,7 +186,7 @@ without restarting the relevant socket, engine, or process:
     `SIGUSR1`; see below)
 *   `dbcache`, `prune`, `storageprofile`, and reindex
 *   `pruneopreturn`, `pruneopreturnsize` and `pruneopreturnpeers`, OP_RETURN
-    data pruning
+    data pruning, and `restoreopreturns`, which undoes it
 *   index enable/disable (`txindex`/`addressindex`/`blockfilterindex`)
 *   DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`)
 *   Tor (`proxy`/`onion`/`torcontrol`/`listenonion`)

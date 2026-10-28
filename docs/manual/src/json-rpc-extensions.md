@@ -216,6 +216,18 @@ The RPCs read such a block through its strip record:
 }
 ```
 
+Under `restoreopreturns` the response also carries `restore`, the download's
+counts, and `worker` is one of `restoring`, `waiting_for_peers`,
+`waiting_for_disk`, `waiting_for_tip` or `restored`:
+
+```json
+"restore": {
+  "total_blocks": 123, "remaining_blocks": 40, "restored_blocks": 83,
+  "bytes_downloaded": 96000000, "remaining_bytes": 47000000,
+  "in_flight": 32, "peers": 2
+}
+```
+
 `getblockchaininfo` carries the first nine of these under `opreturn_prune`,
 only on a node that strips or still holds stripped blocks.
 

@@ -23,13 +23,15 @@ fn mine(node: &TestNode, n: u64, addr: &str) -> Vec<String> {
 }
 
 /// Mine a block whose second transaction carries a `PAYLOAD`-byte
-/// OP_RETURN, bury it under ten more, and return its hash.
+/// OP_RETURN, bury it under ten more, and return its hash. Spends the
+/// coinbase of the first block it mines, so it can be called again.
 fn block_with_a_big_op_return(node: &TestNode) -> String {
     use bitcoin::blockdata::opcodes::all::OP_RETURN;
     use bitcoin::script::{Builder, PushBytesBuf};
 
     let wallet = DeterministicWallet::from_secret([0x5b; 32]);
     let addr = wallet.address.to_string();
+    let coinbase = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() + 1;
     mine(node, 101, &addr);
     let data = Builder::new()
         .push_opcode(OP_RETURN)
@@ -38,7 +40,7 @@ fn block_with_a_big_op_return(node: &TestNode) -> String {
     assert_eq!(data.len(), PAYLOAD);
     let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbases(
         node,
-        &[(1, &wallet)],
+        &[(coinbase, &wallet)],
         &[wallet.address.script_pubkey(), data],
         100_000,
     );
@@ -1497,12 +1499,16 @@ struct RawPeer {
 
 impl RawPeer {
     fn connect(port: u16) -> Self {
+        Self::connect_as(port, bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS)
+    }
+
+    /// Connect advertising `services`.
+    fn connect_as(port: u16, services: bitcoin::p2p::ServiceFlags) -> Self {
         use bitcoin::p2p::message::NetworkMessage;
         let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream.set_nodelay(true).unwrap();
         let mut peer = Self { stream };
         let zero: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let services = bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS;
         peer.send(NetworkMessage::Version(bitcoin::p2p::message_network::VersionMessage {
             version: 70016,
             services,
@@ -1645,4 +1651,332 @@ fn pruneopreturnpeers_intact_serves_deep_intact_blocks_and_notfound_for_stripped
         }
         node.stop();
     }
+}
+
+/// What a [`RawPeer`] serving a restore does with a `getdata` for a block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Withhold {
+    /// Never answers: the request stalls.
+    Silently,
+    /// Answers `notfound`.
+    NotFound,
+}
+
+type Asked = std::sync::Arc<std::sync::Mutex<Vec<bitcoin::BlockHash>>>;
+
+/// Run `peer` on a thread of its own until `stop`: answer pings, and treat
+/// every block `getdata` as `mode` says. Returns the blocks asked for, as
+/// they are asked.
+fn withhold_blocks(
+    mut peer: RawPeer,
+    mode: Withhold,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (std::thread::JoinHandle<()>, Asked) {
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    let asked = Asked::default();
+    let seen = asked.clone();
+    let thread = std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match peer.recv(Duration::from_millis(200)) {
+                Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
+                Ok(NetworkMessage::GetData(inv)) => {
+                    let blocks: Vec<Inventory> =
+                        inv.into_iter().filter(|i| matches!(i, Inventory::Block(_) | Inventory::WitnessBlock(_))).collect();
+                    seen.lock().unwrap().extend(blocks.iter().filter_map(|i| match i {
+                        Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(*h),
+                        _ => None,
+                    }));
+                    if mode == Withhold::NotFound && !blocks.is_empty() {
+                        peer.send(NetworkMessage::NotFound(blocks));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (thread, asked)
+}
+
+/// `n` blocks with a big OP_RETURN on a node that strips them, and an archive
+/// node B that synced the chain from it first. A is stopped when this
+/// returns. Returns A's datadir and RPC port, each stripped block's hash and
+/// raw bytes, and B.
+fn stripped_node_and_archive(n: usize, extra: &[&str]) -> (PathBuf, u16, Vec<(String, serde_json::Value)>, TestNode) {
+    use serde_json::json;
+    let mut args = vec!["--allowteststrip"];
+    args.extend_from_slice(extra);
+    let mut a = TestNode::start(&args);
+    let hashes: Vec<String> = (0..n).map(|_| block_with_a_big_op_return(&a)).collect();
+    let blocks: Vec<(String, serde_json::Value)> =
+        hashes.iter().map(|h| (h.clone(), a.rpc_ok("getblock", vec![json!(h), json!(0)]))).collect();
+    let tip = a.rpc_ok("getbestblockhash", vec![]);
+    let b = TestNode::start(&[]);
+    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(|| b.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(120), "B never synced from A");
+    for (hash, _) in &blocks {
+        assert_eq!(strip(&a, hash).expect("strip")["outcome"], "stripped");
+    }
+    assert_eq!(a.rpc_ok("getopreturnpruneinfo", vec![])["blocks"], json!(n));
+    let (datadir, rpcport) = (a.datadir.clone(), a.rpcport);
+    a.stop();
+    a.datadir = PathBuf::new();
+    (datadir, rpcport, blocks, b)
+}
+
+fn advertises_network(node: &TestNode) -> bool {
+    node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("NETWORK"))
+}
+
+fn prune_info(node: &TestNode) -> serde_json::Value {
+    node.rpc_ok("getopreturnpruneinfo", vec![])
+}
+
+/// Wait for a `-restoreopreturns` node to restore every stripped block in
+/// `blocks`, then for the finish: a block mined to wake the worker, and the
+/// node reports `restored` and advertises `NODE_NETWORK`.
+fn wait_for_the_restore(node: &TestNode, blocks: &[(String, serde_json::Value)], secs: u64) {
+    use serde_json::json;
+    common::poll_until(
+        || blocks.iter().all(|(h, raw)| node.rpc_call_with_params("getblock", vec![json!(h), json!(0)]).unwrap()["result"] == *raw),
+        test_timeout(secs),
+        "the stripped blocks were never all restored",
+    );
+    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    mine(node, 1, &addr);
+    common::poll_until(
+        || prune_info(node)["worker"] == "restored" && advertises_network(node),
+        test_timeout(90),
+        "the node never finished the restore",
+    );
+}
+
+/// Plan §11.7 tests 1 and 2: a node restarted with `-restoreopreturns` and an
+/// archive peer downloads every stripped block again, gets the original
+/// bytes back and the punched space with them, and becomes a full node
+/// without a restart: it advertises `NODE_NETWORK` and serves a new peer the
+/// whole chain. Its datadir is left with no strip family, so it runs as an
+/// ordinary node without the flag.
+#[test]
+fn restoreopreturns_downloads_every_stripped_block_again() {
+    use serde_json::json;
+    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(3, &[]);
+
+    let a_port = find_available_port();
+    let port_arg = format!("--port={a_port}");
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
+    assert!(!advertises_network(&a), "premise: limited while blocks are stripped");
+    let info = prune_info(&a);
+    assert_eq!(info["enabled"], false, "{info}");
+    assert_eq!(info["worker"], "waiting_for_peers", "no peer yet: {info}");
+    let stripped_allocation = allocated(&a);
+
+    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    wait_for_the_restore(&a, &blocks, 120);
+    let info = prune_info(&a);
+    assert_eq!(info["blocks"], 0, "{info}");
+    assert_eq!(info["restore"]["total_blocks"], 3, "{info}");
+    assert_eq!(info["restore"]["restored_blocks"], 3, "{info}");
+    assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
+    assert!(info["restore"]["bytes_downloaded"].as_u64().unwrap() > 3 * PAYLOAD as u64, "{info}");
+    assert!(payload_on_disk(&a), "the payloads are back on disk");
+    assert!(allocated(&a) > stripped_allocation, "the punched space is allocated again");
+    assert!(!has_corrupt_warning(&a));
+    for (hash, _) in &blocks {
+        let block = a.rpc_ok("getblock", vec![json!(hash), json!(2)]);
+        let ours = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+        assert_eq!(ours, b.rpc_ok("getblock", vec![json!(hash), json!(0)]), "the archive's bytes");
+        assert!(block.get("opreturn_stripped").is_none(), "{hash}");
+        let txid = block["tx"][1]["txid"].as_str().unwrap();
+        assert!(a.rpc_call_with_params("getrawtransaction", vec![json!(txid), json!(0), json!(hash)]).unwrap()["result"].is_string());
+    }
+    b.stop();
+
+    // A new peer sees NODE_NETWORK and syncs the whole chain from A alone,
+    // blocks far deeper than 288 included.
+    let tip = a.rpc_ok("getbestblockhash", vec![]);
+    let c = TestNode::start(&[]);
+    c.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")]);
+    common::poll_until(|| c.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(120), "C never synced from A");
+    let a_seen = c.rpc_ok("getpeerinfo", vec![]);
+    assert!(a_seen[0]["servicesnames"].as_array().unwrap().contains(&json!("NETWORK")), "{a_seen}");
+    let mut c = c;
+    c.stop();
+
+    a.stop();
+    a.datadir = PathBuf::new();
+    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
+    assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "the strip family is gone: {cfs:?}");
+    // Without the flag: an ordinary unpruned node.
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    assert!(advertises_network(&a), "a full node after a restart");
+    assert_eq!(prune_info(&a)["worker"], "off");
+    a.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Plan §11.7 test 4: the flag on a datadir that never stripped starts, and
+/// creates no strip family.
+#[test]
+fn restoreopreturns_on_a_node_that_never_stripped_does_nothing() {
+    let rpcport = find_available_port();
+    let datadir = fresh_test_datadir("satd-restore-never-stripped");
+    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns"]);
+    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    mine(&node, 5, &addr);
+    assert!(advertises_network(&node));
+    let info = prune_info(&node);
+    assert_eq!(info["worker"], "restored", "{info}");
+    assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
+    node.stop();
+    node.datadir = PathBuf::new();
+    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
+    assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "{cfs:?}");
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Plan §11.7 test 3 at startup: the flag with an OP_RETURN pruning option
+/// fails, naming both. The must-succeed half is every other restore test.
+#[test]
+fn restoreopreturns_with_a_pruning_option_is_refused_at_startup() {
+    let datadir = fresh_test_datadir("satd-restore-conflict");
+    let stderr = datadir.join("stderr.log");
+    let _ = std::fs::create_dir_all(&datadir);
+    let status = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .arg("--restoreopreturns")
+        .arg("--pruneopreturn=0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .status()
+        .expect("run satd");
+    let text = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert!(!status.success(), "refused at startup: {text}");
+    assert!(text.contains("-restoreopreturns") && text.contains("-pruneopreturn"), "{text}");
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Plan §11.7 test 5: with only a limited peer connected, an intact one
+/// included, the restore waits for a full peer and asks the limited one for
+/// nothing. Connecting the archive peer unblocks it.
+#[test]
+fn restoreopreturns_never_asks_a_limited_peer() {
+    use bitcoin::p2p::ServiceFlags;
+    use serde_json::json;
+    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(1, &[]);
+    let a_port = find_available_port();
+    let port_arg = format!("--port={a_port}");
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
+
+    let intact = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1u64 << 28);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (limited, asked) = withhold_blocks(RawPeer::connect_as(a_port, intact), Withhold::NotFound, stop.clone());
+    common::poll_until(
+        || a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().len() == 1,
+        test_timeout(30),
+        "the limited peer never connected",
+    );
+    // Several of the download's two-second ticks.
+    std::thread::sleep(Duration::from_secs(8));
+    let info = prune_info(&a);
+    assert_eq!(info["worker"], "waiting_for_peers", "{info}");
+    assert_eq!(info["restore"]["peers"], 0, "{info}");
+
+    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    wait_for_the_restore(&a, &blocks, 120);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    limited.join().unwrap();
+    assert_eq!(*asked.lock().unwrap(), Vec::<bitcoin::BlockHash>::new(), "the limited peer was never asked");
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Plan §11.7 tests 6 and 7: a full peer that withholds its blocks, by never
+/// answering or by answering `notfound`, is asked first; the restore moves
+/// the blocks to the archive peer once it connects, and completes.
+#[test]
+fn restoreopreturns_moves_on_from_a_peer_that_withholds_blocks() {
+    use serde_json::json;
+    for mode in [Withhold::NotFound, Withhold::Silently] {
+        let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(2, &[]);
+        let a_port = find_available_port();
+        let port_arg = format!("--port={a_port}");
+        let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (withholding, asked) = withhold_blocks(RawPeer::connect(a_port), mode, stop.clone());
+        common::poll_until(|| asked.lock().unwrap().len() >= blocks.len(), test_timeout(30), "the withholding peer was never asked");
+        a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+        // A stalled request moves after the 15-second stall timeout.
+        wait_for_the_restore(&a, &blocks, 120);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        withholding.join().unwrap();
+        let asked = asked.lock().unwrap();
+        for (hash, _) in &blocks {
+            assert!(asked.contains(&hash.parse().unwrap()), "the withholding peer was asked for {hash}");
+        }
+        a.stop();
+        b.stop();
+        let _ = std::fs::remove_dir_all(&datadir);
+    }
+}
+
+/// Plan §11.7 test 9: with too little free space for what the holes lack,
+/// the restore waits; with enough, it resumes and completes.
+#[test]
+fn restoreopreturns_waits_for_free_space() {
+    use serde_json::json;
+    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(1, &[]);
+    let free = datadir.join("free-space");
+    std::fs::write(&free, "0").unwrap();
+    let mut a = TestNode::start_with_datadir_env(
+        &datadir,
+        rpcport,
+        &["--restoreopreturns"],
+        &[("SATD_TEST_FREE_SPACE_FILE", free.to_str().unwrap())],
+    );
+    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(|| prune_info(&a)["worker"] == "waiting_for_disk", test_timeout(30), "never waited for disk");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(prune_info(&a)["worker"], "waiting_for_disk");
+    assert_eq!(prune_info(&a)["blocks"], 1, "nothing restored while waiting");
+    std::fs::write(&free, (1u64 << 40).to_string()).unwrap();
+    wait_for_the_restore(&a, &blocks, 120);
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// Plan §11.7 test 10: a pruning node restores its stripped blocks and ends
+/// with none, still pruning.
+#[test]
+fn restoreopreturns_on_a_pruning_node() {
+    use serde_json::json;
+    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(2, &[]);
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", "--prune=1"]);
+    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(
+        || prune_info(&a)["blocks"] == 0,
+        test_timeout(120),
+        "the stripped blocks were never all restored",
+    );
+    for (hash, raw) in &blocks {
+        assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), *raw);
+    }
+    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    mine(&a, 1, &addr);
+    common::poll_until(|| prune_info(&a)["worker"] == "restored", test_timeout(90), "never finished");
+    assert_eq!(a.rpc_ok("getblockchaininfo", vec![])["pruned"], true, "still pruning");
+    assert!(!advertises_network(&a), "a pruning node stays limited");
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
 }

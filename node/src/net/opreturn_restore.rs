@@ -60,6 +60,8 @@ pub struct RestoreDownloader {
     skipped: u64,
     /// Where the next assignment starts its round-robin over the peers.
     next_start: usize,
+    /// How many peers the download could ask when last driven.
+    pub peers: usize,
     total_blocks: u64,
     remaining_bytes: u64,
     restored_blocks: u64,
@@ -94,6 +96,7 @@ impl RestoreDownloader {
             caps: HashMap::new(),
             skipped: 0,
             next_start: 0,
+            peers: 0,
             total_blocks: 0,
             remaining_bytes: 0,
             restored_blocks: 0,
@@ -316,9 +319,8 @@ impl RestoreDownloader {
         if secs > 0.0 { self.restored_blocks as f64 / secs } else { 0.0 }
     }
 
-    /// The counts for `getopreturnpruneinfo`, with `peers` connected peers
-    /// to ask.
-    pub fn progress(&self, peers: usize) -> RestoreProgress {
+    /// The counts for `getopreturnpruneinfo`.
+    pub fn progress(&self) -> RestoreProgress {
         RestoreProgress {
             total_blocks: self.total_blocks,
             remaining_blocks: self.queue.len() as u64 + self.window.len() as u64 + self.skipped,
@@ -326,7 +328,7 @@ impl RestoreDownloader {
             bytes_downloaded: self.bytes_downloaded,
             remaining_bytes: self.remaining_bytes,
             in_flight: self.in_flight.len() as u64,
-            peers: peers as u64,
+            peers: self.peers as u64,
         }
     }
 }
@@ -405,7 +407,7 @@ mod tests {
         assert!(dl.note_not_found(&hash, other));
         assert!(dl.assign(&[1, 2], Instant::now()).is_empty());
         assert!(dl.is_idle(), "refused by every peer: left for the next pass");
-        assert_eq!(dl.progress(2).remaining_blocks, 1, "still counted as remaining");
+        assert_eq!(dl.progress().remaining_blocks, 1, "still counted as remaining");
         assert!(!dl.may_start_pass(Instant::now(), &[1, 2]), "a pass that restored nothing waits");
         assert!(dl.may_start_pass(Instant::now() + FRUITLESS_PASS_WAIT, &[1, 2]));
         assert!(dl.may_start_pass(Instant::now(), &[1, 2, 3]), "unless a new peer has connected");
@@ -439,13 +441,13 @@ mod tests {
     #[test]
     fn progress_counts_down_to_nothing() {
         let mut dl = started(3);
-        assert_eq!(dl.progress(1).remaining_bytes, 3000);
+        assert_eq!(dl.progress().remaining_bytes, 3000);
         let out = dl.assign(&[7], Instant::now());
         for hash in &out[0].1 {
             assert!(dl.note_restored(hash, 7, 1200));
         }
         assert!(!dl.note_restored(&out[0].1[0], 7, 1200), "counted once");
-        let p = dl.progress(1);
+        let p = dl.progress();
         assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3));
         assert_eq!((p.bytes_downloaded, p.remaining_bytes, p.in_flight), (3600, 0, 0));
         assert!(dl.is_idle());
