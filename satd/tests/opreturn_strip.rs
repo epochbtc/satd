@@ -1275,13 +1275,17 @@ fn restoring_the_last_stripped_block_makes_a_full_node_again() {
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     assert!(!network(&a), "premise: limited while a block is stripped");
     a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    // Until a peer has finished its handshake, `getblockfrompeer` refuses it.
     common::poll_until(
-        || !a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().is_empty(),
+        || {
+            a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().iter().any(|p| {
+                a.rpc_call_with_params("getblockfrompeer", vec![json!(hash), p["id"].clone()]).unwrap()["error"]
+                    .is_null()
+            })
+        },
         test_timeout(30),
-        "A never reconnected to B",
+        "A never asked B for the block",
     );
-    let peer = a.rpc_ok("getpeerinfo", vec![])[0]["id"].clone();
-    a.rpc_ok("getblockfrompeer", vec![json!(hash), peer]);
     common::poll_until(
         || a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)]).unwrap()["result"] == raw,
         test_timeout(30),
