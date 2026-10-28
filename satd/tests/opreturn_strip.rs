@@ -1244,6 +1244,82 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
+/// Restoring the last stripped block with the option off (plan §11.5) makes
+/// the node a full node again without a restart: it advertises
+/// `NODE_NETWORK`, a peer that connects afterwards sees it in the node's
+/// `version`, and the strip family is gone from the datadir, so it would open
+/// as an ordinary one.
+#[test]
+fn restoring_the_last_stripped_block_makes_a_full_node_again() {
+    use serde_json::json;
+
+    let network = |node: &TestNode| {
+        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].as_array().unwrap().contains(&json!("NETWORK"))
+    };
+    let mut a = TestNode::start(&["--allowteststrip"]);
+    let hash = block_with_a_big_op_return(&a);
+    let raw = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+    let tip = a.rpc_ok("getbestblockhash", vec![]);
+    let mut b = TestNode::start(&[]);
+    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(|| b.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(60), "B never synced from A");
+    assert_eq!(strip(&a, &hash).expect("strip")["outcome"], "stripped");
+
+    // A restart with the option off: the stripped block keeps A limited, and
+    // the worker runs to notice when it goes.
+    let (datadir, rpcport) = (a.datadir.clone(), a.rpcport);
+    a.stop();
+    a.datadir = PathBuf::new();
+    let a_port = find_available_port();
+    let port_arg = format!("--port={a_port}");
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
+    assert!(!network(&a), "premise: limited while a block is stripped");
+    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(
+        || !a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().is_empty(),
+        test_timeout(30),
+        "A never reconnected to B",
+    );
+    let peer = a.rpc_ok("getpeerinfo", vec![])[0]["id"].clone();
+    a.rpc_ok("getblockfrompeer", vec![json!(hash), peer]);
+    common::poll_until(
+        || a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)]).unwrap()["result"] == raw,
+        test_timeout(30),
+        "the block was never restored",
+    );
+    // A new tip wakes the worker from its idle wait.
+    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    mine(&a, 1, &addr);
+    common::poll_until(|| network(&a), test_timeout(60), "A never advertised NODE_NETWORK again");
+    assert_eq!(a.rpc_ok("getopreturnpruneinfo", vec![])["blocks"], 0);
+
+    let mut c = TestNode::start(&[]);
+    c.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")]);
+    common::poll_until(
+        || {
+            c.rpc_ok("getpeerinfo", vec![])
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["servicesnames"].as_array().unwrap().contains(&json!("NETWORK")))
+        },
+        test_timeout(30),
+        "a new peer never saw NODE_NETWORK in A's version",
+    );
+    c.stop();
+    b.stop();
+
+    a.stop();
+    a.datadir = PathBuf::new();
+    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
+    assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "the strip family is gone: {cfs:?}");
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    assert!(network(&a), "a full node after a restart");
+    assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), raw);
+    a.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
 /// A transaction paying `wallet` back with one OP_RETURN of `len` bytes (the
 /// whole scriptPubKey), spending coinbase `coinbase`. Returns its txid.
 fn send_op_return(node: &TestNode, wallet: &DeterministicWallet, coinbase: u64, len: usize, byte: u8) -> String {
