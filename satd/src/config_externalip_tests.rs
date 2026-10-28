@@ -10,7 +10,7 @@ fn load(extra: &[&str]) -> Result<Box<Config>, String> {
     let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap(), "--conf", conf.to_str().unwrap()];
     args.extend_from_slice(extra);
     let args = normalize_args(args.into_iter().map(String::from).collect());
-    let cli = Box::new(CliArgs::try_parse_from(args).unwrap());
+    let cli = Box::new(parse_cli(args).unwrap());
     Config::from_cli(*cli).map(Box::new)
 }
 

@@ -1321,7 +1321,6 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::collections::HashSet;
 
     /// Build a deterministic `Config` for tests: regtest, isolated empty
@@ -1334,7 +1333,7 @@ mod tests {
     /// that was never removed (#550).
     fn test_config() -> (Config, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli = config::CliArgs::try_parse_from([
+        let cli = config::parse_cli([
             "satd",
             "--regtest",
             "--datadir",

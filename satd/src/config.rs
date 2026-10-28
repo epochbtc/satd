@@ -1594,7 +1594,7 @@ impl Config {
                 node::shutdown::exit_now(1);
             }
         }
-        let cli = match CliArgs::try_parse_from(normalized) {
+        let cli = match parse_cli(normalized) {
             Ok(c) => c,
             Err(e) => {
                 // `--version` and `--help` come back as `Err` from
@@ -3102,11 +3102,13 @@ impl Config {
             .unwrap_or(true);
 
         let limitancestorcount = cli
+            .policy_size_args
             .limitancestorcount
             .or_else(|| file_get("limitancestorcount").and_then(|v| v.parse().ok()))
             .unwrap_or(25);
 
         let limitdescendantcount = cli
+            .policy_size_args
             .limitdescendantcount
             .or_else(|| file_get("limitdescendantcount").and_then(|v| v.parse().ok()))
             .unwrap_or(25);
@@ -3115,6 +3117,7 @@ impl Config {
         // requested count exceeds MAX_CLUSTER_COUNT_LIMIT, so a value above 64
         // is a configuration mistake, not a bigger mempool.
         let limitclustercount = cli
+            .policy_size_args
             .limitclustercount
             .or_else(|| file_get("limitclustercount").and_then(|v| v.parse().ok()))
             .unwrap_or(node::mempool::policy::MAX_CLUSTER_COUNT);
@@ -5601,28 +5604,6 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        value_name = "N",
-        help = "Maximum unconfirmed ancestor count (default: 25)"
-    )]
-    pub limitancestorcount: Option<usize>,
-
-    #[arg(
-        long,
-        value_name = "N",
-        help = "Maximum unconfirmed descendant count (default: 25)"
-    )]
-    pub limitdescendantcount: Option<usize>,
-
-    #[arg(
-        long,
-        value_name = "N",
-        help = "Do not accept transactions connected to N or more other \
-                unconfirmed transactions (default: 64, maximum: 64)"
-    )]
-    pub limitclustercount: Option<usize>,
-
-    #[arg(
-        long,
         value_name = "HOURS",
         help = "Mempool expiry in hours (default: 336)"
     )]
@@ -6008,7 +5989,8 @@ pub struct CliArgs {
     #[command(flatten)]
     pub chain_work_args: ChainWorkArgs,
 
-    /// `-bytespersigop` and `-limitclustersize`, hand-built for the same stack-frame reason as
+    /// `-bytespersigop`, `-limitclustersize` and the ancestor, descendant and
+    /// cluster count limits, hand-built for the same stack-frame reason as
     /// [`StratumArgs`].
     #[command(flatten)]
     pub policy_size_args: PolicySizeArgs,
@@ -7226,6 +7208,43 @@ pub struct StratumArgs {
     pub stratumv2jd: Option<bool>,
 }
 
+/// The stack [`on_cli_stack`] gives clap.
+const CLI_STACK: usize = 16 * 1024 * 1024;
+
+/// Run `f` on a thread of its own with a [`CLI_STACK`] stack. clap's derived
+/// builder for [`CliArgs`] is one frame of about 1.9 MiB in a debug build,
+/// near the whole 2 MiB a test thread or a non-main thread gets, and each
+/// derived option adds a few KiB. Building it here keeps every caller clear
+/// of that limit without raising the stack of any other thread: the
+/// node's own threads keep the size they have in production.
+fn on_cli_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("cli-parse".into())
+            .stack_size(CLI_STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn the command-line parser thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// [`CliArgs::try_parse_from`] on [`on_cli_stack`]. Every parse of the
+/// command line goes through here.
+pub(crate) fn parse_cli<I, T>(argv: I) -> Result<CliArgs, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+    on_cli_stack(move || CliArgs::try_parse_from(argv))
+}
+
+/// [`CliArgs::command`] on [`on_cli_stack`].
+pub(crate) fn cli_command() -> clap::Command {
+    on_cli_stack(CliArgs::command)
+}
+
 /// How a Stratum flag's value is parsed.
 #[derive(Clone, Copy)]
 enum StratumArgKind {
@@ -7458,12 +7477,15 @@ fn resolve_limit_cluster_size(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> O
     }
 }
 
-/// Bitcoin Core's `-bytespersigop` and `-limitclustersize` (see
-/// [`CliArgs::policy_size_args`]).
+/// Bitcoin Core's `-bytespersigop`, `-limitclustersize` and the ancestor,
+/// descendant and cluster count limits (see [`CliArgs::policy_size_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct PolicySizeArgs {
     pub bytespersigop: Option<String>,
     pub limitclustersize: Option<String>,
+    pub limitancestorcount: Option<usize>,
+    pub limitdescendantcount: Option<usize>,
+    pub limitclustercount: Option<usize>,
 }
 
 /// Help text is Core's own (v31.1 `src/init.cpp`).
@@ -7479,6 +7501,14 @@ const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "N",
         StratumArgKind::Text,
         "Do not accept transactions whose virtual size with all in-mempool connected transactions exceeds <n> kilobytes (default: 101)",
+    ),
+    ("limitancestorcount", "N", StratumArgKind::Usize, "Maximum unconfirmed ancestor count (default: 25)"),
+    ("limitdescendantcount", "N", StratumArgKind::Usize, "Maximum unconfirmed descendant count (default: 25)"),
+    (
+        "limitclustercount",
+        "N",
+        StratumArgKind::Usize,
+        "Do not accept transactions connected to N or more other unconfirmed transactions (default: 64, maximum: 64)",
     ),
 ];
 
@@ -7504,6 +7534,9 @@ impl clap::FromArgMatches for PolicySizeArgs {
         Ok(Self {
             bytespersigop: m.remove_one("bytespersigop"),
             limitclustersize: m.remove_one("limitclustersize"),
+            limitancestorcount: m.remove_one("limitancestorcount"),
+            limitdescendantcount: m.remove_one("limitdescendantcount"),
+            limitclustercount: m.remove_one("limitclustercount"),
         })
     }
 
@@ -8911,7 +8944,7 @@ fn is_satd_long_flag(name: &str) -> bool {
             // with a single dash. Without this they fall through to the
             // unsupported-option filter and `satd -version` starts a node
             // instead of printing a version.
-            let mut cmd = CliArgs::command();
+            let mut cmd = cli_command();
             cmd.build();
             for arg in cmd.get_arguments() {
                 if let Some(long) = arg.get_long() {
@@ -10379,7 +10412,7 @@ mod tests {
     /// did. Deleting the `is_satd_long_flag` arm in `normalize_args` fails here.
     #[test]
     fn every_satd_flag_is_reachable_in_single_dash_form() {
-        let longs: Vec<String> = CliArgs::command()
+        let longs: Vec<String> = cli_command()
             .get_arguments()
             .filter_map(|a| a.get_long().map(str::to_string))
             .filter(|l| l != "help" && l != "version")
@@ -10419,7 +10452,7 @@ mod tests {
             assert!(warnings.is_empty(), "{flag} warned: {warnings:?}");
             // clap reports these as errors of a display kind, which the caller
             // turns into a successful print-and-exit.
-            let err = CliArgs::try_parse_from(kept).expect_err("display flag");
+            let err = parse_cli(kept).expect_err("display flag");
             assert!(matches!(
                 err.kind(),
                 clap::error::ErrorKind::DisplayVersion | clap::error::ErrorKind::DisplayHelp
@@ -10490,7 +10523,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
         );
-        let cli = CliArgs::try_parse_from(args).expect("Core-spelled fee rates must parse");
+        let cli = parse_cli(args).expect("Core-spelled fee rates must parse");
         assert_eq!(cli.minrelaytxfee, Some(1_000));
         assert_eq!(cli.dustrelayfee, Some(3_000));
     }
@@ -10502,11 +10535,11 @@ mod tests {
     fn bare_blockfilterindex_means_basic() {
         for spelling in ["-blockfilterindex", "-blockfilterindex=basic", "-blockfilterindex=1"] {
             let args = normalize_args(vec!["satd".to_string(), spelling.to_string()]);
-            let cli = CliArgs::try_parse_from(args).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            let cli = parse_cli(args).unwrap_or_else(|e| panic!("{spelling}: {e}"));
             assert_eq!(cli.blockfilterindex, Some(true), "{spelling}");
         }
         let args = normalize_args(vec!["satd".to_string(), "-blockfilterindex=0".to_string()]);
-        let cli = CliArgs::try_parse_from(args).expect("explicit 0 must still parse");
+        let cli = parse_cli(args).expect("explicit 0 must still parse");
         assert_eq!(cli.blockfilterindex, Some(false));
     }
 
@@ -10529,7 +10562,7 @@ mod tests {
                 conf.to_str().unwrap(),
             ];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+            Config::from_cli(parse_cli(args).unwrap())
         };
         let core_refusal = "Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)";
 
@@ -10563,7 +10596,7 @@ mod tests {
             let conf = dir.path().join("fee.conf");
             std::fs::write(&conf, body).unwrap();
             Config::from_cli(
-                CliArgs::try_parse_from([
+                parse_cli([
                     "satd",
                     "--datadir",
                     dir.path().to_str().unwrap(),
@@ -10610,7 +10643,7 @@ blockmintxfee=0.00001
         assert_eq!(norm("-nolisten=1"), "--listen=0");
         assert_eq!(norm("-nolisten=abc"), "--listen=1");
         assert_eq!(norm("-nolisten="), "--listen=0");
-        let cli = CliArgs::try_parse_from(normalize_args(vec!["satd".into(), "-nolisten=0".into()]))
+        let cli = parse_cli(normalize_args(vec!["satd".into(), "-nolisten=0".into()]))
             .expect("Core accepts -nolisten=0");
         assert_eq!(cli.listen, Some(true));
         assert_eq!(
@@ -10624,13 +10657,13 @@ blockmintxfee=0.00001
         let args = normalize_args(
             ["satd", "-v2transport=0", "-v2transport=1"].iter().map(|s| s.to_string()).collect(),
         );
-        let cli = CliArgs::try_parse_from(args).expect("a repeated option must not abort startup");
+        let cli = parse_cli(args).expect("a repeated option must not abort startup");
         assert_eq!(cli.v2transport, Some(true), "the last value must win");
 
         let args = normalize_args(
             ["satd", "-port=1111", "-port=2222"].iter().map(|s| s.to_string()).collect(),
         );
-        assert_eq!(CliArgs::try_parse_from(args).unwrap().port, Some(2222));
+        assert_eq!(parse_cli(args).unwrap().port, Some(2222));
     }
 
     /// Last-wins must not silently swallow a genuinely repeatable option --
@@ -10644,7 +10677,7 @@ blockmintxfee=0.00001
                 .map(|s| s.to_string())
                 .collect(),
         );
-        let cli = CliArgs::try_parse_from(args).expect("repeatable options must parse");
+        let cli = parse_cli(args).expect("repeatable options must parse");
         assert_eq!(cli.bind.len(), 2, "-bind must accumulate: {:?}", cli.bind);
         assert_eq!(cli.connect.len(), 2, "-connect must accumulate");
     }
@@ -10653,11 +10686,10 @@ blockmintxfee=0.00001
     /// clusters, with this message, and allows 0. satd accepted any size.
     #[test]
     fn maxmempool_below_cores_floor_is_refused() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |mb: &str| {
             Config::from_cli(
-                CliArgs::try_parse_from([
+                parse_cli([
                     "satd",
                     "--regtest",
                     "--datadir",
@@ -10676,12 +10708,11 @@ blockmintxfee=0.00001
     /// command line in either spelling or from the file.
     #[test]
     fn txannouncedelay_is_on_by_default_and_can_be_turned_off() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .expect("loads")
                 .txannouncedelay
         };
@@ -10698,12 +10729,11 @@ blockmintxfee=0.00001
     /// either spelling or from the file.
     #[test]
     fn nap_is_off_by_default_and_can_be_turned_on() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .expect("loads")
                 .nap
         };
@@ -10720,12 +10750,11 @@ blockmintxfee=0.00001
     /// source, the command line winning.
     #[test]
     fn napaggregator_defaults_off_and_reads_both_sources() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .map(|c| (c.napaggregator, c.nap))
         };
         assert_eq!(load(&[]), Ok((false, false)));
@@ -10739,12 +10768,11 @@ blockmintxfee=0.00001
     /// command line winning, and a file value that is not a count refused.
     #[test]
     fn napaggregatormax_defaults_to_a_million() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .map(|c| c.napaggregatormax)
         };
         assert_eq!(load(&[]), Ok(1_000_000));
@@ -10760,12 +10788,11 @@ blockmintxfee=0.00001
     /// the command line winning, and a file value that is not a count refused.
     #[test]
     fn napmaxattestations_defaults_to_no_limit() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .map(|c| c.napmaxattestations)
         };
         assert_eq!(load(&[]), Ok(0));
@@ -10775,19 +10802,18 @@ blockmintxfee=0.00001
         assert_eq!(load(&["--napmaxattestations=7"]), Ok(7), "the command line wins");
         std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=lots\n").unwrap();
         assert!(load(&[]).unwrap_err().contains("-napmaxattestations"));
-        assert!(CliArgs::try_parse_from(["satd", "--napmaxattestations=-1"]).is_err());
+        assert!(parse_cli(["satd", "--napmaxattestations=-1"]).is_err());
     }
 
     /// `-napstorerecover`: off by default, on from the command line in either
     /// spelling or from the file, and independent of `-nap`.
     #[test]
     fn napstorerecover_is_off_by_default_and_can_be_turned_on() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            let c = Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            let c = Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
                 .expect("loads");
             (c.nap, c.napstorerecover)
         };
@@ -10800,17 +10826,52 @@ blockmintxfee=0.00001
         assert_eq!(load(&["-napstorerecover=0"]), (false, false), "the command line wins");
     }
 
+    /// The derived builder runs on [`on_cli_stack`]'s own thread, so a caller
+    /// with a small stack (a test thread, a reload on a worker) parses fine.
+    #[test]
+    fn the_command_line_parses_from_a_small_thread() {
+        let parsed = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
+                (cfg.limitclustercount, cli_command().get_arguments().count() > 100)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(parsed, (64, true));
+    }
+
+    /// The count limits live in the hand-built `PolicySizeArgs` group; they
+    /// still parse as integers on the command line, as the derived args did.
+    #[test]
+    fn mempool_count_limits_parse_from_the_command_line() {
+        let cfg = Config::from_cli(
+            parse_cli([
+                "satd",
+                "--regtest",
+                "--limitancestorcount=7",
+                "--limitdescendantcount=8",
+                "--limitclustercount=9",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((cfg.limitancestorcount, cfg.limitdescendantcount, cfg.limitclustercount), (7, 8, 9));
+        assert!(parse_cli(["satd", "--limitclustercount=x"]).is_err());
+        assert!(Config::from_cli(parse_cli(["satd", "--regtest", "--limitclustercount=65"]).unwrap()).is_err());
+    }
+
     /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`
     /// floor with it: room for 40 of the largest cluster. It used to be an
     /// unknown option, so Core's own tests could not start satd with it.
     #[test]
     fn limitclustersize_is_read_and_moves_the_maxmempool_floor() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
         };
         assert_eq!(load(&[]).expect("defaults").limitclustersize, 101);
         assert_eq!(load(&["-limitclustersize=10"]).expect("Core's spelling").limitclustersize, 10);
@@ -10825,12 +10886,11 @@ blockmintxfee=0.00001
     /// address index whose spend rows serve it.
     #[test]
     fn txospenderindex_needs_the_address_index_and_no_pruning() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
         };
         assert!(load(&["-txospenderindex"]).expect("with the default address index").txospenderindex);
         assert_eq!(
@@ -10847,10 +10907,9 @@ blockmintxfee=0.00001
     /// different sockets, so they are not a duplicate binding.
     #[test]
     fn cores_stock_tor_bind_pair_is_accepted() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir",
@@ -10870,12 +10929,11 @@ blockmintxfee=0.00001
     /// starting a node that binds nothing while its config names listeners.
     #[test]
     fn bind_with_listen_disabled_is_refused_like_core() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let with = |extra: &[&str]| {
             let mut argv = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             argv.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+            Config::from_cli(parse_cli(argv).unwrap())
         };
         for extra in [
             vec!["--listen=0", "--bind=127.0.0.1"],
@@ -10935,7 +10993,7 @@ blockmintxfee=0.00001
         let with = |extra: &[&str]| {
             let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             a.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(a).unwrap()).unwrap()
+            Config::from_cli(parse_cli(a).unwrap()).unwrap()
         };
 
         let cfg = with(&[]);
@@ -10957,7 +11015,7 @@ blockmintxfee=0.00001
 bind=127.0.0.1:9002
 ").unwrap();
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir",
@@ -10981,7 +11039,7 @@ bind=127.0.0.1:9002
         let cfg = |extra: &[&str]| {
             let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
             a.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(a).unwrap())
+            Config::from_cli(parse_cli(a).unwrap())
         };
         const A: &str = "127.0.0.1:11012";
         for pair in [
@@ -11016,7 +11074,6 @@ bind=127.0.0.1:9002
     /// still an error, not a silent fall-through to the default.
     #[test]
     fn bad_config_fee_rate_is_shadowed_by_the_command_line() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(&conf, "regtest=1\nminrelaytxfee=0,00001\n").unwrap();
@@ -11024,11 +11081,11 @@ bind=127.0.0.1:9002
 
         let mut argv: Vec<&str> = base.to_vec();
         argv.push(conf.to_str().unwrap());
-        let err = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap_err();
+        let err = Config::from_cli(parse_cli(&argv).unwrap()).unwrap_err();
         assert!(err.contains("minrelaytxfee"), "{err}");
 
         argv.push("--minrelaytxfee=2000");
-        let cfg = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(&argv).unwrap()).unwrap();
         assert_eq!(cfg.minrelaytxfee, 2000);
     }
 
@@ -11039,7 +11096,6 @@ bind=127.0.0.1:9002
     /// functional tests depend on.
     #[test]
     fn minrelaytxfee_is_only_raised_when_it_was_not_set() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let base = |extra: &[&str]| -> Config {
             let mut argv: Vec<String> = vec![
@@ -11049,7 +11105,7 @@ bind=127.0.0.1:9002
                 dir.path().to_str().unwrap().into(),
             ];
             argv.extend(extra.iter().map(|s| (*s).to_string()));
-            Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).expect("config")
+            Config::from_cli(parse_cli(&argv).unwrap()).expect("config")
         };
 
         // Neither set: Core's DEFAULT_MIN_RELAY_TX_FEE.
@@ -11079,7 +11135,7 @@ bind=127.0.0.1:9002
         std::fs::write(&conf, "regtest=1\nminrelaytxfee=0\nincrementalrelayfee=0.00001\n")
             .unwrap();
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 confdir.path().to_str().unwrap(),
@@ -11097,7 +11153,6 @@ bind=127.0.0.1:9002
     /// discovered when a light client finds no NODE_COMPACT_FILTERS.
     #[test]
     fn blockfilterindex_matches_core_value_handling() {
-        use clap::Parser;
         let load = |body: &str| {
             let dir = tempfile::tempdir().expect("tempdir");
             let conf = dir.path().join("bitcoin.conf");
@@ -11109,7 +11164,7 @@ bind=127.0.0.1:9002
                 "--conf",
                 conf.to_str().unwrap(),
             ];
-            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+            Config::from_cli(parse_cli(argv).unwrap())
         };
 
         assert!(load("regtest=1\nblockfilterindex=\n").unwrap().blockfilterindex);
@@ -11162,7 +11217,7 @@ bind=127.0.0.1:9002
         assert_eq!(warnings.len(), 2, "got: {warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("fallbackfee")));
         // The surviving args must still parse.
-        assert!(CliArgs::try_parse_from(kept).is_ok());
+        assert!(parse_cli(kept).is_ok());
     }
 
     /// Core spells a boolean's negation `-nofoo`; classify on the base key so
@@ -11185,7 +11240,7 @@ bind=127.0.0.1:9002
         let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
         assert_eq!(kept, vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]);
         assert!(warnings.is_empty());
-        assert!(CliArgs::try_parse_from(kept).is_err(), "clap must still reject the typo");
+        assert!(parse_cli(kept).is_err(), "clap must still reject the typo");
     }
 
     /// A Core option that is fatal to skip must be fatal on the command line
@@ -11219,7 +11274,7 @@ bind=127.0.0.1:9002
             );
             assert!(warnings.is_empty(), "{flag} warned instead of erroring: {warnings:?}");
             assert!(
-                CliArgs::try_parse_from(kept).is_err(),
+                parse_cli(kept).is_err(),
                 "{flag} must reach clap and be rejected"
             );
         }
@@ -11400,10 +11455,9 @@ rpcport=8332
 
     #[test]
     fn rpc_admission_defaults_match_core() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
+            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Bitcoin Core's defaults.
@@ -11426,8 +11480,7 @@ rpcport=8332
     /// at the edge of the 2 MiB test-thread stack (#1002).
     #[inline(never)]
     fn parse_boxed(argv: &[&str]) -> Box<Config> {
-        use clap::Parser;
-        let cli = Box::new(CliArgs::try_parse_from(argv).unwrap());
+        let cli = Box::new(parse_cli(argv).unwrap());
         Box::new(Config::from_cli(*cli).unwrap())
     }
 
@@ -11498,13 +11551,12 @@ rpcport=8332
     /// repeatable, five deployment names, last value wins per name.
     #[test]
     fn testactivationheight_parses_and_is_regtest_only() {
-        use clap::Parser;
         use node::validation::script::TestActivationOverrides;
         let dir = tempfile::tempdir().expect("tempdir");
         let with = |args: &[&str]| {
             let mut argv = vec!["satd", "--datadir", dir.path().to_str().unwrap()];
             argv.extend_from_slice(args);
-            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+            Config::from_cli(parse_cli(argv).unwrap())
         };
 
         // Unset: no overrides.
@@ -11571,7 +11623,6 @@ rpcport=8332
     /// sources apply, and for one name the config file wins.
     #[test]
     fn testactivationheight_merges_cli_and_config_file() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(
@@ -11584,7 +11635,7 @@ testactivationheight=segwit@900
         )
         .unwrap();
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -11606,7 +11657,6 @@ testactivationheight=segwit@900
 
     #[test]
     fn uacomment_accumulates_across_the_command_line_and_the_config_file() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(&conf, "regtest=1\nuacomment=fromfile\n").unwrap();
@@ -11617,7 +11667,7 @@ testactivationheight=segwit@900
         // command line replace the file wholesale, which silently dropped the
         // operator's config-file label whenever a wrapper appended one flag.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -11636,7 +11686,7 @@ testactivationheight=segwit@900
 
         // Either source alone still works.
         let file_only = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -11658,7 +11708,6 @@ testactivationheight=segwit@900
     /// was dropped before the resolver could read it.
     #[test]
     fn mocktime_from_config_file() {
-        use clap::Parser;
         for body in [
             "regtest=1\n[regtest]\nmocktime=1700000000\n",
             "regtest=1\nmocktime=1700000000\n",
@@ -11673,7 +11722,7 @@ testactivationheight=segwit@900
                 "--conf",
                 conf.to_str().unwrap(),
             ];
-            let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+            let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
             assert_eq!(cfg.mocktime, Some(1_700_000_000), "conf body {body:?}");
         }
     }
@@ -11681,7 +11730,6 @@ testactivationheight=segwit@900
     /// The config-file spelling resolves through the same path.
     #[test]
     fn testactivationheight_from_config_file() {
-        use clap::Parser;
         use node::validation::script::TestActivationOverrides;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
@@ -11701,7 +11749,7 @@ testactivationheight=bip34@2
             "--conf",
             conf.to_str().unwrap(),
         ];
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert_eq!(
             cfg.test_activation_overrides,
             Some(TestActivationOverrides {
@@ -11719,12 +11767,11 @@ testactivationheight=bip34@2
     /// The declared peer count is the floor.
     #[test]
     fn the_peer_floor_default_follows_the_connect_list() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let with = |args: &[&str]| {
             let mut argv = vec!["satd", "--datadir", dir.path().to_str().unwrap()];
             argv.extend_from_slice(args);
-            Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap()
+            Config::from_cli(parse_cli(argv).unwrap()).unwrap()
         };
 
         // One trusted upstream: a floor of 1 is the most this node can ever
@@ -11768,7 +11815,7 @@ testactivationheight=bip34@2
         let conf = dir.path().join("connect-floor.conf");
         std::fs::write(&conf, "connect=10.0.0.5:8333\nconnect=10.0.0.6:8333\n").unwrap();
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -11804,19 +11851,18 @@ testactivationheight=bip34@2
 
     #[test]
     fn policy_engine_config_defaults_and_parsing() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults: no policy file, 50 MB quarantine budget.
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
+            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.policyfile.is_none());
         assert_eq!(cfg.quarantinemempool, 50);
 
         // Explicit values parse through.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -11834,9 +11880,8 @@ testactivationheight=bip34@2
 
     #[test]
     fn policyfile_must_be_absolute() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -11854,10 +11899,9 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_listener_disabled_by_default() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
+            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Opt-in: no read-only listener unless -rpcreadonlybind is set.
@@ -11870,9 +11914,8 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_listener_cli_enables_and_overrides() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -11898,11 +11941,10 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_nonloopback_requires_allowip() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         // A non-loopback read-only bind with no allowlist must be rejected,
         // mirroring the main listener's accidental-exposure guard.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -11921,7 +11963,6 @@ testactivationheight=bip34@2
     /// (or the Core functional framework, which writes 99000) set it.
     #[test]
     fn server_and_peer_timeouts_come_from_the_config_file() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(&conf, "regtest=1\n[regtest]\nrpcservertimeout=99000\npeertimeout=7\n").unwrap();
@@ -11932,7 +11973,7 @@ testactivationheight=bip34@2
             "--conf",
             conf.to_str().unwrap(),
         ];
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert_eq!(cfg.rpc_server_timeout, Some(std::time::Duration::from_secs(99_000)));
         assert_eq!(cfg.peertimeout, 7);
         assert!(is_known_config_key("rpcservertimeout"));
@@ -11942,7 +11983,6 @@ testactivationheight=bip34@2
     /// Core: `peertimeout must be a positive integer.`
     #[test]
     fn a_non_positive_peertimeout_is_refused() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let argv = [
             "satd",
@@ -11951,7 +11991,7 @@ testactivationheight=bip34@2
             dir.path().to_str().unwrap(),
             "--peertimeout=0",
         ];
-        let err = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap_err();
+        let err = Config::from_cli(parse_cli(argv).unwrap()).unwrap_err();
         assert_eq!(err, "peertimeout must be a positive integer.");
     }
 
@@ -11978,10 +12018,9 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_tls_partial_config_is_rejected() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         // TLS bind without cert/key must be rejected, mirroring -rpctlsbind.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -11999,10 +12038,9 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_mtls_requires_tls_bind_and_ca() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         // mTLS without a TLS bind is rejected.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -12017,9 +12055,8 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_readonly_mtls_clientallow_requires_mtls() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -12034,9 +12071,8 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpc_admission_cli_overrides() {
-        use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -12069,14 +12105,13 @@ testactivationheight=bip34@2
 
     #[test]
     fn api_threads_default_and_override() {
-        use clap::Parser;
         // Default: max(2, cores/4), and never below the floor of 2.
         assert!(default_api_threads() >= 2, "API thread floor is 2");
         assert!(is_known_config_key("apithreads"), "apithreads must be known");
 
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
+            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap(),
         )
         .unwrap();
@@ -12084,7 +12119,7 @@ testactivationheight=bip34@2
 
         // CLI override (kebab `--api-threads`), with the >=1 clamp.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir",
@@ -12101,7 +12136,7 @@ testactivationheight=bip34@2
         // runtime builder (which would fail to spawn the threads and panic
         // the daemon at boot).
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir",
@@ -12204,9 +12239,6 @@ testactivationheight=bip34@2
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
-            limitancestorcount: None,
-            limitdescendantcount: None,
-            limitclustercount: None,
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
@@ -12526,9 +12558,6 @@ testactivationheight=bip34@2
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
-            limitancestorcount: None,
-            limitdescendantcount: None,
-            limitclustercount: None,
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
@@ -12718,7 +12747,7 @@ testactivationheight=bip34@2
     }
 
     fn fast_start_config(args: &[&str]) -> Result<Config, String> {
-        Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+        Config::from_cli(parse_cli(args).unwrap())
     }
 
     /// `--esploratlsbind` without the matching cert/key flags must be
@@ -12824,7 +12853,7 @@ testactivationheight=bip34@2
     #[test]
     fn test_esplora_tls_partial_config_is_rejected() {
         // Missing both cert and key.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12838,7 +12867,7 @@ testactivationheight=bip34@2
         );
 
         // Cert without key.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12849,7 +12878,7 @@ testactivationheight=bip34@2
         assert!(Config::from_cli(cli).is_err());
 
         // Key without cert.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12862,7 +12891,7 @@ testactivationheight=bip34@2
         // All three present — config loads cleanly. The actual cert
         // parsing happens at server bind time; here we only verify the
         // flag-shape gate is satisfied.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12885,7 +12914,7 @@ testactivationheight=bip34@2
         let load = |extra: &[&str]| {
             let mut args = vec!["satd", "--regtest", "--datadir=/tmp/satd-test"];
             args.extend_from_slice(extra);
-            Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+            Config::from_cli(parse_cli(args).unwrap())
         };
         let full = [
             "--metricsport=9332",
@@ -12938,7 +12967,7 @@ testactivationheight=bip34@2
     /// uniformly across all three surfaces.
     #[test]
     fn test_rpc_tls_partial_config_is_rejected() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12951,7 +12980,7 @@ testactivationheight=bip34@2
             "expected partial-TLS error, got: {err}"
         );
 
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12961,7 +12990,7 @@ testactivationheight=bip34@2
         .unwrap();
         assert!(Config::from_cli(cli).is_err());
 
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12974,7 +13003,7 @@ testactivationheight=bip34@2
         // All three present — config loads cleanly. Cert parsing
         // happens at server bind time; here we only verify the
         // flag-shape gate is satisfied.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -12995,7 +13024,7 @@ testactivationheight=bip34@2
     fn test_electrum_mtls_partial_config_is_rejected() {
         // No TLS surface at all — `--electrummtls=1` without
         // `--electrumtlsbind` must error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13010,7 +13039,7 @@ testactivationheight=bip34@2
         );
 
         // TLS surface present, but no CA bundle — must error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13029,7 +13058,7 @@ testactivationheight=bip34@2
         );
 
         // All four present — config loads.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13054,7 +13083,7 @@ testactivationheight=bip34@2
     #[test]
     fn test_esplora_mtls_partial_config_is_rejected() {
         // mTLS=1 without esplora TLS surface — must error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13069,7 +13098,7 @@ testactivationheight=bip34@2
         );
 
         // TLS surface present, but no CA bundle — must error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13087,7 +13116,7 @@ testactivationheight=bip34@2
         );
 
         // All four present — config loads.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13112,7 +13141,7 @@ testactivationheight=bip34@2
     /// Reject the misconfiguration at startup.
     #[test]
     fn test_esplora_mtls_clientallow_requires_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13135,7 +13164,7 @@ testactivationheight=bip34@2
     #[test]
     fn test_rpc_mtls_partial_config_is_rejected() {
         // mTLS without TLS bind — error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13149,7 +13178,7 @@ testactivationheight=bip34@2
         );
 
         // TLS bind + cert + key, mTLS on, no CA — error.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13166,7 +13195,7 @@ testactivationheight=bip34@2
         );
 
         // Full quad — config loads.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13187,7 +13216,7 @@ testactivationheight=bip34@2
     /// port; we refuse to start to surface the misconfiguration.
     #[test]
     fn test_rpc_disable_auth_requires_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13217,7 +13246,7 @@ testactivationheight=bip34@2
             "--rpcmtlsclientca=/tmp/ca.pem",
             "--rpcdisableauth=1",
         ];
-        let ok = Config::from_cli(CliArgs::try_parse_from(base).unwrap())
+        let ok = Config::from_cli(parse_cli(base).unwrap())
             .expect("auth-disabled mTLS alone loads");
         assert!(ok.rpc_whitelist.is_inert());
         for extra in [
@@ -13225,12 +13254,12 @@ testactivationheight=bip34@2
             "--rpcwhitelistdefault=1",
         ] {
             let argv: Vec<&str> = base.iter().copied().chain([extra]).collect();
-            let err = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap_err();
+            let err = Config::from_cli(parse_cli(argv).unwrap()).unwrap_err();
             assert!(err.contains("rpcwhitelist"), "{extra}: {err}");
         }
         // An explicit default of 0 with no list restricts nobody: allowed.
         let argv: Vec<&str> = base.iter().copied().chain(["--rpcwhitelistdefault=0"]).collect();
-        Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).expect("inert whitelist");
+        Config::from_cli(parse_cli(argv).unwrap()).expect("inert whitelist");
     }
 
     /// Both keys load from bitcoin.conf (they used to refuse startup), and a
@@ -13238,7 +13267,6 @@ testactivationheight=bip34@2
     /// Core's `GetArgs` returns both sources' values.
     #[test]
     fn rpcwhitelist_reads_the_file_and_the_command_line_together() {
-        use clap::Parser;
         use node::rpc::whitelist::MethodScope;
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
@@ -13250,7 +13278,7 @@ testactivationheight=bip34@2
         let dirs = dir.path().to_str().unwrap();
         let confs = conf.to_str().unwrap();
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--datadir", dirs, "--conf", confs]).unwrap(),
+            parse_cli(["satd", "--datadir", dirs, "--conf", confs]).unwrap(),
         )
         .unwrap();
         assert!(!cfg.rpc_whitelist.default_deny(), "the file's default=0 applies");
@@ -13258,7 +13286,7 @@ testactivationheight=bip34@2
         assert_eq!(cfg.rpc_whitelist.scope_for("other"), None);
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--datadir",
                 dirs,
@@ -13282,13 +13310,12 @@ testactivationheight=bip34@2
     /// the default, which with no list would leave everyone unrestricted.
     #[test]
     fn rpcwhitelistdefault_file_values_are_read_or_refused() {
-        use clap::Parser;
         let load = |body: &str| {
             let dir = tempfile::tempdir().expect("tempdir");
             let conf = dir.path().join("bitcoin.conf");
             std::fs::write(&conf, format!("regtest=1\n{body}")).unwrap();
             Config::from_cli(
-                CliArgs::try_parse_from([
+                parse_cli([
                     "satd",
                     "--datadir",
                     dir.path().to_str().unwrap(),
@@ -13317,7 +13344,7 @@ testactivationheight=bip34@2
                 .map(|s| s.to_string())
                 .collect();
             let (kept, _) = filter_unsupported_core_cli_args(normalize_args(argv)).unwrap();
-            Config::from_cli(CliArgs::try_parse_from(kept).unwrap()).unwrap()
+            Config::from_cli(parse_cli(kept).unwrap()).unwrap()
         };
         assert!(parse(&["-rpcwhitelistdefault"]).rpc_whitelist.default_deny());
         assert!(!parse(&["-norpcwhitelistdefault"]).rpc_whitelist.default_deny());
@@ -13330,7 +13357,7 @@ testactivationheight=bip34@2
     /// `--rpcmtls=1` would reject every TLS connection.
     #[test]
     fn test_rpc_mtls_clientallow_requires_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13349,7 +13376,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn test_events_grpc_tls_cert_requires_key() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13366,7 +13393,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn test_events_grpc_mtls_requires_ca() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13385,7 +13412,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn test_events_grpc_mtls_clientallow_requires_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13406,7 +13433,7 @@ testactivationheight=bip34@2
     /// no `--events-grpc-auth` (and thus no `--authfile`) required.
     #[test]
     fn test_events_grpc_allow_remote_satisfied_by_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13428,7 +13455,7 @@ testactivationheight=bip34@2
     /// on the Config. Default 10s when unset.
     #[test]
     fn test_rpc_tls_handshake_timeout_parses() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13437,7 +13464,7 @@ testactivationheight=bip34@2
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.rpc_tls_handshake_timeout, 10);
 
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13452,7 +13479,7 @@ testactivationheight=bip34@2
     /// flags, and a mix all collapse to the same `Vec<String>` shape.
     #[test]
     fn test_electrum_mtls_clientallow_parses() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13480,7 +13507,7 @@ testactivationheight=bip34@2
     /// Surface that misconfiguration at startup.
     #[test]
     fn test_electrum_mtls_clientallow_requires_mtls() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
@@ -13502,7 +13529,7 @@ testactivationheight=bip34@2
     fn stratum_config(args: &[&str]) -> Result<Config, String> {
         let mut argv = vec!["satd", "--datadir=/tmp/satd-test"];
         argv.extend_from_slice(args);
-        Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        Config::from_cli(parse_cli(argv).unwrap())
     }
 
     /// A Stratum V1 session carries the payout address in cleartext, so a
@@ -13549,7 +13576,7 @@ testactivationheight=bip34@2
     #[test]
     fn stratum_flags_parse_every_value_shape() {
         let config = Config::from_cli(
-            CliArgs::try_parse_from(normalize_args(
+            parse_cli(normalize_args(
                 [
                     "satd",
                     "-regtest",
@@ -13586,8 +13613,8 @@ testactivationheight=bip34@2
         assert_eq!(config.stratum_max_conns, 5);
         assert!(!config.stratum_allow_plaintext_remote);
 
-        assert!(CliArgs::try_parse_from(["satd", "--stratumdifficulty=many"]).is_err());
-        assert!(CliArgs::try_parse_from(["satd", "--stratum=maybe"]).is_err());
+        assert!(parse_cli(["satd", "--stratumdifficulty=many"]).is_err());
+        assert!(parse_cli(["satd", "--stratum=maybe"]).is_err());
     }
 
     /// Stratum V2 is encrypted and authenticated, so its bind may be
@@ -13786,7 +13813,7 @@ testactivationheight=bip34@2
         // Config::load must refuse. This is the misconfigured-
         // exposure case Core specifically guards against, and the
         // single most important static check in PR-1.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-rpc-compat-test1",
@@ -13808,7 +13835,7 @@ testactivationheight=bip34@2
     fn loopback_bind_does_not_require_allowlist() {
         // Default + loopback explicit binds both bypass the
         // allowlist-required check.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-rpc-compat-test2",
@@ -13823,7 +13850,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn non_loopback_bind_with_allowlist_is_accepted() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-rpc-compat-test3",
@@ -13840,7 +13867,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn default_rpcbind_is_both_loopbacks() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-rpc-compat-test4",
@@ -13870,7 +13897,7 @@ testactivationheight=bip34@2
             "[::1]:0",
             "[::1]:65536",
         ] {
-            let cli = CliArgs::try_parse_from([
+            let cli = parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-rpc-compat-test5",
@@ -13888,7 +13915,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpccookiefile_must_be_absolute() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-rpc-compat-test5",
@@ -13904,7 +13931,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn authfile_defaults_to_none() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-authfile-test1",
@@ -13916,7 +13943,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn authfile_cli_sets_path() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-authfile-test2",
@@ -13929,7 +13956,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn authfile_must_be_absolute() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-authfile-test3",
@@ -13951,7 +13978,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpcauthbearer_defaults_off() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-bearer-test1",
@@ -13963,7 +13990,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpcauthbearer_requires_authfile() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-bearer-test2",
@@ -13976,7 +14003,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn mcpauth_requires_authfile() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test1",
@@ -13989,7 +14016,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn mcpallowremote_requires_mcpauth() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test2",
@@ -14003,7 +14030,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn mcpallowedhost_is_repeatable_and_comma_separated() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test3",
@@ -14022,7 +14049,7 @@ testactivationheight=bip34@2
     fn mcpallowedhost_rejects_a_url() {
         // The `Host` header is an authority. An operator who pastes a URL here
         // would otherwise match nothing and see an unexplained 403.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test4",
@@ -14036,7 +14063,7 @@ testactivationheight=bip34@2
     #[test]
     fn mcpallowedhost_defaults_to_empty() {
         // Empty means "loopback only" downstream — the pre-existing behaviour.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test5",
@@ -14052,7 +14079,7 @@ testactivationheight=bip34@2
     fn eventsgrpcallowremote_requires_eventsgrpcauth() {
         // A remote events-gRPC bind without bearer auth would be an
         // unauthenticated public firehose — must hard-error at startup.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-grpc-remote-test",
@@ -14066,7 +14093,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn eventsgrpc_remote_auth_chain_is_accepted() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-grpc-remote-test2",
@@ -14089,7 +14116,7 @@ testactivationheight=bip34@2
     #[test]
     fn eventsgrpc_remote_auth_requires_tls() {
         let err = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-grpc-remote-notls",
@@ -14110,7 +14137,7 @@ testactivationheight=bip34@2
     #[test]
     fn eventsgrpc_remote_mtls_without_bearer_auth_is_still_accepted() {
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-grpc-remote-mtls-only",
@@ -14133,7 +14160,7 @@ testactivationheight=bip34@2
     #[test]
     fn eventsgrpc_loopback_auth_does_not_require_tls() {
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-grpc-loopback-auth",
@@ -14150,7 +14177,7 @@ testactivationheight=bip34@2
     fn streamws_allow_remote_requires_streamws_auth() {
         // A remote streamws bind without bearer auth would be an
         // unauthenticated public firehose — must hard-error at startup.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-streamws-remote-test",
@@ -14164,7 +14191,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn streamws_remote_auth_chain_is_accepted() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-streamws-remote-test2",
@@ -14183,7 +14210,7 @@ testactivationheight=bip34@2
     fn mcp_remote_auth_chain_is_accepted() {
         // A remote MCP bind needs auth AND TLS: bearer tokens must never cross
         // the wire in cleartext.
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-mcp-test3",
@@ -14203,7 +14230,7 @@ testactivationheight=bip34@2
     fn mcp_allow_remote_requires_tls() {
         // Without --mcpcert/--mcpkey the remote bind is refused even with auth.
         let err = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-mcp-notls",
@@ -14220,7 +14247,7 @@ testactivationheight=bip34@2
     #[test]
     fn mcp_cert_and_key_must_pair() {
         let err = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-mcp-halftls",
@@ -14235,7 +14262,7 @@ testactivationheight=bip34@2
     #[test]
     fn mcp_mtls_requires_cert_and_ca() {
         let err = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--datadir=/tmp/satd-mcp-mtls",
@@ -14249,7 +14276,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpcauthbearer_with_authfile_is_accepted() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-bearer-test3",
@@ -14287,7 +14314,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn chain_flag_routes_to_network() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--chain=regtest",
             "--datadir=/tmp/satd-chain-test1",
@@ -14299,7 +14326,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn chain_flag_conflicts_with_old_form() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--chain=regtest",
             "--signet",
@@ -14329,7 +14356,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn blocksdir_must_be_absolute() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-chain-test3",
@@ -14345,7 +14372,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn blocksdir_absolute_is_accepted() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-chain-test4",
@@ -14361,7 +14388,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn blocksdir_defaults_to_none() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-chain-test5",
@@ -14373,7 +14400,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn signetseednode_collects_repeated_values() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--signet",
             "--datadir=/tmp/satd-chain-test6",
@@ -14401,7 +14428,7 @@ rpcport=39999
         let tmpdir = tempfile::tempdir().unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
         std::fs::write(&conf_path, content).unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--signet",
             "--datadir",
@@ -14420,7 +14447,7 @@ rpcport=39999
         let tmpdir = tempfile::tempdir().unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
         std::fs::write(&conf_path, content).unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--datadir",
             tmpdir.path().to_str().unwrap(),
@@ -14443,7 +14470,7 @@ rpcport=39999
         assert_eq!(cfg.unwrap().stopatheight, Some(7));
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -14469,7 +14496,7 @@ rpcport=39999
             std::fs::write(tmpdir.path().join(name), body).unwrap();
         }
         let conf_path = tmpdir.path().join("bitcoin.conf");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -14594,7 +14621,7 @@ rpcport=39999
         std::fs::write(tmpdir.path().join("bitcoin.conf"), main).unwrap();
         std::fs::write(tmpdir.path().join("rt.conf"), inc[0].1).unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--datadir",
             tmpdir.path().to_str().unwrap(),
@@ -14613,7 +14640,7 @@ rpcport=39999
         // ignored — so a config that fails fast under Core also fails fast
         // under satd instead of booting without the included settings.
         let tmpdir = tempfile::tempdir().unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -14660,7 +14687,7 @@ rpcport=39999
 
     fn parse_negation(args: &[&str]) -> Result<Config, String> {
         let normalized = normalize_args(args.iter().map(|s| s.to_string()).collect());
-        let cli = CliArgs::try_parse_from(normalized).map_err(|e| e.to_string())?;
+        let cli = parse_cli(normalized).map_err(|e| e.to_string())?;
         Config::from_cli(cli)
     }
 
@@ -15078,7 +15105,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn testnet4_via_chain_selector() {
-        let cli = CliArgs::try_parse_from(["satd", "--chain=testnet4"]).unwrap();
+        let cli = parse_cli(["satd", "--chain=testnet4"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Testnet4);
         assert_eq!(cfg.rpcport, 48332);
@@ -15087,7 +15114,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn testnet4_via_flag() {
-        let cli = CliArgs::try_parse_from(["satd", "--testnet4"]).unwrap();
+        let cli = parse_cli(["satd", "--testnet4"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Testnet4);
     }
@@ -15095,14 +15122,14 @@ mcpallowedhost=node.local
     #[test]
     fn testnet4_negation_resolves_to_mainnet() {
         let argv = normalize_args(vec!["satd".into(), "-notestnet4".into()]);
-        let cli = CliArgs::try_parse_from(argv).unwrap();
+        let cli = parse_cli(argv).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Bitcoin);
     }
 
     #[test]
     fn testnet4_conflicts_with_chain() {
-        let cli = CliArgs::try_parse_from(["satd", "--chain=main", "--testnet4"]).unwrap();
+        let cli = parse_cli(["satd", "--chain=main", "--testnet4"]).unwrap();
         assert!(Config::from_cli(cli).is_err());
     }
 
@@ -15120,7 +15147,7 @@ mcpallowedhost=node.local
         let tmpdir = tempfile::tempdir().unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
         std::fs::write(&conf_path, body).unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--datadir",
             tmpdir.path().to_str().unwrap(),
@@ -15189,7 +15216,7 @@ mcpallowedhost=node.local
         let tmpdir = tempfile::tempdir().unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
         std::fs::write(&conf_path, "signet=1\n").unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir",
@@ -15209,7 +15236,7 @@ mcpallowedhost=node.local
         let tmpdir = tempfile::tempdir().unwrap();
         let conf_path = tmpdir.path().join("bitcoin.conf");
         std::fs::write(&conf_path, "chain=signet\n").unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--profile=regtest-dev",
             "--datadir",
@@ -15225,7 +15252,7 @@ mcpallowedhost=node.local
     fn network_setting_profile_still_applies_with_no_selector() {
         // Without any CLI/file selector, the profile's default network applies.
         let tmpdir = tempfile::tempdir().unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--profile=regtest-dev",
             "--datadir",
@@ -15239,7 +15266,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn forcednsseed_fixedseeds_defaults() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(!cfg.forcednsseed, "forcednsseed defaults off");
         assert!(cfg.fixedseeds, "fixedseeds defaults on");
     }
@@ -15247,7 +15274,7 @@ mcpallowedhost=node.local
     #[test]
     fn forcednsseed_and_fixedseeds_flags() {
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--forcednsseed", "--fixedseeds=0"])
+            parse_cli(["satd", "--regtest", "--forcednsseed", "--fixedseeds=0"])
                 .unwrap(),
         )
         .unwrap();
@@ -15260,7 +15287,7 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-nofixedseeds"].iter().map(|s| s.to_string()).collect(),
         );
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.fixedseeds);
     }
 
@@ -15277,7 +15304,7 @@ mcpallowedhost=node.local
     fn asmap_resolves_relative_to_datadir_and_requires_file() {
         let tmpdir = tempfile::tempdir().unwrap();
         std::fs::write(tmpdir.path().join("ip_asn.map"), b"\x00\x00").unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--regtest",
             "--datadir", tmpdir.path().to_str().unwrap(),
             "--asmap", "ip_asn.map",
@@ -15290,7 +15317,7 @@ mcpallowedhost=node.local
     #[test]
     fn asmap_missing_file_errors() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--regtest",
             "--datadir", tmpdir.path().to_str().unwrap(),
             "--asmap", "nope.map",
@@ -15322,11 +15349,11 @@ mcpallowedhost=node.local
     #[test]
     fn maxuploadtarget_flows_to_config() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--maxuploadtarget", "250M"]).unwrap();
+            parse_cli(["satd", "--regtest", "--maxuploadtarget", "250M"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.max_upload_target, 250 * 1024 * 1024);
         // default off
-        let cli2 = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        let cli2 = parse_cli(["satd", "--regtest"]).unwrap();
         assert_eq!(Config::from_cli(cli2).unwrap().max_upload_target, 0);
     }
 
@@ -15334,7 +15361,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn whitelist_parses_perms_and_subnet() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--regtest",
             "--whitelist", "noban,relay@10.0.0.0/8",
             "--whitelist", "192.168.1.5",
@@ -15352,7 +15379,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn whitebind_parses_addr_and_perms() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--regtest",
             "--whitebind", "noban@127.0.0.1:19999",
         ])
@@ -15366,7 +15393,7 @@ mcpallowedhost=node.local
     #[test]
     fn whitelist_invalid_subnet_errors() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--whitelist", "relay@not-an-ip"])
+            parse_cli(["satd", "--regtest", "--whitelist", "relay@not-an-ip"])
                 .unwrap();
         assert!(Config::from_cli(cli).unwrap_err().contains("whitelist"));
     }
@@ -15382,7 +15409,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn externalip_parses_ip_and_ip_port() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--regtest",
             "--externalip", "203.0.113.7",
             "--externalip", "198.51.100.9:12345",
@@ -15398,7 +15425,7 @@ mcpallowedhost=node.local
     #[test]
     fn externalip_rejects_hostname() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--externalip", "node.example.com"])
+            parse_cli(["satd", "--regtest", "--externalip", "node.example.com"])
                 .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert!(err.contains("externalip"), "got: {err}");
@@ -15408,19 +15435,19 @@ mcpallowedhost=node.local
 
     #[test]
     fn blocksonly_defaults_false() {
-        let cli = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest"]).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
     }
 
     #[test]
     fn blocksonly_flag_and_negation() {
-        let cli = CliArgs::try_parse_from(["satd", "--regtest", "--blocksonly"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--blocksonly"]).unwrap();
         assert!(Config::from_cli(cli).unwrap().blocksonly);
 
         let argv = normalize_args(
             ["satd", "--regtest", "-noblocksonly"].iter().map(|s| s.to_string()).collect(),
         );
-        let cli = CliArgs::try_parse_from(argv).unwrap();
+        let cli = parse_cli(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
     }
 
@@ -15430,7 +15457,7 @@ mcpallowedhost=node.local
     fn blockreconstructionextratxn_defaults_to_cores_100_and_clamps_negative_to_zero() {
         let parse = |argv: &[&str]| {
             let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
-            Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap().blockreconstructionextratxn
+            Config::from_cli(parse_cli(argv).unwrap()).unwrap().blockreconstructionextratxn
         };
         assert_eq!(parse(&["satd", "--regtest"]), 100);
         assert_eq!(parse(&["satd", "--regtest", "-blockreconstructionextratxn=7"]), 7);
@@ -15445,7 +15472,7 @@ mcpallowedhost=node.local
     fn cmpctblockprefill_is_off_with_an_8192_byte_budget_by_default() {
         let parse = |argv: &[&str]| {
             let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
-            let c = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+            let c = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
             (c.cmpctblockprefill, c.cmpctblockprefillbytes)
         };
         assert_eq!(parse(&["satd", "--regtest"]), (false, 8192));
@@ -15458,7 +15485,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn log_format_knob_defaults() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(cfg.log_timestamps, "timestamps default on (Core parity)");
         assert!(!cfg.log_thread_names);
         assert!(!cfg.log_source_locations);
@@ -15467,7 +15494,7 @@ mcpallowedhost=node.local
     #[test]
     fn log_format_knobs_via_cli_and_negation() {
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--logthreadnames",
@@ -15484,7 +15511,7 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-nologtimestamps"].iter().map(|s| s.to_string()).collect(),
         );
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.log_timestamps);
     }
 
@@ -15500,13 +15527,13 @@ mcpallowedhost=node.local
     #[test]
     fn loglevel_honored_via_cli_and_file() {
         // Default: no explicit level.
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(cfg.log_level.is_empty());
         assert!(is_known_config_key("loglevel"));
 
         // CLI bare level.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=debug"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--loglevel=debug"]).unwrap(),
         )
         .unwrap();
         assert_eq!(cfg.log_level, vec!["debug".to_string()]);
@@ -15524,7 +15551,7 @@ mcpallowedhost=node.local
         // Core reads -loglevel with GetArgs (plural): multiple per-category
         // entries must all be retained, not collapsed to one.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--loglevel=net:debug",
@@ -15556,7 +15583,7 @@ mcpallowedhost=node.local
         // A bare global level and a per-category override both reach the
         // EnvFilter (build succeeds — invalid tokens would warn, not panic).
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--loglevel=net:debug"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--loglevel=net:debug"]).unwrap(),
         )
         .unwrap();
         let rendered = format!("{}", build_env_filter(&cfg));
@@ -15571,12 +15598,12 @@ mcpallowedhost=node.local
 
     #[test]
     fn checkpoints_default_on_and_disablable() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(cfg.enforce_checkpoints, "checkpoints enforced by default");
         assert!(is_known_config_key("checkpoints"));
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--checkpoints=0"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--checkpoints=0"]).unwrap(),
         )
         .unwrap();
         assert!(!cfg.enforce_checkpoints);
@@ -15585,18 +15612,18 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-nocheckpoints"].iter().map(|s| s.to_string()).collect(),
         );
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.enforce_checkpoints);
     }
 
     #[test]
     fn acceptnonstdtxn_defaults_off_and_is_honored() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(!cfg.acceptnonstdtxn, "standard relay by default (Core parity)");
         assert!(is_known_config_key("acceptnonstdtxn"));
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--acceptnonstdtxn=1"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--acceptnonstdtxn=1"]).unwrap(),
         )
         .unwrap();
         assert!(cfg.acceptnonstdtxn);
@@ -15607,12 +15634,12 @@ mcpallowedhost=node.local
 
     #[test]
     fn networkactive_defaults_on_and_disablable() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(cfg.networkactive, "networking enabled by default");
         assert!(is_known_config_key("networkactive"));
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--networkactive=0"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--networkactive=0"]).unwrap(),
         )
         .unwrap();
         assert!(!cfg.networkactive);
@@ -15621,7 +15648,7 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-nonetworkactive"].iter().map(|s| s.to_string()).collect(),
         );
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.networkactive);
     }
 
@@ -15638,11 +15665,11 @@ mcpallowedhost=node.local
 
         // Unset stays None — "honor whatever the blocks dir carries" must
         // be distinguishable from an explicit blocksxor=0.
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, None);
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--blocksxor=1"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--blocksxor=1"]).unwrap(),
         )
         .unwrap();
         assert_eq!(cfg.blocksxor, Some(true));
@@ -15651,7 +15678,7 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-noblocksxor"].iter().map(|s| s.to_string()).collect(),
         );
-        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, Some(false));
 
         // Config-file value resolves; explicit CLI wins over the file.
@@ -15666,22 +15693,22 @@ mcpallowedhost=node.local
             "--conf",
             conf_path.to_str().unwrap(),
         ];
-        let cfg = Config::from_cli(CliArgs::try_parse_from(base).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(base).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, Some(true));
         let mut with_cli = base.to_vec();
         with_cli.push("--blocksxor=0");
-        let cfg = Config::from_cli(CliArgs::try_parse_from(with_cli).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(with_cli).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, Some(false));
     }
 
     #[test]
     fn allowignoredconf_default_off_and_honored() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(!cfg.allow_ignored_conf);
         assert!(is_known_config_key("allowignoredconf"));
 
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--allowignoredconf"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--allowignoredconf"]).unwrap(),
         )
         .unwrap();
         assert!(cfg.allow_ignored_conf);
@@ -15691,7 +15718,7 @@ mcpallowedhost=node.local
     fn whitelistrelay_modifies_implicit_entry_perms() {
         // Default: implicit whitelist entry keeps relay, no forcerelay.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--whitelist=127.0.0.1"]).unwrap(),
+            parse_cli(["satd", "--regtest", "--whitelist=127.0.0.1"]).unwrap(),
         )
         .unwrap();
         assert!(cfg.whitelist_relay && !cfg.whitelist_force_relay);
@@ -15700,7 +15727,7 @@ mcpallowedhost=node.local
 
         // -whitelistrelay=0 strips relay from the implicit entry.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--whitelist=127.0.0.1",
@@ -15713,7 +15740,7 @@ mcpallowedhost=node.local
 
         // -whitelistforcerelay=1 grants forcerelay (and relay).
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--whitelist=10.0.0.0/8",
@@ -15731,7 +15758,7 @@ mcpallowedhost=node.local
         // An entry with an explicit perms@ prefix is NOT touched by the
         // global -whitelistrelay default (Core only modifies implicit ones).
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from([
+            parse_cli([
                 "satd",
                 "--regtest",
                 "--whitelist=noban@127.0.0.1",
@@ -15749,13 +15776,13 @@ mcpallowedhost=node.local
 
     #[test]
     fn blocknotify_honored_via_cli_and_file() {
-        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert_eq!(cfg.block_notify, None);
         assert!(is_known_config_key("blocknotify"));
 
         // CLI: the %s placeholder is preserved verbatim for runtime substitution.
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--blocknotify=/usr/bin/notify %s"])
+            parse_cli(["satd", "--regtest", "--blocknotify=/usr/bin/notify %s"])
                 .unwrap(),
         )
         .unwrap();
@@ -15786,7 +15813,7 @@ mcpallowedhost=node.local
             );
         }
 
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--alertnotify=mail %s",
@@ -15828,7 +15855,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn v2transport_defaults_true_v2only_false() {
-        let cli = CliArgs::try_parse_from(["satd", "--regtest"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.v2transport, "v2transport should default on (Core parity)");
         assert!(!cfg.v2only);
@@ -15839,10 +15866,10 @@ mcpallowedhost=node.local
         let argv = normalize_args(
             ["satd", "--regtest", "-nov2transport"].iter().map(|s| s.to_string()).collect(),
         );
-        let cli = CliArgs::try_parse_from(argv).unwrap();
+        let cli = parse_cli(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().v2transport);
 
-        let cli = CliArgs::try_parse_from(["satd", "--regtest", "--v2only"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--v2only"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.v2only);
     }
@@ -15852,7 +15879,7 @@ mcpallowedhost=node.local
     #[test]
     fn signetchallenge_parses_hex_on_signet() {
         let hex = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
-        let cli = CliArgs::try_parse_from(["satd", "--signet", "--signetchallenge", hex]).unwrap();
+        let cli = parse_cli(["satd", "--signet", "--signetchallenge", hex]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Signet);
         let ch = cfg.signet_challenge.expect("challenge should be set");
@@ -15864,7 +15891,7 @@ mcpallowedhost=node.local
     fn signetchallenge_rejected_off_signet() {
         // On mainnet the flag is meaningless — must hard-error, not be
         // silently accepted-and-ignored.
-        let cli = CliArgs::try_parse_from(["satd", "--signetchallenge", "5187"]).unwrap();
+        let cli = parse_cli(["satd", "--signetchallenge", "5187"]).unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert!(err.contains("signetchallenge"), "got: {err}");
         assert!(err.contains("signet"), "error should mention signet: {err}");
@@ -15873,7 +15900,7 @@ mcpallowedhost=node.local
     #[test]
     fn signetchallenge_invalid_hex_errors() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
+            parse_cli(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         // Core's `ReadSigNetArgs` wording; feature_signet.py matches it.
         assert_eq!(err, "-signetchallenge must be hex, not 'zzzz'.");
@@ -15881,7 +15908,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn signetchallenge_refuses_multiple_values() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd", "--signet", "--signetchallenge", "51", "--signetchallenge", "51",
         ])
         .unwrap();
@@ -16185,13 +16212,13 @@ notarealkey=1
     #[test]
     fn listenonion_defaults_off() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-lo-1"]).unwrap();
+            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-lo-1"]).unwrap();
         assert!(!Config::from_cli(cli).unwrap().listenonion);
     }
 
     #[test]
     fn listenonion_torcontrol_implies_on() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-lo-2",
@@ -16203,7 +16230,7 @@ notarealkey=1
 
     #[test]
     fn listenonion_explicit_off_overrides_torcontrol() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-lo-3",
@@ -16216,7 +16243,7 @@ notarealkey=1
 
     #[test]
     fn listenonion_explicit_on_without_torcontrol() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-lo-4",
@@ -16231,9 +16258,9 @@ notarealkey=1
     #[test]
     fn dnsseed_defaults_true_and_parses_false() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-ds-1"]).unwrap();
+            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-ds-1"]).unwrap();
         assert!(Config::from_cli(cli).unwrap().dnsseed);
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-ds-2",
@@ -16245,7 +16272,7 @@ notarealkey=1
 
     #[test]
     fn seednode_collects_repeated_values() {
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-sn-1",
@@ -16260,9 +16287,9 @@ notarealkey=1
     #[test]
     fn persistmempool_defaults_on_and_parses_off() {
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir=/tmp/satd-pm-1"]).unwrap();
+            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-pm-1"]).unwrap();
         assert!(Config::from_cli(cli).unwrap().persistmempool);
-        let cli = CliArgs::try_parse_from([
+        let cli = parse_cli([
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-pm-2",
@@ -16331,7 +16358,7 @@ notarealkey=1
 
     fn parse_raw(args: &[&str]) -> Config {
         let argv = normalize_args(args.iter().map(|s| s.to_string()).collect());
-        let cli = CliArgs::try_parse_from(argv).expect("clap parse");
+        let cli = parse_cli(argv).expect("clap parse");
         Config::from_cli(cli).expect("config build")
     }
 
@@ -16349,7 +16376,7 @@ notarealkey=1
         }
         argv.extend(args.iter().map(|s| s.to_string()));
         let (argv, _) = filter_unsupported_core_cli_args(normalize_args(argv))?;
-        let cli = CliArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
+        let cli = parse_cli(argv).map_err(|e| e.to_string())?;
         Config::from_cli(cli)
     }
 

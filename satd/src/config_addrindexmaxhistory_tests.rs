@@ -17,7 +17,7 @@ fn load(body: &str, extra: &[&str]) -> Config {
     ];
     args.extend_from_slice(extra);
     let args = normalize_args(args.into_iter().map(String::from).collect());
-    Config::from_cli(CliArgs::try_parse_from(args).unwrap()).unwrap()
+    Config::from_cli(parse_cli(args).unwrap()).unwrap()
 }
 
 #[test]

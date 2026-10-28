@@ -20,7 +20,7 @@ fn load(body: &str, extra: &[&str]) -> Box<Config> {
     ];
     args.extend_from_slice(extra);
     let args = normalize_args(args.into_iter().map(String::from).collect());
-    let cli = Box::new(CliArgs::try_parse_from(args).unwrap());
+    let cli = Box::new(parse_cli(args).unwrap());
     Box::new(Config::from_cli(*cli).unwrap())
 }
 
