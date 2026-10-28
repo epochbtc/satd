@@ -104,7 +104,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), chunks[footer_idx]);
 }
 
-/// Single-line services row. Columns separated by two spaces:
+/// Single-line services row. Each column's dot: green when done or
+/// serving, yellow while work is pending (a sync, a backfill, a scan, a
+/// restore, or a pause or wait in any of them), red when failed, dim when
+/// off or unknown. Columns separated by two spaces:
 /// `addr-idx <state>`, `sp-idx <state>` (only when the silent-payment
 /// index is enabled), `esplora <state>`, `electrum <state>`.
 ///
@@ -173,11 +176,11 @@ fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProg
                 } else {
                     String::new()
                 };
-                spans.push(dot(Color::Green));
+                spans.push(dot(Color::Yellow));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
                     format!(" backfill {}({}/{}){}", pct, cursor, snapshot, eta),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::Yellow),
                 ));
             }
             "paused" => {
@@ -229,7 +232,7 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
                 } else {
                     String::new()
                 };
-                spans.push(dot(Color::Green));
+                spans.push(dot(Color::Yellow));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
                     format!(
@@ -240,7 +243,7 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
                         snapshot,
                         eta,
                     ),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::Yellow),
                 ));
             }
             "paused" => {
@@ -346,8 +349,14 @@ fn listener_spans(
 
 /// `op-restore <state>` under `-restoreopreturns`, laid out as the index
 /// backfills are: the daemon's percentage over the current pass, blocks
-/// restored of the pass's total, and its ETA. Otherwise `op-strip <state>`:
-/// how many blocks are stripped, and whether the worker is running.
+/// restored of the pass's total, and its ETA. Otherwise `op-prune <state>`:
+/// the worker's scan while it catches up, then how many blocks are
+/// stripped.
+/// How far behind its target the strip worker may be and still count as
+/// caught up: once it is, it wakes every minute, so a new block or two
+/// always waits for it.
+const SCAN_CAUGHT_UP_WITHIN: u64 = 6;
+
 fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnProgress) {
     if let Some(r) = op.restore.as_ref() {
         let label = "op-restore";
@@ -363,19 +372,33 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
                     Some(s) if s > 0 => format!("  ETA {}", format_duration(s)),
                     _ => String::new(),
                 };
-                (Color::Green, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
+                (Color::Yellow, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
             }
         };
         spans.push(dot(color));
         spans.push(Span::styled(label, Style::default().fg(Color::White)));
-        let style = if color == Color::Green { Color::Gray } else { color };
-        spans.push(Span::styled(text, Style::default().fg(style)));
+        spans.push(Span::styled(text, Style::default().fg(color)));
         return;
     }
-    let label = "op-strip";
-    let blocks = format!(" {} blocks", format_num(op.blocks));
+    let label = "op-prune";
+    let blocks = format!(" {} blocks stripped", format_num(op.blocks));
     let (color, text) = match op.worker.as_str() {
-        "running" => (Color::Green, blocks),
+        // Still working through the chain: yellow, as a syncing index is.
+        "running" => match op.scan {
+            Some((examined, target)) if target.saturating_sub(examined) > SCAN_CAUGHT_UP_WITHIN => {
+                let pct = examined as f64 * 100.0 / target.max(1) as f64;
+                (
+                    Color::Yellow,
+                    format!(
+                        " scanning {pct:.1}% ({}/{}), {} stripped",
+                        format_num(examined),
+                        format_num(target),
+                        format_num(op.blocks)
+                    ),
+                )
+            }
+            _ => (Color::Green, blocks),
+        },
         "ibd" | "reindex" | "background_validation" => (Color::Yellow, format!("{blocks}, paused ({})", op.worker)),
         // The option is off; stripped blocks remain until restored.
         "off" => (Color::DarkGray, format!("{blocks}, off")),
@@ -1137,6 +1160,7 @@ mod tests {
         crate::state::OpReturnProgress {
             worker: worker.to_string(),
             blocks: 1_234,
+            scan: None,
             restore,
         }
     }
@@ -1166,7 +1190,7 @@ mod tests {
         // The daemon's ratio verbatim, not done/total (830/1230 = 67.5% here
         // too, so check the ETA and peers to tell the layout apart).
         assert!(r.contains("op-restore 67.5% (830/1,230) 3 peers  ETA"), "{r}");
-        assert!(!r.contains("op-strip"), "{r}");
+        assert!(!r.contains("op-prune"), "{r}");
     }
 
     #[test]
@@ -1186,15 +1210,74 @@ mod tests {
     #[test]
     fn services_row_shows_the_strip_worker_without_a_restore() {
         for (worker, want) in [
-            ("running", "op-strip 1,234 blocks"),
-            ("ibd", "op-strip 1,234 blocks, paused (ibd)"),
-            ("off", "op-strip 1,234 blocks, off"),
+            ("running", "op-prune 1,234 blocks stripped"),
+            ("ibd", "op-prune 1,234 blocks stripped, paused (ibd)"),
+            ("off", "op-prune 1,234 blocks stripped, off"),
         ] {
             let mut st = AppState::new();
             st.opreturn = Some(opreturn(worker, None));
             let r = row(&st);
             assert!(r.contains(want), "{worker}: {r}");
         }
+    }
+
+    /// The first scan is pending until it reaches the target: yellow with
+    /// its progress, as a syncing index is; green once it is within a few
+    /// blocks of it.
+    #[test]
+    fn services_row_shows_the_strip_scan_until_it_catches_up() {
+        let mut st = AppState::new();
+        let mut op = opreturn("running", None);
+        op.scan = Some((262_640, 973_303));
+        st.opreturn = Some(op.clone());
+        let r = row(&st);
+        assert!(r.contains("op-prune scanning 27.0% (262,640/973,303), 1,234 stripped"), "{r}");
+        assert_eq!(opreturn_dot(&op), Color::Yellow);
+        for behind in [0, SCAN_CAUGHT_UP_WITHIN] {
+            op.scan = Some((973_303 - behind, 973_303));
+            st.opreturn = Some(op.clone());
+            let r = row(&st);
+            assert!(r.contains("op-prune 1,234 blocks stripped") && !r.contains("scanning"), "{behind}: {r}");
+            assert_eq!(opreturn_dot(&op), Color::Green, "{behind}");
+        }
+    }
+
+    /// One rule for every column: yellow while work is pending, green only
+    /// once it is done.
+    #[test]
+    fn services_row_dots_are_yellow_while_work_is_pending() {
+        let dot_before = |st: &AppState, label: &str| -> Color {
+            let spans = services_line(st).spans;
+            let at = spans.iter().position(|s| s.content == label).unwrap_or_else(|| panic!("no {label}"));
+            spans[at - 1].style.fg.expect("a coloured dot")
+        };
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, false, "running"));
+        assert_eq!(dot_before(&st, "sp-idx"), Color::Yellow, "sp-idx backfill");
+        st.sp_index = Some(sp(true, true, "completed"));
+        assert_eq!(dot_before(&st, "sp-idx"), Color::Green, "sp-idx synced");
+
+        let mut st = AppState::new();
+        st.backfill = Some(crate::state::BackfillProgress {
+            state: "running".into(),
+            pass: 1,
+            cursor_height: 500_000,
+            snapshot_height: 900_000,
+            estimated_remaining_seconds: 60,
+            last_error: None,
+        });
+        assert_eq!(dot_before(&st, "addr-idx"), Color::Yellow, "addr-idx backfill");
+
+        let mut st = AppState::new();
+        st.opreturn = Some(opreturn("restoring", Some(restore_view())));
+        assert_eq!(dot_before(&st, "op-restore"), Color::Yellow, "op-restore downloading");
+    }
+
+    /// The colour of the dot `opreturn_spans` draws.
+    fn opreturn_dot(op: &crate::state::OpReturnProgress) -> Color {
+        let mut spans = Vec::new();
+        opreturn_spans(&mut spans, op);
+        spans[0].style.fg.expect("a coloured dot")
     }
 
     /// A daemon too old to report the worker, or a state this build does not
@@ -1206,7 +1289,7 @@ mod tests {
             let mut st = AppState::new();
             st.opreturn = Some(opreturn(worker, None));
             let r = row(&st);
-            assert!(r.contains("op-strip 1,234 blocks") && !r.contains("off") && !r.contains("paused"), "{worker:?}: {r}");
+            assert!(r.contains("op-prune 1,234 blocks stripped") && !r.contains("off") && !r.contains("paused"), "{worker:?}: {r}");
         }
         for restore in [None, Some(restore_view())] {
             let mut st = AppState::new();
