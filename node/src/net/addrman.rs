@@ -619,7 +619,9 @@ impl AddrMan {
         if let Some(e) = self.entries.remove(addr)
             && e.tried
         {
-            let slot = self.tried_slot(addr);
+            // Under the group it was placed with, as every slot is.
+            let slot = self.tried_slot_in(addr, &e.group);
+            let slot = slot.bucket * BUCKET_SIZE + slot.position;
             if self.tried_slots.get(&slot) == Some(addr) {
                 self.tried_slots.remove(&slot);
             }
@@ -1575,6 +1577,18 @@ mod tests {
         }
         assert!(!a.entries[&addr].is_terrible(1_060));
         assert!(a.entries[&addr].is_terrible(1_061));
+    }
+
+    /// A removed tried entry frees the slot it was placed in, under the
+    /// group cached with it, even when the group function has changed since.
+    #[test]
+    fn removing_a_tried_entry_frees_its_slot_under_its_own_group() {
+        let mut a = AddrMan::new();
+        let addr = sa("44.7.0.1:8333");
+        assert!(a.mark_good(addr, 1));
+        a.set_group_fn(Box::new(|_| vec![9, 9, 9]));
+        a.remove_entry(&addr);
+        assert!(a.tried_slots.is_empty());
     }
 
     /// An incumbent nobody tests is replaced once the newcomer has waited
