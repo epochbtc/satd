@@ -174,6 +174,10 @@ impl Store for SplitStore {
         self.block_store.for_each_opreturn_strip(f)
     }
 
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        self.block_store.drop_opreturn_strip_cf()
+    }
+
     fn chain_tx_backfill_complete(&self) -> bool {
         self.block_store.chain_tx_backfill_complete()
     }

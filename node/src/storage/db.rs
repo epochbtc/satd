@@ -368,6 +368,12 @@ impl Store for InMemoryStore {
         Ok(self.opreturn_strip_meta.read().clone())
     }
 
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        self.opreturn_strip.write().clear();
+        *self.opreturn_strip_meta.write() = None;
+        Ok(())
+    }
+
     fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
         for (hash, record) in self.opreturn_strip.read().iter() {
             f(hash, record);

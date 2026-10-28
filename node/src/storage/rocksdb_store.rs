@@ -95,11 +95,13 @@ const TEMP_VALUE_LEN: usize = 32 + node_index::TXSEQ_LEN;
 
 /// OP_RETURN strip records, keyed by the 32-byte block hash, plus the
 /// strip worker's state under [`OPRETURN_STRIP_META_KEY`]. Created on the
-/// first write that needs it and never dropped, so a datadir that never
-/// strips stays openable by a release that predates this family, and one
-/// that did is refused by it: RocksDB will not open a database with an
-/// undeclared column family, and an older release would otherwise serve
-/// the zeroed bytes as the block.
+/// first write that needs it, so a datadir that never strips stays openable
+/// by a release that predates this family, and one that did is refused by
+/// it: RocksDB will not open a database with an undeclared column family,
+/// and an older release would otherwise serve the zeroed bytes as the
+/// block. Dropped again once no record is left and the option is off
+/// (`Store::drop_opreturn_strip_cf`), which makes the datadir an ordinary
+/// one again.
 const CF_OPRETURN_STRIP: &str = "opreturn_strip";
 /// Key of the strip worker's cursor and counters. Four bytes, so it can
 /// never collide with a block hash.
@@ -647,12 +649,28 @@ pub struct RocksDbStore {
     /// to batches: each batch is either in the snapshot or in `pending`,
     /// never neither and never both.
     recent_window: parking_lot::Mutex<RecentWindowState>,
+    /// Held shared by every batch write that touches the strip family, from
+    /// its handle lookup to its `db.write`, and by `flush_durable` across its
+    /// flush; exclusively by `drop_opreturn_strip_cf`. A batch built against
+    /// the family's handle and written after the drop fails with RocksDB's
+    /// "invalid column family", and a flush listing it with "Column family
+    /// dropped"; most batches carrying a strip remove, and many flushes, are
+    /// a block's connect. Reads need no gate: a dropped family's handle still
+    /// reads what it held.
+    strip_cf_gate: parking_lot::RwLock<()>,
     /// Test hook: when set, a build signals the sender once its snapshot is
     /// taken and waits on the receiver before scanning, so a test can land
     /// writes in exactly that gap through a layer (a `CoinCache`) that owns
     /// this store.
     #[cfg(test)]
     recent_window_test_pause: parking_lot::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    >,
+    /// Test hook: when set, the next batch write that touches the strip
+    /// family signals the sender once its `WriteBatch` holds the family's
+    /// handle, and waits on the receiver before writing it.
+    #[cfg(test)]
+    strip_write_test_pause: parking_lot::Mutex<
         Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     >,
 }
@@ -1058,8 +1076,11 @@ impl RocksDbStore {
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
             tuning,
             recent_window: parking_lot::Mutex::new(RecentWindowState::Absent),
+            strip_cf_gate: parking_lot::RwLock::new(()),
             #[cfg(test)]
             recent_window_test_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            strip_write_test_pause: parking_lot::Mutex::new(None),
         };
         *store.recent_window.lock() = store.load_recent_window();
         // outpoint_spend completeness marker (review H6 round 2).
@@ -1476,6 +1497,15 @@ impl RocksDbStore {
 
     /// Create the strip family if it does not exist yet. Two writers can
     /// race here; the loser's error is harmless once the family exists.
+    #[cfg(test)]
+    pub(super) fn pause_next_strip_write(
+        &self,
+        began: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.strip_write_test_pause.lock() = Some((began, resume));
+    }
+
     fn create_opreturn_strip_cf(&self) -> Result<(), StoreError> {
         if self.db.cf_handle(CF_OPRETURN_STRIP).is_some() {
             return Ok(());
@@ -1925,6 +1955,7 @@ impl RocksDbStore {
         // Only a put creates the strip family. A remove for a block that
         // never had a record must not, or every datadir would become one
         // an older release refuses to open.
+        let _strip_cf = batch.has_opreturn_strip_ops().then(|| self.strip_cf_gate.read());
         if !batch.opreturn_strip_puts.is_empty() || batch.opreturn_strip_meta.is_some() {
             self.create_opreturn_strip_cf()?;
         }
@@ -2359,6 +2390,11 @@ impl RocksDbStore {
             if let Some(meta) = &batch.opreturn_strip_meta {
                 wb.put_cf(&cf_strip, OPRETURN_STRIP_META_KEY, meta);
             }
+            #[cfg(test)]
+            if let Some((began, resume)) = self.strip_write_test_pause.lock().take() {
+                let _ = began.send(());
+                let _ = resume.recv();
+            }
         }
 
         // Metadata: backfill cursor advance. Atomic with the addr-CF and
@@ -2592,6 +2628,16 @@ impl Store for RocksDbStore {
             .map_err(|e| StoreError::Database(format!("read {CF_OPRETURN_STRIP} meta: {e}")))
     }
 
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        let _gate = self.strip_cf_gate.write();
+        if self.db.cf_handle(CF_OPRETURN_STRIP).is_none() {
+            return Ok(());
+        }
+        self.db
+            .drop_cf(CF_OPRETURN_STRIP)
+            .map_err(|e| StoreError::Database(format!("drop_cf({CF_OPRETURN_STRIP}): {e}")))
+    }
+
     fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
         let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
             return Ok(());
@@ -2686,6 +2732,9 @@ impl Store for RocksDbStore {
         // `wait(true)` returns only once the flush is durable on disk.
         let mut fopts = FlushOptions::default();
         fopts.set_wait(true);
+        // RocksDB fails a flush that lists a family dropped after its handle
+        // was taken ("Column family dropped"), as it fails a batch write.
+        let _strip_cf = self.strip_cf_gate.read();
         let handles: Vec<_> = ALL_CFS
             .iter()
             .filter_map(|name| self.db.cf_handle(name))

@@ -1407,7 +1407,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             } else if cs.opreturn_prune_active() {
                 tracing::info!(
                     "-pruneopreturn is off, but stripped blocks remain: the node stays \
-                     NODE_NETWORK_LIMITED (getblockfrompeer restores a block)"
+                     NODE_NETWORK_LIMITED until the last one is restored (getblockfrompeer \
+                     restores a block)"
                 );
             } else if config.opreturn_prune_peers != node::storage::opreturn_strip::PrunePeers::default() {
                 tracing::warn!(

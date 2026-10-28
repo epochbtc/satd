@@ -25,7 +25,9 @@ item below is (or will be) written up in full in the in-development
   served to peers. A stripping node advertises `NODE_NETWORK_LIMITED` only,
   and a datadir that has stripped a block no longer opens in 0.6.x.
   `getopreturnpruneinfo` and a `getblockchaininfo` `opreturn_prune` object
-  report it; `getblockfrompeer` restores a stripped block in place.
+  report it; `getblockfrompeer` restores a stripped block in place, and with
+  the option off, restoring the last one makes the node `NODE_NETWORK` again
+  without a restart.
 
 - Streaming matches read from a stripped block carry `raw_tx_stripped`, and
   `PrefixMatched` now carries the matching `txid`; the Rust and Go SDKs

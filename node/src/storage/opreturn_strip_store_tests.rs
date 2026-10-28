@@ -276,3 +276,116 @@ fn a_buffered_put_and_remove_in_one_batch_reads_as_it_flushes() {
     cache.flush().unwrap();
     assert_eq!(cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(), None, "flushed");
 }
+
+/// Dropping the family (plan §11.5) takes the records and the meta with it,
+/// and leaves a datadir a release that predates the family opens again. A
+/// remove afterwards does not bring it back, and a second drop is a no-op.
+#[test]
+fn dropping_the_strip_family_makes_the_datadir_ordinary_again() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        let mut batch = put(hash(1), b"record");
+        batch.opreturn_strip_meta = Some(b"cursor".to_vec());
+        store.write_batch(batch).unwrap();
+        assert!(chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "premise");
+
+        store.drop_opreturn_strip_cf().unwrap();
+        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
+        assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap(), None);
+        assert_eq!(store.opreturn_strip_meta().unwrap(), None);
+        store.write_batch(remove(hash(1))).unwrap();
+        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "a remove must not recreate it");
+        store.drop_opreturn_strip_cf().unwrap();
+    }
+    open_without_strip_cf(dir.path()).expect("an older release opens the datadir again");
+}
+
+/// A batch that touches the family, written while the family is dropped, must
+/// still land: most such batches are a block's connect, and RocksDB refuses a
+/// write whose family was dropped after the batch took its handle ("Invalid
+/// column family specified in write batch"). The drop waits for the write.
+#[test]
+fn a_drop_waits_for_a_batch_that_holds_the_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap());
+    store.write_batch(put(hash(1), b"record")).unwrap();
+    let (began_tx, began_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_strip_write(began_tx, resume_rx);
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || store.write_batch(remove(hash(1))))
+    };
+    began_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the write reached the family");
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let dropper = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let r = store.drop_opreturn_strip_cf();
+            dropped_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        dropped_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "the drop ran while a write held the family"
+    );
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap().expect("the write racing the drop lands");
+    dropper.join().unwrap().unwrap();
+    assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
+}
+
+/// The in-memory store and both layers forward the drop.
+#[test]
+fn every_layer_drops_the_strip_family() {
+    let batch = || {
+        let mut batch = put(hash(1), b"record");
+        batch.opreturn_strip_meta = Some(b"cursor".to_vec());
+        batch
+    };
+    let store = InMemoryStore::new();
+    store.write_batch(batch()).unwrap();
+    store.drop_opreturn_strip_cf().unwrap();
+    assert_eq!((store.get_opreturn_strip(&hash(1)).unwrap(), store.opreturn_strip_meta().unwrap()), (None, None));
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = CoinCache::new(Box::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()), 10);
+    cache.write_batch(batch()).unwrap();
+    cache.drop_opreturn_strip_cf().unwrap();
+    assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "through a CoinCache");
+
+    let block_store = Arc::new(InMemoryStore::new());
+    let split = SplitStore::new(block_store.clone(), Arc::new(InMemoryStore::new()), None);
+    split.write_batch(batch()).unwrap();
+    split.drop_opreturn_strip_cf().unwrap();
+    assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap(), None, "through a SplitStore");
+}
+
+
+/// A durability flush racing the drop must not fail either: RocksDB refuses
+/// a flush that lists a family dropped after its handle was taken.
+#[test]
+fn flushes_racing_the_family_drop_never_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flusher = {
+        let (store, stop) = (store.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut flushes = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                store.flush_durable().expect("a flush racing the drop");
+                flushes += 1;
+            }
+            flushes
+        })
+    };
+    for _ in 0..300 {
+        store.write_batch(put(hash(1), b"record")).unwrap();
+        store.drop_opreturn_strip_cf().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(flusher.join().unwrap() > 0, "premise: the flusher ran");
+}

@@ -1490,6 +1490,13 @@ impl Store for CoinCache {
         self.inner.for_each_opreturn_strip(f)
     }
 
+    /// Straight to the inner store. A strip remove still pending here finds
+    /// no family at its flush and is skipped, as for a node that never
+    /// stripped.
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        self.inner.drop_opreturn_strip_cf()
+    }
+
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         // Snapshot the invalidation generation BEFORE the dirty check: if
         // a batch pops this outpoint from `clean` after this load, the
@@ -5516,6 +5523,9 @@ mod tests {
         }
         fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
             self.inner.for_each_opreturn_strip(f)
+        }
+        fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+            self.inner.drop_opreturn_strip_cf()
         }
         fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
             self.inner.get_undo(hash)
