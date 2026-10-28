@@ -1783,6 +1783,14 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
 
     a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
     wait_for_the_restore(&a, &blocks, 120);
+    // The restore logs its progress, not a line per block.
+    let log = std::fs::read_to_string(&a.stderr_log).unwrap_or_default();
+    assert!(log.contains("OP_RETURN restore complete"), "the finish is logged: {log}");
+    assert!(
+        !log.contains("Restored an OP_RETURN-stripped block in place"),
+        "no INFO line per restored block: {}",
+        log.lines().filter(|l| l.contains("Restored")).collect::<Vec<_>>().join("\n")
+    );
     let info = prune_info(&a);
     assert_eq!(info["blocks"], 0, "{info}");
     assert_eq!(info["restore"]["total_blocks"], 2, "{info}");

@@ -128,8 +128,15 @@ impl RestoreDownloader {
     }
 
     /// Start a pass over `work`, the stripped blocks in the order to fetch
-    /// them.
+    /// them. An empty `work` starts nothing: the last pass's counts stay,
+    /// and the next read waits a minute. The records are all gone, and the
+    /// strip worker's finish step has yet to notice.
     pub fn start_pass(&mut self, work: Vec<RestoreItem>, now: Instant) {
+        if work.is_empty() {
+            self.skipped = 0;
+            self.fruitless_at = Some((now, None));
+            return;
+        }
         self.total_blocks = work.len() as u64;
         self.remaining_bytes = work.iter().map(|i| i.len).sum();
         self.queue = work.into();
@@ -499,5 +506,10 @@ mod tests {
         assert!(dl.may_start_pass(Instant::now(), &[7]), "a pass that restored something does not wait");
         dl.start_pass(Vec::new(), Instant::now());
         assert!(!dl.may_start_pass(Instant::now(), &[7]), "an empty pass waits too");
+        // The records are gone before the strip worker's finish step sees
+        // it: the report still describes the pass that restored them.
+        let p = dl.progress();
+        assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3), "{p:?}");
+        assert_eq!(p.estimated_remaining_seconds, Some(0));
     }
 }

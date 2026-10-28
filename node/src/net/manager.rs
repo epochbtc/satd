@@ -7811,12 +7811,18 @@ impl PeerManager {
                 Some(Ok(work)) => {
                     restore.loading = false;
                     let bytes: u64 = work.iter().map(|i| i.len).sum();
-                    tracing::info!(
-                        blocks = work.len(),
-                        bytes,
-                        "OP_RETURN restore: downloading the stripped blocks again from peers that keep \
-                         every block"
-                    );
+                    if work.is_empty() {
+                        // The last block is restored; the strip worker's
+                        // finish step has yet to run.
+                        tracing::debug!("OP_RETURN restore: no stripped block to download in this pass");
+                    } else {
+                        tracing::info!(
+                            blocks = work.len(),
+                            bytes,
+                            "OP_RETURN restore: downloading the stripped blocks again from peers that keep \
+                             every block"
+                        );
+                    }
                     restore.start_pass(work, now);
                 }
                 Some(Err(e)) => {
