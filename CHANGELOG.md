@@ -182,6 +182,9 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `-alertnotify` runs for warnings raised during startup, such as
+  `reindex.halted` and `reindex.short` from a `-reindex` (#884).
+
 - The address index built by a backfill (`-addressindex` turned on for an
   already-synced chain) leaves out unspendable outputs, as the index built
   while blocks connect always has. It used to record each OP_RETURN output,

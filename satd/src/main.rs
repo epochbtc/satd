@@ -1458,6 +1458,30 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         tip = %chain_state.tip_hash(),
         "Chain state initialized"
     );
+
+    // -alertnotify: run a shell command whenever the node raises a new
+    // operational warning, with `%s` replaced by the warning text (Bitcoin
+    // Core parity — Core fires this on `DoWarning`). Warnings are deduped by
+    // id in `NodeWarnings`, so the hook fires once per *new* warning, not on
+    // every repeat. Serial dispatch via the same primitive as blocknotify.
+    //
+    // Installed as soon as the warnings registry exists, before the snapshot
+    // resume and the reindex (#884): Core's hook is live for the whole of
+    // startup, so a `reindex.halted` or `reindex.short` must fire it too. A
+    // warning `ChainState::new` itself recorded is sent on install.
+    if let Some(cmd_template) = config
+        .alert_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
+        tracing::warn!(
+            "-alertnotify configured; running a command on each new node warning. {}",
+            notifyhooks::STREAMING_API_NOTICE
+        );
+        let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        chain_state.warnings().set_alert_notifier(alert_tx);
+        notifyhooks::spawn_alert_notifier(alert_rx, cmd_template);
+    }
     // The chainstate database closes when the last reference to its store is
     // dropped; `main` checks this at exit.
     let chainstate_db = Arc::downgrade(chain_state.store_ref());
@@ -2178,25 +2202,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             notifyhooks::STREAMING_API_NOTICE
         );
         notifyhooks::spawn_block_notifier(chain_event_tx.subscribe(), cmd_template);
-    }
-
-    // -alertnotify: run a shell command whenever the node raises a new
-    // operational warning, with `%s` replaced by the warning text (Bitcoin
-    // Core parity — Core fires this on `DoWarning`). Warnings are deduped by
-    // id in `NodeWarnings`, so the hook fires once per *new* warning, not on
-    // every repeat. Serial dispatch via the same primitive as blocknotify.
-    if let Some(cmd_template) = config
-        .alert_notify
-        .clone()
-        .filter(|c| !c.trim().is_empty())
-    {
-        tracing::warn!(
-            "-alertnotify configured; running a command on each new node warning. {}",
-            notifyhooks::STREAMING_API_NOTICE
-        );
-        let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        chain_state.warnings().set_alert_notifier(alert_tx);
-        notifyhooks::spawn_alert_notifier(alert_rx, cmd_template);
     }
 
     // -startupnotify / -shutdownnotify fire once per process (at ready / at

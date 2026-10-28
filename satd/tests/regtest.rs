@@ -8033,8 +8033,16 @@ fn a_reindex_over_a_missing_block_file_raises_reindex_short() {
     );
     std::fs::remove_file(blocks.join("blk00001.dat")).unwrap();
 
-    let mut node =
-        TestNode::start_with_datadir(&datadir, rpcport, &["--fastprune=1", "--reindex"]);
+    // #884: the warning is raised during startup, and `-alertnotify` must run
+    // for it as Core's would.
+    let notify_dir = fresh_test_datadir("satd-reindex-short-alert");
+    let alerts = notify_dir.join("alertnotify.log");
+    let alertnotify = format!("--alertnotify=echo %s >> {}", alerts.display());
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--fastprune=1", "--reindex", &alertnotify],
+    );
     let height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap();
     assert!(
         height > 0 && height < 600,
@@ -8059,8 +8067,20 @@ fn a_reindex_over_a_missing_block_file_raises_reindex_short() {
             || short["context"]["first_orphan_file"] == "blk00002.dat",
         "the warning must locate the hole: {short}"
     );
+    let read = || std::fs::read_to_string(&alerts).unwrap_or_default();
+    let deadline = Instant::now() + test_timeout(30);
+    while !read().contains("reindex.short") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = read();
+    assert_eq!(
+        log.matches("reindex.short").count(),
+        1,
+        "-alertnotify runs once for the reindex.short raised during startup: {log:?}"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::remove_dir_all(&notify_dir);
 }
 
 #[test]
