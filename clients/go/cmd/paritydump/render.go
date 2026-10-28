@@ -96,14 +96,15 @@ func render(ev satdevents.Event) map[string]any {
 		})
 	case *satdevents.ScriptMatched:
 		return obj("script_matched", map[string]any{
-			"scripthash":  hexb(e.Scripthash),
-			"txid":        hexb(e.Txid),
-			"is_output":   e.IsOutput,
-			"index":       e.Index,
-			"confirmed":   e.Confirmed,
-			"amount":      optU64(e.Amount),
-			"raw_tx":      hexb(e.RawTx),
-			"descriptors": descriptors(e.Descriptors),
+			"scripthash":      hexb(e.Scripthash),
+			"txid":            hexb(e.Txid),
+			"is_output":       e.IsOutput,
+			"index":           e.Index,
+			"confirmed":       e.Confirmed,
+			"amount":          optU64(e.Amount),
+			"raw_tx":          hexb(e.RawTx),
+			"descriptors":     descriptors(e.Descriptors),
+			"raw_tx_stripped": e.RawTxStripped,
 		})
 	case *satdevents.TxidMatched:
 		return obj("txid_matched", map[string]any{
@@ -137,20 +138,23 @@ func render(ev satdevents.Event) map[string]any {
 			"confirmed":        e.Confirmed,
 			"height":           e.Height,
 			"matched_prevouts": prevouts(e.MatchedPrevouts),
+			"raw_tx_stripped":  e.RawTxStripped,
+			"txid":             hexb(e.Txid),
 		})
 	case *satdevents.SilentPaymentMatched:
 		return obj("silent_payment_matched", map[string]any{
-			"scan_pubkey":   hexb(e.ScanPubkey),
-			"txid":          hexb(e.Txid),
-			"vout":          e.Vout,
-			"output_pubkey": hexb(e.OutputPubkey),
-			"amount":        e.Amount,
-			"tweak":         hexb(e.Tweak),
-			"k":             e.K,
-			"label":         optU32(e.Label),
-			"confirmed":     e.Confirmed,
-			"height":        optU32(e.Height),
-			"raw_tx":        hexb(e.RawTx),
+			"scan_pubkey":     hexb(e.ScanPubkey),
+			"txid":            hexb(e.Txid),
+			"vout":            e.Vout,
+			"output_pubkey":   hexb(e.OutputPubkey),
+			"amount":          e.Amount,
+			"tweak":           hexb(e.Tweak),
+			"k":               e.K,
+			"label":           optU32(e.Label),
+			"confirmed":       e.Confirmed,
+			"height":          optU32(e.Height),
+			"raw_tx":          hexb(e.RawTx),
+			"raw_tx_stripped": e.RawTxStripped,
 		})
 	case *satdevents.BlockTweaks:
 		return obj("block_tweaks", map[string]any{

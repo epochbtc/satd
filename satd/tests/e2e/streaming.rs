@@ -2557,3 +2557,100 @@ async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
     };
     assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid));
 }
+
+/// A bounded rescan over an OP_RETURN-stripped block, on a stream opted into
+/// raw_tx (plan §2.8, PR 5d). The block holds two transactions paying the
+/// watched script: one stripped, one intact. The stripped one matches under its
+/// txid with no bytes and `raw_tx_stripped` set, never empty or zero-filled
+/// bytes passed off as the transaction; the intact one still inlines its bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
+    use bitcoin::blockdata::opcodes::all::OP_RETURN;
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::{Builder, PushBytesBuf};
+    use satd_events::proto::v1::RescanBlocks;
+    use serde_json::json;
+
+    let sn = start_streaming_async(vec!["--allowteststrip"]).await;
+    let wallet = DeterministicWallet::from_secret([0x61; 32]);
+    let dest = DeterministicWallet::from_secret([0x62; 32]).address.script_pubkey();
+    let sh = scripthash_hex(&dest);
+    let rpc = sn.node.rpc_handle();
+    let (block, height, stripped, intact) = tokio::task::spawn_blocking(move || {
+        let addr = wallet.address.to_string();
+        rpc.mine(102, &addr);
+        let data = Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(PushBytesBuf::try_from(vec![0x5a; 9_996]).unwrap())
+            .into_script();
+        let (s_raw, s_txid) = crate::common::build_signed_p2wpkh_spend_of_coinbases(
+            &rpc,
+            &[(1, &wallet)],
+            &[dest.clone(), data],
+            100_000,
+        );
+        let (i_raw, i_txid) =
+            crate::common::build_signed_p2wpkh_spend_of_coinbases(&rpc, &[(2, &wallet)], &[dest], 100_000);
+        // The helper splits the value across both outputs, so the OP_RETURN
+        // burns half the coinbase: allow it.
+        let sent = rpc.call("sendrawtransaction", vec![json!(s_raw), json!(0), json!(50)]).unwrap();
+        assert!(sent["error"].is_null(), "{sent}");
+        rpc.send_raw_tx(&i_raw);
+        let block = rpc.mine(1, &addr).remove(0);
+        rpc.mine(10, &addr);
+        let out = rpc.call("stripopreturns", vec![json!(block), json!(4096)]).unwrap();
+        assert_eq!(out["result"]["outcome"], "stripped", "{out}");
+        let height = rpc.call("getblockheader", vec![json!(block)]).unwrap()["result"]["height"]
+            .as_u64()
+            .unwrap() as u32;
+        (block, height, s_txid, i_txid)
+    })
+    .await
+    .unwrap();
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (tx, mut stream) = client.watch(vec![add_scripts(&[&sh])]).await;
+    tx.send(SubscribeControl {
+        msg: Some(Control::SetWatchOptions(
+            satd_events::proto::v1::SetWatchOptions { include_raw_tx: true },
+        )),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    tx.send(SubscribeControl {
+        msg: Some(Control::RescanBlocks(RescanBlocks { from_height: height, to_height: height })),
+    })
+    .await
+    .unwrap();
+
+    let (mut seen_stripped, mut seen_intact) = (false, false);
+    loop {
+        let ev = next_event_matching(&mut stream, 30, |b| {
+            matches!(b, Body::ScriptMatched(_) | Body::RescanComplete(_) | Body::RescanResult(_))
+        })
+        .await;
+        match ev.body.unwrap() {
+            Body::ScriptMatched(s) if hex::encode(&s.txid) == display_to_internal_hex(&stripped) => {
+                assert!(s.raw_tx.is_empty(), "no bytes for a stripped tx");
+                assert!(s.raw_tx_stripped, "and the flag says why");
+                seen_stripped = true;
+            }
+            Body::ScriptMatched(s) if hex::encode(&s.txid) == display_to_internal_hex(&intact) => {
+                let decoded: bitcoin::Transaction =
+                    bitcoin::consensus::deserialize(&s.raw_tx).expect("the intact tx's bytes");
+                assert_eq!(decoded.compute_txid().as_raw_hash().to_byte_array().to_vec(), s.txid);
+                assert!(!s.raw_tx_stripped);
+                seen_intact = true;
+            }
+            Body::ScriptMatched(s) => panic!("unexpected match in block {block}: {s:?}"),
+            Body::RescanComplete(_) => break,
+            Body::RescanResult(r) => {
+                use satd_events::proto::v1::rescan_result::Outcome;
+                assert!(matches!(r.outcome, Some(Outcome::Accepted(_))), "rescan refused: {r:?}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(seen_stripped && seen_intact, "both transactions matched");
+}

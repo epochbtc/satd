@@ -314,6 +314,7 @@ mod canonical {
                 confirmed,
                 amount,
                 raw_tx,
+                raw_tx_stripped,
                 descriptors,
             } => obj(
                 "script_matched",
@@ -325,6 +326,7 @@ mod canonical {
                     ("confirmed", json!(confirmed)),
                     ("amount", json!(amount)),
                     ("raw_tx", json!(hexs(raw_tx.as_deref().unwrap_or(&[])))),
+                    ("raw_tx_stripped", json!(raw_tx_stripped)),
                     (
                         "descriptors",
                         Value::Array(
@@ -393,6 +395,8 @@ mod canonical {
                         ]),
                     ),
                     ("raw_tx", json!(hexs(&m.raw_tx))),
+                    ("raw_tx_stripped", json!(m.raw_tx_stripped)),
+                    ("txid", json!(hexs(&m.txid))),
                     ("confirmed", json!(m.confirmed)),
                     ("height", json!(m.height)),
                     (
@@ -427,6 +431,7 @@ mod canonical {
                 confirmed,
                 height,
                 raw_tx,
+                raw_tx_stripped,
             } => obj(
                 "silent_payment_matched",
                 [
@@ -441,6 +446,7 @@ mod canonical {
                     ("confirmed", json!(confirmed)),
                     ("height", json!(height)),
                     ("raw_tx", json!(hexs(raw_tx.as_deref().unwrap_or(&[])))),
+                    ("raw_tx_stripped", json!(raw_tx_stripped)),
                 ],
             ),
             Event::BlockTweaks { block_hash, height, entries, filtered } => obj(

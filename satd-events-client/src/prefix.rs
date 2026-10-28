@@ -99,7 +99,8 @@ pub struct SpendingHit {
 /// prevouts the server did not retain and so could not be filtered locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixHits {
-    /// The delivered transaction's id (recomputed from `raw_tx`).
+    /// The delivered transaction's id: recomputed from `raw_tx`, or, when its
+    /// bytes were stripped, the txid the node sent.
     pub txid: Txid,
     /// `false` = mempool, `true` = connected block.
     pub confirmed: bool,
@@ -114,6 +115,12 @@ pub struct PrefixHits {
     /// match cannot be confirmed locally. Resolve these outpoints yourself to
     /// complete the filter — never treat them as non-matches.
     pub unresolved: Vec<Outpoint>,
+    /// The node had stripped this transaction's OP_RETURN payloads, so it sent
+    /// no bytes: `funding` is empty because the outputs could not be checked,
+    /// not because none matched. Fetch the transaction's outputs by `txid`
+    /// (e.g. `getrawtransaction` verbose) to complete the filter. Spending hits
+    /// are still found from the retained prevout scripts, with `vin` unknown.
+    pub outputs_unavailable: bool,
 }
 
 impl PrefixHits {
@@ -122,11 +129,13 @@ impl PrefixHits {
         !self.funding.is_empty() || !self.spending.is_empty()
     }
 
-    /// Whether any spend-side prevout could not be filtered locally (script not
-    /// retained); the caller must resolve [`unresolved`](Self::unresolved) to be
-    /// sure this tx is a true non-match.
+    /// Whether part of the match could not be filtered locally: a spend-side
+    /// prevout whose script was not retained, or outputs the node could not
+    /// send ([`outputs_unavailable`](Self::outputs_unavailable)). The caller must
+    /// resolve [`unresolved`](Self::unresolved) and fetch unavailable outputs to
+    /// be sure this tx is a true non-match.
     pub fn has_unresolved(&self) -> bool {
-        !self.unresolved.is_empty()
+        !self.unresolved.is_empty() || self.outputs_unavailable
     }
 }
 
@@ -215,13 +224,24 @@ impl PrefixWatcher {
     /// recomputes `sha256(scriptPubKey)` for each output and each retained spent
     /// prevout, and returns the true hits. Returns [`StreamError::Decode`] if
     /// `raw_tx` is not a valid consensus-serialized transaction.
+    ///
+    /// A match whose transaction the node had OP_RETURN-stripped carries no
+    /// bytes; its txid comes from the match, and the result has
+    /// [`outputs_unavailable`](PrefixHits::outputs_unavailable) set.
     pub fn filter(&self, m: &PrefixMatch) -> Result<PrefixHits, StreamError> {
-        let tx: Transaction = consensus::deserialize(&m.raw_tx)
-            .map_err(|e| StreamError::Decode(format!("prefix raw_tx decode: {e}")))?;
-        let txid = tx.compute_txid();
+        let (tx, txid) = if m.raw_tx_stripped {
+            let txid = Txid::from_slice(&m.txid)
+                .map_err(|e| StreamError::Decode(format!("prefix txid decode: {e}")))?;
+            (None, txid)
+        } else {
+            let tx: Transaction = consensus::deserialize(&m.raw_tx)
+                .map_err(|e| StreamError::Decode(format!("prefix raw_tx decode: {e}")))?;
+            let txid = tx.compute_txid();
+            (Some(tx), txid)
+        };
 
         let mut funding = Vec::new();
-        for (vout, out) in tx.output.iter().enumerate() {
+        for (vout, out) in tx.iter().flat_map(|tx| tx.output.iter()).enumerate() {
             let sh = scripthash_of(out.script_pubkey.as_bytes());
             if self.watched.contains(&sh) {
                 funding.push(FundingHit {
@@ -244,7 +264,7 @@ impl PrefixWatcher {
             let sh = scripthash_of(&sp.script_pubkey);
             if self.watched.contains(&sh) {
                 spending.push(SpendingHit {
-                    vin: find_vin(&tx, &sp.outpoint),
+                    vin: tx.as_ref().and_then(|tx| find_vin(tx, &sp.outpoint)),
                     outpoint: sp.outpoint.clone(),
                     scripthash: sh,
                     script_pubkey: ScriptBuf::from_bytes(sp.script_pubkey.clone()),
@@ -253,7 +273,15 @@ impl PrefixWatcher {
             }
         }
 
-        Ok(PrefixHits { txid, confirmed: m.confirmed, height: m.height, funding, spending, unresolved })
+        Ok(PrefixHits {
+            txid,
+            confirmed: m.confirmed,
+            height: m.height,
+            funding,
+            spending,
+            unresolved,
+            outputs_unavailable: tx.is_none(),
+        })
     }
 }
 
@@ -298,6 +326,8 @@ mod tests {
         PrefixMatch {
             prefix: ScriptPrefix { prefix: vec![0u8, 0u8], bits: 16 },
             raw_tx: consensus::serialize(tx),
+            raw_tx_stripped: false,
+            txid: tx.compute_txid().to_byte_array().to_vec(),
             confirmed: true,
             height: 800_000,
             matched_prevouts: prevouts,
@@ -508,10 +538,46 @@ mod tests {
         let m = PrefixMatch {
             prefix: ScriptPrefix { prefix: vec![0, 0], bits: 16 },
             raw_tx: vec![0xff, 0x00, 0x01],
+            raw_tx_stripped: false,
+            txid: vec![],
             confirmed: false,
             height: 0,
             matched_prevouts: vec![],
         };
         assert!(matches!(w.filter(&m), Err(StreamError::Decode(_))));
+    }
+
+    /// A match on a transaction the node had OP_RETURN-stripped carries no
+    /// bytes: the txid comes from the match, the outputs are reported
+    /// unavailable rather than unmatched, and a retained spent prevout still
+    /// matches.
+    #[test]
+    fn a_stripped_match_names_its_txid_and_reports_its_outputs_unavailable() {
+        let mut w = PrefixWatcher::new();
+        w.watch_script(&spk(7));
+        let (op, wire_op) = dummy_outpoint(0x11, 0);
+        let tx = tx_with(
+            vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk(7) }],
+            vec![TxIn { previous_output: op, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
+        );
+        let mut m = prefix_match(
+            &tx,
+            vec![SpentPrevout { outpoint: wire_op.clone(), script_pubkey: spk(7).to_bytes(), amount: Some(5) }],
+        );
+        let intact = w.filter(&m).unwrap();
+        assert_eq!(intact.funding.len(), 1, "premise: the intact match funds the script");
+        assert!(!intact.outputs_unavailable);
+        assert!(!intact.has_unresolved());
+
+        m.raw_tx = vec![];
+        m.raw_tx_stripped = true;
+        let hits = w.filter(&m).unwrap();
+        assert_eq!(hits.txid, tx.compute_txid());
+        assert!(hits.funding.is_empty());
+        assert!(hits.outputs_unavailable);
+        assert!(hits.has_unresolved(), "the caller must still fetch the outputs");
+        assert_eq!(hits.spending.len(), 1);
+        assert_eq!(hits.spending[0].vin, None);
+        assert_eq!(hits.spending[0].outpoint, wire_op);
     }
 }
