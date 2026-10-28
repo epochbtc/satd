@@ -149,7 +149,8 @@ fn a_dial_pass_fills_every_slot_from_distinct_groups() {
     leave_ibd(&pm);
     let addrs: Vec<SocketAddr> = (0..MAX_OUTBOUND).map(own_group).collect();
     learn(&pm, &addrs);
-    let dials = dialled(&pm);
+    let mut dials = dialled(&pm);
+    dials.sort();
     assert_eq!(dials, addrs);
 }
 
@@ -398,4 +399,126 @@ async fn seeds_are_dialled_by_the_automatic_pass() {
         assert!(Instant::now() < deadline, "the seed peer appears");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Mark `addrs` as dialled a moment ago, connected or not.
+fn tried_just_now(pm: &PeerManager, addrs: &[SocketAddr]) {
+    let mut backoff = pm.reconnect_backoff.write();
+    for a in addrs {
+        backoff.insert(
+            *a,
+            ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+        );
+    }
+}
+
+/// Core passes over an address it tried in the last ten minutes until it
+/// has looked at 30 candidates. satd dialled the first candidates on its
+/// list that were not backing off, and a dial that connected cleared the
+/// backoff, so a peer that hung up just after the handshake was dialled
+/// again on the next pass: about a thousand times a day for each of the
+/// two peers at the front of one node's list.
+#[test]
+fn an_automatic_dial_passes_over_a_peer_it_just_tried() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let addrs: Vec<SocketAddr> = (0..20).map(own_group).collect();
+    learn(&pm, &addrs);
+    tried_just_now(&pm, &addrs[1..]);
+    for _ in 0..20 {
+        let got = dialled(&pm);
+        assert_eq!(got.first(), Some(&addrs[0]), "the one not tried lately goes first: {got:?}");
+        assert_eq!(got.len(), MAX_OUTBOUND, "the passed-over ones fill the rest: {got:?}");
+    }
+}
+
+/// Core draws its candidates with replacement, so a book of fewer than 30
+/// addresses, all tried lately, still gives it one to dial. Each address
+/// comes up once in a satd pass; the ones passed over are dialled once
+/// every other candidate has been looked at.
+#[test]
+fn a_book_smaller_than_the_skip_count_still_redials_its_peers() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let addrs: Vec<SocketAddr> = (0..3).map(own_group).collect();
+    learn(&pm, &addrs);
+    tried_just_now(&pm, &addrs);
+    let mut got = dialled(&pm);
+    got.sort();
+    assert_eq!(got, addrs);
+}
+
+/// Core's `AddrMan::Select` takes the tried table or the new table at the
+/// toss of a coin, then an entry at random. satd walked its list in the
+/// order it learned the addresses, so the ones loaded from `peers.dat` were
+/// first on every pass, and a book of a few tried addresses and many new
+/// ones dialled the same few first every time.
+#[test]
+fn automatic_dials_draw_tried_and_new_at_even_odds() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let tried: Vec<SocketAddr> = (0..10).map(own_group).collect();
+    let new: Vec<SocketAddr> = (10..1010).map(own_group).collect();
+    {
+        let mut book = pm.addrman.write();
+        for a in &new {
+            assert!(book.add(*a, 1));
+        }
+        for a in &tried {
+            book.mark_good(*a, 1);
+        }
+    }
+    learn(&pm, &tried);
+    learn(&pm, &new);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut tried_first = 0;
+    for _ in 0..400 {
+        let order = pm.automatic_dial_order(&mut rng);
+        assert_eq!(order.len(), tried.len() + new.len());
+        if tried.contains(&order[0]) {
+            tried_first += 1;
+        }
+    }
+    assert!((140..=260).contains(&tried_first), "tried first in {tried_first} of 400");
+    let mut order = pm.automatic_dial_order(&mut rng);
+    order.sort();
+    let mut all: Vec<SocketAddr> = tried.iter().chain(&new).copied().collect();
+    all.sort();
+    assert_eq!(order, all, "every learned address, once");
+}
+
+/// The onion half of the pass follows the same rule: an onion peer that
+/// hung up just after the handshake was dialled again on the next tick,
+/// since a dial that connected cleared its backoff.
+#[test]
+fn an_onion_dial_passes_over_a_peer_it_just_tried() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.reachable.write().onion = true;
+    // Seven of the eight automatic slots taken: room for one onion dial.
+    for i in 0..MAX_OUTBOUND - 1 {
+        add_peer(&pm, outbound(i as PeerId + 1, own_group(100 + i), ConnType::OutboundFullRelay));
+    }
+    let onions: Vec<PeerAddr> = (0..3)
+        .map(|i| PeerAddr::Onion { host: format!("{}.onion", "a".repeat(55) + &i.to_string()), port: 8333 })
+        .collect();
+    *pm.connect_peer_addrs.write() = onions.clone();
+    {
+        let mut backoff = pm.onion_reconnect_backoff.write();
+        for o in &onions[..2] {
+            backoff.insert(
+                o.to_string(),
+                ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+            );
+        }
+    }
+    let got: Vec<PeerAddr> = pm.reserve_onion_dials(Instant::now()).into_iter().map(|(t, _slot)| t).collect();
+    assert_eq!(got, vec![onions[2].clone()], "the one not tried lately");
+
+    // Tried lately, all of them: there is nothing else, so one is dialled.
+    pm.onion_reconnect_backoff.write().insert(
+        onions[2].to_string(),
+        ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+    );
+    assert_eq!(pm.reserve_onion_dials(Instant::now()).len(), 1);
 }

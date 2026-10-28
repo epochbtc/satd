@@ -286,6 +286,22 @@ impl AddrMan {
         self.add_from_replacing(addr, now, services, source).0
     }
 
+    /// [`add_from_replacing`](Self::add_from_replacing) for an address last
+    /// seen at `seen` rather than `now`, as Core dates a DNS seed's answers
+    /// days back. Whether an entry is terrible, and so replaceable, is still
+    /// judged at `now`: judged at `seen`, every entry seen since would read
+    /// as seen in the future, and terrible.
+    pub fn add_seen_replacing(
+        &mut self,
+        addr: SocketAddr,
+        seen: u64,
+        now: u64,
+        services: u64,
+        source: IpAddr,
+    ) -> (bool, Option<SocketAddr>) {
+        self.add_dated(addr, seen, now, services, source)
+    }
+
     /// [`add_from`](Self::add_from), and when the book or the address's
     /// network group is full, make room for the new address by dropping one
     /// entry (of that group and new, when the group is full; new before
@@ -303,11 +319,23 @@ impl AddrMan {
         services: u64,
         source: IpAddr,
     ) -> (bool, Option<SocketAddr>) {
+        self.add_dated(addr, now, now, services, source)
+    }
+
+    fn add_dated(
+        &mut self,
+        addr: SocketAddr,
+        seen: u64,
+        now: u64,
+        services: u64,
+        source: IpAddr,
+    ) -> (bool, Option<SocketAddr>) {
         if !self.admits(&addr) {
             return (false, None);
         }
         if let Some(e) = self.entries.get_mut(&addr) {
-            e.last_seen = now;
+            // Never back in time: a seed's answer is dated days ago.
+            e.last_seen = e.last_seen.max(seen);
             // Core's `AddSingle`: gossiped services are only ever added, never
             // replace what is known. Without it an address first heard of
             // without a service never gained it.
@@ -351,7 +379,7 @@ impl AddrMan {
                 tried: false,
                 last_success: 0,
                 attempts: 0,
-                last_seen: now,
+                last_seen: seen,
                 services,
                 source,
                 group,
@@ -404,6 +432,11 @@ impl AddrMan {
         if let Some(e) = self.entries.get_mut(addr) {
             e.services = services;
         }
+    }
+
+    /// Whether `addr` is in the tried table.
+    pub fn is_tried(&self, addr: &SocketAddr) -> bool {
+        self.entries.get(addr).is_some_and(|e| e.tried)
     }
 
     /// Whether the book holds `addr`, in either table.
@@ -779,6 +812,34 @@ mod tests {
         assert_eq!(a.len(), MAX_NEW_PER_GROUP);
         // A different group is still accepted.
         assert!(a.add(sa("11.0.0.1:8333"), 1));
+    }
+
+    /// A seed's answer is dated days back, but the entries it would replace
+    /// are judged at the present: a group full of addresses seen just now
+    /// has nothing terrible in it, and the seed is refused, as Core refuses
+    /// it. Judged at the seed's date, every one of them read as seen in the
+    /// future, and terrible, so seeding evicted fresh entries.
+    #[test]
+    fn a_seed_dated_days_back_replaces_nothing_fresh() {
+        let mut a = AddrMan::new();
+        let now = 10_000_000;
+        for i in 0..MAX_NEW_PER_GROUP {
+            assert!(a.add(sa(&format!("44.1.{}.{}:8333", i / 250, i % 250 + 1)), now));
+        }
+        let seed = sa("44.1.9.9:8333");
+        let five_days = 5 * 24 * 60 * 60;
+        assert_eq!(a.add_seen_replacing(seed, now - five_days, now, DEFAULT_SERVICES, seed.ip()), (false, None));
+        assert_eq!(a.len(), MAX_NEW_PER_GROUP);
+        assert!(!a.contains(&seed));
+
+        // With room, it goes in under its own date, and a later sighting of
+        // a known address never moves its date back.
+        let other = sa("45.1.1.1:8333");
+        assert!(a.add_seen_replacing(other, now - five_days, now, DEFAULT_SERVICES, other.ip()).0);
+        assert_eq!(a.entries[&other].last_seen, now - five_days);
+        let known = sa("44.1.0.1:8333");
+        a.add_seen_replacing(known, now - five_days, now, DEFAULT_SERVICES, known.ip());
+        assert_eq!(a.entries[&known].last_seen, now);
     }
 
     #[test]
