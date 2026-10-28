@@ -1067,7 +1067,121 @@ pub fn get_tx_out_view(
     Ok(response)
 }
 
-/// `gettxoutsetinfo` — return UTXO set statistics.
+/// `gettxoutsetinfo`'s optional arguments, as the caller supplied them
+/// (`None` = omitted or `null`).
+#[derive(Debug, Default, Clone)]
+pub struct TxOutSetInfoArgs {
+    pub hash_type: Option<String>,
+    /// A height (JSON number) or a block hash (JSON string); Core declares it
+    /// with `skip_type_check`, so the shape is checked here.
+    pub hash_or_height: Option<Value>,
+    pub use_index: Option<bool>,
+}
+
+/// Core's `RPC_INVALID_PARAMETER` for a `hash_or_height` without
+/// coinstatsindex (`src/rpc/blockchain.cpp`, `gettxoutsetinfo`). satd keeps
+/// no per-height UTXO stats, so any block but the tip gets it.
+const SPECIFIC_HEIGHT_NEEDS_INDEX: &str = "Querying specific block heights requires coinstatsindex";
+
+/// Core's `ParseHashOrHeight` (`src/rpc/blockchain.cpp`): a number is a
+/// height on the active chain, anything else is read as a block hash.
+fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> Result<BlockHash, (i32, String)> {
+    if let Value::Number(n) = param {
+        // `getInt<int>`: a fraction or a value outside `int` is refused.
+        let height = n
+            .as_i64()
+            .and_then(|h| i32::try_from(h).ok())
+            .ok_or((-1, "JSON integer out of range".to_string()))?;
+        if height < 0 {
+            return Err((-8, format!("Target block height {height} is negative")));
+        }
+        let tip = chain_state.tip_height();
+        if height as u32 > tip {
+            return Err((-8, format!("Target block height {height} after current tip {tip}")));
+        }
+        return chain_state
+            .get_block_hash_by_height(height as u32)
+            .ok_or((-5, "Block not found".to_string()));
+    }
+    let Value::String(s) = param else {
+        // `ParseHashV` calls `get_str()`, whose type error Core answers as
+        // `RPC_MISC_ERROR`.
+        return Err((
+            -1,
+            format!(
+                "JSON value of type {} is not of expected type string",
+                crate::rpc::params::json_type_name(param)
+            ),
+        ));
+    };
+    let hash: BlockHash = crate::rpc::util::parse_hash_v(s, "hash_or_height")?;
+    if chain_state.get_block_index(&hash).is_none() {
+        return Err((-5, "Block not found".to_string()));
+    }
+    Ok(hash)
+}
+
+/// `gettxoutsetinfo` — return UTXO set statistics for the tip.
+///
+/// satd keeps no UTXO-set hash and no per-height stats, so the arguments that
+/// ask for them are refused by name rather than accepted and answered with
+/// the tip (#896): a `hash_or_height` naming any block but the tip, and an
+/// explicit `hash_type` of `muhash` or `hash_serialized_3`. An omitted
+/// `hash_type`, or `"none"`, keeps the reply plain callers have always had.
+/// Errors that Core itself raises are Core's, in Core's order.
+pub fn get_tx_out_set_info_with(
+    chain_state: &ChainState,
+    args: &TxOutSetInfoArgs,
+) -> Result<Value, (i32, String)> {
+    // Core's `ParseHashType` comes first.
+    let hash_type = args.hash_type.as_deref();
+    if let Some(t) = hash_type
+        && !matches!(t, "hash_serialized_3" | "muhash" | "none")
+    {
+        return Err((-8, format!("'{t}' is not a valid hash_type")));
+    }
+    let target = match &args.hash_or_height {
+        None => None,
+        Some(param) => {
+            let hash = parse_hash_or_height(chain_state, param)?;
+            if hash != chain_state.tip_hash() {
+                return Err((-8, SPECIFIC_HEIGHT_NEEDS_INDEX.to_string()));
+            }
+            // Core's two checks for a specific block, which hold for the tip
+            // named explicitly as well.
+            if hash_type == Some("hash_serialized_3") {
+                return Err((
+                    -8,
+                    "hash_serialized_3 hash type cannot be queried for a specific block".to_string(),
+                ));
+            }
+            if args.use_index == Some(false) {
+                return Err((
+                    -8,
+                    "Cannot set use_index to false when querying for a specific block".to_string(),
+                ));
+            }
+            Some(hash)
+        }
+    };
+    if let Some(t @ ("muhash" | "hash_serialized_3")) = hash_type {
+        return Err((
+            -8,
+            format!("satd does not compute a UTXO set hash; hash_type '{t}' is not supported (use 'none')"),
+        ));
+    }
+    let response = get_tx_out_set_info(chain_state)?;
+    // A block that connected after the check above makes the named block no
+    // longer the tip, and the stats just read are for the new one.
+    if let Some(hash) = target
+        && response["bestblock"].as_str() != Some(hash.to_string().as_str())
+    {
+        return Err((-8, SPECIFIC_HEIGHT_NEEDS_INDEX.to_string()));
+    }
+    Ok(response)
+}
+
+/// `gettxoutsetinfo` with no arguments: UTXO set statistics for the tip.
 pub fn get_tx_out_set_info(chain_state: &ChainState) -> Result<Value, (i32, String)> {
     // One consistent view: tip, coin count, total amount and the height
     // histogram are read under the chain's accept lock (after a cache

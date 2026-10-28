@@ -779,6 +779,8 @@ silently returning an empty or wrong answer.
   |---|---|---|
   | `utxoupdatepsbt` | `descriptors` | satd fills in UTXOs only; an empty list is a faithful no-op and is accepted |
   | `converttopsbt` | `iswitness` | satd's decoder auto-detects, which is Core's behaviour when the argument is omitted |
+  | `gettxoutsetinfo` | `hash_or_height` | satd keeps no per-height UTXO stats; the tip, by height or hash, is answered, and any other block gets Core's "Querying specific block heights requires coinstatsindex" |
+  | `gettxoutsetinfo` | `hash_type` | satd computes no UTXO-set hash, so `muhash` and `hash_serialized_3` are refused; an omitted `hash_type` (Core's default is `hash_serialized_3`) and `"none"` are answered, with `hash_serialized_3` left empty |
 
   Silently accepting an argument that is never acted on is the failure mode
   worth avoiding: the caller would get an answer to another question and no

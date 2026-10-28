@@ -185,6 +185,11 @@ item below is (or will be) written up in full in the in-development
 - `-alertnotify` runs for warnings raised during startup, such as
   `reindex.halted` and `reindex.short` from a `-reindex` (#884).
 
+- `gettxoutsetinfo` refuses a `hash_or_height` naming any block but the
+  tip, and an explicit `hash_type` of `muhash` or `hash_serialized_3`, with
+  Core's errors where Core has one, instead of answering with the tip's
+  stats. No arguments, or `hash_type` `"none"`, answer as before (#896).
+
 - The address index built by a backfill (`-addressindex` turned on for an
   already-synced chain) leaves out unspendable outputs, as the index built
   while blocks connect always has. It used to record each OP_RETURN output,
