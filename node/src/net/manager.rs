@@ -122,8 +122,23 @@ const MINIMUM_CONNECT_TIME_SECS: u64 = 30;
 /// chain with at least our tip's work are kept whatever else happens.
 const MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT: usize = 4;
 
+/// How old Core dates an address a DNS seed gave (`ThreadDNSAddressSeed`:
+/// a random age between three and seven days), so that it reads as older
+/// than one a peer gossiped.
+const SEED_ADDR_MIN_AGE_SECS: u64 = 3 * 24 * 60 * 60;
+const SEED_ADDR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long an automatic dial candidate tried once is passed over for
+/// others: Core's ten minutes in `ThreadOpenConnections` ("only consider
+/// very recently tried nodes after 30 failed attempts").
+const RECENT_TRY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// How many candidates one automatic dial looks at before it takes a
+/// recently tried one: Core's 30.
+const RECENT_TRY_SKIPS: usize = 30;
+
 /// Cap on the automatic dial list. Only an address the address book holds
-/// gets on it (seeds aside), so this is the book's own size.
+/// gets on it, so this is the book's own size.
 const MAX_LEARNED_ADDRS: usize = crate::net::addrman::MAX_ENTRIES;
 
 /// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
@@ -494,6 +509,9 @@ impl StuckWait {
 struct ReconnectState {
     attempts: u32,
     next_attempt: Instant,
+    /// When the last dial ended, whether it connected or not: Core's
+    /// `nLastTry`, for [`RECENT_TRY_WINDOW`].
+    last_try: Option<Instant>,
 }
 
 impl ReconnectState {
@@ -501,7 +519,12 @@ impl ReconnectState {
         Self {
             attempts: 0,
             next_attempt: Instant::now(),
+            last_try: None,
         }
+    }
+
+    fn tried_since(&self, since: Instant) -> bool {
+        self.last_try.is_some_and(|t| t > since)
     }
 
     /// Backoff delay: 10s, 20s, 40s, 80s, 160s, capped at `max`
@@ -2339,6 +2362,13 @@ impl PeerManager {
     /// announced it (Core's `nServices` and `source`, which `getnodeaddresses`
     /// and `getrawaddrman` report).
     pub fn add_learned_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
+        self.learn_addr(addr, now_unix_secs(), services, source);
+    }
+
+    /// Put `addr` in the address book as new, last seen at `seen`, and on
+    /// the dial list if the book holds it: the rule every address the node
+    /// learns for itself goes through, gossiped or from a seed.
+    fn learn_addr(&self, addr: SocketAddr, seen: u64, services: u64, source: IpAddr) {
         // Record in the persistent address book (peers.dat) as a *new*
         // address. This is the chokepoint for gossiped addresses, and the
         // book's rule decides what the node learns at all. An address it
@@ -2357,18 +2387,18 @@ impl PeerManager {
         // `ProcessMessage`, `g_reachable_nets.Contains`): under `-onlynet` a
         // node does not fill its book with addresses it will never dial.
         if !self.reachable.read().contains_socket(&addr) {
-            tracing::debug!(%addr, "Ignoring a gossiped address on a network -onlynet leaves out");
+            tracing::debug!(%addr, "Ignoring a learned address on a network -onlynet leaves out");
             return;
         }
         {
             let mut book = self.addrman.write();
             if !book.admits(&addr) {
-                tracing::debug!(%addr, "Ignoring a gossiped address the address book does not take");
+                tracing::debug!(%addr, "Ignoring a learned address the address book does not take");
                 return;
             }
-            let (inserted, evicted) = book.add_from_replacing(addr, now_unix_secs(), services, source);
+            let (inserted, evicted) = book.add_from_replacing(addr, seen, services, source);
             if !inserted && !book.contains(&addr) {
-                tracing::debug!(%addr, "Not dialling a gossiped address the address book has no room for");
+                tracing::debug!(%addr, "Not dialling a learned address the address book has no room for");
                 return;
             }
             // A full book makes room by dropping a terrible entry; it
@@ -2387,12 +2417,23 @@ impl PeerManager {
     /// as automatic connections, so they join the learned candidates rather
     /// than `manual_addrs`, under the same rule as gossip. An onion seed
     /// joins the onion candidates.
+    ///
+    /// Into the book as well, as new, last seen a random three to seven
+    /// days ago, as Core's `ThreadDNSAddressSeed` dates a seed's answers.
+    /// satd put them on the dial list only, so a seed address the node did
+    /// not reach before a restart was gone after it, and one it could not
+    /// connect to never became terrible and replaceable.
     pub fn add_learned_peer_addr(&self, addr: &PeerAddr) {
         match addr {
             PeerAddr::Socket(sa) => {
-                if self.reachable.read().contains_socket(sa) && self.addrman.read().admits(sa) {
-                    self.push_learned(*sa);
-                }
+                use rand::Rng as _;
+                let age = rand::thread_rng().gen_range(SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS);
+                self.learn_addr(
+                    *sa,
+                    now_unix_secs().saturating_sub(age),
+                    crate::net::addrman::DEFAULT_SERVICES,
+                    sa.ip(),
+                );
             }
             PeerAddr::Onion { host, port } => self.add_onion_connect_addr(host.clone(), *port),
         }
@@ -4672,47 +4713,105 @@ impl PeerManager {
 
     /// The learned addresses the automatic half of the reconnect loop dials
     /// this pass, each with the place it took in the automatic budget, in
-    /// the order of the dial list. Stops when the budget is spent.
+    /// the order [`Self::automatic_dial_order`] draws. Stops when the budget
+    /// is spent.
+    ///
+    /// A candidate dialled in the last [`RECENT_TRY_WINDOW`] is passed over
+    /// until a dial has looked at [`RECENT_TRY_SKIPS`] candidates, as Core
+    /// passes over one it tried in the last ten minutes. satd took the
+    /// first candidates on the list that were not backing off, and a dial
+    /// that connected cleared the backoff, so a peer that hung up just
+    /// after the handshake was dialled again on the next pass, and the
+    /// node went back to the same few peers all day.
     ///
     /// An address the operator also named is offered by the manual half,
     /// and `spawn_peer` makes it the manual connection it is: Core makes no
     /// automatic connection to an added node (`AddedNodesContain`, v31.1
     /// `src/net.cpp:2883`).
     fn reserve_automatic_dials(self: &Arc<Self>, now: Instant) -> Vec<(SocketAddr, DialSlot)> {
-        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let tried_recently = |addr: &SocketAddr| {
+            recent.is_some_and(|since| {
+                self.reconnect_backoff.read().get(addr).is_some_and(|s| s.tried_since(since))
+            })
+        };
         let mut groups = self.outbound_netgroups();
         let mut dials = Vec::new();
-        for addr in learned {
-            if self.is_manual_target(&PeerAddr::Socket(addr)) || !self.may_dial(&addr) {
-                continue;
-            }
-            let target = PeerAddr::Socket(addr);
-            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
-                continue;
-            }
-            // One automatic outbound peer per network group, as Core
-            // requires (v31.1 `src/net.cpp:2829`): a candidate in a group
-            // the node already has an outbound peer in, or is dialling, is
-            // skipped. satd walked the list in order, and addresses learned
-            // together often sit in one group, so several slots could go to
-            // one /16.
+        // One automatic outbound peer per network group, as Core requires
+        // (v31.1 `src/net.cpp:2829`): a candidate in a group the node
+        // already has an outbound peer in, or is dialling, is skipped. satd
+        // walked the list in order, and addresses learned together often sit
+        // in one group, so several slots could go to one /16. Err when the
+        // budget is spent.
+        let mut take = |addr: SocketAddr| -> Result<bool, ()> {
             let group = self.outbound_netgroup(addr.ip());
             if group.as_ref().is_some_and(|g| groups.contains(g)) {
+                return Ok(false);
+            }
+            let slot = self.reserve_dial(DialBudget::Automatic).map_err(|_| ())?;
+            // The dials of one pass run in parallel, so the group is taken
+            // now, not when the peer connects.
+            if let Some(group) = group {
+                groups.insert(group);
+            }
+            dials.push((addr, slot));
+            Ok(true)
+        };
+        // Core's `nTries`: the candidates looked at for the next dial.
+        let mut tries = 0usize;
+        // Recently tried candidates passed over, for when every other one
+        // has been looked at: Core draws with replacement, so with fewer
+        // than `RECENT_TRY_SKIPS` addresses it still reaches one.
+        let mut passed_over = Vec::new();
+        for addr in self.automatic_dial_order(&mut rand::thread_rng()) {
+            tries += 1;
+            let target = PeerAddr::Socket(addr);
+            if self.is_manual_target(&target)
+                || !self.may_dial(&addr)
+                || self.is_peer_addr_banned(&target)
+                || !self.redial_due(&target, now)
+            {
                 continue;
             }
-            match self.reserve_dial(DialBudget::Automatic) {
-                Ok(slot) => {
-                    // The dials of one pass run in parallel, so the group is
-                    // taken now, not when the peer connects.
-                    if let Some(group) = group {
-                        groups.insert(group);
-                    }
-                    dials.push((addr, slot));
-                }
-                Err(_) => break,
+            if tries < RECENT_TRY_SKIPS && tried_recently(&addr) {
+                passed_over.push(addr);
+                continue;
+            }
+            match take(addr) {
+                Ok(true) => tries = 0,
+                Ok(false) => {}
+                Err(()) => return dials,
+            }
+        }
+        for addr in passed_over {
+            if take(addr).is_err() {
+                break;
             }
         }
         dials
+    }
+
+    /// The learned addresses in the order an automatic pass tries them:
+    /// each next one from the tried table or the new table at the toss of a
+    /// coin, at random within it, as Core's `AddrMan::Select` draws (an
+    /// address not in the book counts as new). satd walked the list in the
+    /// order it learned the addresses, so the ones it loaded from
+    /// `peers.dat` at startup were first on every pass.
+    fn automatic_dial_order(&self, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
+        use rand::seq::SliceRandom as _;
+        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        let (mut tried, mut new): (Vec<SocketAddr>, Vec<SocketAddr>) = {
+            let book = self.addrman.read();
+            learned.into_iter().partition(|a| book.is_tried(a))
+        };
+        tried.shuffle(rng);
+        new.shuffle(rng);
+        let mut order = Vec::with_capacity(tried.len() + new.len());
+        while !tried.is_empty() || !new.is_empty() {
+            let from_tried = new.is_empty() || (!tried.is_empty() && rng.r#gen::<bool>());
+            order.extend(if from_tried { tried.pop() } else { new.pop() });
+        }
+        order
     }
 
     /// The network group the one-per-group outbound rule keys `ip` on: the
@@ -4929,6 +5028,7 @@ impl PeerManager {
             }
             let connected = result.is_ok();
             let update = |state: &mut ReconnectState| {
+                state.last_try = Some(Instant::now());
                 if connected {
                     state.reset();
                 } else {
@@ -12890,22 +12990,17 @@ impl PeerManager {
         // completes — that is when it sends its one-shot `getaddr` — and
         // skips block-relay-only peers. Inbound links latch lazily instead,
         // in the addr handlers.
-        if direction == Direction::Outbound && !quiet {
-            self.setup_address_relay(id);
-        }
+        let relays_addrs = direction == Direction::Outbound && !quiet && self.setup_address_relay(id);
 
-        // Proactively request addresses from outbound peers when running over a
-        // proxy. Onion peers are discovered only through gossip (the hardcoded
-        // seeds aside), and a one-time getaddr pulls the peer's address set
-        // promptly instead of waiting for unsolicited trickle — which a short-
-        // lived connection may never deliver. Matches Bitcoin Core, which sends
-        // getaddr to outbound peers. Scoped to proxy mode to leave clearnet
-        // address handling unchanged in this fix.
-        if direction == Direction::Outbound
-            && conn_type != ConnType::AddrFetch
-            && !quiet
-            && (self.proxy.is_some() || self.onion_proxy.is_some())
-        {
+        // The one-shot `getaddr` to every outbound peer that relays addresses,
+        // as Core sends it (`ProcessMessage`, VERSION). satd sent it only over
+        // a proxy, and on clearnet that left the address book with nothing
+        // new: a Core peer relays addresses to an inbound link only once that
+        // link has sent `addr`, `addrv2` or `getaddr` (`SetupAddressRelay`),
+        // so a node that sent none was told of no address at all, and dialled
+        // the few in its book over and over. An addr-fetch link has sent its
+        // `getaddr` already.
+        if relays_addrs && conn_type != ConnType::AddrFetch {
             self.note_getaddr_sent(id);
             writer.send(NetworkMessage::GetAddr)
                 .await
@@ -15537,6 +15632,15 @@ mod tests {
         pm.add_learned_peer_addr(&PeerAddr::Socket(seed));
         assert!(pm.learned_addrs.read().contains(&seed));
         assert!(!pm.manual_addrs.read().contains(&seed));
+        // In the book too, new, and dated three to seven days back as Core
+        // dates a seed's answers. satd left seeds out of the book.
+        {
+            let book = pm.addrman.read();
+            let entry = book.iter().find(|e| e.addr == seed).expect("the seed is in the address book");
+            assert!(!entry.tried);
+            let age = now_unix_secs() - entry.last_seen;
+            assert!((SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS + 5).contains(&age), "age {age}");
+        }
 
         pm.connect_peer_addr_automatic(&PeerAddr::Socket(seed)).await.expect("the seed dial connects");
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);

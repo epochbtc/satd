@@ -249,6 +249,45 @@ fn an_addr_fetch_peers_answer_is_taken_whole() {
     poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
 }
 
+/// Core sends `getaddr` to every outbound peer that relays addresses, as
+/// the handshake completes, and to no block-relay-only one. satd sent it
+/// only over a proxy. A Core peer relays addresses to an inbound link only
+/// after it has sent `addr`, `addrv2` or `getaddr`, so on clearnet the node
+/// was told of no address at all: one synced mainnet node had 44 tried
+/// addresses and no new one, and dialled the same eight peers all day.
+#[test]
+fn outbound_full_relay_peers_are_asked_for_addresses() {
+    let node = TestNode::start(&["--v2transport=0"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+
+    node.rpc_ok("addconnection", vec![json!(target), json!("outbound-full-relay"), json!(false)]);
+    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
+    assert!(
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        "the node asks its full-relay peer for addresses"
+    );
+    // Room for the whole answer, past the rate limit.
+    peer.send(addr_msg(1, 600));
+    poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+    node.rpc_ok("addconnection", vec![json!(target), json!("block-relay-only"), json!(false)]);
+    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the block-relay peer");
+    // The session setup goes out before the node reads anything, so by the
+    // `pong` a `getaddr` would have come.
+    let nonce = rand_nonce();
+    peer.send(NetworkMessage::Ping(nonce));
+    let first = peer.recv_until(test_timeout(30), |m| {
+        matches!(m, NetworkMessage::GetAddr) || matches!(m, NetworkMessage::Pong(n) if *n == nonce)
+    });
+    assert!(
+        matches!(first, Some(NetworkMessage::Pong(_))),
+        "no getaddr to a block-relay-only peer: {first:?}"
+    );
+}
+
 /// Core counts manual connections apart from the automatic outbound target:
 /// `addnode onetry` takes no grant at all, and added nodes have their own
 /// limit of eight (`semAddnode`), redialled every minute however many

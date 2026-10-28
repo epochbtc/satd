@@ -186,6 +186,11 @@ item below is (or will be) written up in full in the in-development
   and each output script over 10,000 bytes, as an unspent coin under that
   script's scripthash.
 
+- Outbound peers are sent `getaddr` on clearnet too, seed addresses enter
+  the address book, and automatic dials are drawn at random from the tried
+  and new tables, passing over addresses tried in the last ten minutes, as
+  in Core. A node used to redial the same few peers all day.
+
 - The address book's service bits follow an outbound peer's `version` and
   add up over later announcements, as Core's do; they used to stay as first
   heard.

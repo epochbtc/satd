@@ -307,7 +307,8 @@ impl AddrMan {
             return (false, None);
         }
         if let Some(e) = self.entries.get_mut(&addr) {
-            e.last_seen = now;
+            // Never back in time: a seed's answer is dated days ago.
+            e.last_seen = e.last_seen.max(now);
             // Core's `AddSingle`: gossiped services are only ever added, never
             // replace what is known. Without it an address first heard of
             // without a service never gained it.
@@ -404,6 +405,11 @@ impl AddrMan {
         if let Some(e) = self.entries.get_mut(addr) {
             e.services = services;
         }
+    }
+
+    /// Whether `addr` is in the tried table.
+    pub fn is_tried(&self, addr: &SocketAddr) -> bool {
+        self.entries.get(addr).is_some_and(|e| e.tried)
     }
 
     /// Whether the book holds `addr`, in either table.
