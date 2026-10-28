@@ -104,7 +104,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), chunks[footer_idx]);
 }
 
-/// Single-line services row. Columns separated by two spaces:
+/// Single-line services row. Each column's dot: green when done or
+/// serving, yellow while work is pending (a sync, a backfill, a scan, a
+/// restore, or a pause or wait in any of them), red when failed, dim when
+/// off or unknown. Columns separated by two spaces:
 /// `addr-idx <state>`, `sp-idx <state>` (only when the silent-payment
 /// index is enabled), `esplora <state>`, `electrum <state>`.
 ///
@@ -173,11 +176,11 @@ fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProg
                 } else {
                     String::new()
                 };
-                spans.push(dot(Color::Green));
+                spans.push(dot(Color::Yellow));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
                     format!(" backfill {}({}/{}){}", pct, cursor, snapshot, eta),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::Yellow),
                 ));
             }
             "paused" => {
@@ -229,7 +232,7 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
                 } else {
                     String::new()
                 };
-                spans.push(dot(Color::Green));
+                spans.push(dot(Color::Yellow));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
                     format!(
@@ -240,7 +243,7 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
                         snapshot,
                         eta,
                     ),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::Yellow),
                 ));
             }
             "paused" => {
@@ -369,13 +372,12 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
                     Some(s) if s > 0 => format!("  ETA {}", format_duration(s)),
                     _ => String::new(),
                 };
-                (Color::Green, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
+                (Color::Yellow, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
             }
         };
         spans.push(dot(color));
         spans.push(Span::styled(label, Style::default().fg(Color::White)));
-        let style = if color == Color::Green { Color::Gray } else { color };
-        spans.push(Span::styled(text, Style::default().fg(style)));
+        spans.push(Span::styled(text, Style::default().fg(color)));
         return;
     }
     let label = "op-prune";
@@ -1238,6 +1240,37 @@ mod tests {
             assert!(r.contains("op-prune 1,234 blocks stripped") && !r.contains("scanning"), "{behind}: {r}");
             assert_eq!(opreturn_dot(&op), Color::Green, "{behind}");
         }
+    }
+
+    /// One rule for every column: yellow while work is pending, green only
+    /// once it is done.
+    #[test]
+    fn services_row_dots_are_yellow_while_work_is_pending() {
+        let dot_before = |st: &AppState, label: &str| -> Color {
+            let spans = services_line(st).spans;
+            let at = spans.iter().position(|s| s.content == label).unwrap_or_else(|| panic!("no {label}"));
+            spans[at - 1].style.fg.expect("a coloured dot")
+        };
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, false, "running"));
+        assert_eq!(dot_before(&st, "sp-idx"), Color::Yellow, "sp-idx backfill");
+        st.sp_index = Some(sp(true, true, "completed"));
+        assert_eq!(dot_before(&st, "sp-idx"), Color::Green, "sp-idx synced");
+
+        let mut st = AppState::new();
+        st.backfill = Some(crate::state::BackfillProgress {
+            state: "running".into(),
+            pass: 1,
+            cursor_height: 500_000,
+            snapshot_height: 900_000,
+            estimated_remaining_seconds: 60,
+            last_error: None,
+        });
+        assert_eq!(dot_before(&st, "addr-idx"), Color::Yellow, "addr-idx backfill");
+
+        let mut st = AppState::new();
+        st.opreturn = Some(opreturn("restoring", Some(restore_view())));
+        assert_eq!(dot_before(&st, "op-restore"), Color::Yellow, "op-restore downloading");
     }
 
     /// The colour of the dot `opreturn_spans` draws.

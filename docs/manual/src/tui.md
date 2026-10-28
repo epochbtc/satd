@@ -257,13 +257,17 @@ addr-idx <state>   [sp-idx <state>]   esplora <state>   electrum <state>
 The `sp-idx` column appears only when the silent-payment index is
 enabled, so nodes not using it keep the three-column row.
 
+Every column's dot follows one rule: green when done or serving, yellow while
+work is pending (a sync, backfill, scan or restore, or a pause or wait in
+one), red when it failed, dim when off or unknown.
+
 `addr-idx` states:
 
 | Display | Meaning |
 |---|---|
 | `⬤ synced` (green) | Address-history index is at tip. Esplora and Electrum are safe to serve history. |
 | `⬤ syncing` (yellow) | Backfill in progress. Address queries may return partial history. |
-| `⬤ backfill pass N/2 XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height. The `ETA` is omitted for the first few seconds after a start, resume, or daemon restart — it is measured over the current working span, so it has nothing to report until that span has run (see [Disk footprint](./disk-footprint.md)). |
+| `⬤ backfill pass N/2 XX% (C/S) ETA …` (yellow) | Active backfill with progress. `C/S` is cursor / snapshot height. The `ETA` is omitted for the first few seconds after a start, resume, or daemon restart — it is measured over the current working span, so it has nothing to report until that span has run (see [Disk footprint](./disk-footprint.md)). |
 | `⬤ backfill paused …` (yellow) | Backfill paused. Resume with `sat-cli resumeindex address`. |
 | `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
 | `⬭ off` (gray) | Address index disabled (`-addressindex=0`). |
@@ -278,7 +282,7 @@ and the streaming [`tweaks`](./streaming.md) category):
 | *(column absent)* | Index disabled (`-silentpaymentindex=0`, the default), or a satd too old to report it. Exception: on an older satd with a backfill mid-flight, the backfill itself is proof the index is on, so the column shows (without a percentage — see below). |
 | `⬤ synced` (green) | Tweak index is at tip. `getsilentpaymentblockdata` and the streaming `tweaks` category return data. |
 | `⬤ syncing` (yellow) | Enabled but not caught up: fresh sync, or a backfill is still owed. Tweak-serving surfaces do not return data yet. |
-| `⬤ backfill XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height, and the percentage is the daemon-reported ratio over the taproot-era walk — **not** `C/S`, which would measure from genesis and overstate progress. Unlike the address index this is a **single** pass, so there is no pass counter. On a satd too old to report the ratio, the counts show with no percentage. |
+| `⬤ backfill XX% (C/S) ETA …` (yellow) | Active backfill with progress. `C/S` is cursor / snapshot height, and the percentage is the daemon-reported ratio over the taproot-era walk — **not** `C/S`, which would measure from genesis and overstate progress. Unlike the address index this is a **single** pass, so there is no pass counter. On a satd too old to report the ratio, the counts show with no percentage. |
 | `⬤ backfill paused …` (yellow) | Backfill paused. Resume with `sat-cli resumeindex silentpayment`. |
 | `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
 
@@ -296,7 +300,7 @@ pruning](./disk-footprint.md#opreturn-data-pruning), from
 | `⬤ op-prune N blocks stripped` (green) | The worker has caught up (within a few blocks of T) and keeps up with the tip; N blocks are stripped. |
 | `⬤ op-prune N blocks stripped, paused (…)` (yellow) | The worker waits for IBD, a reindex or an AssumeUTXO background validation to finish. |
 | `⬭ op-prune N blocks stripped, off` (dim) | Pruning is off but N stripped blocks remain; `restoreopreturns` downloads them again. |
-| `⬤ op-restore XX% (D/T) P peers ETA …` (green) | `restoreopreturns` is downloading: D of the pass's T stripped blocks restored, from P full peers. The percentage and ETA are the daemon's. |
+| `⬤ op-restore XX% (D/T) P peers ETA …` (yellow) | `restoreopreturns` is downloading: D of the pass's T stripped blocks restored, from P full peers. The percentage and ETA are the daemon's. |
 | `⬤ op-restore waiting for … (D/T)` (yellow) | The restore waits for a full peer (`NODE_NETWORK`), for disk space, or for the tip to catch up. |
 
 `esplora` and `electrum` states:

@@ -37,6 +37,8 @@ item below is (or will be) written up in full in the in-development
   `getopreturnpruneinfo.restore` and three `satd_opreturn_restore_*` metrics
   report it.
 
+- sat-tui's services row is yellow wherever work is pending: an address or
+  silent-payment backfill in progress is no longer green.
 - sat-tui shows OP_RETURN pruning in its services row: `op-prune` with the
   worker's scan while it catches up (yellow), then the blocks stripped, or under `-restoreopreturns`
   `op-restore` with the restore's percentage, counts, peers and ETA, laid out
