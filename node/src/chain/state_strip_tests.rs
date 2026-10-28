@@ -1420,3 +1420,31 @@ fn a_failed_finish_is_retried_by_the_next_pass() {
     assert!(!cs.opreturn_prune_active(), "the failed finish was never retried");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The restore's work list (plan §11.4): every record whose block is still
+/// stored, by height, newest first on a pruning node (R-6), each with the
+/// stored block's length. A record whose block is gone is left out.
+#[test]
+fn the_restore_work_list_is_the_stored_records_in_height_order() {
+    let (cs, _dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let pick = [blocks[40].block_hash(), blocks[5].block_hash(), blocks[90].block_hash()];
+    let unknown = BlockHash::from_byte_array([7; 32]);
+    let mut puts: Vec<(BlockHash, Vec<u8>)> = pick.iter().map(|h| (*h, vec![1])).collect();
+    puts.push((unknown, vec![1]));
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: puts,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let heights = |work: &[RestoreItem]| work.iter().map(|i| i.height).collect::<Vec<_>>();
+    let ascending = cs.opreturn_restore_work(false).unwrap();
+    assert_eq!(heights(&ascending), vec![6, 41, 91], "the unknown block is left out");
+    assert_eq!(heights(&cs.opreturn_restore_work(true).unwrap()), vec![91, 41, 6]);
+    for item in &ascending {
+        let block = blocks.iter().find(|b| b.block_hash() == item.hash).unwrap();
+        assert_eq!(item.len, serialize(block).len() as u64, "the stored length");
+    }
+}

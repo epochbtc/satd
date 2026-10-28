@@ -1765,7 +1765,8 @@ fn wait_for_the_restore(node: &TestNode, blocks: &[(String, serde_json::Value)],
 #[test]
 fn restoreopreturns_downloads_every_stripped_block_again() {
     use serde_json::json;
-    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(3, &[]);
+    // Two: a third would spend a coinbase past regtest's first halving.
+    let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(2, &[]);
 
     let a_port = find_available_port();
     let port_arg = format!("--port={a_port}");
@@ -1780,10 +1781,10 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
     wait_for_the_restore(&a, &blocks, 120);
     let info = prune_info(&a);
     assert_eq!(info["blocks"], 0, "{info}");
-    assert_eq!(info["restore"]["total_blocks"], 3, "{info}");
-    assert_eq!(info["restore"]["restored_blocks"], 3, "{info}");
+    assert_eq!(info["restore"]["total_blocks"], 2, "{info}");
+    assert_eq!(info["restore"]["restored_blocks"], 2, "{info}");
     assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
-    assert!(info["restore"]["bytes_downloaded"].as_u64().unwrap() > 3 * PAYLOAD as u64, "{info}");
+    assert!(info["restore"]["bytes_downloaded"].as_u64().unwrap() > 2 * PAYLOAD as u64, "{info}");
     assert!(payload_on_disk(&a), "the payloads are back on disk");
     assert!(allocated(&a) > stripped_allocation, "the punched space is allocated again");
     assert!(!has_corrupt_warning(&a));
@@ -1799,6 +1800,9 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
 
     // A new peer sees NODE_NETWORK and syncs the whole chain from A alone,
     // blocks far deeper than 288 included.
+    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    mine(&a, 100, &addr);
+    assert!(a.rpc_ok("getblockcount", vec![]).as_u64().unwrap() > 300, "premise: a chain deeper than 288");
     let tip = a.rpc_ok("getbestblockhash", vec![]);
     let c = TestNode::start(&[]);
     c.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")]);
