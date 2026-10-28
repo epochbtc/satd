@@ -1334,3 +1334,27 @@ fn the_worker_stops_when_nothing_is_left_to_count() {
     assert!(!cs.opreturn_prune_active());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A count cached while the last record's remove still waited for a flush
+/// says one record is left after the record has gone. The next pass must not
+/// trust it: it recounts, finds none, and finishes.
+#[test]
+fn a_stale_count_does_not_keep_the_node_stripping() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 1, "premise: the cached count");
+    // The remove lands without dropping the cached totals, as a flush of a
+    // buffered remove does after a pass already counted.
+    cs.store
+        .write_batch(StoreBatch {
+            opreturn_strip_removes: vec![hash],
+            ..Default::default()
+        })
+        .unwrap();
+    pass(&cs, 1000);
+    assert!(!cs.opreturn_prune_active(), "the pass trusted a count taken before the flush");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -709,11 +709,15 @@ impl ChainState {
     pub fn strip_pass(&self, max_blocks: u32, stop: &std::sync::atomic::AtomicBool) -> Result<PassReport, StripError> {
         let Some(config) = self.opreturn_prune_config() else {
             // The option is off on a node that holds stripped blocks: nothing
-            // to strip, but a record removed since the last pass (`-prune`,
-            // `getblockfrompeer`, a fresh copy) dropped the totals.
+            // to strip, but records go (`-prune`, `getblockfrompeer`, a fresh
+            // copy), and the last one going finishes the job. Recount every
+            // pass, after a flush: a remove that rides a coin batch waits in
+            // the cache until one, and a count taken meanwhile still sees its
+            // record, so a count cached only after a removal could stay one
+            // too high for good.
             *self.strip.worker.lock() = WorkerStatus::Off;
-            let dropped = self.strip.summary.lock().is_none();
-            if dropped && self.opreturn_strip_summary_records()? == 0 {
+            self.flush_durable()?;
+            if self.opreturn_strip_summary_records()? == 0 {
                 self.finish_opreturn_unstrip()?;
             }
             return Ok(PassReport::default());
