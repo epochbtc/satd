@@ -137,6 +137,40 @@ const RECENT_TRY_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// recently tried one: Core's 30.
 const RECENT_TRY_SKIPS: usize = 30;
 
+/// Core's rule for the candidates of one automatic pass, in the order they
+/// are drawn: one dialled in the last [`RECENT_TRY_WINDOW`] is passed over
+/// until [`RECENT_TRY_SKIPS`] candidates have been looked at since the last
+/// dial (Core's `nTries`). `take` dials a candidate: `Ok(true)` if it did,
+/// `Ok(false)` if it turned it down, `Err` when the pass is over. Core draws
+/// with replacement, so it reaches a recently tried candidate even with
+/// fewer than `RECENT_TRY_SKIPS` to draw from; each candidate comes up once
+/// here, so the ones passed over are offered again at the end.
+fn pass_over_recent_tries<T>(
+    candidates: impl IntoIterator<Item = T>,
+    tried_recently: impl Fn(&T) -> bool,
+    mut take: impl FnMut(T) -> Result<bool, ()>,
+) {
+    let mut tries = 0usize;
+    let mut passed_over = Vec::new();
+    for candidate in candidates {
+        tries += 1;
+        if tries < RECENT_TRY_SKIPS && tried_recently(&candidate) {
+            passed_over.push(candidate);
+            continue;
+        }
+        match take(candidate) {
+            Ok(true) => tries = 0,
+            Ok(false) => {}
+            Err(()) => return,
+        }
+    }
+    for candidate in passed_over {
+        if take(candidate).is_err() {
+            return;
+        }
+    }
+}
+
 /// Cap on the automatic dial list. Only an address the address book holds
 /// gets on it, so this is the book's own size.
 const MAX_LEARNED_ADDRS: usize = crate::net::addrman::MAX_ENTRIES;
@@ -2396,7 +2430,7 @@ impl PeerManager {
                 tracing::debug!(%addr, "Ignoring a learned address the address book does not take");
                 return;
             }
-            let (inserted, evicted) = book.add_from_replacing(addr, seen, services, source);
+            let (inserted, evicted) = book.add_seen_replacing(addr, seen, now_unix_secs(), services, source);
             if !inserted && !book.contains(&addr) {
                 tracing::debug!(%addr, "Not dialling a learned address the address book has no room for");
                 return;
@@ -4656,33 +4690,59 @@ impl PeerManager {
             self.spawn_redial(PeerAddr::Socket(addr), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
         }
 
-        // `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up
-        // to MAX_ONION_CONNECT_ADDRS), and every onion dial holds a circuit
-        // through the one proxy, so on top of the free slots a tick starts
-        // no more than a burst of them.
+        for (target, slot) in self.reserve_onion_dials(now) {
+            self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        }
+    }
+
+    /// The onion peers learned from `addrv2` gossip that the automatic half
+    /// of the reconnect loop dials this pass, each with the place it took in
+    /// the automatic budget. An onion peer dialled in the last
+    /// [`RECENT_TRY_WINDOW`] is passed over as a clearnet one is
+    /// ([`Self::reserve_automatic_dials`]).
+    ///
+    /// `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up to
+    /// MAX_ONION_CONNECT_ADDRS), and every onion dial holds a circuit through
+    /// the one proxy, so on top of the free slots a tick starts no more than
+    /// a burst of them.
+    fn reserve_onion_dials(self: &Arc<Self>, now: Instant) -> Vec<(PeerAddr, DialSlot)> {
+        // Under `-connect`, only the peers the operator named; with an
+        // `-onlynet` that leaves out onion, none.
+        if !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
+            return Vec::new();
+        }
         let onion: Vec<PeerAddr> = self.connect_peer_addrs.read().clone();
         let mut budget = Self::onion_dial_budget(
             self.automatic_outbound_target(),
             self.automatic_outbound_peers(),
             self.dials_in_flight.lock().automatic,
         );
-        for target in onion.into_iter().filter(|a| !self.is_manual_target(a)) {
-            // Under `-connect`, only the peers the operator named; with an
-            // `-onlynet` that leaves out onion, none.
-            if budget == 0 || !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
-                break;
-            }
-            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
-                continue;
-            }
-            match self.reserve_dial(DialBudget::Automatic) {
-                Ok(slot) => {
-                    budget -= 1;
-                    self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let mut dials = Vec::new();
+        pass_over_recent_tries(
+            onion.into_iter().filter(|a| !self.is_manual_target(a)),
+            |target| {
+                recent.is_some_and(|since| {
+                    self.onion_reconnect_backoff
+                        .read()
+                        .get(&target.to_string())
+                        .is_some_and(|s| s.tried_since(since))
+                })
+            },
+            |target| {
+                if budget == 0 {
+                    return Err(());
                 }
-                Err(_) => return,
-            }
-        }
+                if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
+                    return Ok(false);
+                }
+                let slot = self.reserve_dial(DialBudget::Automatic).map_err(|_| ())?;
+                budget -= 1;
+                dials.push((target, slot));
+                Ok(true)
+            },
+        );
+        dials
     }
 
     /// Whether the reconnect loop should dial `target` now: it is neither
@@ -4757,37 +4817,21 @@ impl PeerManager {
             dials.push((addr, slot));
             Ok(true)
         };
-        // Core's `nTries`: the candidates looked at for the next dial.
-        let mut tries = 0usize;
-        // Recently tried candidates passed over, for when every other one
-        // has been looked at: Core draws with replacement, so with fewer
-        // than `RECENT_TRY_SKIPS` addresses it still reaches one.
-        let mut passed_over = Vec::new();
-        for addr in self.automatic_dial_order(&mut rand::thread_rng()) {
-            tries += 1;
-            let target = PeerAddr::Socket(addr);
-            if self.is_manual_target(&target)
-                || !self.may_dial(&addr)
-                || self.is_peer_addr_banned(&target)
-                || !self.redial_due(&target, now)
-            {
-                continue;
-            }
-            if tries < RECENT_TRY_SKIPS && tried_recently(&addr) {
-                passed_over.push(addr);
-                continue;
-            }
-            match take(addr) {
-                Ok(true) => tries = 0,
-                Ok(false) => {}
-                Err(()) => return dials,
-            }
-        }
-        for addr in passed_over {
-            if take(addr).is_err() {
-                break;
-            }
-        }
+        pass_over_recent_tries(
+            self.automatic_dial_order(&mut rand::thread_rng()),
+            tried_recently,
+            |addr| {
+                let target = PeerAddr::Socket(addr);
+                if self.is_manual_target(&target)
+                    || !self.may_dial(&addr)
+                    || self.is_peer_addr_banned(&target)
+                    || !self.redial_due(&target, now)
+                {
+                    return Ok(false);
+                }
+                take(addr)
+            },
+        );
         dials
     }
 

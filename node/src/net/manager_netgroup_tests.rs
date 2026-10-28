@@ -486,3 +486,39 @@ fn automatic_dials_draw_tried_and_new_at_even_odds() {
     all.sort();
     assert_eq!(order, all, "every learned address, once");
 }
+
+/// The onion half of the pass follows the same rule: an onion peer that
+/// hung up just after the handshake was dialled again on the next tick,
+/// since a dial that connected cleared its backoff.
+#[test]
+fn an_onion_dial_passes_over_a_peer_it_just_tried() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.reachable.write().onion = true;
+    // Seven of the eight automatic slots taken: room for one onion dial.
+    for i in 0..MAX_OUTBOUND - 1 {
+        add_peer(&pm, outbound(i as PeerId + 1, own_group(100 + i), ConnType::OutboundFullRelay));
+    }
+    let onions: Vec<PeerAddr> = (0..3)
+        .map(|i| PeerAddr::Onion { host: format!("{}.onion", "a".repeat(55) + &i.to_string()), port: 8333 })
+        .collect();
+    *pm.connect_peer_addrs.write() = onions.clone();
+    {
+        let mut backoff = pm.onion_reconnect_backoff.write();
+        for o in &onions[..2] {
+            backoff.insert(
+                o.to_string(),
+                ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+            );
+        }
+    }
+    let got: Vec<PeerAddr> = pm.reserve_onion_dials(Instant::now()).into_iter().map(|(t, _slot)| t).collect();
+    assert_eq!(got, vec![onions[2].clone()], "the one not tried lately");
+
+    // Tried lately, all of them: there is nothing else, so one is dialled.
+    pm.onion_reconnect_backoff.write().insert(
+        onions[2].to_string(),
+        ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+    );
+    assert_eq!(pm.reserve_onion_dials(Instant::now()).len(), 1);
+}
