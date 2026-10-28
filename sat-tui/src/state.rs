@@ -326,7 +326,7 @@ impl OpReturnProgress {
                 o.get("depth").and_then(|n| n.as_u64()),
                 v.get("blocks").and_then(|n| n.as_u64()),
             ) {
-                (Some(examined), Some(depth), Some(tip)) => Some((examined, tip.saturating_sub(depth + 2))),
+                (Some(examined), Some(depth), Some(tip)) => Some((examined, tip.saturating_sub(depth.saturating_add(2)))),
                 _ => None,
             },
             restore: o.get("restore").map(|r| RestoreView {
@@ -2633,6 +2633,8 @@ mod tests {
         let scanning = json!({"blocks": 973_593, "opreturn_prune": {
             "worker": "running", "blocks": 4, "depth": 288, "examined_below_height": 262_640}});
         assert_eq!(OpReturnProgress::from_json(&scanning).unwrap().scan, Some((262_640, 973_303)), "the daemon's target");
+        let hostile_depth = json!({"blocks": 10, "opreturn_prune": {"depth": u64::MAX, "examined_below_height": 0}});
+        assert_eq!(OpReturnProgress::from_json(&hostile_depth).unwrap().scan, Some((0, 0)), "no overflow");
         let hostile = json!({"opreturn_prune": {"restore": {"progress_ratio": 7.5}}});
         assert_eq!(OpReturnProgress::from_json(&hostile).unwrap().restore.unwrap().progress_ratio, Some(1.0));
     }
