@@ -281,6 +281,57 @@ impl IbdBitmap {
     }
 }
 
+/// OP_RETURN pruning, from `getblockchaininfo.opreturn_prune`: present only
+/// on a node that strips or still holds stripped blocks, so a node that
+/// never used it shows no column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpReturnProgress {
+    /// The worker's state: `running`, `ibd`, `reindex`,
+    /// `background_validation` or `off` while stripping; under
+    /// `-restoreopreturns`, `restoring`, `waiting_for_peers`,
+    /// `waiting_for_disk`, `waiting_for_tip` or `restored`. Empty on a
+    /// daemon that predates the field.
+    pub worker: String,
+    /// Stripped blocks, as last added up.
+    pub blocks: u64,
+    /// The `-restoreopreturns` download, when the option is set.
+    pub restore: Option<RestoreView>,
+}
+
+/// `getblockchaininfo.opreturn_prune.restore`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreView {
+    pub total_blocks: u64,
+    pub remaining_blocks: u64,
+    /// Daemon-computed, over the current pass.
+    pub progress_ratio: Option<f64>,
+    pub estimated_remaining_seconds: Option<u64>,
+    /// Connected peers the restore can ask.
+    pub peers: u64,
+}
+
+impl OpReturnProgress {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let o = v.get("opreturn_prune")?;
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        Some(OpReturnProgress {
+            worker: o.get("worker").and_then(|w| w.as_str()).unwrap_or("").to_string(),
+            blocks: u(o, "blocks"),
+            restore: o.get("restore").map(|r| RestoreView {
+                total_blocks: u(r, "total_blocks"),
+                remaining_blocks: u(r, "remaining_blocks"),
+                progress_ratio: r
+                    .get("progress_ratio")
+                    .and_then(|x| x.as_f64())
+                    .filter(|x| x.is_finite())
+                    .map(|x| x.clamp(0.0, 1.0)),
+                estimated_remaining_seconds: r.get("estimated_remaining_seconds").and_then(|s| s.as_u64()),
+                peers: u(r, "peers"),
+            }),
+        })
+    }
+}
+
 /// Snapshot of the address-index backfill from `getsatdindexinfo`. Only
 /// surfaced in the UI when state is one of `running`, `paused`, or
 /// `failed` — `idle`, `completed`, `cancelled`, `rejected` are quiet.
@@ -624,6 +675,8 @@ pub struct AppState {
     /// Silent-payment index status from `getsatdindexinfo`. `None` when the
     /// daemon has not reported a `silentpayments` object at all.
     pub sp_index: Option<SpIndexProgress>,
+    /// OP_RETURN pruning or its restore, on a node that uses it.
+    pub opreturn: Option<OpReturnProgress>,
 
     /// Listener and address-index status from `getserverstatus`. Drives
     /// the always-visible services row in the steady view.
@@ -860,6 +913,7 @@ impl AppState {
             ibd_bitmap: None,
             backfill: None,
             sp_index: None,
+            opreturn: None,
             server_status: ServerStatus::default(),
             server_version: None,
 
@@ -936,6 +990,7 @@ impl AppState {
         self.chain_time = v.get("time").and_then(|t| t.as_u64()).unwrap_or(0);
         self.is_ibd = v.get("initialblockdownload").and_then(|b| b.as_bool()).unwrap_or(false);
         self.verification_progress = v.get("verificationprogress").and_then(|p| p.as_f64()).unwrap_or(0.0);
+        self.opreturn = OpReturnProgress::from_json(v);
         if let Some(s) = v.get("chainwork").and_then(|c| c.as_str()) {
             self.chainwork_hex = s.to_string();
         }
@@ -2546,6 +2601,25 @@ mod tests {
         st.update_epoch_anchor(944_352, &header);
         assert_eq!(st.epoch_start_height, Some(944_352));
         assert_eq!(st.epoch_start_time, Some(1_714_389_222));
+    }
+
+    #[test]
+    fn opreturn_progress_parses_a_restore_and_is_absent_otherwise() {
+        assert_eq!(OpReturnProgress::from_json(&json!({"blocks": 5})), None, "a node that never stripped");
+        let v = json!({"opreturn_prune": {
+            "worker": "restoring", "blocks": 40,
+            "restore": {"total_blocks": 123, "remaining_blocks": 40, "progress_ratio": 0.675,
+                        "estimated_remaining_seconds": 240, "peers": 3}
+        }});
+        let p = OpReturnProgress::from_json(&v).expect("present");
+        assert_eq!(p.worker, "restoring");
+        let r = p.restore.expect("restore");
+        assert_eq!((r.total_blocks, r.remaining_blocks, r.peers), (123, 40, 3));
+        assert_eq!((r.progress_ratio, r.estimated_remaining_seconds), (Some(0.675), Some(240)));
+        let stripping = OpReturnProgress::from_json(&json!({"opreturn_prune": {"worker": "running", "blocks": 7}})).unwrap();
+        assert_eq!((stripping.blocks, stripping.restore), (7, None));
+        let hostile = json!({"opreturn_prune": {"restore": {"progress_ratio": 7.5}}});
+        assert_eq!(OpReturnProgress::from_json(&hostile).unwrap().restore.unwrap().progress_ratio, Some(1.0));
     }
 
     #[test]

@@ -126,6 +126,12 @@ fn services_line(state: &AppState) -> Line<'static> {
         spans.push(Span::raw("  "));
         sp_index_spans(&mut spans, sp);
     }
+    // Only on a node that strips, holds stripped blocks or is restoring them.
+    // `restored` can show for one poll while the object is going away.
+    if let Some(op) = state.opreturn.as_ref().filter(|o| o.worker != "restored") {
+        spans.push(Span::raw("  "));
+        opreturn_spans(&mut spans, op);
+    }
     spans.push(Span::raw("  "));
     listener_spans(&mut spans, "esplora", &state.server_status.esplora, None);
     spans.push(Span::raw("  "));
@@ -336,6 +342,51 @@ fn listener_spans(
             }
         }
     }
+}
+
+/// `op-restore <state>` under `-restoreopreturns`, laid out as the index
+/// backfills are: the daemon's percentage over the current pass, blocks
+/// restored of the pass's total, and its ETA. Otherwise `op-strip <state>`:
+/// how many blocks are stripped, and whether the worker is running.
+fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnProgress) {
+    if let Some(r) = op.restore.as_ref() {
+        let label = "op-restore";
+        let done = format_num(r.total_blocks.saturating_sub(r.remaining_blocks));
+        let total = format_num(r.total_blocks);
+        let (color, text) = match op.worker.as_str() {
+            "waiting_for_peers" => (Color::Yellow, format!(" waiting for a full peer ({done}/{total})")),
+            "waiting_for_disk" => (Color::Yellow, format!(" waiting for disk space ({done}/{total})")),
+            "waiting_for_tip" => (Color::Yellow, format!(" waiting for the tip ({done}/{total})")),
+            _ => {
+                let pct = r.progress_ratio.map(|x| format!("{:.1}% ", x * 100.0)).unwrap_or_default();
+                let eta = match r.estimated_remaining_seconds {
+                    Some(s) if s > 0 => format!("  ETA {}", format_duration(s)),
+                    _ => String::new(),
+                };
+                (Color::Green, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
+            }
+        };
+        spans.push(dot(color));
+        spans.push(Span::styled(label, Style::default().fg(Color::White)));
+        let style = if color == Color::Green { Color::Gray } else { color };
+        spans.push(Span::styled(text, Style::default().fg(style)));
+        return;
+    }
+    let label = "op-strip";
+    let blocks = format!(" {} blocks", format_num(op.blocks));
+    let (color, text) = match op.worker.as_str() {
+        "running" => (Color::Green, blocks),
+        "ibd" | "reindex" | "background_validation" => (Color::Yellow, format!("{blocks}, paused ({})", op.worker)),
+        // The option is off; stripped blocks remain until restored.
+        "off" => (Color::DarkGray, format!("{blocks}, off")),
+        // A daemon that does not say (older than the field), or a state
+        // this build does not know: the count, and no claim about the
+        // worker.
+        _ => (Color::DarkGray, blocks),
+    };
+    spans.push(dot(color));
+    spans.push(Span::styled(label, Style::default().fg(Color::White)));
+    spans.push(Span::styled(text, Style::default().fg(if color == Color::Green { Color::Gray } else { color })));
 }
 
 fn dot(color: Color) -> Span<'static> {
@@ -1080,6 +1131,88 @@ mod tests {
         assert!(r.contains("addr-idx"));
         assert!(r.contains("esplora"));
         assert!(r.contains("electrum"));
+    }
+
+    fn opreturn(worker: &str, restore: Option<crate::state::RestoreView>) -> crate::state::OpReturnProgress {
+        crate::state::OpReturnProgress {
+            worker: worker.to_string(),
+            blocks: 1_234,
+            restore,
+        }
+    }
+
+    fn restore_view() -> crate::state::RestoreView {
+        crate::state::RestoreView {
+            total_blocks: 1_230,
+            remaining_blocks: 400,
+            progress_ratio: Some(0.675),
+            estimated_remaining_seconds: Some(240),
+            peers: 3,
+        }
+    }
+
+    #[test]
+    fn services_row_has_no_opreturn_column_on_a_node_that_never_stripped() {
+        let st = AppState::new();
+        let r = row(&st);
+        assert!(!r.contains("op-"), "{r}");
+    }
+
+    #[test]
+    fn services_row_shows_restore_progress_like_a_backfill() {
+        let mut st = AppState::new();
+        st.opreturn = Some(opreturn("restoring", Some(restore_view())));
+        let r = row(&st);
+        // The daemon's ratio verbatim, not done/total (830/1230 = 67.5% here
+        // too, so check the ETA and peers to tell the layout apart).
+        assert!(r.contains("op-restore 67.5% (830/1,230) 3 peers  ETA"), "{r}");
+        assert!(!r.contains("op-strip"), "{r}");
+    }
+
+    #[test]
+    fn services_row_names_what_a_restore_waits_for() {
+        for (worker, words) in [
+            ("waiting_for_peers", "waiting for a full peer"),
+            ("waiting_for_disk", "waiting for disk space"),
+            ("waiting_for_tip", "waiting for the tip"),
+        ] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn(worker, Some(restore_view())));
+            let r = row(&st);
+            assert!(r.contains(&format!("op-restore {words} (830/1,230)")), "{worker}: {r}");
+        }
+    }
+
+    #[test]
+    fn services_row_shows_the_strip_worker_without_a_restore() {
+        for (worker, want) in [
+            ("running", "op-strip 1,234 blocks"),
+            ("ibd", "op-strip 1,234 blocks, paused (ibd)"),
+            ("off", "op-strip 1,234 blocks, off"),
+        ] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn(worker, None));
+            let r = row(&st);
+            assert!(r.contains(want), "{worker}: {r}");
+        }
+    }
+
+    /// A daemon too old to report the worker, or a state this build does not
+    /// know, shows the count without claiming the worker is off; `restored`,
+    /// briefly reported as the object goes away, shows no column.
+    #[test]
+    fn services_row_claims_no_worker_state_it_was_not_told() {
+        for worker in ["", "something_new"] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn(worker, None));
+            let r = row(&st);
+            assert!(r.contains("op-strip 1,234 blocks") && !r.contains("off") && !r.contains("paused"), "{worker:?}: {r}");
+        }
+        for restore in [None, Some(restore_view())] {
+            let mut st = AppState::new();
+            st.opreturn = Some(opreturn("restored", restore));
+            assert!(!row(&st).contains("op-"), "{}", row(&st));
+        }
     }
 
     #[test]

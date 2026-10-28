@@ -224,12 +224,17 @@ counts, and `worker` is one of `restoring`, `waiting_for_peers`,
 "restore": {
   "total_blocks": 123, "remaining_blocks": 40, "restored_blocks": 83,
   "bytes_downloaded": 96000000, "remaining_bytes": 47000000,
-  "in_flight": 32, "peers": 2
+  "in_flight": 32, "peers": 2,
+  "progress_ratio": 0.675, "estimated_remaining_seconds": 240
 }
 ```
 
-`getblockchaininfo` carries the first nine of these under `opreturn_prune`,
-only on a node that strips or still holds stripped blocks.
+`progress_ratio` is over the current pass; `estimated_remaining_seconds` is
+`null` until the first block is restored.
+
+`getblockchaininfo` carries the first nine of these, `worker` and `restore`
+under `opreturn_prune`, only on a node that strips or still holds stripped
+blocks.
 
 ## Node attestation (NAP)
 

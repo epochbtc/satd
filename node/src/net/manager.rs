@@ -7979,15 +7979,13 @@ impl PeerManager {
         self.chain_state.set_opreturn_restore_status(crate::chain::state::WorkerStatus::Restoring, Some(progress));
         let done = restore.restored_blocks();
         if done.is_multiple_of(RESTORE_PROGRESS_EVERY) {
-            let now = Instant::now();
-            let rate = restore.rate(now);
-            let eta_secs = (rate > 0.0).then(|| (progress.remaining_blocks as f64 / rate) as u64);
+            let rate = restore.rate(Instant::now());
             tracing::info!(
                 restored = done,
                 remaining = progress.remaining_blocks,
                 remaining_bytes = progress.remaining_bytes,
                 blocks_per_sec = format!("{rate:.1}"),
-                eta_secs,
+                eta_secs = progress.estimated_remaining_seconds,
                 "OP_RETURN restore progress"
             );
         }

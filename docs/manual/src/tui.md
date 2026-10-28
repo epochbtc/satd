@@ -285,6 +285,19 @@ and the streaming [`tweaks`](./streaming.md) category):
 The silent-payment backfill is CPU-bound and can run for hours on mainnet;
 see [Disk footprint](./disk-footprint.md) for measured timings.
 
+`op-strip` and `op-restore` states ([OP_RETURN data
+pruning](./disk-footprint.md#opreturn-data-pruning), from
+`getblockchaininfo.opreturn_prune`):
+
+| Display | Meaning |
+|---|---|
+| *(column absent)* | No block is stripped and pruning is off: an ordinary node, or one whose restore has finished. |
+| `⬤ op-strip N blocks` (green) | `pruneopreturn` is on and the worker is running; N blocks are stripped. |
+| `⬤ op-strip N blocks, paused (…)` (yellow) | The worker waits for IBD, a reindex or an AssumeUTXO background validation to finish. |
+| `⬭ op-strip N blocks, off` (dim) | Pruning is off but N stripped blocks remain; `restoreopreturns` downloads them again. |
+| `⬤ op-restore XX% (D/T) P peers ETA …` (green) | `restoreopreturns` is downloading: D of the pass's T stripped blocks restored, from P full peers. The percentage and ETA are the daemon's. |
+| `⬤ op-restore waiting for … (D/T)` (yellow) | The restore waits for a full peer (`NODE_NETWORK`), for disk space, or for the tip to catch up. |
+
 `esplora` and `electrum` states:
 
 | Display | Meaning |

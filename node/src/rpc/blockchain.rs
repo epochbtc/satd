@@ -159,30 +159,42 @@ pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
         "outputs": summary.outputs,
         "bytes_zeroed": summary.bytes_zeroed,
         "bytes_freed_estimate": summary.bytes_freed_estimate,
+        // A lock read each: cheap enough for `getblockchaininfo` too, which
+        // is what sat-tui polls.
+        "worker": chain_state.opreturn_strip_worker_status().label(),
     });
+    // `-restoreopreturns` (plan §11.6): the download's counts, once a pass
+    // has started; zeros before.
+    if chain_state.opreturn_restore_requested() {
+        let p = chain_state.opreturn_restore_progress().unwrap_or_default();
+        let pending = chain_state.opreturn_restore_pending();
+        let remaining = if pending { p.remaining_blocks } else { 0 };
+        out["restore"] = json!({
+            "total_blocks": p.total_blocks,
+            "remaining_blocks": remaining,
+            "restored_blocks": p.restored_blocks,
+            "bytes_downloaded": p.bytes_downloaded,
+            "remaining_bytes": if pending { p.remaining_bytes } else { 0 },
+            "in_flight": p.in_flight,
+            "peers": p.peers,
+            // Of the current pass. A pass that starts over (blocks every peer
+            // refused) counts from its own start.
+            "progress_ratio": match (pending, p.total_blocks) {
+                (false, _) => 1.0,
+                (true, 0) => 0.0,
+                (true, total) => total.saturating_sub(remaining) as f64 / total as f64,
+            },
+            "estimated_remaining_seconds": if pending { p.estimated_remaining_seconds } else { Some(0) },
+        });
+    }
     if detailed {
         out["peers"] = json!(chain_state.opreturn_prune_peers().as_str());
-        out["worker"] = json!(chain_state.opreturn_strip_worker_status().label());
         // The height the worker's scan is heading for: every block below it
         // is past the strip depth.
         out["examine_target_height"] = json!(config.map(|c| {
             chain_state.tip_height().saturating_sub(c.depth.saturating_add(2))
         }));
         out["filesystem_block_size"] = json!(chain_state.opreturn_strip_fs_block());
-        // `-restoreopreturns` (plan §11.6): the download's counts, once a
-        // pass has started; zeros before.
-        if chain_state.opreturn_restore_requested() {
-            let p = chain_state.opreturn_restore_progress().unwrap_or_default();
-            out["restore"] = json!({
-                "total_blocks": p.total_blocks,
-                "remaining_blocks": if chain_state.opreturn_restore_pending() { p.remaining_blocks } else { 0 },
-                "restored_blocks": p.restored_blocks,
-                "bytes_downloaded": p.bytes_downloaded,
-                "remaining_bytes": if chain_state.opreturn_restore_pending() { p.remaining_bytes } else { 0 },
-                "in_flight": p.in_flight,
-                "peers": p.peers,
-            });
-        }
         out["probe"] = match (config, chain_state.opreturn_strip_fs_block()) {
             (_, Some(_)) => json!("ok"),
             (None, None) => json!("not run"),
