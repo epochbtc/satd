@@ -173,11 +173,16 @@ impl ChainstateReport {
 /// The blocks-and-store form of the check, usable without a running node.
 ///
 /// `read_block` is handed each ancestor's hash and index entry and returns the
-/// block, or `None` if it cannot be read. A live node resolves it through the
-/// chain state; an offline audit reads the flat files directly.
+/// block as stored, or `None` if it cannot be read. A live node resolves it
+/// through the chain state; an offline audit reads the flat files directly and
+/// applies the block's strip record. Every txid comes from the stored block:
+/// an OP_RETURN-stripped transaction's is in its strip record.
 pub fn verify_chainstate_with(
     store: &dyn crate::storage::Store,
-    read_block: &mut dyn FnMut(&BlockHash, &crate::storage::blockindex::BlockIndexEntry) -> Option<bitcoin::Block>,
+    read_block: &mut dyn FnMut(
+        &BlockHash,
+        &crate::storage::blockindex::BlockIndexEntry,
+    ) -> Option<crate::storage::opreturn_strip::StoredBlock>,
     tip_hash: BlockHash,
     tip_height: u32,
     window: u32,
@@ -270,9 +275,9 @@ pub fn verify_chainstate_with(
         };
 
         match read_block(&cursor, &entry) {
-            Some(block) => {
-                for (tx_idx, tx) in block.txdata.iter().enumerate() {
-                    let txid = tx.compute_txid();
+            Some(stored) => {
+                for (tx_idx, tx) in stored.block.txdata.iter().enumerate() {
+                    let txid = stored.txid(tx_idx);
                     let expected_seq = block_first_txseq.map(|f| f + tx_idx as u64);
                     match store.get_tx_seq(&txid) {
                         Some(seq) => {
@@ -414,7 +419,7 @@ impl ChainState {
         let (tip_hash, tip_height) = self.tip_snapshot();
         verify_chainstate_with(
             &**self.store_ref(),
-            &mut |hash, _entry| self.get_block(hash),
+            &mut |hash, _entry| self.get_stored_block(hash),
             tip_hash,
             tip_height,
             window,

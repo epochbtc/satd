@@ -182,12 +182,21 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
                 data_pos: entry.data_pos,
             };
             let raw = flat.read_block(&pos).ok()?;
-            let block: bitcoin::Block = bitcoin::consensus::deserialize(&raw).ok()?;
+            // Applies the block's strip record, as the node's own reads do,
+            // so a stripped block is audited under its recorded txids. A
+            // record that does not verify reads as unreadable.
+            let stored = node::storage::opreturn_strip::decode_for_replay(
+                &store,
+                raw,
+                hash,
+                &flat.xor_key(),
+            )
+            .ok()?;
             // A mis-recorded offset lands on another record's start, not on
             // garbage, so deserialization succeeds and hands back a different
             // block. Treat that as unreadable rather than auditing the wrong
             // block's contents against this height.
-            (block.block_hash() == *hash).then_some(block)
+            (stored.block.block_hash() == *hash).then_some(stored)
         },
         tip_hash,
         tip_entry.height,

@@ -108,8 +108,10 @@ pub(crate) type StripHook = Box<dyn FnOnce(&ChainState) + Send>;
 pub(crate) struct StripState {
     /// One strip at a time. Two calls on one block could otherwise each
     /// plan against the other's half-written record. Taken before
-    /// `accept_lock`, and never while holding it.
-    lock: Mutex<()>,
+    /// `accept_lock`, and never while holding it. `invalidate_block` takes it
+    /// too, so no record lands between its stripped-block check and its
+    /// marks.
+    pub(super) lock: Mutex<()>,
     /// The blocks dir's punch capabilities, probed by the first strip.
     caps: Mutex<Option<PunchCaps>>,
     /// `-allowteststrip` on a regtest node: the `stripopreturns` RPC is

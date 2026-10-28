@@ -432,8 +432,12 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
+    // Mark it the way invalidateblock does. Not through invalidateblock: it
+    // refuses to disconnect a block that already has a strip record (plan
+    // §2.10), which the second case below needs.
     let invalidate = move |cs: &ChainState| {
-        let _ = cs.invalidate_block(hash);
+        let _accept = cs.accept_lock.lock();
+        cs.mark_subtree_invalid(hash).unwrap();
         assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
     };
 
@@ -898,5 +902,52 @@ fn a_replay_names_a_lost_strip_record() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The live chainstate audit reads a stripped block through its record: the
+/// block is neither unreadable nor short of txindex rows, so a healthy chain
+/// with a stripped block in the window is consistent (plan §2.8, PR 5e).
+#[test]
+fn the_chainstate_audit_reads_a_stripped_block_through_its_record() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let hash = blocks[101].block_hash();
+    assert!(cs.verify_chainstate_default().is_consistent(), "premise: consistent before");
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    assert_eq!(cs.get_block(&hash), None, "premise: stripped");
+    let report = cs.verify_chainstate_default();
+    assert!(report.is_consistent(), "{}", report.describe());
+    assert!(report.unreadable.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `invalidate_block` waits for a strip in progress: a strip commits its
+/// record before `accept_lock`, so only the strip lock keeps a record from
+/// landing between invalidate's stripped-block check and its marks.
+#[test]
+fn invalidate_block_waits_for_a_strip_in_progress() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let cs = std::sync::Arc::new(cs);
+    let tip = blocks.last().unwrap().block_hash();
+    let held = cs.strip.lock.lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let cs = cs.clone();
+        std::thread::spawn(move || {
+            let r = cs.invalidate_block(tip);
+            done_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "invalidate_block ran while a strip held the lock"
+    );
+    drop(held);
+    done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
+    worker.join().unwrap().expect("invalidate");
+    assert_eq!(cs.store.get_block_index(&tip).unwrap().status, BlockStatus::Invalid);
     let _ = std::fs::remove_dir_all(dir);
 }

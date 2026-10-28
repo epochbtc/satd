@@ -8214,11 +8214,9 @@ impl ChainState {
                         ChainError::FlatFile("block index entry missing for reorg connect".into())
                     })?;
                     side_failed_at = Some((*side_hash, side_entry.height));
-                    let side_block = self
-                        .get_block(side_hash)
-                        .ok_or(ChainError::FlatFile(
-                            "block data missing for reorg connect".to_string(),
-                        ))?;
+                    let side_block = self.get_block(side_hash).ok_or_else(|| {
+                        self.reorg_read_error(side_hash, side_entry.height, "block data missing for reorg connect")
+                    })?;
                     let parent_entry = self
                         .store
                         .get_block_index(&side_entry.header.prev_blockhash)
@@ -8873,8 +8871,9 @@ impl ChainState {
             let entry = self.store.get_block_index(&current)
                 .ok_or(ChainError::BadPrevBlock)?;
 
-            let block = self.get_block(&current)
-                .ok_or(ChainError::FlatFile("block data missing for reorg".to_string()))?;
+            let block = self.get_block(&current).ok_or_else(|| {
+                self.reorg_read_error(&current, entry.height, "block data missing for reorg")
+            })?;
 
             let undo = self.store.get_undo(&current)
                 .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
@@ -8970,6 +8969,24 @@ impl ChainState {
             disconnected_txs,
         })
     }
+    /// Whether `hash` has an OP_RETURN strip record, for choosing an error
+    /// message. A record that cannot be read counts as none: the read that
+    /// failed already failed closed.
+    fn has_strip_record(&self, hash: &BlockHash) -> bool {
+        matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
+    }
+
+    /// The error for a reorg path that could not read block `hash`: the
+    /// stripped-data message when the block is OP_RETURN-stripped, which
+    /// `get_block` reads as unavailable, and `generic` otherwise.
+    fn reorg_read_error(&self, hash: &BlockHash, height: u32, generic: &str) -> ChainError {
+        if self.has_strip_record(hash) {
+            ChainError::FlatFile(stripped_block_message(hash, height))
+        } else {
+            ChainError::FlatFile(generic.to_string())
+        }
+    }
+
     // --- invalidateblock / reconsiderblock (Bitcoin Core parity) ----------
 
     /// Mark `hash` (and every data-carrying descendant) invalid, then
@@ -8987,6 +9004,12 @@ impl ChainState {
     /// Returns [`ChainError::BlockNotFound`] for an unknown hash and
     /// [`ChainError::InvalidArgument`] when asked to invalidate genesis.
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        // The strip lock first, in its order (before `accept_lock`): a strip
+        // commits its record before it takes `accept_lock`, so without it a
+        // record could land between the stripped-block check below and the
+        // invalid marks, and the marks would stand over a rollback that then
+        // fails on that block.
+        let _strip_guard = self.strip.lock.lock();
         let _accept_guard = self.accept_lock.lock();
         self.check_no_snapshot_load()?;
 
@@ -9015,6 +9038,26 @@ impl ChainState {
                 "cannot invalidate a block at or below the AssumeUTXO snapshot height ({})",
                 bg.snapshot_height()
             )));
+        }
+
+        // Refuse before marking anything when the rollback would have to
+        // disconnect an OP_RETURN-stripped block: disconnect cannot run on one
+        // (its bytes are the filled form), and marking first would leave the
+        // branch invalid with the tip still on it.
+        if self.active_chain_contains(&hash, entry.height) {
+            let (mut cursor, _) = self.tip_snapshot();
+            loop {
+                let e = self.store.get_block_index(&cursor).ok_or(ChainError::BadPrevBlock)?;
+                if e.height < entry.height {
+                    break;
+                }
+                // A record that cannot be read refuses too: the marks would
+                // otherwise land before the disconnect hit the same fault.
+                if self.store.get_opreturn_strip(&cursor)?.is_some() {
+                    return Err(ChainError::InvalidArgument(stripped_block_message(&cursor, e.height)));
+                }
+                cursor = e.header.prev_blockhash;
+            }
         }
 
         // Flush block-index writes still buffered in the coin cache to the
@@ -10136,9 +10179,9 @@ impl ChainState {
                     ChainError::FlatFile("block index entry missing for reorg connect".into())
                 })?;
                 reconnect_failed_at = Some((*h, e.height));
-                let block = self.get_block(h).ok_or(ChainError::FlatFile(
-                    "block data missing for reorg connect".to_string(),
-                ))?;
+                let block = self.get_block(h).ok_or_else(|| {
+                    self.reorg_read_error(h, e.height, "block data missing for reorg connect")
+                })?;
                 let parent_entry = self
                     .store
                     .get_block_index(&e.header.prev_blockhash)
@@ -10738,6 +10781,17 @@ impl ReplayHashes {
 /// The error a replay stops with on a block whose strip record does not
 /// verify. It never connects such a block: without the record its txids are
 /// unknown.
+/// Why a reorg or `invalidateblock` cannot go through block `hash`: it is
+/// OP_RETURN-stripped, and disconnecting or reconnecting a block needs its
+/// full data (plan §2.10).
+fn stripped_block_message(hash: &BlockHash, height: u32) -> String {
+    format!(
+        "block {hash} at height {height} has stripped OP_RETURN data; a reorg that \
+         disconnects or reconnects it is not possible without re-downloading it \
+         (getblockfrompeer)"
+    )
+}
+
 fn unreplayable_record(
     height: u32,
     hash: &BlockHash,

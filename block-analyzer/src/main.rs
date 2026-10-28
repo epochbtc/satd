@@ -11,7 +11,13 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(name = "block-analyzer", about = "Analyze block data for pre-pass parallelization potential")]
 struct Args {
-    /// Path to blocks directory containing blk*.dat files
+    /// Path to blocks directory containing blk*.dat files.
+    ///
+    /// The files are parsed as they are on disk. On a node that has stripped
+    /// OP_RETURN payloads (-pruneopreturn), a stripped output reads as its
+    /// OP_RETURN byte followed by zeros, and a stripped transaction hashes to a
+    /// txid that is not its own; the node applies its strip records, this tool
+    /// does not.
     #[arg(long)]
     blocks_dir: PathBuf,
 
