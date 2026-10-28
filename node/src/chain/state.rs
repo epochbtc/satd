@@ -21,7 +21,10 @@ use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
 #[path = "state_strip.rs"]
 mod strip;
-pub use strip::{FAILPOINT_ENV, PassReport, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus, run_strip_worker};
+pub use strip::{
+    FAILPOINT_ENV, PassReport, RestoreItem, RestoreProgress, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus,
+    run_strip_worker,
+};
 
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`

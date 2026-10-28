@@ -135,6 +135,13 @@ pub(crate) struct StripState {
     /// One more than the value of `changes` read before the option-off pass's
     /// last flush and recount; 0 before the first.
     counted: std::sync::atomic::AtomicU64,
+    /// `-restoreopreturns`: the P2P downloader fetches the stripped blocks
+    /// again (plan §11).
+    restore: std::sync::atomic::AtomicBool,
+    /// What the restore is doing, as the downloader last set it.
+    restore_status: Mutex<WorkerStatus>,
+    /// The restore's counts, as the downloader last reported them.
+    restore_progress: Mutex<Option<RestoreProgress>>,
     /// The records' totals and when they were added up.
     summary: Mutex<Option<(std::time::Instant, opreturn_strip::StripSummary)>>,
     /// The totals as last added up, however long ago: what `getblockchaininfo`
@@ -487,7 +494,8 @@ pub struct StripConfig {
     pub size_threshold: u64,
 }
 
-/// What the strip worker is doing.
+/// What the strip worker, or under `-restoreopreturns` the restore, is
+/// doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorkerStatus {
     /// `-pruneopreturn` is off, or the worker has not started.
@@ -496,6 +504,16 @@ pub enum WorkerStatus {
     Running,
     /// Waiting for the node to go quiet; the reason names what it waits for.
     Paused(&'static str),
+    /// Downloading stripped blocks again.
+    Restoring,
+    /// No connected peer that keeps every block.
+    WaitingForPeers,
+    /// Too little free space on the blocks volume for what is left.
+    WaitingForDisk,
+    /// The node is behind its best header, or not quiet: the tip comes first.
+    WaitingForTip,
+    /// `-restoreopreturns` with no stripped block left.
+    Restored,
 }
 
 impl WorkerStatus {
@@ -503,11 +521,43 @@ impl WorkerStatus {
         match self {
             Self::Off => "off",
             Self::Running => "running",
+            Self::Restoring => "restoring",
+            Self::WaitingForPeers => "waiting_for_peers",
+            Self::WaitingForDisk => "waiting_for_disk",
+            Self::WaitingForTip => "waiting_for_tip",
+            Self::Restored => "restored",
             Self::Paused("initial block download") => "ibd",
             Self::Paused("an AssumeUTXO background chainstate is validating") => "background_validation",
             Self::Paused(_) => "reindex",
         }
     }
+}
+
+/// A `-restoreopreturns` pass as the downloader reports it
+/// (`getopreturnpruneinfo.restore`, plan §11.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestoreProgress {
+    /// Stripped blocks when the pass started.
+    pub total_blocks: u64,
+    pub remaining_blocks: u64,
+    /// Restored since the node started.
+    pub restored_blocks: u64,
+    pub bytes_downloaded: u64,
+    /// The stored lengths of the blocks the pass has left, roughly what is
+    /// still to download.
+    pub remaining_bytes: u64,
+    pub in_flight: u64,
+    /// Connected peers the restore may ask.
+    pub peers: u64,
+}
+
+/// One stripped block for the restore to fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreItem {
+    pub hash: BlockHash,
+    pub height: u32,
+    /// The stored block's length in bytes, which a full copy matches.
+    pub len: u64,
 }
 
 /// What one [`ChainState::strip_pass`] did.
@@ -536,6 +586,79 @@ impl ChainState {
     /// Set `-pruneopreturnpeers`. Call once, at startup.
     pub fn set_opreturn_prune_peers(&self, peers: opreturn_strip::PrunePeers) {
         let _ = self.strip.peers.set(peers);
+    }
+
+    /// Turn `-restoreopreturns` on. Call once, at startup.
+    pub fn request_opreturn_restore(&self) {
+        self.strip.restore.store(true, Ordering::Release);
+        *self.strip.restore_status.lock() = WorkerStatus::WaitingForPeers;
+    }
+
+    pub fn opreturn_restore_requested(&self) -> bool {
+        self.strip.restore.load(Ordering::Acquire)
+    }
+
+    /// `-restoreopreturns` and a stripped block left to download.
+    pub fn opreturn_restore_pending(&self) -> bool {
+        self.opreturn_restore_requested() && self.strip.has_records.load(Ordering::Acquire)
+    }
+
+    /// Why the restore must wait for the tip (plan §11.4, R-3): the node is
+    /// not quiet, or its best header is ahead of its tip. `None` when it may
+    /// download.
+    pub fn opreturn_restore_held_by_tip(&self) -> Option<&'static str> {
+        if let Err(StripError::NotQuiet(why)) = self.check_quiet() {
+            return Some(why);
+        }
+        (self.headers_tip_height() > self.tip_height()).then_some("the tip is behind the best header")
+    }
+
+    /// The stripped blocks, in height order (descending with `descending`),
+    /// each with its stored length: the work list of a restore pass. A record
+    /// whose block is no longer stored (pruned meanwhile) is left out.
+    pub fn opreturn_restore_work(&self, descending: bool) -> Result<Vec<RestoreItem>, StoreError> {
+        let mut hashes = Vec::new();
+        self.store.for_each_opreturn_strip(&mut |hash, _| hashes.push(*hash))?;
+        let mut work = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let Some(entry) = self.store.get_block_index(&hash) else {
+                continue;
+            };
+            if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid) {
+                continue;
+            }
+            let pos = FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            };
+            let Ok(len) = self.flat_files.lock().read_block_len(&pos) else {
+                continue;
+            };
+            work.push(RestoreItem {
+                hash,
+                height: entry.height,
+                len: u64::from(len),
+            });
+        }
+        if descending {
+            work.sort_unstable_by(|a, b| b.height.cmp(&a.height));
+        } else {
+            work.sort_unstable_by_key(|i| i.height);
+        }
+        Ok(work)
+    }
+
+    /// The downloader's report of what the restore is doing.
+    pub fn set_opreturn_restore_status(&self, status: WorkerStatus, progress: Option<RestoreProgress>) {
+        *self.strip.restore_status.lock() = status;
+        if progress.is_some() {
+            *self.strip.restore_progress.lock() = progress;
+        }
+    }
+
+    /// The restore's counts, once a pass has started.
+    pub fn opreturn_restore_progress(&self) -> Option<RestoreProgress> {
+        *self.strip.restore_progress.lock()
     }
 
     /// What a node with stripped blocks serves to peers.
@@ -595,6 +718,9 @@ impl ChainState {
             "OP_RETURN restore complete: no block is stripped any more. The node serves the full chain \
              again (NODE_NETWORK) and its datadir is an ordinary one"
         );
+        if self.opreturn_restore_requested() {
+            tracing::info!("-restoreopreturns has nothing left to do and can be removed");
+        }
         Ok(true)
     }
 
@@ -694,7 +820,15 @@ impl ChainState {
             .and_then(|b| opreturn_strip::StripMeta::decode(&b))
     }
 
+    /// What the strip worker is doing, or under `-restoreopreturns` the
+    /// restore: `Restored` once no stripped block is left.
     pub fn opreturn_strip_worker_status(&self) -> WorkerStatus {
+        if self.opreturn_restore_requested() {
+            if !self.strip.has_records.load(Ordering::Acquire) {
+                return WorkerStatus::Restored;
+            }
+            return *self.strip.restore_status.lock();
+        }
         *self.strip.worker.lock()
     }
 
