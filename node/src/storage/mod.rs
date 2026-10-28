@@ -820,6 +820,12 @@ pub trait Store: Send + Sync {
     /// [`Self::get_opreturn_strip`] has none: a store that forgot it would
     /// report nothing stripped.
     fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError>;
+    /// Remove the strip family, records and meta with it; nothing when it
+    /// does not exist. For a node with no record left and the option off:
+    /// without the family, a release that predates it opens the datadir
+    /// again. No default: a layered store that dropped this silently would
+    /// leave the datadir one an older release refuses.
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError>;
     fn clear_chainstate(&self) -> Result<(), StoreError>;
     /// Clear everything: block index, UTXO set, undo data, tx index, height index, tip.
     /// Used by `-reindex`.

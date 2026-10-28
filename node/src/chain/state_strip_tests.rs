@@ -1214,3 +1214,118 @@ fn a_record_removed_elsewhere_leaves_the_totals_after_the_next_pass() {
     assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// With the option off, restoring the last stripped block finishes the job
+/// (plan §11.5) at the worker's next pass: the node is no longer stripping,
+/// so it advertises `NODE_NETWORK` again, and the strip family is gone.
+#[test]
+fn restoring_the_last_stripped_block_with_the_option_off_finishes() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    cs.strip_block(&b.block_hash(), THRESHOLD).unwrap();
+    // A cursor left from when the option was on.
+    let meta = opreturn_strip::StripMeta {
+        next_height: 103,
+        size_threshold: THRESHOLD,
+        depth: 0,
+        last_hash: None,
+    };
+    cs.write_strip_meta(&meta).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert!(cs.opreturn_prune_active(), "premise: a stripped block keeps the node limited");
+    assert_eq!(cs.opreturn_strip_meta(), Some(meta), "premise: a record keeps the family");
+
+    cs.repair_block_data(b).unwrap();
+    assert_eq!(record(&cs, &b.block_hash()), None, "premise: restored");
+    assert!(cs.opreturn_prune_active(), "until the worker's pass");
+    assert_eq!(pass(&cs, 1000), PassReport::default());
+    assert!(!cs.opreturn_prune_active());
+    assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
+    assert!(!cs.holds_strip_record(&b.block_hash()));
+    assert_eq!(cs.opreturn_strip_meta(), None, "the strip family is dropped, cursor and all");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record left, or the option on, and the pass finishes nothing.
+#[test]
+fn a_record_left_or_the_option_on_keeps_the_node_stripping() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    cs.strip_block(&b.block_hash(), THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    cs.forget_strip_summary();
+    assert_eq!(pass(&cs, 1000), PassReport::default());
+    assert!(cs.opreturn_prune_active(), "a record is left");
+    assert!(record(&cs, &b.block_hash()).is_some());
+
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 0,
+        size_threshold: THRESHOLD,
+    });
+    cs.repair_block_data(b).unwrap();
+    pass(&cs, 1000);
+    assert!(cs.opreturn_prune_active(), "the option is on");
+    assert!(cs.opreturn_strip_meta().is_some(), "and its cursor is kept");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// At startup with the option off and no record, the family goes: a drop a
+/// crash interrupted, or a datadir that only ever held the worker's cursor.
+/// With the option on, the cursor stays.
+#[test]
+fn startup_drops_an_empty_strip_family_only_with_the_option_off() {
+    let meta = opreturn_strip::StripMeta {
+        next_height: 50,
+        size_threshold: THRESHOLD,
+        depth: 288,
+        last_hash: None,
+    };
+    let (cs, dir) = make_chain_state();
+    chain(&cs);
+    cs.write_strip_meta(&meta).unwrap();
+    cs.configure_opreturn_prune(StripConfig {
+        depth: 288,
+        size_threshold: THRESHOLD,
+    });
+    cs.load_opreturn_strip_state().unwrap();
+    assert_eq!(cs.opreturn_strip_meta(), Some(meta), "the option is on");
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (cs, dir) = make_chain_state();
+    chain(&cs);
+    cs.write_strip_meta(&meta).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    assert_eq!(cs.opreturn_strip_meta(), None);
+    assert!(!cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The worker stops once nothing is stripped and the option is off, rather
+/// than idling for the life of the node.
+#[test]
+fn the_worker_stops_when_nothing_is_left_to_count() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = blocks[101].clone();
+    cs.strip_block(&b.block_hash(), THRESHOLD).unwrap();
+    cs.load_opreturn_strip_state().unwrap();
+    cs.repair_block_data(&b).unwrap();
+    let cs = std::sync::Arc::new(cs);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = {
+        let (cs, stop) = (cs.clone(), stop.clone());
+        std::thread::spawn(move || {
+            run_strip_worker(cs, stop);
+            done_tx.send(()).unwrap();
+        })
+    };
+    let finished = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(finished.is_ok(), "the worker kept running with nothing to do");
+    assert!(!cs.opreturn_prune_active());
+    let _ = std::fs::remove_dir_all(dir);
+}

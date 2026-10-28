@@ -95,11 +95,13 @@ const TEMP_VALUE_LEN: usize = 32 + node_index::TXSEQ_LEN;
 
 /// OP_RETURN strip records, keyed by the 32-byte block hash, plus the
 /// strip worker's state under [`OPRETURN_STRIP_META_KEY`]. Created on the
-/// first write that needs it and never dropped, so a datadir that never
-/// strips stays openable by a release that predates this family, and one
-/// that did is refused by it: RocksDB will not open a database with an
-/// undeclared column family, and an older release would otherwise serve
-/// the zeroed bytes as the block.
+/// first write that needs it, so a datadir that never strips stays openable
+/// by a release that predates this family, and one that did is refused by
+/// it: RocksDB will not open a database with an undeclared column family,
+/// and an older release would otherwise serve the zeroed bytes as the
+/// block. Dropped again once no record is left and the option is off
+/// (`Store::drop_opreturn_strip_cf`), which makes the datadir an ordinary
+/// one again.
 const CF_OPRETURN_STRIP: &str = "opreturn_strip";
 /// Key of the strip worker's cursor and counters. Four bytes, so it can
 /// never collide with a block hash.
@@ -647,6 +649,13 @@ pub struct RocksDbStore {
     /// to batches: each batch is either in the snapshot or in `pending`,
     /// never neither and never both.
     recent_window: parking_lot::Mutex<RecentWindowState>,
+    /// Held shared by every batch write that touches the strip family, from
+    /// its handle lookup to its `db.write`, and exclusively by
+    /// `drop_opreturn_strip_cf`. A batch built against the family's handle
+    /// and written after the drop would fail with RocksDB's "invalid column
+    /// family", and most batches carrying a strip remove are a block's
+    /// connect.
+    strip_cf_gate: parking_lot::RwLock<()>,
     /// Test hook: when set, a build signals the sender once its snapshot is
     /// taken and waits on the receiver before scanning, so a test can land
     /// writes in exactly that gap through a layer (a `CoinCache`) that owns
@@ -1058,6 +1067,7 @@ impl RocksDbStore {
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
             tuning,
             recent_window: parking_lot::Mutex::new(RecentWindowState::Absent),
+            strip_cf_gate: parking_lot::RwLock::new(()),
             #[cfg(test)]
             recent_window_test_pause: parking_lot::Mutex::new(None),
         };
@@ -1925,6 +1935,7 @@ impl RocksDbStore {
         // Only a put creates the strip family. A remove for a block that
         // never had a record must not, or every datadir would become one
         // an older release refuses to open.
+        let _strip_cf = batch.has_opreturn_strip_ops().then(|| self.strip_cf_gate.read());
         if !batch.opreturn_strip_puts.is_empty() || batch.opreturn_strip_meta.is_some() {
             self.create_opreturn_strip_cf()?;
         }
@@ -2590,6 +2601,16 @@ impl Store for RocksDbStore {
         self.db
             .get_cf(&cf, OPRETURN_STRIP_META_KEY)
             .map_err(|e| StoreError::Database(format!("read {CF_OPRETURN_STRIP} meta: {e}")))
+    }
+
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        let _gate = self.strip_cf_gate.write();
+        if self.db.cf_handle(CF_OPRETURN_STRIP).is_none() {
+            return Ok(());
+        }
+        self.db
+            .drop_cf(CF_OPRETURN_STRIP)
+            .map_err(|e| StoreError::Database(format!("drop_cf({CF_OPRETURN_STRIP}): {e}")))
     }
 
     fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {

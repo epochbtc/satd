@@ -124,8 +124,8 @@ pub(crate) struct StripState {
     /// to a node with stripped blocks even after the option is turned off.
     peers: std::sync::OnceLock<opreturn_strip::PrunePeers>,
     /// Some block has a strip record. Set at startup from the store and by
-    /// every strip; never cleared while running, so a node that restored its
-    /// last stripped block stays limited until a restart rechecks.
+    /// every strip; cleared when the worker finds the last record gone with
+    /// the option off ([`ChainState::finish_opreturn_unstrip`]).
     has_records: std::sync::atomic::AtomicBool,
     /// What the worker is doing, for `getopreturnpruneinfo`.
     worker: Mutex<WorkerStatus>,
@@ -549,13 +549,46 @@ impl ChainState {
     }
 
     /// Read the store once at startup for whether any block is stripped.
+    /// Call after [`Self::configure_opreturn_prune`]: with the option off
+    /// and no record, the strip family is dropped, as the worker drops it
+    /// when the last record goes (plan §11.5). That finishes a drop a crash
+    /// interrupted, and frees a datadir that only ever held the worker's
+    /// cursor.
     pub fn load_opreturn_strip_state(&self) -> Result<(), StoreError> {
         let (summary, records) = self.compute_strip_summary()?;
         // Every record counts here, read back or not: its block is stripped
         // on disk either way.
         self.strip.has_records.store(records > 0, Ordering::Release);
+        if records == 0 && self.opreturn_prune_config().is_none() {
+            self.store.drop_opreturn_strip_cf()?;
+        }
         *self.strip.summary.lock() = Some((std::time::Instant::now(), summary));
         Ok(())
+    }
+
+    /// With the option off, the last strip record gone: drop the strip
+    /// family and clear [`StripState::has_records`], so the node advertises
+    /// `NODE_NETWORK` again on its next handshake and an older release can
+    /// open the datadir (plan §11.5). Rechecks under the strip lock, which
+    /// every record write takes. Returns whether it finished.
+    pub(super) fn finish_opreturn_unstrip(&self) -> Result<bool, StoreError> {
+        if self.opreturn_prune_config().is_some() {
+            return Ok(false);
+        }
+        let _strip = self.strip.lock.lock();
+        let (summary, records) = self.compute_strip_summary()?;
+        if records > 0 {
+            return Ok(false);
+        }
+        self.store.drop_opreturn_strip_cf()?;
+        self.strip.has_records.store(false, Ordering::Release);
+        *self.strip.summary.lock() = Some((std::time::Instant::now(), summary));
+        *self.strip.usage.lock() = None;
+        tracing::info!(
+            "OP_RETURN restore complete: no block is stripped any more. The node serves the full chain \
+             again (NODE_NETWORK) and its datadir is an ordinary one"
+        );
+        Ok(true)
     }
 
     /// The records' totals, and how many records there are, decodable or not.
@@ -612,6 +645,14 @@ impl ChainState {
         let (summary, _) = self.compute_strip_summary()?;
         *cached = Some((std::time::Instant::now(), summary));
         Ok(summary)
+    }
+
+    /// Add the totals up again, as [`Self::opreturn_strip_summary`] would on
+    /// a miss, and return how many records there are.
+    fn opreturn_strip_summary_records(&self) -> Result<u64, StoreError> {
+        let (summary, records) = self.compute_strip_summary()?;
+        *self.strip.summary.lock() = Some((std::time::Instant::now(), summary));
+        Ok(records)
     }
 
     /// The totals as last added up, without reading the store: at startup,
@@ -671,8 +712,9 @@ impl ChainState {
             // to strip, but a record removed since the last pass (`-prune`,
             // `getblockfrompeer`, a fresh copy) dropped the totals.
             *self.strip.worker.lock() = WorkerStatus::Off;
-            if self.strip.summary.lock().is_none() {
-                let _ = self.opreturn_strip_summary();
+            let dropped = self.strip.summary.lock().is_none();
+            if dropped && self.opreturn_strip_summary_records()? == 0 {
+                self.finish_opreturn_unstrip()?;
             }
             return Ok(PassReport::default());
         };
@@ -1007,6 +1049,11 @@ pub fn run_strip_worker(chain: std::sync::Arc<ChainState>, stop: std::sync::Arc<
         };
         if more {
             continue;
+        }
+        // The option is off and the last stripped block is restored: there
+        // is nothing left to keep count of.
+        if !chain.opreturn_prune_active() {
+            break;
         }
         let tip = chain.tip_height();
         let started = std::time::Instant::now();

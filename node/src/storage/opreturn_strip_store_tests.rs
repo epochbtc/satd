@@ -276,3 +276,80 @@ fn a_buffered_put_and_remove_in_one_batch_reads_as_it_flushes() {
     cache.flush().unwrap();
     assert_eq!(cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(), None, "flushed");
 }
+
+/// Dropping the family (plan §11.5) takes the records and the meta with it,
+/// and leaves a datadir a release that predates the family opens again. A
+/// remove afterwards does not bring it back, and a second drop is a no-op.
+#[test]
+fn dropping_the_strip_family_makes_the_datadir_ordinary_again() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
+        let mut batch = put(hash(1), b"record");
+        batch.opreturn_strip_meta = Some(b"cursor".to_vec());
+        store.write_batch(batch).unwrap();
+        assert!(chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "premise");
+
+        store.drop_opreturn_strip_cf().unwrap();
+        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
+        assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap(), None);
+        assert_eq!(store.opreturn_strip_meta().unwrap(), None);
+        store.write_batch(remove(hash(1))).unwrap();
+        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "a remove must not recreate it");
+        store.drop_opreturn_strip_cf().unwrap();
+    }
+    open_without_strip_cf(dir.path()).expect("an older release opens the datadir again");
+}
+
+/// A batch that touches the family, written while the family is dropped, must
+/// still land: most such batches are a block's connect, and RocksDB fails a
+/// write to a family dropped after the batch looked its handle up.
+#[test]
+fn batches_racing_the_family_drop_never_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (store, stop) = (store.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut writes = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                store.write_batch(remove(hash(2))).expect("a batch racing the drop");
+                writes += 1;
+            }
+            writes
+        })
+    };
+    for _ in 0..200 {
+        store.write_batch(put(hash(1), b"record")).unwrap();
+        store.drop_opreturn_strip_cf().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.join().unwrap() > 0, "premise: the writer ran");
+}
+
+/// The in-memory store and both layers forward the drop.
+#[test]
+fn every_layer_drops_the_strip_family() {
+    let batch = || {
+        let mut batch = put(hash(1), b"record");
+        batch.opreturn_strip_meta = Some(b"cursor".to_vec());
+        batch
+    };
+    let store = InMemoryStore::new();
+    store.write_batch(batch()).unwrap();
+    store.drop_opreturn_strip_cf().unwrap();
+    assert_eq!((store.get_opreturn_strip(&hash(1)).unwrap(), store.opreturn_strip_meta().unwrap()), (None, None));
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = CoinCache::new(Box::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()), 10);
+    cache.write_batch(batch()).unwrap();
+    cache.drop_opreturn_strip_cf().unwrap();
+    assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "through a CoinCache");
+
+    let block_store = Arc::new(InMemoryStore::new());
+    let split = SplitStore::new(block_store.clone(), Arc::new(InMemoryStore::new()), None);
+    split.write_batch(batch()).unwrap();
+    split.drop_opreturn_strip_cf().unwrap();
+    assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap(), None, "through a SplitStore");
+}

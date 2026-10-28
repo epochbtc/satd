@@ -376,6 +376,9 @@ impl Store for ControllableStore {
     fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
         self.inner.for_each_opreturn_strip(f)
     }
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        self.inner.drop_opreturn_strip_cf()
+    }
     fn flush_durable(&self) -> Result<(), StoreError> {
         self.inner.flush_durable()
     }
