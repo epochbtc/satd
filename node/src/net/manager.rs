@@ -386,6 +386,9 @@ fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pe
     }
     (!services.has(wanted)).then_some(wanted)
 }
+/// A restore pass's work list as read on the blocking pool.
+type RestoreWork = Result<Vec<crate::chain::state::RestoreItem>, String>;
+
 /// What became of a block the restore asked for.
 #[derive(Clone, Copy)]
 enum RestoreArrival {
@@ -1300,7 +1303,7 @@ pub struct PeerManager {
     opreturn_restore: parking_lot::Mutex<Option<crate::net::opreturn_restore::RestoreDownloader>>,
     /// A restore pass's work list, read on the blocking pool and picked up
     /// by the next tick.
-    opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<Result<Vec<crate::chain::state::RestoreItem>, String>>>>,
+    opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<RestoreWork>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// The block processor and background catch-up threads, named. Both
