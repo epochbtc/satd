@@ -382,7 +382,9 @@ fn only_a_valid_block_on_the_active_chain_is_stripped() {
 /// punch drops the record in its own batch. The strip's record lands after
 /// it and describes the old copy, so it is removed again, and nothing is
 /// punched. The repair needs a record to act (it leaves a readable intact
-/// block alone), so this is an extension of a block stripped once.
+/// block alone), so this is an extension of a block stripped once. The hook
+/// drives the append half directly: a full repair would restore this block
+/// in place, which waits for the strip lock the strip holds.
 #[test]
 fn a_repoint_before_the_punch_leaves_no_record() {
     let (cs, dir) = make_chain_state();
@@ -393,10 +395,8 @@ fn a_repoint_before_the_punch_leaves_no_record() {
     let old = cs.store.get_block_index(&hash).unwrap();
     let before = on_disk(&cs, &hash);
     *cs.strip.after_plan_hook.lock() = Some(Box::new(move |cs: &ChainState| {
-        // `get_block` sees the record and answers None, so the repair
-        // appends a full copy.
         assert!(matches!(
-            cs.repair_block_data(&b).unwrap(),
+            cs.repair_block_data_by_append(&b, 102).unwrap(),
             crate::chain::state::BlockDataRepair::Repaired { .. }
         ));
         assert!(record(cs, &b.block_hash()).is_none(), "the repair dropped the record");
@@ -949,5 +949,92 @@ fn invalidate_block_waits_for_a_strip_in_progress() {
     done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
     worker.join().unwrap().expect("invalidate");
     assert_eq!(cs.store.get_block_index(&tip).unwrap().status, BlockStatus::Invalid);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `getblockfrompeer`'s repair of a stripped block restores it in place
+/// (plan §2.12): the entry keeps its position, nothing is appended, the
+/// payload is back on disk, the record is gone, and the block reads intact.
+#[test]
+fn a_repair_restores_a_stripped_block_in_place() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0), "premise: punched");
+    let entry = cs.store.get_block_index(&hash).unwrap();
+    let file = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let len = std::fs::metadata(&file).unwrap().len();
+
+    assert!(matches!(cs.repair_block_data(b).unwrap(), crate::chain::state::BlockDataRepair::Repaired { .. }));
+    let now = cs.store.get_block_index(&hash).unwrap();
+    assert_eq!((now.file_number, now.data_pos), (entry.file_number, entry.data_pos), "in place");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), len, "nothing appended");
+    assert_eq!(payload_on_disk(&cs, &hash, 1, 1), op_return(BIG, 1).as_bytes()[1..], "the payload is back");
+    assert_eq!(record(&cs, &hash), None);
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(b));
+    assert_eq!(corrupt_warning(&cs, &hash), None);
+    // A repeat finds the block readable and writes nothing.
+    assert!(matches!(
+        cs.repair_block_data(b).unwrap(),
+        crate::chain::state::BlockDataRepair::AlreadyPresent { .. }
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A record that does not describe the peer's copy is never trusted to place
+/// it: the repair appends a copy as for any damaged block, and the record goes
+/// with the old one.
+#[test]
+fn a_repair_appends_when_the_record_does_not_describe_the_block() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = &blocks[101];
+    let hash = b.block_hash();
+    cs.strip_block(&hash, THRESHOLD).unwrap();
+    let entry = cs.store.get_block_index(&hash).unwrap();
+    // A record that decodes but whose filled hash is not this block's.
+    let mut wrong = record(&cs, &hash).unwrap();
+    wrong.filled_sha256[0] ^= 1;
+    cs.store
+        .write_batch(StoreBatch { opreturn_strip_puts: vec![(hash, wrong.encode())], ..Default::default() })
+        .unwrap();
+
+    assert!(matches!(cs.repair_block_data(b).unwrap(), crate::chain::state::BlockDataRepair::Repaired { .. }));
+    let now = cs.store.get_block_index(&hash).unwrap();
+    assert_ne!((now.file_number, now.data_pos), (entry.file_number, entry.data_pos), "appended");
+    assert_eq!(record(&cs, &hash), None);
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(b));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The in-place restore waits for a strip in progress: a redo, which writes no
+/// record, would otherwise punch bytes whose record the restore had removed.
+#[test]
+fn an_in_place_restore_waits_for_a_strip_in_progress() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    let b = blocks[101].clone();
+    cs.strip_block(&b.block_hash(), THRESHOLD).unwrap();
+    let cs = std::sync::Arc::new(cs);
+    let held = cs.strip.lock.lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let cs = cs.clone();
+        std::thread::spawn(move || {
+            let r = cs.repair_block_data(&b).map(|_| ());
+            done_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "the restore ran while a strip held the lock"
+    );
+    drop(held);
+    done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
+    worker.join().unwrap().expect("restore");
+    assert_eq!(record(&cs, &blocks[101].block_hash()), None);
     let _ = std::fs::remove_dir_all(dir);
 }

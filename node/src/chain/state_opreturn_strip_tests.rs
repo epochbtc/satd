@@ -306,8 +306,8 @@ fn prune_drops_the_strip_records_of_the_blocks_it_deletes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// `getblockfrompeer`'s repair appends a full copy and points the entry at
-/// it; the record of the old copy goes in the same batch.
+/// `getblockfrompeer`'s repair writes the full copy back (in place, see
+/// `a_repair_restores_a_stripped_block_in_place`) and drops the record.
 #[test]
 fn repairing_a_stripped_block_with_a_full_copy_drops_the_record() {
     let (cs, dir) = make_chain_state();
@@ -454,5 +454,41 @@ fn a_repoint_between_the_index_read_and_the_record_lookup_is_not_corruption() {
 
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&b), "the reader follows the repoint");
     assert_eq!(corrupt_warning(&cs, &hash), None, "a repoint is not corruption");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The same race with an in-place restore (plan §2.12), which writes the full
+/// block over the stripped one and then removes the record, the entry staying
+/// where it is. A reader that read the punched bytes and then finds no record
+/// must read again, not report corruption.
+#[test]
+fn an_in_place_restore_between_the_byte_read_and_the_record_lookup_is_not_corruption() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = chain_with_a_big_op_return(&cs);
+    let b = blocks[101].clone();
+    let hash = b.block_hash();
+    strip(&cs, &b);
+    cs.flush_durable().unwrap();
+
+    // What the restore does, in its order: the bytes, then the record.
+    let entry = cs.store.get_block_index(&hash).unwrap();
+    let offset = u64::from(entry.data_pos) + 8;
+    let mut body = serialize(&b);
+    let key = cs.flat_files.lock().xor_key();
+    crate::storage::flatfile::xor_in_place(&mut body, &key, offset);
+    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    controls.before_next_strip_lookup(move |inner: &InMemoryStore| {
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&file, &body, offset).unwrap();
+        inner
+            .write_batch(StoreBatch { opreturn_strip_removes: vec![hash], ..Default::default() })
+            .unwrap();
+    });
+    cs.store_ref().drop_read_overlays();
+
+    assert_eq!(cs.get_block(&hash).as_ref(), Some(&b), "the reader reads again");
+    assert_eq!(corrupt_warning(&cs, &hash), None, "a restore is not corruption");
     let _ = std::fs::remove_dir_all(dir);
 }

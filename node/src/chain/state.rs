@@ -4893,15 +4893,15 @@ impl ChainState {
                     && opreturn_strip::has_punched_op_return(&stored.block, &xor_key)
                     && !stored.verify_merkle() =>
             {
-                // A repair can point the entry at a fresh copy and drop the
-                // record in one batch, between this reader's index read and
-                // its record lookup. The reader then holds the old, punched
-                // bytes and no record, on a store that is consistent. Read
-                // again from where the entry points now.
-                let moved = self.store.get_block_index(hash).is_some_and(|now| {
-                    now.file_number != entry.file_number || now.data_pos != entry.data_pos
-                });
-                if moved && may_retry {
+                // A repair can drop the record between this reader's byte
+                // read and its record lookup: by pointing the entry at a
+                // fresh copy in the same batch, or by restoring the block in
+                // place and only then removing the record. Either way the
+                // reader holds the old, punched bytes and no record, on a
+                // store that is consistent. Read again: the second read
+                // finds the fresh copy, the restored bytes, or the same
+                // missing record, which is then real.
+                if may_retry {
                     return self.read_stored_block(hash, false);
                 }
                 self.report_corrupt_block_data(
@@ -5480,6 +5480,24 @@ impl ChainState {
             return Ok(BlockDataRepair::AlreadyPresent { height });
         }
 
+        // An OP_RETURN-stripped copy is restored in place when the peer's
+        // block is the one its strip record describes (plan §2.12): no second
+        // copy, no new slack.
+        if let Some(restored) = self.restore_stripped_in_place(block, height)? {
+            return Ok(restored);
+        }
+        self.repair_block_data_by_append(block, height)
+    }
+
+    /// The general half of [`Self::repair_block_data`], once `block` has
+    /// passed its checks at `height`: append a fresh copy and point the entry
+    /// at it.
+    pub(super) fn repair_block_data_by_append(
+        &self,
+        block: &Block,
+        height: u32,
+    ) -> Result<BlockDataRepair, ChainError> {
+        let hash = block.block_hash();
         // Append the record BEFORE taking `accept_lock`. `write_block_durable`
         // takes the flat-file mutex, and `store_block` holds `accept_lock`
         // while writing its batch *after* releasing that mutex — acquiring

@@ -1188,3 +1188,58 @@ fn a_reorg_past_a_stripped_block_fails_closed_with_the_stripped_message() {
     assert!(!has_corrupt_warning(&node));
     node.stop();
 }
+
+/// `getblockfrompeer` restores a stripped block in place (plan §2.12, PR 7).
+/// Node A strips a block that node B holds intact, then fetches it from B:
+/// the raw block is served again, the strip summary is gone, the payload is
+/// back in A's block files, and the punched space is allocated again. A runs
+/// with a blocks-dir xor key, so the restore must encode what it writes.
+#[test]
+fn getblockfrompeer_restores_a_stripped_block_in_place() {
+    use serde_json::json;
+
+    let mut a = TestNode::start(&["--allowteststrip", "--blocksxor=1"]);
+    let hash = block_with_a_big_op_return(&a);
+    let tip = a.rpc_ok("getbestblockhash", vec![]);
+    let raw = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+
+    let mut b = TestNode::start(&[]);
+    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
+    common::poll_until(
+        || b.rpc_ok("getbestblockhash", vec![]) == tip,
+        test_timeout(60),
+        "B never synced from A",
+    );
+
+    let before = allocated(&a);
+    let out = strip(&a, &hash).expect("strip");
+    assert_eq!(out["outcome"], "stripped", "{out}");
+    assert!(!payload_on_disk(&a), "premise: the payload is gone");
+    assert!(allocated(&a) < before, "premise: the punch gave space back");
+    assert_raw_block_unavailable(&a, &hash);
+    let stripped = allocated(&a);
+
+    let peer = a.rpc_ok("getpeerinfo", vec![])[0]["id"].clone();
+    a.rpc_ok("getblockfrompeer", vec![json!(hash), peer]);
+    common::poll_until(
+        || a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)]).unwrap()["result"] == raw,
+        test_timeout(30),
+        "the block was never restored",
+    );
+    let block = a.rpc_ok("getblock", vec![json!(hash), json!(1)]);
+    assert!(block.get("opreturn_stripped").is_none(), "the record is gone: {block}");
+    assert!(payload_on_disk(&a), "the payload is back on disk");
+    assert!(allocated(&a) > stripped, "the punched space is allocated again");
+    assert!(!has_corrupt_warning(&a));
+
+    // In place: a restart reads it intact, and a strip finds no record to redo.
+    let datadir = a.datadir.clone();
+    let rpcport = a.rpcport;
+    a.stop();
+    a.datadir = PathBuf::new();
+    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--blocksxor=1"]);
+    assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), raw);
+    a.stop();
+    b.stop();
+    let _ = std::fs::remove_dir_all(&datadir);
+}
