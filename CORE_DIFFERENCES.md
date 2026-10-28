@@ -123,7 +123,9 @@ every chain and never dialled, as in Core.
 **On `-seednode`.** Core opens a `-seednode` peer as a short-lived
 `addr-fetch` connection, drops it once it has answered `getaddr`, and uses
 none under `-connect`. satd dials it as a `manual` connection and keeps it,
-under `-connect` too.
+under `-connect` too. The exception is a host name under `-proxy`: satd
+then opens it as Core does, an `addr-fetch` connection by name that the
+proxy resolves, and none under `-connect`.
 
 **Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
@@ -976,10 +978,9 @@ silently returning an empty or wrong answer.
   Core's Tor controller takes Tor's SOCKS port from the control connection,
   so Core accepts `-onlynet=onion` with `-listenonion` and no `-proxy`; satd's
   does not, and refuses that combination instead of starting with no
-  outbound transport. With `-proxy` set, satd's built-in bootstrap seeds are
-  `.onion` addresses only (no DNS through the proxy), so a proxied node
-  whose `-onlynet` leaves out onion needs `-seednode` or `-addnode`; satd
-  warns at startup. Core would fetch its DNS seeds through the proxy.
+  outbound transport. With `-proxy` set, satd reaches its DNS seeds by name
+  through the proxy, as `addr-fetch` connections, as Core does; it also
+  adds its built-in `.onion` seeds, which Core has no list of.
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
   argument descriptions. Two things follow from that, both deliberate:

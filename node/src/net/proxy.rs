@@ -42,6 +42,22 @@ pub async fn connect_socks5(
         .map_err(|e| format!("SOCKS5 connect to {} failed: {}", target, e))
 }
 
+/// Connect to a host name through a SOCKS5 proxy, which resolves it: a
+/// SOCKS5 domain-name CONNECT, so no lookup happens here. How a proxied node
+/// reaches a DNS seed or a `-seednode` hostname without a local DNS query,
+/// as Core's `ConnectNode` does through its name proxy.
+pub async fn connect_socks5_name(
+    proxy_addr: &str,
+    host: &str,
+    port: u16,
+    cred: SocksCred<'_>,
+    timeouts: DialTimeouts,
+) -> Result<TcpStream, String> {
+    socks5_connect(proxy_addr, (host, port), cred, timeouts)
+        .await
+        .map_err(|e| format!("SOCKS5 connect to {host}:{port} failed: {e}"))
+}
+
 /// Connect to a .onion address through a SOCKS5 proxy.
 /// Uses hostname-based SOCKS5 CONNECT (the proxy resolves the .onion).
 pub async fn connect_socks5_onion(
@@ -259,6 +275,27 @@ mod tests {
             "the exact .onion hostname must be passed through unresolved"
         );
         assert_eq!(port, 8333, "target port must be preserved");
+    }
+
+    /// #994: a DNS seed or `-seednode` host name reached through the proxy
+    /// goes as a SOCKS5 domain name (type 0x03), for the proxy to resolve:
+    /// a local lookup would leak it. Perturbation: hand the proxy an IP
+    /// address in its place and the address type is 0x01.
+    #[tokio::test]
+    async fn a_name_dial_sends_the_name_unresolved() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy_addr = listener.local_addr().expect("addr").to_string();
+        let server = tokio::spawn(fake_socks5_capture(listener));
+
+        let dial = connect_socks5_name(&proxy_addr, "seed.example.org", 8333, None, roomy()).await;
+        assert!(dial.is_ok(), "name dial should succeed: {dial:?}");
+        let (atyp, host_bytes, port) = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server did not finish")
+            .expect("server task panicked");
+        assert_eq!(atyp, 0x03);
+        assert_eq!(host_bytes, b"seed.example.org");
+        assert_eq!(port, 8333);
     }
 
     /// A fake SOCKS5 server that *requires* username/password auth (method

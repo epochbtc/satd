@@ -178,6 +178,13 @@ fn dial_added_seednodes(old: &Config, new: &Config, h: &ReloadHandles) {
     let pm = h.peer_manager.clone();
     let network = new.network;
     let proxy = new.proxy.clone();
+    // As at startup: under -proxy a host name is opened by name, as an
+    // `addr-fetch` the proxy resolves, and none under -connect.
+    if proxy.is_some() && new.automatic_outbound {
+        for (host, port) in node::net::dns::operator_seed_names(&added, network) {
+            pm.add_addr_fetch(host, port);
+        }
+    }
     tokio::spawn(async move {
         let seed_addrs =
             node::net::dns::resolve_operator_seeds(&added, network, proxy.as_deref()).await;
