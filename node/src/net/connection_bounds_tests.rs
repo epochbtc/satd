@@ -152,3 +152,49 @@ async fn a_bad_checksum_addrv2_is_skipped() {
     let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
     assert_eq!(got, NetworkMessage::Ping(6));
 }
+
+/// A `headers` whose tx counts are not zero is read: rust-bitcoin's decoder
+/// refused it, and the v1 reader skipped the message, so not one of its
+/// headers was learned.
+#[tokio::test]
+async fn a_headers_with_nonzero_tx_counts_is_read() {
+    let hs = crate::net::headers::test_headers();
+    for counts in [[&[0x01][..], &[0xfc]], [&[0xfd, 0x00, 0x01], &[0x00]]] {
+        let headers = NetworkMessage::Unknown {
+            command: CommandString::try_from_static("headers").unwrap(),
+            payload: crate::net::headers::payload_with_tx_counts(&hs, &counts),
+        };
+        let mut bytes = frame(headers);
+        bytes.extend(frame(NetworkMessage::Ping(7)));
+        let mut reader = Cursor::new(bytes);
+        let mut buf = Vec::new();
+        let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+        assert_eq!(got, NetworkMessage::Headers(hs.to_vec()), "tx counts {counts:02x?}");
+        let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+        assert_eq!(next, NetworkMessage::Ping(7));
+    }
+}
+
+/// A corrupt or truncated `headers` frame is skipped, as any other
+/// undecodable frame is.
+#[tokio::test]
+async fn a_bad_headers_frame_is_skipped() {
+    let hs = crate::net::headers::test_headers();
+    let payload = crate::net::headers::payload_with_tx_counts(&hs, &[&[0x00], &[0x00]]);
+    let mut bad_checksum = frame(NetworkMessage::Unknown {
+        command: CommandString::try_from_static("headers").unwrap(),
+        payload: payload.clone(),
+    });
+    bad_checksum[20] ^= 1;
+    let truncated = frame(NetworkMessage::Unknown {
+        command: CommandString::try_from_static("headers").unwrap(),
+        payload: payload[..payload.len() - 1].to_vec(),
+    });
+    for mut bytes in [bad_checksum, truncated] {
+        bytes.extend(frame(NetworkMessage::Ping(8)));
+        let mut reader = Cursor::new(bytes);
+        let mut buf = Vec::new();
+        let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+        assert_eq!(got, NetworkMessage::Ping(8));
+    }
+}

@@ -94,9 +94,10 @@ pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
     if contents.is_empty() || (contents[0] == 0 && contents.len() < 13) {
         return Err(V2CodecError::Truncated);
     }
-    // `addrv2`, by short ID or long form, is read as Core reads it: the
-    // `bip324` decoder uses rust-bitcoin's, which refuses service bits Core
-    // accepts (`net::addrv2`).
+    // `addrv2` and `headers`, by short ID or long form, are read as Core
+    // reads them: the `bip324` decoder uses rust-bitcoin's, which refuses
+    // service bits (`net::addrv2`) and tx counts (`net::headers`) Core
+    // accepts.
     let addrv2_payload = match contents[0] {
         ADDRV2_SHORT_ID => Some(&contents[1..]),
         0 if contents[1..13] == crate::net::addrv2::ADDRV2_COMMAND => Some(&contents[13..]),
@@ -107,11 +108,24 @@ pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
             .map(NetworkMessage::AddrV2)
             .map_err(|e| V2CodecError::Deserialize(e.to_string()));
     }
+    let headers_payload = match contents[0] {
+        HEADERS_SHORT_ID => Some(&contents[1..]),
+        0 if contents[1..13] == crate::net::headers::HEADERS_COMMAND => Some(&contents[13..]),
+        _ => None,
+    };
+    if let Some(payload) = headers_payload {
+        return crate::net::headers::decode_payload(payload)
+            .map(NetworkMessage::Headers)
+            .map_err(|e| V2CodecError::Deserialize(e.to_string()));
+    }
     bip324::serde::deserialize(contents).map_err(|e| V2CodecError::Deserialize(e.to_string()))
 }
 
 /// BIP 324's short message-type ID for `addrv2`.
 const ADDRV2_SHORT_ID: u8 = 28;
+
+/// BIP 324's short message-type ID for `headers`.
+const HEADERS_SHORT_ID: u8 = 13;
 
 /// Core's `V2_MESSAGE_IDS` (`src/net.cpp:917`): the message type each BIP 324
 /// short ID stands for, indexed by ID. IDs 29-32 are assigned but unused.
@@ -672,6 +686,41 @@ mod tests {
             assert_eq!(addrs.len(), 3);
             assert_eq!(addrs[1].services.to_u64(), 1 << 26 | 0x409);
         }
+    }
+
+    /// `headers`, by short ID and in long form, is read past a non-zero tx
+    /// count, which the `bip324` decoder refuses.
+    #[test]
+    fn headers_with_nonzero_tx_counts_decode() {
+        let hs = crate::net::headers::test_headers();
+        let payload = crate::net::headers::payload_with_tx_counts(&hs, &[&[0xfc], &[0xfd, 0x00, 0x01]]);
+        let mut short = vec![HEADERS_SHORT_ID];
+        short.extend_from_slice(&payload);
+        let mut long = vec![0u8];
+        long.extend_from_slice(&crate::net::headers::HEADERS_COMMAND);
+        long.extend_from_slice(&payload);
+        assert!(bip324::serde::deserialize(&short).is_err(), "bip324 refuses it");
+        for contents in [short, long] {
+            assert_eq!(decode_message(&contents).unwrap(), NetworkMessage::Headers(hs.to_vec()));
+        }
+        // What rust-bitcoin writes still round-trips.
+        let msg = NetworkMessage::Headers(hs.to_vec());
+        assert_eq!(decode_message(&encode_message(msg.clone())).unwrap(), msg);
+    }
+
+    /// The defect over v2: a `headers` with a non-zero tx count was skipped
+    /// (before #1136, the peer was dropped). Now its headers arrive, and so
+    /// do the messages after it.
+    #[tokio::test]
+    async fn a_v2_headers_with_a_nonzero_tx_count_arrives() {
+        let (mut server, mut client, _, _) = counted_pair(Network::Regtest).await;
+        let hs = crate::net::headers::test_headers();
+        let mut contents = vec![HEADERS_SHORT_ID];
+        contents.extend_from_slice(&crate::net::headers::payload_with_tx_counts(&hs, &[&[0x01], &[0x00]]));
+        send_contents(&mut client, &contents).await;
+        client.send(NetworkMessage::Ping(11)).await.unwrap();
+        assert_eq!(server.recv().await.unwrap(), NetworkMessage::Headers(hs.to_vec()));
+        assert_eq!(server.recv().await.unwrap(), NetworkMessage::Ping(11));
     }
 
     #[test]

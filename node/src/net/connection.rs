@@ -441,21 +441,39 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
             c.record_recv(wire_len);
         }
 
-        // `addrv2` is read as Core reads it, not by rust-bitcoin's decoder,
-        // which refuses service bits Core accepts (`net::addrv2`).
-        let result = if header[4..16] == crate::net::addrv2::ADDRV2_COMMAND {
-            match crate::net::addrv2::decode_v1_payload(&header, &buf[HEADER_SIZE..]) {
-                Ok(addrs) => {
+        // `addrv2` and `headers` are read as Core reads them, not by
+        // rust-bitcoin's decoder, which refuses messages Core accepts
+        // (`net::addrv2`, `net::headers`).
+        let core_read = if header[4..16] == crate::net::addrv2::ADDRV2_COMMAND {
+            Some((
+                "addrv2",
+                crate::net::addrv2::decode_v1_payload(&header, &buf[HEADER_SIZE..])
+                    .map(NetworkMessage::AddrV2)
+                    .map_err(|e| e.to_string()),
+            ))
+        } else if header[4..16] == crate::net::headers::HEADERS_COMMAND {
+            Some((
+                "headers",
+                crate::net::headers::decode_v1_payload(&header, &buf[HEADER_SIZE..])
+                    .map(NetworkMessage::Headers)
+                    .map_err(|e| e.to_string()),
+            ))
+        } else {
+            None
+        };
+        let result = if let Some((cmd, decoded)) = core_read {
+            match decoded {
+                Ok(msg) => {
                     if let Some(c) = counters {
-                        c.attribute_recv("addrv2", wire_len);
+                        c.attribute_recv(cmd, wire_len);
                     }
-                    Some(Ok(NetworkMessage::AddrV2(addrs)))
+                    Some(Ok(msg))
                 }
                 Err(e) => {
                     if let Some(c) = counters {
                         c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
                     }
-                    tracing::debug!(cmd = "addrv2", error = %e, "Skipping unparseable message");
+                    tracing::debug!(cmd, error = %e, "Skipping unparseable message");
                     None
                 }
             }

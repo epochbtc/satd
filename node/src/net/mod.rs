@@ -9,6 +9,7 @@ pub mod compact;
 pub mod connection;
 pub mod dns;
 pub mod flow;
+pub mod headers;
 pub mod ibd;
 pub mod limits;
 pub mod manager;

@@ -135,3 +135,59 @@ fn a_catch_up_announces_the_tip_it_reaches() {
         "B never announced the tip its catch-up reached"
     );
 }
+
+/// Two regtest headers on top of genesis, their proof of work ground here so
+/// no other node is needed.
+fn two_headers_on_genesis() -> [bitcoin::block::Header; 2] {
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
+    let mut prev = genesis;
+    std::array::from_fn(|i| {
+        let mut h = bitcoin::block::Header {
+            // Version 1 is below regtest's BIP 34/65/66 heights.
+            version: bitcoin::block::Version::from_consensus(0x2000_0000),
+            prev_blockhash: prev.block_hash(),
+            merkle_root: bitcoin::hashes::Hash::from_byte_array([i as u8 + 1; 32]),
+            time: genesis.time + 1 + i as u32,
+            nonce: 0,
+            ..genesis
+        };
+        while h.validate_pow(h.target()).is_err() {
+            h.nonce += 1;
+        }
+        prev = h;
+        h
+    })
+}
+
+/// A `headers` message whose tx counts are not zero is read, as Core reads
+/// it (`net_processing.cpp`, "ignore tx count; assume it is 0"). satd's
+/// decoder refused the whole message, so the headers in it were lost. Sent
+/// by hand: rust-bitcoin's encoder always writes a zero count.
+#[test]
+fn headers_with_nonzero_tx_counts_are_accepted() {
+    let port = find_available_port();
+    let node = TestNode::start(&[&format!("--port={port}")]);
+    let mut peer = Peer::connect(port);
+    let headers = two_headers_on_genesis();
+    let mut payload = vec![2u8];
+    for (h, tx_count) in headers.iter().zip([&[0x01][..], &[0xfd, 0x00, 0x01]]) {
+        payload.extend(serialize(h));
+        payload.extend_from_slice(tx_count);
+    }
+    peer.send(NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from_static("headers").unwrap(),
+        payload,
+    });
+    let tip = headers[1].block_hash().to_string();
+    poll_until(
+        || {
+            node.rpc_ok("getchaintips", vec![])
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["hash"] == tip.as_str() && t["height"] == 2)
+        },
+        test_timeout(30),
+        "the node did not learn the headers",
+    );
+}

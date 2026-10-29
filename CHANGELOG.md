@@ -182,6 +182,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- A `headers` message with a non-zero transaction count after a header is
+  read as Core reads it. satd refused the whole message, so the header
+  announcements in it were lost (#1139).
+
 - An `addrv2` listing a node with a service bit at or above 25 is read as
   Core reads it. satd refused the whole message: over v1 every address in
   it was lost, and over v2 the peer was dropped, so outbound peers churned
