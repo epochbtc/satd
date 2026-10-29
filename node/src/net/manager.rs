@@ -7171,6 +7171,14 @@ impl PeerManager {
                 ) => {
                     tracing::debug!(id, "Header rejected: time-too-new");
                 }
+                // A header forking below the last checkpoint: Core's
+                // `MaybePunishNodeForBlock` answers `BLOCK_CHECKPOINT` with
+                // `Misbehaving`, which discourages and disconnects the peer.
+                // No honest peer sends one: its main-chain headers below the
+                // checkpoint are already known and skipped before the check.
+                crate::chain::state::ChainError::ForkBeforeCheckpoint(_) => {
+                    self.add_ban_score(id, BAN_THRESHOLD, &format!("Header rejected: {}", e));
+                }
                 other => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
                 }
@@ -8018,7 +8026,8 @@ impl PeerManager {
                 crate::validation::ValidationError::TimeTooNew,
             ) => false,
             crate::chain::state::ChainError::Validation(_)
-            | crate::chain::state::ChainError::CheckpointMismatch(_) => true,
+            | crate::chain::state::ChainError::CheckpointMismatch(_)
+            | crate::chain::state::ChainError::ForkBeforeCheckpoint(_) => true,
             crate::chain::state::ChainError::Connect(ce) => ce.is_verdict_on_block(),
             _ => false,
         }
@@ -8036,7 +8045,7 @@ impl PeerManager {
         match e {
             ChainError::Validation(crate::validation::ValidationError::TimeTooNew) => false,
             ChainError::Validation(v) => !v.is_mutation_class(),
-            ChainError::CheckpointMismatch(_) => true,
+            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
             ChainError::Connect(ce) => ce.is_verdict_on_block(),
             _ => false,
         }
