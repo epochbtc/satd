@@ -1683,6 +1683,43 @@ fn test_getnetworkinfo_connections() {
     node.stop();
 }
 
+/// #896: through the RPC layer, positional and named, `gettxoutsetinfo`
+/// refuses a block other than the tip and an explicit UTXO-set hash type,
+/// and still answers the tip and `hash_type` `"none"`.
+#[test]
+fn test_gettxoutsetinfo_refuses_what_it_cannot_honour() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_ok("generatetoaddress", vec![json!(3), json!(addr)]);
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+
+    let ok = node.rpc_ok("gettxoutsetinfo", vec![json!("none"), json!(3)]);
+    assert_eq!(ok["height"], 3, "{ok}");
+    let ok = node.rpc_ok("gettxoutsetinfo", vec![json!("none"), tip.clone()]);
+    assert_eq!(ok["bestblock"], tip, "{ok}");
+
+    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(1)]).unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "Querying specific block heights requires coinstatsindex");
+    let r = node
+        .rpc_call_with_named_params("gettxoutsetinfo", json!({"hash_or_height": 2}))
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    for t in ["muhash", "hash_serialized_3"] {
+        let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!(t)]).unwrap();
+        assert_eq!(r["error"]["code"], -8, "{t}: {r}");
+    }
+    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("sha256")]).unwrap();
+    assert_eq!(r["error"]["message"], "'sha256' is not a valid hash_type", "{r}");
+    // A mistyped `use_index` is Core's type error, not ignored.
+    let r = node
+        .rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(null), json!("yes")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -3, "{r}");
+    node.stop();
+}
+
 #[test]
 fn test_gettxoutsetinfo() {
     let mut node = TestNode::start(&[]);

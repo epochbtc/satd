@@ -128,8 +128,8 @@ pub fn get_index_info_core_compat(
     if coinstatsindex_enabled {
         // satd accepts `-coinstatsindex` so a Core `bitcoin.conf` drops in
         // unchanged, but implements no UTXO-set hash index: `gettxoutsetinfo`
-        // ignores `hash_type`, `hash_or_height` and `use_index` and answers
-        // for the tip only. Reporting `synced: true` here would tell a client
+        // answers for the tip only, and refuses a `hash_or_height` naming
+        // any other block and a `muhash` / `hash_serialized_3` hash type. Reporting `synced: true` here would tell a client
         // following Core's documented pattern — poll `synced`, then query the
         // index — that data it is about to get wrong is ready. It never
         // reports synced, so that client stops at the poll instead.

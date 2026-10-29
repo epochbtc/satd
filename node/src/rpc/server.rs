@@ -2621,8 +2621,14 @@ pub async fn start(
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
-        blockchain::get_tx_out_set_info(&ctx.chain_state)
+    module.register_method("gettxoutsetinfo", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let hash_type: Option<String> = args.optional("hash_type")?;
+        let hash_or_height = args.raw("hash_or_height")?;
+        let use_index: Option<bool> = args.optional("use_index")?;
+        args.check()?;
+        let args = blockchain::TxOutSetInfoArgs { hash_type, hash_or_height, use_index };
+        blockchain::get_tx_out_set_info_with(&ctx.chain_state, &args)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
