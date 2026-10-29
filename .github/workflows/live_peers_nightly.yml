@@ -208,15 +208,15 @@ jobs:
   # The triage step runs on the runner it reports on. When that runner is lost
   # ("The hosted runner lost communication with the server"), the step and the
   # log go with it and nothing is filed. This job runs on a fresh runner and
-  # files the "broken" issue for a failed run whose triage step did not finish.
-  # Dispatched runs only print what would be filed.
+  # files the "broken" issue for a failed or cancelled (timed-out) run whose
+  # triage step did not finish. Dispatched runs only print what would be filed.
   report-untriaged:
     name: report a run that ended before triage
     needs: smoke
     if: >-
       always()
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      && needs.smoke.result == 'failure'
+      && (needs.smoke.result == 'failure' || needs.smoke.result == 'cancelled')
       && needs.smoke.outputs.triaged != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5

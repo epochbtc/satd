@@ -92,12 +92,21 @@ NETWORK_FLAG = {"mainnet": None, "testnet4": "--testnet4", "signet": "--signet"}
 NETWORK_SUBDIR = {"mainnet": "", "testnet4": "testnet4", "signet": "signet"}
 
 
+def env_num(kind, name, default):
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        # A bad setting is the caller's, never a finding (exit 1).
+        print(f"error: {name} is not a number: {os.environ.get(name)!r}", file=sys.stderr)
+        sys.exit(2)
+
+
 def env_int(name, default):
-    return int(os.environ.get(name, default))
+    return env_num(int, name, default)
 
 
 def env_float(name, default):
-    return float(os.environ.get(name, default))
+    return env_num(float, name, default)
 
 
 SECONDS = env_int("LIVE_PEERS_SECONDS", 240)
@@ -313,19 +322,18 @@ def rpc(port, cookie, method, params=None, timeout=10):
         return json.loads(resp.read())["result"]
 
 
-def run_network(satd, network, workdir, out):
+def run_network(satd, network, port, workdir, out):
     """Thread body: every way out leaves a result, so no network goes missing."""
     try:
-        _run_network(satd, network, workdir, out)
+        _run_network(satd, network, port, workdir, out)
     except Exception as e:
         out[network] = {"network": network, "error": f"harness error: {e!r}"}
 
 
-def _run_network(satd, network, workdir, out):
+def _run_network(satd, network, port, workdir, out):
     datadir = workdir / network
     datadir.mkdir(parents=True, exist_ok=True)
     log = workdir / f"{network}.log"
-    port = int(os.environ.get(f"LIVE_PEERS_RPCPORT_{network.upper()}", 0)) or free_port()
     args = [str(satd)]
     if NETWORK_FLAG[network]:
         args.append(NETWORK_FLAG[network])
@@ -478,7 +486,11 @@ def main():
             parent = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
             workdir = Path(tempfile.mkdtemp(prefix="satd-live-peers-", dir=parent))
         print(f"satd {satd}; networks {' '.join(networks)}; {SECONDS}s each; logs in {workdir}", flush=True)
-        threads = [threading.Thread(target=run_network, args=(satd, n, workdir, results)) for n in networks]
+        # Read here, not in the threads, so a bad setting stops the run.
+        ports = {n: env_int(f"LIVE_PEERS_RPCPORT_{n.upper()}", 0) or free_port() for n in networks}
+        threads = [
+            threading.Thread(target=run_network, args=(satd, n, ports[n], workdir, results)) for n in networks
+        ]
         for t in threads:
             t.start()
         for t in threads:
