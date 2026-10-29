@@ -120,6 +120,14 @@ are not required to. Verification details are in `SECURITY.md`.
   `. scripts/ci/coverage-env.sh`, then the `cargo test` commands you want,
   then `cargo llvm-cov report --html`; the script makes the satd processes
   the regtest harness spawns count, which plain `cargo llvm-cov` misses.
+- Live peers — the nightly `Live-peer smoke (nightly)` workflow runs a
+  release `satd` against the public testnet4 and signet peers for a few
+  minutes each and fails on messages it cannot decode or on peers dropped
+  right after the handshake: what real Bitcoin Core peers send, which no
+  scripted test peer does. It does not run on pull requests. If your change
+  touches what satd sends or how it parses peer messages, run it before
+  opening one: `cargo build --release --bin satd && scripts/live-peers/smoke.py`
+  (about four minutes; exit 1 is a finding, 2 means no peer was reachable).
 
 ## AI-assisted contributions
 
