@@ -454,6 +454,8 @@ then this section is informative.
 are free to multiply. Coin weight cannot be multiplied, and borrowed coins
 must stay put for `MIN_COIN_AGE` and drop out when returned.
 
+**Economic nodes** NAP allows 'economic nodes' to express preferences as a human-interpreted signal. This is intended to be in addition to traditional miner signaling and allows a greater proportion of the network to participate in signaling. NAP is *not* intended to gate decisions in an automated, mechanical fashion (e.g., a BIP must be activated if some arbitrary NAP threshold is met).
+
 **A human-readable message.** Hardware signers display what they sign. Every
 field of the attestation appears in the text, so the signer sees the whole
 statement.
@@ -504,6 +506,16 @@ new command anyway, so a version byte would add nothing.
 
 **Legacy signatures for P2PKH.** Many wallets can sign a P2PKH message only
 with `signmessage`. BIP 322 full proofs are also accepted for P2PKH.
+
+## Custodians
+
+Exchanges, companies and ETFs control a large supply of coins. Conceptually, these custodians are free to signal on behalf of the beneficial owners of those coins (similar in concept to how a corporate proxy might vote on behalf of shareholders). A downside of this approach is that it exposes public information about the exact UTXOs under their control, because NAP attestations are public.
+
+One mitigation to this issue available in v1 is to attest only for a small fraction of custodied coins, but do so in proportion to the voting preferences of the underlying beneficial owners. For example, only NAP attest for 10% of coins but ensure that the distribution of attestations matches the distribution of beneficial owners' preferences.
+
+A possible NAP v2 might introduce a mechanism to attest and prove ownership of coins without revealing the exact UTXOs under their control via more advanced cryptographic techniques. This is out of scope of this document.
+
+Custodians are also free to decline to attest at all, or to attest purely based on their internal corporate interests. This is an acknowledged potential concern that NAP cannot fully address technically.
 
 ## Security and privacy considerations
 
