@@ -1,0 +1,237 @@
+# Nightly live-peer smoke: a release satd on a fresh datadir joins testnet4
+# and signet through the DNS seeds for a few minutes each, and
+# scripts/live-peers/smoke.py reads its log.
+#
+# It catches what no test with a scripted peer can: a message that real
+# Bitcoin Core peers send and satd cannot decode. The regtest and functional
+# suites talk to peers that send what the tests wrote. A `getaddr` sent to
+# every outbound peer passed all of them, and then on the public networks
+# every v2 peer was dropped about 100 ms after its handshake, because real
+# `addrv2` replies list nodes with service bits the decoder refused. This job
+# fails on that within the first minute.
+#
+# The script fails the run on
+#   decode  a message decode failure ending connections from two or more
+#           distinct peers on either network, and
+#   churn   on BOTH networks: most handshaken peers gone within 30 s, or a
+#           mean of fewer than two connected peers after the warm-up.
+# Churn on one network alone is left to that network; see the script's
+# header for the thresholds and their environment overrides. Its exit
+# status 2 means inconclusive (no peer finished a handshake: the runner or
+# the seeds had no network).
+#
+# NOT a PR gate: it needs the public network and minutes of wall time, and
+# the network's behaviour is not the pull request's. GitHub-hosted runners
+# only (this repository is public).
+#
+# A scheduled failure files or updates one issue per class:
+#   live-peers-regression  the smoke found decode failures or churn (exit 1).
+#                          A finding: fix satd, never loosen a threshold to
+#                          quiet it.
+#   live-peers-broken      anything else (build, inconclusive network,
+#                          timeout): quiet unless the two scheduled runs
+#                          before this one failed too.
+# Dispatched runs never file issues.
+
+name: Live-peer smoke (nightly)
+
+on:
+  schedule:
+    # Nightly 01:50 UTC, clear of the other nightlies (00:30 mutants, 02:40
+    # coverage, 03:20 fuzz targets, 04:00 block differential, 04:37 Core
+    # functional, 05:15 Warnet).
+    - cron: '50 1 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Run time per network, in seconds"
+        required: false
+        default: "240"
+      networks:
+        description: "Space-separated networks (testnet4, signet, mainnet)"
+        required: false
+        default: "testnet4 signet"
+
+permissions:
+  contents: read
+  issues: write
+  # The streak check reads this workflow's run history.
+  actions: read
+
+concurrency:
+  group: live-peers-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # canary.yml's RUST_TOOLCHAIN: the same compiler, so the canary target
+  # cache that ci.yml seeds on master restores into a warm build.
+  RUST_TOOLCHAIN: '1.93.0'
+
+jobs:
+  smoke:
+    name: live peers (testnet4 + signet)
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master as of 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-canary-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-cargo-
+
+      # Restore only: the canary's release target directory, seeded on master
+      # by ci.yml's seed-canary-cache. This job builds the same binary and
+      # adds nothing worth a second ~1.4 GB cache entry.
+      - name: Restore the release target directory
+        uses: actions/cache/restore@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-canary-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-canary-target-
+
+      - name: Build satd (release)
+        run: cargo build --release --locked --bin satd
+
+      - name: Run the live-peer smoke
+        id: smoke
+        env:
+          SATD_BIN: target/release/satd
+          LIVE_PEERS_WORKDIR: ${{ runner.temp }}/live-peers
+          LIVE_PEERS_SECONDS: ${{ inputs.seconds || '240' }}
+          LIVE_PEERS_NETWORKS: ${{ inputs.networks || 'testnet4 signet' }}
+        run: |
+          set +e
+          python3 scripts/live-peers/smoke.py 2>&1 | tee "$RUNNER_TEMP/smoke.out"
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Upload logs
+        if: always() && steps.smoke.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-peers-logs
+          path: |
+            ${{ runner.temp }}/live-peers/*.log
+            ${{ runner.temp }}/live-peers/report.json
+            ${{ runner.temp }}/smoke.out
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: File or update the tracking issue
+        id: triage
+        # cancelled() too: a job that hits `timeout-minutes` is cancelled, not
+        # failed. The concurrency group never cancels a run.
+        if: (failure() || cancelled()) && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SMOKE_RC: ${{ steps.smoke.outputs.rc }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          # One open issue per label: comment if one is open, else open one.
+          notify() {
+            label="$1"; color="$2"; desc="$3"; title="$4"; body="$5"
+            gh label create "$label" --color "$color" --description "$desc" 2>/dev/null || true
+            existing=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --label "$label" --title "$title" --body "$body"
+            fi
+          }
+          out="$RUNNER_TEMP/smoke.out"
+          if [ "$SMOKE_RC" = "1" ]; then
+            # The report table and verdict, then the first offending lines.
+            excerpt=$(head -c 12000 "$out" 2>/dev/null || true)
+            body=$(printf 'The nightly live-peer smoke found satd mishandling real peers.\n\n- Run: %s\n- Commit: `%s`\n\n```\n%s\n```\n\nThe full logs are in the run'"'"'s `live-peers-logs` artifact. Reproduce with `cargo build --release --bin satd && scripts/live-peers/smoke.py`.\n' \
+              "$RUN_URL" "$GITHUB_SHA" "$excerpt")
+            notify live-peers-regression B60205 "the nightly live-peer smoke found decode failures or churn" \
+              "Live-peer smoke: satd mishandles real peers ($today)" "$body"
+            exit 0
+          fi
+          # Anything else is the job, not a finding. Quiet unless the two
+          # scheduled runs before this one failed too; a failed query counts
+          # as a streak, so it cannot read as "no streak" and stay silent.
+          if ! prior_failures=$(gh run list \
+            --workflow live_peers_nightly.yml \
+            --event schedule --status completed --limit 2 \
+            --json conclusion \
+            --jq '[.[] | select(.conclusion == "failure")] | length'); then
+            echo "Could not read prior run conclusions; assuming a streak."
+            prior_failures=2
+          fi
+          if [ "${prior_failures:-0}" -lt 2 ]; then
+            echo "Not a finding (smoke rc '${SMOKE_RC:-none}') and not a streak ($prior_failures/2). Rerun."
+            exit 0
+          fi
+          body=$(printf 'The nightly live-peer smoke has failed three scheduled runs in a row without a finding (latest smoke exit status: `%s`; 2 means no peer finished a handshake, empty means an earlier step failed).\n\n- Latest run: %s\n- Commit: `%s`\n' \
+            "${SMOKE_RC:-none}" "$RUN_URL" "$GITHUB_SHA")
+          notify live-peers-broken FBCA04 "the nightly live-peer smoke is failing (not a finding)" \
+            "Live-peer smoke broken: 3 failed runs in a row ($today)" "$body"
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed run whose triage step did not finish.
+  # Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: smoke
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && needs.smoke.result == 'failure'
+      && needs.smoke.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: live-peers-broken
+          LABEL_COLOR: FBCA04
+          LABEL_DESC: "the nightly live-peer smoke is failing (not a finding)"
+          TITLE: "Live-peer smoke ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.smoke.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh
