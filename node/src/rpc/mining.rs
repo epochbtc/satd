@@ -151,6 +151,7 @@ fn is_verdict(e: &crate::chain::state::ChainError) -> bool {
         E::PrevBlockNotFound
         | E::BadPrevBlock
         | E::CheckpointMismatch(_)
+        | E::ForkBeforeCheckpoint(_)
         | E::Validation(_) => true,
         // A mutation-class failure is a verdict on these bytes, not one
         // `accept_block` may record against the hash: still a reject reason.

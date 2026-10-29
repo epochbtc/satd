@@ -112,6 +112,11 @@ pub enum ChainError {
     DecodeFailed,
     #[error("checkpoint mismatch at height {0}")]
     CheckpointMismatch(u32),
+    /// A new header forks off the chain below the last checkpoint the block
+    /// index holds (Core v29's `BLOCK_CHECKPOINT`, raised in
+    /// `ContextualCheckBlockHeader`). The height is the refused header's.
+    #[error("bad-fork-prior-to-checkpoint")]
+    ForkBeforeCheckpoint(u32),
     #[error("{0}")]
     Validation(#[from] validation::ValidationError),
     #[error("{0}")]
@@ -1192,9 +1197,16 @@ impl ChainState {
     /// Enable or disable enforcement of the built-in block checkpoints
     /// (Core `-checkpoints`, default enabled). Call once, before the
     /// `ChainState` is shared (wrapped in an `Arc`). `-checkpoints=0`
-    /// disables checkpoint validation in `connect_block`.
+    /// disables checkpoint validation in `connect_block` and the
+    /// `bad-fork-prior-to-checkpoint` rule on new headers.
     pub fn set_enforce_checkpoints(&mut self, enforce: bool) {
         self.enforce_checkpoints = enforce;
+    }
+
+    /// Replace the checkpoint set, for tests that pin a regtest chain.
+    #[cfg(test)]
+    pub(crate) fn set_checkpoints_for_test(&mut self, checkpoints: Vec<Checkpoint>) {
+        self.checkpoints = checkpoints;
     }
 
     /// The signet challenge this node validates against: the configured
@@ -2614,6 +2626,48 @@ impl ChainState {
             .unwrap_or(false)
     }
 
+    /// The height of the highest checkpoint whose block is in the index,
+    /// header-only or not: Core v29's `BlockManager::GetLastCheckpoint`.
+    /// `None` when checkpoints are not enforced (`-checkpoints=0`), the
+    /// network has none, or the index holds none of them yet, as on a node
+    /// whose header sync has not reached the first one past genesis.
+    fn last_checkpoint_in_index(&self) -> Option<u32> {
+        if !self.enforce_checkpoints {
+            return None;
+        }
+        self.checkpoints
+            .iter()
+            .filter(|cp| self.store.get_block_index(&cp.hash).is_some())
+            .map(|cp| cp.height)
+            .max()
+    }
+
+    /// Core v29's checkpoint rule in `ContextualCheckBlockHeader`: "Don't
+    /// accept any forks from the main chain prior to last checkpoint". A new
+    /// header at `height` below `last_checkpoint` branches off below a block
+    /// the chain is pinned to, so its fork can never become the best chain,
+    /// and storing it would only let a peer fill the block index with
+    /// early-chain headers that cost almost nothing to mine. Callers apply it
+    /// only to a header the index does not hold yet, after the
+    /// already-known check, as `AcceptBlockHeader` does: a main-chain header
+    /// sent again stays harmless.
+    fn check_fork_after_checkpoint(
+        height: u32,
+        last_checkpoint: Option<u32>,
+    ) -> Result<(), ChainError> {
+        match last_checkpoint {
+            Some(cp) if height < cp => {
+                tracing::debug!(
+                    height,
+                    last_checkpoint = cp,
+                    "header refused: forked chain older than last checkpoint"
+                );
+                Err(ChainError::ForkBeforeCheckpoint(height))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Accept a block header without block data (for headers-first sync).
     /// Validates PoW and difficulty but does not process transactions.
     pub fn accept_header(&self, header: &bitcoin::block::Header) -> Result<BlockHash, ChainError> {
@@ -2645,6 +2699,10 @@ impl ChainState {
             self.network,
             |h| self.store.get_block_index(h),
         )?;
+
+        // `bad-fork-prior-to-checkpoint`, where Core checks it: after the
+        // difficulty, before the time and version rules.
+        Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
 
         // The rest of Core's `ContextualCheckBlockHeader`: time-too-old,
         // time-too-new and bad-version. Core applies them in
@@ -2917,6 +2975,10 @@ impl ChainState {
         // header it accepted before the one that failed: a batch whose last
         // header is ahead of our clock must not lose the rest.
         let mut refused: Option<ChainError> = None;
+        // The last checkpoint in the index, raised below when this batch
+        // stages a checkpoint's header: Core accepts a batch one header at a
+        // time, so a checkpoint earlier in the batch already counts.
+        let mut last_checkpoint = self.last_checkpoint_in_index();
 
         for header in headers {
             let hash = header.block_hash();
@@ -2985,6 +3047,11 @@ impl ChainState {
                 break;
             }
 
+            if let Err(e) = Self::check_fork_after_checkpoint(new_height, last_checkpoint) {
+                refused = Some(e);
+                break;
+            }
+
             // Time and version, as in `accept_header`. The MTP walk resolves
             // ancestors the same way the difficulty check does: this batch's
             // predecessors first, then the store.
@@ -3021,6 +3088,12 @@ impl ChainState {
 
             batch.block_index_puts.push((hash, entry.clone()));
             batch_index.insert(hash, entry);
+            if self.enforce_checkpoints
+                && self.checkpoints.iter().any(|cp| cp.hash == hash)
+                && last_checkpoint.is_none_or(|h| new_height > h)
+            {
+                last_checkpoint = Some(new_height);
+            }
             // Staged for the in-batch retarget lookup only. Which heights get a
             // height->hash row is decided once, from the best-header chain, in
             // `commit_accepted_headers`.
@@ -5238,6 +5311,13 @@ impl ChainState {
             self.network,
             |h| store_ref.get_block_index(h),
         )?;
+
+        // A block that arrives without its header accepted first is held to
+        // the header rule `AcceptBlockHeader` would have applied to it; one
+        // whose header is in the index passed it then.
+        if self.store.get_block_index(&block_hash).is_none() {
+            Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
+        }
 
         // Time and version (Core's `ContextualCheckBlockHeader`). A block
         // whose header was accepted has passed these already; one stored
@@ -7948,6 +8028,13 @@ impl ChainState {
             self.network,
             |h| store_ref.get_block_index(h),
         )?;
+
+        // A block that arrives without its header accepted first is held to
+        // the header rule `AcceptBlockHeader` would have applied to it; one
+        // whose header is in the index passed it then.
+        if self.store.get_block_index(&block_hash).is_none() {
+            Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
+        }
 
         // Timestamp check (median time past). The MTP ancestor walk follows the
         // candidate block's own parent pointers (not the active-chain height
@@ -10708,6 +10795,10 @@ mod ctxcheck_tests;
 #[cfg(test)]
 #[path = "state_assumevalid_tests.rs"]
 mod assumevalid_tests;
+
+#[cfg(test)]
+#[path = "state_ckptfork_tests.rs"]
+mod ckptfork_tests;
 
 // Unix only: the tests overwrite block files in place with `FileExt`.
 #[cfg(all(test, unix))]
