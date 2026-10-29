@@ -25,15 +25,16 @@ dropped every peer whose `addrv2` reply it could not decode, and of the fixed
 build, from one IPv4-only host:
 
                        broken build              fixed build
-  decode peers/network 14-26                     0
+  decode peers/network 5-19 (unambiguously       0
+                       attributed)
   short-lived ratio    85-100%                   0-33% (>= 8 handshakes: 0-14%)
   mean peers testnet4  0.4-1.7                   3.9-8.6
   mean peers signet    10-16 (v1 peers survived) 23-27
 
-Decode failures alone tell the two apart by an order of magnitude. Testnet4
-has few reachable IPv4 nodes, so its mean peer count runs low even when
-healthy, and on signet the v1 peers survived the broken build, so neither the
-short-lived ratio nor the mean is judged on one network alone.
+Decode failures alone tell the two apart. Testnet4 has few reachable IPv4
+nodes, so its mean peer count runs low even when healthy, and on signet the
+v1 peers survived the broken build, so neither the short-lived ratio nor the
+mean is judged on one network alone.
 
 Exit status: 0 pass; 1 a finding (decode, churn, or satd exiting before its
 run time); 2 inconclusive (satd could not be started, or no peer finished a
@@ -116,6 +117,8 @@ SHORT_SECONDS = env_float("LIVE_PEERS_SHORT_SECONDS", 30)
 MAX_SHORT_RATIO = env_float("LIVE_PEERS_MAX_SHORT_RATIO", 0.5)
 MIN_HANDSHAKES = env_int("LIVE_PEERS_MIN_HANDSHAKES", 8)
 MIN_MEAN_PEERS = env_float("LIVE_PEERS_MIN_MEAN_PEERS", 2)
+# How long after a decode `Read error` its peer's task end may come.
+ATTRIBUTE_SECONDS = 0.5
 
 # A tracing line: `<rfc3339>Z  LEVEL target: message fields...`.
 LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)Z\s+([A-Z]+)\s+(\S+): (.*)$")
@@ -211,22 +214,30 @@ def analyze(log_path, network):
     if end is None:
         end = max([start or 0] + [t for t, *_ in task_end] + list(disconnected.values()))
 
-    # The read error carries no peer id. Its reader task ends the peer at
-    # once, so the first `Peer task ended` at or after it, not yet claimed,
-    # names the peer.
+    # The read error carries no peer id. Its reader task ending closes the
+    # peer's channel, and the peer task ends at once with "connection
+    # closed", so that line names the peer. Only an unambiguous match counts:
+    # with no candidate, or more than one, inside ATTRIBUTE_SECONDS, the error
+    # goes under "?", so a coincidental disconnect cannot pose as a second
+    # decoding peer.
     decode_peers = {}
     claimed = set()
     for ts, line, seen, ctx in read_errors:
+        cands = [
+            (pid, addr)
+            for t, pid, addr, raw in task_end
+            if ts <= t < ts + ATTRIBUTE_SECONDS and pid not in claimed and "connection closed" in raw
+        ]
         who = "?"
-        for t, pid, addr, _ in task_end:
-            if t >= ts and t - ts < 2.0 and pid not in claimed:
-                claimed.add(pid)
-                who = addr
-                ctx = seen.get(pid, ctx)
-                break
+        if len(cands) == 1:
+            pid, who = cands[0]
+            claimed.add(pid)
+            ctx = seen.get(pid, ctx)
         decode_peers.setdefault(who, []).append((line, ctx))
-    # Errors that could not be attributed share the key "?": one peer.
-    decode_distinct = len(decode_peers)
+    # Distinct peers named; unattributed errors add one only when nothing
+    # was attributed, so "?" can never be the second peer.
+    named = [w for w in decode_peers if w != "?"]
+    decode_distinct = len(named) or (1 if decode_peers else 0)
 
     # Peers that finished the handshake, address-fetch connections left out
     # (those end by design once they have their addresses).
@@ -357,12 +368,16 @@ def _run_network(satd, network, port, workdir, out):
         while time.monotonic() < deadline and proc.poll() is None:
             time.sleep(1)
         if proc.poll() is not None:
-            # satd itself gave up on the live network: a finding.
+            # satd itself gave up on the live network: a finding, unless it
+            # could not bind its RPC port (taken between free_port() and the
+            # bind), which is this harness's race.
+            lf.flush()
+            bind_race = "Address already in use" in Path(log).read_text(errors="replace")
             out[network] = {
                 "network": network,
                 "log": str(log),
-                "error": f"satd exited early ({proc.returncode})",
-                "crashed": True,
+                "error": f"satd exited early ({proc.returncode})" + (": RPC port taken" if bind_race else ""),
+                "crashed": not bind_race,
             }
             return
         try:
