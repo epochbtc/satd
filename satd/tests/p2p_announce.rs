@@ -143,7 +143,8 @@ fn two_headers_on_genesis() -> [bitcoin::block::Header; 2] {
     let mut prev = genesis;
     std::array::from_fn(|i| {
         let mut h = bitcoin::block::Header {
-            // Version 1 is below regtest's BIP 34/65/66 heights.
+            // Not genesis's version 1, which regtest's BIP 34/65/66 rules
+            // refuse from height 1.
             version: bitcoin::block::Version::from_consensus(0x2000_0000),
             prev_blockhash: prev.block_hash(),
             merkle_root: bitcoin::hashes::Hash::from_byte_array([i as u8 + 1; 32]),
