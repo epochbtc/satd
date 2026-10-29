@@ -18,14 +18,15 @@
 # Churn on one network alone is left to that network; see the script's
 # header for the thresholds and their environment overrides. Its exit
 # status 2 means inconclusive (no peer finished a handshake: the runner or
-# the seeds had no network).
+# the seeds had no network), and 3 that the script itself failed.
 #
 # NOT a PR gate: it needs the public network and minutes of wall time, and
 # the network's behaviour is not the pull request's. GitHub-hosted runners
 # only (this repository is public).
 #
 # A scheduled failure files or updates one issue per class:
-#   live-peers-regression  the smoke found decode failures or churn (exit 1).
+#   live-peers-regression  the smoke found decode failures, churn or satd
+#                          exiting early (exit 1).
 #                          A finding: fix satd, never loosen a threshold to
 #                          quiet it.
 #   live-peers-broken      anything else (build, inconclusive network,
@@ -178,13 +179,15 @@ jobs:
             exit 0
           fi
           # Anything else is the job, not a finding. Quiet unless the two
-          # scheduled runs before this one failed too; a failed query counts
-          # as a streak, so it cannot read as "no streak" and stay silent.
+          # scheduled runs before this one failed too (a timeout counts: the
+          # concurrency group never cancels a run, so a cancelled one hit
+          # timeout-minutes); a failed query counts as a streak, so it cannot
+          # read as "no streak" and stay silent.
           if ! prior_failures=$(gh run list \
             --workflow live_peers_nightly.yml \
             --event schedule --status completed --limit 2 \
             --json conclusion \
-            --jq '[.[] | select(.conclusion == "failure")] | length'); then
+            --jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")] | length'); then
             echo "Could not read prior run conclusions; assuming a streak."
             prior_failures=2
           fi
@@ -192,7 +195,7 @@ jobs:
             echo "Not a finding (smoke rc '${SMOKE_RC:-none}') and not a streak ($prior_failures/2). Rerun."
             exit 0
           fi
-          body=$(printf 'The nightly live-peer smoke has failed three scheduled runs in a row without a finding (latest smoke exit status: `%s`; 2 means no peer finished a handshake, empty means an earlier step failed).\n\n- Latest run: %s\n- Commit: `%s`\n' \
+          body=$(printf 'The nightly live-peer smoke has failed three scheduled runs in a row without a finding (latest smoke exit status: `%s`; 2 means satd could not be started or no peer finished a handshake, 3 means the script itself failed, empty means an earlier step failed or the job timed out).\n\n- Latest run: %s\n- Commit: `%s`\n' \
             "${SMOKE_RC:-none}" "$RUN_URL" "$GITHUB_SHA")
           notify live-peers-broken FBCA04 "the nightly live-peer smoke is failing (not a finding)" \
             "Live-peer smoke broken: 3 failed runs in a row ($today)" "$body"

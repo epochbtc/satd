@@ -35,9 +35,11 @@ has few reachable IPv4 nodes, so its mean peer count runs low even when
 healthy, and on signet the v1 peers survived the broken build, so neither the
 short-lived ratio nor the mean is judged on one network alone.
 
-Exit status: 0 pass, 1 a finding (decode or churn), 2 inconclusive (satd did
-not start, or no peer finished a handshake on some network: the runner had no
-network, or the seeds were down). The printed report, also appended to
+Exit status: 0 pass; 1 a finding (decode, churn, or satd exiting before its
+run time); 2 inconclusive (satd could not be started, or no peer finished a
+handshake on some network: the runner had no network, or the seeds were
+down); 3 the script itself failed. A decode failure or an early exit on one
+network is a finding even when another network was inconclusive. The printed report, also appended to
 $GITHUB_STEP_SUMMARY when set, carries trend numbers that never fail the run:
 addresses learned, distinct peers, the v1/v2 transport mix and undecodable
 messages the reader skipped.
@@ -312,6 +314,14 @@ def rpc(port, cookie, method, params=None, timeout=10):
 
 
 def run_network(satd, network, workdir, out):
+    """Thread body: every way out leaves a result, so no network goes missing."""
+    try:
+        _run_network(satd, network, workdir, out)
+    except Exception as e:
+        out[network] = {"network": network, "error": f"harness error: {e!r}"}
+
+
+def _run_network(satd, network, workdir, out):
     datadir = workdir / network
     datadir.mkdir(parents=True, exist_ok=True)
     log = workdir / f"{network}.log"
@@ -339,7 +349,13 @@ def run_network(satd, network, workdir, out):
         while time.monotonic() < deadline and proc.poll() is None:
             time.sleep(1)
         if proc.poll() is not None:
-            out[network] = {"network": network, "log": str(log), "error": f"satd exited early ({proc.returncode})"}
+            # satd itself gave up on the live network: a finding.
+            out[network] = {
+                "network": network,
+                "log": str(log),
+                "error": f"satd exited early ({proc.returncode})",
+                "crashed": True,
+            }
             return
         try:
             peers = rpc(port, cookie, "getpeerinfo")
@@ -415,14 +431,20 @@ def details(results):
 
 def verdict(results):
     rs = list(results.values())
-    if any("error" in r or r["inconclusive"] for r in rs):
-        return 2, "INCONCLUSIVE: satd did not run, or no peer finished a handshake, on " + ", ".join(
-            r["network"] for r in rs if "error" in r or r["inconclusive"]
-        )
-    decode = [r["network"] for r in rs if r["decode_fail"]]
+    if not rs:
+        return 2, "INCONCLUSIVE: no network produced a result"
+    # Findings on one network stand whatever happened on the others.
+    crashed = [r["network"] for r in rs if r.get("crashed")]
+    if crashed:
+        return 1, "FAIL (exit): satd exited before its run time on " + ", ".join(crashed)
+    decode = [r["network"] for r in rs if r.get("decode_fail")]
     if decode:
         return 1, "FAIL (decode): peers' messages could not be decoded on " + ", ".join(decode)
-    if rs and all(r["churn"] for r in rs):
+    # Churn is judged across every network, so all of them must have run.
+    unjudged = [r["network"] for r in rs if "error" in r or r["inconclusive"]]
+    if unjudged:
+        return 2, "INCONCLUSIVE: satd did not run, or no peer finished a handshake, on " + ", ".join(unjudged)
+    if all(r["churn"] for r in rs):
         why = "; ".join(f"{r['network']}: {', '.join(r['churn_reasons'])}" for r in rs)
         return 1, "FAIL (churn on every network): " + why
     return 0, "PASS"
@@ -461,7 +483,9 @@ def main():
             t.start()
         for t in threads:
             t.join()
-        results = {n: results[n] for n in networks if n in results}
+        results = {
+            n: results.get(n, {"network": n, "error": "no result (harness thread died)"}) for n in networks
+        }
         slim = {
             n: {k: v for k, v in r.items() if not k.endswith("_detail")} for n, r in results.items()
         }
@@ -483,4 +507,11 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # Exit 1 is reserved for findings about satd; a harness bug is not one.
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(3)
