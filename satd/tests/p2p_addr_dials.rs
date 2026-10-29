@@ -352,3 +352,140 @@ fn manual_connections_are_outside_the_automatic_outbound_target() {
     assert_eq!(outbound(&node).len(), 5, "three automatic peers and two manual ones");
     node.stop();
 }
+
+// ---- Seeds by name through the proxy (#994) ----
+
+/// Serve one SOCKS5 CONNECT on `listener`, as a proxy would, and return the
+/// stream (now the tunnel) with the address type, host and port asked for.
+/// Takes the username/password method when offered: `-proxyrandomize` sends
+/// credentials by default.
+fn socks5_accept(listener: &TcpListener, timeout: Duration) -> (TcpStream, u8, String, u16) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + timeout;
+    let mut s = loop {
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(e) => panic!("no connection to the proxy within {timeout:?}: {e}"),
+        }
+    };
+    s.set_nonblocking(false).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut head = [0u8; 2];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(head[0], 5, "SOCKS version");
+    let mut methods = vec![0u8; head[1] as usize];
+    s.read_exact(&mut methods).unwrap();
+    if methods.contains(&2) {
+        s.write_all(&[5, 2]).unwrap();
+        let mut ver_ulen = [0u8; 2];
+        s.read_exact(&mut ver_ulen).unwrap();
+        let mut user = vec![0u8; ver_ulen[1] as usize];
+        s.read_exact(&mut user).unwrap();
+        let mut plen = [0u8; 1];
+        s.read_exact(&mut plen).unwrap();
+        let mut pass = vec![0u8; plen[0] as usize];
+        s.read_exact(&mut pass).unwrap();
+        s.write_all(&[1, 0]).unwrap();
+    } else {
+        s.write_all(&[5, 0]).unwrap();
+    }
+    let mut req = [0u8; 4];
+    s.read_exact(&mut req).unwrap();
+    assert_eq!(&req[..3], &[5, 1, 0], "a CONNECT");
+    let host = match req[3] {
+        3 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).unwrap();
+            let mut h = vec![0u8; len[0] as usize];
+            s.read_exact(&mut h).unwrap();
+            String::from_utf8(h).unwrap()
+        }
+        1 => {
+            let mut a = [0u8; 4];
+            s.read_exact(&mut a).unwrap();
+            std::net::Ipv4Addr::from(a).to_string()
+        }
+        other => panic!("unexpected address type {other}"),
+    };
+    let mut port = [0u8; 2];
+    s.read_exact(&mut port).unwrap();
+    s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+    (s, req[3], host, u16::from_be_bytes(port))
+}
+
+/// #994: under `-proxy`, a `-seednode` host name is not looked up locally,
+/// nor dropped. It is handed to the proxy by name (a SOCKS5 domain-name
+/// CONNECT) and opened as an `addr-fetch` connection, as Core opens it
+/// (`AddAddrFetch`, `ConnectNode` with a name proxy): the node asks for
+/// addresses, keeps the answer, and drops the connection. `seed.invalid`
+/// cannot resolve anywhere, so only the proxy path can reach it.
+/// Perturbation: drop the `add_addr_fetch` loop for `-seednode` in main.rs
+/// and the proxy is never dialled.
+#[test]
+fn a_seednode_name_under_a_proxy_is_fetched_by_name_through_it() {
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let node = TestNode::start(&[
+        "--v2transport=0",
+        &format!("--proxy={proxy_addr}"),
+        "--seednode=seed.invalid",
+    ]);
+
+    let (stream, atyp, host, port) = socks5_accept(&proxy, test_timeout(60));
+    assert_eq!(atyp, 3, "the name goes to the proxy unresolved");
+    assert_eq!((host.as_str(), port), ("seed.invalid", 18444), "at the network's default port");
+
+    let mut peer = Peer::handshake(stream).expect("handshake through the proxy");
+    assert!(
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        "an addr-fetch connection asks for addresses"
+    );
+    let peers = node.rpc_ok("getpeerinfo", vec![]);
+    let fetch: Vec<&serde_json::Value> = peers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["connection_type"] == "addr-fetch")
+        .collect();
+    assert_eq!(fetch.len(), 1, "one addr-fetch peer: {peers}");
+    assert_eq!(fetch[0]["addr"], "seed.invalid:18444", "named by the name it was opened to");
+
+    peer.send(addr_msg(30, 5));
+    poll_until(|| book_size(&node) == 5, test_timeout(30), "the seed's answer is kept");
+    assert!(
+        peer.recv_until(test_timeout(30), |_| false).is_none(),
+        "the connection is dropped once it has answered"
+    );
+}
+
+/// Under `-connect` no `-seednode` name is fetched, as Core uses none
+/// there, and the node says so rather than dropping it silently.
+/// Perturbation: remove the warning in main.rs and the log line is missing.
+#[test]
+fn a_seednode_name_under_a_proxy_and_connect_is_reported_unused() {
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let node = TestNode::start(&[
+        "--v2transport=0",
+        &format!("--proxy={proxy_addr}"),
+        "--connect=127.0.0.1:1",
+        "--seednode=seed.invalid",
+        "--loglevel=warn",
+    ]);
+    poll_until(
+        || {
+            std::fs::read_to_string(&node.stderr_log)
+                .is_ok_and(|log| log.contains("-seednode seed.invalid is not used"))
+        },
+        test_timeout(30),
+        "the unused -seednode name is reported",
+    );
+    proxy.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(proxy.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "nothing is fetched through the proxy under -connect"
+    );
+}

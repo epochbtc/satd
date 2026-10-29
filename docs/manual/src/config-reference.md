@@ -231,7 +231,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections; `proxy=0` is none. Lowers `listen` by default (see `listen`). A **hostname** in `-addnode`/`-seednode`/`-connect` is refused while this is set, rather than resolved by the local resolver — that lookup would leak the peer names the proxy is there to hide. Use a literal IP or a `.onion` address. |
+| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections; `proxy=0` is none. Lowers `listen` by default (see `listen`). Nothing is looked up on the local resolver while this is set: that lookup would leak the peer names the proxy is there to hide. The DNS seeds, and a **hostname** in `-seednode`, are handed to the proxy by name instead, as short-lived `addr-fetch` connections that ask for addresses and close, as Core does. A hostname in `-addnode`/`-connect` is refused; use a literal IP or a `.onion` address. |
 | `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are not negotiated. Set `=0` to opt out. |
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. `onion=0` (`-noonion`) never reaches `.onion`, even through `proxy`. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |

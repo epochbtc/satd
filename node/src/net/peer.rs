@@ -299,6 +299,12 @@ pub struct PeerInfo {
     /// dedup, getpeerinfo, and addrman can distinguish onion peers. `None`
     /// for clearnet and inbound peers.
     pub onion_host: Option<String>,
+    /// For an outbound connection opened by name through the proxy (an
+    /// `addr-fetch` to a DNS seed or a `-seednode` hostname under `-proxy`):
+    /// the `host:port` it was opened to, Core's `CNode::m_addr_name`. The
+    /// proxy resolved the name, so `addr` is the `0.0.0.0:port` placeholder,
+    /// as for an onion peer, and says nothing about the peer.
+    pub addr_name: Option<String>,
     /// The peer came in on the listener a Tor hidden service forwards to
     /// (`-bind=…=onion`): Core's `CNode::m_inbound_onion`. Its socket address
     /// is the one Tor dialled from, usually loopback, and says nothing about
@@ -371,6 +377,7 @@ impl PeerInfo {
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
+            addr_name: None,
             inbound_onion: false,
             getaddr_recvd: false,
             conn_type: match direction {
@@ -489,9 +496,10 @@ impl PeerInfo {
     /// The two callers must agree, or an address satd itself printed cannot
     /// be fed back to it.
     pub fn addr_string(&self) -> String {
-        match &self.onion_host {
-            Some(host) => format!("{host}:{}", self.addr.port()),
-            None => self.addr.to_string(),
+        match (&self.onion_host, &self.addr_name) {
+            (Some(host), _) => format!("{host}:{}", self.addr.port()),
+            (None, Some(name)) => name.clone(),
+            (None, None) => self.addr.to_string(),
         }
     }
 

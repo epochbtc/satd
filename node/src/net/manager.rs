@@ -937,6 +937,8 @@ enum IncomingTransport {
 enum OutboundDial {
     Direct(SocketAddr),
     Onion(String, u16),
+    /// A host name the proxy resolves (`addr-fetch` by name).
+    Name(String, u16),
 }
 
 /// Holds a per-type outbound slot from the moment the capacity check passes
@@ -1315,6 +1317,10 @@ pub struct PeerManager {
     /// onion equivalent, stopping the reconnect loop from opening a second
     /// connection to an onion peer it's already dialing/connected to.
     pending_onion_dials: RwLock<HashSet<String>>,
+    /// Destinations to open an `addr-fetch` connection to by name, through
+    /// the proxy: Core's `m_addr_fetches`. [`Self::add_addr_fetch`] queues
+    /// one; the manager loop opens one per tick ([`Self::process_addr_fetch`]).
+    addr_fetches: parking_lot::Mutex<std::collections::VecDeque<(String, u16)>>,
     /// Outbound dials in flight, per [`DialBudget`]: counted against the
     /// automatic outbound target and the added-node limit along with the
     /// peers already connected. See [`Self::reserve_dial`].
@@ -1615,6 +1621,7 @@ impl PeerManager {
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
             pending_connections: RwLock::new(HashSet::new()),
             pending_onion_dials: RwLock::new(HashSet::new()),
+            addr_fetches: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             dials_in_flight: parking_lot::Mutex::new(DialsInFlight::default()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
@@ -3443,6 +3450,72 @@ impl PeerManager {
         Ok(())
     }
 
+    /// Queue an `addr-fetch` connection to `host:port` by name, for the
+    /// proxy to resolve: Core's `AddAddrFetch`. With `-proxy` set, Core seeds
+    /// this way rather than by a local DNS query (`ThreadDNSAddressSeed`,
+    /// when `HaveNameProxy()`), and opens a `-seednode` hostname the same way;
+    /// the connection asks for addresses and is dropped once it has them.
+    /// The manager loop opens one queued entry per tick.
+    pub fn add_addr_fetch(&self, host: String, port: u16) {
+        self.addr_fetches.lock().push_back((host, port));
+    }
+
+    /// Open the next queued `addr-fetch` by name, if an outbound slot is
+    /// free: Core's `ProcessAddrFetch`, which pops the entry and then tries
+    /// for a `semOutbound` grant, dropping the entry when there is none.
+    fn process_addr_fetch(self: &Arc<Self>) {
+        if !self.is_network_active() {
+            return;
+        }
+        let Some((host, port)) = self.addr_fetches.lock().pop_front() else {
+            return;
+        };
+        {
+            let mut pending = self.pending_typed_dials.write();
+            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending) {
+                tracing::debug!(%host, port, "addr-fetch by name not opened: {e}");
+                return;
+            }
+            pending.push(ConnType::AddrFetch);
+        }
+        let pm = self.clone();
+        tokio::spawn(async move {
+            // Releases the reservation on every exit path.
+            let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type: ConnType::AddrFetch };
+            if let Err(e) = pm.connect_addr_fetch_by_name(&host, port).await {
+                tracing::debug!(%host, port, "addr-fetch by name failed: {e}");
+            }
+        });
+    }
+
+    /// Dial `host:port` through the proxy and open it as an `addr-fetch`
+    /// connection. The caller holds the outbound reservation.
+    async fn connect_addr_fetch_by_name(self: &Arc<Self>, host: &str, port: u16) -> Result<(), String> {
+        let stream = self.dial_name(host, port).await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(%host, port, id, "Opening addr-fetch connection by name via proxy");
+        let (conn, id) = self
+            .establish_outbound(id, stream, OutboundDial::Name(host.to_string(), port), None)
+            .await?;
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+        // The proxy resolved the name, so there is no peer socket to record:
+        // the `0.0.0.0` placeholder an onion peer has, with the name kept for
+        // `getpeerinfo` and `disconnectnode`.
+        let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+        self.spawn_peer(
+            id,
+            placeholder_addr,
+            IncomingTransport::Established(Box::new(conn)),
+            Direction::Outbound,
+            None,
+            Some(format!("{host}:{port}")),
+            Some(ConnType::AddrFetch),
+        );
+        Ok(())
+    }
+
     /// `connect_outbound_as`, with the reservation optional. `reserve` false
     /// takes no place in any limit here: `add_connection` has already taken
     /// its per-type one and the reconnect loop its [`DialSlot`], each held
@@ -3554,6 +3627,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             None,
+            None,
             conn_type,
         );
         Ok(())
@@ -3649,6 +3723,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             Some(host),
+            None,
             conn_type,
         );
         Ok(())
@@ -5590,6 +5665,10 @@ impl PeerManager {
             // Drop addr-fetch connections whose peer never sent a usable
             // `addr`. Read through the node clock, not the wall clock, so
             // `setmocktime` moves the deadline the way it does in Core.
+            // One queued addr-fetch by name per tick, as Core's
+            // `ThreadOpenConnections` runs `ProcessAddrFetch` every 500 ms.
+            self.process_addr_fetch();
+
             if ticks.is_multiple_of(2) {
                 self.expire_addr_fetch_peers();
                 self.expire_compact_state();
@@ -5631,6 +5710,7 @@ impl PeerManager {
                 // fill the tried table.
                 if handle.info.direction == Direction::Outbound
                     && handle.info.onion_host.is_none()
+                    && handle.info.addr_name.is_none()
                     && handle.info.conn_type != ConnType::NapPull
                 {
                     let mut book = self.addrman.write();
@@ -12537,6 +12617,7 @@ impl PeerManager {
     /// the type `addconnection` was given. `None` means "work it out from
     /// the address" ([`Self::untyped_outbound_conn_type`]), which is how the
     /// reconnect loop's dials, and a seed's, reach here.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_peer(
         self: &Arc<Self>,
         id: PeerId,
@@ -12544,11 +12625,13 @@ impl PeerManager {
         transport: IncomingTransport,
         direction: Direction,
         onion_host: Option<&str>,
+        addr_name: Option<String>,
         conn_type: Option<ConnType>,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
         info.onion_host = onion_host.map(str::to_string);
+        info.addr_name = addr_name;
         // Peers from `addnode` / `-connect` are `manual`; everything the
         // node dials by itself is `outbound-full-relay`. The type is not a
         // label only: it decides the outgoing `-whitelist` below, whether a
@@ -12795,6 +12878,21 @@ impl PeerManager {
             .map_err(|e| format!("connect to onion {host}:{port} via proxy: {e}"))
     }
 
+    /// Dial a host name through `-proxy`, which resolves it: Core's
+    /// `ConnectNode` with a destination name and a name proxy. Never resolved
+    /// here; with no proxy there is no dial.
+    async fn dial_name(&self, host: &str, port: u16) -> Result<TcpStream, String> {
+        let proxy_addr = self
+            .proxy
+            .as_deref()
+            .ok_or("no proxy configured to resolve a name through")?;
+        let cred = self.socks_cred();
+        let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        proxy::connect_socks5_name(proxy_addr, host, port, cred_ref, self.socks_dial_timeouts())
+            .await
+            .map_err(|e| format!("connect to {host}:{port} via proxy: {e}"))
+    }
+
     /// Bounds for a SOCKS5 dial: `-timeout` reaches the proxy, and the SOCKS5
     /// exchange gets at least [`SOCKS5_EXCHANGE_TIMEOUT_FLOOR_MS`].
     fn socks_dial_timeouts(&self) -> proxy::DialTimeouts {
@@ -12806,6 +12904,7 @@ impl PeerManager {
         match target {
             OutboundDial::Direct(addr) => self.dial_direct(*addr).await,
             OutboundDial::Onion(host, port) => self.dial_onion(host, *port).await,
+            OutboundDial::Name(host, port) => self.dial_name(host, *port).await,
         }
     }
 
@@ -12834,7 +12933,7 @@ impl PeerManager {
         let magic = self.chain_state.p2p_magic();
         let skip_v2 = match &target {
             OutboundDial::Direct(addr) => self.v2_downgraded.read().contains(addr),
-            OutboundDial::Onion(..) => false,
+            OutboundDial::Onion(..) | OutboundDial::Name(..) => false,
         };
         let v2_wanted = use_v2.unwrap_or_else(|| self.v2_transport_enabled());
         if !v2_wanted || skip_v2 {
@@ -13720,7 +13819,12 @@ impl PeerManager {
         // outbound peer's `version` states what its address offers now,
         // over what gossip said. Onion peers have no entry in the book.
         if direction == Direction::Outbound {
-            let dialled = self.peers.read().get(&id).filter(|h| h.info.onion_host.is_none()).map(|h| h.info.addr);
+            let dialled = self
+                .peers
+                .read()
+                .get(&id)
+                .filter(|h| h.info.onion_host.is_none() && h.info.addr_name.is_none())
+                .map(|h| h.info.addr);
             if let Some(addr) = dialled {
                 self.addrman.write().set_services(&addr, their_version.services.to_u64());
             }

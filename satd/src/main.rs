@@ -4639,22 +4639,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     peer_manager.set_automatic_outbound(config.automatic_outbound);
     peer_manager.set_reachable(config.reachable);
     peer_manager.set_onion_disabled(config.noonion);
-    // satd's proxied bootstrap seeds are .onion only (no DNS through the
-    // proxy), so a proxied node whose -onlynet leaves out onion has no
-    // built-in way to find peers; Core would fetch the DNS seeds through
-    // the proxy instead.
-    if config.proxy.is_some()
-        && !config.reachable.onion
-        && config.automatic_outbound
-        && config.seednode.is_empty()
-        && config.addnode.is_empty()
-    {
-        tracing::warn!(
-            "-proxy is set and -onlynet leaves out onion: satd's proxied bootstrap seeds are .onion \
-             addresses, so this node has no built-in way to find peers. Add -seednode or -addnode \
-             peers on a network -onlynet allows."
-        );
-    }
 
     // Connect to configured peers (and register for auto-reconnect).
     //
@@ -4711,6 +4695,23 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // Core-style hostnames and port-less entries (`seed.example.com`,
     // `1.2.3.4`) get the network default port instead of being rejected.
     if !config.seednode.is_empty() {
+        // Under -proxy a seed host name is not looked up here: it is opened
+        // by name, as an `addr-fetch` connection the proxy resolves, as Core
+        // opens every `-seednode` (`AddAddrFetch`; its `ConnectNode` hands
+        // the name to the proxy). Core uses none under -connect.
+        if config.proxy.is_some() {
+            for (host, port) in node::net::dns::operator_seed_names(&config.seednode, config.network) {
+                if config.automatic_outbound {
+                    peer_manager.add_addr_fetch(host, port);
+                } else {
+                    // Core logs "-seednode is ignored when -connect is used".
+                    tracing::warn!(
+                        "-seednode {host} is not used: under -proxy a seed host name is fetched \
+                         through the proxy as an addr-fetch connection, and -connect uses none"
+                    );
+                }
+            }
+        }
         let seed_addrs = node::net::dns::resolve_operator_seeds(
             &config.seednode,
             config.network,
@@ -4748,6 +4749,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let signet_seeds = config.signet_seed_nodes.clone();
         let force = config.forcednsseed;
         let shutdown = shutdown_rx.clone();
+        // Under -proxy the DNS seeds are reached by name through it, as
+        // `addr-fetch` connections, never looked up locally: Core's
+        // `ThreadDNSAddressSeed` with a name proxy (#994). The built-in
+        // .onion seeds are added as well.
+        let fetch = if proxy.is_some() {
+            node::net::dns::proxied_seed_names(network, &signet_seeds)
+        } else {
+            Vec::new()
+        };
         tokio::spawn(async move {
             // Learned, not named: Core adds a seed's answers to its address
             // book and dials them as automatic `outbound-full-relay`
@@ -4760,6 +4770,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 || async move {
                     node::net::dns::resolve_seeds_with(network, proxy.as_deref(), &signet_seeds).await
                 },
+                fetch,
                 shutdown,
             )
             .await;

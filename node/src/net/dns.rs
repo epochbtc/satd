@@ -189,6 +189,40 @@ pub fn fixed_seeds_for_network(network: Network) -> Vec<PeerAddr> {
         .collect()
 }
 
+/// The seeds a node under `-proxy` reaches by name, as `addr-fetch`
+/// connections the proxy resolves: each of the network's DNS seeds, and on
+/// signet each `-signetseednode` entry that needs a lookup, at the
+/// network's default port unless the entry names one. Core does the same
+/// when a name proxy is set (`ThreadDNSAddressSeed`: `AddAddrFetch(seed)`
+/// when `HaveNameProxy()`, rather than `LookupHost`), so a proxied node
+/// whose `-onlynet` leaves out onion still bootstraps, and nothing is looked
+/// up on the local resolver.
+pub fn proxied_seed_names(network: Network, extra_signet_seeds: &[String]) -> Vec<(String, u16)> {
+    let port = default_port(network);
+    let mut out: Vec<(String, u16)> = seeds_for_network(network)
+        .iter()
+        .map(|seed| split_seed_host_port(seed, port))
+        .collect();
+    if network == Network::Signet {
+        out.extend(operator_seed_names(extra_signet_seeds, network));
+    }
+    out
+}
+
+/// The entries of an operator seed list (`-seednode`, `-signetseednode`)
+/// that are host names: neither an IP literal nor a `.onion` address. Under
+/// `-proxy` these are reached by name, as `addr-fetch` connections the proxy
+/// resolves (Core's `AddAddrFetch` with a name proxy); without one
+/// [`resolve_operator_seeds`] looks them up.
+pub fn operator_seed_names(seeds: &[String], network: Network) -> Vec<(String, u16)> {
+    let port = default_port(network);
+    seeds
+        .iter()
+        .map(|seed| split_seed_host_port(seed, port))
+        .filter(|(host, _)| !host.ends_with(".onion") && host.parse::<std::net::IpAddr>().is_err())
+        .collect()
+}
+
 /// Resolve seeds for the given network, returning PeerAddr values.
 ///
 /// When a proxy is configured, uses hardcoded .onion seeds instead of
@@ -375,11 +409,9 @@ pub async fn resolve_operator_seeds(
         } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             out.push(PeerAddr::Socket(SocketAddr::new(ip, p)));
         } else if proxy.is_some() {
-            tracing::warn!(
-                seed = %host,
-                "skipping DNS seed node under proxy mode (would leak DNS); \
-                 use a .onion address or literal IP instead",
-            );
+            // Not looked up here, which would leak the query: under a proxy
+            // the caller opens it by name (`operator_seed_names`).
+            tracing::debug!(seed = %host, "seed node host name left for the proxy to resolve");
         } else {
             let target = format!("{host}:{p}");
             match tokio::net::lookup_host(&target).await {
@@ -677,6 +709,36 @@ mod tests {
         )
         .await;
         assert!(out.is_empty());
+    }
+
+    /// #994: what a proxied node reaches by name. Every DNS seed at the
+    /// network's port, the signet operator seeds that need a lookup, and
+    /// nothing that is an IP literal or an onion address (those are dialled
+    /// as they are). Perturbation: drop the IP-literal filter in
+    /// `operator_seed_names` and `192.0.2.7` is listed.
+    #[test]
+    fn a_proxied_node_reaches_dns_seeds_and_seed_hostnames_by_name() {
+        let names = proxied_seed_names(Network::Bitcoin, &[]);
+        assert_eq!(names.len(), MAINNET_SEEDS.len());
+        assert!(names.iter().all(|(h, p)| *p == 8333 && MAINNET_SEEDS.contains(&h.as_str())));
+        assert!(proxied_seed_names(Network::Regtest, &[]).is_empty());
+
+        let ops = vec![
+            "seed.example.com".to_string(),
+            "seed2.example.com:39333".to_string(),
+            "192.0.2.7".to_string(),
+            "[2001:db8::1]:38333".to_string(),
+            "6megrst422lxzsqvshkqkg6z2zl2f6n532vy7t5hj5xmfoauoygzqad.onion".to_string(),
+        ];
+        let expected = vec![
+            ("seed.example.com".to_string(), 38333),
+            ("seed2.example.com".to_string(), 39333),
+        ];
+        assert_eq!(operator_seed_names(&ops, Network::Signet), expected);
+        let signet = proxied_seed_names(Network::Signet, &ops);
+        assert!(signet.ends_with(&expected), "{signet:?}");
+        // The extras are signet's only.
+        assert_eq!(proxied_seed_names(Network::Bitcoin, &ops).len(), MAINNET_SEEDS.len());
     }
 
     #[test]
