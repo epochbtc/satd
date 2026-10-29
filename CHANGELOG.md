@@ -251,6 +251,12 @@ item below is (or will be) written up in full in the in-development
   transactions and refuse a longer history (Electrum `history too large`,
   Esplora 400 `Too many history entries`); `get_first_use` reads only the
   first block. The new `-addrindexmaxhistory` sets the cap (`0` for none).
+- An Electrum connection may hold 10,000 scripthash subscriptions by default
+  (`-electrummaxsubsperconn`, was 1000), and the server-wide registry 50,000
+  (`-addrindexsubscriptions`, was 10,000): a desktop wallet with a few
+  hundred transactions, or a few accounts open, passed 1000 and its sync
+  failed partway. Subscribing no longer walks the whole registry each time,
+  which made N subscribes O(N²).
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
   does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,

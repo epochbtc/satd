@@ -5,11 +5,19 @@
 //! feature flag. CFs are created unconditionally on DB open; only the
 //! per-block emission and the protocol-side endpoints check `enabled`.
 
-/// Default cap for concurrent per-scripthash subscriptions. Plumbed in
-/// via `--addrindexsubscriptions=N`. Generous enough for typical
-/// mobile-wallet xpub-derivation patterns (~20-200 scripthashes per
-/// wallet) without unbounded memory growth.
-pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
+/// Default cap for concurrent per-scripthash subscriptions, server-wide:
+/// every Electrum connection and Esplora SSE stream shares it. Plumbed in
+/// via `--addrindexsubscriptions=N`.
+///
+/// Five Electrum connections at their default cap of 10,000 (a large
+/// desktop wallet each) fit together. It moves with that cap: at 10,000
+/// against a per-connection 1,000, ten wallets filled it, and raising only
+/// the per-connection cap would let one wallet take it all (#1121).
+/// Measured cost per subscribed scripthash: about 4.6 KB, so about 230 MB
+/// when full, and a history read after every block, on the blocking pool:
+/// about 30-55 µs for a short history on a warm index (one to three
+/// seconds per block when full), about 0.2-0.35 ms at 20 transactions.
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 50_000;
 
 /// Per-channel `tokio::broadcast` capacity for status updates. Slow
 /// consumers see `RecvError::Lagged` and resync from a fresh

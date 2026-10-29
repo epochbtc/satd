@@ -257,7 +257,7 @@ startup error.
 | `txindex` | off | restart | core | Maintain a full transaction index. |
 | `addressindex` | on | restart | satd | Maintain an address-history index (backs native Electrum/Esplora). |
 | `addrindexmaxhistory` | 200000 | restart | satd | Largest scripthash history (transactions) the Electrum and Esplora address queries serve; a busier script is refused. `0` = no cap, which restores whole-history reads. See the Electrum chapter's History cap. |
-| `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
+| `addrindexsubscriptions` | 50000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
@@ -329,7 +329,7 @@ startup error.
 | `electrummtlsclientca` | none | restart | satd | PEM CA bundle to verify client certs when `electrummtls=1`. |
 | `electrummtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
 | `electrummaxconns` | 64 | restart | satd | Hard cap on simultaneously-open Electrum connections. |
-| `electrummaxsubsperconn` | 1000 | restart | satd | Per-connection scripthash subscription cap. |
+| `electrummaxsubsperconn` | 10000 | restart | satd | Per-connection scripthash subscription cap. |
 | `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). Past it the client gets a `request timed out` error and the connection is closed; the connection keeps its slot until the handler's work ends. |
 | `electrummaxbatchrequests` | 100 | restart | satd | Max requests per JSON-RPC batch line. Wallets (Sparrow) batch their whole gap-limit window of subscribes at scan time. |
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
