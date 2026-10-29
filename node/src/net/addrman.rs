@@ -143,15 +143,20 @@ impl AddrEntry {
     /// satd records `last_try` when a dial ends rather than when it starts,
     /// so the minute runs from the result.
     pub fn is_terrible(&self, now: u64) -> bool {
-        if self.last_try != 0 && now.saturating_sub(self.last_try) <= ADDRMAN_TEST_GRACE_SECS {
-            return false;
-        }
-        self.last_seen > now + 10 * 60
-            || now.saturating_sub(self.last_seen) > ADDRMAN_HORIZON_SECS
-            || (self.last_success == 0 && self.attempts >= ADDRMAN_RETRIES)
-            || (now.saturating_sub(self.last_success) > ADDRMAN_MIN_FAIL_SECS
-                && self.attempts >= ADDRMAN_MAX_FAILURES)
+        is_terrible(self.last_seen, self.last_success, self.last_try, self.attempts, now)
     }
+}
+
+/// [`AddrEntry::is_terrible`] over the fields it reads, for an address the
+/// book does not hold as well (the onion candidates).
+pub fn is_terrible(last_seen: u64, last_success: u64, last_try: u64, attempts: u32, now: u64) -> bool {
+    if last_try != 0 && now.saturating_sub(last_try) <= ADDRMAN_TEST_GRACE_SECS {
+        return false;
+    }
+    last_seen > now + 10 * 60
+        || now.saturating_sub(last_seen) > ADDRMAN_HORIZON_SECS
+        || (last_success == 0 && attempts >= ADDRMAN_RETRIES)
+        || (now.saturating_sub(last_success) > ADDRMAN_MIN_FAIL_SECS && attempts >= ADDRMAN_MAX_FAILURES)
 }
 
 /// Network group key used for bucketing. IPv4 → the `/16`; IPv6 → the

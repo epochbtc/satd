@@ -87,6 +87,14 @@ const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// peer. The reconnect loop never opens more than the outbound target anyway.
 const MAX_ONION_CONNECT_ADDRS: usize = 512;
 
+/// The share of [`MAX_ONION_CONNECT_ADDRS`] the onions one source may hold:
+/// the network group of the clearnet peer that announced them, or the onion
+/// peer itself. Core bounds one source group to 64 of its 1024 new buckets
+/// (`ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP`, v31.1 `src/addrman.h:25`); here
+/// one source fills at most an eighth of the list, so it takes eight
+/// sources to fill it.
+const MAX_ONION_ADDRS_PER_SOURCE: usize = MAX_ONION_CONNECT_ADDRS / 8;
+
 /// Upper bound on onion dials the reconnect loop starts in a single 10s tick.
 /// Onion dials each hold a Tor circuit through the one configured SOCKS proxy,
 /// so a burst must be bounded even when many slots are open — otherwise a peer
@@ -540,6 +548,27 @@ impl StuckWait {
 }
 
 /// Per-address reconnect backoff state.
+/// A learned onion candidate's record ([`PeerManager::onion_candidates`]).
+#[derive(Debug, Clone)]
+struct OnionCandidate {
+    /// The source whose share it counts against; `None` for a seed.
+    source: Option<Vec<u8>>,
+    /// Unix seconds it was last announced or connected.
+    last_seen: u64,
+    /// Unix seconds of the last dial that connected; 0 if none.
+    last_success: u64,
+    /// Unix seconds the last dial ended; 0 if none.
+    last_try: u64,
+    /// Failed dials since the last that connected.
+    attempts: u32,
+}
+
+impl OnionCandidate {
+    fn is_terrible(&self, now: u64) -> bool {
+        crate::net::addrman::is_terrible(self.last_seen, self.last_success, self.last_try, self.attempts, now)
+    }
+}
+
 struct ReconnectState {
     attempts: u32,
     next_attempt: Instant,
@@ -1394,6 +1423,12 @@ pub struct PeerManager {
     dns_enabled: std::sync::atomic::AtomicBool,
     /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
+    /// What the node knows of each onion host on `connect_peer_addrs` that
+    /// it learned for itself (gossip or a seed), keyed by host: where it
+    /// came from and how its dials went, Core's `AddrInfo` fields that
+    /// `IsTerrible` reads. Lock order: `connect_peer_addrs`, then this, then
+    /// `onion_reconnect_backoff`.
+    onion_candidates: RwLock<HashMap<String, OnionCandidate>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
     max_ahead: u32,
     /// Latest ETA (seconds) from the weight-aware IBD estimator.
@@ -1644,6 +1679,7 @@ impl PeerManager {
             onion_proxy,
             proxy_randomize: std::sync::atomic::AtomicBool::new(true),
             connect_peer_addrs: RwLock::new(Vec::new()),
+            onion_candidates: RwLock::new(HashMap::new()),
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
@@ -2542,6 +2578,22 @@ impl PeerManager {
     /// connection and the existing candidate list. This is what lets a
     /// proxy-only node grow its peer set past the hardcoded onion seeds.
     fn add_onion_connect_addr(&self, host: String, port: u16) {
+        self.add_onion_candidate(host, port, None);
+    }
+
+    /// [`Self::add_onion_connect_addr`] for an onion announced by a peer,
+    /// whose share of the list it counts against: `source` is the
+    /// announcer's network group, or its own onion host (see
+    /// [`Self::onion_source`]).
+    ///
+    /// The list was first come, first kept: once one peer's `getaddr`
+    /// answer had filled it, every later onion was refused for the life of
+    /// the process, and nothing left it but `addnode … remove`. Now one
+    /// source holds at most [`MAX_ONION_ADDRS_PER_SOURCE`] of it, and a full
+    /// list makes room for a new onion by dropping a learned one that is
+    /// terrible, as Core's `AddSingle` overwrites a terrible entry
+    /// (v31.1 `src/addrman.cpp:581`).
+    fn add_onion_candidate(&self, host: String, port: u16, source: Option<Vec<u8>>) {
         // Under `-connect` the node dials only the peers it was told to; see
         // `may_dial`. Onion candidates are in-memory only, so refusing them
         // here is enough to keep them off the dial list.
@@ -2553,18 +2605,86 @@ impl PeerManager {
         }
         // Core looks no further at a banned address it is told about, as the
         // clearnet arms do; the reconnect loop would not dial it either.
-        if self.ban_list.read().is_onion_banned(&host, crate::time::now_secs()) {
+        let now = now_unix_secs();
+        if self.ban_list.read().is_onion_banned(&host, now) {
             return;
         }
         let mut addrs = self.connect_peer_addrs.write();
+        let mut candidates = self.onion_candidates.write();
         let already = addrs
             .iter()
             .any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if *h == host));
-        if already || addrs.len() >= MAX_ONION_CONNECT_ADDRS {
+        if already {
+            if let Some(c) = candidates.get_mut(&host) {
+                c.last_seen = c.last_seen.max(now);
+            }
             return;
         }
+        if let Some(src) = &source {
+            let held = candidates.values().filter(|c| c.source.as_ref() == Some(src)).count();
+            if held >= MAX_ONION_ADDRS_PER_SOURCE {
+                tracing::debug!(onion = %host, "Not learning an onion peer: its source has its share");
+                return;
+            }
+        }
+        if addrs.len() >= MAX_ONION_CONNECT_ADDRS {
+            // A learned onion that is terrible and not in use gives up its
+            // place. A peer the operator named never does.
+            let victim = addrs.iter().position(|a| match a {
+                PeerAddr::Onion { host: h, .. } => {
+                    candidates.get(h).is_some_and(|c| c.is_terrible(now))
+                        && !self.is_manual_target(a)
+                        && !self.is_onion_connected(h)
+                        && !self.pending_onion_dials.read().contains(h)
+                }
+                PeerAddr::Socket(_) => false,
+            });
+            let Some(i) = victim else {
+                return;
+            };
+            let gone = addrs.remove(i);
+            if let PeerAddr::Onion { host: h, .. } = &gone {
+                candidates.remove(h);
+            }
+            self.onion_reconnect_backoff.write().remove(&gone.to_string());
+            tracing::debug!(onion = %gone, "Dropped a terrible onion peer to make room");
+        }
         tracing::debug!(onion = %host, port, "Discovered onion peer via addrv2");
+        candidates.insert(host.clone(), OnionCandidate { source, last_seen: now, last_success: 0, last_try: 0, attempts: 0 });
         addrs.push(PeerAddr::Onion { host, port });
+    }
+
+    /// The source an onion announced by peer `id` counts against: the
+    /// network group of a clearnet peer, or the host of an onion peer,
+    /// whose address is the unspecified placeholder. A peer that is no
+    /// longer connected, or has neither, is a source of its own: the share
+    /// bounds it as well.
+    fn onion_source(&self, id: PeerId) -> Vec<u8> {
+        if let Some(ip) = self.peer_ip(id) {
+            let mut key = b"g".to_vec();
+            key.extend(self.addrman.read().group_key(ip));
+            return key;
+        }
+        if let Some(host) = self.peers.read().get(&id).and_then(|h| h.info.onion_host.clone()) {
+            return [b"o".as_slice(), host.as_bytes()].concat();
+        }
+        [b"p".as_slice(), &id.to_le_bytes()].concat()
+    }
+
+    /// Record how a dial to a learned onion candidate went, for
+    /// [`OnionCandidate::is_terrible`] (Core's `Attempt` and `Good`).
+    fn note_onion_dial(&self, host: &str, connected: bool) {
+        if let Some(c) = self.onion_candidates.write().get_mut(host) {
+            let now = now_unix_secs();
+            c.last_try = now;
+            if connected {
+                c.last_success = now;
+                c.last_seen = now;
+                c.attempts = 0;
+            } else {
+                c.attempts = c.attempts.saturating_add(1);
+            }
+        }
     }
 
     /// Load the persistent address book from `path` (peers.dat), then
@@ -2998,6 +3118,12 @@ impl PeerManager {
                 let mut addrs = self.connect_peer_addrs.write();
                 let before = addrs.len();
                 addrs.retain(|a| a != addr);
+                // The record is the host's; another port of it may remain.
+                let host_listed =
+                    addrs.iter().any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if h == host));
+                if addrs.len() < before && !host_listed {
+                    self.onion_candidates.write().remove(host);
+                }
                 addrs.len() < before
             }
         }
@@ -5210,6 +5336,9 @@ impl PeerManager {
                 }
             }
             let connected = result.is_ok();
+            if let PeerAddr::Onion { host, .. } = &target {
+                pm.note_onion_dial(host, connected);
+            }
             let update = |state: &mut ReconnectState| {
                 state.last_try = Some(Instant::now());
                 if connected {
@@ -5231,12 +5360,17 @@ impl PeerManager {
                         update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
                     }
                 }
-                PeerAddr::Onion { .. } => update(
-                    pm.onion_reconnect_backoff
-                        .write()
-                        .entry(target.to_string())
-                        .or_insert_with(ReconnectState::new),
-                ),
+                // Likewise for an onion that left the list while the dial ran
+                // (a full list dropped it, or `addnode … remove`).
+                // The list first: `add_onion_candidate` holds it while it
+                // drops a backoff entry, so the other order deadlocks.
+                PeerAddr::Onion { .. } => {
+                    let listed = pm.connect_peer_addrs.read();
+                    let mut backoff = pm.onion_reconnect_backoff.write();
+                    if listed.contains(&target) {
+                        update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
+                    }
+                }
             }
         });
     }
@@ -6084,6 +6218,10 @@ impl PeerManager {
                 let count = addrs.len();
                 let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
                 let source = self.peer_ip(id);
+                // Read once for the whole message: the announcer can leave `peers`
+                // while it is processed, and its later onions must still count
+                // against its share.
+                let onion_source = self.onion_source(id);
                 let mut processed = 0u64;
                 for addr_msg in &admitted {
                     match &addr_msg.addr {
@@ -6097,7 +6235,7 @@ impl PeerManager {
                                 continue;
                             }
                             processed += 1;
-                            self.add_onion_connect_addr(host, addr_msg.port);
+                            self.add_onion_candidate(host, addr_msg.port, Some(onion_source.clone()));
                         }
                         // IPv4 / IPv6 (and, under a proxy, anything else with a
                         // socket form) flow through the clearnet address book.

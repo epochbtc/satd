@@ -202,6 +202,12 @@ item below is (or will be) written up in full in the in-development
   incumbent (test-before-evict), and tried dials draw a bucket first. One
   /16 could fill the whole tried table (#924).
 
+- The onion candidate list (onion peers learned from `addrv2`, up to 512)
+  holds at most 64 from one source, and a full list drops a terrible onion
+  (three failed dials and never reached, or Core's other `IsTerrible`
+  rules) to take a new one. One peer's `getaddr` answer could fill it for
+  the life of the process (#1120).
+
 - The address book's service bits follow an outbound peer's `version` and
   add up over later announcements, as Core's do; they used to stay as first
   heard.
