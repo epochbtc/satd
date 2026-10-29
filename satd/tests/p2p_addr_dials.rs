@@ -288,6 +288,54 @@ fn outbound_full_relay_peers_are_asked_for_addresses() {
     );
 }
 
+/// An `addrv2` of `n` full-node addresses laid out as `addr_msg`'s, whose
+/// first entry advertises service bit 26 (set by some implementations on
+/// the network). Encoded by hand: rust-bitcoin's encoder would write it,
+/// but its decoder refuses it.
+fn addrv2_with_service_bit_26(base: u8, n: usize) -> NetworkMessage {
+    let full = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
+    let mut payload = serialize(&bitcoin::VarInt(n as u64));
+    for i in 0..n {
+        let services = if i == 0 { full | 1 << 26 } else { full };
+        payload.extend_from_slice(&1_760_000_000u32.to_le_bytes());
+        payload.extend(serialize(&bitcoin::VarInt(services)));
+        payload.extend_from_slice(&[1, 4, base + (i / 250) as u8, (i % 250) as u8, 7, 7]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+    }
+    NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from_static("addrv2").unwrap(),
+        payload,
+    }
+}
+
+/// A `getaddr` answer that lists a node with a service bit at or above 25
+/// is learned whole, and the peer stays. Core reads `addrv2` services with
+/// no range check; satd refused the whole message, so over v1 none of its
+/// addresses was learned, and over v2 the peer was dropped.
+#[test]
+fn a_getaddr_answer_listing_a_high_service_bit_is_learned() {
+    let node = TestNode::start(&["--v2transport=0"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+    node.rpc_ok("addconnection", vec![json!(target), json!("outbound-full-relay"), json!(false)]);
+    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
+    assert!(
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        "the node asks for addresses"
+    );
+    peer.send_and_sync(addrv2_with_service_bit_26(1, 600));
+    poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
+    let bit26 = node
+        .rpc_ok("getnodeaddresses", vec![json!(0)])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["address"] == "1.0.7.7")
+        .cloned()
+        .expect("the bit-26 entry is in the book");
+    assert_ne!(bit26["services"].as_u64().unwrap() & 1 << 26, 0, "{bit26}");
+}
+
 /// Core counts manual connections apart from the automatic outbound target:
 /// `addnode onetry` takes no grant at all, and added nodes have their own
 /// limit of eight (`semAddnode`), redialled every minute however many

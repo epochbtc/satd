@@ -1,4 +1,5 @@
 pub mod addr_rate;
+pub mod addrv2;
 pub mod addrman;
 pub mod ban;
 pub mod asmap;
