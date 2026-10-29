@@ -3,11 +3,12 @@
 //! rust-bitcoin's `AddrV2Message` decoder refuses things Core accepts, and
 //! one refused entry loses the whole message:
 //!
-//! - It reads `services` as a size-checked CompactSize, so any value above
-//!   `MAX_SIZE` (0x0200_0000, i.e. any service bit at or above 25) fails.
-//!   Core reads it with `CompactSizeFormatter<false>`, no range check
-//!   (`src/protocol.h:446`). Nodes that set bit 26 are on the network, and
-//!   a `getaddr` reply of 1000 entries nearly always lists one.
+//! - Up to 0.32.9 it read `services` as a size-checked CompactSize, so any
+//!   value above `MAX_SIZE` (0x0200_0000, i.e. any service bit at or above
+//!   25) failed. Core reads it with `CompactSizeFormatter<false>`, no range
+//!   check (`src/protocol.h:446`). Nodes that set bit 26 are on the
+//!   network, and a `getaddr` reply of 1000 entries nearly always lists one.
+//!   0.32.10 dropped the check; this reader keeps Core's rule either way.
 //! - It fails an IPv6 entry that carries an embedded IPv4 or TORv2 address,
 //!   a TORv2 entry of the wrong length, and a CJDNS entry without the `fc`
 //!   prefix. Core reads each of these as an invalid address that is never
@@ -232,10 +233,10 @@ mod tests {
             entry(2, 1 << 26 | 0x409, 1, &[5, 6, 7, 8], 8333),
             entry(3, u64::MAX, 1, &[9, 9, 9, 9], 18333),
         ]);
-        assert!(
-            bitcoin::consensus::deserialize::<Vec<AddrV2Message>>(&p).is_err(),
-            "rust-bitcoin refuses this payload; if it stops refusing, this module can go"
-        );
+        // rust-bitcoin 0.32.9 refused this payload; 0.32.10 dropped the
+        // range check (#6182) and reads it. The module stays for the
+        // entries Core reads as invalid, which rust-bitcoin still refuses.
+        assert!(bitcoin::consensus::deserialize::<Vec<AddrV2Message>>(&p).is_ok());
         let got = decode_payload(&p).expect("Core reads this payload");
         assert_eq!(got.len(), 3);
         assert_eq!(got[1].services.to_u64(), 1 << 26 | 0x409);
