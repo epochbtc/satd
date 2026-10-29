@@ -524,3 +524,79 @@ fn an_onion_dial_passes_over_a_peer_it_just_tried() {
     );
     assert_eq!(pm.reserve_onion_dials(Instant::now()).len(), 1);
 }
+
+/// #924: Core draws a tried bucket before an entry in it, so a group's share
+/// of the tried draws is bounded by its eight buckets. Five hundred tried
+/// entries in one /16 and fifty in fifty other groups: the big group used to
+/// come first in about 500 of every 550 tried draws.
+#[test]
+fn tried_dials_draw_a_bucket_before_an_entry() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let big = one_group(2000);
+    let small: Vec<SocketAddr> = (0..50).map(own_group).collect();
+    let mut tried_big = Vec::new();
+    {
+        let mut book = pm.addrman.write();
+        let small_tried = small.iter().filter(|a| book.mark_good(**a, 1)).count();
+        assert!(small_tried > 40, "fixture: {small_tried}");
+        for a in &big {
+            if book.mark_good(*a, 1) {
+                tried_big.push(*a);
+            }
+        }
+        assert!(tried_big.len() > 200, "fixture: {}", tried_big.len());
+        // The flood's collisions settle, every incumbent alive, so no
+        // incumbent to test goes first.
+        assert!(book.resolve_collisions(1).is_empty());
+        assert_eq!(book.select_tried_collision(), None);
+    }
+    learn(&pm, &tried_big);
+    learn(&pm, &small);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let mut big_first = 0;
+    for _ in 0..1000 {
+        if tried_big.contains(&pm.automatic_dial_order(&mut rng)[0]) {
+            big_first += 1;
+        }
+    }
+    // At most 8 of the ~58 buckets drawn belong to the big group.
+    assert!(big_first < 250, "the one group came first in {big_first} of 1000");
+}
+
+/// Test-before-evict, end to end: a promotion into a taken tried slot puts
+/// the incumbent first on the next dial order, and an incumbent the node is
+/// connected to is marked good on the reconnect tick, so the newcomer stays
+/// new.
+#[test]
+fn a_tried_collision_tests_the_incumbent() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let old = SocketAddr::from(([44, 7, 0, 1], 8333));
+    let now = now_unix_secs();
+    let (new, slot) = {
+        let mut book = pm.addrman.write();
+        // Long ago, so nothing but this tick's test keeps the incumbent.
+        assert!(book.mark_good(old, now - 10 * 3600));
+        let bucket = book.tried_bucket(&old).unwrap();
+        let target = book.tried_slot(&old);
+        let new = (2..60_000u32)
+            .map(|i| SocketAddr::from(([44, 7, (i / 250) as u8, (i % 250) as u8 + 1], 8333)))
+            .find(|c| book.tried_slot(c) == target)
+            .expect("a colliding address");
+        book.add(new, now);
+        assert!(!book.mark_good(new, now - 3600), "fixture: the slot is taken");
+        assert_eq!(book.select_tried_collision(), Some(old));
+        (new, bucket)
+    };
+    learn(&pm, &[new]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    assert_eq!(pm.automatic_dial_order(&mut rng)[0], old, "the incumbent is tested first");
+
+    add_peer(&pm, outbound(1, old, ConnType::OutboundFullRelay));
+    pm.resolve_tried_collisions();
+    let book = pm.addrman.read();
+    assert!(book.is_tried(&old) && book.tried_bucket(&old) == Some(slot));
+    assert!(!book.is_tried(&new), "a connected incumbent keeps its slot");
+    assert_eq!(book.select_tried_collision(), None);
+}

@@ -196,6 +196,12 @@ item below is (or will be) written up in full in the in-development
   and new tables, passing over addresses tried in the last ten minutes, as
   in Core. A node used to redial the same few peers all day.
 
+- The address book's tried table bounds each network group as Core's does:
+  a tried entry sits at its Core `bucket/position` slot, one group reaches
+  at most 8 of its 256 buckets, a promotion into a taken slot waits on the
+  incumbent (test-before-evict), and tried dials draw a bucket first. One
+  /16 could fill the whole tried table (#924).
+
 - The address book's service bits follow an outbound peer's `version` and
   add up over later announcements, as Core's do; they used to stay as first
   heard.

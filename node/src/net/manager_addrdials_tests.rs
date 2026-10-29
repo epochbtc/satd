@@ -626,7 +626,7 @@ fn a_full_book_replaces_a_terrible_entry() {
 
     let stale = addr_at(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(stale);
+        pm.addrman.write().mark_attempt(stale, now_unix_secs() - 120);
     }
     pm.add_learned_addr_from(fresh, 9, source);
     assert!(pm.addrman.read().contains(&fresh), "the new address takes the terrible one's place");
@@ -670,7 +670,7 @@ fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
 
     let stale = in_group(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(stale);
+        pm.addrman.write().mark_attempt(stale, now_unix_secs() - 120);
     }
     pm.reconnect_backoff.write().insert(stale, ReconnectState::new());
     pm.add_learned_addr_from(fresh, 9, source);
@@ -691,11 +691,14 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
     let long_ago = crate::time::now_secs() - 31 * 24 * 60 * 60;
     {
         let mut book = pm.addrman.write();
+        // A /16 each, so neither table's per-group bound refuses one; an
+        // address whose tried slot another took stays new.
         for i in 0..full {
-            let a = SocketAddr::from(([11 + (i / 65536) as u8, ((i / 256) % 256) as u8, (i % 256) as u8, 1], 8333));
+            let a = SocketAddr::from(([11 + (i / 256) as u8, (i % 256) as u8, 1, 1], 8333));
             book.mark_good(a, long_ago);
         }
-        assert_eq!(book.len(), full, "fixture: the book is full of tried entries");
+        assert_eq!(book.len(), full, "fixture: the book is full");
+        assert!(book.iter().filter(|e| e.tried).count() > full / 2, "fixture: mostly tried");
     }
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, IpAddr::from([198, 51, 100, 1]));

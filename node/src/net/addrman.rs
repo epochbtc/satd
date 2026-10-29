@@ -5,16 +5,32 @@
 //! address book modeled on Bitcoin Core's addrman: addresses are split
 //! into a *new* table (gossiped/seeded, unverified) and a *tried* table
 //! (we have connected successfully), and both are bucketed by network
-//! *group* (the `/16` for IPv4, or — once `-asmap` is wired — the ASN) so
-//! that no single network group can dominate the table and eclipse the
-//! node. Selection is biased ~50/50 between tried and new.
+//! *group* (the `/16` for IPv4, or the ASN under `-asmap`) so that no
+//! single network group can dominate the book and eclipse the node: a group
+//! holds at most [`MAX_NEW_PER_GROUP`] new entries, and its tried entries
+//! live in at most [`TRIED_BUCKETS_PER_GROUP`] of the tried table's buckets.
+//! Selection is biased ~50/50 between tried and new.
+//!
+//! The tried table is Core's (`vvTried`, `src/addrman_impl.h`): every tried
+//! entry sits at the `bucket/position` slot Core's formulas give it
+//! (`GetTriedBucket`, `GetBucketPosition`), at most one per slot, so one
+//! group never holds more than 8 x 64 = 512 of its 16,384 slots. A promotion
+//! into a taken slot waits, as Core's test-before-evict does (`Good_`,
+//! `ResolveCollisions_`): the incumbent stays unless it has not connected
+//! for four hours and then fails a dial, or goes untested for 40 minutes,
+//! and the incumbent it replaces goes back to the new table (`MakeTried`).
+//! The key that places entries is kept in `peers.dat`, as Core keeps
+//! `nKey`, so they stay put across restarts.
 //!
 //! The on-disk format is satd-native and versioned (magic `SADR`); it is
 //! NOT byte-compatible with Core's `peers.dat`, and is treated as
 //! untrusted on load (capped, malformed records skipped). Version 2 adds
 //! each entry's advertised service bits and the address of the peer that
 //! told us about it; a version 1 file still loads, with Core's defaults for
-//! the two fields.
+//! the two fields. The slot key follows the records as a trailer (`SKEY`
+//! and 16 bytes), which a reader that predates it never reaches: such a
+//! file still loads in an older satd. A file without it loads under a fresh
+//! key, and a tried entry whose slot another already took goes back to new.
 //!
 //! The book holds what Core's would: an address that is not valid (Core's
 //! `IsValid`: `0.0.0.0`, `255.255.255.255`, `::` and the like) is refused on
@@ -25,11 +41,10 @@
 //! would refuse; see [`AddrMan::set_admit_private`].
 //!
 //! Core's addrman stores every entry at a fixed `bucket/position` slot, and
-//! `getrawaddrman` reports those slots. satd keeps a flat map instead, so
-//! [`AddrMan::positions`] *derives* a slot for each entry with Core's own
-//! bucket formulas, keyed by a per-process random key. The slots are stable
-//! for the life of the process and spread entries the way Core's do, but
-//! they are not where anything is stored, and two processes disagree.
+//! `getrawaddrman` reports those slots. A tried entry's slot is where satd
+//! keeps it. The new table is a flat map with a per-group cap, so
+//! [`AddrMan::positions`] *derives* a slot for each new entry with Core's
+//! own bucket formulas; those slots are not where anything is stored.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -41,7 +56,7 @@ use std::path::Path;
 pub const MAX_ENTRIES: usize = 16_384;
 /// Per-network-group cap in the *new* table (eclipse resistance: stop one
 /// `/16`/ASN from flooding the book with addresses).
-const MAX_NEW_PER_GROUP: usize = 64;
+pub const MAX_NEW_PER_GROUP: usize = 64;
 
 /// The service bits an entry carries when nothing better is known:
 /// `NODE_NETWORK | NODE_WITNESS`, which is what Core's `addpeeraddress`
@@ -51,17 +66,34 @@ pub const DEFAULT_SERVICES: u64 = 1 | 8;
 /// Current `peers.dat` format version (see the module docs).
 const FORMAT_VERSION: u32 = 2;
 
-// Core's table geometry (`src/addrman_impl.h`), used to derive the
-// `bucket/position` slots `getrawaddrman` reports.
+// Core's table geometry (`src/addrman_impl.h`, `src/addrman.h`): the tried
+// table's slots, and the `bucket/position` slots `getrawaddrman` reports.
 const TRIED_BUCKET_COUNT: u64 = 256;
 const NEW_BUCKET_COUNT: u64 = 1024;
 const BUCKET_SIZE: u64 = 64;
-const TRIED_BUCKETS_PER_GROUP: u64 = 8;
+/// Core's `ADDRMAN_TRIED_BUCKETS_PER_GROUP`: the tried buckets one network
+/// group's entries can land in.
+pub const TRIED_BUCKETS_PER_GROUP: u64 = 8;
 const NEW_BUCKETS_PER_SOURCE_GROUP: u64 = 64;
 
-// `positions` places every entry in a table of its own. The tried table
-// holds exactly `MAX_ENTRIES` slots, so every entry can be tried and still
-// find one; a larger cap would leave `FreeSlots::take` nowhere to stop.
+/// Core's `ADDRMAN_SET_TRIED_COLLISION_SIZE`: promotions waiting on a taken
+/// tried slot.
+const TRIED_COLLISION_SIZE: usize = 10;
+/// Core's `ADDRMAN_REPLACEMENT`: an incumbent that connected this recently
+/// keeps its slot, and one that failed a dial this recently loses it.
+const ADDRMAN_REPLACEMENT_SECS: u64 = 4 * 60 * 60;
+/// Core's `ADDRMAN_TEST_WINDOW`: how long a promotion waits for its
+/// incumbent to be tested before it replaces it anyway.
+const ADDRMAN_TEST_WINDOW_SECS: u64 = 40 * 60;
+/// Core gives an incumbent this long after a dial to connect before a
+/// failure counts against it (`ResolveCollisions_`).
+const ADDRMAN_TEST_GRACE_SECS: u64 = 60;
+
+/// The `peers.dat` trailer that carries the slot key.
+const KEY_TRAILER: &[u8; 4] = b"SKEY";
+
+// `positions` places every new entry in a table of its own, which must have
+// room for all of them; the tried table holds exactly `MAX_ENTRIES` slots.
 const _: () = assert!(MAX_ENTRIES as u64 <= TRIED_BUCKET_COUNT * BUCKET_SIZE);
 const _: () = assert!(MAX_ENTRIES as u64 <= NEW_BUCKET_COUNT * BUCKET_SIZE);
 
@@ -74,6 +106,9 @@ pub struct AddrEntry {
     pub last_success: u64,
     /// Consecutive failed attempts since the last success.
     pub attempts: u32,
+    /// Unix seconds of the last dial, failed or not (Core's `m_last_try`;
+    /// 0 if none since startup). Not persisted, as Core does not persist it.
+    pub last_try: u64,
     /// Unix seconds this address was last seen (gossiped or connected).
     pub last_seen: u64,
     /// Service bits the address was announced with (Core's `nServices`).
@@ -102,11 +137,15 @@ const ADDRMAN_MAX_FAILURES: u32 = 10;
 const ADDRMAN_MIN_FAIL_SECS: u64 = 7 * 24 * 60 * 60;
 
 impl AddrEntry {
-    /// Core's `AddrInfo::IsTerrible`, without its one-minute grace after an
-    /// attempt (satd does not record when it last tried): seen in the
-    /// future, not seen for 30 days, tried three times and never reached,
-    /// or ten failures with no success in a week.
+    /// Core's `AddrInfo::IsTerrible`: never within a minute of the last
+    /// dial; otherwise seen in the future, not seen for 30 days, tried three
+    /// times and never reached, or ten failures with no success in a week.
+    /// satd records `last_try` when a dial ends rather than when it starts,
+    /// so the minute runs from the result.
     pub fn is_terrible(&self, now: u64) -> bool {
+        if self.last_try != 0 && now.saturating_sub(self.last_try) <= ADDRMAN_TEST_GRACE_SECS {
+            return false;
+        }
         self.last_seen > now + 10 * 60
             || now.saturating_sub(self.last_seen) > ADDRMAN_HORIZON_SECS
             || (self.last_success == 0 && self.attempts >= ADDRMAN_RETRIES)
@@ -136,10 +175,17 @@ type GroupFn = Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>;
 
 pub struct AddrMan {
     entries: HashMap<SocketAddr, AddrEntry>,
+    /// The tried table (Core's `vvTried`): the entry at each taken slot,
+    /// keyed `bucket * BUCKET_SIZE + position`. Holds every tried entry,
+    /// each at [`AddrMan::tried_slot`], and nothing else.
+    tried_slots: HashMap<u64, SocketAddr>,
+    /// New entries whose promotion is waiting on a taken tried slot (Core's
+    /// `m_tried_collisions`), at most [`TRIED_COLLISION_SIZE`].
+    tried_collisions: std::collections::BTreeSet<SocketAddr>,
     /// Pluggable network-group function (replaced by `-asmap`).
     group_fn: GroupFn,
-    /// SipHash key for the derived `bucket/position` slots (Core's
-    /// `nKey`). Random per process, so slots are stable within a run.
+    /// SipHash key for the `bucket/position` slots (Core's `nKey`). Random
+    /// for a new book, and kept in `peers.dat` with it.
     slot_key: (u64, u64),
     /// Whether the book takes addresses that are valid but not publicly
     /// routable: private ranges, loopback, link-local. See the module docs.
@@ -212,6 +258,8 @@ impl AddrMan {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            tried_slots: HashMap::new(),
+            tried_collisions: Default::default(),
             group_fn: Box::new(default_group),
             slot_key: (rand::random(), rand::random()),
             admit_private: true,
@@ -354,7 +402,7 @@ impl AddrMan {
             else {
                 return (false, None);
             };
-            self.entries.remove(&victim);
+            self.remove_entry(&victim);
             evicted = Some(victim);
         } else if self.entries.len() >= MAX_ENTRIES {
             // A terrible new entry first, then a terrible tried one: Core
@@ -369,7 +417,7 @@ impl AddrMan {
             let Some(victim) = terrible(false).or_else(|| terrible(true)) else {
                 return (false, None);
             };
-            self.entries.remove(&victim);
+            self.remove_entry(&victim);
             evicted = Some(victim);
         }
         self.entries.insert(
@@ -379,6 +427,7 @@ impl AddrMan {
                 tried: false,
                 last_success: 0,
                 attempts: 0,
+                last_try: 0,
                 last_seen: seen,
                 services,
                 source,
@@ -388,7 +437,9 @@ impl AddrMan {
         (true, evicted)
     }
 
-    /// Promote an address to the *tried* table after a successful connect.
+    /// Record a successful connect to `addr` and promote it to the *tried*
+    /// table, Core's `Good` with test-before-evict. Returns whether it moved
+    /// to tried now.
     ///
     /// Only the addresses we successfully *dialed* (outbound) should be
     /// passed here — an inbound peer's socket address is its ephemeral
@@ -396,32 +447,186 @@ impl AddrMan {
     /// table. The total cap is enforced even on this path: a brand-new
     /// address is not inserted once the table is full, so inbound churn (or
     /// any future caller) cannot grow the table without bound. An address
-    /// already present is always refreshed/promoted.
-    pub fn mark_good(&mut self, addr: SocketAddr, now: u64) {
+    /// already present is always refreshed.
+    ///
+    /// When its tried slot holds another entry, the address stays new and
+    /// waits in the collision set (if it has room) until
+    /// [`resolve_collisions`](Self::resolve_collisions) has tested the
+    /// incumbent. satd used to promote every address it reached, with no
+    /// bound per network group, so one group could fill the tried table.
+    pub fn mark_good(&mut self, addr: SocketAddr, now: u64) -> bool {
         // A manual peer the operator named can be anything the book would
         // refuse from gossip; connecting to it does not make it an entry.
         // Core's `Good` only promotes an entry `Add` already took.
         if !self.admits(&addr) {
-            return;
-        }
-        if !self.entries.contains_key(&addr) && self.entries.len() >= MAX_ENTRIES {
-            return;
+            return false;
         }
         let group = self.group_of(&addr);
+        if !self.entries.contains_key(&addr) {
+            if self.entries.len() >= MAX_ENTRIES {
+                return false;
+            }
+            // One the book does not hold yet goes in as new and is promoted
+            // from there, so it must find room in one table or the other: a
+            // taken tried slot would leave it in a new table its group has
+            // already filled.
+            let slot = self.tried_slot_in(&addr, &group);
+            if self.tried_slots.contains_key(&(slot.bucket * BUCKET_SIZE + slot.position))
+                && self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP
+            {
+                return false;
+            }
+        }
         let entry = self.entries.entry(addr).or_insert_with(|| AddrEntry {
             addr,
             tried: false,
             last_success: 0,
             attempts: 0,
+            last_try: 0,
             last_seen: now,
             services: DEFAULT_SERVICES,
             source: addr.ip(),
             group,
         });
-        entry.tried = true;
         entry.last_success = now;
+        entry.last_try = now;
         entry.last_seen = now;
         entry.attempts = 0;
+        if entry.tried {
+            return false;
+        }
+        let slot = self.tried_slot(&addr);
+        if self.tried_slots.get(&slot).is_some_and(|other| *other != addr) {
+            if self.tried_collisions.len() < TRIED_COLLISION_SIZE {
+                self.tried_collisions.insert(addr);
+            }
+            tracing::debug!(%addr, "Tried-table collision; promotion waits on the incumbent");
+            return false;
+        }
+        self.make_tried(addr, now);
+        true
+    }
+
+    /// Core's `MakeTried`: put new entry `addr` in its tried slot, moving
+    /// the entry there, if any, back to the new table. Returns an address
+    /// that left the book for it: the demoted entry goes back to new as
+    /// Core's does, which in satd means its group's new-table cap must have
+    /// room. A terrible new entry of the group gives up its place; if there
+    /// is none, the demoted entry is dropped, where Core's `ClearNew` drops
+    /// whatever held the slot it moves to.
+    fn make_tried(&mut self, addr: SocketAddr, now: u64) -> Option<SocketAddr> {
+        let slot = self.tried_slot(&addr);
+        let mut dropped = None;
+        if let Some(old) = self.tried_slots.remove(&slot)
+            && let Some(o) = self.entries.get_mut(&old)
+        {
+            o.tried = false;
+            let group = o.group.clone();
+            tracing::debug!(%old, %addr, "Moved a tried entry back to new to make space");
+            if self.new_count_in_group(&group) > MAX_NEW_PER_GROUP {
+                let victim = self
+                    .entries
+                    .values()
+                    .find(|e| !e.tried && e.group == group && e.addr != old && e.is_terrible(now))
+                    .map_or(old, |e| e.addr);
+                self.remove_entry(&victim);
+                dropped = Some(victim);
+            }
+        }
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.tried = true;
+            self.tried_slots.insert(slot, addr);
+        }
+        self.tried_collisions.remove(&addr);
+        dropped
+    }
+
+    /// Core's `ResolveCollisions_`: settle the promotions waiting on a taken
+    /// tried slot. A newcomer whose incumbent connected in the last four
+    /// hours stays new. One whose incumbent was dialled in the last four
+    /// hours, more than a minute ago, without connecting since, takes the
+    /// slot, and so does one whose incumbent has gone untested for 40
+    /// minutes after the newcomer connected. Returns the addresses that left
+    /// the book (see [`make_tried`](Self::make_tried)).
+    pub fn resolve_collisions(&mut self, now: u64) -> Vec<SocketAddr> {
+        let mut dropped = Vec::new();
+        for new in std::mem::take(&mut self.tried_collisions) {
+            let Some(info_new) = self.entries.get(&new) else { continue };
+            if info_new.tried {
+                continue;
+            }
+            let slot = self.tried_slot(&new);
+            let promote = match self.tried_slots.get(&slot).and_then(|old| self.entries.get(old)) {
+                // No longer a collision.
+                None => true,
+                Some(old) if now.saturating_sub(old.last_success) < ADDRMAN_REPLACEMENT_SECS => {
+                    // The incumbent is alive: the newcomer stays new.
+                    continue;
+                }
+                Some(old) if now.saturating_sub(old.last_try) < ADDRMAN_REPLACEMENT_SECS => {
+                    // Dialled and failed: give it a minute to connect.
+                    if now.saturating_sub(old.last_try) <= ADDRMAN_TEST_GRACE_SECS {
+                        self.tried_collisions.insert(new);
+                        continue;
+                    }
+                    true
+                }
+                Some(_) => {
+                    // Untested: wait out the window, then replace anyway.
+                    if now.saturating_sub(info_new.last_success) <= ADDRMAN_TEST_WINDOW_SECS {
+                        self.tried_collisions.insert(new);
+                        continue;
+                    }
+                    true
+                }
+            };
+            if promote {
+                if let Some(e) = self.entries.get_mut(&new) {
+                    e.last_success = now;
+                    e.last_try = now;
+                    e.attempts = 0;
+                }
+                dropped.extend(self.make_tried(new, now));
+            }
+        }
+        dropped
+    }
+
+    /// Core's `SelectTriedCollision`: the incumbent of a random waiting
+    /// promotion, for the node to test by connecting to it.
+    pub fn select_tried_collision(&self) -> Option<SocketAddr> {
+        use rand::seq::IteratorRandom as _;
+        let new = self.tried_collisions.iter().choose(&mut rand::thread_rng())?;
+        self.tried_slots.get(&self.tried_slot(new)).copied()
+    }
+
+    /// The incumbents of every waiting promotion.
+    pub fn tried_collision_incumbents(&self) -> Vec<SocketAddr> {
+        self.tried_collisions
+            .iter()
+            .filter_map(|new| self.tried_slots.get(&self.tried_slot(new)).copied())
+            .collect()
+    }
+
+    /// The tried bucket `addr` sits in, if it is tried.
+    pub fn tried_bucket(&self, addr: &SocketAddr) -> Option<u64> {
+        self.is_tried(addr).then(|| self.tried_slot(addr) / BUCKET_SIZE)
+    }
+
+    /// Remove `addr` from the book, and from the tried table and the
+    /// collision set with it.
+    fn remove_entry(&mut self, addr: &SocketAddr) {
+        if let Some(e) = self.entries.remove(addr)
+            && e.tried
+        {
+            // Under the group it was placed with, as every slot is.
+            let slot = self.tried_slot_in(addr, &e.group);
+            let slot = slot.bucket * BUCKET_SIZE + slot.position;
+            if self.tried_slots.get(&slot) == Some(addr) {
+                self.tried_slots.remove(&slot);
+            }
+        }
+        self.tried_collisions.remove(addr);
     }
 
     /// Core's `SetServices`: replace the services of `addr`, if the book
@@ -444,10 +649,11 @@ impl AddrMan {
         self.entries.contains_key(addr)
     }
 
-    /// Record a failed connection attempt.
-    pub fn mark_attempt(&mut self, addr: SocketAddr) {
+    /// Record a failed connection attempt at `now`.
+    pub fn mark_attempt(&mut self, addr: SocketAddr, now: u64) {
         if let Some(e) = self.entries.get_mut(&addr) {
             e.attempts = e.attempts.saturating_add(1);
+            e.last_try = now;
         }
     }
 
@@ -508,7 +714,8 @@ impl AddrMan {
     ///
     /// Adding an address that is already present fails with
     /// `failed-adding-to-new` whichever table was asked for, because Core's
-    /// `Add` refuses a duplicate before `Good` is ever reached. The caps
+    /// `Add` refuses a duplicate before `Good` is ever reached. One whose
+    /// tried slot is taken fails with `failed-adding-to-tried` and stays new. The caps
     /// that bound gossip bound this path too, and so does [`admits`]: Core's
     /// `AddSingle` refuses an address that is not routable the same way.
     ///
@@ -517,8 +724,9 @@ impl AddrMan {
         if !self.add_from(addr, now, DEFAULT_SERVICES, addr.ip()) {
             return Err("failed-adding-to-new");
         }
-        if tried {
-            self.mark_good(addr, now);
+        // A taken tried slot leaves it in new, as Core's `Good` does.
+        if tried && !self.mark_good(addr, now) {
+            return Err("failed-adding-to-tried");
         }
         Ok(())
     }
@@ -546,48 +754,64 @@ impl AddrMan {
         bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.slot_key.0, self.slot_key.1, &data)
     }
 
+    /// The tried slot of `addr`, as `bucket * BUCKET_SIZE + position`. The
+    /// group is the one cached in its entry, or computed for one not held.
+    pub(crate) fn tried_slot(&self, addr: &SocketAddr) -> u64 {
+        let group = match self.entries.get(addr) {
+            Some(e) => self.tried_slot_in(addr, &e.group),
+            None => self.tried_slot_in(addr, &self.group_of(addr)),
+        };
+        group.bucket * BUCKET_SIZE + group.position
+    }
+
+    fn tried_slot_in(&self, addr: &SocketAddr, group: &[u8]) -> AddrSlot {
+        let key = addr_key(addr);
+        let h1 = self.slot_hash(&[&key]) % TRIED_BUCKETS_PER_GROUP;
+        let bucket = self.slot_hash(&[group, &h1.to_le_bytes()]) % TRIED_BUCKET_COUNT;
+        let position = self.slot_hash(&[b"K", &bucket.to_le_bytes(), &key]) % BUCKET_SIZE;
+        AddrSlot { tried: true, bucket, position }
+    }
+
     /// The slot Core's formulas give `e` (`AddrInfo::GetTriedBucket`,
     /// `GetNewBucket` and `GetBucketPosition` in `src/addrman.cpp`), with
-    /// SipHash under this process's key in place of Core's `HashWriter`.
+    /// SipHash under the book's key in place of Core's `HashWriter`.
     fn derived_slot(&self, e: &AddrEntry) -> AddrSlot {
+        if e.tried {
+            return self.tried_slot_in(&e.addr, &e.group);
+        }
         let key = addr_key(&e.addr);
         let group = &e.group;
-        let bucket = if e.tried {
-            let h1 = self.slot_hash(&[&key]) % TRIED_BUCKETS_PER_GROUP;
-            self.slot_hash(&[group, &h1.to_le_bytes()]) % TRIED_BUCKET_COUNT
-        } else {
+        let bucket = {
             let src_group = (self.group_fn)(e.source);
             let h1 = self.slot_hash(&[group, &src_group]) % NEW_BUCKETS_PER_SOURCE_GROUP;
             self.slot_hash(&[&src_group, &h1.to_le_bytes()]) % NEW_BUCKET_COUNT
         };
-        let tag: &[u8] = if e.tried { b"K" } else { b"N" };
-        let position = self.slot_hash(&[tag, &bucket.to_le_bytes(), &key]) % BUCKET_SIZE;
-        AddrSlot { tried: e.tried, bucket, position }
+        let position = self.slot_hash(&[b"N", &bucket.to_le_bytes(), &key]) % BUCKET_SIZE;
+        AddrSlot { tried: false, bucket, position }
     }
 
-    /// Every entry with a derived `bucket/position` slot, unique within its
-    /// table. See the module docs: the slots are computed, not stored.
+    /// Every entry with its `bucket/position` slot, unique within its
+    /// table: a tried entry's is where it is kept, a new entry's is derived
+    /// (see the module docs).
     ///
     /// Core never has two entries in one slot (a collision evicts or is
     /// refused), and `getrawaddrman` keys its JSON objects by slot, so a
-    /// collision here must not be reported twice under one key. Entries are
-    /// placed in address order, which keeps the result deterministic for a
-    /// given key. A taken slot moves to the next free position in the same
-    /// bucket, wrapping within it: Core keeps every entry in the bucket its
-    /// formula gives, so one group's tried entries never span more than
-    /// `TRIED_BUCKETS_PER_GROUP` buckets. Only a full bucket spills into the
-    /// next one with room, since the flat map can hold more of one group
-    /// than Core's buckets would.
+    /// collision among the derived slots must not be reported twice under
+    /// one key. New entries are placed in address order, which keeps the
+    /// result deterministic for a given key. A taken slot moves to the next
+    /// free position in the same bucket, wrapping within it, and only a full
+    /// bucket spills into the next one with room, since the flat map can
+    /// hold more of one source group than Core's buckets would.
     pub fn positions(&self) -> Vec<(AddrSlot, &AddrEntry)> {
         let mut entries: Vec<&AddrEntry> = self.entries.values().collect();
         entries.sort_by_key(|e| e.addr);
         let mut new = TakenSlots::new(NEW_BUCKET_COUNT);
-        let mut tried = TakenSlots::new(TRIED_BUCKET_COUNT);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let mut slot = self.derived_slot(e);
-            let table = if e.tried { &mut tried } else { &mut new };
-            (slot.bucket, slot.position) = table.take(slot.bucket, slot.position);
+            if !e.tried {
+                (slot.bucket, slot.position) = new.take(slot.bucket, slot.position);
+            }
             out.push((slot, e));
         }
         out
@@ -614,22 +838,67 @@ impl AddrMan {
             return Err(format!("peers.dat: unsupported version {version}"));
         }
         let count = read_u32(&mut cur).unwrap_or(0).min(MAX_ENTRIES as u32);
+        let mut read = Vec::new();
+        let mut complete = true;
         for _ in 0..count {
             match read_entry(&mut cur, version) {
-                // A file written before the book refused them can hold
-                // addresses it would not take now, `0.0.0.0` learned from a
-                // peer's gossip among them. Drop them here, or they would be
-                // seeded straight back onto the dial list.
-                Some(e) if !self.admits(&e.addr) => continue,
-                Some(mut e) => {
-                    // Recompute the cached group under the active group_fn
-                    // (the on-disk format does not store it, since `-asmap`
-                    // can change the grouping between runs).
-                    e.group = self.group_of(&e.addr);
-                    self.entries.insert(e.addr, e);
+                Some(e) => read.push(e),
+                None => {
+                    // truncated/garbage tail — keep what we have
+                    complete = false;
+                    break;
                 }
-                None => break, // truncated/garbage tail — keep what we have
             }
+        }
+        // The slot key, which places the tried entries: a fresh one for a
+        // file without it, or for a book that already holds entries.
+        if complete && self.entries.is_empty() {
+            let mut tag = [0u8; 4];
+            if cur.read_exact(&mut tag).is_ok()
+                && &tag == KEY_TRAILER
+                && let (Ok(k0), Ok(k1)) = (read_u64(&mut cur), read_u64(&mut cur))
+            {
+                self.slot_key = (k0, k1);
+            }
+        }
+        // New entries first, so a tried entry that loses its slot finds its
+        // group's new-table count as it will stand.
+        read.sort_by_key(|e| e.tried);
+        for mut e in read {
+            // A file written before the book refused them can hold
+            // addresses it would not take now, `0.0.0.0` learned from a
+            // peer's gossip among them. Drop them here, or they would be
+            // seeded straight back onto the dial list.
+            if !self.admits(&e.addr) || self.entries.contains_key(&e.addr) {
+                continue;
+            }
+            // Recompute the cached group under the active group_fn (the
+            // on-disk format does not store it, since `-asmap` can change
+            // the grouping between runs).
+            e.group = self.group_of(&e.addr);
+            if e.tried {
+                // Core's `Unserialize` places each tried entry at its slot
+                // and drops one whose slot is taken. A file from before the
+                // tried table, or under another key or grouping, can hold
+                // more than a slot each: the rest go back to new while their
+                // group has room there, and are dropped past it.
+                let slot = self.tried_slot_in(&e.addr, &e.group);
+                let slot = slot.bucket * BUCKET_SIZE + slot.position;
+                match self.tried_slots.entry(slot) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(e.addr);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        let in_group =
+                            self.entries.values().filter(|o| !o.tried && o.group == e.group).count();
+                        if in_group >= MAX_NEW_PER_GROUP {
+                            continue;
+                        }
+                        e.tried = false;
+                    }
+                }
+            }
+            self.entries.insert(e.addr, e);
         }
         Ok(())
     }
@@ -645,6 +914,9 @@ impl AddrMan {
         for e in self.entries.values() {
             write_entry(&mut buf, e);
         }
+        buf.extend_from_slice(KEY_TRAILER);
+        buf.extend_from_slice(&self.slot_key.0.to_le_bytes());
+        buf.extend_from_slice(&self.slot_key.1.to_le_bytes());
         {
             let mut f = std::fs::File::create(&tmp)
                 .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
@@ -763,6 +1035,7 @@ fn read_entry(cur: &mut io::Cursor<&Vec<u8>>, version: u32) -> Option<AddrEntry>
         tried: tried[0] != 0,
         last_success,
         attempts,
+        last_try: 0,
         last_seen,
         services,
         source,
@@ -890,12 +1163,13 @@ mod tests {
         // flood of (e.g. inbound) successful handshakes can't grow the
         // table without bound. An already-present address is still promoted.
         let mut a = AddrMan::new();
-        // Fill the table to the cap with tried entries from distinct groups
-        // (so the per-group new cap doesn't interfere).
+        // Fill the table to the cap from distinct groups, a /16 each (so
+        // the per-group caps don't interfere); an address whose tried slot
+        // is taken stays new.
         for i in 0..MAX_ENTRIES {
-            let octet_b = (i / 256) as u8;
-            let octet_c = (i % 256) as u8;
-            a.mark_good(sa(&format!("10.{octet_b}.{octet_c}.1:8333")), 1);
+            let octet_a = 20 + i / 256;
+            let octet_b = i % 256;
+            a.mark_good(sa(&format!("{octet_a}.{octet_b}.1.1:8333")), 1);
         }
         assert_eq!(a.len(), MAX_ENTRIES);
         // A brand-new address at capacity is rejected (not inserted).
@@ -903,8 +1177,8 @@ mod tests {
         assert_eq!(a.len(), MAX_ENTRIES);
         assert!(!a.entries.contains_key(&sa("203.0.113.7:8333")));
         // But an address already present is still refreshed/promoted.
-        a.mark_good(sa("10.0.0.1:8333"), 99);
-        assert_eq!(a.entries[&sa("10.0.0.1:8333")].last_success, 99);
+        a.mark_good(sa("20.0.1.1:8333"), 99);
+        assert_eq!(a.entries[&sa("20.0.1.1:8333")].last_success, 99);
     }
 
     #[test]
@@ -1087,13 +1361,13 @@ mod tests {
             a.mark_good(sa(&format!("10.244.{i}.5:18444")), 1);
         }
         let buckets: std::collections::HashSet<u64> =
-            a.positions().iter().map(|(s, _)| s.bucket).collect();
+            a.positions().iter().filter(|(s, _)| s.tried).map(|(s, _)| s.bucket).collect();
         assert!(buckets.len() > 1, "{buckets:?}");
         assert!(buckets.len() <= TRIED_BUCKETS_PER_GROUP as usize, "{buckets:?}");
     }
 
-    /// One /16's tried entries share at most eight buckets of 64 slots,
-    /// so 300 of them must collide; each still gets its own slot, or
+    /// One /16's tried entries share at most eight buckets of 64 slots, so
+    /// of 300 some collide; each tried one has its own slot, or
     /// `getrawaddrman` would report two entries under one key and drop one.
     #[test]
     fn colliding_slots_are_moved_not_shared() {
@@ -1102,9 +1376,9 @@ mod tests {
             a.mark_good(sa(&format!("10.244.{}.{}:18444", i / 256, i % 256)), 1);
         }
         let slots = a.positions();
-        let unique: std::collections::HashSet<(u64, u64)> =
-            slots.iter().map(|(s, _)| (s.bucket, s.position)).collect();
-        assert_eq!(unique.len(), 300);
+        let unique: std::collections::HashSet<(bool, u64, u64)> =
+            slots.iter().map(|(s, _)| (s.tried, s.bucket, s.position)).collect();
+        assert_eq!(unique.len(), slots.len());
     }
 
     /// The placement `positions` makes, one slot at a time: the derived
@@ -1136,9 +1410,9 @@ mod tests {
             .collect()
     }
 
-    /// Tried entries in one /16 share its eight buckets (512 slots), so most
-    /// of 3000 overflow them; new entries from one source group share its 64
-    /// buckets. Placement matches a slot-by-slot probe.
+    /// Tried entries in one /16 share its eight buckets (512 slots), and the
+    /// rest of 3000 stay new or are refused; new entries from one source
+    /// group share its 64 buckets. Placement matches a slot-by-slot probe.
     #[test]
     fn positions_match_a_slot_by_slot_probe_under_heavy_collision() {
         let mut a = AddrMan::new();
@@ -1195,21 +1469,226 @@ mod tests {
         }
     }
 
-    /// The worst case: every entry tried and in one /16. The tried table has
-    /// exactly `MAX_ENTRIES` slots, so every slot ends up used once, nearly
-    /// all of them by entries the group's eight full buckets sent on.
+    /// #924: one /16 that connects without end gets no more of the tried
+    /// table than its eight buckets, 512 slots, and no more than its 64
+    /// places in the new table: the rest is refused. satd promoted every
+    /// address it reached, so one group could fill all 16,384.
     #[test]
-    fn positions_fill_a_full_tried_table_from_one_group() {
+    fn one_group_cannot_hold_more_than_its_share_of_tried() {
         let mut a = AddrMan::new();
         for i in 0..MAX_ENTRIES {
             a.mark_good(sa(&format!("10.244.{}.{}:18444", i / 256, i % 256)), 1);
         }
-        assert_eq!(a.len(), MAX_ENTRIES);
-        let slots = a.positions();
-        assert!(slots.iter().all(|(s, _)| s.tried));
-        let used: std::collections::HashSet<(u64, u64)> =
-            slots.iter().map(|(s, _)| (s.bucket, s.position)).collect();
-        assert_eq!(used.len() as u64, TRIED_BUCKET_COUNT * BUCKET_SIZE);
+        let tried: Vec<&AddrEntry> = a.iter().filter(|e| e.tried).collect();
+        assert!(tried.len() <= (TRIED_BUCKETS_PER_GROUP * BUCKET_SIZE) as usize, "{}", tried.len());
+        assert!(tried.len() > 100, "the group still gets its share: {}", tried.len());
+        let buckets: std::collections::HashSet<u64> =
+            tried.iter().filter_map(|e| a.tried_bucket(&e.addr)).collect();
+        assert!(buckets.len() <= TRIED_BUCKETS_PER_GROUP as usize, "{buckets:?}");
+        assert!(a.new_count_in_group(&[10, 244]) <= MAX_NEW_PER_GROUP);
+        assert_eq!(a.len(), tried.len() + a.new_count_in_group(&[10, 244]));
+        assert!(a.tried_collisions.len() <= TRIED_COLLISION_SIZE);
+        assert_slots_consistent(&a);
+    }
+
+    /// The tried table and the entries agree: every tried entry sits at its
+    /// own slot, and every slot holds a tried entry.
+    fn assert_slots_consistent(a: &AddrMan) {
+        let tried = a.iter().filter(|e| e.tried).count();
+        assert_eq!(a.tried_slots.len(), tried);
+        for (slot, addr) in &a.tried_slots {
+            assert!(a.entries[addr].tried, "{addr}");
+            assert_eq!(a.tried_slot(addr), *slot, "{addr}");
+        }
+    }
+
+    /// Diverse tried entries survive a flood from one group: a promotion
+    /// into a taken slot waits on the incumbent instead of replacing it
+    /// (test-before-evict).
+    #[test]
+    fn a_flood_from_one_group_evicts_no_diverse_tried_entry() {
+        let mut a = AddrMan::new();
+        let diverse: Vec<SocketAddr> = (0..2000u32)
+            .map(|i| sa(&format!("{}.{}.1.1:8333", 20 + i / 250, i % 250)))
+            .filter(|addr| a.mark_good(*addr, 1))
+            .collect();
+        assert!(diverse.len() > 1500, "{}", diverse.len());
+        for i in 0..20_000u32 {
+            a.mark_good(sa(&format!("44.7.{}.{}:8333", (i / 250) % 250, i % 250 + 1)), 2);
+        }
+        for addr in &diverse {
+            assert!(a.is_tried(addr), "{addr} lost its tried slot");
+        }
+        assert_slots_consistent(&a);
+    }
+
+    /// Two addresses with one tried slot, under some key: the second waits
+    /// in the collision set.
+    fn colliding_pair() -> (AddrMan, SocketAddr, SocketAddr) {
+        let mut a = AddrMan::new();
+        let old = sa("44.7.0.1:8333");
+        assert!(a.mark_good(old, 1_000));
+        let slot = a.tried_slot(&old);
+        let new = (2..60_000u32)
+            .map(|i| sa(&format!("44.7.{}.{}:8333", i / 250, i % 250 + 1)))
+            .find(|c| a.tried_slot(c) == slot)
+            .expect("a colliding address");
+        a.add(new, 1_000);
+        (a, old, new)
+    }
+
+    /// Core's `ResolveCollisions_`: an incumbent that connected in the last
+    /// four hours keeps its slot; one that failed a dial since, a minute
+    /// after the dial, gives it up and goes back to new.
+    #[test]
+    fn a_collision_replaces_the_incumbent_only_after_it_fails() {
+        let (mut a, old, new) = colliding_pair();
+        let t = 1_000;
+        assert!(!a.mark_good(new, t), "the slot is taken");
+        assert!(!a.is_tried(&new) && a.is_tried(&old));
+        assert_eq!(a.select_tried_collision(), Some(old));
+
+        // Alive within four hours: the newcomer stays new.
+        assert!(a.resolve_collisions(t + 60).is_empty());
+        assert!(a.is_tried(&old) && !a.is_tried(&new));
+        assert!(a.tried_collisions.is_empty(), "the collision is settled");
+
+        // Five hours on, with the incumbent's dial failing.
+        let t2 = t + 5 * 3600;
+        a.mark_good(new, t2);
+        a.mark_attempt(old, t2);
+        a.resolve_collisions(t2 + 30);
+        assert!(a.is_tried(&old), "a minute's grace after the dial");
+        a.resolve_collisions(t2 + 61);
+        assert!(a.is_tried(&new), "the newcomer takes the slot");
+        assert!(a.contains(&old) && !a.is_tried(&old), "the incumbent goes back to new");
+        assert_slots_consistent(&a);
+    }
+
+    /// Core's one-minute grace: an entry is not terrible within a minute of
+    /// its last dial, whatever its failures.
+    #[test]
+    fn an_entry_is_not_terrible_within_a_minute_of_a_dial() {
+        let mut a = AddrMan::new();
+        let addr = sa("44.7.0.1:8333");
+        a.add(addr, 1_000);
+        for _ in 0..3 {
+            a.mark_attempt(addr, 1_000);
+        }
+        assert!(!a.entries[&addr].is_terrible(1_060));
+        assert!(a.entries[&addr].is_terrible(1_061));
+    }
+
+    /// A removed tried entry frees the slot it was placed in, under the
+    /// group cached with it, even when the group function has changed since.
+    #[test]
+    fn removing_a_tried_entry_frees_its_slot_under_its_own_group() {
+        let mut a = AddrMan::new();
+        let addr = sa("44.7.0.1:8333");
+        assert!(a.mark_good(addr, 1));
+        a.set_group_fn(Box::new(|_| vec![9, 9, 9]));
+        a.remove_entry(&addr);
+        assert!(a.tried_slots.is_empty());
+    }
+
+    /// An incumbent nobody tests is replaced once the newcomer has waited
+    /// 40 minutes since it connected.
+    #[test]
+    fn an_untested_incumbent_is_replaced_after_the_test_window() {
+        let (mut a, old, new) = colliding_pair();
+        let t = 1_000 + 5 * 3600;
+        a.mark_good(new, t);
+        a.resolve_collisions(t + 39 * 60);
+        assert!(a.is_tried(&old));
+        a.resolve_collisions(t + 41 * 60);
+        assert!(a.is_tried(&new) && !a.is_tried(&old));
+        assert_slots_consistent(&a);
+    }
+
+    /// `addpeeraddress … true` into a taken slot answers Core's error and
+    /// leaves the address in new.
+    #[test]
+    fn add_manual_into_a_taken_tried_slot_fails_at_tried() {
+        let mut a = AddrMan::new();
+        let old = sa("44.7.0.1:8333");
+        a.mark_good(old, 1);
+        let slot = a.tried_slot(&old);
+        let new = (2..60_000u32)
+            .map(|i| sa(&format!("44.7.{}.{}:8333", i / 250, i % 250 + 1)))
+            .find(|c| a.tried_slot(c) == slot)
+            .unwrap();
+        assert_eq!(a.add_manual(new, true, 1), Err("failed-adding-to-tried"));
+        assert!(a.contains(&new) && !a.is_tried(&new));
+    }
+
+    /// The slot key is kept in `peers.dat`, so every tried entry comes back
+    /// in its slot; the trailer comes after the records, where a reader
+    /// that predates it stops.
+    #[test]
+    fn tried_slots_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        let mut a = AddrMan::new();
+        for i in 0..300u32 {
+            a.mark_good(sa(&format!("{}.{}.3.4:8333", 20 + i % 30, i / 30)), 5);
+        }
+        a.dump(&path).unwrap();
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.slot_key, a.slot_key);
+        let mut before: Vec<(u64, SocketAddr)> = a.tried_slots.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut after: Vec<(u64, SocketAddr)> = b.tried_slots.iter().map(|(k, v)| (*k, *v)).collect();
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+        assert_slots_consistent(&b);
+    }
+
+    /// A book written before the tried table (no key, and one /16 with
+    /// thousands of tried entries) loads with that group held to its slots;
+    /// the rest go back to new up to the group's cap, and are dropped past
+    /// it, while other groups' entries load untouched.
+    #[test]
+    fn an_old_book_full_of_one_group_loads_within_its_share() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"SADR");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        let mut all = Vec::new();
+        for i in 0..3000u32 {
+            all.push((sa(&format!("10.244.{}.{}:18444", i / 250, i % 250 + 1)), true));
+        }
+        for i in 0..100u32 {
+            all.push((sa(&format!("{}.9.9.9:8333", 20 + i)), true));
+        }
+        buf.extend_from_slice(&(all.len() as u32).to_le_bytes());
+        for (addr, tried) in &all {
+            let e = AddrEntry {
+                addr: *addr,
+                tried: *tried,
+                last_success: 7,
+                attempts: 0,
+                last_try: 0,
+                last_seen: 7,
+                services: DEFAULT_SERVICES,
+                source: addr.ip(),
+                group: Vec::new(),
+            };
+            write_entry(&mut buf, &e);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        std::fs::write(&path, &buf).unwrap();
+        let mut a = AddrMan::new();
+        a.load(&path).unwrap();
+        let group_tried = a.iter().filter(|e| e.tried && e.group == [10, 244]).count();
+        assert!(group_tried <= 512, "{group_tried}");
+        assert_eq!(a.new_count_in_group(&[10, 244]), MAX_NEW_PER_GROUP);
+        // A single-address group that lost its slot has room in new.
+        for i in 0..100u32 {
+            assert!(a.contains(&sa(&format!("{}.9.9.9:8333", 20 + i))), "{i}");
+        }
+        assert_eq!(a.len(), group_tried + MAX_NEW_PER_GROUP + 100);
+        assert_slots_consistent(&a);
     }
 
     #[test]
@@ -1275,6 +1754,7 @@ mod tests {
                 tried: true,
                 last_success: 1,
                 attempts: 0,
+                last_try: 0,
                 last_seen: 1,
                 services: DEFAULT_SERVICES,
                 source: addr.ip(),

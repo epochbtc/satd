@@ -99,13 +99,14 @@ expect Core's peer set to carry over.
 
 **On `getrawaddrman` slots.** Core's address manager stores each entry in
 a fixed `bucket/position` slot of its new or tried table, and
-`getrawaddrman` reports those slots. satd's address book is a flat map, so
-it *derives* a slot for each entry from Core's own bucket formulas
-(`GetNewBucket`, `GetTriedBucket`, `GetBucketPosition`), keyed by a random
-per-process key instead of `-test=addrman`'s fixed one. The slots are
-stable while the node runs and are spread as Core's are, but they change on
-restart and never match Core's for the same address; a collision moves to
-the next free slot rather than evicting an entry. `getnodeaddresses`,
+`getrawaddrman` reports those slots. satd's tried table is Core's: each
+tried entry is stored at the slot Core's formulas give it (`GetTriedBucket`,
+`GetBucketPosition`), with Core's collision handling and test-before-evict,
+under a random key kept in `peers.dat`. Its new table is a flat map with a
+per-group cap, so a new entry's slot is *derived* from `GetNewBucket` and
+`GetBucketPosition`, and a collision there moves to the next free slot
+rather than evicting an entry. The key is random rather than
+`-test=addrman`'s fixed one, so no slot matches Core's for the same address. `getnodeaddresses`,
 `getaddrmaninfo` and `getrawaddrman` report IPv4 and IPv6 only: onion
 candidates learned from `addrv2` gossip are held outside the address book.
 
