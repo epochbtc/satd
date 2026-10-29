@@ -114,3 +114,41 @@ async fn a_send_counts_its_bytes_as_the_socket_takes_them() {
         stats.bytes_sent()
     );
 }
+
+/// An `addrv2` whose entries include one advertising service bit 26 is read
+/// whole: rust-bitcoin's decoder refused it, and the v1 reader skipped the
+/// message, so not one of its addresses was learned.
+#[tokio::test]
+async fn an_addrv2_with_a_high_service_bit_is_read_whole() {
+    let addrv2 = NetworkMessage::Unknown {
+        command: CommandString::try_from_static("addrv2").unwrap(),
+        payload: crate::net::addrv2::payload_with_service_bit_26(),
+    };
+    let mut bytes = frame(addrv2);
+    bytes.extend(frame(NetworkMessage::Ping(5)));
+    let mut reader = Cursor::new(bytes);
+    let mut buf = Vec::new();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let NetworkMessage::AddrV2(addrs) = got else { panic!("expected addrv2, got {got:?}") };
+    let ips: Vec<_> = addrs.iter().map(|a| a.socket_addr().unwrap().ip().to_string()).collect();
+    assert_eq!(ips, ["1.2.3.4", "5.6.7.8", "9.9.9.9"]);
+    assert_eq!(addrs[1].services.to_u64(), 1 << 26 | 0x409);
+    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    assert_eq!(next, NetworkMessage::Ping(5));
+}
+
+/// A corrupt `addrv2` frame is skipped, as any other undecodable frame is.
+#[tokio::test]
+async fn a_bad_checksum_addrv2_is_skipped() {
+    let addrv2 = NetworkMessage::Unknown {
+        command: CommandString::try_from_static("addrv2").unwrap(),
+        payload: crate::net::addrv2::payload_with_service_bit_26(),
+    };
+    let mut bytes = frame(addrv2);
+    bytes[20] ^= 1;
+    bytes.extend(frame(NetworkMessage::Ping(6)));
+    let mut reader = Cursor::new(bytes);
+    let mut buf = Vec::new();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    assert_eq!(got, NetworkMessage::Ping(6));
+}
