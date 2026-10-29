@@ -182,6 +182,11 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- P2P messages are read as Core reads them (#1142): a `version` without its
+  optional trailing fields (such as `relay`) completes the handshake, bytes
+  after a message's last field are ignored, any non-zero `sendcmpct` flag is
+  true, and an out-of-range `feefilter` is ignored. `bitcoin` 0.32.102.
+
 - An `addrv2` listing a node with a service bit at or above 25 is read as
   Core reads it. satd refused the whole message: over v1 every address in
   it was lost, and over v2 the peer was dropped, so outbound peers churned

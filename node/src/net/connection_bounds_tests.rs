@@ -152,3 +152,27 @@ async fn a_bad_checksum_addrv2_is_skipped() {
     let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
     assert_eq!(got, NetworkMessage::Ping(6));
 }
+
+/// A `version` that ends after the start height, with no relay byte, is
+/// read (relay true, Core's default), and so is the message after it. The
+/// v1 reader skipped it, and the handshake with such a peer never completed.
+#[tokio::test]
+async fn a_version_without_a_relay_byte_is_read() {
+    let mut payload = 70016u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&0x409u64.to_le_bytes());
+    payload.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 52]);
+    payload.extend_from_slice(&7u64.to_le_bytes());
+    payload.extend_from_slice(&[3, b'/', b'x', b'/']);
+    payload.extend_from_slice(&42i32.to_le_bytes());
+    let version = NetworkMessage::Unknown { command: CommandString::try_from_static("version").unwrap(), payload };
+    let mut bytes = frame(version);
+    bytes.extend(frame(NetworkMessage::Ping(8)));
+    let mut reader = Cursor::new(bytes);
+    let mut buf = Vec::new();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let NetworkMessage::Version(v) = got else { panic!("expected version, got {got:?}") };
+    assert_eq!((v.user_agent.as_str(), v.start_height, v.relay), ("/x/", 42, true));
+    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    assert_eq!(next, NetworkMessage::Ping(8));
+}

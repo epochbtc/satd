@@ -1,4 +1,4 @@
-use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::consensus::serialize;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::Magic;
 use bitcoin::Network;
@@ -460,16 +460,15 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
                 }
             }
         } else {
-            match deserialize::<RawNetworkMessage>(buf) {
-                Ok(raw) if *raw.magic() != magic => Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "wrong network magic",
-                ))),
-                Ok(raw) => {
+            // Read as Core reads it (`net::payload`): bytes after the last
+            // field are ignored, where rust-bitcoin refuses the message.
+            // The magic was checked above.
+            match crate::net::payload::decode_v1_frame(buf) {
+                Ok(msg) => {
                     if let Some(c) = counters {
-                        c.attribute_recv(raw.cmd(), wire_len);
+                        c.attribute_recv(msg.cmd(), wire_len);
                     }
-                    Some(Ok(raw.into_payload()))
+                    Some(Ok(msg))
                 }
                 Err(_) if &header[4..16] == b"pong\0\0\0\0\0\0\0\0" && payload_len < 8 => {
                     // Too short to hold a nonce. Core still acts on it -- it

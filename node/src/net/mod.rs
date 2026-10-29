@@ -14,6 +14,7 @@ pub mod limits;
 pub mod manager;
 pub mod opreturn_restore;
 pub mod orphan_blocks;
+pub mod payload;
 pub mod peer;
 pub mod permissions;
 pub mod proxy;

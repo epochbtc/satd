@@ -4631,12 +4631,16 @@ impl PeerManager {
 
     /// Record a peer's BIP 133 `feefilter`.
     ///
-    /// The message carries an `i64`; a negative value clamps to 0 (pass
-    /// everything, Core's signed comparison) rather than wrapping through
-    /// `as u64` into a filter that drops every announcement.
+    /// A value outside `MoneyRange` (negative, or above `MAX_MONEY`) is
+    /// ignored and the peer's previous filter stays, as Core ignores it
+    /// (`net_processing.cpp:5035-5045`).
     fn set_peer_fee_filter(&self, id: PeerId, rate: i64) {
+        let Some(rate) = u64::try_from(rate).ok().filter(|r| *r <= MAX_MONEY_SATS) else {
+            tracing::debug!(id, rate, "Ignoring out-of-range fee filter");
+            return;
+        };
         if let Some(handle) = self.peers.write().get_mut(&id) {
-            handle.info.fee_filter = rate.max(0) as u64;
+            handle.info.fee_filter = rate;
             tracing::debug!(id, rate, "Peer set fee filter");
         }
     }
@@ -15061,6 +15065,58 @@ mod tests {
             },
             rx,
         )
+    }
+
+    /// A `feefilter` outside `MoneyRange` is ignored and the peer keeps its
+    /// previous filter, as Core ignores it (`net_processing.cpp:5038`).
+    /// satd clamped a negative value to 0 and took one above `MAX_MONEY`.
+    #[test]
+    fn an_out_of_range_fee_filter_is_ignored() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                Box::new(InMemoryStore::new()),
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::new(
+            chain_state,
+            Arc::new(Mempool::new(1_000_000, 0)),
+            Arc::new(FeeEstimator::new()),
+            Network::Regtest,
+            shutdown_rx,
+        );
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h, _rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h);
+        let filter = || pm.peers.read().get(&1).unwrap().info.fee_filter;
+
+        pm.set_peer_fee_filter(1, 5_000);
+        assert_eq!(filter(), 5_000);
+        for out_of_range in [-1, i64::MIN, MAX_MONEY_SATS as i64 + 1, i64::MAX] {
+            pm.set_peer_fee_filter(1, out_of_range);
+            assert_eq!(filter(), 5_000, "{out_of_range} must be ignored");
+        }
+        pm.set_peer_fee_filter(1, MAX_MONEY_SATS as i64);
+        assert_eq!(filter(), MAX_MONEY_SATS);
+        pm.set_peer_fee_filter(1, 0);
+        assert_eq!(filter(), 0);
     }
 
     /// `announce_tx` is the local-origin broadcast path shared by the
