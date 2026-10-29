@@ -2,6 +2,9 @@
 # Build output of the standalone BDK canary crate (scripts/canary/bdk-canary).
 # Its Cargo.lock IS committed (reproducible downstream pin); its target/ is not.
 /scripts/canary/bdk-canary/target
+# The push relay was removed (#510), but an old checkout may still hold its
+# build output, which a stray `git add -A` once committed.
+/contrib/push-relay/target
 
 *.swp
 .idea/
