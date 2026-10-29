@@ -293,6 +293,10 @@ item below is (or will be) written up in full in the in-development
   finality, coinbase height and `CheckTransaction` before a block is written,
   as in Core's `AcceptBlockHeader` and `AcceptBlock`; they were checked only
   for blocks arriving outside initial block download, or only at connect.
+- A header or block that forks off the chain below the last checkpoint in
+  the block index is refused (`bad-fork-prior-to-checkpoint`) and its sender
+  banned, as in Core v29; such headers used to be stored without bound
+  (#1131).
 - `-assumevalid` skipped script verification for every block at or below the
   assumevalid height; it now skips only buried ancestors of the assumevalid
   block on the best-header chain, under Core's minimum-chain-work and

@@ -1197,7 +1197,8 @@ impl ChainState {
     /// Enable or disable enforcement of the built-in block checkpoints
     /// (Core `-checkpoints`, default enabled). Call once, before the
     /// `ChainState` is shared (wrapped in an `Arc`). `-checkpoints=0`
-    /// disables checkpoint validation in `connect_block`.
+    /// disables checkpoint validation in `connect_block` and the
+    /// `bad-fork-prior-to-checkpoint` rule on new headers.
     pub fn set_enforce_checkpoints(&mut self, enforce: bool) {
         self.enforce_checkpoints = enforce;
     }
