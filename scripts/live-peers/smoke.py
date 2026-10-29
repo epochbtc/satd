@@ -36,8 +36,8 @@ nodes, so its mean peer count runs low even when healthy, and on signet the
 v1 peers survived the broken build, so neither the short-lived ratio nor the
 mean is judged on one network alone.
 
-Exit status: 0 pass; 1 a finding (decode, churn, or satd exiting before its
-run time); 2 inconclusive (satd could not be started, or no peer finished a
+Exit status: 0 pass; 1 a finding (decode, churn, satd exiting before its run
+time, or satd not stopping within 120 s of `stop`); 2 inconclusive (satd could not be started, or no peer finished a
 handshake on some network: the runner had no network, or the seeds were
 down); 3 the script itself failed. A decode failure or an early exit on one
 network is a finding even when another network was inconclusive. The printed report, also appended to
@@ -143,7 +143,7 @@ def parse_ts(s):
 
 def analyze(log_path, network):
     """Read one satd log and return the report for its network."""
-    start = shutdown = None
+    start = shutdown = last = None
     connected = {}  # id -> (ts, addr, user_agent)
     disconnected = {}  # id -> ts
     addrfetch = set()
@@ -166,6 +166,7 @@ def analyze(log_path, network):
             msg = m.group(4)
             if start is None:
                 start = ts
+            last = ts
             if msg.startswith("received: "):
                 p = PEER_EQ.search(msg)
                 if p:
@@ -207,12 +208,14 @@ def analyze(log_path, network):
                 c = re.search(r"\bcount=(\d+)", msg)
                 if c:
                     addr_received += int(c.group(1))
-            elif msg.startswith("P2P manager shutting down") and shutdown is None:
+            elif shutdown is None and (
+                msg.startswith("Received stop RPC") or msg.startswith("P2P manager shutting down")
+            ):
+                # The stop request, or the P2P side's own notice when it
+                # stops another way; peers dropped from here on are not churn.
                 shutdown = ts
 
-    end = shutdown
-    if end is None:
-        end = max([start or 0] + [t for t, *_ in task_end] + list(disconnected.values()))
+    end = shutdown if shutdown is not None else (last or 0)
 
     # The read error carries no peer id. Its reader task ending closes the
     # peer's channel, and the peer task ends at once with "connection
@@ -400,6 +403,8 @@ def _run_network(satd, network, port, workdir, out):
         try:
             proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
+            # A clean stop takes seconds; one that never ends is satd's bug.
+            snapshot["hung_on_stop"] = True
             proc.kill()
             proc.wait()
     r = analyze(log, network)
@@ -460,6 +465,9 @@ def verdict(results):
     crashed = [r["network"] for r in rs if r.get("crashed")]
     if crashed:
         return 1, "FAIL (exit): satd exited before its run time on " + ", ".join(crashed)
+    hung = [r["network"] for r in rs if r.get("hung_on_stop")]
+    if hung:
+        return 1, "FAIL (stop): satd did not stop within 120 s of `stop` on " + ", ".join(hung)
     decode = [r["network"] for r in rs if r.get("decode_fail")]
     if decode:
         return 1, "FAIL (decode): peers' messages could not be decoded on " + ", ".join(decode)
@@ -484,11 +492,15 @@ def main():
         print(__doc__)
         return 2
     else:
+        if SECONDS <= WARMUP:
+            print("error: LIVE_PEERS_SECONDS must exceed LIVE_PEERS_WARMUP_SECONDS", file=sys.stderr)
+            return 2
         satd = Path(os.environ.get("SATD_BIN", REPO / "target" / "release" / "satd"))
         if not os.access(satd, os.X_OK):
             print(f"error: no satd binary at {satd} (set SATD_BIN)", file=sys.stderr)
             return 2
-        networks = os.environ.get("LIVE_PEERS_NETWORKS", "testnet4 signet").split()
+        # Deduplicated: two runs of one network would share its datadir.
+        networks = list(dict.fromkeys(os.environ.get("LIVE_PEERS_NETWORKS", "testnet4 signet").split()))
         for n in networks:
             if n not in NETWORK_FLAG:
                 print(f"error: unknown network {n}", file=sys.stderr)
