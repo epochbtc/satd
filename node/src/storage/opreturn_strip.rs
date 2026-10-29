@@ -678,7 +678,8 @@ pub struct StripSummary {
     /// Bytes zeroed: each stripped script's length less its `0x6a`.
     pub bytes_zeroed: u64,
     /// The whole filesystem blocks every span is sure to contain, wherever it
-    /// starts: a cautious minimum of what the punches gave back. The records
+    /// starts: a cautious minimum of what the punches gave back (on Linux;
+    /// APFS deallocates on a best-effort basis, see `punch`). The records
     /// do not keep file offsets, so the exact figure cannot be rebuilt from
     /// them; the block files' allocated size is the measurement.
     pub bytes_freed_estimate: u64,

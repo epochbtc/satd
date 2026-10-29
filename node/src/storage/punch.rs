@@ -12,8 +12,10 @@
 //!   FALLOC_FL_KEEP_SIZE)`. The kernel zeroes the partial blocks at the edges
 //!   and deallocates the whole ones in one call.
 //! - macOS: `fcntl(F_PUNCHHOLE)`, which APFS accepts only on block-aligned
-//!   ranges. The aligned middle is punched and the unaligned edges are
-//!   overwritten with zeros.
+//!   ranges. The unaligned edges are overwritten with zeros, then the aligned
+//!   middle is punched. APFS deallocates on a best-effort basis: a later
+//!   write beside a hole can allocate it again (as zeros), so on macOS the
+//!   space returned is at most, not at least, what [`freed_bytes`] says.
 //! - Anything else reports [`PunchError::Unsupported`].
 //!
 //! Punching is not a secure erase: it makes no attempt to overwrite the
@@ -228,6 +230,10 @@ mod sys {
         let first = offset.div_ceil(fs_block) * fs_block;
         let last = (end / fs_block) * fs_block;
         if last > first {
+            // The edges first: APFS can allocate a fresh hole again when the
+            // block beside it is written, so the punch comes last.
+            write_zeros(file, offset, first - offset)?;
+            write_zeros(file, last, end - last)?;
             let arg = libc::fpunchhole_t {
                 fp_flags: 0,
                 reserved: 0,
@@ -247,8 +253,6 @@ mod sys {
                     return Err(err);
                 }
             }
-            write_zeros(file, offset, first - offset)?;
-            write_zeros(file, last, end - last)?;
         } else {
             // No whole block inside the range: nothing to deallocate.
             write_zeros(file, offset, len)?;

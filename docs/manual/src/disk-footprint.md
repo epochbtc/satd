@@ -356,7 +356,12 @@ alongside `prune`, the indexes, Esplora and Electrum.
 
 **Filesystem support.** The blocks directory's filesystem must support hole
 punching (ext4, XFS, btrfs, ZFS, tmpfs, APFS). satd probes it at startup and
-refuses to start, naming the error, when it does not.
+refuses to start, naming the error, when it does not. On APFS the payload is
+gone from the block file as on Linux, but giving the space back is
+best-effort: APFS can allocate a hole again, as zeros, when it writes the
+block beside it, so `blocks_dir_allocated_bytes` can drop by less than
+`bytes_freed_estimate`. APFS local snapshots, which Time Machine takes, keep
+the original bytes until they expire.
 
 ### What it saves
 
@@ -466,7 +471,7 @@ stripped:
 - `blocks`, `transactions`, `outputs` and `bytes_zeroed`, added up from the
   strip records;
 - `bytes_freed_estimate`, the whole filesystem blocks every span is sure to
-  contain: a cautious minimum;
+  contain: a cautious minimum on Linux, at most what APFS returns;
 - `blocks_dir_apparent_bytes` and `blocks_dir_allocated_bytes`, a stat of the
   block files (cached for a minute). Their difference is the measurement of
   what the holes save;
