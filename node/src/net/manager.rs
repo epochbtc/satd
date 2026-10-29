@@ -1096,7 +1096,7 @@ pub struct PeerManager {
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
-    /// Track the highest header height we've stored.
+    /// Mirror of `ChainState::headers_tip_height`: the best header's height.
     headers_tip: AtomicU64,
     /// Blocks we asked a peer for outside the IBD scheduler (a `getdata`
     /// sent while following the tip): peer → the hashes asked of it, when,
@@ -4767,6 +4767,19 @@ impl PeerManager {
         });
     }
 
+    /// Re-read the header tip mirror from the chain state.
+    ///
+    /// The `headers` paths store it as they accept headers, but the header
+    /// tip also moves on block paths (`accept_block` connecting a block that
+    /// out-works the best header, `submitblock`, a local miner) and, since
+    /// #1119, can move *down* there: a block making a shorter chain the most
+    /// work. Without this a mirror left at the taller chain's height would
+    /// keep `is_ibd` true until the next `headers` message.
+    fn refresh_headers_tip(&self) {
+        let htip = u64::from(self.chain_state.headers_tip_height());
+        self.headers_tip.store(htip, Ordering::Relaxed);
+    }
+
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
         // The best header is at least our own tip. `headers_tip` only moves
@@ -5628,7 +5641,7 @@ impl PeerManager {
 
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
-            let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+            self.refresh_headers_tip();
 
             // When chain advances, immediately request more blocks (don't wait for timer)
             // Reconnect backoff is not reset here: a dial's backoff ends when
@@ -14355,6 +14368,10 @@ mod chainsel_tests;
 #[cfg(test)]
 #[path = "manager_txrequest_tests.rs"]
 mod txrequest_tests;
+
+#[cfg(test)]
+#[path = "manager_lowwork_tests.rs"]
+mod lowwork_tests;
 
 #[cfg(test)]
 #[path = "manager_1p1c_tests.rs"]

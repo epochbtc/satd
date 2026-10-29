@@ -190,6 +190,12 @@ item below is (or will be) written up in full in the in-development
   Core's errors where Core has one, instead of answering with the tip's
   stats. No arguments, or `hash_type` `"none"`, answer as before (#896).
 
+- A long chain of low-work headers no longer holds the node in initial
+  block download. The header height (`getblockchaininfo.headers`, the IBD
+  check, readiness) is the most-work header's, as in Core, not the highest
+  header stored, so a minimum-difficulty fork taller than the real chain
+  no longer stops transaction relay (#1119).
+
 - The address index built by a backfill (`-addressindex` turned on for an
   already-synced chain) leaves out unspendable outputs, as the index built
   while blocks connect always has. It used to record each OP_RETURN output,
