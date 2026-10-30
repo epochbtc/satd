@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: epochbtc-satd
 category: bitcoin
 name: satd
-version: "0.6.3"
+version: "0.7.0"
 tagline: A Bitcoin full node in Rust, with Electrum and Esplora built in
 description: >-
   satd is a Bitcoin Core-compatible full node written in Rust. It speaks
@@ -58,35 +58,41 @@ path: "/status"
 # A community store may host its own icon; the official store hosts its own
 # and wants this unset. Pinned to the release tag so a later change on master
 # cannot alter an already-published listing.
-icon: https://raw.githubusercontent.com/epochbtc/satd/v0.6.3/contrib/packaging/startos/icon.png
+icon: https://raw.githubusercontent.com/epochbtc/satd/v0.7.0/contrib/packaging/startos/icon.png
 releaseNotes: >-
-  Updates satd to 0.6.3, a security release for the bundled `sat-cli` and
-  `sat-tui`: when given `-rpccacert`, they now trust only that certificate
-  authority for the node's TLS certificate, instead of adding it to the public
-  ones. The node itself is unchanged from 0.6.2.
+  Updates satd to 0.7.0. satd now publishes Bitcoin Core's ZMQ notifications,
+  accepts package CPFP and TRUC (version 3) transactions as Core does, and can
+  strip large OP_RETURN payloads from deep blocks with `pruneopreturn` (off by
+  default). Headers and P2P messages are read as Core reads them.
 
 
-  Updating from 0.6.0 or 0.6.1 also brings 0.6.2: satd refuses TLS
-  certificates that chain through the eMudhra (emSign) intermediate
-  certificate authorities, whose private keys were disclosed on 2026-10-20.
+  Several defaults change to match Core. `getrawtransaction`, `getblock` and
+  `decoderawtransaction` drop the fields Core does not have; the mempool
+  limits each transaction's cluster to 64; transactions reach peers a few
+  seconds later; and Electrum and Esplora refuse balance and UTXO requests for
+  a scripthash with more than 200,000 transactions unless
+  `addrindexmaxhistory` is raised.
 
 
-  No rebuild is needed when updating from 0.6.0, 0.6.1 or 0.6.2. Updating
-  straight from 0.5.2 rebuilds the chainstate once on the first start, from
-  the block files already on disk; the status page shows its progress.
+  No rebuild is needed when updating from 0.6.x. A node that has used
+  `pruneopreturn` cannot go back to 0.6.x. Updating straight from 0.5.2
+  rebuilds the chainstate once on the first start, from the block files
+  already on disk; the status page shows its progress.
 
 
-  Updating from 0.6.0 also brings the 0.6.1 fixes. Since 0.6.1, Electrum and
-  Esplora requests time out after 30 seconds. A wallet that reads a very long
-  address history may need `electrumrequesttimeout` raised in the app's
-  bitcoin.conf.
+  Updating from 0.6.0, 0.6.1 or 0.6.2 also brings the 0.6.x security fixes
+  for TLS certificate checking. Since 0.6.1, Electrum and Esplora requests
+  time out after 30 seconds. A wallet that reads a very long address history
+  may need `electrumrequesttimeout` raised in the app's bitcoin.conf.
 
 
   Full notes:
-  https://github.com/epochbtc/satd/blob/v0.6.3/docs/release-notes/0.6.3.md,
-  https://github.com/epochbtc/satd/blob/v0.6.3/docs/release-notes/0.6.2.md
-  and, for 0.6.1,
-  https://github.com/epochbtc/satd/blob/v0.6.3/docs/release-notes/0.6.1.md
+  https://github.com/epochbtc/satd/blob/v0.7.0/docs/release-notes/0.7.0.md
+  and, for 0.6.x,
+  https://github.com/epochbtc/satd/blob/v0.7.0/docs/release-notes/0.6.3.md,
+  https://github.com/epochbtc/satd/blob/v0.7.0/docs/release-notes/0.6.2.md
+  and
+  https://github.com/epochbtc/satd/blob/v0.7.0/docs/release-notes/0.6.1.md
 # Regenerable, and hundreds of gigabytes. What stays in the backup is what
 # cannot be re-derived: tls/ (the CA clients have imported), secrets/ (the MCP
 # token), authfile.toml and bitcoin.conf. `data/` is the directory mounted at
