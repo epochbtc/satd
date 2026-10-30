@@ -8,18 +8,20 @@ Version: 1
 ```
 
 Status: draft for review. The wire format and the publisher side are
-implemented in satd 0.7.0 development builds, which are unreleased; anything
+implemented in satd 0.7.0; anything
 here may still change in response to review. The aggregator's report format
 (see [Reports](#reports)) is not yet specified.
 
 ## Abstract
 
-NAP lets Bitcoin holders publish signed, non-binding statements, weighted by
-the coins they control. A holder signs one key-value pair for one unspent
+NAP lets node operators publish signed, non-binding statements, weighted by
+the coins they control. A node operator signs one key-value pair for one unspent
 output with the key or script that locks it, using BIP 322 or, for P2PKH
 outputs, Bitcoin Core's `signmessage`. Nothing is locked up or spent. The
 statement counts with the coin's value for as long as the coin stays unspent
 and the signature stays fresh.
+
+The name follows the economic-node argument: a node's say in Bitcoin rests on the coins and payments behind it, not on the node itself. NAP makes that weight explicit. A node publishes statements signed by coins its operator controls, and an aggregator counts them by value. Running more nodes adds nothing.
 
 This document specifies the signed message, the attestation's serialization,
 the rules that make an attestation valid at a chain tip, supersession, the
@@ -29,9 +31,7 @@ aggregators, and the serving limits.
 ## Motivation
 
 Soft fork activation has been gated on miner signaling. Miners are one
-constituency. Holders, exchanges, custodians and merchants have no legible way
-to signal; their views surface on mailing lists and social media, where they
-cannot be measured.
+constituency. Node operators, exchanges, custodians and merchants have no legible way to signal; their views surface on mailing lists and social media, where they cannot be measured.
 
 NAP measures **auditable coin-backed statements**: statements authorised by
 the scripts controlling participating outputs. It does not establish who owns
@@ -39,9 +39,13 @@ those coins, and it says nothing about holders who did not participate.
 Participation is self-selected, so a result is correct about the coins that
 signed and silent about the rest.
 
+NAP allows economic participants to express preferences as a human-interpreted signal. This is intended to be used in addition to traditional miner signaling and allows a greater proportion of the network to participate in signaling. NAP is *not* intended to gate decisions in an automated, mechanical fashion (e.g., a softfork must be activated if some arbitrary NAP threshold is met).
+
 NAP is not binding. No activation logic, policy or consensus rule reads NAP
-data. Weight comes from coins, not from nodes or hash rate, so running many
+data. Weight comes from coins, not from node count or hash rate, so running many
 publishers adds no weight.
+
+Not every attestor needs to run a node themselves: public nodes may accept valid attestations from the public anonymously if they so choose.
 
 The key-value format is generic. Keys can name soft fork parameters, policy
 questions, or nothing of consequence. A mechanism already in everyday use
@@ -86,12 +90,12 @@ consist of printable ASCII bytes (0x20 to 0x7E inclusive). A key is 1 to
 namespace: any key is valid. Proposal authors are encouraged to name a
 canonical key for their proposal, such as `bip_xyz.support`.
 
-An empty value is a **withdrawal**. It supersedes the holder's earlier value
+An empty value is a **withdrawal**. It supersedes the operator's earlier value
 for that key like any other value, and counts toward no value.
 
 ### Signed message
 
-The holder signs the following text, with LF (0x0A) line endings and no
+The operator signs the following text, with LF (0x0A) line endings and no
 trailing newline:
 
 ```
@@ -450,11 +454,11 @@ then this section is informative.
 
 ## Rationale
 
-**Coins, not compute or nodes.** Compute is rentable by the hour, and nodes
+**Coins, not compute or node count.** Compute is rentable by the hour, and nodes
 are free to multiply. Coin weight cannot be multiplied, and borrowed coins
 must stay put for `MIN_COIN_AGE` and drop out when returned.
 
-**Economic nodes** NAP allows 'economic nodes' to express preferences as a human-interpreted signal. This is intended to be in addition to traditional miner signaling and allows a greater proportion of the network to participate in signaling. NAP is *not* intended to gate decisions in an automated, mechanical fashion (e.g., a BIP must be activated if some arbitrary NAP threshold is met).
+**Economic nodes** NAP allows economic participants to express preferences as a human-interpreted signal. This is intended to be in addition to traditional miner signaling and allows a greater proportion of the network to participate in signaling. NAP is *not* intended to gate decisions in an automated, mechanical fashion (e.g., a softfork must be activated if some arbitrary NAP threshold is met).
 
 **A human-readable message.** Hardware signers display what they sign. Every
 field of the attestation appears in the text, so the signer sees the whole
@@ -511,23 +515,15 @@ with `signmessage`. BIP 322 full proofs are also accepted for P2PKH.
 
 Exchanges, companies and ETFs control a large supply of coins. Conceptually, these custodians are free to signal on behalf of the beneficial owners of those coins (similar in concept to how a corporate proxy might vote on behalf of shareholders). A downside of this approach is that it exposes public information about the exact UTXOs under their control, because NAP attestations are public.
 
-One mitigation to this issue available in v1 is to attest only for a small fraction of custodied coins, but do so in proportion to the voting preferences of the underlying beneficial owners. For example, only NAP attest for 10% of coins but ensure that the distribution of attestations matches the distribution of beneficial owners' preferences.
+One mitigation to this issue available in v1 is to attest only for a small fraction of custodied coins, but do so in proportion to the voting preferences of the underlying beneficial owners. For example, only NAP attest for 10% of coins but ensure that the distribution of attestations matches the distribution of beneficial owners' preferences. The downside of this is that it reduces the total weight of attestations relative to the rest of the network.
 
-A possible NAP v2 might introduce a mechanism to attest and prove ownership of coins without revealing the exact UTXOs under their control via more advanced cryptographic techniques. This is out of scope of this document.
-
-Custodians are also free to decline to attest at all, or to attest purely based on their internal corporate interests. This is an acknowledged potential concern that NAP cannot fully address technically.
+Custodians are also free to decline to attest at all, or to attest purely based on their internal interests. This is an acknowledged potential concern that NAP cannot fully address technically; users who care about this should consider sovereign self-custody instead.
 
 ## Security and privacy considerations
 
 **Paid signing.** A holder or custodian can be paid to sign. This needs no
 capital and no coin movement, and the attestation is a verifiable receipt for
 the payer. It is inherent to any signed-signal scheme.
-
-**Custody.** Exchanges and custodians control large outputs and can sign
-with coins their customers own. NAP cannot tell owned coins from custodied
-ones. Weight caps and concentration limits are defeated by splitting coins,
-so NAP has neither. Reports show the shape of participation; interpreting it
-is left to the people reading them.
 
 **Withheld attestations.** A publisher or network path that withholds a newer
 attestation leaves the older one counting at that aggregator. Comparing
@@ -624,7 +620,8 @@ A `napatt` carrying the attestation above as the last page:
 - **Anonymous attestations.** Proving control of some qualifying output
   without revealing which, with a one-per-coin tag against double counting.
   Curve-tree constructions do this for Taproot outputs; their maturity needs
-  evaluating.
+  evaluating. This would mitigate the privacy concern around custodians
+  exposing UTXOs under their control. This is a possible avenue of exploration for NAP v2.
 - **Reports.** The snapshot digest and report format (see
   [Reports](#reports)).
 
