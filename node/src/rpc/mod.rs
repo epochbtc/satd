@@ -74,3 +74,5 @@ pub mod util;
 mod rpcparity_tests;
 #[cfg(test)]
 mod txparity_tests;
+#[cfg(test)]
+mod txoutsetinfo_tests;

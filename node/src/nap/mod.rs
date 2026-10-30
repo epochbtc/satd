@@ -15,11 +15,23 @@
 //!   state for it.
 //! - [`p2p`]: the `getnapatt` and `napatt` messages, paging, and the
 //!   serving limits.
+//! - [`collect`]: the aggregator's intake, cheapest check first, with the
+//!   verification budgets; it feeds the [`aggregate`], the set an
+//!   aggregator keeps and judges at each tip.
+//! - [`pull`]: which publishers the aggregator pulls, and when; the peer
+//!   manager sends and dials for it.
+//! - [`report`]: the report on a set at a tip, and the snapshots that let
+//!   another aggregator replay it.
 
+pub mod aggregate;
 pub mod chain;
+pub mod collect;
 pub mod message;
+pub(crate) mod par;
 pub mod p2p;
 pub mod publisher;
+pub mod pull;
+pub mod report;
 pub mod store;
 pub mod validity;
 pub mod wire;
@@ -47,6 +59,10 @@ pub const TEST_MIN_COIN_AGE: u32 = 6;
 /// How old a coinbase coin must be at the anchor on every network: it cannot
 /// attest before it can be spent.
 pub const COINBASE_MATURITY: u32 = bitcoin::constants::COINBASE_MATURITY;
+/// The smallest coin that attests, on every network. Weight follows value,
+/// so dust could not sway a count, but it could fill an aggregator's set for
+/// almost no capital; the floor makes that cost real coins.
+pub const MIN_COIN_VALUE: bitcoin::Amount = bitcoin::Amount::from_sat(10_000);
 /// How far below the tip `createnapattestation` anchors.
 pub const ANCHOR_DEPTH: u32 = 6;
 /// The largest serialized attestation, in bytes.
@@ -159,8 +175,14 @@ impl Attestation {
 }
 
 #[cfg(test)]
+mod aggregate_tests;
+#[cfg(test)]
 pub(crate) mod p2p_tests;
 #[cfg(test)]
 mod publisher_tests;
+#[cfg(test)]
+pub(crate) mod pull_tests;
+#[cfg(test)]
+mod report_tests;
 #[cfg(test)]
 mod tests;

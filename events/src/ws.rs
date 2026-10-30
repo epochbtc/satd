@@ -1536,6 +1536,7 @@ fn watch_match_json(
             height,
             amount,
             raw_tx,
+            raw_tx_stripped,
         } => {
             // Hex of the full tx when this stream opted in (SetWatchOptions) and
             // the match carried it; `null` otherwise. Mirrors the gRPC gate.
@@ -1544,7 +1545,7 @@ fn watch_match_json(
             } else {
                 None
             };
-            json!({
+            let mut v = json!({
             "schema_version": node::events::SCHEMA_VERSION,
             "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
             "body": {
@@ -1572,7 +1573,9 @@ fn watch_match_json(
                     }))
                     .collect::<Vec<_>>(),
             }
-            })
+            });
+            mark_raw_tx_stripped(&mut v, include_raw_tx && *raw_tx_stripped);
+            v
         }
         WatchMatch::TxidMatched {
             txid,
@@ -1648,7 +1651,7 @@ fn watch_match_json(
         WatchMatch::PrefixMatched(pm) => {
             let (masked, bits) = pm.prefix;
             let nbytes = (bits as usize).div_ceil(8).min(4);
-            json!({
+            let mut v = json!({
                 "schema_version": node::events::SCHEMA_VERSION,
                 "cursor": pm.height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
                 "body": {
@@ -1656,6 +1659,7 @@ fn watch_match_json(
                     "prefix": hex::encode(&masked.to_be_bytes()[..nbytes]),
                     "bits": bits,
                     "raw_tx": hex::encode(pm.raw_tx.as_ref()),
+                    "txid": hex::encode(pm.txid.as_raw_hash().to_byte_array()),
                     "confirmed": pm.confirmed,
                     "height": pm.height,
                     "matched_prevouts": pm.matched_prevouts.iter().map(|m| json!({
@@ -1671,7 +1675,9 @@ fn watch_match_json(
                         "has_amount": m.amount.is_some(),
                     })).collect::<Vec<_>>(),
                 }
-            })
+            });
+            mark_raw_tx_stripped(&mut v, pm.raw_tx_stripped);
+            v
         }
         WatchMatch::SilentPaymentMatched {
             scan_pubkey,
@@ -1685,13 +1691,14 @@ fn watch_match_json(
             confirmed,
             height,
             raw_tx,
+            raw_tx_stripped,
         } => {
             let raw_tx_hex = if include_raw_tx {
                 raw_tx.as_ref().map(hex::encode)
             } else {
                 None
             };
-            json!({
+            let mut v = json!({
             "schema_version": node::events::SCHEMA_VERSION,
             "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
             "body": {
@@ -1711,8 +1718,20 @@ fn watch_match_json(
                 "height": height,
                 "raw_tx": raw_tx_hex,
             }
-            })
+            });
+            mark_raw_tx_stripped(&mut v, include_raw_tx && *raw_tx_stripped);
+            v
         }
+    }
+}
+
+/// On a match whose transaction was read from an OP_RETURN-stripped block:
+/// `raw_tx` is `null`, never empty or zero-filled hex, and `raw_tx_stripped`
+/// is `true`. The key is absent on every other match.
+fn mark_raw_tx_stripped(v: &mut serde_json::Value, stripped: bool) {
+    if stripped {
+        v["body"]["raw_tx"] = serde_json::Value::Null;
+        v["body"]["raw_tx_stripped"] = serde_json::Value::Bool(true);
     }
 }
 
@@ -2129,6 +2148,7 @@ mod tests {
             height: Some(100),
             amount: Some(50_000),
             raw_tx: Some(std::sync::Arc::from(vec![0xde, 0xad, 0xbe, 0xef])),
+            raw_tx_stripped: false,
         };
         // Value fields are always present; raw_tx only when opted in.
         let off = watch_match_json(&m, &[], false);
@@ -2139,6 +2159,48 @@ mod tests {
 
         let on = watch_match_json(&m, &[], true);
         assert_eq!(on["body"]["raw_tx"], "deadbeef", "opt-in → hex of the tx");
+    }
+
+    /// A match on a transaction read from an OP_RETURN-stripped block: on an
+    /// opted-in stream, `raw_tx` is null (never empty or zero-filled hex) and
+    /// `raw_tx_stripped` is true; the key is absent otherwise. A prefix match,
+    /// which always carries the tx, reads the same, with its txid.
+    #[test]
+    fn stripped_match_json_has_no_hex_and_the_flag() {
+        use bitcoin::hashes::Hash;
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let m = WatchMatch::ScriptMatched {
+            scripthash: [0xaa; 32],
+            txid,
+            is_output: true,
+            index: 0,
+            confirmed: true,
+            height: Some(100),
+            amount: Some(50_000),
+            raw_tx: None,
+            raw_tx_stripped: true,
+        };
+        let on = watch_match_json(&m, &[], true);
+        assert!(on["body"]["raw_tx"].is_null());
+        assert_eq!(on["body"]["raw_tx_stripped"], true);
+        let off = watch_match_json(&m, &[], false);
+        assert!(off["body"]["raw_tx"].is_null());
+        assert!(off["body"].get("raw_tx_stripped").is_none(), "not opted in: no flag");
+
+        let pm = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
+            prefix: (0xabcd_0000, 16),
+            raw_tx: std::sync::Arc::from(&[][..]),
+            raw_tx_stripped: true,
+            txid,
+            confirmed: true,
+            height: Some(5),
+            matched_prevouts: vec![],
+        }));
+        let v = watch_match_json(&pm, &[], false);
+        assert!(v["body"]["raw_tx"].is_null(), "never empty hex: {v}");
+        assert_eq!(v["body"]["raw_tx_stripped"], true);
+        assert_eq!(v["body"]["txid"], hex::encode(txid.as_raw_hash().to_byte_array()));
     }
 
     #[test]
@@ -2262,6 +2324,8 @@ mod tests {
         let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
             raw_tx: vec![0x01, 0x02].into(),
+            raw_tx_stripped: false,
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32])),
             confirmed: true,
             height: Some(5),
             matched_prevouts: vec![
@@ -2447,6 +2511,7 @@ mod tests {
             confirmed: true,
             height: Some(321),
             raw_tx: Some(std::sync::Arc::from(vec![0xaa, 0xbb].as_slice())),
+            raw_tx_stripped: false,
         };
         // Opted out: no raw_tx.
         let v = watch_match_json(&m, &[], false);

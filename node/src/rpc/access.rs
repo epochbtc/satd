@@ -81,6 +81,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "getbestblockhash"
         | "getblock"
         | "getblockchaininfo"
+        | "getopreturnpruneinfo"
         | "getdeploymentinfo"
         | "getblockcount"
         | "getblockfilter"
@@ -158,6 +159,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // read the chain and the publisher's store, and change neither.
         | "createnapattestation"
         | "listnapattestations"
+        // The aggregator's set, which collection alone changes. The report
+        // on it is computed once per tip and set, however often it is asked.
+        | "listnapaggregate"
+        | "getnapreport"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---
@@ -239,7 +244,13 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "generate"
         | "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain"
         // walks the whole UTXO set; minute-scale on mainnet
-        | "scantxoutset" => Control,
+        | "scantxoutset"
+        // NAP: a replay reads a file and verifies every signature in it; an
+        // export writes a file.
+        | "replaynapsnapshot" | "exportnapsnapshot"
+        // satd's test-only strip tool (regtest, `-allowteststrip`): rewrites
+        // block files in place.
+        | "stripopreturns" => Control,
 
         // --- Block-connecting / chainstate-activating (correctness-critical) ---
         "generateblock"
@@ -320,6 +331,8 @@ mod tests {
             "scantxoutset",
             "getblockfileaudit",
             "verifychain",
+            "replaynapsnapshot",
+            "exportnapsnapshot",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::Control), "{m}");
             assert!(!readonly_listener_allows(m), "{m} must be rejected");
@@ -353,6 +366,7 @@ mod tests {
             "getnodeaddresses",
             "getaddrmaninfo",
             "getrawaddrman",
+            "getnapreport",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::Read), "{m}");
             assert!(readonly_listener_allows(m), "{m} must be allowed");

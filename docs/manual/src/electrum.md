@@ -40,7 +40,7 @@ the address index for scripthash history (on by default) and
 | `--electrummtlsclientca=<path>` | none | PEM CA bundle to verify client certs when `--electrummtls=1`. |
 | `--electrummtlsclientallow=<subj>` | any CA-signed | Allowlist of accepted client-cert CN / DNS-SAN values. |
 | `--electrummaxconns=<n>` | `64` | Hard cap on simultaneously-open connections. |
-| `--electrummaxsubsperconn=<n>` | `1000` | Per-connection scripthash subscription cap. See [Subscription limits](#subscription-limits) for how it relates to the server-wide `--addrindexsubscriptions`. |
+| `--electrummaxsubsperconn=<n>` | `10000` | Per-connection scripthash subscription cap. See [Subscription limits](#subscription-limits) for how it relates to the server-wide `--addrindexsubscriptions`. |
 | `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. A request still running after this long is answered with a `request timed out` error and its connection is closed. The handler's work cannot be interrupted, so the connection keeps its `--electrummaxconns` slot until that work ends. |
 | `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets such as Sparrow batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
@@ -81,11 +81,11 @@ exactly as in the Electrum protocol.
 
 | Method | Description |
 |---|---|
-| `server.version` | Negotiate client/server software + protocol version. |
+| `server.version` | Negotiate client/server software + protocol version. Also accepts rbitcoin's `1.4.2-asof`; see [Chain-tip stamps](#chain-tip-stamps). |
 | `server.ping` | Keepalive; returns null. |
 | `server.banner` | Server banner text (configurable via `--electrumbanner`). |
 | `server.donation_address` | Configured donation address (empty if unset). |
-| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), etc. |
+| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), `asof` / `asof_protocol` ([As of a block](#as-of-a-block)), etc. |
 | `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set; no peer gossip). |
 
 ### Headers & blocks
@@ -133,6 +133,84 @@ exactly as in the Electrum protocol.
 |---|---|
 | `blockchain.tweaks.subscribe` | BIP 352 tweak stream for client-side scanning. Requires `-silentpaymentindex=1`; see below. |
 
+## Chain-tip stamps
+
+The methods that read the chain at one block answer for the tip the
+request started at, and name it beside `result`:
+
+```json
+{"jsonrpc": "2.0", "id": 7, "result": {"confirmed": 5000, "unconfirmed": 0},
+ "chain_tip": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+ "chain_tip_height": 3}
+```
+
+They are `blockchain.scripthash.get_history`, `get_balance` and
+`listunspent`, and `blockchain.transaction.get`, `get_merkle` and
+`id_from_pos`. The members and methods are rbitcoin's (satd adds
+`id_from_pos`), and as on rbitcoin every connection gets them. A wallet
+that syncs with several requests compares `chain_tip` across them: if it
+changed, a block connected or a reorg happened in between, and the answers
+do not describe one chain.
+
+- Nothing above the pinned tip counts as confirmed. A transaction that
+  confirms while the request runs is listed as the unconfirmed transaction
+  it was: `get_history` and `listunspent` give it height `0` (`-1` when it
+  spends another transaction that was unconfirmed then) and `get_history`
+  its fee when its inputs can be read; `get_balance` counts it in
+  `unconfirmed`; `transaction.get` gives it no block, and `get_merkle`
+  and `id_from_pos` no proof or position.
+- A mempool transaction whose parent confirmed above the pinned tip spent
+  an unconfirmed parent as of it, and has height `-1` too.
+- `transaction.get`'s `confirmations` counts to the pinned tip.
+- A disconnect while a request runs (a reorg, or `invalidateblock`) runs it
+  again at the new tip. One that a disconnect interrupts eight times in a
+  row is answered with the error `chain view moved`.
+- The mempool part of an answer is read as it is when the request reads it.
+- Errors, and every other method, carry no stamp.
+
+`server.version` also accepts rbitcoin's protocol string `1.4.2-asof`, alone
+or at either end of a `[min, max]` range, and answers with it, so a client
+written for rbitcoin negotiates as it does there. The protocol spoken is
+still 1.4, and the stamps do not depend on it.
+
+### As of a block
+
+The same six methods take one more argument, after their own (optional
+ones included): `asof:<blockhash>`, rbitcoin's. The answer is then as of
+that block, which must be on the best chain, and leaves out the mempool:
+
+```json
+{"id": 1, "method": "blockchain.scripthash.listunspent",
+ "params": ["<scripthash>", "asof:<blockhash>"]}
+{"id": 2, "method": "blockchain.transaction.get",
+ "params": ["<txid>", true, "asof:<blockhash>"]}
+```
+
+- Blocks above the asof block do not count: a transaction confirmed later
+  is left out of `get_history`, an output spent later is still in
+  `listunspent` and `get_balance`, and `transaction.get`, `get_merkle` and
+  `id_from_pos` find nothing confirmed later.
+- `chain_tip` / `chain_tip_height` name the asof block.
+- A hash that is not a block on the best chain is the error
+  `asof not on chain`, and so is one that leaves the best chain while the
+  request runs. The answer never comes from another block at that height.
+- A malformed hash, or `asof:` on any other method, is an error, never
+  ignored.
+- `listunspent` and `get_balance` as of a block are worked out from the
+  scripthash's history, under the same [history cap](#history-cap).
+
+rbitcoin takes `asof:` only after `server.version` negotiated `1.4.2-asof`;
+satd takes it on any connection, so sending it is the opt-in.
+`server.features` reports `asof: true` and `asof_protocol: "1.4.2-asof"`.
+
+**Check `server.features` before sending `asof:`.** A server without the
+feature does not always refuse it: `transaction.get`, `get_merkle` and
+`id_from_pos` already take an optional last argument, and an older satd (or
+another server) reads `asof:…` there as `verbose = false` or
+`merkle = false`, or ignores it, and answers live, with no error. Check the
+answer too: its `chain_tip` names the asof block only when the asof was
+applied.
+
 ## Subscriptions
 
 Two long-lived push subscriptions are supported. Only
@@ -165,22 +243,27 @@ one pass is running share the next pass.
 
 Two caps apply to `blockchain.scripthash.subscribe`:
 
-- `--electrummaxsubsperconn` (default `1000`) bounds one connection.
-- `--addrindexsubscriptions` (default `10000`) bounds the distinct
+- `--electrummaxsubsperconn` (default `10000`) bounds one connection. A
+  desktop wallet subscribes every address it has used plus its gap-limit
+  windows, for every wallet it has open, on one connection; 10,000 covers a
+  large one.
+- `--addrindexsubscriptions` (default `50000`) bounds the distinct
   scripthashes subscribed across the whole server. Esplora's
   `/address/:addr/sse` and `/scripthash/:hash/sse` streams count against it
   too. Once it is full, every further subscribe of a new scripthash is
   refused with `subscribe: subscription cap reached (N scripthashes)`,
   whichever connection asks.
 
-With the defaults, 10 connections at their own cap fill the server-wide
-registry while 54 of the 64 connection slots are still free, and satd logs
+With the defaults, five connections at their own cap fill the server-wide
+registry while 59 of the 64 connection slots are still free, and satd logs
 how many connections fill it at startup. For the per-connection cap to bind
 first, set `--addrindexsubscriptions` to at least
-`--electrummaxconns` × `--electrummaxsubsperconn` (64,000 with the defaults),
-plus room for the Esplora SSE streams you serve. Each subscribed scripthash
-costs a notification channel of a few kilobytes and a history read on every
-block, so size it to the wallets you serve. `--addrindexsubscriptions` can be
+`--electrummaxconns` × `--electrummaxsubsperconn` (640,000 with the
+defaults), plus room for the Esplora SSE streams you serve. Each subscribed
+scripthash costs about 4.6 KB of memory (about 230 MB for a full default
+registry) and a history read after every block (tens of microseconds for a
+short history on a warm index, more for a long one), so size it to the
+wallets you serve. `--addrindexsubscriptions` can be
 changed with `SIGHUP`; lowering it does not drop existing subscriptions.
 
 `blockchain.tweaks.subscribe` also pushes notifications, but it is a bounded
@@ -305,9 +388,18 @@ backend.
 - **Histories over the cap are refused**, not truncated: see
   [History cap](#history-cap).
 - satd advertises a single protocol version (`protocol_min == protocol_max
-  == 1.4`); it does not negotiate a range.
+  == 1.4`); it does not negotiate a range. The one other string it accepts
+  is rbitcoin's `1.4.2-asof` ([Chain-tip stamps](#chain-tip-stamps)).
 - `server.peers.subscribe` returns an empty list: satd does not participate
   in Electrum peer gossip.
+- **OP_RETURN-pruned blocks** (`pruneopreturn`, see
+  [OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning)):
+  `blockchain.transaction.get` without `verbose` refuses a stripped
+  transaction with `transaction data not available (OP_RETURN data
+  stripped)`. With `verbose` it reads as satd's `getrawtransaction` does: no
+  `hex`, `"opreturn_stripped": true`, and each stripped output's
+  `scriptPubKey` reduced to the bare `OP_RETURN` plus `stripped_size`.
+  `get_merkle`, `id_from_pos` and `blockchain.tweaks.subscribe` are unchanged.
 - The protocol layer is vendored from `romanz/electrs` (MIT; attribution in
   `electrum-proto/vendor/electrs.MIT`) and adapted to satd's `AddressIndex`
   trait over the shared RocksDB.

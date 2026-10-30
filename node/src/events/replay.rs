@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::BlockHash;
 
 use crate::chain::events::ChainEvent;
+use crate::storage::opreturn_strip::StoredBlock;
 
 use super::{
     Cursor, CursorRejectReason, EdgeStamp, EventPublisher, NodeEvent, NodeEventBody,
@@ -129,9 +130,11 @@ impl BlockCursorSource for crate::chain::state::ChainState {
 ///
 /// [`RescanBlocks`]: https://docs.rs/satd-events-proto
 pub trait BlockScanSource: BlockCursorSource {
-    /// Full block for `hash`, or `None` if not held locally (pruned or
-    /// header-only). A rescan silently skips heights whose body is unavailable.
-    fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block>;
+    /// Full block for `hash` as stored, or `None` if not held locally (pruned
+    /// or header-only). A rescan silently skips heights whose body is
+    /// unavailable. An OP_RETURN-stripped block comes back in its filled form,
+    /// with the txids its strip record holds.
+    fn block_body(&self, hash: &BlockHash) -> Option<StoredBlock>;
 
     /// Undo data for `hash` (spent coins, one per non-coinbase input in connect
     /// order), or `None` if not held. Needed only when a script or prefix is
@@ -179,8 +182,8 @@ pub trait BlockScanSource: BlockCursorSource {
 }
 
 impl BlockScanSource for crate::chain::state::ChainState {
-    fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block> {
-        self.get_block(hash)
+    fn block_body(&self, hash: &BlockHash) -> Option<StoredBlock> {
+        self.get_stored_block(hash)
     }
 
     fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
@@ -655,7 +658,7 @@ mod tests {
     // Bodies are unused by `plan_rescan` (pure range planning); the flat chain
     // holds no real blocks.
     impl BlockScanSource for FlatChain {
-        fn block_body(&self, _hash: &BlockHash) -> Option<bitcoin::Block> {
+        fn block_body(&self, _hash: &BlockHash) -> Option<StoredBlock> {
             None
         }
         fn block_undo(&self, _hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {

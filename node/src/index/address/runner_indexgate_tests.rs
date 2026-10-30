@@ -133,8 +133,9 @@ fn reorg_cleanup_keeps_the_rows_the_active_chain_owns() {
     assert_eq!(cs.tip_hash(), a102.block_hash());
 
     // What a backfill run over this chain wrote beyond the live rows: the
-    // funding row for A102's OP_RETURN output (the live path does not index
-    // unspendable outputs), and the pass-1 lookup row pass 2 used for S.
+    // funding row for A102's OP_RETURN output (which a pass 1 from before
+    // it skipped unspendable outputs wrote, and a reorg must still clear),
+    // and the pass-1 lookup row pass 2 used for S.
     let store = cs.store_ref();
     // The live rows are on disk before the backfill's, as they would be
     // for any block older than one flush window.
@@ -283,4 +284,100 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
     );
     assert_eq!(funding_heights(&cs, &sh_empty).len(), 5, "every row written afterwards");
     assert_eq!(handle.cursor().state, BackfillState::Completed);
+}
+
+/// Run a backfill over `cs` from genesis to `tip` (at `height`) and wait
+/// for it to complete.
+fn run_backfill(cs: &Arc<ChainState>, tip: &Block, height: u32) {
+    cs.store_ref().create_backfill_temp_cf().unwrap();
+    let handle = Arc::new(BackfillHandle::new(BackfillCursor {
+        state: BackfillState::Running,
+        pass: 1,
+        cursor_height: 0,
+        snapshot_height: height,
+        started_at_unix: 1,
+        snapshot_tip_hash: tip.block_hash().to_byte_array(),
+    }));
+    let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+    let runner = BackfillRunner {
+        handle: handle.clone(),
+        chain: cs.clone(),
+        cfg: AddressIndexConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        shutdown,
+    };
+    runner.run().expect("the backfill completes");
+    cs.store_ref().flush().unwrap();
+    assert_eq!(handle.cursor().state, BackfillState::Completed);
+}
+
+/// A backfill indexes what the live path indexes. Block 102 carries both
+/// kinds of unspendable output: an OP_RETURN on a spending transaction and
+/// a script over Core's `MAX_SCRIPT_SIZE` (10,000 bytes) on the coinbase. The live path writes no
+/// row for either, so the backfill must not.
+///
+/// Fails without the fix: pass 1 wrote funding rows for both, so a
+/// scripthash query on either script found an unspent output that a node
+/// indexed live does not have.
+#[test]
+fn the_backfill_skips_unspendable_outputs_as_the_live_path_does() {
+    let live_dir = tempfile::tempdir().unwrap();
+    let backfill_dir = tempfile::tempdir().unwrap();
+    let live = chain_with_address_index(live_dir.path());
+    let backfilled = Arc::new(chain(backfill_dir.path(), false));
+
+    let mut blocks = connect_chain(&live, 101);
+    for b in &blocks {
+        backfilled.accept_block(b).expect("fixture block connects");
+    }
+    let coinbase_1 = OutPoint {
+        txid: blocks[0].txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let oversized = ScriptBuf::from_bytes(vec![0x51; 10_001]);
+    let mut b102 = build_test_block_spending(blocks[100].block_hash(), 102, BASE + 100_000, coinbase_1);
+    b102.txdata[1].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: op_return_script(),
+    });
+    b102.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: oversized.clone(),
+    });
+    remine(&mut b102);
+    live.accept_block(&b102).expect("B102 connects");
+    backfilled.accept_block(&b102).expect("B102 connects");
+    blocks.push(b102);
+    live.store_ref().flush().unwrap();
+
+    run_backfill(&backfilled, &blocks[101], 102);
+
+    let sh_empty = scripthash_of(&ScriptBuf::new());
+    let sh_op_return = scripthash_of(&op_return_script());
+    let sh_oversized = scripthash_of(&oversized);
+    assert!(
+        funding_heights(&backfilled, &sh_op_return).is_empty(),
+        "the backfill indexed an OP_RETURN output"
+    );
+    assert!(
+        funding_heights(&backfilled, &sh_oversized).is_empty(),
+        "the backfill indexed an output over MAX_SCRIPT_SIZE"
+    );
+    assert!(funding_heights(&live, &sh_op_return).is_empty());
+    assert!(funding_heights(&live, &sh_oversized).is_empty());
+
+    // Everything spendable is indexed the same both ways.
+    assert_eq!(funding_heights(&backfilled, &sh_empty), funding_heights(&live, &sh_empty));
+    assert_eq!(funding_heights(&live, &sh_empty).len(), 103, "102 coinbases and S's output");
+    let spending = |cs: &ChainState| -> Vec<(u32, bitcoin::Txid, u32)> {
+        cs.store_ref()
+            .iter_addr_spending(&sh_empty)
+            .into_iter()
+            .map(|(k, _)| (k.height, k.txid, k.vin))
+            .collect()
+    };
+    assert_eq!(spending(&backfilled), spending(&live));
+    assert_eq!(spending(&live).len(), 1);
 }

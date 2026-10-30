@@ -607,4 +607,46 @@ mod tests {
         assert!(matches!(verdict, satd_policy::Verdict::Quarantine { .. }));
         assert_eq!(verdict.rule(), Some("bulk"));
     }
+
+    /// `tx.signals_rbf` is BIP125's signal: some input's nSequence below
+    /// 0xfffffffe. 0xfffffffe itself, which only enables nLockTime, does not
+    /// signal.
+    #[test]
+    fn signals_rbf_is_bip125s_sequence_threshold() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let ruleset = satd_policy::parse_ruleset("version 1\nquarantine rbf when tx.signals_rbf").unwrap();
+        let cfg = MempoolConfig::default();
+        let ctx = PolicyCtx { network: BNetwork::Regtest, height: 1, mempool_bytes: 0 };
+        let prev = vec![TxOut { value: Amount::from_sat(10_000), script_pubkey: spk(vec![0x51]) }];
+        for (sequence, signals) in [(0xffff_fffd, true), (0xffff_fffe, false), (0xffff_ffff, false)] {
+            let tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence(sequence),
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk(vec![0x51]) }],
+            };
+            let verdict = evaluate(
+                &ruleset,
+                &tx,
+                &tx.compute_txid(),
+                &prev,
+                &[false],
+                9_000,
+                1_000,
+                tx.weight().to_wu() as usize,
+                &cfg,
+                ctx,
+                TxSource::P2p,
+                false,
+            );
+            assert_eq!(verdict.rule() == Some("rbf"), signals, "nSequence {sequence:#x}");
+        }
+    }
 }

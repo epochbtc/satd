@@ -2,8 +2,9 @@
 //!
 //! Holders submit signed attestations through the RPCs; the publisher
 //! checks each against the chain, keeps at most one per `(outpoint, key)`
-//! and at most [`MAX_KEYS_PER_OUTPOINT`] keys per outpoint (D3), and writes
-//! them to [`store`](super::store) on every change. At each new tip
+//! and at most [`MAX_KEYS_PER_OUTPOINT`] keys per outpoint (D3), and records
+//! every change in [`store`](super::store)'s journal: one synced record, so
+//! a change costs the same however many attestations are stored. At each new tip
 //! ([`Publisher::on_tip`]) it drops the attestations whose coin was spent
 //! and re-judges the rest; it serves only those valid at its own tip.
 //!
@@ -12,8 +13,8 @@
 //!
 //! Chain reads can wait out a block commit, so none is made while holding the
 //! entries' lock: readers (`list`, `serving`) take it only to copy or update.
-//! A separate writer lock serializes the changes `submit`, `remove` and
-//! `on_tip` make. `submit` holds it across its re-check of the stored entry;
+//! A separate writer lock, which holds the journal, serializes the changes
+//! `submit`, `remove` and `on_tip` make. `submit` holds it across its re-check of the stored entry;
 //! `on_tip` judges without it and applies each result only to the entry it
 //! judged, so a long pass never holds up the RPCs.
 
@@ -25,7 +26,9 @@ use bitcoin::psbt::Psbt;
 use bitcoin::{Amount, BlockHash, OutPoint};
 use parking_lot::Mutex;
 
-use super::validity::{Timelocks, check_chain, check_coin_age, check_timelocks, verify_signature};
+use super::validity::{
+    Timelocks, check_chain, check_coin_age, check_coin_value, check_timelocks, verify_signature,
+};
 use super::{
     ANCHOR_DEPTH, Attestation, ChainView, Coin, FormatError, LEGACY_SIGNATURE_LEN,
     MAX_KEYS_PER_OUTPOINT, NapSignature, Rejection, message, store, supersedes,
@@ -40,7 +43,7 @@ pub trait ChainSource {
     /// Run `read` against one chain state that does not change during it.
     /// `read` may run more than once. `None` when the chain would not hold
     /// still, which callers report as "try again".
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T>;
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T>;
 }
 
 /// Why the publisher refused a request.
@@ -138,11 +141,15 @@ enum Assessed {
 
 type Key = (OutPoint, String);
 
+/// The files a store that did not read back was moved to, and why.
+pub type SetAside = (Vec<PathBuf>, String);
+
 pub struct Publisher {
     path: PathBuf,
     entries: Mutex<BTreeMap<Key, Entry>>,
-    /// Held by every change to `entries`, for as long as the change takes.
-    writer: Mutex<()>,
+    /// Held by every change to `entries`, for as long as the change takes,
+    /// with the journal the change is recorded in.
+    writer: Mutex<store::Journal>,
     /// The most attestations the store takes (`-napmaxattestations`); 0 is
     /// no limit.
     max_attestations: usize,
@@ -152,16 +159,32 @@ impl Publisher {
     /// Load the store at `path` (a missing file is an empty store) and judge
     /// every entry at `chain`'s tip.
     pub fn open(path: PathBuf, chain: &impl ChainSource) -> Result<Self, String> {
+        let opened = store::read(&path)?;
         let mut entries: BTreeMap<Key, Entry> = BTreeMap::new();
-        for att in store::load(&path)? {
+        for att in opened.base {
             let key = (att.outpoint(), att.key().to_owned());
             if entries.get(&key).is_some_and(|e| !supersedes(&att, &e.att)) {
                 continue;
             }
             entries.insert(key, Entry { att, locks: None, status: None });
         }
-        let publisher =
-            Publisher { path, entries: Mutex::new(entries), writer: Mutex::new(()), max_attestations: 0 };
+        // The journal's records are changes the publisher made, in order.
+        for record in opened.records {
+            match record {
+                store::Record::Put(att) => {
+                    entries.insert((att.outpoint(), att.key().to_owned()), Entry { att, locks: None, status: None });
+                }
+                store::Record::Remove(outpoint, key) => {
+                    entries.remove(&(outpoint, key));
+                }
+            }
+        }
+        let publisher = Publisher {
+            path,
+            entries: Mutex::new(entries),
+            writer: Mutex::new(opened.journal),
+            max_attestations: 0,
+        };
         publisher.on_tip(chain);
         Ok(publisher)
     }
@@ -175,36 +198,76 @@ impl Publisher {
         self
     }
 
+    /// Fold the journal in once it reaches `len` bytes (and outgrows the
+    /// file), rather than [`store::MIN_COMPACT_LEN`].
+    #[cfg(test)]
+    pub(super) fn with_compaction_at(self, len: u64) -> Self {
+        self.writer.lock().set_compact_at(len);
+        self
+    }
+
+    /// The journal's length on disk.
+    #[cfg(test)]
+    pub(super) fn journal_len(&self) -> u64 {
+        self.writer.lock().bytes()
+    }
+
+    /// Compactions tried since the store was opened.
+    #[cfg(test)]
+    pub(super) fn compactions(&self) -> u32 {
+        self.writer.lock().compactions
+    }
+
     fn full(&self, len: usize) -> bool {
         self.max_attestations != 0 && len >= self.max_attestations
     }
 
-    /// [`Self::open`], but a store that does not read back is renamed to
-    /// `<name>.bad-<unix seconds>` and the publisher starts empty
-    /// (`-napstorerecover`). Returns the path the file was moved to, for the
-    /// caller to report. Fails only if the file cannot be moved aside.
+    /// [`Self::open`], but a store that does not read back is renamed, the
+    /// file and its journal each to `<name>.bad-<unix seconds>`, and the
+    /// publisher starts empty (`-napstorerecover`). Returns the paths they
+    /// were moved to and why, for the caller to report. Fails only if a
+    /// file cannot be moved aside.
     pub fn open_recovering(
         path: PathBuf,
         chain: &impl ChainSource,
-    ) -> Result<(Self, Option<(PathBuf, String)>), String> {
-        let why = match store::load(&path) {
+    ) -> Result<(Self, Option<SetAside>), String> {
+        let why = match store::read(&path) {
             Ok(_) => return Self::open(path, chain).map(|p| (p, None)),
             Err(why) => why,
         };
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let mut aside = path.clone().into_os_string();
-        aside.push(format!(".bad-{secs}"));
-        let aside = PathBuf::from(aside);
-        std::fs::rename(&path, &aside)
-            .map_err(|e| format!("{why}; moving it to {} failed: {e}", aside.display()))?;
+        let set_aside = |file: &std::path::Path| -> Result<Option<PathBuf>, String> {
+            // A name not taken, so a second recovery in the same second does
+            // not replace the file the first one kept.
+            let aside = (0..)
+                .map(|n| {
+                    let mut aside = file.to_path_buf().into_os_string();
+                    aside.push(if n == 0 { format!(".bad-{secs}") } else { format!(".bad-{secs}-{n}") });
+                    PathBuf::from(aside)
+                })
+                .find(|p| !p.exists())
+                .expect("an unbounded range");
+            match std::fs::rename(file, &aside) {
+                Ok(()) => Ok(Some(aside)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{why}; moving it to {} failed: {e}", aside.display())),
+            }
+        };
+        // The journal follows the file, so the two go aside together.
+        let base = set_aside(&path)?;
+        let journal = set_aside(&store::journal_path(&path)).map_err(|e| match &base {
+            Some(moved) => format!("{e}; {} was already moved to {}", path.display(), moved.display()),
+            None => e,
+        })?;
+        let aside: Vec<PathBuf> = [base, journal].into_iter().flatten().collect();
         Ok((Self::open(path, chain)?, Some((aside, why))))
     }
 
     /// The message for `outpoint`, `key` and `value`, anchored
     /// [`ANCHOR_DEPTH`] blocks below the tip, after checking that the coin
-    /// exists and is old enough at that anchor.
+    /// exists, holds enough to attest, and is old enough at that anchor.
     pub fn create(
         &self,
         chain: &impl ChainSource,
@@ -223,6 +286,7 @@ impl Publisher {
         let (anchor_height, anchor_hash, coin, network) = read.ok_or(PublishError::ChainTooShort)?;
         let anchor_hash = anchor_hash.ok_or(PublishError::Busy)?;
         let coin = coin.ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
+        check_coin_value(&coin).map_err(PublishError::Rejected)?;
         check_coin_age(network, &coin, anchor_height).map_err(PublishError::Rejected)?;
 
         let text = message::render(&outpoint, key, value, anchor_height, &anchor_hash);
@@ -283,7 +347,7 @@ impl Publisher {
         let value = status.map_err(PublishError::Rejected)?;
 
         let key = (att.outpoint(), att.key().to_owned());
-        let _writer = self.writer.lock();
+        let mut journal = self.writer.lock();
         let (current, key_count, total) = {
             let entries = self.entries.lock();
             let current = entries.get(&key).map(|e| (e.att.clone(), e.locks.clone()));
@@ -321,13 +385,15 @@ impl Publisher {
         let mut entries = self.entries.lock();
         let entry = Entry { att: att.clone(), locks, status: Some(Ok(value)) };
         let previous = entries.insert(key.clone(), entry);
-        if let Err(e) = self.save(&entries) {
+        if let Err(e) = journal.append(&store::Record::Put(att.clone())) {
             match previous {
                 Some(p) => entries.insert(key, p),
                 None => entries.remove(&key),
             };
             return Err(PublishError::Io(e));
         }
+        drop(entries);
+        self.compact_if_due(&mut journal);
         tracing::info!(
             target: "nap",
             outpoint = %att.outpoint(),
@@ -386,13 +452,15 @@ impl Publisher {
     /// already collected stay valid; only signing an empty value withdraws.
     pub fn remove(&self, outpoint: OutPoint, key: &str) -> Result<Attestation, PublishError> {
         let k = (outpoint, key.to_owned());
-        let _writer = self.writer.lock();
+        let mut journal = self.writer.lock();
         let mut entries = self.entries.lock();
         let entry = entries.remove(&k).ok_or(PublishError::NotFound)?;
-        if let Err(e) = self.save(&entries) {
+        if let Err(e) = journal.append(&store::Record::Remove(k.0, k.1.clone())) {
             entries.insert(k, entry);
             return Err(PublishError::Io(e));
         }
+        drop(entries);
+        self.compact_if_due(&mut journal);
         Ok(entry.att)
     }
 
@@ -443,7 +511,7 @@ impl Publisher {
                     .map(|(a, tip)| (key, att.id(), a, tip))
             })
             .collect();
-        let _writer = self.writer.lock();
+        let mut journal = self.writer.lock();
         let mut entries = self.entries.lock();
         let mut spent = Vec::new();
         for (key, id, assessed, tip) in judged {
@@ -486,13 +554,52 @@ impl Publisher {
             entries.remove(key);
             tracing::info!(target: "nap", outpoint = %key.0, key = key.1, "NAP: coin spent; attestation dropped");
         }
-        if let Err(e) = self.save(&entries) {
-            tracing::error!(target: "nap", "NAP: could not write the attestation store: {e}");
+        // A drop that is not written is made again when the store is next
+        // loaded and judged, which finds the coin still spent.
+        for key in spent {
+            if let Err(e) = journal.append(&store::Record::Remove(key.0, key.1)) {
+                tracing::error!(target: "nap", "NAP: could not write the attestation store: {e}");
+                break;
+            }
         }
+        drop(entries);
+        self.compact_if_due(&mut journal);
     }
 
-    fn save(&self, entries: &BTreeMap<Key, Entry>) -> Result<(), String> {
-        store::save(&self.path, &store::encode(entries.values().map(|e| &e.att)))
+    /// Write the store to the file whole and empty the journal, whatever
+    /// their sizes, and accept no change after: at a clean shutdown, so the
+    /// file alone holds every attestation and a build that does not read the
+    /// journal (an older satd, after a rollback) loses none. A tip pass or an
+    /// RPC still running when shutdown begins may come after it: a
+    /// submission or removal is then refused, and a spent coin's drop is
+    /// made only in memory, again at the next load. Returns whether there
+    /// was anything to fold.
+    pub fn fold_journal(&self) -> Result<bool, String> {
+        let mut journal = self.writer.lock();
+        let folded = if journal.has_records() {
+            let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+            journal.compact(&self.path, atts.iter()).map(|()| true)
+        } else {
+            Ok(false)
+        };
+        // Closed even when the fold failed: the journal then still holds
+        // every change, and must not take one the next start cannot order.
+        journal.close();
+        folded
+    }
+
+    /// Fold the journal into the file once it has outgrown it, so loading
+    /// stays proportional to what is stored. The entries' lock is held only
+    /// to copy them; the writer lock, held by the caller, keeps them as
+    /// copied. A failure leaves the journal, which still holds every change.
+    fn compact_if_due(&self, journal: &mut store::Journal) {
+        if !journal.wants_compaction() {
+            return;
+        }
+        let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+        if let Err(e) = journal.compact(&self.path, atts.iter()) {
+            tracing::error!(target: "nap", "NAP: could not fold the journal into the attestation store: {e}");
+        }
     }
 }
 

@@ -14,14 +14,17 @@
 use std::collections::HashMap;
 
 use axum::Json;
+use axum::Extension;
 use axum::extract::{Path, State};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Block, OutPoint, TxMerkleNode, Txid};
+use bitcoin::{OutPoint, TxMerkleNode, Txid};
 use node::storage::Store;
+use node::storage::opreturn_strip::StoredBlock;
 use serde::Serialize;
 
+use crate::chain_tip::Pin;
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::tx::TxStatusJson;
 use crate::state::EsploraState;
@@ -58,6 +61,7 @@ pub struct MerkleProofJson {
 
 pub async fn tx_outspend(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path((txid_s, vout)): Path<(String, u32)>,
 ) -> EsploraResult<Json<OutspendJson>> {
     let txid = parse_txid(&txid_s)?;
@@ -65,16 +69,17 @@ pub async fn tx_outspend(
     // Without this check, every malformed request fell through to the
     // bottom of build_outspend and returned `200 {spent:false}`, which
     // looks indistinguishable from a real unspent outpoint.
-    let output_count = output_count_of(&state, &txid)?;
+    let output_count = output_count_of(&state, &pin, &txid)?;
     if vout as usize >= output_count {
         return Err(EsploraError::NotFound);
     }
     let outpoint = OutPoint { txid, vout };
-    Ok(Json(build_outspend_one(&state, &outpoint)?))
+    Ok(Json(build_outspend_one(&state, &pin, &outpoint)?))
 }
 
 pub async fn tx_outspends(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(txid_s): Path<String>,
 ) -> EsploraResult<Json<Vec<OutspendJson>>> {
     let txid = parse_txid(&txid_s)?;
@@ -82,12 +87,16 @@ pub async fn tx_outspends(
     // Determine the tx's output count. For confirmed txs we look up the
     // tx body via txindex; for mempool txs we read it from the entry.
     // Either path returns the output count without serializing the body.
-    let output_count = output_count_of(&state, &txid)?;
+    let output_count = output_count_of(&state, &pin, &txid)?;
 
     // Precompute the mempool's prev_output → (spending_txid, vin)
     // index once per request so /outspends is O(N) rather than
     // O(N × mempool_size).
-    let mempool_index = build_mempool_spent_index(&state);
+    let mempool_index = if pin.mempool {
+        build_mempool_spent_index(&state)
+    } else {
+        HashMap::new()
+    };
 
     // Confirmed spends for the whole transaction in one prefix scan.
     // The spend index keys on the funding transaction's ordinal, so all
@@ -99,8 +108,8 @@ pub async fn tx_outspends(
     let mut out = Vec::with_capacity(output_count);
     for vout in 0..output_count as u32 {
         out.push(match confirmed.get(&vout) {
-            Some(sref) => confirmed_outspend(&state, sref),
-            None => build_outspend(&state, &OutPoint { txid, vout }, &mempool_index)?,
+            Some(sref) => confirmed_outspend(&state, &pin, sref),
+            None => build_outspend(&state, &pin, &OutPoint { txid, vout }, &mempool_index)?,
         });
     }
     Ok(Json(out))
@@ -108,11 +117,12 @@ pub async fn tx_outspends(
 
 pub async fn tx_merkle_proof(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(txid_s): Path<String>,
 ) -> EsploraResult<Json<MerkleProofJson>> {
     let txid = parse_txid(&txid_s)?;
-    let (block, height, pos) = locate_confirmed_tx(&state, &txid)?;
-    let txids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+    let (block, height, pos) = locate_confirmed_tx(&state, &pin, &txid)?;
+    let txids = block.txids();
     let branch = compute_merkle_branch(&txids, pos);
     Ok(Json(MerkleProofJson {
         block_height: height,
@@ -124,13 +134,18 @@ pub async fn tx_merkle_proof(
 
 pub async fn tx_merkleblock_proof(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(txid_s): Path<String>,
 ) -> EsploraResult<String> {
     let txid = parse_txid(&txid_s)?;
-    let (block, _height, _pos) = locate_confirmed_tx(&state, &txid)?;
+    let (block, _height, _pos) = locate_confirmed_tx(&state, &pin, &txid)?;
     // Build a partial-merkle-tree containing only this txid. Encoded as
     // a P2P MerkleBlock and hex-stringified, matching upstream.
-    let mb = MerkleBlock::from_block_with_predicate(&block, |t| *t == txid);
+    // From the header and the stored txids, which a stripped block's
+    // strip record holds.
+    let mb = MerkleBlock::from_header_txids_with_predicate(&block.block.header, &block.txids(), |t| {
+        *t == txid
+    });
     Ok(hex::encode(serialize(&mb)))
 }
 
@@ -171,12 +186,14 @@ fn build_mempool_spent_index(state: &EsploraState) -> HashMap<OutPoint, (Txid, u
 /// instead of O(N × mempool_size).
 fn build_outspend(
     state: &EsploraState,
+    pin: &Pin,
     outpoint: &OutPoint,
     mempool_index: &HashMap<OutPoint, (Txid, u32)>,
 ) -> EsploraResult<OutspendJson> {
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
-        return Ok(confirmed_outspend(state, &sref));
+        return Ok(confirmed_outspend(state, pin, &sref));
     }
+    // Empty as of a block (`?asof=`).
     if let Some((spend_txid, vin)) = mempool_index.get(outpoint) {
         return Ok(mempool_outspend(*spend_txid, *vin));
     }
@@ -190,26 +207,41 @@ fn build_outspend(
 /// (review M4).
 fn build_outspend_one(
     state: &EsploraState,
+    pin: &Pin,
     outpoint: &OutPoint,
 ) -> EsploraResult<OutspendJson> {
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
-        return Ok(confirmed_outspend(state, &sref));
+        return Ok(confirmed_outspend(state, pin, &sref));
     }
     // Acting-only (design §6.1): a quarantined spender must not surface here,
     // matching the batched `/outspends` path (`build_mempool_spent_index`) and
     // `getrawmempool`. The single-output path previously used the unfiltered
     // `spending_tx`, so the two endpoints disagreed for the same outpoint.
+    if !pin.mempool {
+        return Ok(unspent_outspend());
+    }
     if let Some((spend_txid, vin)) = state.mempool.spending_tx_acting(outpoint) {
         return Ok(mempool_outspend(spend_txid, vin));
     }
     Ok(unspent_outspend())
 }
 
+/// A spend the spend index holds. One confirmed above the pinned tip
+/// confirmed while the request ran: as of the pin it was a mempool spend.
+/// As of a block (`?asof=`), with no mempool, the output was unspent.
 fn confirmed_outspend(
     state: &EsploraState,
+    pin: &Pin,
     sref: &node_index::SpendingRef,
 ) -> OutspendJson {
-    let block_hash = state.chain.get_block_hash_by_height(sref.height);
+    if !pin.covers(sref.height) {
+        return if pin.mempool {
+            mempool_outspend(sref.spending_txid, sref.spending_vin)
+        } else {
+            unspent_outspend()
+        };
+    }
+    let block_hash = pin.hash_at_height(&state.chain, sref.height);
     let block_time = block_hash
         .and_then(|h| state.chain.get_block_index(&h))
         .map(|e| e.header.time);
@@ -251,15 +283,22 @@ fn unspent_outspend() -> OutspendJson {
 
 /// Resolve a tx's output count without serializing the body. Confirmed
 /// txs are looked up via txindex; mempool txs are read from the entry.
-fn output_count_of(state: &EsploraState, txid: &Txid) -> EsploraResult<usize> {
+///
+/// As of a block (`?asof=`) a transaction only in the mempool is unknown. One
+/// the txindex holds is known at any height, as rbitcoin answers: its
+/// outputs are unspent until a spend at or below the pin.
+fn output_count_of(state: &EsploraState, pin: &Pin, txid: &Txid) -> EsploraResult<usize> {
     if state.chain.store_ref().has_txindex()
         && let Some(block_hash) = state.chain.store_ref().get_tx_location(txid)
-        && let Some(block) = state.chain.get_block(&block_hash)
-        && let Some(tx) = block.txdata.iter().find(|t| t.compute_txid() == *txid)
+        && let Some(block) = state.chain.get_stored_block(&block_hash)
+        && let Some(i) = block.txids().iter().position(|t| t == txid)
     {
-        return Ok(tx.output.len());
+        // A stripped transaction keeps every output, OP_RETURNs included.
+        return Ok(block.block.txdata[i].output.len());
     }
-    if let Some(entry) = state.mempool.get(txid) {
+    if pin.mempool
+        && let Some(entry) = state.mempool.get(txid)
+    {
         return Ok(entry.tx.output.len());
     }
     Err(EsploraError::NotFound)
@@ -269,11 +308,12 @@ fn output_count_of(state: &EsploraState, txid: &Txid) -> EsploraResult<usize> {
 /// position within the block's tx list. Used by both merkle-proof
 /// endpoints. Returns 404 if the tx is unknown or unconfirmed (mempool
 /// txs have no merkle proof until a block confirms them) — matches
-/// upstream Esplora.
+/// upstream Esplora. The block is as stored: a stripped one still proves.
 fn locate_confirmed_tx(
     state: &EsploraState,
+    pin: &Pin,
     txid: &Txid,
-) -> EsploraResult<(Block, u32, usize)> {
+) -> EsploraResult<(StoredBlock, u32, usize)> {
     if !state.chain.store_ref().has_txindex() {
         return Err(EsploraError::ServiceUnavailable);
     }
@@ -284,7 +324,7 @@ fn locate_confirmed_tx(
         .ok_or(EsploraError::NotFound)?;
     let block = state
         .chain
-        .get_block(&block_hash)
+        .get_stored_block(&block_hash)
         .ok_or_else(|| {
             EsploraError::Internal(format!(
                 "txindex points at {block_hash} but block data is missing"
@@ -298,10 +338,15 @@ fn locate_confirmed_tx(
                 "txindex points at {block_hash} but block index entry is missing"
             ))
         })?;
+    // Confirmed above the pinned tip: unconfirmed as of the pin, and a
+    // mempool transaction has no merkle proof.
+    if !pin.covers(entry.height) {
+        return Err(EsploraError::NotFound);
+    }
     let pos = block
-        .txdata
+        .txids()
         .iter()
-        .position(|t| t.compute_txid() == *txid)
+        .position(|t| t == txid)
         .ok_or_else(|| {
             EsploraError::Internal(format!(
                 "txindex points at {block_hash} but tx {txid} not present in block"

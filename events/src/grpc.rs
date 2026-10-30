@@ -2775,6 +2775,7 @@ fn watch_match_to_proto(
             height,
             amount,
             raw_tx,
+            raw_tx_stripped,
         } => {
             // raw_tx is carried on the match only when some subscriber opted in;
             // put it on THIS connection's wire only if this connection did.
@@ -2792,6 +2793,7 @@ fn watch_match_to_proto(
                 amount: amount.unwrap_or(0),
                 has_amount: amount.is_some(),
                 raw_tx,
+                raw_tx_stripped: include_raw_tx && *raw_tx_stripped,
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -2863,6 +2865,8 @@ fn watch_match_to_proto(
                     bits: bits as u32,
                 }),
                 raw_tx: pm.raw_tx.to_vec(),
+                raw_tx_stripped: pm.raw_tx_stripped,
+                txid: pm.txid.as_raw_hash().to_byte_array().to_vec(),
                 confirmed: pm.confirmed,
                 height: pm.height.unwrap_or(0),
                 matched_prevouts: pm
@@ -2891,6 +2895,7 @@ fn watch_match_to_proto(
             confirmed,
             height,
             raw_tx,
+            raw_tx_stripped,
         } => {
             // raw_tx rides the match only when some subscriber opted in; put it
             // on THIS connection's wire only if this connection did.
@@ -2911,6 +2916,7 @@ fn watch_match_to_proto(
                 confirmed: *confirmed,
                 height: height.unwrap_or(0),
                 raw_tx,
+                raw_tx_stripped: include_raw_tx && *raw_tx_stripped,
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -4003,7 +4009,10 @@ mod tests {
             }
         }
         impl node::events::BlockScanSource for MovingChain {
-            fn block_body(&self, hash: &bitcoin::BlockHash) -> Option<bitcoin::Block> {
+            fn block_body(
+                &self,
+                hash: &bitcoin::BlockHash,
+            ) -> Option<node::storage::opreturn_strip::StoredBlock> {
                 self.inner.block_body(hash)
             }
             fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
@@ -4051,7 +4060,10 @@ mod tests {
             }
         }
         impl node::events::BlockScanSource for NoSnapshot {
-            fn block_body(&self, hash: &bitcoin::BlockHash) -> Option<bitcoin::Block> {
+            fn block_body(
+                &self,
+                hash: &bitcoin::BlockHash,
+            ) -> Option<node::storage::opreturn_strip::StoredBlock> {
                 self.0.block_body(hash)
             }
             fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
@@ -4495,6 +4507,7 @@ mod tests {
                 height: Some(100),
                 amount: Some(50_000),
                 raw_tx: None,
+                raw_tx_stripped: false,
             },
             vec![pb::DescriptorMatch {
                 descriptor: "wpkh(xpub)".into(),
@@ -4536,6 +4549,7 @@ mod tests {
             height: Some(100),
             amount: Some(1),
             raw_tx: Some(bytes.clone()),
+            raw_tx_stripped: false,
         };
         let raw_of = |ev: pb::NodeEvent| match ev.body.unwrap() {
             pb::node_event::Body::ScriptMatched(s) => s.raw_tx,
@@ -4556,8 +4570,57 @@ mod tests {
             height: Some(100),
             amount: Some(1),
             raw_tx: None,
+            raw_tx_stripped: false,
         };
         assert!(raw_of(watch_match_to_proto(&e, &m_none, Vec::new(), true)).is_empty());
+    }
+
+    /// A match on a transaction read from an OP_RETURN-stripped block carries
+    /// no bytes and, on an opted-in stream, `raw_tx_stripped`. A prefix match,
+    /// which always carries the tx, sets the flag and names the txid.
+    #[test]
+    fn stripped_match_proto_has_no_bytes_and_the_flag() {
+        use bitcoin::hashes::Hash;
+        use node::events::WatchMatch;
+        let e = edge();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let m = WatchMatch::ScriptMatched {
+            scripthash: [0xaa; 32],
+            txid,
+            is_output: true,
+            index: 0,
+            confirmed: true,
+            height: Some(100),
+            amount: Some(1),
+            raw_tx: None,
+            raw_tx_stripped: true,
+        };
+        let script = |include| match watch_match_to_proto(&e, &m, Vec::new(), include).body.unwrap() {
+            pb::node_event::Body::ScriptMatched(s) => s,
+            other => panic!("wrong body: {other:?}"),
+        };
+        let on = script(true);
+        assert!(on.raw_tx.is_empty() && on.raw_tx_stripped);
+        let off = script(false);
+        assert!(off.raw_tx.is_empty() && !off.raw_tx_stripped, "not opted in: no flag");
+
+        let pm = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
+            prefix: (0xabcd_0000, 16),
+            raw_tx: std::sync::Arc::from(&[][..]),
+            raw_tx_stripped: true,
+            txid,
+            confirmed: true,
+            height: Some(5),
+            matched_prevouts: vec![],
+        }));
+        match watch_match_to_proto(&e, &pm, Vec::new(), false).body.unwrap() {
+            pb::node_event::Body::PrefixMatched(p) => {
+                assert!(p.raw_tx.is_empty() && p.raw_tx_stripped);
+                assert_eq!(p.txid, txid.as_raw_hash().to_byte_array().to_vec());
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
     }
 
     // sha256("grpc-sub-token") and sha256("grpc-nosub-token"), fixed vectors.
@@ -7388,8 +7451,12 @@ mod tests {
     }
 
     impl node::events::BlockScanSource for MockScanBlocks {
-        fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block> {
-            self.blocks.values().find(|b| b.block_hash() == *hash).cloned()
+        fn block_body(&self, hash: &BlockHash) -> Option<node::storage::opreturn_strip::StoredBlock> {
+            self.blocks
+                .values()
+                .find(|b| b.block_hash() == *hash)
+                .cloned()
+                .map(node::storage::opreturn_strip::StoredBlock::intact)
         }
         fn block_undo(&self, _hash: &BlockHash) -> Option<node::storage::undo::UndoData> {
             None
@@ -7646,6 +7713,7 @@ mod tests {
             confirmed: true,
             height: Some(880),
             raw_tx: None,
+            raw_tx_stripped: false,
         };
         let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
         let pb::node_event::Body::SilentPaymentMatched(sp) = ev.body.unwrap() else {
@@ -7682,6 +7750,7 @@ mod tests {
             confirmed: true,
             height: Some(1),
             raw_tx: Some(std::sync::Arc::from(vec![0xde, 0xad].as_slice())),
+            raw_tx_stripped: false,
         };
         // Opted out: raw_tx stripped even though the match carries it.
         let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
@@ -7714,6 +7783,7 @@ mod tests {
             confirmed: false,
             height: None,
             raw_tx: None,
+            raw_tx_stripped: false,
         };
         let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
         assert!(ev.cursor.is_none(), "unconfirmed match carries no cursor");

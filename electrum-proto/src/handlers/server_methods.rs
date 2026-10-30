@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-use crate::PROTOCOL_VERSION;
+use crate::{PROTOCOL_ASOF, PROTOCOL_VERSION};
 use crate::error::JsonRpcError;
 use crate::state::ElectrumState;
 
@@ -18,7 +18,14 @@ use crate::state::ElectrumState;
 /// form is NOT a min-only — electrs's `check_between(version, single,
 /// single)` rejects clients that don't match exactly. We mirror that
 /// to keep the `server.version` contract identical.
+///
+/// rbitcoin's dialect [`PROTOCOL_ASOF`] is accepted too, as the single
+/// string or either end of the pair, and answered with that string; see
+/// [`asks_for_asof`].
 pub fn version(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+    if asks_for_asof(&params) {
+        return Ok(json!([server_name(state), PROTOCOL_ASOF]));
+    }
     // Client name + protocol-version arg are both optional. We do
     // intersection logic only when we got a useful protocol-version.
     let arr = match &params {
@@ -52,6 +59,20 @@ pub fn version(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcErr
     }
 
     Ok(json!([server_name(state), supported]))
+}
+
+/// Whether `server.version`'s `protocol_version` names [`PROTOCOL_ASOF`]:
+/// the single string, or either end of a `[min, max]` pair, as rbitcoin
+/// negotiates it.
+pub fn asks_for_asof(params: &Value) -> bool {
+    match params.as_array().and_then(|a| a.get(1)) {
+        Some(Value::String(s)) => s == PROTOCOL_ASOF,
+        Some(Value::Array(range)) => range
+            .iter()
+            .take(2)
+            .any(|v| v.as_str() == Some(PROTOCOL_ASOF)),
+        _ => false,
+    }
 }
 
 /// `server.ping()` — returns `null`.
@@ -122,6 +143,13 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
         // configured and refuses every subscribe, so reporting `true` there
         // would send a wallet to a backend that cannot answer it for hours.
         "tweaks": state.sp_index.as_ref().is_some_and(|i| i.is_complete()),
+        // rbitcoin's keys: the answers of the stamped methods name the block
+        // they were read at, and take a trailing `asof:<blockhash>`. The
+        // dialect is `asof_protocol`, which satd accepts but does not
+        // require before `asof:`.
+        "chain_tip": true,
+        "asof": true,
+        "asof_protocol": PROTOCOL_ASOF,
     }))
 }
 
@@ -202,6 +230,21 @@ mod tests {
         assert!(version_in_range("1.4.5", "1.4.5", "1.4.5"));
         assert!(!version_in_range("1.5", "2.0", "1.4.5"));
         assert!(!version_in_range("1.0", "1.3", "1.4.5"));
+    }
+
+    /// rbitcoin's dialect is asked for as the single string or at either
+    /// end of a range; a dotted version, a missing argument or a range that
+    /// merely spans it is not the dialect.
+    #[test]
+    fn asof_dialect_is_named_not_ranged() {
+        use serde_json::json;
+        assert!(asks_for_asof(&json!(["w", "1.4.2-asof"])));
+        assert!(asks_for_asof(&json!(["w", ["1.4", "1.4.2-asof"]])));
+        assert!(asks_for_asof(&json!(["w", ["1.4.2-asof", "1.6"]])));
+        assert!(!asks_for_asof(&json!(["w", "1.4"])));
+        assert!(!asks_for_asof(&json!(["w", ["1.4", "1.6"]])));
+        assert!(!asks_for_asof(&json!(["w"])));
+        assert!(!asks_for_asof(&json!([])));
     }
 
     #[test]

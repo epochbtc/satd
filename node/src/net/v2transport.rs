@@ -63,8 +63,8 @@ pub enum V2CodecError {
     /// The decrypted packet contents were too short to hold a v2 message.
     #[error("v2 message buffer truncated")]
     Truncated,
-    /// The BIP 324 deserializer rejected the contents (bad short ID or
-    /// malformed payload).
+    /// The contents could not be decoded (unknown short ID or malformed
+    /// payload).
     #[error("v2 message deserialization failed: {0}")]
     Deserialize(String),
 }
@@ -86,15 +86,74 @@ pub fn encode_message(msg: NetworkMessage) -> Vec<u8> {
 /// header byte already stripped (i.e. what the peer passed to
 /// [`encode_message`]).
 pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
-    // Guard the two indexing paths in `bip324::serde::deserialize` that
-    // assume a minimum length (it reads `buffer[0]`, and for the zero-byte
-    // command form reads `buffer[1..13]`). Decrypted-and-authenticated
-    // bytes can still be truncated/garbage, so fail closed rather than
-    // panic.
+    // Guard the two indexing paths below that assume a minimum length
+    // (`contents[0]`, and for the zero-byte command form `contents[1..13]`).
+    // Decrypted-and-authenticated bytes can still be truncated/garbage, so
+    // fail closed rather than panic.
     if contents.is_empty() || (contents[0] == 0 && contents.len() < 13) {
         return Err(V2CodecError::Truncated);
     }
-    bip324::serde::deserialize(contents).map_err(|e| V2CodecError::Deserialize(e.to_string()))
+    // `addrv2`, by short ID or long form, is read as Core reads it
+    // (`net::addrv2`): rust-bitcoin's decoder refuses entries Core reads.
+    let addrv2_payload = match contents[0] {
+        ADDRV2_SHORT_ID => Some(&contents[1..]),
+        0 if contents[1..13] == crate::net::addrv2::ADDRV2_COMMAND => Some(&contents[13..]),
+        _ => None,
+    };
+    if let Some(payload) = addrv2_payload {
+        return crate::net::addrv2::decode_payload(payload)
+            .map(NetworkMessage::AddrV2)
+            .map_err(|e| V2CodecError::Deserialize(e.to_string()));
+    }
+    // Every other message is read as Core reads it (`net::payload`), by
+    // short ID or in long form. The `bip324` decoder reads a long-form
+    // `tx`, `inv` and the rest as unknown, where Core takes the type by
+    // name, and refuses fields Core accepts.
+    use bitcoin::p2p::message::CommandString;
+    let (command, payload) = match contents[0] {
+        0 => (
+            <CommandString as bitcoin::consensus::Decodable>::consensus_decode(&mut &contents[1..13])
+                .map_err(|e| V2CodecError::Deserialize(e.to_string()))?,
+            &contents[13..],
+        ),
+        id => match V2_MESSAGE_IDS.get(usize::from(id)) {
+            Some(name) if !name.is_empty() => (
+                CommandString::try_from_static(name).expect("short ID names fit a command"),
+                &contents[1..],
+            ),
+            _ => return Err(V2CodecError::Deserialize(format!("unknown short message id {id}"))),
+        },
+    };
+    crate::net::payload::decode_payload(command, payload).map_err(|e| V2CodecError::Deserialize(e.to_string()))
+}
+
+/// BIP 324's short message-type ID for `addrv2`.
+const ADDRV2_SHORT_ID: u8 = 28;
+
+/// Core's `V2_MESSAGE_IDS` (`src/net.cpp:917`): the message type each BIP 324
+/// short ID stands for, indexed by ID. IDs 29-32 are assigned but unused.
+const V2_MESSAGE_IDS: [&str; 29] = [
+    "", "addr", "block", "blocktxn", "cmpctblock", "feefilter", "filteradd", "filterclear",
+    "filterload", "getblocks", "getblocktxn", "getdata", "getheaders", "headers", "inv",
+    "mempool", "merkleblock", "notfound", "ping", "pong", "sendcmpct", "tx", "getcfilters",
+    "cfilter", "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "addrv2",
+];
+
+/// The message type of v2 packet contents, for a log line: the short ID's
+/// name, or the long-form type sanitized as Core's `SanitizeString`.
+fn v2_message_type_label(contents: &[u8]) -> String {
+    match contents.first() {
+        None => String::new(),
+        Some(0) => {
+            let end = contents.len().min(13);
+            let raw = String::from_utf8_lossy(&contents[1..end]);
+            crate::net::limits::sanitize_string(raw.trim_end_matches('\0'))
+        }
+        Some(&id) => match V2_MESSAGE_IDS.get(usize::from(id)) {
+            Some(name) => (*name).to_string(),
+            None => format!("short id {id}"),
+        },
+    }
 }
 
 /// Counts raw handshake bytes into the peer's totals as they cross the
@@ -243,8 +302,24 @@ async fn recv_v2<S: AsyncRead + Unpin>(
             }
             continue;
         }
-        let msg = decode_message(&plaintext[1..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // A genuine packet that decrypted but does not decode is skipped and
+        // the connection kept, as on v1. Core does the same: an unknown
+        // message type is dropped (`V2Transport::GetReceivedMessage`,
+        // `src/net.cpp:1472`), and a payload that fails to deserialize is
+        // caught and logged (`PeerManagerImpl::ProcessMessages`,
+        // `src/net_processing.cpp:5195`). Only framing and cipher failures
+        // above, which desynchronize the stream, end the connection.
+        let msg = match decode_message(&plaintext[1..]) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if let Some(c) = counters {
+                    c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
+                }
+                let cmd = v2_message_type_label(&plaintext[1..]);
+                tracing::debug!(cmd = %cmd, error = %e, "Skipping unparseable message");
+                continue;
+            }
+        };
         if let Some(c) = counters {
             c.attribute_recv(msg.cmd(), wire_len);
         }
@@ -594,6 +669,127 @@ mod tests {
             let decoded = decode_message(&encoded).expect("decode");
             assert_eq!(decoded, msg);
         }
+    }
+
+    /// `addrv2`, by short ID and in long form, is read past a service bit
+    /// that rust-bitcoin's decoder refused up to 0.32.9.
+    #[test]
+    fn addrv2_with_a_high_service_bit_decodes() {
+        let payload = crate::net::addrv2::payload_with_service_bit_26();
+        let mut short = vec![ADDRV2_SHORT_ID];
+        short.extend_from_slice(&payload);
+        let mut long = vec![0u8];
+        long.extend_from_slice(&crate::net::addrv2::ADDRV2_COMMAND);
+        long.extend_from_slice(&payload);
+        for contents in [short, long] {
+            let NetworkMessage::AddrV2(addrs) = decode_message(&contents).unwrap() else {
+                panic!("not addrv2")
+            };
+            assert_eq!(addrs.len(), 3);
+            assert_eq!(addrs[1].services.to_u64(), 1 << 26 | 0x409);
+        }
+    }
+
+    /// v2 messages are read as Core reads them (`net::payload`): by short
+    /// ID and in long form, past fields the `bip324` decoder refuses.
+    #[test]
+    fn v2_messages_are_read_as_core_reads_them() {
+        // `sendcmpct` (short ID 20) with a flag byte of 2: Core reads true.
+        let mut sendcmpct = vec![20u8, 2];
+        sendcmpct.extend_from_slice(&2u64.to_le_bytes());
+        assert!(bip324::serde::deserialize(&sendcmpct).is_err(), "bip324 refuses it");
+        assert_eq!(
+            decode_message(&sendcmpct).unwrap(),
+            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                send_compact: true,
+                version: 2
+            })
+        );
+
+        // A long-form `version` with no relay byte, then bytes after a
+        // full one.
+        let mut version = vec![0u8];
+        version.extend_from_slice(b"version\0\0\0\0\0");
+        version.extend_from_slice(&70016u32.to_le_bytes());
+        version.extend_from_slice(&9u64.to_le_bytes());
+        version.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        version.extend_from_slice(&[0u8; 26]);
+        version.extend_from_slice(&[0u8; 26]);
+        version.extend_from_slice(&7u64.to_le_bytes());
+        version.extend_from_slice(&[3, b'/', b'x', b'/']);
+        version.extend_from_slice(&42i32.to_le_bytes());
+        assert!(bip324::serde::deserialize(&version).is_err(), "bip324 refuses it");
+        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else { panic!("not version") };
+        assert_eq!((v.nonce, v.user_agent.as_str(), v.start_height, v.relay), (7, "/x/", 42, true));
+        version.extend_from_slice(&[0, 0xee, 0xee]);
+        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else { panic!("not version") };
+        assert!(!v.relay);
+
+        // A long-form `ping`: Core takes the type by name; `bip324` reads
+        // it as unknown.
+        let mut ping = vec![0u8];
+        ping.extend_from_slice(b"ping\0\0\0\0\0\0\0\0");
+        ping.extend_from_slice(&5u64.to_le_bytes());
+        assert!(matches!(bip324::serde::deserialize(&ping), Ok(NetworkMessage::Unknown { .. })));
+        assert_eq!(decode_message(&ping).unwrap(), NetworkMessage::Ping(5));
+
+        // An unknown short ID is refused, and so skipped, as Core rejects it.
+        assert!(decode_message(&[29, 0]).is_err());
+        assert!(decode_message(&[200]).is_err());
+        // A long-form unknown type passes through.
+        let mut unknown = vec![0u8];
+        unknown.extend_from_slice(b"napatt\0\0\0\0\0\0");
+        unknown.extend_from_slice(&[1, 2]);
+        assert!(matches!(decode_message(&unknown).unwrap(),
+            NetworkMessage::Unknown { ref command, ref payload } if command.as_ref() == "napatt" && payload == &[1, 2]));
+    }
+
+    #[test]
+    fn message_type_labels() {
+        assert_eq!(v2_message_type_label(&[28, 1]), "addrv2");
+        assert_eq!(v2_message_type_label(&[13]), "headers");
+        assert_eq!(v2_message_type_label(&[200]), "short id 200");
+        let mut long = vec![0u8];
+        long.extend_from_slice(b"foo\n\0\0\0\0\0\0\0\0");
+        assert_eq!(v2_message_type_label(&long), "foo");
+    }
+
+    /// Seal `contents` as one genuine packet, bypassing the encoder.
+    async fn send_contents(conn: &mut V2Connection, contents: &[u8]) {
+        let packet = conn.cipher.outbound().encrypt_to_vec(contents, PacketType::Genuine, None);
+        conn.stream.write_all(&packet).await.unwrap();
+    }
+
+    /// The defect over v2: a peer's `getaddr` reply listing a node with
+    /// service bit 26 failed to decode, the reader ended, and the peer was
+    /// dropped. Now its addresses arrive, and so do the messages after it.
+    #[tokio::test]
+    async fn a_v2_addrv2_with_a_high_service_bit_arrives_whole() {
+        let (mut server, mut client, _, _) = counted_pair(Network::Regtest).await;
+        let mut contents = vec![ADDRV2_SHORT_ID];
+        contents.extend_from_slice(&crate::net::addrv2::payload_with_service_bit_26());
+        send_contents(&mut client, &contents).await;
+        client.send(NetworkMessage::Ping(9)).await.unwrap();
+        let NetworkMessage::AddrV2(addrs) = server.recv().await.unwrap() else { panic!("not addrv2") };
+        let ips: Vec<_> = addrs.iter().map(|a| a.socket_addr().unwrap().ip().to_string()).collect();
+        assert_eq!(ips, ["1.2.3.4", "5.6.7.8", "9.9.9.9"]);
+        assert_eq!(server.recv().await.unwrap(), NetworkMessage::Ping(9));
+    }
+
+    /// A genuine packet that decrypts but does not decode (a malformed
+    /// payload, an unknown short ID, a truncated long-form type) is skipped
+    /// and the connection kept, as Core keeps it.
+    #[tokio::test]
+    async fn a_v2_connection_survives_an_undecodable_packet() {
+        let (mut server, mut client, _, _) = counted_pair(Network::Regtest).await;
+        // `ping` (short ID 18) with a 3-byte payload: too short for its nonce.
+        send_contents(&mut client, &[18, 1, 2, 3]).await;
+        // An ID BIP 324 leaves unassigned.
+        send_contents(&mut client, &[200, 0]).await;
+        // A long-form type cut short.
+        send_contents(&mut client, &[0, b'f', b'o']).await;
+        client.send(NetworkMessage::Ping(10)).await.unwrap();
+        assert_eq!(server.recv().await.unwrap(), NetworkMessage::Ping(10));
     }
 
     #[test]

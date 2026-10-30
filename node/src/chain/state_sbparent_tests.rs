@@ -147,6 +147,34 @@ fn a_stored_block_without_more_work_leaves_the_best_header_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A1 - A2 - A3 - A4                (A4 submitted as a block, connects)
+///             \
+///              [B4]                (header first, the same work as A4)
+///
+/// The tip moves to A4, which has data, but the best header stays on B4:
+/// Core raises `m_best_header` only to an entry with more work
+/// (`node/blockstorage.cpp`, `AddToBlockIndex`), so the first seen of two
+/// equal-work headers keeps it.
+#[test]
+fn connecting_a_block_of_equal_work_leaves_the_best_header_alone() {
+    let (cs, dir) = make_chain_state();
+    let mut prev = genesis();
+    for h in 1..=3 {
+        let b = build_test_block(prev, h, BASE + 600 * h);
+        prev = cs.accept_block(&b).unwrap().hash();
+    }
+    let b4 = build_test_block(prev, 4, BASE + 2460);
+    cs.accept_header(&b4.header).unwrap();
+    assert_eq!(cs.best_header_hash(), b4.block_hash());
+
+    let a4 = build_test_block(prev, 4, BASE + 2400);
+    cs.accept_block(&a4).unwrap();
+    assert_eq!(cs.tip_hash(), a4.block_hash());
+    assert_eq!(cs.best_header_hash(), b4.block_hash(), "B4 was seen first");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A stored child that fails to connect is not connected: the drain's
 /// connect marks it invalid and the header tip moves back to the parent.
 ///

@@ -93,6 +93,20 @@ const CF_ADDR_BACKFILL_TEMP: &str = "addr_backfill_outpoint_to_scripthash";
 /// neither without a second read of the funding output's block.
 const TEMP_VALUE_LEN: usize = 32 + node_index::TXSEQ_LEN;
 
+/// OP_RETURN strip records, keyed by the 32-byte block hash, plus the
+/// strip worker's state under [`OPRETURN_STRIP_META_KEY`]. Created on the
+/// first write that needs it, so a datadir that never strips stays openable
+/// by a release that predates this family, and one that did is refused by
+/// it: RocksDB will not open a database with an undeclared column family,
+/// and an older release would otherwise serve the zeroed bytes as the
+/// block. Dropped again once no record is left and the option is off
+/// (`Store::drop_opreturn_strip_cf`), which makes the datadir an ordinary
+/// one again.
+const CF_OPRETURN_STRIP: &str = "opreturn_strip";
+/// Key of the strip worker's cursor and counters. Four bytes, so it can
+/// never collide with a block hash.
+const OPRETURN_STRIP_META_KEY: &[u8] = b"meta";
+
 /// BIP 352 silent-payment tweak index. One row per block from taproot
 /// activation upward, keyed `height_be[4]`. Always compiled (runtime
 /// opt-in, not a cargo feature); single-sourced from the codec crate so
@@ -129,6 +143,7 @@ const ALL_CFS: &[&str] = &[
     CF_FILTER_HEADER,
     CF_ADDR_BACKFILL_TEMP,
     CF_SP_TWEAKS,
+    CF_OPRETURN_STRIP,
 ];
 
 /// Every column family the per-CF diagnostics report on, in
@@ -158,6 +173,7 @@ const DIAG_CFS: &[&str] = &[
     CF_FILTER_HEADER,
     CF_ADDR_BACKFILL_TEMP,
     CF_SP_TWEAKS,
+    CF_OPRETURN_STRIP,
 ];
 
 const TIP_KEY: &[u8] = b"tip";
@@ -633,12 +649,28 @@ pub struct RocksDbStore {
     /// to batches: each batch is either in the snapshot or in `pending`,
     /// never neither and never both.
     recent_window: parking_lot::Mutex<RecentWindowState>,
+    /// Held shared by every batch write that touches the strip family, from
+    /// its handle lookup to its `db.write`, and by `flush_durable` across its
+    /// flush; exclusively by `drop_opreturn_strip_cf`. A batch built against
+    /// the family's handle and written after the drop fails with RocksDB's
+    /// "invalid column family", and a flush listing it with "Column family
+    /// dropped"; most batches carrying a strip remove, and many flushes, are
+    /// a block's connect. Reads need no gate: a dropped family's handle still
+    /// reads what it held.
+    strip_cf_gate: parking_lot::RwLock<()>,
     /// Test hook: when set, a build signals the sender once its snapshot is
     /// taken and waits on the receiver before scanning, so a test can land
     /// writes in exactly that gap through a layer (a `CoinCache`) that owns
     /// this store.
     #[cfg(test)]
     recent_window_test_pause: parking_lot::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    >,
+    /// Test hook: when set, the next batch write that touches the strip
+    /// family signals the sender once its `WriteBatch` holds the family's
+    /// handle, and waits on the receiver before writing it.
+    #[cfg(test)]
+    strip_write_test_pause: parking_lot::Mutex<
         Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     >,
 }
@@ -918,6 +950,13 @@ impl RocksDbStore {
                 make_cf_opts(true, 32, None, false),
             ));
         }
+        // Declared only once it exists; the first strip write creates it.
+        if existing_cfs.iter().any(|n| n == CF_OPRETURN_STRIP) {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                CF_OPRETURN_STRIP,
+                make_cf_opts(true, 4, None, false),
+            ));
+        }
         // Pre-cleanup `addr_funding` / `addr_spending`. Register with
         // bare opts so RocksDB opens; we drop them after the schema
         // check confirms it's safe to discard.
@@ -1037,8 +1076,11 @@ impl RocksDbStore {
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
             tuning,
             recent_window: parking_lot::Mutex::new(RecentWindowState::Absent),
+            strip_cf_gate: parking_lot::RwLock::new(()),
             #[cfg(test)]
             recent_window_test_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            strip_write_test_pause: parking_lot::Mutex::new(None),
         };
         *store.recent_window.lock() = store.load_recent_window();
         // outpoint_spend completeness marker (review H6 round 2).
@@ -1453,6 +1495,31 @@ impl RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Create the strip family if it does not exist yet. Two writers can
+    /// race here; the loser's error is harmless once the family exists.
+    #[cfg(test)]
+    pub(super) fn pause_next_strip_write(
+        &self,
+        began: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.strip_write_test_pause.lock() = Some((began, resume));
+    }
+
+    fn create_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        if self.db.cf_handle(CF_OPRETURN_STRIP).is_some() {
+            return Ok(());
+        }
+        let opts = self.cf_options(CF_OPRETURN_STRIP);
+        match self.db.create_cf(CF_OPRETURN_STRIP, &opts) {
+            Ok(()) => Ok(()),
+            Err(_) if self.db.cf_handle(CF_OPRETURN_STRIP).is_some() => Ok(()),
+            Err(e) => Err(StoreError::Database(format!(
+                "create_cf({CF_OPRETURN_STRIP}): {e}"
+            ))),
+        }
+    }
+
     pub(crate) fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
         self.db
             .cf_handle(name)
@@ -1474,6 +1541,8 @@ impl RocksDbStore {
                 | CF_FILTER
                 | CF_FILTER_HEADER
                 | CF_SP_TWEAKS
+                // Probed on every block read, and almost every probe misses.
+                | CF_OPRETURN_STRIP
         );
         #[cfg(not(feature = "block-filter-index"))]
         let bloom = matches!(
@@ -1484,6 +1553,7 @@ impl RocksDbStore {
                 | CF_SPENT
                 | CF_TX_LOC
                 | CF_SP_TWEAKS
+                | CF_OPRETURN_STRIP
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
@@ -1496,6 +1566,7 @@ impl RocksDbStore {
             #[cfg(feature = "block-filter-index")]
             CF_FILTER_HEADER => 8,
             CF_SP_TWEAKS => 16,
+            CF_OPRETURN_STRIP => 4,
             _ => 2,
         };
 
@@ -1881,6 +1952,13 @@ impl RocksDbStore {
     /// write fails. Nothing here ever needed ownership: rows are
     /// serialized into a RocksDB `WriteBatch`, never moved out.
     fn write_batch_inner(&self, batch: &StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+        // Only a put creates the strip family. A remove for a block that
+        // never had a record must not, or every datadir would become one
+        // an older release refuses to open.
+        let _strip_cf = batch.has_opreturn_strip_ops().then(|| self.strip_cf_gate.read());
+        if !batch.opreturn_strip_puts.is_empty() || batch.opreturn_strip_meta.is_some() {
+            self.create_opreturn_strip_cf()?;
+        }
         let mut wb = WriteBatch::default();
 
         let cf_bi = self.cf(CF_BLOCK_INDEX);
@@ -2299,6 +2377,26 @@ impl RocksDbStore {
             }
         }
 
+        // Strip records. Without the family there is nothing to remove.
+        if batch.has_opreturn_strip_ops()
+            && let Some(cf_strip) = self.db.cf_handle(CF_OPRETURN_STRIP)
+        {
+            for (hash, record) in &batch.opreturn_strip_puts {
+                wb.put_cf(&cf_strip, hash_bytes(hash), record);
+            }
+            for hash in &batch.opreturn_strip_removes {
+                wb.delete_cf(&cf_strip, hash_bytes(hash));
+            }
+            if let Some(meta) = &batch.opreturn_strip_meta {
+                wb.put_cf(&cf_strip, OPRETURN_STRIP_META_KEY, meta);
+            }
+            #[cfg(test)]
+            if let Some((began, resume)) = self.strip_write_test_pause.lock().take() {
+                let _ = began.send(());
+                let _ = resume.recv();
+            }
+        }
+
         // Metadata: backfill cursor advance. Atomic with the addr-CF and
         // (when present) temp-CF writes above, so resume is consistent.
         if let Some(adv) = &batch.backfill_cursor_advance {
@@ -2512,6 +2610,49 @@ impl RocksDbStore {
 }
 
 impl Store for RocksDbStore {
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
+            return Ok(None);
+        };
+        self.db
+            .get_cf(&cf, hash_bytes(hash))
+            .map_err(|e| StoreError::Database(format!("read {CF_OPRETURN_STRIP} {hash}: {e}")))
+    }
+
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
+            return Ok(None);
+        };
+        self.db
+            .get_cf(&cf, OPRETURN_STRIP_META_KEY)
+            .map_err(|e| StoreError::Database(format!("read {CF_OPRETURN_STRIP} meta: {e}")))
+    }
+
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        let _gate = self.strip_cf_gate.write();
+        if self.db.cf_handle(CF_OPRETURN_STRIP).is_none() {
+            return Ok(());
+        }
+        self.db
+            .drop_cf(CF_OPRETURN_STRIP)
+            .map_err(|e| StoreError::Database(format!("drop_cf({CF_OPRETURN_STRIP}): {e}")))
+    }
+
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
+            return Ok(());
+        };
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item
+                .map_err(|e| StoreError::Database(format!("iterate {CF_OPRETURN_STRIP}: {e}")))?;
+            // The `meta` key is 4 bytes; a block's is its 32-byte hash.
+            if let Ok(bytes) = <[u8; 32]>::try_from(key.as_ref()) {
+                f(&BlockHash::from_byte_array(bytes), &value);
+            }
+        }
+        Ok(())
+    }
+
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
@@ -2591,6 +2732,9 @@ impl Store for RocksDbStore {
         // `wait(true)` returns only once the flush is durable on disk.
         let mut fopts = FlushOptions::default();
         fopts.set_wait(true);
+        // RocksDB fails a flush that lists a family dropped after its handle
+        // was taken ("Column family dropped"), as it fails a batch write.
+        let _strip_cf = self.strip_cf_gate.read();
         let handles: Vec<_> = ALL_CFS
             .iter()
             .filter_map(|name| self.db.cf_handle(name))
@@ -2916,6 +3060,10 @@ impl Store for RocksDbStore {
         // BIP 352 tweak index: same reasoning — -reindex-chainstate
         // rebuilds rows from genesis via the connect_block emit path.
         cfs.push(CF_SP_TWEAKS);
+        // Never `CF_OPRETURN_STRIP`. A strip record describes the bytes in
+        // the block files, which a rebuild keeps, and is keyed by block
+        // hash, which a rebuild does not change. Dropping it would leave
+        // the zeroed payloads with nothing to say they were stripped.
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -2979,6 +3127,8 @@ impl Store for RocksDbStore {
             all_cfs.push(CF_FILTER);
             all_cfs.push(CF_FILTER_HEADER);
         }
+        // Never `CF_OPRETURN_STRIP`: `-reindex` re-reads the same block
+        // files the records describe. See `clear_chainstate`.
         for cf_name in all_cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -3981,13 +4131,14 @@ mod tests {
         }
         let mut created = DB::list_cf(&Options::default(), dir.path().join("chainstate")).unwrap();
         // The backfill temp CF is created lazily when a backfill starts,
-        // so a freshly opened store has not made it yet.
-        created.retain(|n| n != CF_ADDR_BACKFILL_TEMP);
+        // and the strip CF by the first strip, so a freshly opened store
+        // has made neither yet.
+        created.retain(|n| n != CF_ADDR_BACKFILL_TEMP && n != CF_OPRETURN_STRIP);
         created.sort();
 
         let mut listed: Vec<String> = ALL_CFS
             .iter()
-            .filter(|n| **n != CF_ADDR_BACKFILL_TEMP)
+            .filter(|n| **n != CF_ADDR_BACKFILL_TEMP && **n != CF_OPRETURN_STRIP)
             .map(|n| n.to_string())
             .collect();
         listed.sort();

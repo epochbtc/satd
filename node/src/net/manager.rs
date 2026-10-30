@@ -87,6 +87,14 @@ const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// peer. The reconnect loop never opens more than the outbound target anyway.
 const MAX_ONION_CONNECT_ADDRS: usize = 512;
 
+/// The share of [`MAX_ONION_CONNECT_ADDRS`] the onions one source may hold:
+/// the network group of the clearnet peer that announced them, or the onion
+/// peer itself. Core bounds one source group to 64 of its 1024 new buckets
+/// (`ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP`, v31.1 `src/addrman.h:25`); here
+/// one source fills at most an eighth of the list, so it takes eight
+/// sources to fill it.
+const MAX_ONION_ADDRS_PER_SOURCE: usize = MAX_ONION_CONNECT_ADDRS / 8;
+
 /// Upper bound on onion dials the reconnect loop starts in a single 10s tick.
 /// Onion dials each hold a Tor circuit through the one configured SOCKS proxy,
 /// so a burst must be bounded even when many slots are open — otherwise a peer
@@ -122,8 +130,57 @@ const MINIMUM_CONNECT_TIME_SECS: u64 = 30;
 /// chain with at least our tip's work are kept whatever else happens.
 const MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT: usize = 4;
 
+/// How old Core dates an address a DNS seed gave (`ThreadDNSAddressSeed`:
+/// a random age between three and seven days), so that it reads as older
+/// than one a peer gossiped.
+const SEED_ADDR_MIN_AGE_SECS: u64 = 3 * 24 * 60 * 60;
+const SEED_ADDR_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long an automatic dial candidate tried once is passed over for
+/// others: Core's ten minutes in `ThreadOpenConnections` ("only consider
+/// very recently tried nodes after 30 failed attempts").
+const RECENT_TRY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// How many candidates one automatic dial looks at before it takes a
+/// recently tried one: Core's 30.
+const RECENT_TRY_SKIPS: usize = 30;
+
+/// Core's rule for the candidates of one automatic pass, in the order they
+/// are drawn: one dialled in the last [`RECENT_TRY_WINDOW`] is passed over
+/// until [`RECENT_TRY_SKIPS`] candidates have been looked at since the last
+/// dial (Core's `nTries`). `take` dials a candidate: `Ok(true)` if it did,
+/// `Ok(false)` if it turned it down, `Err` when the pass is over. Core draws
+/// with replacement, so it reaches a recently tried candidate even with
+/// fewer than `RECENT_TRY_SKIPS` to draw from; each candidate comes up once
+/// here, so the ones passed over are offered again at the end.
+fn pass_over_recent_tries<T>(
+    candidates: impl IntoIterator<Item = T>,
+    tried_recently: impl Fn(&T) -> bool,
+    mut take: impl FnMut(T) -> Result<bool, ()>,
+) {
+    let mut tries = 0usize;
+    let mut passed_over = Vec::new();
+    for candidate in candidates {
+        tries += 1;
+        if tries < RECENT_TRY_SKIPS && tried_recently(&candidate) {
+            passed_over.push(candidate);
+            continue;
+        }
+        match take(candidate) {
+            Ok(true) => tries = 0,
+            Ok(false) => {}
+            Err(()) => return,
+        }
+    }
+    for candidate in passed_over {
+        if take(candidate).is_err() {
+            return;
+        }
+    }
+}
+
 /// Cap on the automatic dial list. Only an address the address book holds
-/// gets on it (seeds aside), so this is the book's own size.
+/// gets on it, so this is the book's own size.
 const MAX_LEARNED_ADDRS: usize = crate::net::addrman::MAX_ENTRIES;
 
 /// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
@@ -372,6 +429,48 @@ const BG_CATCHUP_STALE_SECS: u64 = 30;
 /// A peer that has not answered gets no more until it does or its requests
 /// time out.
 const BG_CATCHUP_PER_PEER: usize = 16;
+/// [`PeerManager::missing_desirable_services`] for a tip `tip_depth` blocks'
+/// worth of time behind now. A pending OP_RETURN restore downloads only from
+/// peers that keep every block (plan §11.4), so while one is pending the
+/// outbound slots keep looking for those, as they do while the tip is old.
+fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pending: bool) -> Option<ServiceFlags> {
+    let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    if services.has(ServiceFlags::NETWORK_LIMITED)
+        && tip_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+        && !restore_pending
+    {
+        wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    }
+    (!services.has(wanted)).then_some(wanted)
+}
+/// A restore pass's work list as read on the blocking pool.
+type RestoreWork = Result<Vec<crate::chain::state::RestoreItem>, String>;
+
+/// Run `load`, a restore pass's work-list read, turning a panic into an
+/// error: the slot it fills is what clears the download's `loading`, so a
+/// read that never reports would hold the restore until a restart.
+fn load_restore_work(load: impl FnOnce() -> RestoreWork + std::panic::UnwindSafe) -> RestoreWork {
+    std::panic::catch_unwind(load).unwrap_or_else(|_| Err("the work-list read panicked".to_string()))
+}
+
+/// What became of a block the restore asked for.
+#[derive(Clone, Copy)]
+enum RestoreArrival {
+    Restored,
+    /// The copy failed to authenticate: the peer's fault.
+    BadCopy,
+    /// A failure of ours, or an index entry that changed meanwhile.
+    NotOurs,
+}
+
+/// Most blocks in one restore `getdata`.
+const PER_GETDATA_BLOCKS: usize = 128;
+/// A restore progress line every this many blocks restored, as the strip
+/// pass logs every thousand blocks.
+const RESTORE_PROGRESS_EVERY: u64 = 1000;
+/// Regtest only: a file holding the free space, in bytes, that the restore's
+/// disk check sees in place of the blocks volume's.
+pub const RESTORE_TEST_FREE_SPACE_ENV: &str = "SATD_TEST_FREE_SPACE_FILE";
 /// Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`: the depth a pruned node
 /// promises to serve (BIP 159).
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
@@ -449,9 +548,33 @@ impl StuckWait {
 }
 
 /// Per-address reconnect backoff state.
+/// A learned onion candidate's record ([`PeerManager::onion_candidates`]).
+#[derive(Debug, Clone)]
+struct OnionCandidate {
+    /// The source whose share it counts against; `None` for a seed.
+    source: Option<Vec<u8>>,
+    /// Unix seconds it was last announced or connected.
+    last_seen: u64,
+    /// Unix seconds of the last dial that connected; 0 if none.
+    last_success: u64,
+    /// Unix seconds the last dial ended; 0 if none.
+    last_try: u64,
+    /// Failed dials since the last that connected.
+    attempts: u32,
+}
+
+impl OnionCandidate {
+    fn is_terrible(&self, now: u64) -> bool {
+        crate::net::addrman::is_terrible(self.last_seen, self.last_success, self.last_try, self.attempts, now)
+    }
+}
+
 struct ReconnectState {
     attempts: u32,
     next_attempt: Instant,
+    /// When the last dial ended, whether it connected or not: Core's
+    /// `nLastTry`, for [`RECENT_TRY_WINDOW`].
+    last_try: Option<Instant>,
 }
 
 impl ReconnectState {
@@ -459,7 +582,12 @@ impl ReconnectState {
         Self {
             attempts: 0,
             next_attempt: Instant::now(),
+            last_try: None,
         }
+    }
+
+    fn tried_since(&self, since: Instant) -> bool {
+        self.last_try.is_some_and(|t| t > since)
     }
 
     /// Backoff delay: 10s, 20s, 40s, 80s, 160s, capped at `max`
@@ -838,6 +966,8 @@ enum IncomingTransport {
 enum OutboundDial {
     Direct(SocketAddr),
     Onion(String, u16),
+    /// A host name the proxy resolves (`addr-fetch` by name).
+    Name(String, u16),
 }
 
 /// Holds a per-type outbound slot from the moment the capacity check passes
@@ -966,7 +1096,7 @@ pub struct PeerManager {
     next_id: AtomicU64,
     event_tx: mpsc::Sender<NetEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
-    /// Track the highest header height we've stored.
+    /// Mirror of `ChainState::headers_tip_height`: the best header's height.
     headers_tip: AtomicU64,
     /// Blocks we asked a peer for outside the IBD scheduler (a `getdata`
     /// sent while following the tip): peer → the hashes asked of it, when,
@@ -984,6 +1114,13 @@ pub struct PeerManager {
     /// [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`], which bounds the whole table by the
     /// connection limit no matter what peers announce.
     in_flight_blocks: RwLock<HashMap<PeerId, HashMap<bitcoin::BlockHash, BlockRequest>>>,
+    /// Peers that answered a full-block request from the sweep with
+    /// `notfound`, by block. The sweep asks them for that block again only
+    /// when no other peer can be asked, so a `NODE_INTACT_BLOCKS` peer that
+    /// stripped a block does not keep getting the request. Kept only for
+    /// blocks the sweep still misses, and a peer leaves it when it
+    /// disconnects.
+    sweep_not_found: RwLock<HashMap<bitcoin::BlockHash, Vec<PeerId>>>,
     /// Blocks on their way in as a `cmpctblock`: hash → when we asked for
     /// one or, for a pushed or answered `cmpctblock`, when reconstruction
     /// started. Dropped when the block arrives by any route, when its
@@ -1097,6 +1234,8 @@ pub struct PeerManager {
     nap: RwLock<Option<Arc<crate::nap::Publisher>>>,
     /// The NAP serving limits, per connection and per network group.
     nap_limits: parking_lot::Mutex<crate::nap::p2p::ServeLimits>,
+    /// `-napaggregator`: the pulls that collect publishers' attestations.
+    nap_puller: RwLock<Option<Arc<crate::nap::pull::Puller>>>,
     /// Wakes the manager loop's event drain before its next 500 ms tick.
     ///
     /// The drain cadence is deliberate everywhere else, but a peer whose
@@ -1207,6 +1346,10 @@ pub struct PeerManager {
     /// onion equivalent, stopping the reconnect loop from opening a second
     /// connection to an onion peer it's already dialing/connected to.
     pending_onion_dials: RwLock<HashSet<String>>,
+    /// Destinations to open an `addr-fetch` connection to by name, through
+    /// the proxy: Core's `m_addr_fetches`. [`Self::add_addr_fetch`] queues
+    /// one; the manager loop opens one per tick ([`Self::process_addr_fetch`]).
+    addr_fetches: parking_lot::Mutex<std::collections::VecDeque<(String, u16)>>,
     /// Outbound dials in flight, per [`DialBudget`]: counted against the
     /// automatic outbound target and the added-node limit along with the
     /// peers already connected. See [`Self::reserve_dial`].
@@ -1254,6 +1397,12 @@ pub struct PeerManager {
     /// historical block data (genesis→`snapshot_height`) for the
     /// background validator. Idle (empty) unless a snapshot is loaded.
     bg_downloader: RwLock<BgDownloader>,
+    /// The `-restoreopreturns` download (plan §11.4): `None` until a
+    /// restore is pending, and again once it is done.
+    opreturn_restore: parking_lot::Mutex<Option<crate::net::opreturn_restore::RestoreDownloader>>,
+    /// A restore pass's work list, read on the blocking pool and picked up
+    /// by the next tick.
+    opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<RestoreWork>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
     /// The block processor and background catch-up threads, named. Both
@@ -1274,6 +1423,12 @@ pub struct PeerManager {
     dns_enabled: std::sync::atomic::AtomicBool,
     /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
+    /// What the node knows of each onion host on `connect_peer_addrs` that
+    /// it learned for itself (gossip or a seed), keyed by host: where it
+    /// came from and how its dials went, Core's `AddrInfo` fields that
+    /// `IsTerrible` reads. Lock order: `connect_peer_addrs`, then this, then
+    /// `onion_reconnect_backoff`.
+    onion_candidates: RwLock<HashMap<String, OnionCandidate>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
     max_ahead: u32,
     /// Latest ETA (seconds) from the weight-aware IBD estimator.
@@ -1443,6 +1598,7 @@ impl PeerManager {
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(HashMap::new()),
+            sweep_not_found: RwLock::new(HashMap::new()),
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
@@ -1472,6 +1628,7 @@ impl PeerManager {
             }),
             nap: RwLock::new(None),
             nap_limits: parking_lot::Mutex::new(Default::default()),
+            nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
@@ -1499,6 +1656,7 @@ impl PeerManager {
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
             pending_connections: RwLock::new(HashSet::new()),
             pending_onion_dials: RwLock::new(HashSet::new()),
+            addr_fetches: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             dials_in_flight: parking_lot::Mutex::new(DialsInFlight::default()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
@@ -1513,12 +1671,15 @@ impl PeerManager {
                 BG_CATCHUP_WINDOW,
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
             )),
+            opreturn_restore: parking_lot::Mutex::new(None),
+            opreturn_restore_loaded: Arc::new(parking_lot::Mutex::new(None)),
             bg_connect_signal: bg_connect_signal.clone(),
             connector_threads: parking_lot::Mutex::new(Vec::new()),
             proxy,
             onion_proxy,
             proxy_randomize: std::sync::atomic::AtomicBool::new(true),
             connect_peer_addrs: RwLock::new(Vec::new()),
+            onion_candidates: RwLock::new(HashMap::new()),
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
@@ -1967,6 +2128,15 @@ impl PeerManager {
         self.prune_target_mb > 0 || self.prune_manual.load(Ordering::Relaxed)
     }
 
+    /// `-pruneopreturnpeers=intact` on a node that strips: serve any block
+    /// still held intact, at any depth (plan §2.9.1). Never on a node that
+    /// also prunes, which deletes whole files and keeps Core's limits.
+    fn serves_intact_blocks(&self) -> bool {
+        !self.is_pruning()
+            && self.chain_state.opreturn_prune_active()
+            && self.chain_state.opreturn_prune_peers() == crate::storage::opreturn_strip::PrunePeers::Intact
+    }
+
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
     /// when randomization is off. Tor uses the username/password as its
     /// stream-isolation key (`IsolateSOCKSAuth`), so a unique pair per dial
@@ -2114,13 +2284,21 @@ impl PeerManager {
         out
     }
 
-    /// Install `-whitelist` permission entries. Set once at startup.
     /// `-nap`: serve `publisher`'s attestations and advertise `NODE_NAP`
     /// on handshakes from now on.
     pub fn set_nap_publisher(&self, publisher: Arc<crate::nap::Publisher>) {
         *self.nap.write() = Some(publisher);
     }
 
+    /// `-napaggregator`: pull publishers' attestations into `puller`'s
+    /// collector, over the connections to `NODE_NAP` peers and over pull
+    /// connections ([`ConnType::NapPull`]) to the ones the address book
+    /// knows. [`Self::run_nap_collection`] drives it.
+    pub fn set_nap_aggregator(&self, puller: Arc<crate::nap::pull::Puller>) {
+        *self.nap_puller.write() = Some(puller);
+    }
+
+    /// Install `-whitelist` permission entries. Set once at startup.
     pub fn set_whitelist(&self, entries: Vec<crate::net::permissions::WhitelistEntry>) {
         *self.whitelist.write() = entries;
     }
@@ -2261,6 +2439,13 @@ impl PeerManager {
     /// announced it (Core's `nServices` and `source`, which `getnodeaddresses`
     /// and `getrawaddrman` report).
     pub fn add_learned_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
+        self.learn_addr(addr, now_unix_secs(), services, source);
+    }
+
+    /// Put `addr` in the address book as new, last seen at `seen`, and on
+    /// the dial list if the book holds it: the rule every address the node
+    /// learns for itself goes through, gossiped or from a seed.
+    fn learn_addr(&self, addr: SocketAddr, seen: u64, services: u64, source: IpAddr) {
         // Record in the persistent address book (peers.dat) as a *new*
         // address. This is the chokepoint for gossiped addresses, and the
         // book's rule decides what the node learns at all. An address it
@@ -2279,18 +2464,18 @@ impl PeerManager {
         // `ProcessMessage`, `g_reachable_nets.Contains`): under `-onlynet` a
         // node does not fill its book with addresses it will never dial.
         if !self.reachable.read().contains_socket(&addr) {
-            tracing::debug!(%addr, "Ignoring a gossiped address on a network -onlynet leaves out");
+            tracing::debug!(%addr, "Ignoring a learned address on a network -onlynet leaves out");
             return;
         }
         {
             let mut book = self.addrman.write();
             if !book.admits(&addr) {
-                tracing::debug!(%addr, "Ignoring a gossiped address the address book does not take");
+                tracing::debug!(%addr, "Ignoring a learned address the address book does not take");
                 return;
             }
-            let (inserted, evicted) = book.add_from_replacing(addr, now_unix_secs(), services, source);
+            let (inserted, evicted) = book.add_seen_replacing(addr, seen, now_unix_secs(), services, source);
             if !inserted && !book.contains(&addr) {
-                tracing::debug!(%addr, "Not dialling a gossiped address the address book has no room for");
+                tracing::debug!(%addr, "Not dialling a learned address the address book has no room for");
                 return;
             }
             // A full book makes room by dropping a terrible entry; it
@@ -2309,12 +2494,23 @@ impl PeerManager {
     /// as automatic connections, so they join the learned candidates rather
     /// than `manual_addrs`, under the same rule as gossip. An onion seed
     /// joins the onion candidates.
+    ///
+    /// Into the book as well, as new, last seen a random three to seven
+    /// days ago, as Core's `ThreadDNSAddressSeed` dates a seed's answers.
+    /// satd put them on the dial list only, so a seed address the node did
+    /// not reach before a restart was gone after it, and one it could not
+    /// connect to never became terrible and replaceable.
     pub fn add_learned_peer_addr(&self, addr: &PeerAddr) {
         match addr {
             PeerAddr::Socket(sa) => {
-                if self.reachable.read().contains_socket(sa) && self.addrman.read().admits(sa) {
-                    self.push_learned(*sa);
-                }
+                use rand::Rng as _;
+                let age = rand::thread_rng().gen_range(SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS);
+                self.learn_addr(
+                    *sa,
+                    now_unix_secs().saturating_sub(age),
+                    crate::net::addrman::DEFAULT_SERVICES,
+                    sa.ip(),
+                );
             }
             PeerAddr::Onion { host, port } => self.add_onion_connect_addr(host.clone(), *port),
         }
@@ -2382,6 +2578,22 @@ impl PeerManager {
     /// connection and the existing candidate list. This is what lets a
     /// proxy-only node grow its peer set past the hardcoded onion seeds.
     fn add_onion_connect_addr(&self, host: String, port: u16) {
+        self.add_onion_candidate(host, port, None);
+    }
+
+    /// [`Self::add_onion_connect_addr`] for an onion announced by a peer,
+    /// whose share of the list it counts against: `source` is the
+    /// announcer's network group, or its own onion host (see
+    /// [`Self::onion_source`]).
+    ///
+    /// The list was first come, first kept: once one peer's `getaddr`
+    /// answer had filled it, every later onion was refused for the life of
+    /// the process, and nothing left it but `addnode … remove`. Now one
+    /// source holds at most [`MAX_ONION_ADDRS_PER_SOURCE`] of it, and a full
+    /// list makes room for a new onion by dropping a learned one that is
+    /// terrible, as Core's `AddSingle` overwrites a terrible entry
+    /// (v31.1 `src/addrman.cpp:581`).
+    fn add_onion_candidate(&self, host: String, port: u16, source: Option<Vec<u8>>) {
         // Under `-connect` the node dials only the peers it was told to; see
         // `may_dial`. Onion candidates are in-memory only, so refusing them
         // here is enough to keep them off the dial list.
@@ -2393,18 +2605,86 @@ impl PeerManager {
         }
         // Core looks no further at a banned address it is told about, as the
         // clearnet arms do; the reconnect loop would not dial it either.
-        if self.ban_list.read().is_onion_banned(&host, crate::time::now_secs()) {
+        let now = now_unix_secs();
+        if self.ban_list.read().is_onion_banned(&host, now) {
             return;
         }
         let mut addrs = self.connect_peer_addrs.write();
+        let mut candidates = self.onion_candidates.write();
         let already = addrs
             .iter()
             .any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if *h == host));
-        if already || addrs.len() >= MAX_ONION_CONNECT_ADDRS {
+        if already {
+            if let Some(c) = candidates.get_mut(&host) {
+                c.last_seen = c.last_seen.max(now);
+            }
             return;
         }
+        if let Some(src) = &source {
+            let held = candidates.values().filter(|c| c.source.as_ref() == Some(src)).count();
+            if held >= MAX_ONION_ADDRS_PER_SOURCE {
+                tracing::debug!(onion = %host, "Not learning an onion peer: its source has its share");
+                return;
+            }
+        }
+        if addrs.len() >= MAX_ONION_CONNECT_ADDRS {
+            // A learned onion that is terrible and not in use gives up its
+            // place. A peer the operator named never does.
+            let victim = addrs.iter().position(|a| match a {
+                PeerAddr::Onion { host: h, .. } => {
+                    candidates.get(h).is_some_and(|c| c.is_terrible(now))
+                        && !self.is_manual_target(a)
+                        && !self.is_onion_connected(h)
+                        && !self.pending_onion_dials.read().contains(h)
+                }
+                PeerAddr::Socket(_) => false,
+            });
+            let Some(i) = victim else {
+                return;
+            };
+            let gone = addrs.remove(i);
+            if let PeerAddr::Onion { host: h, .. } = &gone {
+                candidates.remove(h);
+            }
+            self.onion_reconnect_backoff.write().remove(&gone.to_string());
+            tracing::debug!(onion = %gone, "Dropped a terrible onion peer to make room");
+        }
         tracing::debug!(onion = %host, port, "Discovered onion peer via addrv2");
+        candidates.insert(host.clone(), OnionCandidate { source, last_seen: now, last_success: 0, last_try: 0, attempts: 0 });
         addrs.push(PeerAddr::Onion { host, port });
+    }
+
+    /// The source an onion announced by peer `id` counts against: the
+    /// network group of a clearnet peer, or the host of an onion peer,
+    /// whose address is the unspecified placeholder. A peer that is no
+    /// longer connected, or has neither, is a source of its own: the share
+    /// bounds it as well.
+    fn onion_source(&self, id: PeerId) -> Vec<u8> {
+        if let Some(ip) = self.peer_ip(id) {
+            let mut key = b"g".to_vec();
+            key.extend(self.addrman.read().group_key(ip));
+            return key;
+        }
+        if let Some(host) = self.peers.read().get(&id).and_then(|h| h.info.onion_host.clone()) {
+            return [b"o".as_slice(), host.as_bytes()].concat();
+        }
+        [b"p".as_slice(), &id.to_le_bytes()].concat()
+    }
+
+    /// Record how a dial to a learned onion candidate went, for
+    /// [`OnionCandidate::is_terrible`] (Core's `Attempt` and `Good`).
+    fn note_onion_dial(&self, host: &str, connected: bool) {
+        if let Some(c) = self.onion_candidates.write().get_mut(host) {
+            let now = now_unix_secs();
+            c.last_try = now;
+            if connected {
+                c.last_success = now;
+                c.last_seen = now;
+                c.attempts = 0;
+            } else {
+                c.attempts = c.attempts.saturating_add(1);
+            }
+        }
     }
 
     /// Load the persistent address book from `path` (peers.dat), then
@@ -2838,6 +3118,12 @@ impl PeerManager {
                 let mut addrs = self.connect_peer_addrs.write();
                 let before = addrs.len();
                 addrs.retain(|a| a != addr);
+                // The record is the host's; another port of it may remain.
+                let host_listed =
+                    addrs.iter().any(|a| matches!(a, PeerAddr::Onion { host: h, .. } if h == host));
+                if addrs.len() < before && !host_listed {
+                    self.onion_candidates.write().remove(host);
+                }
                 addrs.len() < before
             }
         }
@@ -3002,8 +3288,9 @@ impl PeerManager {
             }
             ConnType::BlockRelay => Some(MAX_OUTBOUND_BLOCK_RELAY),
             ConnType::AddrFetch | ConnType::Feeler => None,
-            // Core returns false rather than opening one of these.
-            ConnType::Inbound | ConnType::Manual => {
+            // Core returns false rather than opening one of these. A NAP pull
+            // is satd's own, and opened only by the aggregator.
+            ConnType::Inbound | ConnType::Manual | ConnType::NapPull => {
                 return Err(format!(
                     "cannot open a {} connection this way",
                     conn_type.as_str()
@@ -3043,8 +3330,9 @@ impl PeerManager {
             .values()
             .filter(|h| h.info.conn_type != ConnType::Inbound)
             // Core exempts MANUAL: `-addnode` peers have their own semaphore
-            // (`semAddnode`) and do not consume an automatic slot.
-            .filter(|h| h.info.conn_type != ConnType::Manual)
+            // (`semAddnode`) and do not consume an automatic slot. Nor does a
+            // NAP pull, which the aggregator bounds itself.
+            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull))
             .count()
             + pending.len();
         if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
@@ -3079,14 +3367,15 @@ impl PeerManager {
 
     /// Outbound peers that count against the automatic target: every one
     /// but the manual connections, which Core counts apart (`semAddnode`,
-    /// or no limit at all), connected or still in the handshake.
+    /// or no limit at all), and NAP pulls, which take no outbound slot;
+    /// connected or still in the handshake.
     fn automatic_outbound_peers(&self) -> usize {
         self.peers
             .read()
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && h.info.conn_type != ConnType::Manual
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
                     && h.info.state != PeerState::Disconnected
             })
             .count()
@@ -3287,6 +3576,72 @@ impl PeerManager {
         Ok(())
     }
 
+    /// Queue an `addr-fetch` connection to `host:port` by name, for the
+    /// proxy to resolve: Core's `AddAddrFetch`. With `-proxy` set, Core seeds
+    /// this way rather than by a local DNS query (`ThreadDNSAddressSeed`,
+    /// when `HaveNameProxy()`), and opens a `-seednode` hostname the same way;
+    /// the connection asks for addresses and is dropped once it has them.
+    /// The manager loop opens one queued entry per tick.
+    pub fn add_addr_fetch(&self, host: String, port: u16) {
+        self.addr_fetches.lock().push_back((host, port));
+    }
+
+    /// Open the next queued `addr-fetch` by name, if an outbound slot is
+    /// free: Core's `ProcessAddrFetch`, which pops the entry and then tries
+    /// for a `semOutbound` grant, dropping the entry when there is none.
+    fn process_addr_fetch(self: &Arc<Self>) {
+        if !self.is_network_active() {
+            return;
+        }
+        let Some((host, port)) = self.addr_fetches.lock().pop_front() else {
+            return;
+        };
+        {
+            let mut pending = self.pending_typed_dials.write();
+            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending) {
+                tracing::debug!(%host, port, "addr-fetch by name not opened: {e}");
+                return;
+            }
+            pending.push(ConnType::AddrFetch);
+        }
+        let pm = self.clone();
+        tokio::spawn(async move {
+            // Releases the reservation on every exit path.
+            let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type: ConnType::AddrFetch };
+            if let Err(e) = pm.connect_addr_fetch_by_name(&host, port).await {
+                tracing::debug!(%host, port, "addr-fetch by name failed: {e}");
+            }
+        });
+    }
+
+    /// Dial `host:port` through the proxy and open it as an `addr-fetch`
+    /// connection. The caller holds the outbound reservation.
+    async fn connect_addr_fetch_by_name(self: &Arc<Self>, host: &str, port: u16) -> Result<(), String> {
+        let stream = self.dial_name(host, port).await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(%host, port, id, "Opening addr-fetch connection by name via proxy");
+        let (conn, id) = self
+            .establish_outbound(id, stream, OutboundDial::Name(host.to_string(), port), None)
+            .await?;
+        if !self.is_network_active() {
+            return Err("networking disabled during connect (networkactive=false)".to_string());
+        }
+        // The proxy resolved the name, so there is no peer socket to record:
+        // the `0.0.0.0` placeholder an onion peer has, with the name kept for
+        // `getpeerinfo` and `disconnectnode`.
+        let placeholder_addr: SocketAddr = ([0, 0, 0, 0], port).into();
+        self.spawn_peer(
+            id,
+            placeholder_addr,
+            IncomingTransport::Established(Box::new(conn)),
+            Direction::Outbound,
+            None,
+            Some(format!("{host}:{port}")),
+            Some(ConnType::AddrFetch),
+        );
+        Ok(())
+    }
+
     /// `connect_outbound_as`, with the reservation optional. `reserve` false
     /// takes no place in any limit here: `add_connection` has already taken
     /// its per-type one and the reconnect loop its [`DialSlot`], each held
@@ -3398,6 +3753,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             None,
+            None,
             conn_type,
         );
         Ok(())
@@ -3493,6 +3849,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             Some(host),
+            None,
             conn_type,
         );
         Ok(())
@@ -4274,12 +4631,16 @@ impl PeerManager {
 
     /// Record a peer's BIP 133 `feefilter`.
     ///
-    /// The message carries an `i64`; a negative value clamps to 0 (pass
-    /// everything, Core's signed comparison) rather than wrapping through
-    /// `as u64` into a filter that drops every announcement.
+    /// A value outside `MoneyRange` (negative, or above `MAX_MONEY`) is
+    /// ignored and the peer's previous filter stays, as Core ignores it
+    /// (`net_processing.cpp:5035-5045`).
     fn set_peer_fee_filter(&self, id: PeerId, rate: i64) {
+        let Some(rate) = u64::try_from(rate).ok().filter(|r| *r <= MAX_MONEY_SATS) else {
+            tracing::debug!(id, rate, "Ignoring out-of-range fee filter");
+            return;
+        };
         if let Some(handle) = self.peers.write().get_mut(&id) {
-            handle.info.fee_filter = rate.max(0) as u64;
+            handle.info.fee_filter = rate;
             tracing::debug!(id, rate, "Peer set fee filter");
         }
     }
@@ -4410,6 +4771,19 @@ impl PeerManager {
         });
     }
 
+    /// Re-read the header tip mirror from the chain state.
+    ///
+    /// The `headers` paths store it as they accept headers, but the header
+    /// tip also moves on block paths (`accept_block` connecting a block that
+    /// out-works the best header, `submitblock`, a local miner) and, since
+    /// #1119, can move *down* there: a block making a shorter chain the most
+    /// work. Without this a mirror left at the taller chain's height would
+    /// keep `is_ibd` true until the next `headers` message.
+    fn refresh_headers_tip(&self) {
+        let htip = u64::from(self.chain_state.headers_tip_height());
+        self.headers_tip.store(htip, Ordering::Relaxed);
+    }
+
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
         // The best header is at least our own tip. `headers_tip` only moves
@@ -4469,7 +4843,37 @@ impl PeerManager {
         }
         self.redial_manual_peers(now);
         self.evict_extra_outbound_peer();
+        self.resolve_tried_collisions();
         self.dial_automatic_peers(now);
+    }
+
+    /// Settle the promotions waiting on a taken tried slot, as Core's
+    /// connection thread calls `ResolveCollisions` before each pass. An
+    /// incumbent the node is connected to has passed its test, and is marked
+    /// good first, as Core marks a collision's incumbent good rather than
+    /// open a feeler to a peer it already has (`ThreadOpenConnections`,
+    /// v31.1 `src/net.cpp:2811`). An address the resolution drops from the
+    /// book leaves the dial list with it.
+    fn resolve_tried_collisions(&self) {
+        let now = now_unix_secs();
+        let incumbents = self.addrman.read().tried_collision_incumbents();
+        let connected: Vec<SocketAddr> =
+            incumbents.into_iter().filter(|a| self.is_addr_connected(a)).collect();
+        let dropped = {
+            let mut book = self.addrman.write();
+            // Only one the book still holds: one dropped since the read
+            // above would be put back, and perhaps straight into tried.
+            for a in connected {
+                if book.contains(&a) {
+                    book.mark_good(a, now);
+                }
+            }
+            book.resolve_collisions(now)
+        };
+        for gone in dropped {
+            self.learned_addrs.write().remove(&gone);
+            self.reconnect_backoff.write().remove(&gone);
+        }
     }
 
     /// Whether `target` is a peer the operator named.
@@ -4534,33 +4938,59 @@ impl PeerManager {
             self.spawn_redial(PeerAddr::Socket(addr), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
         }
 
-        // `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up
-        // to MAX_ONION_CONNECT_ADDRS), and every onion dial holds a circuit
-        // through the one proxy, so on top of the free slots a tick starts
-        // no more than a burst of them.
+        for (target, slot) in self.reserve_onion_dials(now) {
+            self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        }
+    }
+
+    /// The onion peers learned from `addrv2` gossip that the automatic half
+    /// of the reconnect loop dials this pass, each with the place it took in
+    /// the automatic budget. An onion peer dialled in the last
+    /// [`RECENT_TRY_WINDOW`] is passed over as a clearnet one is
+    /// ([`Self::reserve_automatic_dials`]).
+    ///
+    /// `connect_peer_addrs` is fillable from untrusted addrv2 gossip (up to
+    /// MAX_ONION_CONNECT_ADDRS), and every onion dial holds a circuit through
+    /// the one proxy, so on top of the free slots a tick starts no more than
+    /// a burst of them.
+    fn reserve_onion_dials(self: &Arc<Self>, now: Instant) -> Vec<(PeerAddr, DialSlot)> {
+        // Under `-connect`, only the peers the operator named; with an
+        // `-onlynet` that leaves out onion, none.
+        if !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
+            return Vec::new();
+        }
         let onion: Vec<PeerAddr> = self.connect_peer_addrs.read().clone();
         let mut budget = Self::onion_dial_budget(
             self.automatic_outbound_target(),
             self.automatic_outbound_peers(),
             self.dials_in_flight.lock().automatic,
         );
-        for target in onion.into_iter().filter(|a| !self.is_manual_target(a)) {
-            // Under `-connect`, only the peers the operator named; with an
-            // `-onlynet` that leaves out onion, none.
-            if budget == 0 || !self.automatic_outbound.load(Ordering::Relaxed) || !self.reachable.read().onion {
-                break;
-            }
-            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
-                continue;
-            }
-            match self.reserve_dial(DialBudget::Automatic) {
-                Ok(slot) => {
-                    budget -= 1;
-                    self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let mut dials = Vec::new();
+        pass_over_recent_tries(
+            onion.into_iter().filter(|a| !self.is_manual_target(a)),
+            |target| {
+                recent.is_some_and(|since| {
+                    self.onion_reconnect_backoff
+                        .read()
+                        .get(&target.to_string())
+                        .is_some_and(|s| s.tried_since(since))
+                })
+            },
+            |target| {
+                if budget == 0 {
+                    return Err(());
                 }
-                Err(_) => return,
-            }
-        }
+                if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
+                    return Ok(false);
+                }
+                let slot = self.reserve_dial(DialBudget::Automatic).map_err(|_| ())?;
+                budget -= 1;
+                dials.push((target, slot));
+                Ok(true)
+            },
+        );
+        dials
     }
 
     /// Whether the reconnect loop should dial `target` now: it is neither
@@ -4591,47 +5021,123 @@ impl PeerManager {
 
     /// The learned addresses the automatic half of the reconnect loop dials
     /// this pass, each with the place it took in the automatic budget, in
-    /// the order of the dial list. Stops when the budget is spent.
+    /// the order [`Self::automatic_dial_order`] draws. Stops when the budget
+    /// is spent.
+    ///
+    /// A candidate dialled in the last [`RECENT_TRY_WINDOW`] is passed over
+    /// until a dial has looked at [`RECENT_TRY_SKIPS`] candidates, as Core
+    /// passes over one it tried in the last ten minutes. satd took the
+    /// first candidates on the list that were not backing off, and a dial
+    /// that connected cleared the backoff, so a peer that hung up just
+    /// after the handshake was dialled again on the next pass, and the
+    /// node went back to the same few peers all day.
     ///
     /// An address the operator also named is offered by the manual half,
     /// and `spawn_peer` makes it the manual connection it is: Core makes no
     /// automatic connection to an added node (`AddedNodesContain`, v31.1
     /// `src/net.cpp:2883`).
     fn reserve_automatic_dials(self: &Arc<Self>, now: Instant) -> Vec<(SocketAddr, DialSlot)> {
-        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let tried_recently = |addr: &SocketAddr| {
+            recent.is_some_and(|since| {
+                self.reconnect_backoff.read().get(addr).is_some_and(|s| s.tried_since(since))
+            })
+        };
         let mut groups = self.outbound_netgroups();
         let mut dials = Vec::new();
-        for addr in learned {
-            if self.is_manual_target(&PeerAddr::Socket(addr)) || !self.may_dial(&addr) {
-                continue;
-            }
-            let target = PeerAddr::Socket(addr);
-            if self.is_peer_addr_banned(&target) || !self.redial_due(&target, now) {
-                continue;
-            }
-            // One automatic outbound peer per network group, as Core
-            // requires (v31.1 `src/net.cpp:2829`): a candidate in a group
-            // the node already has an outbound peer in, or is dialling, is
-            // skipped. satd walked the list in order, and addresses learned
-            // together often sit in one group, so several slots could go to
-            // one /16.
+        // One automatic outbound peer per network group, as Core requires
+        // (v31.1 `src/net.cpp:2829`): a candidate in a group the node
+        // already has an outbound peer in, or is dialling, is skipped. satd
+        // walked the list in order, and addresses learned together often sit
+        // in one group, so several slots could go to one /16. Err when the
+        // budget is spent.
+        let mut take = |addr: SocketAddr| -> Result<bool, ()> {
             let group = self.outbound_netgroup(addr.ip());
             if group.as_ref().is_some_and(|g| groups.contains(g)) {
-                continue;
+                return Ok(false);
             }
-            match self.reserve_dial(DialBudget::Automatic) {
-                Ok(slot) => {
-                    // The dials of one pass run in parallel, so the group is
-                    // taken now, not when the peer connects.
-                    if let Some(group) = group {
-                        groups.insert(group);
-                    }
-                    dials.push((addr, slot));
+            let slot = self.reserve_dial(DialBudget::Automatic).map_err(|_| ())?;
+            // The dials of one pass run in parallel, so the group is taken
+            // now, not when the peer connects.
+            if let Some(group) = group {
+                groups.insert(group);
+            }
+            dials.push((addr, slot));
+            Ok(true)
+        };
+        pass_over_recent_tries(
+            self.automatic_dial_order(&mut rand::thread_rng()),
+            tried_recently,
+            |addr| {
+                let target = PeerAddr::Socket(addr);
+                if self.is_manual_target(&target)
+                    || !self.may_dial(&addr)
+                    || self.is_peer_addr_banned(&target)
+                    || !self.redial_due(&target, now)
+                {
+                    return Ok(false);
                 }
-                Err(_) => break,
+                take(addr)
+            },
+        );
+        dials
+    }
+
+    /// The learned addresses in the order an automatic pass tries them:
+    /// each next one from the tried table or the new table at the toss of a
+    /// coin, at random within it, as Core's `AddrMan::Select` draws (an
+    /// address not in the book counts as new). satd walked the list in the
+    /// order it learned the addresses, so the ones it loaded from
+    /// `peers.dat` at startup were first on every pass.
+    ///
+    /// Within the tried table, a bucket is drawn first and then an entry in
+    /// it, as Core's `Select_` picks a bucket and a position: one network
+    /// group's entries share at most eight buckets, so its share of the
+    /// tried draws is bounded by its buckets, not by how many entries it has.
+    ///
+    /// The incumbent of a promotion waiting on its tried slot comes first,
+    /// for the dial to test it (Core's `SelectTriedCollision`, which Core
+    /// tests over a feeler; satd opens no feelers of its own).
+    fn automatic_dial_order(&self, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
+        use rand::seq::SliceRandom as _;
+        let learned: Vec<SocketAddr> = self.learned_addrs.read().iter().copied().collect();
+        let mut buckets: std::collections::BTreeMap<u64, Vec<SocketAddr>> = Default::default();
+        let mut new = Vec::new();
+        let incumbent = {
+            let book = self.addrman.read();
+            for a in learned {
+                match book.tried_bucket(&a) {
+                    Some(b) => buckets.entry(b).or_default().push(a),
+                    None => new.push(a),
+                }
+            }
+            book.select_tried_collision()
+        };
+        let mut tried: Vec<Vec<SocketAddr>> = buckets.into_values().collect();
+        for bucket in &mut tried {
+            bucket.shuffle(rng);
+        }
+        new.shuffle(rng);
+        let mut order = Vec::with_capacity(tried.iter().map(Vec::len).sum::<usize>() + new.len() + 1);
+        order.extend(incumbent);
+        while !tried.is_empty() || !new.is_empty() {
+            let from_tried = new.is_empty() || (!tried.is_empty() && rng.r#gen::<bool>());
+            if from_tried {
+                let i = rng.gen_range(0..tried.len());
+                order.extend(tried[i].pop());
+                if tried[i].is_empty() {
+                    tried.swap_remove(i);
+                }
+            } else {
+                order.extend(new.pop());
             }
         }
-        dials
+        if let Some(first) = incumbent
+            && let Some(dup) = order.iter().skip(1).position(|a| *a == first)
+        {
+            order.remove(dup + 1);
+        }
+        order
     }
 
     /// The network group the one-per-group outbound rule keys `ip` on: the
@@ -4843,11 +5349,15 @@ impl PeerManager {
                 // What makes an address terrible, and so replaceable once
                 // the book is full (Core's `Attempt`).
                 if let PeerAddr::Socket(sa) = &target {
-                    pm.addrman.write().mark_attempt(*sa);
+                    pm.addrman.write().mark_attempt(*sa, now_unix_secs());
                 }
             }
             let connected = result.is_ok();
+            if let PeerAddr::Onion { host, .. } = &target {
+                pm.note_onion_dial(host, connected);
+            }
             let update = |state: &mut ReconnectState| {
+                state.last_try = Some(Instant::now());
                 if connected {
                     state.reset();
                 } else {
@@ -4867,12 +5377,17 @@ impl PeerManager {
                         update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
                     }
                 }
-                PeerAddr::Onion { .. } => update(
-                    pm.onion_reconnect_backoff
-                        .write()
-                        .entry(target.to_string())
-                        .or_insert_with(ReconnectState::new),
-                ),
+                // Likewise for an onion that left the list while the dial ran
+                // (a full list dropped it, or `addnode … remove`).
+                // The list first: `add_onion_candidate` holds it while it
+                // drops a backoff entry, so the other order deadlocks.
+                PeerAddr::Onion { .. } => {
+                    let listed = pm.connect_peer_addrs.read();
+                    let mut backoff = pm.onion_reconnect_backoff.write();
+                    if listed.contains(&target) {
+                        update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
+                    }
+                }
             }
         });
     }
@@ -5070,12 +5585,22 @@ impl PeerManager {
                 match event_rx.try_recv() {
                     Ok(NetEvent::PeerConnected { id, addr: _, version }) => {
                         self.handle_peer_connected(id, version);
+                        self.nap_peer_connected(id);
                     }
                     Ok(NetEvent::PeerDisconnected { id }) => {
                         self.handle_peer_disconnected(id);
                     }
                     Ok(NetEvent::GetDataResume { id }) => {
                         self.resume_getdata(id);
+                    }
+                    Ok(NetEvent::MessageReceived {
+                        id,
+                        msg: NetworkMessage::Unknown { command, payload },
+                    }) if command.as_ref() == crate::nap::p2p::NAPATT => {
+                        // A page verifies signatures; it is taken off this
+                        // loop. The guard counts it out once it is taken.
+                        let guard = crate::net::flow::InFlight::adopt(self.peer_flow(id));
+                        self.handle_napatt(id, payload, guard);
                     }
                     Ok(NetEvent::MessageReceived { id, msg }) => {
                         // The socket task counted this message in as it was
@@ -5120,7 +5645,7 @@ impl PeerManager {
 
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
-            let _htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+            self.refresh_headers_tip();
 
             // When chain advances, immediately request more blocks (don't wait for timer)
             // Reconnect backoff is not reset here: a dial's backoff ends when
@@ -5252,6 +5777,7 @@ impl PeerManager {
             // handoff completes.
             if ticks.is_multiple_of(4) {
                 self.drive_bg_catchup_download();
+                self.drive_opreturn_restore();
             }
 
             // Request blocks: immediately on tip advance, or every 10 ticks as fallback
@@ -5354,6 +5880,10 @@ impl PeerManager {
             // Drop addr-fetch connections whose peer never sent a usable
             // `addr`. Read through the node clock, not the wall clock, so
             // `setmocktime` moves the deadline the way it does in Core.
+            // One queued addr-fetch by name per tick, as Core's
+            // `ThreadOpenConnections` runs `ProcessAddrFetch` every 500 ms.
+            self.process_addr_fetch();
+
             if ticks.is_multiple_of(2) {
                 self.expire_addr_fetch_peers();
                 self.expire_compact_state();
@@ -5377,6 +5907,7 @@ impl PeerManager {
         {
             let mut peers = self.peers.write();
             if let Some(handle) = peers.get_mut(&id) {
+                let stated = version.services.to_u64();
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
                 // Promote to the tried table in the persistent address book,
@@ -5387,8 +5918,22 @@ impl PeerManager {
                 // Onion peers carry the 0.0.0.0 placeholder socket, not a
                 // re-dialable clearnet addr — marking it good would pollute the
                 // addrman (and conflate every onion peer). Skip them.
-                if handle.info.direction == Direction::Outbound && handle.info.onion_host.is_none() {
-                    self.addrman.write().mark_good(handle.info.addr, now_unix_secs());
+                // Nor a NAP pull: a pull connection is opened to addresses
+                // learned only from a gossiped service bit, faster than the
+                // automatic dials, and proves nothing about the peer as one
+                // to sync or relay with. Promoting them would let gossip
+                // fill the tried table.
+                if handle.info.direction == Direction::Outbound
+                    && handle.info.onion_host.is_none()
+                    && handle.info.addr_name.is_none()
+                    && handle.info.conn_type != ConnType::NapPull
+                {
+                    let mut book = self.addrman.write();
+                    book.mark_good(handle.info.addr, now_unix_secs());
+                    // A seed or manual peer enters the book only here, after
+                    // the handshake's `SetServices` found no entry; record
+                    // what it stated rather than the default.
+                    book.set_services(&handle.info.addr, stated);
                 }
                 tracing::info!(
                     id,
@@ -5418,12 +5963,23 @@ impl PeerManager {
 
     fn handle_peer_disconnected(&self, id: PeerId) {
         let mut peers = self.peers.write();
+        let mut nap_pull = None;
         if let Some(handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
             tracing::debug!("Cleared nodestate for peer={id}");
+            if handle.info.conn_type == ConnType::NapPull {
+                nap_pull = Some(handle.info.addr_string());
+            }
         }
         drop(peers);
         self.nap_limits.lock().forget(id);
+        if let Some(puller) = self.nap_puller.read().as_ref() {
+            puller.forget(id);
+            // A pull connection that closed before connecting.
+            if let Some(source) = nap_pull {
+                puller.dial_ended(&source);
+            }
+        }
         // Notify IBD scheduler so in-flight blocks get reassigned
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
@@ -5433,11 +5989,18 @@ impl PeerManager {
         // Return the peer's background-range requests to the pool so they
         // re-request promptly rather than waiting out the stale timeout.
         self.bg_downloader.write().note_peer_gone(id);
+        if let Some(restore) = self.opreturn_restore.lock().as_mut() {
+            restore.note_peer_gone(id);
+        }
         // A departed peer's partial compact block can never be completed,
         // and its requests will never be answered.
         self.pending_compact.write().remove(&id);
         self.hb_peers.lock().retain(|p| *p != id);
         self.in_flight_blocks.write().remove(&id);
+        self.sweep_not_found.write().retain(|_, peers| {
+            peers.retain(|p| *p != id);
+            !peers.is_empty()
+        });
         // Core's `TxDownloadManagerImpl::DisconnectedPeer`: its announcements
         // go, an orphan only it announced goes, and what it was asked for
         // goes to the next announcer at once.
@@ -5457,6 +6020,11 @@ impl PeerManager {
         msg: NetworkMessage,
         in_flight: crate::net::flow::InFlight,
     ) {
+        // A NAP pull connection carries the pull and nothing else: what the
+        // publisher announces or asks for over it is not taken up.
+        if self.conn_type_of(id) == ConnType::NapPull {
+            return;
+        }
         match msg {
             // Neither `Ping` nor `Pong` reaches here: the peer's write loop
             // answers the one and matches the other against that peer's
@@ -5667,6 +6235,10 @@ impl PeerManager {
                 let count = addrs.len();
                 let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
                 let source = self.peer_ip(id);
+                // Read once for the whole message: the announcer can leave `peers`
+                // while it is processed, and its later onions must still count
+                // against its share.
+                let onion_source = self.onion_source(id);
                 let mut processed = 0u64;
                 for addr_msg in &admitted {
                     match &addr_msg.addr {
@@ -5680,7 +6252,7 @@ impl PeerManager {
                                 continue;
                             }
                             processed += 1;
-                            self.add_onion_connect_addr(host, addr_msg.port);
+                            self.add_onion_candidate(host, addr_msg.port, Some(onion_source.clone()));
                         }
                         // IPv4 / IPv6 (and, under a proxy, anything else with a
                         // socket form) flow through the clearnet address book.
@@ -5769,9 +6341,28 @@ impl PeerManager {
                     // A tip-following request it cannot answer no longer
                     // holds the block back from the sweep's next pass.
                     if let Some(asked) = self.in_flight_blocks.write().get_mut(&id) {
+                        let mut not_found = self.sweep_not_found.write();
                         for h in &block_hashes {
-                            asked.remove(h);
+                            if asked.remove(h).is_some() {
+                                let peers = not_found.entry(*h).or_default();
+                                if !peers.contains(&id) {
+                                    peers.push(id);
+                                }
+                            }
                         }
+                    }
+                    // A restore request (plan §11.4): another peer is asked,
+                    // and this one not again for that block this pass.
+                    let refused: Vec<bitcoin::BlockHash> = match self.opreturn_restore.lock().as_mut() {
+                        Some(restore) => block_hashes.iter().copied().filter(|h| restore.note_not_found(h, id)).collect(),
+                        None => Vec::new(),
+                    };
+                    if !refused.is_empty() {
+                        let mut pending = self.block_refetch.write();
+                        for h in &refused {
+                            pending.remove(&(*h, id));
+                        }
+                        tracing::debug!(id, count = refused.len(), "OP_RETURN restore: notfound, asking another peer");
                     }
                     // The background download's heights too, so the next
                     // pass asks a different peer instead of waiting out
@@ -5846,6 +6437,236 @@ impl PeerManager {
                 self.handle_getnapatt(id, &payload)
             }
             _ => {}
+        }
+    }
+
+    /// A peer just connected: with `-napaggregator`, start a pull from it at
+    /// once if it publishes. A new connection is pulled whenever it opens,
+    /// since the publisher's own limits are per connection; a long-lived one
+    /// is pulled again by the collection tick, which also pulls one that
+    /// connected during initial block download. A pull connection to a peer
+    /// that turns out not to publish is closed.
+    fn nap_peer_connected(self: &Arc<Self>, id: PeerId) {
+        let Some(puller) = self.nap_puller.read().clone() else {
+            return;
+        };
+        let Some((publishes, conn_type, source)) = self.peers.read().get(&id).map(|h| {
+            (h.info.services.has(crate::nap::p2p::node_nap()), h.info.conn_type, h.info.addr_string())
+        }) else {
+            return;
+        };
+        let pull_connection = conn_type == ConnType::NapPull;
+        self.nap_start_pull(&puller, id, publishes, conn_type, &source);
+        // Only after the pull is counted, so that a pull connection always
+        // counts against the limit, as dialing or as pulling.
+        if pull_connection {
+            puller.dial_ended(&source);
+        }
+    }
+
+    fn nap_start_pull(
+        self: &Arc<Self>,
+        puller: &crate::nap::pull::Puller,
+        id: PeerId,
+        publishes: bool,
+        conn_type: ConnType,
+        source: &str,
+    ) {
+        let pull_connection = conn_type == ConnType::NapPull;
+        let Some(via) = nap_pull_via(conn_type) else {
+            return;
+        };
+        // Behind the publishers' tips, every anchor would fail on chain
+        // state; the collection tick pulls the publisher once synced.
+        if !pull_connection && self.is_ibd() {
+            return;
+        }
+        if !publishes {
+            if pull_connection {
+                tracing::debug!(target: "nap", "nap-pull peer={id} does not publish; disconnecting");
+                self.disconnect_by_id(id);
+            }
+            return;
+        }
+        match puller.start(id, source, via, Instant::now()) {
+            Some(req) => {
+                tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+            None if pull_connection => {
+                self.disconnect_by_id(id);
+            }
+            None => {}
+        }
+    }
+
+    /// NAP `napatt`: take a page of a pull in progress, off the network
+    /// thread, then continue, end or punish as the pull says. Without
+    /// `-napaggregator` it is ignored, as any unknown message.
+    fn handle_napatt(self: &Arc<Self>, id: PeerId, payload: Vec<u8>, in_flight: crate::net::flow::InFlight) {
+        let Some(puller) = self.nap_puller.read().clone() else {
+            return;
+        };
+        let pm = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
+            let next = puller.on_napatt(&*pm.chain_state, id, &payload, Instant::now());
+            pm.act_on_pull(id, next);
+        });
+    }
+
+    fn act_on_pull(&self, id: PeerId, next: crate::nap::pull::Next) {
+        use crate::nap::pull::Next;
+        match next {
+            Next::Unsolicited => tracing::debug!(target: "nap", "ignoring unsolicited napatt from peer={id}"),
+            Next::Continue(req) => {
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+            Next::Done { close } => {
+                tracing::debug!(target: "nap", "NAP: pull from peer={id} done");
+                if close {
+                    self.disconnect_by_id(id);
+                }
+            }
+            Next::Misbehaved(reason) => {
+                let pull_connection = self.conn_type_of(id) == ConnType::NapPull;
+                self.add_ban_score(id, 100, &reason);
+                // A manual peer is not punished, but a pull connection ends
+                // with its pull whatever the peer is.
+                if pull_connection {
+                    self.disconnect_by_id(id);
+                }
+            }
+        }
+    }
+
+    /// `-napaggregator`'s periodic work, every
+    /// [`crate::nap::pull::TICK_INTERVAL`] until shutdown: end pulls whose
+    /// publisher went quiet, verify deferred attestations as the budget
+    /// allows, save the set, pull connected publishers that are due, and
+    /// open pull connections to due publishers the address book knows.
+    pub async fn run_nap_collection(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut tick = tokio::time::interval(crate::nap::pull::TICK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if let Some(puller) = self.nap_puller.read().clone()
+                        && let Err(e) = puller.collector().aggregate().save_if_dirty()
+                    {
+                        tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
+                    }
+                    return;
+                }
+                _ = tick.tick() => {}
+            }
+            let Some(puller) = self.nap_puller.read().clone() else { continue };
+            self.nap_collection_tick(&puller).await;
+        }
+    }
+
+    async fn nap_collection_tick(self: &Arc<Self>, puller: &Arc<crate::nap::pull::Puller>) {
+        let now = Instant::now();
+        for (id, close) in puller.expire(now) {
+            tracing::debug!(target: "nap", "NAP: pull from peer={id} timed out");
+            if close {
+                self.disconnect_by_id(id);
+            }
+        }
+        // Behind the publishers' tips, a deferred attestation's anchor may
+        // not be on the chain yet; it waits until the node is synced.
+        let (p, pm, ibd) = (puller.clone(), Arc::clone(self), self.is_ibd());
+        let drained = tokio::task::spawn_blocking(move || {
+            let collector = p.collector();
+            let bad = if ibd { Vec::new() } else { collector.drain_deferred(&*pm.chain_state, Instant::now()) };
+            if let Err(e) = collector.aggregate().save_if_dirty() {
+                tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
+            }
+            bad
+        })
+        .await
+        .unwrap_or_default();
+        for (source, why) in drained {
+            puller.note_misbehaving();
+            let peer = self.peers.read().values().find(|h| h.info.addr_string() == source).map(|h| h.info.id);
+            if let Some(id) = peer {
+                self.act_on_pull(id, crate::nap::pull::Next::Misbehaved(crate::nap::pull::misbehaviour(&why)));
+            } else {
+                tracing::info!(
+                    target: "nap",
+                    %source,
+                    "NAP: a deferred attestation from a peer no longer connected fails {}: {why}",
+                    why.rule()
+                );
+            }
+        }
+        if self.is_ibd() || !self.is_network_active() {
+            return;
+        }
+        // Connected publishers that are due.
+        let connected: Vec<(PeerId, String, crate::nap::pull::Via)> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.state == PeerState::Connected && h.info.services.has(crate::nap::p2p::node_nap()))
+            .filter_map(|h| match nap_pull_via(h.info.conn_type)? {
+                crate::nap::pull::Via::Pull => None,
+                via => Some((h.info.id, h.info.addr_string(), via)),
+            })
+            .collect();
+        for (id, source, via) in connected {
+            if puller.due(&source, now)
+                && let Some(req) = puller.start(id, &source, via, now)
+            {
+                tracing::debug!(target: "nap", "NAP: pulling attestations from peer={id}");
+                self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
+            }
+        }
+        // Publishers the address book knows, over pull connections: an
+        // automatic dial, so not under `-connect`, as Core opens no feeler
+        // there either.
+        let free = crate::nap::pull::MAX_PULL_CONNECTIONS.saturating_sub(puller.pull_connections());
+        if free == 0 || !puller.collector().has_room() || !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut candidates: Vec<SocketAddr> = self
+            .addrman
+            .read()
+            .iter()
+            .filter(|e| e.services & crate::nap::p2p::NODE_NAP_BIT != 0)
+            .map(|e| e.addr)
+            .collect();
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+        let mut opened = 0;
+        for addr in candidates {
+            if opened == free {
+                break;
+            }
+            let source = addr.to_string();
+            if !puller.due(&source, now)
+                || self.is_addr_connected(&addr)
+                || self.is_addr_banned(&addr)
+                || !self.reachable.read().contains_socket(&addr)
+            {
+                continue;
+            }
+            puller.dial_started(&source, now);
+            opened += 1;
+            let (pm, p) = (Arc::clone(self), puller.clone());
+            tokio::spawn(async move {
+                let dial = pm.connect_outbound_inner(addr, Some(ConnType::NapPull), None, false);
+                let failed = match tokio::time::timeout(crate::nap::pull::DIAL_TIMEOUT, dial).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some("timed out".to_owned()),
+                };
+                if let Some(e) = failed {
+                    tracing::debug!(target: "nap", %addr, "NAP: pull connection failed: {e}");
+                    p.dial_ended(&addr.to_string());
+                }
+            });
         }
     }
 
@@ -6354,6 +7175,14 @@ impl PeerManager {
                 ) => {
                     tracing::debug!(id, "Header rejected: time-too-new");
                 }
+                // A header forking below the last checkpoint: Core's
+                // `MaybePunishNodeForBlock` answers `BLOCK_CHECKPOINT` with
+                // `Misbehaving`, which discourages and disconnects the peer.
+                // No honest peer sends one: its main-chain headers below the
+                // checkpoint are already known and skipped before the check.
+                crate::chain::state::ChainError::ForkBeforeCheckpoint(_) => {
+                    self.add_ban_score(id, BAN_THRESHOLD, &format!("Header rejected: {}", e));
+                }
                 other => {
                     self.add_ban_score(id, 20, &format!("Header rejected: {}", other));
                 }
@@ -6630,7 +7459,7 @@ impl PeerManager {
             // What the peer claimed at connect, or has announced since.
             (
                 (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from)),
-                handle.info.is_limited(),
+                handle.info.is_depth_limited(),
             )
         };
         let (peer_height, limited) = peer_height;
@@ -6654,7 +7483,9 @@ impl PeerManager {
             // [`LIMITED_PEER_BLOCK_DEPTH`] of its tip (`net_processing.cpp:1533`)
             // and not at all during IBD (`:6164`). The scheduler can hand out
             // any height above the cursor, so use such a peer only when every
-            // one of those is that recent.
+            // one of those is that recent. A limited peer advertising
+            // `NODE_INTACT_BLOCKS` is not held to this: a block it has
+            // stripped comes back `notfound` and goes to another peer.
             if limited && max_height - scheduler.connect_cursor() >= LIMITED_PEER_BLOCK_DEPTH {
                 return;
             }
@@ -6805,17 +7636,21 @@ impl PeerManager {
     /// Peer ids eligible to serve a block re-fetch: connected, advertising
     /// `NODE_NETWORK` so they should hold historical blocks, and
     /// `NODE_WITNESS` so they can serve the witness serialization we ask for.
+    /// Only when no such peer is connected, the `NODE_NETWORK_LIMITED` peers
+    /// with `NODE_INTACT_BLOCKS` instead: one may have stripped the block,
+    /// and a re-fetch does not track a `notfound` to move on from it.
     pub fn block_serving_peer_ids(&self) -> Vec<PeerId> {
         let peers = self.peers.read();
-        peers
-            .iter()
-            .filter(|(_, h)| {
-                h.info.state == PeerState::Connected
-                    && h.info.services.has(ServiceFlags::NETWORK)
-                    && h.info.services.has(ServiceFlags::WITNESS)
-            })
-            .map(|(id, _)| *id)
-            .collect()
+        let (mut full, mut intact) = (Vec::new(), Vec::new());
+        for (id, h) in peers.iter() {
+            if h.info.state == PeerState::Connected
+                && h.info.serves_deep_blocks()
+                && h.info.services.has(ServiceFlags::WITNESS)
+            {
+                if h.info.is_limited() { intact.push(*id) } else { full.push(*id) }
+            }
+        }
+        if full.is_empty() { intact } else { full }
     }
 
     /// Route a block that `getblockfrompeer` asked for into the repair path.
@@ -6862,6 +7697,7 @@ impl PeerManager {
                 %hash, id,
                 "getblockfrompeer: not a data hole; handing to the normal block path"
             );
+            self.note_opreturn_restore_arrival(&hash, id, block, RestoreArrival::NotOurs);
             return false;
         }
 
@@ -6871,6 +7707,16 @@ impl PeerManager {
             // ordinary duplicates.
             self.block_refetch.write().retain(|(h, _), _| *h != hash);
         }
+        self.note_opreturn_restore_arrival(
+            &hash,
+            id,
+            block,
+            match &outcome {
+                Ok(_) => RestoreArrival::Restored,
+                Err(crate::chain::state::ChainError::Validation(_)) => RestoreArrival::BadCopy,
+                Err(_) => RestoreArrival::NotOurs,
+            },
+        );
         match outcome {
             Ok(crate::chain::state::BlockDataRepair::Repaired { height }) => {
                 tracing::info!(
@@ -7184,7 +8030,8 @@ impl PeerManager {
                 crate::validation::ValidationError::TimeTooNew,
             ) => false,
             crate::chain::state::ChainError::Validation(_)
-            | crate::chain::state::ChainError::CheckpointMismatch(_) => true,
+            | crate::chain::state::ChainError::CheckpointMismatch(_)
+            | crate::chain::state::ChainError::ForkBeforeCheckpoint(_) => true,
             crate::chain::state::ChainError::Connect(ce) => ce.is_verdict_on_block(),
             _ => false,
         }
@@ -7202,7 +8049,7 @@ impl PeerManager {
         match e {
             ChainError::Validation(crate::validation::ValidationError::TimeTooNew) => false,
             ChainError::Validation(v) => !v.is_mutation_class(),
-            ChainError::CheckpointMismatch(_) => true,
+            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
             ChainError::Connect(ce) => ce.is_verdict_on_block(),
             _ => false,
         }
@@ -7279,6 +8126,26 @@ impl PeerManager {
     /// Drive the AssumeUTXO background catch-up download: request the next
     /// window of historical block data above the background connect cursor
     /// from connected peers. Frees the tracker once no background remains.
+    /// The peers the background download asks, in id order. Core downloads
+    /// historical blocks only from a peer that keeps them all: NODE_NETWORK,
+    /// not a limited one (`net_processing.cpp:6176`). A limited peer
+    /// advertising `NODE_INTACT_BLOCKS` is asked too.
+    fn bg_catchup_peer_ids(&self) -> Vec<PeerId> {
+        let peers = self.peers.read();
+        let mut ids: Vec<PeerId> = peers
+            .iter()
+            .filter(|(_, h)| {
+                h.info.state == PeerState::Connected
+                    && h.info.serves_blocks()
+                    && h.info.advertises_blocks()
+                    && !h.info.is_depth_limited()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     fn drive_bg_catchup_download(&self) {
         let bg = match self.chain_state.background() {
             Some(b) => b,
@@ -7326,23 +8193,7 @@ impl PeerManager {
             return;
         }
 
-        // Core downloads historical blocks only from a peer that keeps them
-        // all: NODE_NETWORK, not a limited one (`net_processing.cpp:6176`).
-        let peer_ids: Vec<PeerId> = {
-            let peers = self.peers.read();
-            let mut ids: Vec<PeerId> = peers
-                .iter()
-                .filter(|(_, h)| {
-                    h.info.state == PeerState::Connected
-                        && h.info.serves_blocks()
-                        && h.info.advertises_blocks()
-                        && !h.info.is_limited()
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            ids.sort_unstable();
-            ids
-        };
+        let peer_ids = self.bg_catchup_peer_ids();
         if peer_ids.is_empty() {
             return;
         }
@@ -7353,6 +8204,248 @@ impl PeerManager {
             for chunk in hashes.chunks(128) {
                 self.send_to_peer(pid, sync::make_getdata_blocks(chunk));
             }
+        }
+    }
+
+    /// The peers a restore may ask (plan §11.4): connected, keeping every
+    /// block (`NODE_NETWORK`) and serving witnesses. Never a limited peer,
+    /// `NODE_INTACT_BLOCKS` or not: it may have stripped the same block.
+    fn opreturn_restore_peer_ids(&self) -> Vec<PeerId> {
+        let peers = self.peers.read();
+        let mut ids: Vec<PeerId> = peers
+            .iter()
+            .filter(|(_, h)| {
+                h.info.state == PeerState::Connected
+                    && h.info.serves_blocks()
+                    && h.info.services.has(ServiceFlags::NETWORK | ServiceFlags::WITNESS)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Drive the `-restoreopreturns` download (plan §11.4): start a pass over
+    /// the strip records, check the free space before each window, and ask
+    /// peers for the window's blocks. The tip comes first: nothing new is
+    /// asked while the node is behind. Each arrival takes the repair route
+    /// (`handle_refetched_block`), which restores the block in place.
+    fn drive_opreturn_restore(&self) {
+        use crate::chain::state::WorkerStatus;
+        let cs = &self.chain_state;
+        if !cs.opreturn_restore_pending() {
+            *self.opreturn_restore_loaded.lock() = None;
+            if self.opreturn_restore.lock().take().is_some() {
+                tracing::info!("OP_RETURN restore: no stripped block left to download");
+            }
+            return;
+        }
+        let now = Instant::now();
+        let peers = self.opreturn_restore_peer_ids();
+        let mut guard = self.opreturn_restore.lock();
+        let restore = guard.get_or_insert_with(Default::default);
+        restore.peers = peers.len();
+        let stalled = restore.release_stale(now);
+        if stalled > 0 {
+            tracing::debug!(stalled, "OP_RETURN restore: stalled requests given to other peers");
+        }
+        let report = |restore: &crate::net::opreturn_restore::RestoreDownloader, status| {
+            cs.set_opreturn_restore_status(status, Some(restore.progress()));
+        };
+        if let Some(why) = cs.opreturn_restore_held_by_tip() {
+            tracing::trace!(why, "OP_RETURN restore: waiting for the tip");
+            report(restore, WorkerStatus::WaitingForTip);
+            return;
+        }
+        if restore.is_idle() {
+            let loaded = self.opreturn_restore_loaded.lock().take();
+            match loaded {
+                Some(Ok(work)) => {
+                    restore.loading = false;
+                    let bytes: u64 = work.iter().map(|i| i.len).sum();
+                    if work.is_empty() {
+                        // The last block is restored; the strip worker's
+                        // finish step has yet to run.
+                        tracing::debug!("OP_RETURN restore: no stripped block to download in this pass");
+                    } else {
+                        tracing::info!(
+                            blocks = work.len(),
+                            bytes,
+                            "OP_RETURN restore: downloading the stripped blocks again from peers that keep \
+                             every block"
+                        );
+                    }
+                    restore.start_pass(work, now);
+                }
+                Some(Err(e)) => {
+                    restore.loading = false;
+                    tracing::warn!(error = %e, "OP_RETURN restore: reading the strip records failed; retrying in a minute");
+                    restore.hold_off(now);
+                    report(restore, WorkerStatus::Restoring);
+                    return;
+                }
+                None => {
+                    if peers.is_empty() {
+                        report(restore, WorkerStatus::WaitingForPeers);
+                        return;
+                    }
+                    if !restore.loading && restore.may_start_pass(now, &peers) {
+                        // The records, an index read and a file read for each:
+                        // too much for the event loop on a node that stripped a
+                        // lot. On a pruning node, newest first (R-6): those are
+                        // the blocks pruning keeps longest.
+                        restore.loading = true;
+                        let chain = Arc::clone(&self.chain_state);
+                        let slot = Arc::clone(&self.opreturn_restore_loaded);
+                        let descending = self.is_pruning();
+                        tokio::task::spawn_blocking(move || {
+                            // A read only: nothing it could leave half done.
+                            *slot.lock() = Some(load_restore_work(std::panic::AssertUnwindSafe(|| {
+                                chain.opreturn_restore_work(descending).map_err(|e| e.to_string())
+                            })));
+                        });
+                    }
+                    report(restore, WorkerStatus::Restoring);
+                    return;
+                }
+            }
+        }
+        if restore.window_is_empty() {
+            if !self.opreturn_restore_disk_ok(restore, now) {
+                report(restore, WorkerStatus::WaitingForDisk);
+                return;
+            }
+            restore.next_window();
+        }
+        if peers.is_empty() {
+            report(restore, WorkerStatus::WaitingForPeers);
+            return;
+        }
+        let assignments = restore.assign(&peers, now);
+        report(restore, WorkerStatus::Restoring);
+        drop(guard);
+
+        for (peer, hashes) in assignments {
+            // Registered before sending, as `request_block_from_peer` does: the
+            // reply can land before the send returns.
+            {
+                let mut pending = self.block_refetch.write();
+                pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+                for hash in &hashes {
+                    pending.insert((*hash, peer), now);
+                }
+            }
+            for chunk in hashes.chunks(PER_GETDATA_BLOCKS) {
+                if !self.send_to_peer(peer, sync::make_getdata_blocks(chunk)) {
+                    let mut pending = self.block_refetch.write();
+                    for hash in chunk {
+                        pending.remove(&(*hash, peer));
+                    }
+                    if let Some(restore) = self.opreturn_restore.lock().as_mut() {
+                        for hash in chunk {
+                            restore.note_failed(hash, peer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The free-space check before each restore window (plan §11.4): the
+    /// blocks volume needs room for what the holes still lack, plus 1 GiB.
+    /// Warns once when it does not, and rechecks every minute. On regtest the
+    /// figure for free space can come from the file `SATD_TEST_FREE_SPACE_FILE`
+    /// names, read on every check.
+    fn opreturn_restore_disk_ok(
+        &self,
+        restore: &mut crate::net::opreturn_restore::RestoreDownloader,
+        now: Instant,
+    ) -> bool {
+        const RESERVE: u64 = 1 << 30;
+        const RECHECK: Duration = Duration::from_secs(60);
+        let cs = &self.chain_state;
+        let test_free = (cs.network == bitcoin::Network::Regtest)
+            .then(|| std::env::var_os(RESTORE_TEST_FREE_SPACE_ENV))
+            .flatten()
+            .map(|path| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok()));
+        if test_free.is_none()
+            && restore.disk_checked_at.is_some_and(|at| now.duration_since(at) < RECHECK)
+        {
+            return false;
+        }
+        let free = match test_free {
+            Some(free) => free,
+            None => crate::diskspace::free_disk_bytes(cs.blocks_dir()),
+        };
+        let Some(free) = free else {
+            // Free space unknown: nothing to judge by, so do not hold the
+            // restore back.
+            return true;
+        };
+        let (apparent, allocated) = cs.blocks_dir_usage().unwrap_or((0, 0));
+        let needed = apparent.saturating_sub(allocated).min(restore.remaining_bytes());
+        if free >= needed.saturating_add(RESERVE) {
+            if restore.disk_wait_since.take().is_some() {
+                tracing::info!(free, needed, "OP_RETURN restore: enough free space again; resuming");
+            }
+            restore.disk_checked_at = None;
+            return true;
+        }
+        if restore.disk_wait_since.is_none() {
+            tracing::warn!(
+                free,
+                needed,
+                "OP_RETURN restore: the blocks volume has too little free space for the stripped \
+                 blocks (what they need, plus 1 GiB); waiting, and checking again every minute"
+            );
+            restore.disk_wait_since = Some(now);
+        }
+        restore.disk_checked_at = Some(now);
+        false
+    }
+
+    /// Tell the restore what became of a block it asked `peer` for.
+    fn note_opreturn_restore_arrival(
+        &self,
+        hash: &bitcoin::BlockHash,
+        peer: PeerId,
+        block: &bitcoin::Block,
+        arrival: RestoreArrival,
+    ) {
+        let mut guard = self.opreturn_restore.lock();
+        let Some(restore) = guard.as_mut() else {
+            return;
+        };
+        match arrival {
+            RestoreArrival::Restored => {}
+            // The peer's copy does not match the header: ask someone else.
+            RestoreArrival::BadCopy => {
+                restore.note_failed(hash, peer);
+                return;
+            }
+            // Ours, not the peer's: a local error, or the entry changed. Left
+            // for the next pass, held against no peer.
+            RestoreArrival::NotOurs => {
+                restore.skip(hash, Instant::now());
+                return;
+            }
+        }
+        if !restore.note_restored(hash, peer, block.total_size() as u64) {
+            return;
+        }
+        let progress = restore.progress();
+        self.chain_state.set_opreturn_restore_status(crate::chain::state::WorkerStatus::Restoring, Some(progress));
+        let done = restore.restored_blocks();
+        if done.is_multiple_of(RESTORE_PROGRESS_EVERY) {
+            let rate = restore.rate(Instant::now());
+            tracing::info!(
+                restored = done,
+                remaining = progress.remaining_blocks,
+                remaining_bytes = progress.remaining_bytes,
+                blocks_per_sec = format!("{rate:.1}"),
+                eta_secs = progress.estimated_remaining_seconds,
+                "OP_RETURN restore progress"
+            );
         }
     }
 
@@ -10315,7 +11408,11 @@ impl PeerManager {
                 // held is Core's `BLOCK_HAVE_DATA`, read from the block
                 // index: loading each block to find out would read up to 282
                 // of them from disk to answer one small request.
-                if self.is_pruning()
+                // A node limited by OP_RETURN stripping invs no deep block
+                // either: it would disconnect the peer that asked for it.
+                let limited = self.is_pruning()
+                    || (self.chain_state.opreturn_prune_active() && !self.serves_intact_blocks());
+                if limited
                     && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || !self.chain_state.has_block_data(&hash))
                 {
                     break;
@@ -10462,9 +11559,12 @@ impl PeerManager {
         }
         let services = self.local_services();
         let below_limit = self.chain_state.tip_height().saturating_sub(entry.height) > NODE_NETWORK_LIMITED_MIN_BLOCKS + 2;
+        // `-pruneopreturnpeers=intact` serves deep blocks: a stripped one
+        // reads as unavailable below and gets `notfound`, the peer staying.
         if !services.has(ServiceFlags::NETWORK)
             && services.has(ServiceFlags::NETWORK_LIMITED)
             && below_limit
+            && !self.serves_intact_blocks()
             && !self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban)
         {
             tracing::debug!("Ignore block request below NODE_NETWORK_LIMITED threshold, disconnecting peer={id}");
@@ -11322,13 +12422,19 @@ impl PeerManager {
     ///
     /// A block goes to a peer known to have it, as Core downloads from a peer
     /// only up to its `pindexBestKnownBlock` and from a limited peer only
-    /// within [`LIMITED_PEER_BLOCK_DEPTH`] of it (`net_processing.cpp:1533`).
+    /// within [`LIMITED_PEER_BLOCK_DEPTH`] of it (`net_processing.cpp:1533`),
+    /// unless it advertises `NODE_INTACT_BLOCKS`.
     /// When no peer qualifies (heights not yet known), any peer is asked.
     fn sweep_missing_blocks(&self, peers: &[PeerId]) {
         if peers.is_empty() {
             return;
         }
         let missing = self.missing_blocks_to_fetch();
+        let not_found = {
+            let mut not_found = self.sweep_not_found.write();
+            not_found.retain(|hash, _| missing.contains(hash));
+            not_found.clone()
+        };
         if missing.is_empty() {
             return;
         }
@@ -11341,7 +12447,7 @@ impl PeerManager {
                     handles.get(id).map_or((-1, false), |h| {
                         let height = (h.info.best_height as i64)
                             .max(h.info.best_known_height.map_or(-1, i64::from));
-                        (height, h.info.is_limited())
+                        (height, h.info.is_depth_limited())
                     })
                 })
                 .collect()
@@ -11367,11 +12473,14 @@ impl PeerManager {
         let mut given: Vec<Vec<bitcoin::BlockHash>> = vec![Vec::new(); peers.len()];
         let mut next = 0usize;
         for hash in missing {
-            let before: &[PeerId] = match asked.get(&hash) {
+            // Peers to try last: those asked before, and those that said
+            // `notfound`.
+            let mut before: Vec<PeerId> = match asked.get(&hash) {
                 Some((age, _)) if *age < SWEEP_REREQUEST_AFTER => continue,
-                Some((_, who)) => who,
-                None => &[],
+                Some((_, who)) => who.clone(),
+                None => Vec::new(),
             };
+            before.extend(not_found.get(&hash).into_iter().flatten());
             let height = self.chain_state.get_block_index(&hash).map(|e| e.height);
             let any_has_it = (0..peers.len()).any(|i| can_serve(i, height));
             let pick = |fresh_only: bool| {
@@ -11736,6 +12845,7 @@ impl PeerManager {
     /// the type `addconnection` was given. `None` means "work it out from
     /// the address" ([`Self::untyped_outbound_conn_type`]), which is how the
     /// reconnect loop's dials, and a seed's, reach here.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_peer(
         self: &Arc<Self>,
         id: PeerId,
@@ -11743,11 +12853,13 @@ impl PeerManager {
         transport: IncomingTransport,
         direction: Direction,
         onion_host: Option<&str>,
+        addr_name: Option<String>,
         conn_type: Option<ConnType>,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
         info.onion_host = onion_host.map(str::to_string);
+        info.addr_name = addr_name;
         // Peers from `addnode` / `-connect` are `manual`; everything the
         // node dials by itself is `outbound-full-relay`. The type is not a
         // label only: it decides the outgoing `-whitelist` below, whether a
@@ -11994,6 +13106,21 @@ impl PeerManager {
             .map_err(|e| format!("connect to onion {host}:{port} via proxy: {e}"))
     }
 
+    /// Dial a host name through `-proxy`, which resolves it: Core's
+    /// `ConnectNode` with a destination name and a name proxy. Never resolved
+    /// here; with no proxy there is no dial.
+    async fn dial_name(&self, host: &str, port: u16) -> Result<TcpStream, String> {
+        let proxy_addr = self
+            .proxy
+            .as_deref()
+            .ok_or("no proxy configured to resolve a name through")?;
+        let cred = self.socks_cred();
+        let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        proxy::connect_socks5_name(proxy_addr, host, port, cred_ref, self.socks_dial_timeouts())
+            .await
+            .map_err(|e| format!("connect to {host}:{port} via proxy: {e}"))
+    }
+
     /// Bounds for a SOCKS5 dial: `-timeout` reaches the proxy, and the SOCKS5
     /// exchange gets at least [`SOCKS5_EXCHANGE_TIMEOUT_FLOOR_MS`].
     fn socks_dial_timeouts(&self) -> proxy::DialTimeouts {
@@ -12005,6 +13132,7 @@ impl PeerManager {
         match target {
             OutboundDial::Direct(addr) => self.dial_direct(*addr).await,
             OutboundDial::Onion(host, port) => self.dial_onion(host, *port).await,
+            OutboundDial::Name(host, port) => self.dial_name(host, *port).await,
         }
     }
 
@@ -12033,7 +13161,7 @@ impl PeerManager {
         let magic = self.chain_state.p2p_magic();
         let skip_v2 = match &target {
             OutboundDial::Direct(addr) => self.v2_downgraded.read().contains(addr),
-            OutboundDial::Onion(..) => false,
+            OutboundDial::Onion(..) | OutboundDial::Name(..) => false,
         };
         let v2_wanted = use_v2.unwrap_or_else(|| self.v2_transport_enabled());
         if !v2_wanted || skip_v2 {
@@ -12184,6 +13312,10 @@ impl PeerManager {
         // (`fPreferredDownload`/`CanServeBlocks` both exclude it), because the
         // connection is about to be dropped.
         let conn_type = self.conn_type_of(id);
+        // A NAP pull connection carries only the pull, which the aggregator
+        // starts once the peer is connected: none of the session setup
+        // below goes out on it.
+        let quiet = conn_type == ConnType::NapPull;
         if conn_type == ConnType::AddrFetch {
             // Room for the answer, before it can arrive.
             self.note_getaddr_sent(id);
@@ -12191,7 +13323,7 @@ impl PeerManager {
                 .send(NetworkMessage::GetAddr)
                 .await
                 .map_err(|e| format!("send getaddr: {}", e))?;
-        } else {
+        } else if !quiet {
             // Request headers to start sync, from one below our best so an
             // up-to-date peer answers with a header rather than nothing.
             let getheaders = sync::make_initial_getheaders(&self.chain_state);
@@ -12204,17 +13336,18 @@ impl PeerManager {
         // in low-bandwidth mode, as Core does. A peer is asked for
         // high-bandwidth announcements only once it has delivered a block
         // that became our tip (`maybe_set_peer_as_hb`).
-        writer.send(NetworkMessage::SendCmpct(
-            bitcoin::p2p::message_compact_blocks::SendCmpct {
-                send_compact: false,
-                version: 2,
-            },
-        ))
-        .await
-        .map_err(|e| format!("send sendcmpct: {}", e))?;
+        if !quiet {
+            writer
+                .send(NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                    send_compact: false,
+                    version: 2,
+                }))
+                .await
+                .map_err(|e| format!("send sendcmpct: {}", e))?;
+        }
 
         // Send our fee filter (BIP 133) so peer doesn't relay low-fee txs to us
-        if let Some(rate) = self.fee_filter_for(id) {
+        if !quiet && let Some(rate) = self.fee_filter_for(id) {
             writer
                 .send(NetworkMessage::FeeFilter(rate as i64))
                 .await
@@ -12228,21 +13361,17 @@ impl PeerManager {
         // completes — that is when it sends its one-shot `getaddr` — and
         // skips block-relay-only peers. Inbound links latch lazily instead,
         // in the addr handlers.
-        if direction == Direction::Outbound {
-            self.setup_address_relay(id);
-        }
+        let relays_addrs = direction == Direction::Outbound && !quiet && self.setup_address_relay(id);
 
-        // Proactively request addresses from outbound peers when running over a
-        // proxy. Onion peers are discovered only through gossip (the hardcoded
-        // seeds aside), and a one-time getaddr pulls the peer's address set
-        // promptly instead of waiting for unsolicited trickle — which a short-
-        // lived connection may never deliver. Matches Bitcoin Core, which sends
-        // getaddr to outbound peers. Scoped to proxy mode to leave clearnet
-        // address handling unchanged in this fix.
-        if direction == Direction::Outbound
-            && conn_type != ConnType::AddrFetch
-            && (self.proxy.is_some() || self.onion_proxy.is_some())
-        {
+        // The one-shot `getaddr` to every outbound peer that relays addresses,
+        // as Core sends it (`ProcessMessage`, VERSION). satd sent it only over
+        // a proxy, and on clearnet that left the address book with nothing
+        // new: a Core peer relays addresses to an inbound link only once that
+        // link has sent `addr`, `addrv2` or `getaddr` (`SetupAddressRelay`),
+        // so a node that sent none was told of no address at all, and dialled
+        // the few in its book over and over. An addr-fetch link has sent its
+        // `getaddr` already.
+        if relays_addrs && conn_type != ConnType::AddrFetch {
             self.note_getaddr_sent(id);
             writer.send(NetworkMessage::GetAddr)
                 .await
@@ -12264,13 +13393,14 @@ impl PeerManager {
         // Neither goes to a block-relay-only peer.
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
+            && !quiet
             && let Some(msg) = self.self_advertise_externals(id)
             && let Err(e) = writer.send(msg).await
         {
             tracing::debug!(id, "self-advertise addr send failed: {}", e);
         }
 
-        if let Some(addr_msg) = self.self_advertise_addrv2(id) {
+        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2(id) {
             // Best-effort gossip: a failed advertisement must NOT tear down an
             // otherwise-healthy peer we just spent a full Tor rendezvous
             // establishing. Log and continue (unlike the session-setup sends
@@ -12824,19 +13954,17 @@ impl PeerManager {
     /// block-relay-only or addr-fetch peer: `NETWORK | WITNESS`, or
     /// `NETWORK_LIMITED | WITNESS` from a pruned peer while our tip is within a
     /// day of now. Returns the flags wanted when the peer lacks them.
+    ///
+    /// `NODE_INTACT_BLOCKS` does not count for `NETWORK` here: an intact peer
+    /// is used for old blocks only when we are connected to it anyway, so the
+    /// outbound slots keep finding peers that hold every block.
     fn missing_desirable_services(&self, services: ServiceFlags) -> Option<ServiceFlags> {
-        let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        if services.has(ServiceFlags::NETWORK_LIMITED) {
-            let tip_time = self
-                .chain_state
-                .get_block_index(&self.chain_state.tip_hash())
-                .map_or(0, |e| e.header.time as u64);
-            let depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
-            if depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS {
-                wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-            }
-        }
-        (!services.has(wanted)).then_some(wanted)
+        let tip_time = self
+            .chain_state
+            .get_block_index(&self.chain_state.tip_hash())
+            .map_or(0, |e| e.header.time as u64);
+        let tip_depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
+        missing_desirable_services(services, tip_depth, self.chain_state.opreturn_restore_pending())
     }
 
     /// Perform the version/verack handshake, bounded by `-peertimeout`.
@@ -12911,6 +14039,22 @@ impl PeerManager {
                 let addr = conn.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
                 tracing::info!("connected to self at {addr}, disconnecting");
                 return Err("connected to self".to_string());
+            }
+        }
+
+        // Core's `SetServices`, before the services check below so that a
+        // peer dropped for lacking them is recorded as lacking them: an
+        // outbound peer's `version` states what its address offers now,
+        // over what gossip said. Onion peers have no entry in the book.
+        if direction == Direction::Outbound {
+            let dialled = self
+                .peers
+                .read()
+                .get(&id)
+                .filter(|h| h.info.onion_host.is_none() && h.info.addr_name.is_none())
+                .map(|h| h.info.addr);
+            if let Some(addr) = dialled {
+                self.addrman.write().set_services(&addr, their_version.services.to_u64());
             }
         }
 
@@ -12999,8 +14143,10 @@ impl PeerManager {
         // before it has the header, so a peer that mines while this node
         // syncs would hand it an out-of-order chain; header announcements
         // from the start keep that sync in order. Marked sent, so the
-        // condition never sends a second one.
+        // condition never sends a second one. A NAP pull connection syncs
+        // nothing.
         if direction == Direction::Outbound
+            && conn_type != ConnType::NapPull
             && their_version.version.min(PROTOCOL_VERSION) >= SENDHEADERS_VERSION
         {
             conn.send(NetworkMessage::SendHeaders)
@@ -13109,10 +14255,19 @@ impl PeerManager {
     /// fetching history behind an AssumeUTXO snapshot (`init.cpp`). satd
     /// claimed `NODE_NETWORK` when pruned too, so peers asked it for blocks
     /// it had deleted, and dropped `NODE_NETWORK_LIMITED` on every node.
+    ///
+    /// OP_RETURN stripping counts as pruning here (plan §2.9): a node that
+    /// strips, or still holds stripped blocks, does not hold every block as
+    /// it was mined. Under `-pruneopreturnpeers=intact` it also advertises
+    /// `NODE_INTACT_BLOCKS`.
     pub fn local_services(&self) -> ServiceFlags {
         let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-        if !self.is_pruning() && !self.chain_state.has_background() {
+        let stripping = self.chain_state.opreturn_prune_active();
+        if !self.is_pruning() && !self.chain_state.has_background() && !stripping {
             services |= ServiceFlags::NETWORK;
+        }
+        if stripping && self.serves_intact_blocks() {
+            services |= crate::net::peer::node_intact_blocks();
         }
         // BIP 324 NODE_P2P_V2 (bit 11), which Core sets with -v2transport.
         if self.v2_transport_enabled() {
@@ -13168,6 +14323,20 @@ impl PeerManager {
 }
 
 /// Current Unix time in whole seconds (saturating; 0 before the epoch).
+/// The connection a NAP pull from a peer of this kind would run over, or
+/// `None` if none runs over it: an address-fetch or feeler connection closes
+/// at once, so a pull would die with it and wait an hour to be tried again,
+/// and a block-relay connection carries nothing but blocks.
+fn nap_pull_via(conn_type: ConnType) -> Option<crate::nap::pull::Via> {
+    use crate::nap::pull::Via;
+    match conn_type {
+        ConnType::NapPull => Some(Via::Pull),
+        ConnType::OutboundFullRelay | ConnType::Manual => Some(Via::Outbound),
+        ConnType::Inbound => Some(Via::Inbound),
+        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler => None,
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -13212,6 +14381,10 @@ mod chainsel_tests;
 #[cfg(test)]
 #[path = "manager_txrequest_tests.rs"]
 mod txrequest_tests;
+
+#[cfg(test)]
+#[path = "manager_lowwork_tests.rs"]
+mod lowwork_tests;
 
 #[cfg(test)]
 #[path = "manager_1p1c_tests.rs"]
@@ -13892,6 +15065,58 @@ mod tests {
             },
             rx,
         )
+    }
+
+    /// A `feefilter` outside `MoneyRange` is ignored and the peer keeps its
+    /// previous filter, as Core ignores it (`net_processing.cpp:5038`).
+    /// satd clamped a negative value to 0 and took one above `MAX_MONEY`.
+    #[test]
+    fn an_out_of_range_fee_filter_is_ignored() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                Box::new(InMemoryStore::new()),
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm = PeerManager::new(
+            chain_state,
+            Arc::new(Mempool::new(1_000_000, 0)),
+            Arc::new(FeeEstimator::new()),
+            Network::Regtest,
+            shutdown_rx,
+        );
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h, _rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h);
+        let filter = || pm.peers.read().get(&1).unwrap().info.fee_filter;
+
+        pm.set_peer_fee_filter(1, 5_000);
+        assert_eq!(filter(), 5_000);
+        for out_of_range in [-1, i64::MIN, MAX_MONEY_SATS as i64 + 1, i64::MAX] {
+            pm.set_peer_fee_filter(1, out_of_range);
+            assert_eq!(filter(), 5_000, "{out_of_range} must be ignored");
+        }
+        pm.set_peer_fee_filter(1, MAX_MONEY_SATS as i64);
+        assert_eq!(filter(), MAX_MONEY_SATS);
+        pm.set_peer_fee_filter(1, 0);
+        assert_eq!(filter(), 0);
     }
 
     /// `announce_tx` is the local-origin broadcast path shared by the
@@ -14839,6 +16064,15 @@ mod tests {
         pm.add_learned_peer_addr(&PeerAddr::Socket(seed));
         assert!(pm.learned_addrs.read().contains(&seed));
         assert!(!pm.manual_addrs.read().contains(&seed));
+        // In the book too, new, and dated three to seven days back as Core
+        // dates a seed's answers. satd left seeds out of the book.
+        {
+            let book = pm.addrman.read();
+            let entry = book.iter().find(|e| e.addr == seed).expect("the seed is in the address book");
+            assert!(!entry.tried);
+            let age = now_unix_secs() - entry.last_seen;
+            assert!((SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS + 5).contains(&age), "age {age}");
+        }
 
         pm.connect_peer_addr_automatic(&PeerAddr::Socket(seed)).await.expect("the seed dial connects");
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);

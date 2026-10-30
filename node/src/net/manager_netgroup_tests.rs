@@ -149,7 +149,8 @@ fn a_dial_pass_fills_every_slot_from_distinct_groups() {
     leave_ibd(&pm);
     let addrs: Vec<SocketAddr> = (0..MAX_OUTBOUND).map(own_group).collect();
     learn(&pm, &addrs);
-    let dials = dialled(&pm);
+    let mut dials = dialled(&pm);
+    dials.sort();
     assert_eq!(dials, addrs);
 }
 
@@ -176,7 +177,9 @@ fn outbound_peers_hold_their_group_and_inbound_peers_and_feelers_do_not() {
     let candidates: Vec<SocketAddr> =
         [44u8, 45, 46, 47, 48].iter().map(|b| SocketAddr::from(([*b, 1, 1, 1], 8333))).collect();
     learn(&pm, &candidates);
-    let dials = dialled(&pm);
+    // Automatic dials are drawn at random from the book, so compare sets.
+    let mut dials = dialled(&pm);
+    dials.sort();
     assert_eq!(dials, candidates[3..].to_vec(), "only the inbound and feeler groups are free");
 }
 
@@ -398,4 +401,202 @@ async fn seeds_are_dialled_by_the_automatic_pass() {
         assert!(Instant::now() < deadline, "the seed peer appears");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Mark `addrs` as dialled a moment ago, connected or not.
+fn tried_just_now(pm: &PeerManager, addrs: &[SocketAddr]) {
+    let mut backoff = pm.reconnect_backoff.write();
+    for a in addrs {
+        backoff.insert(
+            *a,
+            ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+        );
+    }
+}
+
+/// Core passes over an address it tried in the last ten minutes until it
+/// has looked at 30 candidates. satd dialled the first candidates on its
+/// list that were not backing off, and a dial that connected cleared the
+/// backoff, so a peer that hung up just after the handshake was dialled
+/// again on the next pass: about a thousand times a day for each of the
+/// two peers at the front of one node's list.
+#[test]
+fn an_automatic_dial_passes_over_a_peer_it_just_tried() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let addrs: Vec<SocketAddr> = (0..20).map(own_group).collect();
+    learn(&pm, &addrs);
+    tried_just_now(&pm, &addrs[1..]);
+    for _ in 0..20 {
+        let got = dialled(&pm);
+        assert_eq!(got.first(), Some(&addrs[0]), "the one not tried lately goes first: {got:?}");
+        assert_eq!(got.len(), MAX_OUTBOUND, "the passed-over ones fill the rest: {got:?}");
+    }
+}
+
+/// Core draws its candidates with replacement, so a book of fewer than 30
+/// addresses, all tried lately, still gives it one to dial. Each address
+/// comes up once in a satd pass; the ones passed over are dialled once
+/// every other candidate has been looked at.
+#[test]
+fn a_book_smaller_than_the_skip_count_still_redials_its_peers() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let addrs: Vec<SocketAddr> = (0..3).map(own_group).collect();
+    learn(&pm, &addrs);
+    tried_just_now(&pm, &addrs);
+    let mut got = dialled(&pm);
+    got.sort();
+    assert_eq!(got, addrs);
+}
+
+/// Core's `AddrMan::Select` takes the tried table or the new table at the
+/// toss of a coin, then an entry at random. satd walked its list in the
+/// order it learned the addresses, so the ones loaded from `peers.dat` were
+/// first on every pass, and a book of a few tried addresses and many new
+/// ones dialled the same few first every time.
+#[test]
+fn automatic_dials_draw_tried_and_new_at_even_odds() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let tried: Vec<SocketAddr> = (0..10).map(own_group).collect();
+    let new: Vec<SocketAddr> = (10..1010).map(own_group).collect();
+    {
+        let mut book = pm.addrman.write();
+        for a in &new {
+            assert!(book.add(*a, 1));
+        }
+        for a in &tried {
+            book.mark_good(*a, 1);
+        }
+    }
+    learn(&pm, &tried);
+    learn(&pm, &new);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut tried_first = 0;
+    for _ in 0..400 {
+        let order = pm.automatic_dial_order(&mut rng);
+        assert_eq!(order.len(), tried.len() + new.len());
+        if tried.contains(&order[0]) {
+            tried_first += 1;
+        }
+    }
+    assert!((140..=260).contains(&tried_first), "tried first in {tried_first} of 400");
+    let mut order = pm.automatic_dial_order(&mut rng);
+    order.sort();
+    let mut all: Vec<SocketAddr> = tried.iter().chain(&new).copied().collect();
+    all.sort();
+    assert_eq!(order, all, "every learned address, once");
+}
+
+/// The onion half of the pass follows the same rule: an onion peer that
+/// hung up just after the handshake was dialled again on the next tick,
+/// since a dial that connected cleared its backoff.
+#[test]
+fn an_onion_dial_passes_over_a_peer_it_just_tried() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.reachable.write().onion = true;
+    // Seven of the eight automatic slots taken: room for one onion dial.
+    for i in 0..MAX_OUTBOUND - 1 {
+        add_peer(&pm, outbound(i as PeerId + 1, own_group(100 + i), ConnType::OutboundFullRelay));
+    }
+    let onions: Vec<PeerAddr> = (0..3)
+        .map(|i| PeerAddr::Onion { host: format!("{}.onion", "a".repeat(55) + &i.to_string()), port: 8333 })
+        .collect();
+    *pm.connect_peer_addrs.write() = onions.clone();
+    {
+        let mut backoff = pm.onion_reconnect_backoff.write();
+        for o in &onions[..2] {
+            backoff.insert(
+                o.to_string(),
+                ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+            );
+        }
+    }
+    let got: Vec<PeerAddr> = pm.reserve_onion_dials(Instant::now()).into_iter().map(|(t, _slot)| t).collect();
+    assert_eq!(got, vec![onions[2].clone()], "the one not tried lately");
+
+    // Tried lately, all of them: there is nothing else, so one is dialled.
+    pm.onion_reconnect_backoff.write().insert(
+        onions[2].to_string(),
+        ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+    );
+    assert_eq!(pm.reserve_onion_dials(Instant::now()).len(), 1);
+}
+
+/// #924: Core draws a tried bucket before an entry in it, so a group's share
+/// of the tried draws is bounded by its eight buckets. Five hundred tried
+/// entries in one /16 and fifty in fifty other groups: the big group used to
+/// come first in about 500 of every 550 tried draws.
+#[test]
+fn tried_dials_draw_a_bucket_before_an_entry() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let big = one_group(2000);
+    let small: Vec<SocketAddr> = (0..50).map(own_group).collect();
+    let mut tried_big = Vec::new();
+    {
+        let mut book = pm.addrman.write();
+        let small_tried = small.iter().filter(|a| book.mark_good(**a, 1)).count();
+        assert!(small_tried > 40, "fixture: {small_tried}");
+        for a in &big {
+            if book.mark_good(*a, 1) {
+                tried_big.push(*a);
+            }
+        }
+        assert!(tried_big.len() > 200, "fixture: {}", tried_big.len());
+        // The flood's collisions settle, every incumbent alive, so no
+        // incumbent to test goes first.
+        assert!(book.resolve_collisions(1).is_empty());
+        assert_eq!(book.select_tried_collision(), None);
+    }
+    learn(&pm, &tried_big);
+    learn(&pm, &small);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let mut big_first = 0;
+    for _ in 0..1000 {
+        if tried_big.contains(&pm.automatic_dial_order(&mut rng)[0]) {
+            big_first += 1;
+        }
+    }
+    // At most 8 of the ~58 buckets drawn belong to the big group.
+    assert!(big_first < 250, "the one group came first in {big_first} of 1000");
+}
+
+/// Test-before-evict, end to end: a promotion into a taken tried slot puts
+/// the incumbent first on the next dial order, and an incumbent the node is
+/// connected to is marked good on the reconnect tick, so the newcomer stays
+/// new.
+#[test]
+fn a_tried_collision_tests_the_incumbent() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let old = SocketAddr::from(([44, 7, 0, 1], 8333));
+    let now = now_unix_secs();
+    let (new, slot) = {
+        let mut book = pm.addrman.write();
+        // Long ago, so nothing but this tick's test keeps the incumbent.
+        assert!(book.mark_good(old, now - 10 * 3600));
+        let bucket = book.tried_bucket(&old).unwrap();
+        let target = book.tried_slot(&old);
+        let new = (2..60_000u32)
+            .map(|i| SocketAddr::from(([44, 7, (i / 250) as u8, (i % 250) as u8 + 1], 8333)))
+            .find(|c| book.tried_slot(c) == target)
+            .expect("a colliding address");
+        book.add(new, now);
+        assert!(!book.mark_good(new, now - 3600), "fixture: the slot is taken");
+        assert_eq!(book.select_tried_collision(), Some(old));
+        (new, bucket)
+    };
+    learn(&pm, &[new]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    assert_eq!(pm.automatic_dial_order(&mut rng)[0], old, "the incumbent is tested first");
+
+    add_peer(&pm, outbound(1, old, ConnType::OutboundFullRelay));
+    pm.resolve_tried_collisions();
+    let book = pm.addrman.read();
+    assert!(book.is_tried(&old) && book.tried_bucket(&old) == Some(slot));
+    assert!(!book.is_tried(&new), "a connected incumbent keeps its slot");
+    assert_eq!(book.select_tried_collision(), None);
 }

@@ -196,6 +196,8 @@ fn the_prefetch_connect_marks_a_stored_block_that_fails_to_connect() {
         mtp: 0,
         txids: bad.txdata.iter().map(|t| t.compute_txid()).collect(),
         script_verified_txs: Default::default(),
+        wtxids: None,
+        script_skip_txs: Default::default(),
         context_free_checked: true,
         entry,
         parent,

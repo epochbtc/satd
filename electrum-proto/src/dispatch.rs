@@ -10,6 +10,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use node::chain::pin::{Pin, Pinned};
+
 use crate::error::JsonRpcError;
 use crate::extras::ElectrumExtras;
 use crate::handlers;
@@ -102,6 +104,17 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// The block the answer was read at, display hex: rbitcoin's
+    /// `chain_tip` member. Set on every answer of a
+    /// [stamped](STAMPED_METHODS) method, on every connection, as rbitcoin
+    /// sets it; absent on errors and on every other method. A client that
+    /// does not know the member ignores it, as JSON-RPC clients ignore
+    /// members they do not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_tip: Option<String>,
+    /// That block's height (`chain_tip_height`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_tip_height: Option<u32>,
 }
 
 impl Response {
@@ -111,6 +124,8 @@ impl Response {
             id,
             result: Some(result),
             error: None,
+            chain_tip: None,
+            chain_tip_height: None,
         }
     }
 
@@ -120,7 +135,16 @@ impl Response {
             id,
             result: None,
             error: Some(err),
+            chain_tip: None,
+            chain_tip_height: None,
         }
+    }
+
+    /// Name the block the answer was read at.
+    fn stamped(mut self, pin: &Pin) -> Self {
+        self.chain_tip = Some(pin.hash.to_string());
+        self.chain_tip_height = Some(pin.height);
+        self
     }
 }
 
@@ -156,7 +180,125 @@ impl Notification {
 pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
     let params = req.params.unwrap_or(Value::Array(Vec::new()));
-    let outcome: Result<Value, JsonRpcError> = match req.method.as_str() {
+    let (params, asof) = match take_trailing_asof(&req.method, params) {
+        Ok(taken) => taken,
+        Err(err) => return Response::error(id, err),
+    };
+    if STAMPED_METHODS.contains(&req.method.as_str()) {
+        return dispatch_pinned(state, id, &req.method, &params, asof);
+    }
+    dispatch_unpinned(state, id, &req.method, params)
+}
+
+/// The prefix of the trailing `asof:<blockhash>` argument, rbitcoin's.
+pub const ASOF_PREFIX: &str = "asof:";
+
+/// The error for an `asof` block that is not on the best chain, rbitcoin's.
+pub const ASOF_NOT_ON_CHAIN: &str = "asof not on chain";
+
+/// Take a trailing `asof:<blockhash>` argument off `params`: the remaining
+/// arguments, and the block when there was one.
+///
+/// It is recognised by its prefix, after whatever official arguments the
+/// method took, so a method's optional arguments are unaffected: no
+/// official argument is a string that starts with `asof:`. A client opts in
+/// by sending it; negotiating `1.4.2-asof` first, as rbitcoin requires, is
+/// accepted but not required. Only the [stamped methods](STAMPED_METHODS)
+/// take it; on any other method, and when the hash is malformed, it is an
+/// error, never ignored, so a client never mistakes a live answer for an
+/// as-of one.
+fn take_trailing_asof(
+    method: &str,
+    params: Value,
+) -> Result<(Value, Option<bitcoin::BlockHash>), JsonRpcError> {
+    let Value::Array(mut args) = params else {
+        return Ok((params, None));
+    };
+    let Some(hex) = args
+        .last()
+        .and_then(Value::as_str)
+        .and_then(|s| s.strip_prefix(ASOF_PREFIX))
+    else {
+        return Ok((Value::Array(args), None));
+    };
+    if !STAMPED_METHODS.contains(&method) {
+        return Err(JsonRpcError::bad_request(format!(
+            "asof is not supported by {method}"
+        )));
+    }
+    let hash = hex
+        .parse::<bitcoin::BlockHash>()
+        .map_err(|_| JsonRpcError::bad_request("asof must be asof:<blockhash>"))?;
+    args.pop();
+    Ok((Value::Array(args), Some(hash)))
+}
+
+/// The methods whose answers read the chain at one block: each runs pinned
+/// to the tip it starts at, or to its trailing `asof:` block (see
+/// [`node::chain::pin`] and [`take_trailing_asof`]), and its answer names
+/// that block in `chain_tip` / `chain_tip_height`. rbitcoin stamps the same
+/// methods and takes `asof:` on them, plus `id_from_pos` here.
+pub const STAMPED_METHODS: &[&str] = &[
+    "blockchain.scripthash.get_history",
+    "blockchain.scripthash.get_balance",
+    "blockchain.scripthash.listunspent",
+    "blockchain.transaction.get",
+    "blockchain.transaction.get_merkle",
+    "blockchain.transaction.id_from_pos",
+];
+
+/// The error for a chain that retreated under every run of a pinned method.
+fn chain_view_moved() -> JsonRpcError {
+    JsonRpcError::bad_request(node::chain::pin::CHAIN_VIEW_MOVED)
+}
+
+/// Run a [stamped](STAMPED_METHODS) method pinned to the tip it starts at,
+/// or to `asof`: the answer reads nothing confirmed above that block, and a
+/// disconnect while it runs reruns it. The response names the pinned block.
+/// An `asof` block not on the best chain, now or after a disconnect, is
+/// [`ASOF_NOT_ON_CHAIN`], with no retry onto another block at its height.
+fn dispatch_pinned(
+    state: &ElectrumState,
+    id: Value,
+    method: &str,
+    params: &Value,
+    asof: Option<bitcoin::BlockHash>,
+) -> Response {
+    let run = node::chain::pin::run_pinned(&state.chain, asof, |pin| {
+        let params = params.clone();
+        match method {
+            "blockchain.scripthash.get_history" => {
+                handlers::blockchain::scripthash_get_history(state, params, pin)
+            }
+            "blockchain.scripthash.get_balance" => {
+                handlers::blockchain::scripthash_get_balance(state, params, pin)
+            }
+            "blockchain.scripthash.listunspent" => {
+                handlers::blockchain::scripthash_listunspent(state, params, pin)
+            }
+            "blockchain.transaction.get" => {
+                handlers::blockchain::transaction_get(state, params, pin)
+            }
+            "blockchain.transaction.get_merkle" => {
+                handlers::blockchain::transaction_get_merkle(state, params, pin)
+            }
+            "blockchain.transaction.id_from_pos" => {
+                handlers::blockchain::transaction_id_from_pos(state, params, pin)
+            }
+            other => unreachable!("{other} is not a stamped method"),
+        }
+    });
+    match run {
+        Pinned::Answered(Ok(result), pin) => Response::success(id, result).stamped(&pin),
+        Pinned::Answered(Err(err), _) => Response::error(id, err),
+        Pinned::NotOnChain => Response::error(id, JsonRpcError::bad_request(ASOF_NOT_ON_CHAIN)),
+        Pinned::Moved => Response::error(id, chain_view_moved()),
+    }
+}
+
+/// The rest of [`dispatch`]: the methods that are not pinned.
+fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Value) -> Response {
+    let outcome: Result<Value, JsonRpcError> = match method {
         // server.*
         "server.version" => handlers::server_methods::version(state, params),
         "server.ping" => handlers::server_methods::ping(),
@@ -174,15 +316,6 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         "blockchain.block.headers" => handlers::blockchain::block_headers(state, params),
 
         // blockchain.scripthash.*
-        "blockchain.scripthash.get_history" => {
-            handlers::blockchain::scripthash_get_history(state, params)
-        }
-        "blockchain.scripthash.get_balance" => {
-            handlers::blockchain::scripthash_get_balance(state, params)
-        }
-        "blockchain.scripthash.listunspent" => {
-            handlers::blockchain::scripthash_listunspent(state, params)
-        }
         "blockchain.scripthash.get_mempool" => {
             handlers::blockchain::scripthash_get_mempool(state, params)
         }
@@ -206,18 +339,11 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
         }
 
         // blockchain.transaction.*
-        "blockchain.transaction.get" => handlers::blockchain::transaction_get(state, params),
-        "blockchain.transaction.get_merkle" => {
-            handlers::blockchain::transaction_get_merkle(state, params)
-        }
         "blockchain.transaction.broadcast" => {
             handlers::blockchain::transaction_broadcast(state, params)
         }
         "blockchain.transaction.broadcast_package" => {
             handlers::blockchain::transaction_broadcast_package(state, params)
-        }
-        "blockchain.transaction.id_from_pos" => {
-            handlers::blockchain::transaction_id_from_pos(state, params)
         }
 
         // fees
@@ -255,6 +381,20 @@ pub fn dispatch_with_subscriptions(
     req: Request,
 ) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
+    let handled_here = matches!(
+        req.method.as_str(),
+        "blockchain.scripthash.subscribe"
+            | "blockchain.scripthash.unsubscribe"
+            | "blockchain.headers.subscribe"
+            | "blockchain.tweaks.subscribe"
+    );
+    // None of these takes `asof:`: refuse it rather than read it as a
+    // positional argument. [`dispatch`] checks the rest.
+    if handled_here
+        && let Err(err) = take_trailing_asof(&req.method, req.params.clone().unwrap_or_default())
+    {
+        return Response::error(id, err);
+    }
     let outcome: Result<Value, JsonRpcError> = match req.method.as_str() {
         "blockchain.scripthash.subscribe" => handle_scripthash_subscribe(state, subs, &req),
         "blockchain.scripthash.unsubscribe" => handle_scripthash_unsubscribe(subs, &req),

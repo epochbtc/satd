@@ -16,8 +16,10 @@ attestation.
 satd is a publisher. satd has no wallet, so the holder signs in their own
 wallet and hands the signature to their node, which checks it, stores it and
 judges it again at every new block, and serves the valid ones to peers that
-ask. This chapter covers publishing and serving. Collecting attestations
-from other nodes is not in this build.
+ask. satd is also an aggregator: with `napaggregator=1` it collects the
+attestations publishers serve and keeps the ones that count (see
+[Aggregating](#aggregating)) and reports on them (see [Reports](#reports)).
+[`sat-tui`](tui.md#nap-view-5) shows both halves on key `5`.
 
 ## Enabling
 
@@ -29,14 +31,25 @@ or `nap=1` in the config file. Changing it needs a restart. Without it, the
 four NAP RPCs answer `-1` "NAP is disabled".
 
 The attestations are kept in `nap/attestations.dat` in the network's data
-directory (`~/.bitcoin/signet/nap/attestations.dat` on signet, for example).
-Every change is written through a temporary file and a rename. If the file
-cannot be read back at startup, satd refuses to start rather than start with
-none of them: it holds signatures that may be hard to make again. Move the
-file aside to start without it, or set `napstorerecover=1`, and satd does
-that itself: it renames the file to `attestations.dat.bad-<unix time>`, logs
-a warning naming it, and starts with an empty store. Either way the damaged
-file's signatures are still on disk.
+directory (`~/.bitcoin/signet/nap/attestations.dat` on signet, for example),
+with `attestations.journal` beside it. Each change is one record appended to
+the journal and synced before the RPC returns, so a change costs the same
+however many attestations are stored. Once the journal is larger than the
+file (and at least 1 MiB), the store is written to the file whole, through a
+temporary file and a rename, and the journal starts again. A last journal
+record cut short by a crash is dropped: its RPC had not returned. If the
+store cannot be read back at startup, satd refuses to start rather than
+start with none of them: it holds signatures that may be hard to make again.
+Move both files aside to start without them, or set `napstorerecover=1`, and
+satd does that itself: it renames them to `attestations.dat.bad-<unix time>`
+and `attestations.journal.bad-<unix time>`, logs a warning, and starts with
+an empty store. Either way the damaged files' signatures are still on disk.
+A clean shutdown also writes the store to the file whole and empties the
+journal, so after one the file alone holds every attestation, as an older
+satd, which does not read the journal, would load it. After a crash the
+newest attestations may be only in the journal: copy both files to back
+the store up, and before going back to an older satd, start and stop this
+one cleanly.
 
 ## What gets signed
 
@@ -44,7 +57,7 @@ The holder signs this text exactly, with LF line endings and no newline at
 the end:
 
 ```text
-satd NAP attestation v1
+NAP attestation v1
 outpoint: <txid>:<vout>
 key: <key>
 value: <value>
@@ -71,6 +84,7 @@ An attestation is valid at a tip when:
 | The anchor is the active chain's block at that height | `anchor-not-on-chain` | A reorg replaced the anchor block. Sign again. |
 | `tip - anchor < 26,208` (about six months) | `stale` | Sign again with a new anchor. |
 | The coin is unspent | `coin-not-found` | A spent coin's attestation is dropped. |
+| The coin holds at least 10,000 sats, on every network | `coin-too-small` | A smaller coin cannot attest. Weight follows value, so a dust coin could not sway a count, but the floor keeps dust from filling an aggregator's set. |
 | The coin confirmed at least 4,032 blocks (about four weeks) before the anchor; 6 blocks on testnet, testnet4, signet and regtest | `coin-too-young` | A coin moved recently cannot attest yet. A coinbase coin also waits for coinbase maturity, 100 blocks. |
 | The signature verifies against the coin's scriptPubKey | `signature-invalid`, `signature-inconclusive`, `wrong-format` | |
 | A timelocked proof's locktime and relative lock are met at the next block | `not-yet-valid` | See below. |
@@ -90,7 +104,7 @@ ones.
    ```text
    sat-cli createnapattestation "<txid>:<vout>" "bip_xyz.support" "yes"
    {
-     "message": "satd NAP attestation v1\noutpoint: …\nkey: bip_xyz.support\nvalue: yes\nanchor: 912340 00000000…",
+     "message": "NAP attestation v1\noutpoint: …\nkey: bip_xyz.support\nvalue: yes\nanchor: 912340 00000000…",
      "outpoint": "<txid>:<vout>",
      "key": "bip_xyz.support",
      "value": "yes",
@@ -104,7 +118,8 @@ ones.
    }
    ```
 
-   It checks that the coin exists and is old enough at the anchor. `formats`
+   It checks that the coin exists, holds at least 10,000 sats, and is old
+   enough at the anchor. `formats`
    lists the signature formats the coin's script takes, and `address` is the
    address to sign with. `psbt` is the same request as a PSBT, for signers
    that sign BIP 322 through one; an optional fourth argument, the coin's
@@ -244,8 +259,8 @@ signs another message or another coin, or is not fully signed; the message
 says which.
 
 **Coldcard** signs messages of up to 330 characters. Everything in a NAP
-message but the key and value comes to about 195 characters (more for a
-large output index), so a key and value that add up to more than about 135
+message but the key and value comes to about 190 characters (more for a
+large output index), so a key and value that add up to more than about 140
 characters do not fit. `createnapattestation` warns when a message is longer
 than 330.
 
@@ -291,7 +306,7 @@ sat-cli listnapattestations
     "anchor_hash": "00000000…",
     "format": "simple",
     "signature": "smpAkcwRAIg…",
-    "message": "satd NAP attestation v1\n…",
+    "message": "NAP attestation v1\n…",
     "status": "valid",
     "amount": 0.25000000
   }
@@ -333,18 +348,196 @@ reach the node over Tor all arrive from the loopback address and share one
 group, so many Tor connections from one source can use up that group's
 limits. A malformed `getnapatt` counts as misbehaviour.
 
+## Aggregating
+
+With `napaggregator=1` the node collects attestations from publishers over
+P2P and keeps, for each coin and key, the one that counts at its tip. It does
+not need `nap=1`, and does not advertise `NODE_NAP` unless it also publishes.
+
+*   **Where it looks.** Every full-relay, manual or inbound peer the node is
+    connected to that advertises `NODE_NAP` is asked as soon as the
+    connection opens, and again every hour while it stays up; block-relay,
+    address-fetch and feeler connections are never asked. At most eight
+    pulls run at once, and at most four of them over inbound connections.
+    Publishers the address book knows but the node
+    is not connected to are reached over short `nap-pull` connections, at
+    most two at a time and each address at most once an hour. A `nap-pull`
+    connection (`getpeerinfo` lists it with that `connection_type`) takes no
+    outbound slot and carries the pull and nothing else: no blocks,
+    transactions or addresses. It closes when the pull ends.
+*   **What it checks.** Cheapest first: whether it already holds the
+    attestation, then the anchor, freshness, the coin and its age, and only
+    then the signature. Signature results are cached, so an attestation
+    served by many publishers is verified once. At most 5,000 signatures are
+    verified per pull and 1,000,000 an hour (at most five or six minutes
+    of one core); the rest wait, and pulling pauses
+    while 16 MB of them are waiting. Nothing received is dropped for lack of
+    budget.
+*   **Misbehaviour.** A malformed `napatt`, or an attestation whose
+    signature fails or does not fit its coin, is misbehaviour, and the peer
+    is disconnected and punished as for any other (a manually added peer is
+    not). An attestation that fails only on chain state, such as a spent
+    coin or an anchor the node does not have, is not: the publisher's tip
+    may differ.
+*   **What it keeps.** For each coin and key the attestations that verified,
+    newest first. The newest valid one counts. One that is superseded is kept
+    until the attestation that superseded it is valid and its anchor 144
+    blocks deep, so that if a reorg takes the newer anchor, the older one
+    counts again. At most 8 are kept per coin and key, and at most 256 keys
+    per coin, the first seen; a key new to a full coin is refused. The whole
+    set holds at most `napaggregatormax` attestations (default 1,000,000);
+    when full, pairs new to it are refused, while pairs already held still
+    take newer attestations. At every
+    new block the set is judged again: a spent coin drops out at once, and
+    a stale one, or one whose anchor is lost for good, goes too.
+*   **On disk.** `<datadir>/nap/aggregate/aggregate.dat`, written every 30
+    seconds when it changed and at shutdown. Every signature is verified again
+    when it is loaded; an attestation the chain cannot judge yet (during
+    initial block download, say) waits for it. A file that does not read back
+    is renamed to `aggregate.dat.bad-<unix time>` with a warning, and the node
+    starts with an empty set: collection rebuilds it.
+
+`listnapaggregate` lists the attestations that count, each with its coin's
+value (`amount`) and the peer it was first collected from (`source`), and the
+collection's counters:
+
+```text
+sat-cli listnapaggregate
+{
+  "height": 870000,
+  "held": 3,
+  "counting": 2,
+  "deferred": 0,
+  "pulls": { "active": 0, "completed": 4, "timed_out": 0, "pages": 4 },
+  "misbehaving": 0,
+  "unsolicited": 0,
+  "key_limit": 0,
+  "full": 0,
+  "attestations": [
+    { "id": "…", "outpoint": "…:0", "key": "bip_xyz.support", "value": "yes",
+      "anchor_height": 869994, "anchor_hash": "…", "amount": 0.5, "source": "203.0.113.5:8333" }
+  ]
+}
+```
+
+`held` counts the superseded attestations kept for reorgs too; `counting`
+is one per coin and key.
+
+### Reports
+
+`getnapreport` judges every attestation held at the tip and reports, for
+each key, the weight behind each value. Weight is the coin's value, so one
+1 BTC coin weighs what a hundred 0.01 BTC coins do. Every number is an
+integer: weights in satoshis (`weight_sat`), and shares and coverage in parts
+per million, rounded down (`250000` is 25%). The report is computed once per
+tip and set and served again until either changes, so a dashboard can poll
+it. While collection keeps changing the set, a report on the same tip is
+served again for up to 30 seconds; its `digest` names the set it covers. A
+new block is always reported on afresh.
+
+```text
+sat-cli getnapreport
+{
+  "height": 870000,
+  "hash": "…",
+  "utxo_total_sat": 1980000000000000,
+  "digest": "…",
+  "attestations": 3,
+  "invalid": 0,
+  "counting": 2,
+  "keys": [
+    { "key": "bip_xyz.support", "weight_sat": 50000000, "outpoints": 1, "coverage_ppm": 0,
+      "withdrawn": { "weight_sat": 0, "outpoints": 0 },
+      "values": [
+        { "value": "yes", "weight_sat": 50000000, "outpoints": 1,
+          "share_ppm": 1000000, "coverage_ppm": 0,
+          "value_tiers": [ { "tier": "<0.01", "weight_sat": 0, "outpoints": 0 }, … ],
+          "anchor_age": [ { "blocks": "<2016", "weight_sat": 50000000, "outpoints": 1 }, … ],
+          "coin_age": [ … ],
+          "script_types": [ … ],
+          "concentration": { "top10_ppm": 1000000, "top100_ppm": 1000000 } }
+      ] }
+  ]
+}
+```
+
+*   **The key.** `weight_sat` and `outpoints` are the coins stating a value.
+    `coverage_ppm` is that weight's share of the whole UTXO set's value at the
+    tip (`utxo_total_sat`), in which lost coins count. Coins that withdrew
+    (an empty value) are in `withdrawn`, and in no share.
+*   **Each value**, heaviest first: its weight, its `share_ppm` of the key's
+    weight and its `coverage_ppm`, then breakdowns. Each breakdown lists
+    every bucket, including empty ones.
+    *   `value_tiers`, by coin value: `<0.01`, `0.01-1`, `1-100` and `>=100`
+        BTC.
+    *   `anchor_age`, in blocks below the tip: `<2016` (about two weeks),
+        `<13104` (three months) and `<26208` (the six-month freshness
+        window).
+    *   `coin_age`, in blocks since the coin confirmed: `<13104`, `<52416`
+        (a year), `<104832` (two years), `<262080` (five years) and
+        `>=262080`.
+    *   `script_types`, by the coin's script: `p2pkh`, `p2sh`, `p2wpkh`,
+        `p2wsh`, `p2tr` and `other`.
+    *   `concentration`: the share of the value's weight in its 10 and 100
+        largest coins.
+*   **Coins, not holders.** Tiers and concentration describe coins. One
+    holder can spread across tiers, and several can share a custodian's coin.
+
+Keys and values are shown exactly as signed, ordered by bytes, with no
+grouping of variant spellings.
+
+### Snapshots
+
+The report's `digest` names the set it was computed from. It is SHA256 over
+each attestation's serialized form, prefixed with its length as a compact
+size, in ascending id order. `exportnapsnapshot "path"` writes that set,
+including the superseded attestations kept for reorgs, to a file:
+
+```text
+sat-cli exportnapsnapshot nap-snapshot.dat
+{ "path": "/home/me/.satd/nap-snapshot.dat", "height": 870000, "hash": "…",
+  "attestations": 3, "digest": "…" }
+```
+
+A relative path is resolved against the datadir, as `dumptxoutset` does, and
+an existing file is not overwritten. `replaynapsnapshot "path"` reports on a
+snapshot instead of the node's own set. It verifies every signature, and
+judges the set at this node's tip. Any node can do this, without
+`napaggregator`. At the same tip it gives the same bytes as the aggregator
+that exported the snapshot, so anyone can check a published report. The
+replay does not add the snapshot to the node's set. `invalid` counts
+attestations whose signatures fail. An attestation whose coin is gone is
+not verified, and does not count.
+
+A report, an export and a replay split their work between up to eight
+threads once the set holds a few thousand attestations: the replay's
+signatures, the chain rules for each attestation, and each entry's bytes.
+What depends on order, the digest and the choice of the attestation that
+counts, is computed in order, so the result is the same however the work
+was split.
+
+The file is `"NAPS"`, a version (1), the height and hash it was exported
+at, a count, the length-prefixed attestations, and a SHA256 checksum. A
+replay reads at most `napaggregatormax` attestations, or 1,000,000 on a
+node that does not aggregate.
+
 ## Access
 
-`createnapattestation` and `listnapattestations` change nothing and need
-`rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
+`createnapattestation`, `listnapattestations` and `listnapaggregate` change
+nothing and need `rpc:read`; they are allowed on the read-only listener. `submitnapattestation`
 and `removenapattestation` decide what the node publishes and need
-`rpc:write`. See [Authentication & Authorization](authentication.md).
+`rpc:write`. `getnapreport` needs `rpc:read` and is allowed on the
+read-only listener: it is computed once per tip and set, however often it
+is asked. `replaynapsnapshot` reads a file and verifies every signature in
+it, and `exportnapsnapshot` writes a file. Both need `rpc:write` and are
+refused on the read-only listener, as `scantxoutset` and `dumptxoutset`
+are. See [Authentication & Authorization](authentication.md).
 
 | Error | Meaning |
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |
-| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, or `removenapattestation` found nothing to remove. |
-| `-1` | NAP is disabled, or the chain moved during the call (try again). |
+| `-8` | The message, signature, PSBT, key, value or outpoint is malformed, a PSBT is not fully signed, `removenapattestation` found nothing to remove, a snapshot file does not read or is malformed (`replaynapsnapshot`), or `exportnapsnapshot`'s file exists. |
+| `-1` | NAP is disabled (`nap=1` for the publisher RPCs, `napaggregator=1` for `listnapaggregate`, `getnapreport` and `exportnapsnapshot`), the chain moved during the call (try again), or a snapshot could not be written. |
 
 ## Privacy and key exposure
 

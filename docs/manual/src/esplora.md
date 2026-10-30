@@ -140,7 +140,7 @@ Connections receive a `:keep-alive` heartbeat every 25 seconds, so idle streams
 survive intermediate proxy timeouts (Caddy defaults to 30 s, nginx to 60 s).
 
 Per-scripthash subscriptions consume from the registry capped by
-`--addrindexsubscriptions=N` (default 10000). Over-cap subscribe attempts
+`--addrindexsubscriptions=N` (default 50000). Over-cap subscribe attempts
 return 503.
 
 Total open SSE streams across all three endpoints are capped by
@@ -197,6 +197,100 @@ the standard endpoints (`/address/:addr` or `/blocks/tip/{hash,height}`).
   with `block_height`, `block_hash`, and `block_time`. Mempool spends carry
   `status: { confirmed: false }`.
 
+### OP_RETURN-pruned blocks
+
+On a node running with `pruneopreturn`
+([OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning)):
+
+- **A stripped transaction** (in `/tx/:txid`, `/block/:hash/txs` and the
+  address histories) carries `"opreturn_stripped": true`. Each stripped output
+  reads as the bare `OP_RETURN` it keeps: `scriptpubkey` `"6a"`,
+  `scriptpubkey_asm` `"OP_RETURN"`, `scriptpubkey_type` `"op_return"`, plus
+  `"scriptpubkey_stripped_size"`, the original length. The `txid`, sizes,
+  values and fee are the original's.
+- **Raw bytes are refused** with 404: `/block/:hash/raw` with
+  `block data not available (OP_RETURN data stripped)`, and `/tx/:txid/hex` and
+  `/tx/:txid/raw` with `transaction data not available (OP_RETURN data
+  stripped)`.
+- Block summaries, txids, merkle proofs (both kinds), outspends and statuses
+  are unchanged.
+
+## Chain-tip headers
+
+Every route that reads the chain answers with two extra headers:
+
+| Header | Value |
+|---|---|
+| `X-Bitcoin-Chain-Tip` | The best-chain tip's block hash (display hex) the answer was read at. |
+| `X-Bitcoin-Chain-Tip-Height` | That tip's height. |
+
+They let a client that makes several requests check that the answers
+describe one chain: if the hash differs between two responses, a block
+connected or a reorg happened in between, and the client should fetch the
+batch again. Compare the hash, not the height; a block replaced at the same
+height changes only the hash. The headers follow the proposal in
+mempool/mempool#6584, and rbitcoin's Esplora serves the same two.
+
+Each request answers for the tip it started at, and the headers name that
+tip. Nothing above it counts as confirmed, however many blocks connect while
+the request runs:
+
+- A transaction that confirms in a later block is served as unconfirmed:
+  `status.confirmed: false` from `/tx/:txid` and `/tx/:txid/status`, in the
+  unconfirmed part of `/address/:address/txs`, in `mempool_stats`, and as a
+  mempool spend on the outspend routes. Its outputs are unconfirmed UTXOs.
+  It has no merkle proof yet (404).
+- Confirmed history, chain stats and confirmed UTXOs stop at the tip's
+  height. `/blocks/tip/hash`, `/blocks/tip/height`, `/blocks`,
+  `/block-height/:height` and `/` report the tip, and `/block/:hash/status`
+  reports a later block as not in the best chain.
+- `/block/:hash/...` routes still serve any block the node holds by hash,
+  as before.
+
+A disconnect while a request runs (a reorg, or `invalidateblock`) can change
+the blocks the answer covers, so the request is run again at the new tip. One
+that a disconnect interrupts eight times in a row answers 503
+`chain view moved` with no tip headers.
+
+The mempool part of an answer (unconfirmed transactions, mempool stats and
+UTXOs, mempool spends) is read as it is when the request reads it.
+
+## As of a block: `?asof=<blockhash>`
+
+Some routes answer as of an earlier block on the best chain, given its hash
+(display hex, as `/block/:hash` takes it):
+
+```sh
+curl "http://127.0.0.1:3000/address/bc1q.../utxo?asof=00000000000000000002a7c4..."
+```
+
+| Route | As of the block |
+|---|---|
+| `/address/:address` <br> `/scripthash/:hash` | `chain_stats` over blocks up to and including it; `mempool_stats` all zero. |
+| `.../txs` | The confirmed transactions only, newest first; `?after_txid=` pages them. |
+| `.../txs/chain[/:last_seen_txid]` | The confirmed transactions up to it. |
+| `.../utxo` | Outputs funded up to it and not spent up to it, all confirmed. |
+| `/tx/:txid/status` | `confirmed: true` if it confirmed up to it, `confirmed: false` if later; 404 if only in the mempool. |
+| `/tx/:txid/outspend/:vout` <br> `/tx/:txid/outspends` | Spent only by a spend confirmed up to it; a later or mempool spend leaves the output unspent. 404 for a transaction only in the mempool. |
+
+The mempool is never part of the answer. The
+[chain-tip headers](#chain-tip-headers) name the asof block and its height.
+
+A hash that is not a block on the best chain is 404, and so is one that leaves
+the best chain while the request runs: satd never answers from another block
+at that height. A malformed or empty `asof`, or `asof` on any route not in
+the table, is 404 too. `/utxo?asof=` is worked out from the address's
+history, not the live coin set, so it is refused above the same history cap
+as the stats. rbitcoin's Esplora takes the same parameter with the same
+rules.
+
+Every route carries the headers except `POST /tx`, `/mempool`,
+`/mempool/txids`, `/mempool/recent`, `/fee-estimates`, the
+`/txs/mempool` lists and the SSE streams, which do not read the chain.
+Error answers from a chain route (a 404 for an unknown transaction, say)
+carry them too. With [CORS](#cors) enabled both are listed in
+`Access-Control-Expose-Headers`, so browser clients can read them.
+
 ## Auth
 
 > **Warning.** The default auth mode is `none`. Loopback-only deployments
@@ -233,7 +327,8 @@ cannot be established (unreadable cookie file, or `--esplorauserpass` missing).
 
 `--esploracors=<origin>` enables CORS for the listed origins; `*` allows any
 origin. Allowed methods: `GET` and `POST`. Allowed headers: `Content-Type` and
-`Authorization`. CORS does not bypass authentication; it only admits
+`Authorization`. Exposed headers: the two
+[chain-tip headers](#chain-tip-headers). CORS does not bypass authentication; it only admits
 cross-origin browser requests.
 
 ## Bench harness

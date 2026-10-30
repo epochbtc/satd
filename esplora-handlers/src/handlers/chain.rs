@@ -12,32 +12,33 @@
 
 use bitcoin::BlockHash;
 use axum::Json;
+use axum::Extension;
 use axum::extract::{Path, State};
 
+use crate::chain_tip::Pin;
 use crate::encode::{BlockHeaderJson, block_header_json};
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::block::try_compute_block_size_weight;
 use crate::state::EsploraState;
 
 /// `/blocks/tip/hash`. Plain-text big-endian hex (matches upstream).
-pub async fn tip_hash(State(state): State<EsploraState>) -> String {
-    state.chain.tip_hash().to_string()
+pub async fn tip_hash(Extension(pin): Extension<Pin>) -> String {
+    pin.hash.to_string()
 }
 
 /// `/blocks/tip/height`. Plain-text decimal.
-pub async fn tip_height(State(state): State<EsploraState>) -> String {
-    state.chain.tip_height().to_string()
+pub async fn tip_height(Extension(pin): Extension<Pin>) -> String {
+    pin.height.to_string()
 }
 
 /// `/block-height/:height` → block hash at that active-chain height.
 /// 404 when the height is past tip or otherwise unknown.
 pub async fn block_height(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(height): Path<u32>,
 ) -> EsploraResult<String> {
-    state
-        .chain
-        .get_block_hash_by_height(height)
+    pin.hash_at_height(&state.chain, height)
         .map(|h| h.to_string())
         .ok_or(EsploraError::NotFound)
 }
@@ -46,21 +47,22 @@ pub async fn block_height(
 /// height (newest first). Empty when chain is at genesis.
 pub async fn blocks_recent(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
 ) -> EsploraResult<Json<Vec<BlockHeaderJson>>> {
-    let tip = state.chain.tip_height();
-    Ok(Json(collect_blocks_descending(&state, tip)?))
+    Ok(Json(collect_blocks_descending(&state, &pin, pin.height)?))
 }
 
 /// `/blocks/:start_height` → 10 block-summary objects ending at
 /// `start_height` inclusive, descending. 404 when start_height > tip.
 pub async fn blocks_at_or_below(
     State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
     Path(start_height): Path<u32>,
 ) -> EsploraResult<Json<Vec<BlockHeaderJson>>> {
-    if start_height > state.chain.tip_height() {
+    if !pin.covers(start_height) {
         return Err(EsploraError::NotFound);
     }
-    Ok(Json(collect_blocks_descending(&state, start_height)?))
+    Ok(Json(collect_blocks_descending(&state, &pin, start_height)?))
 }
 
 /// Walk down at most 10 active-chain blocks ending at `start_height`,
@@ -81,25 +83,29 @@ const ACTIVE_WALK_LIMIT: u32 = 200;
 
 /// Name the block a page should start from.
 ///
-/// Within [`ACTIVE_WALK_LIMIT`] of the tip -- the range where a reorg could
-/// have left the height index naming a block that is no longer active -- this
-/// walks parent pointers from the tip and is exact. Deeper than that it takes
+/// Within [`ACTIVE_WALK_LIMIT`] of the pinned tip -- the range where a reorg
+/// could have left the height index naming a block that is no longer active --
+/// this walks parent pointers from the pinned tip and is exact. Deeper than that it takes
 /// the height index row, which is O(1). A stale row there would make the page
 /// start on a side branch, but the page would still be a contiguous run of that
 /// branch's ancestry, and the next request corrects it.
-fn resolve_page_top(state: &EsploraState, start_height: u32) -> Option<BlockHash> {
-    let (_, tip_height) = state.chain.tip_snapshot();
-    if start_height > tip_height {
+fn resolve_page_top(state: &EsploraState, pin: &Pin, start_height: u32) -> Option<BlockHash> {
+    if !pin.covers(start_height) {
         return None;
     }
-    if tip_height - start_height <= ACTIVE_WALK_LIMIT {
-        return state.chain.active_chain_hash_at_height(start_height);
+    if pin.height - start_height <= ACTIVE_WALK_LIMIT {
+        let mut hash = pin.hash;
+        for _ in start_height..pin.height {
+            hash = state.chain.get_block_index(&hash)?.header.prev_blockhash;
+        }
+        return Some(hash);
     }
     state.chain.get_block_hash_by_height(start_height)
 }
 
 fn collect_blocks_descending(
     state: &EsploraState,
+    pin: &Pin,
     start_height: u32,
 ) -> Result<Vec<BlockHeaderJson>, EsploraError> {
     const PAGE: u32 = 10;
@@ -116,7 +122,7 @@ fn collect_blocks_descending(
     //
     // Every entry after the first comes from its child's `prev_blockhash`, so
     // the page is contiguous by construction however the top is resolved.
-    let Some(anchor) = resolve_page_top(state, start_height) else {
+    let Some(anchor) = resolve_page_top(state, pin, start_height) else {
         return Ok(out);
     };
     let mut hash = anchor;

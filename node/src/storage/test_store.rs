@@ -76,7 +76,19 @@ pub(crate) struct StoreControls {
     /// Milliseconds every address-history read sleeps first: what a long
     /// read of a busy scripthash looks like to the thread that makes it.
     addr_read_delay_ms: Arc<AtomicU64>,
+    /// Run once, right after the next strip-record lookup has read the
+    /// store: a strip that commits between a reader's lookup and whatever
+    /// it does next.
+    after_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
+    /// Run once, right before the next strip-record lookup reads the store.
+    before_strip_lookup: Arc<std::sync::Mutex<Option<StripLookupHook>>>,
+    /// Strip-record reads fail, as a corrupt RocksDB row does.
+    strip_unreadable: Arc<AtomicBool>,
+    /// The next drop of the strip family fails, once.
+    fail_next_strip_drop: Arc<AtomicBool>,
 }
+
+type StripLookupHook = Box<dyn FnOnce(&InMemoryStore) + Send>;
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
 /// that reaches this store and covers the outpoint signals `entered` and then
@@ -162,6 +174,27 @@ impl StoreControls {
 
     pub(crate) fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Run `hook` once, against the backing store, right after the next
+    /// strip-record lookup has read it.
+    pub(crate) fn after_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+        *self.after_strip_lookup.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once, against the backing store, right before the next
+    /// strip-record lookup reads it.
+    pub(crate) fn before_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+        *self.before_strip_lookup.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Fail the next `drop_opreturn_strip_cf`, once, as a RocksDB error would.
+    pub(crate) fn fail_next_strip_drop(&self) {
+        self.fail_next_strip_drop.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_strip_unreadable(&self, yes: bool) {
+        self.strip_unreadable.store(yes, Ordering::SeqCst);
     }
 
     /// Set the chainstate L0 file count the store reports.
@@ -280,6 +313,10 @@ impl ControllableStore {
                 addr_reads: Arc::new(AtomicU64::new(0)),
                 addr_rows_served: Arc::new(AtomicU64::new(0)),
                 addr_read_delay_ms: Arc::new(AtomicU64::new(0)),
+                after_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
+                before_strip_lookup: Arc::new(std::sync::Mutex::new(None)),
+                strip_unreadable: Arc::new(AtomicBool::new(false)),
+                fail_next_strip_drop: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -325,6 +362,34 @@ impl Store for ControllableStore {
 
     // ---- everything below is straight delegation ----
 
+    fn get_opreturn_strip(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError> {
+        let before = self.controls.before_strip_lookup.lock().unwrap().take();
+        if let Some(hook) = before {
+            hook(&self.inner);
+        }
+        let read = if self.controls.strip_unreadable.load(Ordering::SeqCst) {
+            Err(StoreError::Database("injected strip-record read fault".into()))
+        } else {
+            self.inner.get_opreturn_strip(hash)
+        };
+        let hook = self.controls.after_strip_lookup.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(&self.inner);
+        }
+        read
+    }
+    fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.opreturn_strip_meta()
+    }
+    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        self.inner.for_each_opreturn_strip(f)
+    }
+    fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
+        if self.controls.fail_next_strip_drop.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Database("injected strip-family drop fault".into()));
+        }
+        self.inner.drop_opreturn_strip_cf()
+    }
     fn flush_durable(&self) -> Result<(), StoreError> {
         self.inner.flush_durable()
     }

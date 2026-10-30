@@ -443,3 +443,26 @@ fn remove_codeseparators(script: &[u8]) -> ScriptBuf {
     }
     ScriptBuf::from_bytes(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_codeseparators_keeps_push_data() {
+        // Each push form carries three 0xab bytes as data, then an
+        // OP_CODESEPARATOR follows. Only the opcode is removed.
+        let pushes: [&[u8]; 4] = [
+            &[0x03],
+            &[0x4c, 0x03],
+            &[0x4d, 0x03, 0x00],
+            &[0x4e, 0x03, 0x00, 0x00, 0x00],
+        ];
+        for push in pushes {
+            let mut script = push.to_vec();
+            script.extend([0xab; 4]);
+            let got = remove_codeseparators(&script);
+            assert_eq!(got.as_bytes(), &script[..script.len() - 1], "push {push:02x?}");
+        }
+    }
+}

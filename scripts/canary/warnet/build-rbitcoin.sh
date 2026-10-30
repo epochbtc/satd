@@ -25,7 +25,12 @@ pinned() { # repo:tag@sha256:... -> pull by digest, tag repo:tag, print repo:tag
     printf '%s' "$base"
 }
 
-[ -d "$SRC/.git" ] || git clone --quiet https://github.com/reardencode/rbitcoin "$SRC"
+# Not a clone: CI restores the cached build into $SRC/target first, and
+# `git clone` refuses a directory that is not empty.
+if [ ! -d "$SRC/.git" ]; then
+    git init --quiet "$SRC"
+    git -C "$SRC" remote add origin https://github.com/reardencode/rbitcoin
+fi
 git -C "$SRC" fetch --quiet origin
 git -C "$SRC" checkout --quiet --detach "$RBITCOIN_COMMIT"
 echo "rbitcoin at $(git -C "$SRC" rev-parse HEAD)"

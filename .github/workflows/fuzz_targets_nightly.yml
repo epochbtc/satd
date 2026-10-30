@@ -1,0 +1,291 @@
+# Nightly run of every self-contained fuzz target in fuzz/ (all of them except
+# block_differential, which needs a live bitcoind and has its own job in
+# core_block_differential_fuzz.yml).
+#
+# The target list is not written down here. scripts/fuzz/run-standalone-targets.sh
+# takes it from `cargo fuzz list`, so a target added to fuzz/Cargo.toml is fuzzed
+# from the next night on. Before this job, the parser targets (auth, PSBT, BIP 322,
+# NAP) were type-checked by the Lint job and never run anywhere.
+#
+# NOT a PR gate: it needs a nightly toolchain and cargo-fuzz, and spends
+# SECONDS_PER_TARGET on each target. The corpus is kept between runs in the
+# Actions cache, so each night starts where the last one stopped. The build is
+# not cached: an ASan build of `node` is several GB, and the repository's
+# 10 GB Actions cache is already close to full with the CI caches.
+#
+# A failure notifies through a GitHub issue, in the same three classes as the
+# block-differential job:
+#   (a) a crash, timeout or OOM input under fuzz/artifacts/ -> `fuzz-crash`
+#   (b) the fuzz step failed or was cancelled without one (a build break, a
+#       target that ran no inputs, the job timeout)          -> `fuzz-targets-broken`
+#   (c) an earlier step failed: quiet, unless the last three scheduled runs
+#       all failed                                            -> `fuzz-targets-broken`
+# Manual runs never notify. Never weaken a target's assertion to quiet it.
+
+name: Fuzz targets (nightly)
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: "Fuzz time per target, in seconds"
+        required: false
+        default: "600"
+  schedule:
+    # Nightly 03:20 UTC, ahead of the block-differential job at 04:00.
+    - cron: '20 3 * * *'
+
+permissions:
+  contents: read
+  issues: write
+  # The streak check reads this workflow's run history.
+  actions: read
+
+concurrency:
+  group: fuzz-targets-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bump together with CARGO_FUZZ_VERSION in core_block_differential_fuzz.yml.
+  # The nightly toolchain is not declared here: run-standalone-targets.sh reads
+  # the one pin in run-block-differential.sh.
+  CARGO_FUZZ_VERSION: '0.13.2'
+
+jobs:
+  fuzz:
+    name: fuzz targets
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Resolve the pinned nightly
+        id: nightly
+        run: |
+          set -euo pipefail
+          # The script parses the pin and fails loudly if it cannot.
+          toolchain=$(FUZZ_NIGHTLY= bash scripts/fuzz/run-standalone-targets.sh --print-toolchain)
+          echo "Pinned nightly: $toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master as of 2026-09-12
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version ${{ env.CARGO_FUZZ_VERSION }}
+
+      # Each run saves a new corpus entry and restores the newest by prefix, so
+      # the corpus grows across nights instead of restarting from empty.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-targets-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-targets-corpus-
+
+      - name: Run the fuzz targets
+        id: fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds_per_target || '600' }}
+          # 80 minutes of fuzzing in all, whatever the target count or the
+          # requested time per target: the rest of the 150-minute job is the
+          # uncached ASan build and setup. The script splits it between targets.
+          TOTAL_SECONDS: "4800"
+        run: bash scripts/fuzz/run-standalone-targets.sh
+
+      # Saved even when a target failed: the inputs that reached new coverage
+      # before the failure are still worth keeping.
+      - name: Save the corpus
+        if: always() && steps.fuzz.outcome != 'skipped'
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus
+          # The attempt too: a re-run keeps its run_id, and saving to a key
+          # that already exists fails.
+          key: fuzz-targets-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload crash artifacts
+        # `cancelled()` too: a job that hits `timeout-minutes` is cancelled,
+        # not failed, and a hang is exactly when the reproducer matters.
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-targets-artifacts
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Triage failure and notify
+        id: triage
+        if: (failure() || cancelled()) && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          # 'failure' / 'cancelled' when the fuzz step itself broke; ''
+          # or 'skipped' when an earlier step did.
+          FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+
+          # One open issue per label: comment on it if there is one.
+          notify() {
+            label="$1"; color="$2"; label_desc="$3"; title="$4"; body="$5"; comment="$6"
+            gh label create "$label" --color "$color" --description "$label_desc" \
+              2>/dev/null || true
+            existing=$(gh issue list --label "$label" --state open \
+              --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$comment"
+            else
+              gh issue create --label "$label" --title "$title" --body "$body"
+            fi
+          }
+
+          repros=$(find fuzz/artifacts -type f 2>/dev/null | sort || true)
+
+          # (a) a reproducer exists: a real finding.
+          if [ -n "$repros" ]; then
+            repro_list=$(echo "$repros" | sed 's/^/- `/; s/$/`/')
+            body=$(cat <<EOF
+          A **nightly fuzz target** found a crash, timeout or OOM.
+
+          - Run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+          - Reproducer(s), also in the \`fuzz-targets-artifacts\` artifact:
+
+          $repro_list
+
+          Reproduce with \`cargo +<pinned nightly> fuzz run <target> <file>\`
+          (the pin is \`FUZZ_NIGHTLY\` in \`scripts/fuzz/run-block-differential.sh\`).
+          Fix the code, not the target's assertion. Close this issue once
+          resolved.
+          EOF
+            )
+            notify fuzz-crash B60205 \
+              "a nightly fuzz target found a crash" \
+              "Fuzz crash in a nightly target ($today)" \
+              "$body" \
+              "Another fuzz finding on $today: $RUN_URL"
+            exit 0
+          fi
+
+          # (b) the fuzz step failed or timed out with no reproducer.
+          if [ "$FUZZ_OUTCOME" = "failure" ] || [ "$FUZZ_OUTCOME" = "cancelled" ]; then
+            body=$(cat <<EOF
+          The **nightly fuzz-target job is broken**: the fuzz step ended as
+          \`$FUZZ_OUTCOME\` without a reproducer. That is not a finding; it means
+          the targets did not get fuzzed. The step summary names the target.
+
+          - Run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+
+          Usual causes: a target no longer compiles against the crate it
+          fuzzes (\`fuzz/\` is a separate workspace, so only the Lint job's
+          type-check sees it), a target that ran zero inputs, a broken pinned
+          nightly, or a run that outgrew \`timeout-minutes\`.
+
+          Reproduce locally:
+
+          \`\`\`
+          SECONDS_PER_TARGET=60 bash scripts/fuzz/run-standalone-targets.sh
+          \`\`\`
+          EOF
+            )
+            notify fuzz-targets-broken D93F0B \
+              "the nightly fuzz-target job is broken (not a finding)" \
+              "Nightly fuzz targets broken ($today)" \
+              "$body" \
+              "Still broken on $today: $RUN_URL"
+            exit 0
+          fi
+
+          # (c) an earlier step failed. Quiet unless the two scheduled runs
+          # before this one failed too. A failed query counts as a streak, so
+          # it cannot read as "no streak" and stay silent.
+          if ! prior_failures=$(gh run list \
+            --workflow fuzz_targets_nightly.yml \
+            --event schedule --status completed --limit 2 \
+            --json conclusion \
+            --jq '[.[] | select(.conclusion == "failure")] | length'); then
+            echo "Could not read prior run conclusions; assuming a streak."
+            prior_failures=2
+          fi
+          if [ "${prior_failures:-0}" -lt 2 ]; then
+            echo "Infra failure before the fuzz step; not a streak ($prior_failures/2). Rerun."
+            exit 0
+          fi
+          body=$(cat <<EOF
+          The **nightly fuzz-target job has failed three scheduled runs in a
+          row**, each before the fuzz step ran (apt, \`cargo install\`, cache,
+          or runner resources). The targets have not been fuzzed since.
+
+          - Latest run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+          EOF
+          )
+          notify fuzz-targets-broken D93F0B \
+            "the nightly fuzz-target job is broken (not a finding)" \
+            "Nightly fuzz targets broken: 3 failed runs in a row ($today)" \
+            "$body" \
+            "Still failing before the fuzz step on $today: $RUN_URL"
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed run whose triage step did not finish.
+  # A lost runner fails the job; a cancelled one is left to the triage step,
+  # which runs on cancellation and tells a timeout from a superseded run.
+  # Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: fuzz
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && needs.fuzz.result == 'failure'
+      && needs.fuzz.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: fuzz-targets-broken
+          LABEL_COLOR: D93F0B
+          LABEL_DESC: "the nightly fuzz-target job is broken (not a finding)"
+          TITLE: "Nightly fuzz targets broken: run ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.fuzz.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh

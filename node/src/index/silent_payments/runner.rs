@@ -328,7 +328,7 @@ impl BackfillRunner {
         &self,
         snapshot: &ActiveChainSnapshot,
         h: u32,
-    ) -> Result<bitcoin::Block, BackfillError> {
+    ) -> Result<crate::storage::opreturn_strip::StoredBlock, BackfillError> {
         let hash = *snapshot.hashes.get(h as usize).ok_or_else(|| {
             BackfillError::Chain(format!(
                 "snapshot index out of range: h={} (snapshot_height={})",
@@ -336,7 +336,7 @@ impl BackfillRunner {
                 snapshot.snapshot_height()
             ))
         })?;
-        self.chain.get_block(&hash).ok_or_else(|| {
+        self.chain.get_stored_block(&hash).ok_or_else(|| {
             BackfillError::Chain(format!(
                 "missing block data for {} at height {} (pruned or corrupt?)",
                 hash, h
@@ -381,7 +381,12 @@ impl BackfillRunner {
                 std::thread::sleep(Duration::from_millis(debug_delay));
             }
 
-            let block = self.read_via_snapshot(snapshot, h)?;
+            let stored = self.read_via_snapshot(snapshot, h)?;
+            // Rows name each transaction by its stored txid: an OP_RETURN-
+            // stripped one's is in its strip record. Its inputs, which the
+            // tweak is computed over, and its taproot outputs are intact.
+            let txids = stored.txids();
+            let block = stored.block;
             let block_hash = block.header.block_hash();
             let undo = self
                 .chain
@@ -412,7 +417,7 @@ impl BackfillRunner {
 
             let mut batch = StoreBatch::default();
             if let Some(row) =
-                build_sp_row(&self.cfg, &block, block_hash, &prev_map).map_err(|e| {
+                build_sp_row(&self.cfg, &block, block_hash, Some(&txids), &prev_map).map_err(|e| {
                     BackfillError::Emit {
                         height: h,
                         detail: e.to_string(),

@@ -332,6 +332,7 @@ fn block_processor_refusals_charge_the_sender_as_core_does() {
     assert!(charged(ChainError::Connect(ConnectError::BadCoinbaseHeight)));
     assert!(charged(ChainError::Validation(ValidationError::TimeTooOld)));
     assert!(charged(ChainError::CheckpointMismatch(10)));
+    assert!(charged(ChainError::ForkBeforeCheckpoint(10)));
     assert!(!charged(ChainError::Validation(ValidationError::TimeTooNew)));
     assert!(!charged(ChainError::Validation(ValidationError::BadMerkleRoot)));
     assert!(!charged(ChainError::Connect(ConnectError::Interrupted)));
@@ -392,4 +393,66 @@ fn a_block_that_fails_itself_charges_its_sender_unless_rebuilt() {
         pm.charge_refused_block(&bad, 1, via_compact, &err);
         assert_eq!(!pm.peers.read().contains_key(&1), charged, "via_compact = {via_compact}");
     }
+}
+
+/// A header forking below the last checkpoint in the index
+/// (`bad-fork-prior-to-checkpoint`) is `BLOCK_CHECKPOINT`, which Core's
+/// `MaybePunishNodeForBlock` answers with `Misbehaving`: the sender is
+/// discouraged at once, not charged the 20 points of other header refusals.
+/// A peer re-sending the main chain's headers below the checkpoint is not
+/// charged at all.
+#[test]
+fn a_header_forking_below_the_last_checkpoint_bans_its_sender() {
+    use crate::chain::checkpoints::Checkpoint;
+    use crate::chain::state::tests::build_test_block;
+    let (pm, _dir) = {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cs = ChainState::new(
+            Box::new(InMemoryStore::new()),
+            FlatFileManager::new(&dir.path().join("blocks")).unwrap(),
+            Network::Regtest,
+            Box::new(crate::validation::script::NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut blocks = Vec::new();
+        for h in 1..=4 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            blocks.push(b);
+        }
+        cs.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: parent }]);
+        for b in &blocks {
+            cs.accept_block(b).expect("connect fixture block");
+        }
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        (
+            PeerManager::new(Arc::new(cs), mempool, fee_estimator, Network::Regtest, shutdown_rx),
+            dir,
+        )
+    };
+    let _rx1 = add_peer(&pm, peer(1, "10.63.0.1:50000", Direction::Inbound));
+    let _rx2 = add_peer(&pm, peer(2, "10.63.0.2:50000", Direction::Inbound));
+    let h1 = pm.chain_state.get_block_hash_by_height(1).expect("height 1");
+    let h2 = pm.chain_state.get_block_hash_by_height(2).expect("height 2");
+
+    let known = pm.chain_state.get_block_index(&h2).expect("indexed").header;
+    pm.handle_headers(2, vec![known]);
+    assert_eq!(outcome(&pm, 2), Outcome::Kept, "a known main-chain header charges nothing");
+
+    let fork = build_test_block(h1, 2, 1_707_100_002);
+    pm.handle_headers(1, vec![fork.header]);
+    assert!(pm.chain_state.get_block_index(&fork.block_hash()).is_none());
+    assert_eq!(outcome(&pm, 1), Outcome::Banned);
 }

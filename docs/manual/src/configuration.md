@@ -185,12 +185,15 @@ without restarting the relevant socket, engine, or process:
 *   TLS/mTLS paths and the mTLS CA (the cert and key contents reload via
     `SIGUSR1`; see below)
 *   `dbcache`, `prune`, `storageprofile`, and reindex
+*   `pruneopreturn`, `pruneopreturnsize` and `pruneopreturnpeers`, OP_RETURN
+    data pruning, and `restoreopreturns`, which undoes it
 *   index enable/disable (`txindex`/`addressindex`/`blockfilterindex`)
 *   DNS-seed bootstrap (`dns`/`dnsseed`/`forcednsseed`/`fixedseeds`/`asmap`)
 *   Tor (`proxy`/`onion`/`torcontrol`/`listenonion`)
 *   `consensus`
 *   `assumevalid` and `stopatheight`
-*   `nap`, `napstorerecover` and `napmaxattestations`, the attestation publisher
+*   `nap`, `napstorerecover` and `napmaxattestations`, the attestation publisher,
+    and `napaggregator`, the aggregator
 *   `uacomment` — the user agent is sent once per connection, in the version
     message, so a change reaches a peer only on a new connection
 

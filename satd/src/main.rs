@@ -1220,6 +1220,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
     flat_files.set_fast_prune(config.fastprune);
+    if config.allow_test_strip && config.network != bitcoin::Network::Regtest {
+        eprintln!("Error: -allowteststrip is a test option and is only accepted with -regtest");
+        auth.cleanup();
+        node::shutdown::exit_now(1);
+    }
 
     // -reindex used to eagerly slurp every block into a `Vec` here so the
     // FlatFileManager could be moved into ChainState; on a fully-synced
@@ -1356,6 +1361,74 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             cs.set_signet_challenge(config.signet_challenge.clone());
             node::chain::state::ChainState::set_max_tip_age(config.maxtipage);
             cs.set_minimum_chain_work(config.minimumchainwork);
+            if config.allow_test_strip {
+                cs.allow_test_strip();
+            }
+            // OP_RETURN pruning (plan §2.1). The peers mode is set either
+            // way: it governs a node that still holds stripped blocks after
+            // the option is turned off.
+            cs.set_opreturn_prune_peers(config.opreturn_prune_peers);
+            if config.restore_opreturns {
+                cs.request_opreturn_restore();
+            }
+            if config.opreturn_prune_depth > 0 {
+                cs.configure_opreturn_prune(node::chain::state::StripConfig {
+                    depth: config.opreturn_prune_depth,
+                    size_threshold: config.opreturn_prune_size,
+                });
+                if let Err(e) = cs.probe_opreturn_strip() {
+                    eprintln!(
+                        "Error: -pruneopreturn needs a filesystem with hole-punch support (ext4, XFS, \
+                         btrfs, ZFS, tmpfs, APFS); the probe in {} failed: {e}",
+                        cs.blocks_dir().display()
+                    );
+                    auth.cleanup();
+                    node::shutdown::exit_now(1);
+                }
+            }
+            if let Err(e) = cs.load_opreturn_strip_state() {
+                eprintln!("Error reading the OP_RETURN strip records: {e}");
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+            if config.opreturn_prune_depth > 0 {
+                tracing::info!(
+                    depth = config.opreturn_prune_depth,
+                    min_size = config.opreturn_prune_size,
+                    peers = config.opreturn_prune_peers.as_str(),
+                    fs_block = cs.opreturn_strip_fs_block(),
+                    "OP_RETURN pruning on: payloads of OP_RETURN outputs of at least min_size bytes \
+                     are stripped from blocks more than depth blocks deep"
+                );
+                if config.opreturn_prune_size < cs.opreturn_strip_fs_block().unwrap_or(4096) {
+                    tracing::warn!(
+                        min_size = config.opreturn_prune_size,
+                        "-pruneopreturnsize is below one filesystem block: outputs this small free \
+                         little or no disk, and each costs ~100 bytes of index"
+                    );
+                }
+            } else if cs.opreturn_restore_pending() {
+                let summary = cs.opreturn_strip_summary_last();
+                tracing::info!(
+                    blocks = summary.blocks,
+                    "-restoreopreturns: the stripped blocks are downloaded again from peers that keep \
+                     every block, once the tip is caught up; the node stays NODE_NETWORK_LIMITED until \
+                     the last one is restored"
+                );
+            } else if cs.opreturn_prune_active() {
+                tracing::info!(
+                    "-pruneopreturn is off, but stripped blocks remain: the node stays \
+                     NODE_NETWORK_LIMITED until the last one is restored (-restoreopreturns downloads \
+                     them all again; getblockfrompeer restores one)"
+                );
+            } else if config.restore_opreturns {
+                tracing::info!("-restoreopreturns: no block is stripped, nothing to restore");
+            } else if config.opreturn_prune_peers != node::storage::opreturn_strip::PrunePeers::default() {
+                tracing::warn!(
+                    "-pruneopreturnpeers={} is ignored: -pruneopreturn is off and no block is stripped",
+                    config.opreturn_prune_peers.as_str()
+                );
+            }
             if cs.network == bitcoin::Network::Signet {
                 tracing::info!(
                     "Signet derived magic (message start): {}",
@@ -1385,6 +1458,30 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         tip = %chain_state.tip_hash(),
         "Chain state initialized"
     );
+
+    // -alertnotify: run a shell command whenever the node raises a new
+    // operational warning, with `%s` replaced by the warning text (Bitcoin
+    // Core parity — Core fires this on `DoWarning`). Warnings are deduped by
+    // id in `NodeWarnings`, so the hook fires once per *new* warning, not on
+    // every repeat. Serial dispatch via the same primitive as blocknotify.
+    //
+    // Installed as soon as the warnings registry exists, before the snapshot
+    // resume and the reindex (#884): Core's hook is live for the whole of
+    // startup, so a `reindex.halted` or `reindex.short` must fire it too. A
+    // warning `ChainState::new` itself recorded is sent on install.
+    if let Some(cmd_template) = config
+        .alert_notify
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+    {
+        tracing::warn!(
+            "-alertnotify configured; running a command on each new node warning. {}",
+            notifyhooks::STREAMING_API_NOTICE
+        );
+        let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        chain_state.warnings().set_alert_notifier(alert_tx);
+        notifyhooks::spawn_alert_notifier(alert_rx, cmd_template);
+    }
     // The chainstate database closes when the last reference to its store is
     // dropped; `main` checks this at exit.
     let chainstate_db = Arc::downgrade(chain_state.store_ref());
@@ -2105,25 +2202,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             notifyhooks::STREAMING_API_NOTICE
         );
         notifyhooks::spawn_block_notifier(chain_event_tx.subscribe(), cmd_template);
-    }
-
-    // -alertnotify: run a shell command whenever the node raises a new
-    // operational warning, with `%s` replaced by the warning text (Bitcoin
-    // Core parity — Core fires this on `DoWarning`). Warnings are deduped by
-    // id in `NodeWarnings`, so the hook fires once per *new* warning, not on
-    // every repeat. Serial dispatch via the same primitive as blocknotify.
-    if let Some(cmd_template) = config
-        .alert_notify
-        .clone()
-        .filter(|c| !c.trim().is_empty())
-    {
-        tracing::warn!(
-            "-alertnotify configured; running a command on each new node warning. {}",
-            notifyhooks::STREAMING_API_NOTICE
-        );
-        let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        chain_state.warnings().set_alert_notifier(alert_tx);
-        notifyhooks::spawn_alert_notifier(alert_rx, cmd_template);
     }
 
     // -startupnotify / -shutdownnotify fire once per process (at ready / at
@@ -3143,6 +3221,28 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // once. Until it lands, the RPC reports the young buckets as an
     // estimate (`exact: false`). A failed scan is retried a few times with
     // growing waits, then left until the next start.
+    // The OP_RETURN strip worker (plan §2.6), when -pruneopreturn is on, or
+    // when it is off on a node that holds stripped blocks: there it only
+    // keeps the totals current as records go. A thread of its own: every
+    // pass is blocking I/O, paced by the tip.
+    let strip_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let strip_thread = if chain_state.opreturn_prune_active() {
+        let chain = chain_state.clone();
+        let stop = strip_stop.clone();
+        match std::thread::Builder::new()
+            .name("opreturn-strip".into())
+            .spawn(move || node::chain::state::run_strip_worker(chain, stop))
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!(error = %e, "could not start the OP_RETURN strip worker; nothing will be stripped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let recent_window_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let recent_window_thread = {
         let chain = chain_state.clone();
@@ -3324,11 +3424,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let opened = if config.napstorerecover {
             node::nap::Publisher::open_recovering(path, &*chain_state).map(|(p, aside)| {
                 if let Some((aside, why)) = aside {
+                    let moved: Vec<String> = aside.iter().map(|p| p.display().to_string()).collect();
                     tracing::warn!(
                         target: "nap",
                         "NAP: the attestation store did not read back ({why}); moved it to {} \
                          and started with an empty one",
-                        aside.display()
+                        moved.join(" and ")
                     );
                 }
                 p
@@ -3357,6 +3458,57 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // Serve it over P2P and advertise NODE_NAP, before P2P starts.
         peer_manager.set_nap_publisher(publisher.clone());
         Some(publisher)
+    } else {
+        None
+    };
+    // Kept for shutdown, which folds the publisher's journal into its file.
+    let nap_at_shutdown = nap.clone();
+
+    // -napaggregator: load the collected set, judge it at the tip, and start
+    // collecting. The set is rebuilt by collection, so a file that does not
+    // read back is moved aside rather than refusing to start.
+    let nap_aggregator = if config.napaggregator {
+        let path = net_datadir.join("nap").join("aggregate").join("aggregate.dat");
+        let max = config.napaggregatormax;
+        let aggregate = match node::nap::aggregate::Aggregate::open_with_max(path.clone(), &*chain_state, max) {
+            Ok(a) => a,
+            Err(why) => {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut aside = path.clone().into_os_string();
+                aside.push(format!(".bad-{secs}"));
+                if let Err(e) = std::fs::rename(&path, &aside) {
+                    eprintln!("Error loading the NAP aggregate ({why}); moving it aside failed: {e}");
+                    auth.cleanup();
+                    node::shutdown::exit_now(1);
+                }
+                tracing::warn!(
+                    target: "nap",
+                    "NAP: the aggregate did not read back ({why}); moved it to {} and started empty",
+                    std::path::PathBuf::from(&aside).display()
+                );
+                match node::nap::aggregate::Aggregate::open_with_max(path, &*chain_state, max) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("Error opening an empty NAP aggregate: {e}");
+                        auth.cleanup();
+                        node::shutdown::exit_now(1);
+                    }
+                }
+            }
+        };
+        let collector = Arc::new(node::nap::collect::Collector::new(aggregate));
+        tracing::info!(target: "nap", held = collector.aggregate().len(), "NAP aggregator enabled");
+        let puller = Arc::new(node::nap::pull::Puller::new(collector.clone()));
+        tokio::spawn(node::nap::chain::follow_tip_aggregate(
+            collector,
+            chain_state.clone(),
+            shutdown_rx.clone(),
+        ));
+        peer_manager.set_nap_aggregator(puller.clone());
+        tokio::spawn(peer_manager.clone().run_nap_collection(shutdown_rx.clone()));
+        Some(puller)
     } else {
         None
     };
@@ -3439,6 +3591,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             })
         },
         nap,
+        nap_aggregator,
     )
     .await
     {
@@ -4486,22 +4639,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     peer_manager.set_automatic_outbound(config.automatic_outbound);
     peer_manager.set_reachable(config.reachable);
     peer_manager.set_onion_disabled(config.noonion);
-    // satd's proxied bootstrap seeds are .onion only (no DNS through the
-    // proxy), so a proxied node whose -onlynet leaves out onion has no
-    // built-in way to find peers; Core would fetch the DNS seeds through
-    // the proxy instead.
-    if config.proxy.is_some()
-        && !config.reachable.onion
-        && config.automatic_outbound
-        && config.seednode.is_empty()
-        && config.addnode.is_empty()
-    {
-        tracing::warn!(
-            "-proxy is set and -onlynet leaves out onion: satd's proxied bootstrap seeds are .onion \
-             addresses, so this node has no built-in way to find peers. Add -seednode or -addnode \
-             peers on a network -onlynet allows."
-        );
-    }
 
     // Connect to configured peers (and register for auto-reconnect).
     //
@@ -4558,6 +4695,23 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // Core-style hostnames and port-less entries (`seed.example.com`,
     // `1.2.3.4`) get the network default port instead of being rejected.
     if !config.seednode.is_empty() {
+        // Under -proxy a seed host name is not looked up here: it is opened
+        // by name, as an `addr-fetch` connection the proxy resolves, as Core
+        // opens every `-seednode` (`AddAddrFetch`; its `ConnectNode` hands
+        // the name to the proxy). Core uses none under -connect.
+        if config.proxy.is_some() {
+            for (host, port) in node::net::dns::operator_seed_names(&config.seednode, config.network) {
+                if config.automatic_outbound {
+                    peer_manager.add_addr_fetch(host, port);
+                } else {
+                    // Core logs "-seednode is ignored when -connect is used".
+                    tracing::warn!(
+                        "-seednode {host} is not used: under -proxy a seed host name is fetched \
+                         through the proxy as an addr-fetch connection, and -connect uses none"
+                    );
+                }
+            }
+        }
         let seed_addrs = node::net::dns::resolve_operator_seeds(
             &config.seednode,
             config.network,
@@ -4595,6 +4749,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let signet_seeds = config.signet_seed_nodes.clone();
         let force = config.forcednsseed;
         let shutdown = shutdown_rx.clone();
+        // Under -proxy the DNS seeds are reached by name through it, as
+        // `addr-fetch` connections, never looked up locally: Core's
+        // `ThreadDNSAddressSeed` with a name proxy (#994). The built-in
+        // .onion seeds are added as well.
+        let fetch = if proxy.is_some() {
+            node::net::dns::proxied_seed_names(network, &signet_seeds)
+        } else {
+            Vec::new()
+        };
         tokio::spawn(async move {
             // Learned, not named: Core adds a seed's answers to its address
             // book and dials them as automatic `outbound-full-relay`
@@ -4607,6 +4770,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 || async move {
                     node::net::dns::resolve_seeds_with(network, proxy.as_deref(), &signet_seeds).await
                 },
+                fetch,
                 shutdown,
             )
             .await;
@@ -4858,6 +5022,21 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // bounded anyway, and a scan that somehow outlives it holds nothing the
     // flush below needs (it reads a snapshot and persists nothing when
     // cancelled).
+    // Stop the strip worker. It checks the flag between blocks and every
+    // 500 ms of its idle wait; a block in hand finishes its punch first.
+    strip_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = strip_thread {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            tracing::warn!("OP_RETURN strip worker did not stop within 10s; continuing shutdown");
+        }
+    }
+
     recent_window_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(handle) = recent_window_thread {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4870,6 +5049,22 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             tracing::warn!(
                 "utxo recent-height window build did not stop within 5s; continuing shutdown"
             );
+        }
+    }
+
+    // Fold the NAP publisher's journal into its file, so the file alone
+    // holds every attestation: a store too small to have been folded in as
+    // it went would otherwise keep its newest ones only in the journal,
+    // which an older satd does not read. One write of the store, before the
+    // chain flush takes the rest of the deadline.
+    if let Some(publisher) = &nap_at_shutdown {
+        match publisher.fold_journal() {
+            Ok(true) => tracing::info!(target: "nap", "NAP: wrote the attestation store"),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                target: "nap",
+                "NAP: could not write the attestation store at shutdown; its journal still holds every change: {e}"
+            ),
         }
     }
 

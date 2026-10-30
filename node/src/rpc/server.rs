@@ -56,6 +56,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getblockchaininfo", "Blockchain"),
     ("getblockcount", "Blockchain"),
     ("getblockfileaudit", "Blockchain"),
+    ("getopreturnpruneinfo", "Blockchain"),
     ("getblockfilter", "Blockchain"),
     ("getblockfrompeer", "Blockchain"),
     ("getblockhash", "Blockchain"),
@@ -170,12 +171,16 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("deriveaddresses", "Util"),
     ("estimaterawfee", "Util"),
     ("estimatesmartfee", "Util"),
+    ("exportnapsnapshot", "Util"),
     ("getdescriptorinfo", "Util"),
     ("getindexinfo", "Util"),
+    ("getnapreport", "Util"),
     ("getsatdindexinfo", "Util"),
+    ("listnapaggregate", "Util"),
     ("listnapattestations", "Util"),
     ("pauseindex", "Util"),
     ("removenapattestation", "Util"),
+    ("replaynapsnapshot", "Util"),
     ("resumeindex", "Util"),
     ("signmessagewithprivkey", "Util"),
     ("submitnapattestation", "Util"),
@@ -196,6 +201,9 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("addpeeraddress", "hidden"),
     ("getrawaddrman", "hidden"),
     ("getorphantxs", "hidden"),
+    // satd's test-only strip tool; registered only with `-allowteststrip`
+    // on regtest.
+    ("stripopreturns", "hidden"),
 ];
 
 /// Core's `GetNetworkNames()`: every network `getaddrmaninfo` reports and
@@ -632,6 +640,18 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
     })
 }
 
+/// `path` as `dumptxoutset` resolves it: an absolute path as given, a
+/// relative one against the network datadir.
+fn resolve_datadir_path(ctx: &RpcContext, path: &str) -> Result<std::path::PathBuf, ErrorObjectOwned> {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    net_datadir_from(ctx)
+        .map(|d| d.join(p))
+        .ok_or_else(|| ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>))
+}
+
 /// How the node prunes, from the effective config. Read by
 /// `getblockchaininfo` and `pruneblockchain`.
 fn prune_mode_from(ctx: &RpcContext) -> blockchain::PruneMode {
@@ -748,6 +768,8 @@ pub struct RpcContext {
     /// The NAP publisher, `Some` with `-nap=1`. The NAP RPCs answer an
     /// error without it.
     pub nap: Option<Arc<crate::nap::Publisher>>,
+    /// The NAP aggregator's pulls and set, `Some` with `-napaggregator=1`.
+    pub nap_aggregator: Option<Arc<crate::nap::pull::Puller>>,
 }
 
 /// RAII guard that releases the [`RpcContext::blockfile_audit_running`]
@@ -904,6 +926,7 @@ pub async fn start(
     readonly: Option<ReadOnlyListener>,
     // The NAP publisher (`-nap=1`), or `None`.
     nap: Option<Arc<crate::nap::Publisher>>,
+    nap_aggregator: Option<Arc<crate::nap::pull::Puller>>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Listener-status + shutdown_tx are needed both inside the RPC
     // context (so the `stop` RPC + `getserverstatus` can use them) AND
@@ -945,8 +968,12 @@ pub async fn start(
         filter_backfill_cmd_tx,
         blockfile_audit_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         nap,
+        nap_aggregator,
     });
 
+    // `stripopreturns` exists only on a regtest node started with
+    // `-allowteststrip`; see its registration below.
+    let test_strip = ctx.chain_state.test_strip_allowed();
     let mut module = RpcModule::new(ctx);
 
     // --- Blockchain RPCs ---
@@ -2594,8 +2621,14 @@ pub async fn start(
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
-        blockchain::get_tx_out_set_info(&ctx.chain_state)
+    module.register_method("gettxoutsetinfo", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let hash_type: Option<String> = args.optional("hash_type")?;
+        let hash_or_height = args.raw("hash_or_height")?;
+        let use_index: Option<bool> = args.optional("use_index")?;
+        args.check()?;
+        let args = blockchain::TxOutSetInfoArgs { hash_type, hash_or_height, use_index };
+        blockchain::get_tx_out_set_info_with(&ctx.chain_state, &args)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -3213,6 +3246,55 @@ pub async fn start(
     // Regtest-gated exactly as Core gates it: on any other chain a caller with
     // RPC access could otherwise force the node to open arbitrary outbound
     // connections of arbitrary type.
+    // `stripopreturns <blockhash> <threshold>`: strip one block's OP_RETURN
+    // payloads at or above `threshold` bytes, now, whatever its depth. A test
+    // tool, so the consumers of stripped blocks can be tested before the
+    // strip worker exists. Registered only on regtest with the hidden
+    // `-allowteststrip`, so on any other node it is method-not-found, and
+    // never advertised by `help`.
+    if test_strip {
+        module.register_async_method("stripopreturns", |params, ctx, _extensions| async move {
+            let mut args = Args::new(&params);
+            let hash: String = args.required("blockhash")?;
+            let threshold: u64 = args.required("threshold")?;
+            args.check()?;
+            let hash = hash.parse::<bitcoin::BlockHash>().map_err(|e| {
+                ErrorObjectOwned::owned(-8, format!("blockhash must be a block hash: {e}"), None::<()>)
+            })?;
+            let chain_state = ctx.chain_state.clone();
+            let outcome = tokio::task::spawn_blocking(move || chain_state.strip_block(&hash, threshold))
+                .await
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(-32603, format!("strip task join error: {e}"), None::<()>)
+                })?;
+            use crate::chain::state::{StripError, StripOutcome};
+            let (name, stats) = match outcome {
+                Ok(StripOutcome::NothingEligible) => ("nothing_eligible", Default::default()),
+                Ok(StripOutcome::Stripped(s)) => ("stripped", s),
+                Ok(StripOutcome::Redone(s)) => ("redone", s),
+                Ok(StripOutcome::Extended(s)) => ("extended", s),
+                Ok(StripOutcome::Raced) => ("raced", Default::default()),
+                Err(e) => {
+                    let code = match e {
+                        StripError::UnknownBlock(_) => -5,
+                        StripError::NotQuiet(_) => -10,
+                        StripError::NotActive(_) | StripError::NotValid { .. } => -8,
+                        _ => -1,
+                    };
+                    return Err(ErrorObjectOwned::owned(code, e.to_string(), None::<()>));
+                }
+            };
+            let stats: crate::chain::state::StripStats = stats;
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                "outcome": name,
+                "txs": stats.txs,
+                "outputs": stats.outputs,
+                "span_bytes": stats.span_bytes,
+                "freed_bytes": stats.freed_bytes,
+            }))
+        })?;
+    }
+
     module.register_async_method("addconnection", |params, ctx, _extensions| async move {
         if ctx.chain_state.network != bitcoin::Network::Regtest {
             // Core throws a bare `std::runtime_error` here, which its
@@ -3824,6 +3906,16 @@ pub async fn start(
         }))
     })?;
 
+    // `getopreturnpruneinfo` (satd extension, plan §2.13): OP_RETURN pruning
+    // in full. Off the async workers: it stats the block files.
+    module.register_async_method("getopreturnpruneinfo", |params, ctx, _extensions| async move {
+        Args::new(&params).check()?;
+        let chain_state = ctx.chain_state.clone();
+        tokio::task::spawn_blocking(move || crate::rpc::blockchain::opreturn_prune_json(&chain_state, true))
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("task join error: {e}"), None::<()>))
+    })?;
+
     module.register_async_method(
         "getblockfileaudit",
         |_params, ctx, _extensions| async move {
@@ -4274,6 +4366,58 @@ pub async fn start(
         Args::new(&params).check()?;
         let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
         Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list(nap, &ctx.chain_state))
+    })?;
+
+    module.register_method("listnapaggregate", |params, ctx, _extensions| {
+        Args::new(&params).check()?;
+        let aggregator = crate::rpc::nap::aggregator_enabled(ctx.nap_aggregator.as_deref())?;
+        Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(aggregator, &ctx.chain_state))
+    })?;
+
+    // A report judges every attestation held at the tip, once per tip and
+    // set, and a replay verifies every signature in a file: off the RPC
+    // threads, as `scantxoutset` is.
+    module.register_async_method("getnapreport", |params, ctx, _extensions| async move {
+        Args::new(&params).check()?;
+        let aggregator = ctx.nap_aggregator.clone();
+        crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        tokio::task::spawn_blocking(move || {
+            crate::rpc::nap::report(aggregator.as_deref().expect("checked above"), &chain)
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("report task failed: {e}"), None::<()>))?
+    })?;
+
+    module.register_async_method("replaynapsnapshot", |params, ctx, _extensions| async move {
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        args.check()?;
+        let path = resolve_datadir_path(&ctx, &path)?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        // A replay takes as many attestations as this node's own set may
+        // hold, or the default if it aggregates nothing.
+        let max = ctx.nap_aggregator.as_deref().map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
+            p.collector().aggregate().max_attestations()
+        });
+        tokio::task::spawn_blocking(move || crate::rpc::nap::report_snapshot(&chain, &path, max))
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("replay task failed: {e}"), None::<()>))?
+    })?;
+
+    module.register_async_method("exportnapsnapshot", |params, ctx, _extensions| async move {
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        args.check()?;
+        let aggregator = ctx.nap_aggregator.clone();
+        crate::rpc::nap::aggregator_enabled(aggregator.as_deref())?;
+        let path = resolve_datadir_path(&ctx, &path)?;
+        let chain = std::sync::Arc::clone(&ctx.chain_state);
+        tokio::task::spawn_blocking(move || {
+            crate::rpc::nap::export_snapshot(aggregator.as_deref().expect("checked above"), &chain, &path)
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("export task failed: {e}"), None::<()>))?
     })?;
 
     module.register_method("removenapattestation", |params, ctx, _extensions| {
@@ -5445,7 +5589,7 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_seven() {
+    fn the_hidden_commands_are_the_expected_eight() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
@@ -5461,6 +5605,7 @@ mod help_listing_tests {
                 "addpeeraddress",
                 "getrawaddrman",
                 "getorphantxs",
+                "stripopreturns",
             ]
         );
     }

@@ -1,4 +1,4 @@
-use bitcoin::{Block, BlockHash, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, Transaction, TxOut, Txid, Wtxid};
 use crossbeam_channel::bounded;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -11,6 +11,7 @@ use std::thread;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
+use crate::storage::opreturn_strip::{self, StoredBlock};
 use crate::chain::replay_plan::ReplayPlan;
 use crate::storage::Store;
 use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptVerifier};
@@ -26,8 +27,15 @@ pub struct PreprocessedBlock {
     pub parent: BlockIndexEntry,
     pub flat_pos: FlatFilePos,
     pub mtp: u32,
-    /// Pre-computed txids (one per transaction in the block).
+    /// Pre-computed txids (one per transaction in the block). For a block
+    /// replayed from an OP_RETURN-stripped copy, `block` is its filled form
+    /// and these are the recorded txids.
     pub txids: Vec<Txid>,
+    /// The recorded wtxids of a stripped block; `None` for an intact one.
+    pub wtxids: Option<Vec<Wtxid>>,
+    /// The stripped transactions of a stripped block, whose scripts cannot
+    /// be verified (see `ConnectParams::script_skip_txs`). Empty otherwise.
+    pub script_skip_txs: HashSet<usize>,
     /// Tx indices where all inputs were speculatively resolved AND scripts
     /// were pre-verified successfully. Only populated in assumevalid mode.
     pub script_verified_txs: HashSet<usize>,
@@ -41,6 +49,11 @@ pub struct PreprocessedBlock {
 /// Replicates the `read_block_direct` pattern from `ChainState`, including
 /// de-obfuscation with the blocks-dir xor key (Core v28+ `xor.dat`).
 fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8]) -> Option<Block> {
+    bitcoin::consensus::deserialize(&read_bytes_from_file(blocks_dir, pos, xor_key)?).ok()
+}
+
+/// The raw, xor-decoded bytes of the block record at `pos`.
+fn read_bytes_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8]) -> Option<Vec<u8>> {
     let path = blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
     let mut file = File::open(&path).ok()?;
     // Flat file layout: [magic:4][size:4][block_data:size]
@@ -56,7 +69,7 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
     let mut data = vec![0u8; size];
     file.read_exact(&mut data).ok()?;
     crate::storage::flatfile::xor_in_place(&mut data, xor_key, pos.data_pos as u64 + 8);
-    bitcoin::consensus::deserialize(&data).ok()
+    Some(data)
 }
 
 /// Prefetch and pre-process a single block at the given height.
@@ -108,7 +121,30 @@ pub fn prefetch_block(
         file_number: entry.file_number,
         data_pos: entry.data_pos,
     };
-    let block = read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
+    //
+    // A replay reads a stripped block through its strip record, as the
+    // direct path does. IBD stays unaware of records: it connects blocks as
+    // they arrive, and a block is stripped only once it is deep in the
+    // active chain. A record that does not verify defers to the direct
+    // read, which stops the replay with the error.
+    let stored = if plan.is_some() {
+        let bytes = read_bytes_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
+        match opreturn_strip::decode_for_replay(store, bytes, &hash, blocks_xor_key) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::debug!(height, block = %hash, error = %e, "prefetch: deferring to the direct read");
+                return None;
+            }
+        }
+    } else {
+        StoredBlock::intact(read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?)
+    };
+    let (txids, wtxids, script_skip_txs) = if stored.is_stripped() {
+        (stored.txids(), Some(stored.wtxids()), stored.stripped_tx_indices())
+    } else {
+        (stored.block.txdata.iter().map(|tx| tx.compute_txid()).collect(), None, HashSet::new())
+    };
+    let block = stored.block;
 
     // 4. Context-free block validation, off the connect thread.
     //
@@ -121,7 +157,13 @@ pub fn prefetch_block(
     // during reindex for this reason. Returning `None` hands the block to the
     // direct-read path, which repeats the check and fails the replay with the
     // specific error.
-    if let Err(e) = crate::validation::block::check_block(&block, network, height) {
+    if let Err(e) = crate::validation::block::check_block_with_hashes(
+        &block,
+        &txids,
+        wtxids.as_deref(),
+        network,
+        height,
+    ) {
         tracing::warn!(
             height,
             block = %hash,
@@ -142,10 +184,8 @@ pub fn prefetch_block(
         }
     };
 
-    // 6. Context-free work: txids + check_transaction
-    let mut txids = Vec::with_capacity(block.txdata.len());
+    // 6. Context-free work: check_transaction (the txids were taken above)
     for tx in &block.txdata {
-        txids.push(tx.compute_txid());
         // Context-free check — if it fails, connect_block will catch it
         let _ = check_transaction(tx);
     }
@@ -190,7 +230,9 @@ pub fn prefetch_block(
         let verifiable: Vec<(usize, &Transaction, Vec<TxOut>)> = block.txdata.iter()
             .enumerate()
             .filter_map(|(tx_idx, tx)| {
-                if tx.is_coinbase() { return None; }
+                // A stripped transaction's signatures commit to bytes
+                // that are gone: connect_block skips its scripts.
+                if tx.is_coinbase() || script_skip_txs.contains(&tx_idx) { return None; }
                 let mut prev_outputs = Vec::with_capacity(tx.input.len());
                 for (input_idx, _) in tx.input.iter().enumerate() {
                     let coin = spec_coins.get(&(tx_idx, input_idx))?;
@@ -215,6 +257,8 @@ pub fn prefetch_block(
         flat_pos,
         mtp,
         txids,
+        wtxids,
+        script_skip_txs,
         script_verified_txs,
         context_free_checked: true,
     })

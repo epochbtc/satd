@@ -845,6 +845,15 @@ mod naming_tests;
 mod tests {
     use super::*;
 
+    /// Core's `STANDARD_SCRIPT_VERIFY_FLAGS` (`src/policy/policy.h`) is every
+    /// flag of `script_verify_flag_name` (`src/script/interpreter.h`, bits 0
+    /// to 20) except SIGPUSHONLY, bit 5. A literal, so the check does not
+    /// repeat the expression it pins.
+    #[test]
+    fn standard_flags_are_cores() {
+        assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS, 0x1f_ffdf);
+    }
+
     /// satd's BIP 322 extension flag is never part of a block or policy flag
     /// set. The consensus crate's entry points refuse it anyway; this pins the
     /// node side, so the flag cannot drift into validation.

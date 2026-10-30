@@ -17,6 +17,44 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- OP_RETURN data pruning (`-pruneopreturn=<N>`, off by default): a
+  background worker zeroes large OP_RETURN payloads in blocks more than N
+  blocks deep (minimum 288) and punches them out of the block files, keeping
+  each block's txids. `-pruneopreturnsize` sets the smallest scriptPubKey
+  stripped (default 4096 bytes), `-pruneopreturnpeers=limited|intact` what is
+  served to peers. A stripping node advertises `NODE_NETWORK_LIMITED` only,
+  and a datadir that has stripped a block no longer opens in 0.6.x.
+  `getopreturnpruneinfo` and a `getblockchaininfo` `opreturn_prune` object
+  report it; `getblockfrompeer` restores a stripped block in place, and with
+  the option off, restoring the last one makes the node `NODE_NETWORK` again
+  without a restart.
+
+- `-restoreopreturns` undoes OP_RETURN pruning: it downloads every stripped
+  block again from `NODE_NETWORK` peers (16 per peer, 1024 at a time, with
+  stall and `notfound` handling, paused while the tip is behind or the disk is
+  short), restores each in place, and makes the node `NODE_NETWORK` again
+  once none is left. Refused with any `-pruneopreturn*` option;
+  `getopreturnpruneinfo.restore` and three `satd_opreturn_restore_*` metrics
+  report it.
+
+- sat-tui's services row is yellow wherever work is pending: an address or
+  silent-payment backfill in progress is no longer green.
+- sat-tui shows OP_RETURN pruning in its services row: `op-prune` with the
+  worker's scan while it catches up (yellow), then the blocks stripped, or under `-restoreopreturns`
+  `op-restore` with the restore's percentage, counts, peers and ETA, laid out
+  as the index backfills are. `getblockchaininfo.opreturn_prune` now carries
+  `worker` and `restore`, which gains `progress_ratio` and
+  `estimated_remaining_seconds`.
+
+- Streaming matches read from a stripped block carry `raw_tx_stripped`, and
+  `PrefixMatched` now carries the matching `txid`; the Rust and Go SDKs
+  surface both and flag the prefix hits they could not filter
+  (`outputs_unavailable` / `OutputsUnavailable`).
+
+- satd downloads old blocks from a connected `NODE_NETWORK_LIMITED` peer
+  that also advertises `NODE_INTACT_BLOCKS` (service bit 28), moving a
+  block it answers `notfound` for to another peer.
+
 - `verifymessage` and `signmessagewithprivkey`, Bitcoin Core's message-signing
   RPCs, byte-compatible with Core.
 
@@ -32,11 +70,31 @@ item below is (or will be) written up in full in the in-development
   `createnapattestation` returns (with key origins and scripts filled in from
   an optional descriptor), and `submitnapattestation` finalizes it, or takes
   the signed transaction in hex as a wallet that finalizes it exports. A coin
-  attests 4,032 blocks after it confirms on mainnet, 6 on the test networks.
+  attests 4,032 blocks after it confirms on mainnet, 6 on the test networks,
+  and only if it holds at least 10,000 sats.
   The publisher advertises the experimental `NODE_NAP` service bit (bit 30)
   and serves its valid attestations to peers that ask with `getnapatt`,
   within per-connection and per-network-group limits.
 
+- NAP aggregator (`-napaggregator=1`, off by default): collects attestations
+  from `NODE_NAP` peers, and over short `nap-pull` connections (a new
+  `getpeerinfo` connection type) from publishers the address book knows;
+  verifies them cheapest check first within budgets; keeps for each coin and
+  key the one that counts, and its predecessors while a reorg could bring
+  them back, in `<datadir>/nap/aggregate/aggregate.dat`, up to
+  `-napaggregatormax` (default 1,000,000); and lists them with
+  `listnapaggregate`.
+- NAP reports: `getnapreport` gives each key's weight per value (in
+  satoshis, shares in parts per million), with breakdowns by coin value,
+  anchor age, coin age and script type, and the digest of the set it came
+  from, computed once per tip and set and allowed on the read-only
+  listener; `exportnapsnapshot` writes that set to a file, and
+  `replaynapsnapshot` replays it on any node, byte for byte at the same
+  tip.
+
+- `sat-tui` NAP view (`5`, only while the node has `-nap` or `-napaggregator`
+  on): what the node publishes and its `getnapreport` report, in BTC and
+  percentages, with each value's breakdowns.
 - Bitcoin Core's `-zmqpub*` notifications (`hashblock`, `hashtx`, `rawblock`,
   `rawtx`, `sequence`) and `getzmqnotifications`: Core's messages byte-for-byte,
   so LND, Umbrel's Bitcoin apps and other ZMQ consumers work unchanged. Ordering
@@ -102,7 +160,78 @@ item below is (or will be) written up in full in the in-development
   against the budget, confirmed-anyway count, foregone fees, a per-rule
   table), and the held count beside the Txs line of the steady view.
 
+- Esplora responses that read the chain carry `X-Bitcoin-Chain-Tip` and
+  `X-Bitcoin-Chain-Tip-Height`. Each request answers for the tip it started
+  at, however many blocks connect while it runs; a disconnect under it runs
+  it again.
+
+- Esplora `?asof=<blockhash>` on the address and scripthash stats, `/txs`,
+  `/txs/chain` and `/utxo` routes and on `/tx/:txid/status` and the outspend
+  routes: the answer as of a block still on the best chain, with no mempool.
+  Same parameter and rules as rbitcoin.
+
+- Electrum `blockchain.scripthash.get_history`, `get_balance`,
+  `listunspent` and `blockchain.transaction.get`, `get_merkle`,
+  `id_from_pos` answer for the tip each request started at, and name it in
+  `chain_tip` / `chain_tip_height` members, as rbitcoin does.
+  `server.version` also accepts rbitcoin's `1.4.2-asof`.
+
+- Electrum trailing `asof:<blockhash>` argument on those six methods: the
+  answer as of a block still on the best chain, with no mempool. rbitcoin's
+  argument; satd does not require negotiating `1.4.2-asof` first.
+
 ### Fixed
+
+- P2P messages are read as Core reads them (#1142): a `version` without its
+  optional trailing fields (such as `relay`) completes the handshake, bytes
+  after a message's last field are ignored, any non-zero `sendcmpct` flag is
+  true, and an out-of-range `feefilter` is ignored. `bitcoin` 0.32.102.
+
+- An `addrv2` listing a node with a service bit at or above 25 is read as
+  Core reads it. satd refused the whole message: over v1 every address in
+  it was lost, and over v2 the peer was dropped, so outbound peers churned
+  once every outbound peer was sent `getaddr` (#1118).
+
+- `-alertnotify` runs for warnings raised during startup, such as
+  `reindex.halted` and `reindex.short` from a `-reindex` (#884).
+
+- `gettxoutsetinfo` refuses a `hash_or_height` naming any block but the
+  tip, and an explicit `hash_type` of `muhash` or `hash_serialized_3`, with
+  Core's errors where Core has one, instead of answering with the tip's
+  stats. No arguments, or `hash_type` `"none"`, answer as before (#896).
+
+- A long chain of low-work headers no longer holds the node in initial
+  block download. The header height (`getblockchaininfo.headers`, the IBD
+  check, readiness) is the most-work header's, as in Core, not the highest
+  header stored, so a minimum-difficulty fork taller than the real chain
+  no longer stops transaction relay (#1119).
+
+- The address index built by a backfill (`-addressindex` turned on for an
+  already-synced chain) leaves out unspendable outputs, as the index built
+  while blocks connect always has. It used to record each OP_RETURN output,
+  and each output script over 10,000 bytes, as an unspent coin under that
+  script's scripthash.
+
+- Outbound peers are sent `getaddr` on clearnet too, seed addresses enter
+  the address book, and automatic dials are drawn at random from the tried
+  and new tables, passing over addresses tried in the last ten minutes, as
+  in Core. A node used to redial the same few peers all day.
+
+- The address book's tried table bounds each network group as Core's does:
+  a tried entry sits at its Core `bucket/position` slot, one group reaches
+  at most 8 of its 256 buckets, a promotion into a taken slot waits on the
+  incumbent (test-before-evict), and tried dials draw a bucket first. One
+  /16 could fill the whole tried table (#924).
+
+- The onion candidate list (onion peers learned from `addrv2`, up to 512)
+  holds at most 64 from one source, and a full list drops a terrible onion
+  (three failed dials and never reached, or Core's other `IsTerrible`
+  rules) to take a new one. One peer's `getaddr` answer could fill it for
+  the life of the process (#1120).
+
+- The address book's service bits follow an outbound peer's `version` and
+  add up over later announcements, as Core's do; they used to stay as first
+  heard.
 
 - BIP 324 (v2 transport) handshakes send 0 to 4095 random garbage bytes after
   the key, as Core's do. satd sent none, so its v2 connections were a fixed
@@ -115,6 +244,9 @@ item below is (or will be) written up in full in the in-development
 
 - `rustls-webpki` 0.103.16 and `webpki-roots` / `webpki-root-certs` 1.0.10
   (RUSTSEC-2026-0381, -0382, -0383: distrusted emSign intermediates).
+
+- `zstd-sys` 2.1.2 (RUSTSEC-2026-0410: a wasm32-only allocator bug; satd
+  builds no wasm32 target, so it was not affected).
 
 - `getrawmempool` lists transactions in Core's mining order: best chunk
   feerate first, a cluster's transactions in its order. It listed them in
@@ -152,6 +284,12 @@ item below is (or will be) written up in full in the in-development
   transactions and refuse a longer history (Electrum `history too large`,
   Esplora 400 `Too many history entries`); `get_first_use` reads only the
   first block. The new `-addrindexmaxhistory` sets the cap (`0` for none).
+- An Electrum connection may hold 10,000 scripthash subscriptions by default
+  (`-electrummaxsubsperconn`, was 1000), and the server-wide registry 50,000
+  (`-addrindexsubscriptions`, was 10,000): a desktop wallet with a few
+  hundred transactions, or a few accounts open, passed 1000 and its sync
+  failed partway. Subscribing no longer walks the whole registry each time,
+  which made N subscribes O(N²).
 - `-maxmempool` below 5 MB is refused at startup with Core's message, as Core
   does; `0` is still allowed.
 - A reorg of more than about 30 blocks could overflow the chain-event channel,
@@ -165,6 +303,10 @@ item below is (or will be) written up in full in the in-development
   finality, coinbase height and `CheckTransaction` before a block is written,
   as in Core's `AcceptBlockHeader` and `AcceptBlock`; they were checked only
   for blocks arriving outside initial block download, or only at connect.
+- A header or block that forks off the chain below the last checkpoint in
+  the block index is refused (`bad-fork-prior-to-checkpoint`) and its sender
+  banned, as in Core v29; such headers used to be stored without bound
+  (#1131).
 - `-assumevalid` skipped script verification for every block at or below the
   assumevalid height; it now skips only buried ancestors of the assumevalid
   block on the best-header chain, under Core's minimum-chain-work and
@@ -189,6 +331,10 @@ item below is (or will be) written up in full in the in-development
   Core's startup refusals; `-proxy` soft-sets `-listen=0`; `-proxy=0` and
   `-onion=0` are read as Core reads them. **A node with `-proxy` and no explicit
   `-listen` stops listening.**
+- Under `-proxy`, the DNS seeds, and a `-seednode` host name, are handed to
+  the proxy by name as short-lived `addr-fetch` connections, as in Core, so a
+  proxied node whose `-onlynet` leaves out onion bootstraps; nothing is
+  looked up locally (#994).
 - `/readyz` is 503 while the `tip_stall` or `peer_floor` health detector is
   raised: a node that lost its peers showed no lag and stayed ready (#979).
 - `getaddr` is answered only for inbound peers, once per connection, from a

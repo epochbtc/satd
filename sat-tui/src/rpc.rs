@@ -277,6 +277,17 @@ impl RpcClient {
     pub async fn get_network_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getnetworkinfo", &[]).await
     }
+
+    /// The attestations this node publishes; `-1 NAP is disabled` without `nap=1`.
+    pub async fn list_nap_attestations(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("listnapattestations", &[]).await
+    }
+
+    /// The report on what this node aggregates; `-1` without `napaggregator=1`.
+    /// The node computes it once per tip and set, so polling it is cheap.
+    pub async fn get_nap_report(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getnapreport", &[]).await
+    }
 }
 
 /// JSON-RPC 2.0 reserved code for an unregistered method. satd returns this

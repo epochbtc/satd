@@ -36,10 +36,16 @@ impl ChainView for View<'_> {
             coinbase: c.coinbase,
         })
     }
+
+    fn utxo_total(&self) -> Amount {
+        // The store's running total, kept with the coins, so a report reads
+        // it without walking the set.
+        Amount::from_sat(self.0.coin_total_amount())
+    }
 }
 
 impl ChainSource for ChainState {
-    fn read<T>(&self, read: &dyn Fn(&dyn ChainView) -> T) -> Option<T> {
+    fn read<T>(&self, read: &dyn Fn(&(dyn ChainView + Sync)) -> T) -> Option<T> {
         self.coherent_read(|| read(&View(self)))
     }
 }
@@ -54,8 +60,34 @@ const TIP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30
 pub async fn follow_tip(
     publisher: std::sync::Arc<super::publisher::Publisher>,
     chain: std::sync::Arc<ChainState>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let c = chain.clone();
+    follow_tip_with(chain, shutdown, move || publisher.on_tip(&*c)).await
+}
+
+/// Judge the aggregator's set at each new tip until `shutdown`, as
+/// [`follow_tip`] does the publisher's.
+pub async fn follow_tip_aggregate(
+    aggregate: std::sync::Arc<super::collect::Collector>,
+    chain: std::sync::Arc<ChainState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let c = chain.clone();
+    follow_tip_with(chain, shutdown, move || {
+        aggregate.aggregate().on_tip(&*c);
+    })
+    .await
+}
+
+/// Run `pass` on a blocking thread at each new tip until `shutdown`, outside
+/// initial block download.
+async fn follow_tip_with(
+    chain: std::sync::Arc<ChainState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    pass: impl Fn() + Send + Sync + 'static,
+) {
+    let pass = std::sync::Arc::new(pass);
     let mut events = chain.subscribe_chain_events();
     let mut poll = tokio::time::interval(TIP_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -81,8 +113,8 @@ pub async fn follow_tip(
         if tip == judged || chain.is_initial_block_download() {
             continue;
         }
-        let (p, c) = (publisher.clone(), chain.clone());
-        judge_at(tip, &mut judged, move || p.on_tip(&*c)).await;
+        let p = pass.clone();
+        judge_at(tip, &mut judged, move || p()).await;
     }
 }
 

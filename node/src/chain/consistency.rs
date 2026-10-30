@@ -173,11 +173,16 @@ impl ChainstateReport {
 /// The blocks-and-store form of the check, usable without a running node.
 ///
 /// `read_block` is handed each ancestor's hash and index entry and returns the
-/// block, or `None` if it cannot be read. A live node resolves it through the
-/// chain state; an offline audit reads the flat files directly.
+/// block as stored, or `None` if it cannot be read. A live node resolves it
+/// through the chain state; an offline audit reads the flat files directly and
+/// applies the block's strip record. Every txid comes from the stored block:
+/// an OP_RETURN-stripped transaction's is in its strip record.
 pub fn verify_chainstate_with(
     store: &dyn crate::storage::Store,
-    read_block: &mut dyn FnMut(&BlockHash, &crate::storage::blockindex::BlockIndexEntry) -> Option<bitcoin::Block>,
+    read_block: &mut dyn FnMut(
+        &BlockHash,
+        &crate::storage::blockindex::BlockIndexEntry,
+    ) -> Option<crate::storage::opreturn_strip::StoredBlock>,
     tip_hash: BlockHash,
     tip_height: u32,
     window: u32,
@@ -270,9 +275,9 @@ pub fn verify_chainstate_with(
         };
 
         match read_block(&cursor, &entry) {
-            Some(block) => {
-                for (tx_idx, tx) in block.txdata.iter().enumerate() {
-                    let txid = tx.compute_txid();
+            Some(stored) => {
+                for (tx_idx, tx) in stored.block.txdata.iter().enumerate() {
+                    let txid = stored.txid(tx_idx);
                     let expected_seq = block_first_txseq.map(|f| f + tx_idx as u64);
                     match store.get_tx_seq(&txid) {
                         Some(seq) => {
@@ -414,7 +419,7 @@ impl ChainState {
         let (tip_hash, tip_height) = self.tip_snapshot();
         verify_chainstate_with(
             &**self.store_ref(),
-            &mut |hash, _entry| self.get_block(hash),
+            &mut |hash, _entry| self.get_stored_block(hash),
             tip_hash,
             tip_height,
             window,
@@ -425,5 +430,97 @@ impl ChainState {
     /// [`Self::verify_chainstate`] over the default ancestry window.
     pub fn verify_chainstate_default(&self) -> ChainstateReport {
         self.verify_chainstate(DEFAULT_ANCESTRY_WINDOW)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash as _;
+
+    use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+    use crate::storage::db::InMemoryStore;
+    use crate::storage::{Store as _, StoreBatch};
+
+    /// A linear chain of `n` connected blocks, heights 0..n-1, hashes by height.
+    fn chain_of(store: &InMemoryStore, n: u32) -> Vec<BlockHash> {
+        let mut hashes = Vec::new();
+        let mut prev = BlockHash::all_zeros();
+        let mut batch = StoreBatch::default();
+        for h in 0..n {
+            let header = bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                nonce: h,
+            };
+            let hash = header.block_hash();
+            batch.block_index_puts.push((
+                hash,
+                BlockIndexEntry {
+                    header,
+                    height: h,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            ));
+            hashes.push(hash);
+            prev = hash;
+        }
+        store.write_batch(batch).unwrap();
+        hashes
+    }
+
+    /// The walk covers `window` blocks back from the tip and stops there,
+    /// short of genesis.
+    #[test]
+    fn the_walk_stops_at_the_bottom_of_the_window() {
+        let store = InMemoryStore::new();
+        let hashes = chain_of(&store, 10);
+        let report = verify_chainstate_with(&store, &mut |_, _| None, hashes[9], 9, 4, None);
+        assert_eq!(report.blocks_checked, 4);
+        assert_eq!(report.lowest_height, 6);
+        assert_eq!(report.unreadable.len(), 4);
+    }
+
+    #[test]
+    fn describe_names_each_fault_and_only_the_faults() {
+        assert_eq!(ChainstateReport::default().describe(), "");
+        let txid = Txid::all_zeros();
+        let block = BlockHash::all_zeros();
+        let cases: [(ChainstateReport, &str); 6] = [
+            (
+                ChainstateReport { missing_coins: vec![OutPoint::null()], ..Default::default() },
+                "1 coin(s) missing",
+            ),
+            (
+                ChainstateReport { unspent_spends: vec![OutPoint::null()], ..Default::default() },
+                "1 spent coin(s) still present",
+            ),
+            (
+                ChainstateReport { height_mismatches: vec![7], ..Default::default() },
+                "1 height row(s) wrong",
+            ),
+            (
+                ChainstateReport { tx_index_wrong: vec![(txid, block)], ..Default::default() },
+                "1 txindex row(s) wrong",
+            ),
+            (
+                ChainstateReport { chain_tx_faults: vec![(7, block)], ..Default::default() },
+                "1 chain_tx row(s) wrong",
+            ),
+            (
+                ChainstateReport { unreadable: vec![block], ..Default::default() },
+                "1 block(s) unreadable",
+            ),
+        ];
+        for (report, want) in cases {
+            assert_eq!(report.describe(), want);
+        }
     }
 }

@@ -98,6 +98,36 @@ are not required to. Verification details are in `SECURITY.md`.
   `fuzz/`). If your change touches block acceptance (PoW, commitments,
   sigops, BIP 34, value conservation, maturity, timestamps, locktime),
   add or extend a case there.
+- Mutation testing — the nightly `Mutation testing` workflow breaks the
+  consensus-critical code one small edit at a time (a rotating slice each
+  night) and runs the crate's tests against each, listing the mutants no test
+  caught in its run summary. It does not run on pull requests. To check your
+  own change the same way before opening one:
+  `git diff master... > /tmp/pr.diff && scripts/mutants/run.sh diff /tmp/pr.diff`
+  (needs `cargo install cargo-mutants`; it edits and restores the working tree,
+  so commit first). For each missed mutant, add a test that fails on it, or
+  say in review why it cannot change behaviour.
+- Fuzz targets — a target added to `fuzz/Cargo.toml` is run every night by
+  the `Fuzz targets (nightly)` workflow without further wiring (targets that
+  need a live `bitcoind` are listed in `ORACLE_TARGETS` in
+  `scripts/fuzz/run-standalone-targets.sh` and need a job of their own).
+  Run one locally with
+  `SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh <target>`.
+- Coverage — the nightly `Coverage` workflow runs the unit, integration and
+  E2E suites under `cargo-llvm-cov` and posts a per-crate and per-`node`-module
+  table in its run summary, with the HTML report as an artifact. It gates
+  nothing. Use it to find code no test reaches. Locally,
+  `. scripts/ci/coverage-env.sh`, then the `cargo test` commands you want,
+  then `cargo llvm-cov report --html`; the script makes the satd processes
+  the regtest harness spawns count, which plain `cargo llvm-cov` misses.
+- Live peers — the nightly `Live-peer smoke (nightly)` workflow runs a
+  release `satd` against the public testnet4 and signet peers for a few
+  minutes each and fails on messages it cannot decode or on peers dropped
+  right after the handshake: what real Bitcoin Core peers send, which no
+  scripted test peer does. It does not run on pull requests. If your change
+  touches what satd sends or how it parses peer messages, run it before
+  opening one: `cargo build --release --bin satd && scripts/live-peers/smoke.py`
+  (about four minutes; exit 1 is a finding, 2 means no peer was reachable).
 
 ## AI-assisted contributions
 

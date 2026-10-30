@@ -61,8 +61,21 @@ env:
 jobs:
   block-differential:
     name: block-differential fuzz
+    outputs:
+      # 'true' once the triage step below has finished; read by
+      # report-untriaged, which files the issue when it never did.
+      triaged: ${{ steps.triaged.outputs.done }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Setup takes ~4 min, the two cold builds below ~30 (up from ~20 in
+    # mid-October), and fuzzing MAX_TOTAL_TIME (30 min by default). 60 minutes
+    # stopped being enough on 2026-10-19 and every nightly after it was
+    # cancelled mid-fuzz. 100 leaves ~35 minutes for the build to keep growing.
+    #
+    # Caching the build would be the better fix, but not while the repository
+    # sits at GitHub's 10 GB cache limit: PR CI touches every entry many times a
+    # day, so an entry this job saves once a night is the least recently used
+    # by the next night and gets evicted first, after pushing a PR-CI cache out.
+    timeout-minutes: 100
 
     steps:
       - name: Checkout
@@ -149,8 +162,8 @@ jobs:
       # a job that exceeds `timeout-minutes`, and `failure()` is false for a
       # cancelled job. This job has no dependency cache, so a cold run builds
       # cargo-fuzz, then node+rocksdb+bitcoinconsensus for gen_corpus, then the
-      # whole tree again under ASan, before fuzzing for 30 minutes — the 60
-      # minute ceiling is not far away. `cancel-in-progress` can cancel it too
+      # whole tree again under ASan, before fuzzing for 30 minutes — see the
+      # `timeout-minutes` note above for how close that is to the ceiling. `cancel-in-progress` can cancel it too
       # (a workflow_dispatch on master supersedes the running nightly). A
       # cancelled run's conclusion is not `failure` either, so the (c) streak
       # counter never counted it: the job could time out every single night and
@@ -162,6 +175,7 @@ jobs:
       # Manual workflow_dispatch runs never notify — whoever dispatched is
       # watching. Never weaken the accept/reject assertion for any of these.
       - name: Triage failure and notify
+        id: triage
         if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -303,16 +317,17 @@ jobs:
           The job has no dependency cache, so every run cold-builds
           \`cargo-fuzz\`, then \`node\` + rocksdb + bitcoinconsensus for
           \`gen_corpus\`, then the whole tree again under ASan, and only then
-          fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). The 60-minute ceiling
-          leaves little headroom, so this trips when the runner is slow or a
-          dependency graph grows.
+          fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). If the build has
+          grown past the headroom \`timeout-minutes\` leaves, this trips every
+          night; compare the build's \`Finished ... in\` lines in this run
+          with an earlier green run.
 
-          Options, roughly in order of preference:
+          Options:
 
-          - Cache the build (\`Swatinem/rust-cache\`, keyed separately from the
-            PR-CI legs since this uses a nightly toolchain).
+          - Raise \`timeout-minutes\` (see the note on it in the workflow).
           - Lower \`MAX_TOTAL_TIME\` so build time and fuzz time fit.
-          - Raise \`timeout-minutes\`.
+          - Cache the build, once the repository has room under GitHub's
+            10 GB cache limit for an entry that is used only once a night.
 
           Note that a cancelled run is invisible to this workflow's own
           consecutive-failure counter, which matches on \`failure\` — so
@@ -374,3 +389,44 @@ jobs:
             "Fuzz job broken: 3+ consecutive scheduled failures ($today)" \
             "$body" \
             "Still failing before the fuzz step as of $today: $RUN_URL"
+
+      - name: Record that triage finished
+        id: triaged
+        if: always() && steps.triage.outcome == 'success'
+        run: echo "done=true" >> "$GITHUB_OUTPUT"
+
+  # The triage step runs on the runner it reports on. When that runner is lost
+  # ("The hosted runner lost communication with the server"), the step and the
+  # log go with it and nothing is filed. This job runs on a fresh runner and
+  # files the "broken" issue for a failed run whose triage step did not finish.
+  # A lost runner fails the job; a cancelled one is left to the triage step,
+  # which runs on cancellation and tells a timeout from a superseded run.
+  # Dispatched runs only print what would be filed.
+  report-untriaged:
+    name: report a run that ended before triage
+    needs: block-differential
+    if: >-
+      always()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && needs.block-differential.result == 'failure'
+      && needs.block-differential.outputs.triaged != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: fuzz-broken
+          LABEL_COLOR: D93F0B
+          LABEL_DESC: "block-differential fuzz job is broken (not a divergence)"
+          TITLE: "Fuzz job broken: block-differential run ended before triage"
+          WORKFLOW: ${{ github.workflow }}
+          JOB_RESULT: ${{ needs.block-differential.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && '1' || '' }}
+        run: bash scripts/ci/report-untriaged-run.sh

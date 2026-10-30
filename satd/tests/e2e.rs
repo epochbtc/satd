@@ -41,6 +41,10 @@ mod electrum_status;
 // against upstream Esplora's rules.
 #[path = "e2e/esplora_paging.rs"]
 mod esplora_paging;
+#[path = "e2e/esplora_asof.rs"]
+mod esplora_asof;
+#[path = "e2e/electrum_asof.rs"]
+mod electrum_asof;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,

@@ -369,6 +369,7 @@ impl BackgroundChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &addr_index,
             sp_index: &sp_index,
             #[cfg(feature = "block-filter-index")]

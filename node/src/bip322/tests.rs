@@ -8,6 +8,7 @@
 //!   (guggero/btcd e385217f, `bip322/testdata/`, sha256 03a77c86…), which the
 //!   BIP references and whose generator made the BIP's vectors.
 
+use std::cell::Cell;
 use std::str::FromStr as _;
 
 use bitcoin::hashes::Hash as _;
@@ -225,6 +226,31 @@ fn signed_p2wpkh_is_valid_only_with_sighash_all() {
         let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else { panic!("{ty:?}") };
         assert!(reason.contains("sighash"), "{ty:?}: {reason}");
     }
+}
+
+/// The scripts run once for a valid proof, and again under the required
+/// flags alone only for one that fails, to tell invalid from inconclusive.
+/// Perturbation: run the required flags first, as the BIP lists the steps,
+/// and the valid proof runs twice.
+#[test]
+fn a_valid_proof_runs_its_scripts_once() {
+    let runs = |spk: &ScriptBuf, message: &[u8], proof: &Proof| {
+        SCRIPT_RUNS.with(|n| n.set(0));
+        let got = verify(spk, message, proof);
+        (got, SCRIPT_RUNS.with(Cell::get))
+    };
+    let (spk, proof) = p2wpkh_proof(EcdsaSighashType::All);
+    let (got, n) = runs(&spk, MESSAGE, &proof);
+    assert!(matches!(got, Verification::Valid { .. }), "{got:?}");
+    assert_eq!(n, 1, "a valid proof");
+    let (got, n) = runs(&spk, b"other", &proof);
+    assert!(matches!(got, Verification::Invalid(_)), "{got:?}");
+    assert_eq!(n, 2, "an invalid proof");
+    let mut v2 = spk.to_bytes();
+    v2[0] = 0x52;
+    let (got, n) = runs(&ScriptBuf::from_bytes(v2), MESSAGE, &Proof::Simple(Witness::from_slice(&[vec![1u8]])));
+    assert!(matches!(got, Verification::Inconclusive(_)), "{got:?}");
+    assert_eq!(n, 2, "an inconclusive proof");
 }
 
 /// The `bip322` crate (0.0.12) rejects every Taproot script-path proof; the

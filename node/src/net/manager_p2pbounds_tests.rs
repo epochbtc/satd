@@ -947,3 +947,235 @@ mod nap {
         );
     }
 }
+
+// ---- NAP aggregator: pulls and pull connections (-napaggregator) ----
+
+mod nap_aggregator {
+    use super::*;
+    use crate::nap::p2p::{GETNAPATT, GetNapAtt, NAPATT, NapAtt, node_nap};
+
+    /// A node aggregating, with an empty set, out of initial block download.
+    fn aggregating_pm() -> (Arc<PeerManager>, Vec<tempfile::TempDir>, Arc<crate::nap::pull::Puller>) {
+        let (pm, dir) = mk_pm();
+        // A peer has announced a headers tip the node's tip is within 24 of.
+        pm.headers_tip.store(1, Ordering::Relaxed);
+        assert!(!pm.is_ibd(), "fixture: out of IBD");
+        let store = tempfile::tempdir().unwrap();
+        let agg = crate::nap::aggregate::Aggregate::open(store.path().join("aggregate.dat"), &*pm.chain_state).unwrap();
+        let puller = Arc::new(crate::nap::pull::Puller::new(Arc::new(crate::nap::collect::Collector::new(agg))));
+        pm.set_nap_aggregator(puller.clone());
+        (pm, vec![dir, store], puller)
+    }
+
+    /// A connected peer of `conn_type`, advertising `services`.
+    fn peer_of(
+        pm: &PeerManager,
+        id: PeerId,
+        conn_type: ConnType,
+        services: ServiceFlags,
+    ) -> mpsc::Receiver<NetworkMessage> {
+        let rx = add_peer(pm, id, addr(id as u8), 64);
+        let mut peers = pm.peers.write();
+        let info = &mut peers.get_mut(&id).unwrap().info;
+        info.direction = Direction::Outbound;
+        info.conn_type = conn_type;
+        info.services = services;
+        rx
+    }
+
+    fn publisher_services() -> ServiceFlags {
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS | node_nap()
+    }
+
+    fn getnapatts(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<GetNapAtt> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                NetworkMessage::Unknown { command, payload } if command.as_ref() == GETNAPATT => {
+                    Some(GetNapAtt::from_bytes(&payload).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn wait_for(cond: impl Fn() -> bool, what: &str) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn a_connected_publisher_is_pulled_and_any_other_peer_is_not() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        let mut publisher = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
+        let mut plain = peer_of(&pm, 2, ConnType::OutboundFullRelay, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+        pm.nap_peer_connected(1);
+        pm.nap_peer_connected(2);
+        assert_eq!(getnapatts(&mut publisher), vec![GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None }]);
+        assert!(getnapatts(&mut plain).is_empty(), "a peer that does not advertise NODE_NAP is never asked");
+        assert_eq!(puller.active(), 1);
+        assert!(connected(&pm, 1), "an ordinary connection stays up for its own sake");
+    }
+
+    #[test]
+    fn a_publisher_that_connects_during_ibd_is_left_for_the_tick() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        pm.headers_tip.store(10_000, Ordering::Relaxed);
+        assert!(pm.is_ibd());
+        let mut publisher = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
+        pm.nap_peer_connected(1);
+        assert!(getnapatts(&mut publisher).is_empty(), "every anchor would fail on chain state");
+        assert!(puller.due(&addr(1).to_string(), Instant::now()), "still due, for the tick");
+    }
+
+    #[tokio::test]
+    async fn only_connections_that_last_are_pulled() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        let brief = [(1, ConnType::AddrFetch), (2, ConnType::Feeler), (3, ConnType::BlockRelay)];
+        let lasting = [(4, ConnType::OutboundFullRelay), (5, ConnType::Manual), (6, ConnType::Inbound)];
+        let mut rxs: Vec<_> = brief.iter().chain(&lasting).map(|&(id, kind)| (id, peer_of(&pm, id, kind, publisher_services()))).collect();
+        for &(id, _) in brief.iter().chain(&lasting) {
+            pm.nap_peer_connected(id);
+        }
+        pm.nap_collection_tick(&puller).await;
+        for (id, rx) in &mut rxs {
+            let asked = !getnapatts(rx).is_empty();
+            assert_eq!(asked, *id >= 4, "peer {id}");
+            assert_eq!(puller.due(&addr(*id as u8).to_string(), Instant::now()), !asked, "peer {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_attestation_waits_out_ibd() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        crate::nap::pull_tests::defer_one(puller.collector());
+        pm.headers_tip.store(10_000, Ordering::Relaxed);
+        assert!(pm.is_ibd());
+        pm.nap_collection_tick(&puller).await;
+        assert_eq!(puller.collector().deferred_len(), 1, "behind the publishers, its anchor may not be on the chain yet");
+        pm.headers_tip.store(1, Ordering::Relaxed);
+        pm.nap_collection_tick(&puller).await;
+        assert_eq!(puller.collector().deferred_len(), 0, "synced, it is judged, and this chain does not hold its anchor");
+    }
+
+    #[test]
+    fn a_node_not_aggregating_asks_nobody() {
+        let (pm, _dir) = mk_pm();
+        let mut publisher = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
+        pm.nap_peer_connected(1);
+        assert!(getnapatts(&mut publisher).is_empty());
+    }
+
+    #[test]
+    fn a_pull_connection_to_a_peer_that_does_not_publish_is_closed() {
+        let (pm, _dirs, _puller) = aggregating_pm();
+        let _rx = peer_of(&pm, 1, ConnType::NapPull, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+        pm.nap_peer_connected(1);
+        assert!(!connected(&pm, 1));
+    }
+
+    #[test]
+    fn a_pull_connection_carries_nothing_but_the_pull() {
+        let (pm, _dirs, _puller) = aggregating_pm();
+        let mut pull = peer_of(&pm, 1, ConnType::NapPull, publisher_services());
+        let mut full = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
+        let ask = || {
+            NetworkMessage::GetHeaders(bitcoin::p2p::message_blockdata::GetHeadersMessage {
+                version: 70016,
+                locator_hashes: vec![pm.chain_state.tip_hash()],
+                stop_hash: bitcoin::BlockHash::all_zeros(),
+            })
+        };
+        deliver(&pm, 1, ask());
+        deliver(&pm, 2, ask());
+        assert!(drain(&mut pull).is_empty(), "nothing is answered over a pull connection");
+        assert!(!drain(&mut full).is_empty(), "the same request is answered over an ordinary one");
+        let peers = pm.peers.read();
+        let info = &peers[&1].info;
+        assert!(!info.serves_blocks() && !info.conn_type.wants_tx_relay() && !info.conn_type.relays_addrs());
+        drop(peers);
+        assert_eq!(pm.automatic_outbound_peers(), 1, "a pull connection takes no outbound slot");
+    }
+
+    #[test]
+    fn a_pull_connection_does_not_promote_its_address() {
+        use bitcoin::p2p::address::Address;
+        let (pm, _dirs, _puller) = aggregating_pm();
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let version = |services| VersionMessage {
+            version: 70016,
+            services,
+            timestamp: crate::time::now_secs() as i64,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, services),
+            nonce: 1,
+            user_agent: "/p/".into(),
+            start_height: 0,
+            relay: false,
+        };
+        let _pull = peer_of(&pm, 1, ConnType::NapPull, publisher_services());
+        let _full = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
+        pm.handle_peer_connected(1, version(publisher_services()));
+        pm.handle_peer_connected(2, version(publisher_services()));
+        let tried = |a: SocketAddr| pm.addrman.read().iter().any(|e| e.addr == a && e.tried);
+        assert!(!tried(addr(1)), "a pull connection proves nothing about the address");
+        assert!(tried(addr(2)), "an ordinary outbound connection still promotes it");
+    }
+
+    #[test]
+    fn a_pull_connection_cannot_be_opened_through_addconnection() {
+        let (pm, _dir) = mk_pm();
+        assert!(pm.check_outbound_limit_for(ConnType::NapPull, &[]).is_err());
+        assert_eq!(ConnType::from_addconnection_str("nap-pull"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_page_ends_the_pull_and_closes_a_pull_connection() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        let _rx = peer_of(&pm, 1, ConnType::NapPull, publisher_services());
+        pm.nap_peer_connected(1);
+        assert_eq!(puller.active(), 1);
+        let last = NapAtt { attestations: vec![], next_cursor: None }.to_bytes();
+        pm.handle_napatt(1, last, InFlight::adopt(None));
+        wait_for(|| !connected(&pm, 1), "the pull connection to close").await;
+        assert_eq!(puller.stats().pulls_completed, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_page_is_punished_and_an_unasked_one_ignored() {
+        let (pm, _dirs, puller) = aggregating_pm();
+        let _a = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
+        let _b = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
+        // Peer 2 was never asked: its page is ignored, and it stays.
+        pm.handle_napatt(2, vec![0xff], InFlight::adopt(None));
+        wait_for(|| puller.stats().unsolicited == 1, "the unasked page to be counted").await;
+        assert!(connected(&pm, 2));
+        // Peer 1 was asked, and answers with garbage.
+        pm.nap_peer_connected(1);
+        pm.handle_napatt(1, vec![0xff], InFlight::adopt(None));
+        wait_for(|| !connected(&pm, 1), "the misbehaving peer to go").await;
+        assert_eq!(puller.stats().misbehaving, 1);
+    }
+
+    #[test]
+    fn napatt_routing_skips_the_ordinary_dispatch() {
+        // `handle_message` would ignore a `napatt` as unknown; the manager
+        // loop routes it to `handle_napatt` before that.
+        let (pm, _dirs, _puller) = aggregating_pm();
+        let mut rx = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
+        deliver(
+            &pm,
+            1,
+            NetworkMessage::Unknown {
+                command: NAPATT.to_string().try_into().unwrap(),
+                payload: vec![0xff],
+            },
+        );
+        assert!(connected(&pm, 1) && drain(&mut rx).is_empty());
+    }
+}

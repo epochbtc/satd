@@ -231,7 +231,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections; `proxy=0` is none. Lowers `listen` by default (see `listen`). A **hostname** in `-addnode`/`-seednode`/`-connect` is refused while this is set, rather than resolved by the local resolver — that lookup would leak the peer names the proxy is there to hide. Use a literal IP or a `.onion` address. |
+| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections; `proxy=0` is none. Lowers `listen` by default (see `listen`). Nothing is looked up on the local resolver while this is set: that lookup would leak the peer names the proxy is there to hide. The DNS seeds, and a **hostname** in `-seednode`, are handed to the proxy by name instead, as short-lived `addr-fetch` connections that ask for addresses and close, as Core does. A hostname in `-addnode`/`-connect` is refused; use a literal IP or a `.onion` address. |
 | `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are not negotiated. Set `=0` to opt out. |
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. `onion=0` (`-noonion`) never reaches `.onion`, even through `proxy`. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
@@ -244,7 +244,7 @@ startup error.
 |---|---|---|---|---|
 | `assumevalid` | per-network hash (none on a custom signet) | restart | core | Skip script verification for HASH's buried ancestors on the best-header chain (`0`=verify all, `all`=skip old blocks). |
 | `assumevalidage` | 86400 | restart | satd | With `assumevalid=all`, still verify scripts for blocks newer than SECS. |
-| `checkpoints` | on | restart | core | Enforce the built-in block checkpoints (mainnet and the default signet; a custom signet has none). `-checkpoints=0` disables checkpoint validation. |
+| `checkpoints` | on | restart | core | Enforce the built-in block checkpoints (mainnet and the default signet; a custom signet has none). A block at a checkpoint height must match it, and a new header forking below the highest checkpoint the block index holds is refused (`bad-fork-prior-to-checkpoint`). `-checkpoints=0` disables both. |
 | `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT, during initial block download too, where the node stops at HEIGHT itself. `0` is off, as in Core. |
 | `testactivationheight` | none | restart | core | Regtest only (warned and ignored elsewhere): `name@height` buried-deployment override (`bip34`\|`dersig`\|`cltv`\|`csv`\|`segwit`), repeatable. Note Core's own asymmetry, which satd matches: this option takes `dersig`/`cltv`, while `getdeploymentinfo` *reports* the same deployments as `bip66`/`bip65`; command-line and config-file occurrences merge, last wins per name. |
 | `vbparams` | none | restart | core | Regtest only (warned and ignored elsewhere): `deployment:start:end[:min_activation_height]` BIP 9 window override. Only `testdummy` is accepted — satd activates taproot at a fixed height and counts no signalling, so an override for it would be reported and not honoured, and is refused by name. |
@@ -257,7 +257,7 @@ startup error.
 | `txindex` | off | restart | core | Maintain a full transaction index. |
 | `addressindex` | on | restart | satd | Maintain an address-history index (backs native Electrum/Esplora). |
 | `addrindexmaxhistory` | 200000 | restart | satd | Largest scripthash history (transactions) the Electrum and Esplora address queries serve; a busier script is refused. `0` = no cap, which restores whole-history reads. See the Electrum chapter's History cap. |
-| `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
+| `addrindexsubscriptions` | 50000 | hot | satd | Max concurrent per-scripthash status subscriptions, server-wide: shared by Electrum connections and Esplora SSE streams. See the Electrum chapter for sizing it against `electrummaxconns` × `electrummaxsubsperconn`. |
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
@@ -329,7 +329,7 @@ startup error.
 | `electrummtlsclientca` | none | restart | satd | PEM CA bundle to verify client certs when `electrummtls=1`. |
 | `electrummtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
 | `electrummaxconns` | 64 | restart | satd | Hard cap on simultaneously-open Electrum connections. |
-| `electrummaxsubsperconn` | 1000 | restart | satd | Per-connection scripthash subscription cap. |
+| `electrummaxsubsperconn` | 10000 | restart | satd | Per-connection scripthash subscription cap. |
 | `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). Past it the client gets a `request timed out` error and the connection is closed; the connection keeps its slot until the handler's work ends. |
 | `electrummaxbatchrequests` | 100 | restart | satd | Max requests per JSON-RPC batch line. Wallets (Sparrow) batch their whole gap-limit window of subscribes at scan time. |
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
@@ -358,6 +358,10 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `prune` | 0 (no pruning) | restart | core | Prune block data to target size in MB. |
+| `pruneopreturn` | 0 (off) | restart | satd | Strip OP_RETURN payloads from stored blocks more than N blocks deep (minimum 288; `1`/`all` = 288). Blocks are still fully validated; the node stops serving historical blocks (NODE_NETWORK_LIMITED). One-way: see [OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning). |
+| `pruneopreturnpeers` | limited | restart | satd | What a stripping node serves to peers. `limited`: only the last 288 blocks, as a pruned Core node. `intact`: any block it still holds intact, at any depth; `notfound` for stripped ones. Both advertise only NODE_NETWORK_LIMITED. |
+| `pruneopreturnsize` | 4096 | restart | satd | Strip only OP_RETURN outputs whose scriptPubKey is at least this size. Bytes, or with a suffix: `k`/`M` (1000s), `KiB`/`MiB` (1024s). |
+| `restoreopreturns` | 0 (off) | restart | satd | Download the blocks OP_RETURN pruning stripped again, from peers that keep every block, until none is left; the node then serves the full chain (NODE_NETWORK) without a restart. Refused with any `pruneopreturn*` option. Does nothing on a node with no stripped block. See [Restoring stripped blocks](disk-footprint.md#restoring-stripped-blocks). |
 | `reindex` | off | restart | core | Rebuild block index and chain state from block files on disk. |
 | `reindexchainstate` | off | restart | core | Rebuild the UTXO set from existing block files (Core `-reindex-chainstate`). |
 | `upgradechainstate` | off | restart | satd | Rebuild the UTXO set from the block files, unprompted, when the datadir's chainstate schema is older than this satd's or a previous rebuild did not finish; otherwise nothing. Safe to leave on. Pruned nodes are refused (they must resync), and a newer schema is never downgraded. The app-store packages set it. |
@@ -391,9 +395,11 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `nap` | off | restart | satd | Publish Node Attestation Protocol attestations: enables `createnapattestation`, `submitnapattestation`, `listnapattestations` and `removenapattestation`, keeps the attestations submitted in `<datadir>/nap/attestations.dat`, serves the valid ones to peers that ask, and advertises the experimental `NODE_NAP` service bit (bit 30). See [Node Attestation (NAP)](nap.md). |
+| `nap` | off | restart | satd | Publish Node Attestation Protocol attestations: enables `createnapattestation`, `submitnapattestation`, `listnapattestations` and `removenapattestation`, keeps the attestations submitted in `<datadir>/nap/attestations.dat` and its journal `attestations.journal`, serves the valid ones to peers that ask, and advertises the experimental `NODE_NAP` service bit (bit 30). See [Node Attestation (NAP)](nap.md). |
+| `napaggregator` | off | restart | satd | Collect Node Attestation Protocol attestations from publishers over P2P: pulls from connected peers that advertise `NODE_NAP` and opens short `nap-pull` connections to the ones the address book knows, verifies what they serve, keeps the set in `<datadir>/nap/aggregate/aggregate.dat`, and enables `listnapaggregate`, `getnapreport` and `exportnapsnapshot`. Independent of `nap`. See [Node Attestation (NAP)](nap.md#aggregating). |
+| `napaggregatormax` | 1000000 | restart | satd | With `napaggregator`, the most attestations the collected set holds; 0 is no limit. When full, coin-and-key pairs new to the set are refused and counted (`listnapaggregate`'s `full`); pairs already held still take newer attestations. A set already larger, after the limit is lowered, keeps what fits. |
 | `napmaxattestations` | 0 (no limit) | restart | satd | With `nap`, the most attestations the store holds. A submission that would add one more is refused (`-26`, `store-full`); replacing a stored one is allowed. A store already larger, after the limit is lowered, is kept whole. |
-| `napstorerecover` | off | restart | satd | With `nap`, an attestation store that does not read back at startup is renamed to `attestations.dat.bad-<unix time>` with a warning and the node starts with an empty one. Off: startup fails, naming the file. |
+| `napstorerecover` | off | restart | satd | With `nap`, an attestation store that does not read back at startup is renamed, `attestations.dat` and `attestations.journal` each with a `.bad-<unix time>` suffix, with a warning, and the node starts with an empty one. Off: startup fails, naming the file. |
 
 ## Events
 
@@ -467,7 +473,7 @@ the order the table lists them. On top of it, a subscriber with more than
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task; a slow hook never stalls block connection, because notifications coalesce instead. The command body is not logged (it may embed credentials). |
-| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). One-shot events such as `deep_reorg` have no standing condition to dedupe, so they are rate-limited instead: one exec per minute per event id, reporting the **worst** occurrence in the window rather than the first. Runs serially like `blocknotify`. See [Observability → Node-health alerts](observability.md#node-health-alerts). |
+| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). One-shot events such as `deep_reorg` have no standing condition to dedupe, so they are rate-limited instead: one exec per minute per event id, reporting the **worst** occurrence in the window rather than the first. Runs serially like `blocknotify`. Live from the start of chain loading, so warnings raised during startup (a `-reindex` that halts or ends short) fire it too. See [Observability → Node-health alerts](observability.md#node-health-alerts). |
 | `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached, so a slow hook does not delay startup. Prefer a systemd `ExecStartPost=`. |
 | `shutdownnotify` | none | restart | core | Shell command run once at the start of a graceful shutdown, before the final flush (no `%s`). Bounded by `maxshutdownsecs` so a hung hook can't wedge teardown. Prefer a systemd `ExecStopPost=`. |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |

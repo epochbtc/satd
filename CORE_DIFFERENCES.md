@@ -99,13 +99,14 @@ expect Core's peer set to carry over.
 
 **On `getrawaddrman` slots.** Core's address manager stores each entry in
 a fixed `bucket/position` slot of its new or tried table, and
-`getrawaddrman` reports those slots. satd's address book is a flat map, so
-it *derives* a slot for each entry from Core's own bucket formulas
-(`GetNewBucket`, `GetTriedBucket`, `GetBucketPosition`), keyed by a random
-per-process key instead of `-test=addrman`'s fixed one. The slots are
-stable while the node runs and are spread as Core's are, but they change on
-restart and never match Core's for the same address; a collision moves to
-the next free slot rather than evicting an entry. `getnodeaddresses`,
+`getrawaddrman` reports those slots. satd's tried table is Core's: each
+tried entry is stored at the slot Core's formulas give it (`GetTriedBucket`,
+`GetBucketPosition`), with Core's collision handling and test-before-evict,
+under a random key kept in `peers.dat`. Its new table is a flat map with a
+per-group cap, so a new entry's slot is *derived* from `GetNewBucket` and
+`GetBucketPosition`, and a collision there moves to the next free slot
+rather than evicting an entry. The key is random rather than
+`-test=addrman`'s fixed one, so no slot matches Core's for the same address. `getnodeaddresses`,
 `getaddrmaninfo` and `getrawaddrman` report IPv4 and IPv6 only: onion
 candidates learned from `addrv2` gossip are held outside the address book.
 
@@ -123,7 +124,9 @@ every chain and never dialled, as in Core.
 **On `-seednode`.** Core opens a `-seednode` peer as a short-lived
 `addr-fetch` connection, drops it once it has answered `getaddr`, and uses
 none under `-connect`. satd dials it as a `manual` connection and keeps it,
-under `-connect` too.
+under `-connect` too. The exception is a host name under `-proxy`: satd
+then opens it as Core does, an `addr-fetch` connection by name that the
+proxy resolves, and none under `-connect`.
 
 **Why one RocksDB instance.** Core uses LevelDB and bundles indices
 (`-txindex`, `-blockfilterindex`, `-coinstatsindex`) as separate
@@ -668,9 +671,28 @@ preserved; the satd extension is opt-in per request or per flag.
 - **`createnapattestation`, `submitnapattestation`, `listnapattestations`,
   `removenapattestation`** publish Node Attestation Protocol attestations,
   holders' signed statements weighted by their coins, with `-nap=1` (off by
-  default). Core has no equivalent. Without the flag they answer -1. See the
-  manual's [Node Attestation](https://epochbtc.github.io/satd/nap.html)
-  chapter.
+  default), and **`listnapaggregate`** lists those an aggregator collected,
+  with `-napaggregator=1`. **`getnapreport`** reports on the collected set
+  and **`exportnapsnapshot`** exports it; **`replaynapsnapshot`** reports
+  on an exported snapshot and needs no flag. Core has no equivalent. Without the flag they
+  answer -1. An aggregator's pulls from publishers it is not connected to
+  run over connections `getpeerinfo` lists as `connection_type`
+  `nap-pull`, a type Core does not have. See the manual's
+  [Node Attestation](https://epochbtc.github.io/satd/nap.html) chapter.
+
+- **`-pruneopreturn`, `-pruneopreturnsize`, `-pruneopreturnpeers`** — strip
+  the payloads of large OP_RETURN outputs (at least `-pruneopreturnsize`
+  bytes, default 4096) from stored blocks more than N blocks deep (at least
+  288), punching the bytes out of the block files. Off by default. Blocks are
+  fully validated either way. A node that strips, or still holds stripped
+  blocks, drops `NODE_NETWORK` and serves as a pruned Core node does
+  (`limited`), or serves its intact blocks at any depth and answers
+  `notfound` for stripped ones (`intact`, which also advertises the
+  experimental `NODE_INTACT_BLOCKS`, bit 28). `getblockchaininfo.pruned`
+  keeps Core's meaning (`-prune` only); a new `opreturn_prune` object and
+  `getopreturnpruneinfo` describe the stripping. One-way: 0.6.x and earlier
+  refuse a datadir that has stripped a block. See the manual's
+  [OP_RETURN data pruning](https://epochbtc.github.io/satd/disk-footprint.html#opreturn-data-pruning).
 
 ---
 
@@ -712,6 +734,20 @@ Core methods satd implements over a narrower input domain than Core does.
 Each rejects what it does not cover with an error naming the gap, rather than
 silently returning an empty or wrong answer.
 
+- **OP_RETURN-stripped transactions** (`-pruneopreturn` only) — their raw
+  bytes are gone, so every surface that serves raw bytes refuses them:
+  `getblock` verbosity 0 with Core's `-1 Block not available (pruned data)`,
+  `getrawtransaction` hex and `gettxspendingprevout`'s `spendingtx` with `-1
+  Transaction data not available (OP_RETURN data stripped)`, Esplora's
+  `/block/:hash/raw`, `/tx/:txid/hex` and `/tx/:txid/raw` with 404, Electrum's
+  non-verbose `blockchain.transaction.get` with an error, and streaming
+  `raw_tx` with `raw_tx_stripped`. Their JSON views keep the real txid, sizes
+  and values, add `opreturn_stripped: true`, and show each stripped output as
+  a bare `OP_RETURN` with `stripped_size` (Esplora:
+  `scriptpubkey_stripped_size`). `getblock` 1+ adds an `opreturn_stripped`
+  summary on a stripped block. A reorg or `invalidateblock` across a stripped
+  block fails naming it, as Core does across pruned data.
+
 - **Output descriptors** — satd implements the key-free forms, `raw(<hex
   script>)` and `addr(<address>)`, with BIP 380 checksums (optional on input,
   verified when present, always emitted). Key expressions — `pk()`, `pkh()`,
@@ -743,6 +779,8 @@ silently returning an empty or wrong answer.
   |---|---|---|
   | `utxoupdatepsbt` | `descriptors` | satd fills in UTXOs only; an empty list is a faithful no-op and is accepted |
   | `converttopsbt` | `iswitness` | satd's decoder auto-detects, which is Core's behaviour when the argument is omitted |
+  | `gettxoutsetinfo` | `hash_or_height` | satd keeps no per-height UTXO stats; the tip, by height or hash, is answered, and any other block gets Core's "Querying specific block heights requires coinstatsindex" |
+  | `gettxoutsetinfo` | `hash_type` | satd computes no UTXO-set hash, so `muhash` and `hash_serialized_3` are refused; an omitted `hash_type` (Core's default is `hash_serialized_3`) and `"none"` are answered, with `hash_serialized_3` left empty |
 
   Silently accepting an argument that is never acted on is the failure mode
   worth avoiding: the caller would get an answer to another question and no
@@ -943,10 +981,9 @@ silently returning an empty or wrong answer.
   Core's Tor controller takes Tor's SOCKS port from the control connection,
   so Core accepts `-onlynet=onion` with `-listenonion` and no `-proxy`; satd's
   does not, and refuses that combination instead of starting with no
-  outbound transport. With `-proxy` set, satd's built-in bootstrap seeds are
-  `.onion` addresses only (no DNS through the proxy), so a proxied node
-  whose `-onlynet` leaves out onion needs `-seednode` or `-addnode`; satd
-  warns at startup. Core would fetch its DNS seeds through the proxy.
+  outbound transport. With `-proxy` set, satd reaches its DNS seeds by name
+  through the proxy, as `addr-fetch` connections, as Core does; it also
+  adds its built-in `.onion` seeds, which Core has no list of.
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
   argument descriptions. Two things follow from that, both deliberate:
@@ -980,6 +1017,7 @@ default behavior set the corresponding flag.
 | `--peerblockfilters` | off | off | Matches Core; opt in to advertise `NODE_COMPACT_FILTERS`. |
 | `--mempoolfullrbf` | on (Core v28+) | on | Matches Core post-v28. |
 | Outbound full-relay target during initial block download | 8, whatever the sync state (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`) | 64 while the tip is more than 24 blocks behind the best header (or no header is known yet, on a node still at genesis), 8 otherwise | More peers to download blocks from in parallel. Once the node leaves IBD it disconnects the surplus one peer per 10-second reconnect pass, in the order of Core's `EvictExtraOutboundPeers` (least recent block announcement first; manual, block-relay-only and chain-sync-protected peers and the only peer on a network are kept). Automatic outbound peers keep Core's one-per-network-group rule throughout; on regtest, addresses that are not publicly routable, which Core's address book never holds, are outside that rule. |
+| Block checkpoints (`-checkpoints`) | removed in v30, which keeps the option only to warn that it has no effect; headers presync guards against low-work header floods instead | on: mainnet and the default signet carry built-in checkpoints, a block at a checkpoint height must match it, and a new header forking below the highest checkpoint in the block index is refused as `bad-fork-prior-to-checkpoint` and its sender banned, as in Core up to v29. `-checkpoints=0` turns both off | satd has no headers presync yet, so the v29 rule is what stops a peer filling the block index with early-chain headers that cost almost nothing to mine. It does not cover testnet4, regtest or a custom signet, which have no checkpoints. |
 | Invalid header in a `cmpctblock` | penalised for most classes of header invalidity (`MaybePunishNodeForBlock` with `via_compact_block`) | ignored, never penalised | A compact block is pushed, not requested, and a header that fails validation leaves no state behind; the block is simply not reconstructed. A `headers` message is still penalised as in Core. |
 | `cmpctblock` prefill (`-cmpctblockprefill`) | not available (proposed in #35558) | off; opt in | An extension Core does not ship yet. With it on, a block is announced with the transactions this node lacked when it arrived prefilled, up to `-cmpctblockprefillbytes` (default 8192); receivers need nothing new, since BIP 152 already requires accepting any well-formed prefill. Off, satd prefills the coinbase only, as Core does. |
 | `sendheaders` to an outbound peer | once the peer has shown a block past the minimum chain work (`MaybeSendSendHeaders`) | in the handshake | satd answers a block `inv` with a `getdata` for the block before it has the header, where Core sends `getheaders`, so a peer that mines while satd syncs from it would hand it blocks out of order until header announcements start. Inbound peers are sent it on Core's condition, and every peer at most once. |

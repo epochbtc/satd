@@ -396,6 +396,7 @@ mod tests {
         assert_eq!(store.get_block_hash_by_height(7), None);
 
         let audit = audit_and_repair_height_index(&store, hashes[19], 19).unwrap();
+        assert_eq!(audit.tip_height, 19);
         assert_eq!(audit.missing, vec![7]);
         assert_eq!(audit.repaired, vec![7]);
         assert!(audit.unrepairable.is_empty());

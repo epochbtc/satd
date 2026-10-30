@@ -172,9 +172,28 @@ impl NodeWarnings {
 
     /// Install the `-alertnotify` sink. The daemon calls this once at
     /// startup when the operator configured `-alertnotify`; the receiving
-    /// task runs the shell command per message. Idempotent (last writer
-    /// wins).
+    /// task runs the shell command per message. Last writer wins.
+    ///
+    /// Every warning already active when the sink is installed is sent to it
+    /// once, in [`list`](Self::list) order (#884). Core has no window in which
+    /// a warning can be set before the hook exists: `AlertNotify` reads
+    /// `-alertnotify` straight from the global arguments, so every warning
+    /// that becomes active fires it, including those raised while the chain
+    /// is loaded or reindexed. Here the sink lives on the chain state, which
+    /// can record warnings while it is being built, so without this catch-up
+    /// those warnings would reach `getwarnings` and never the hook.
+    ///
+    /// The active set is read and the sink stored under the one lock that
+    /// [`record`](Self::record) takes to decide whether an id is new, so a
+    /// warning recorded concurrently is sent exactly once: either here or by
+    /// `record`, never by both and never by neither.
     pub fn set_alert_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        let active = self.active.lock();
+        let mut pending: Vec<&Warning> = active.values().collect();
+        sort_warnings(&mut pending);
+        for w in pending {
+            let _ = tx.send(format!("[{}] {}: {}", w.severity.as_str(), w.id, w.message));
+        }
         *self.alert_tx.lock() = Some(tx);
     }
 
@@ -333,6 +352,7 @@ impl NodeWarnings {
         let now = unix_secs();
         let message: String = message.into();
         let is_new;
+        let sink;
         {
             let mut active = self.active.lock();
             is_new = !active.contains_key(id);
@@ -366,9 +386,12 @@ impl NodeWarnings {
                         count: 1,
                         context: serde_json::json!({ "most_recent_dropped_id": id }),
                     });
+                // Read the sink before the active lock goes: see
+                // `set_alert_notifier`.
+                let sink = overflow_is_new.then(|| self.alert_tx.lock().clone()).flatten();
                 drop(active);
-                if overflow_is_new {
-                    self.send_alert(format!(
+                if let Some(tx) = sink {
+                    let _ = tx.send(format!(
                         "[{}] {}: the active-warnings set hit its cap of {}",
                         Severity::Error.as_str(),
                         OVERFLOW_WARNING_ID,
@@ -395,12 +418,16 @@ impl NodeWarnings {
                     count: 1,
                     context,
                 });
+            // Read the sink while the active lock is held, so this and
+            // `set_alert_notifier`'s catch-up cannot both send this id (or
+            // both miss it).
+            sink = if is_new { self.alert_tx.lock().clone() } else { None };
         }
         // Fire the `-alertnotify` hook once per new warning id (Core fires on
         // each `DoWarning`; deduping by id avoids flooding the hook with
         // identical repeats).
-        if is_new {
-            self.send_alert(format!("[{}] {}: {}", severity.as_str(), id, message));
+        if let Some(tx) = sink {
+            let _ = tx.send(format!("[{}] {}: {}", severity.as_str(), id, message));
         }
     }
 
@@ -427,16 +454,9 @@ impl NodeWarnings {
     /// Active warnings, sorted `Error` first then by first_seen asc.
     pub fn list(&self) -> Vec<Warning> {
         let active = self.active.lock();
-        let mut out: Vec<Warning> = active.values().cloned().collect();
-        out.sort_by(|a, b| {
-            // Error < Warn, i.e. Error first.
-            match (a.severity, b.severity) {
-                (Severity::Error, Severity::Warn) => std::cmp::Ordering::Less,
-                (Severity::Warn, Severity::Error) => std::cmp::Ordering::Greater,
-                _ => a.first_seen_unix_secs.cmp(&b.first_seen_unix_secs),
-            }
-        });
-        out
+        let mut out: Vec<&Warning> = active.values().collect();
+        sort_warnings(&mut out);
+        out.into_iter().cloned().collect()
     }
 
     /// True if at least one `Error`-severity warning is active.
@@ -512,6 +532,18 @@ impl EventRate {
         self.paged_magnitude = worst.magnitude;
         Some((worst, others, window_age.as_secs()))
     }
+}
+
+/// Sort warnings `Error` first, then by `first_seen` ascending.
+fn sort_warnings(ws: &mut [&Warning]) {
+    ws.sort_by(|a, b| {
+        // Error < Warn, i.e. Error first.
+        match (a.severity, b.severity) {
+            (Severity::Error, Severity::Warn) => std::cmp::Ordering::Less,
+            (Severity::Warn, Severity::Error) => std::cmp::Ordering::Greater,
+            _ => a.first_seen_unix_secs.cmp(&b.first_seen_unix_secs),
+        }
+    });
 }
 
 /// Render one `-alertnotify` line, optionally accounting for occurrences the
@@ -627,6 +659,35 @@ mod tests {
     fn clear_missing_is_noop() {
         let w = NodeWarnings::new();
         w.clear("never.recorded"); // no panic
+    }
+
+    /// #884: a warning recorded before `-alertnotify` is installed (a
+    /// `reindex.halted` raised during the startup reindex, say) fires the hook
+    /// once the sink goes in, as Core's would have, and only once.
+    #[test]
+    fn alert_notifier_catches_up_on_warnings_recorded_before_install() {
+        let w = NodeWarnings::new();
+        w.record("early.warn", Severity::Warn, "raised first", json!(null));
+        w.record("reindex.halted", Severity::Error, "block 7 cannot be replayed", json!(null));
+        w.record("gone.again", Severity::Warn, "resolved before install", json!(null));
+        w.clear("gone.again");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        // Error first, then Warn: the order `getwarnings` lists them in.
+        let first = rx.try_recv().expect("an already-active error must fire on install");
+        assert!(first.contains("reindex.halted") && first.contains("block 7"), "{first}");
+        let second = rx.try_recv().expect("an already-active warning must fire on install");
+        assert!(second.contains("early.warn"), "{second}");
+        assert!(rx.try_recv().is_err(), "a cleared warning is not active and must not fire");
+
+        // Repeats after install still only bump the count.
+        w.record("reindex.halted", Severity::Error, "still halted", json!(null));
+        assert!(rx.try_recv().is_err(), "a caught-up id must not fire again on repeat");
+        // A new id after install fires as before.
+        w.record("later.warn", Severity::Warn, "after install", json!(null));
+        assert!(rx.try_recv().expect("new id after install").contains("later.warn"));
     }
 
     #[test]

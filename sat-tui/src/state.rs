@@ -27,6 +27,8 @@ pub enum ViewMode {
     Steady,
     Mempool,
     Chain,
+    /// Offered only while the node has NAP on; see [`AppState::nap_available`].
+    Nap,
 }
 
 /// One snapshot from getmempoolhistory.
@@ -275,6 +277,69 @@ impl IbdBitmap {
             in_flight: v.get("in_flight")?.as_u64()? as usize,
             pending: v.get("pending")?.as_u64()? as usize,
             peer_stats,
+        })
+    }
+}
+
+/// OP_RETURN pruning, from `getblockchaininfo.opreturn_prune`: present only
+/// on a node that strips or still holds stripped blocks, so a node that
+/// never used it shows no column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpReturnProgress {
+    /// The worker's state: `running`, `ibd`, `reindex`,
+    /// `background_validation` or `off` while stripping; under
+    /// `-restoreopreturns`, `restoring`, `waiting_for_peers`,
+    /// `waiting_for_disk`, `waiting_for_tip` or `restored`. Empty on a
+    /// daemon that predates the field.
+    pub worker: String,
+    /// Stripped blocks, as last added up.
+    pub blocks: u64,
+    /// The worker's scan: (examined below, target), the target being the
+    /// tip less the strip depth and 2, as the daemon's
+    /// `examine_target_height`. `None` from a daemon that does not say.
+    pub scan: Option<(u64, u64)>,
+    /// The `-restoreopreturns` download, when the option is set.
+    pub restore: Option<RestoreView>,
+}
+
+/// `getblockchaininfo.opreturn_prune.restore`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreView {
+    pub total_blocks: u64,
+    pub remaining_blocks: u64,
+    /// Daemon-computed, over the current pass.
+    pub progress_ratio: Option<f64>,
+    pub estimated_remaining_seconds: Option<u64>,
+    /// Connected peers the restore can ask.
+    pub peers: u64,
+}
+
+impl OpReturnProgress {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let o = v.get("opreturn_prune")?;
+        let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        Some(OpReturnProgress {
+            worker: o.get("worker").and_then(|w| w.as_str()).unwrap_or("").to_string(),
+            blocks: u(o, "blocks"),
+            scan: match (
+                o.get("examined_below_height").and_then(|n| n.as_u64()),
+                o.get("depth").and_then(|n| n.as_u64()),
+                v.get("blocks").and_then(|n| n.as_u64()),
+            ) {
+                (Some(examined), Some(depth), Some(tip)) => Some((examined, tip.saturating_sub(depth.saturating_add(2)))),
+                _ => None,
+            },
+            restore: o.get("restore").map(|r| RestoreView {
+                total_blocks: u(r, "total_blocks"),
+                remaining_blocks: u(r, "remaining_blocks"),
+                progress_ratio: r
+                    .get("progress_ratio")
+                    .and_then(|x| x.as_f64())
+                    .filter(|x| x.is_finite())
+                    .map(|x| x.clamp(0.0, 1.0)),
+                estimated_remaining_seconds: r.get("estimated_remaining_seconds").and_then(|s| s.as_u64()),
+                peers: u(r, "peers"),
+            }),
         })
     }
 }
@@ -622,6 +687,8 @@ pub struct AppState {
     /// Silent-payment index status from `getsatdindexinfo`. `None` when the
     /// daemon has not reported a `silentpayments` object at all.
     pub sp_index: Option<SpIndexProgress>,
+    /// OP_RETURN pruning or its restore, on a node that uses it.
+    pub opreturn: Option<OpReturnProgress>,
 
     /// Listener and address-index status from `getserverstatus`. Drives
     /// the always-visible services row in the steady view.
@@ -642,6 +709,13 @@ pub struct AppState {
     /// A monitoring tool showing stale data as though it were live is worse
     /// than one showing an error.
     pub rpc_failures: std::collections::BTreeMap<&'static str, String>,
+
+    /// What the node publishes over NAP (`listnapattestations`).
+    pub nap_publisher: crate::nap::Half<Vec<crate::nap::Published>>,
+    /// The node's NAP report (`getnapreport`).
+    pub nap_report: crate::nap::Half<crate::nap::Report>,
+    /// Selected value row in the NAP view, over [`crate::nap::Report::value_rows`].
+    pub selected_nap_row: usize,
 
     // Internal tracking
     prev_blocks: u32,
@@ -851,6 +925,7 @@ impl AppState {
             ibd_bitmap: None,
             backfill: None,
             sp_index: None,
+            opreturn: None,
             server_status: ServerStatus::default(),
             server_version: None,
 
@@ -861,6 +936,10 @@ impl AppState {
             show_reorgs: false,
 
             rpc_failures: std::collections::BTreeMap::new(),
+
+            nap_publisher: crate::nap::Half::Unknown,
+            nap_report: crate::nap::Half::Unknown,
+            selected_nap_row: 0,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -923,6 +1002,7 @@ impl AppState {
         self.chain_time = v.get("time").and_then(|t| t.as_u64()).unwrap_or(0);
         self.is_ibd = v.get("initialblockdownload").and_then(|b| b.as_bool()).unwrap_or(false);
         self.verification_progress = v.get("verificationprogress").and_then(|p| p.as_f64()).unwrap_or(0.0);
+        self.opreturn = OpReturnProgress::from_json(v);
         if let Some(s) = v.get("chainwork").and_then(|c| c.as_str()) {
             self.chainwork_hex = s.to_string();
         }
@@ -1702,6 +1782,80 @@ impl AppState {
         }
     }
 
+    /// Apply one `listnapattestations` poll.
+    pub fn update_nap_publisher(&mut self, poll: crate::nap::Poll<Vec<crate::nap::Published>>) {
+        Self::apply_nap(&mut self.rpc_failures, "listnapattestations", &mut self.nap_publisher, poll);
+        self.leave_nap_view_if_off();
+    }
+
+    /// Apply one `getnapreport` poll.
+    pub fn update_nap_report(&mut self, poll: crate::nap::Poll<crate::nap::Report>) {
+        Self::apply_nap(&mut self.rpc_failures, "getnapreport", &mut self.nap_report, poll);
+        let rows = match &self.nap_report {
+            crate::nap::Half::On(r) => r.value_rows().len(),
+            _ => 0,
+        };
+        self.selected_nap_row = self.selected_nap_row.min(rows.saturating_sub(1));
+        self.leave_nap_view_if_off();
+    }
+
+    /// A half that is off is not failing: only other errors are recorded,
+    /// and those leave the half as it was.
+    fn apply_nap<T>(
+        failures: &mut std::collections::BTreeMap<&'static str, String>,
+        method: &'static str,
+        half: &mut crate::nap::Half<T>,
+        poll: crate::nap::Poll<T>,
+    ) {
+        match poll {
+            crate::nap::Poll::On(t) => {
+                failures.remove(method);
+                *half = crate::nap::Half::On(t);
+            }
+            crate::nap::Poll::Off => {
+                failures.remove(method);
+                *half = crate::nap::Half::Off;
+            }
+            crate::nap::Poll::Failed(e) => {
+                failures.insert(method, e);
+            }
+            crate::nap::Poll::Unanswered => {}
+        }
+    }
+
+    /// Whether the NAP view is offered: the node has `nap=1`,
+    /// `napaggregator=1`, or both.
+    pub fn nap_available(&self) -> bool {
+        self.nap_publisher.is_on() || self.nap_report.is_on()
+    }
+
+    /// Key `5`: toggle the NAP view, which is offered only while the node
+    /// has NAP on. Otherwise the key does nothing.
+    pub fn press_nap_key(&mut self) {
+        if self.nap_available() {
+            self.toggle_mode(ViewMode::Nap);
+        }
+    }
+
+    /// A node restarted with NAP off takes the view away from under a
+    /// forced key 5; fall back to automatic.
+    fn leave_nap_view_if_off(&mut self) {
+        use crate::nap::Half::Off;
+        if self.force_mode == Some(ViewMode::Nap)
+            && matches!(self.nap_publisher, Off)
+            && matches!(self.nap_report, Off)
+        {
+            self.toggle_mode(ViewMode::Nap);
+        }
+    }
+
+    /// Move the NAP view's value selection by `delta` rows.
+    pub fn move_nap_selection(&mut self, delta: isize) {
+        let crate::nap::Half::On(r) = &self.nap_report else { return };
+        let last = r.value_rows().len().saturating_sub(1);
+        self.selected_nap_row = self.selected_nap_row.saturating_add_signed(delta).min(last);
+    }
+
     /// One-line summary of currently-failing methods for the title bar, or
     /// `None` when everything answered.
     pub fn rpc_failure_line(&self) -> Option<String> {
@@ -2459,6 +2613,30 @@ mod tests {
         st.update_epoch_anchor(944_352, &header);
         assert_eq!(st.epoch_start_height, Some(944_352));
         assert_eq!(st.epoch_start_time, Some(1_714_389_222));
+    }
+
+    #[test]
+    fn opreturn_progress_parses_a_restore_and_is_absent_otherwise() {
+        assert_eq!(OpReturnProgress::from_json(&json!({"blocks": 5})), None, "a node that never stripped");
+        let v = json!({"opreturn_prune": {
+            "worker": "restoring", "blocks": 40,
+            "restore": {"total_blocks": 123, "remaining_blocks": 40, "progress_ratio": 0.675,
+                        "estimated_remaining_seconds": 240, "peers": 3}
+        }});
+        let p = OpReturnProgress::from_json(&v).expect("present");
+        assert_eq!(p.worker, "restoring");
+        let r = p.restore.expect("restore");
+        assert_eq!((r.total_blocks, r.remaining_blocks, r.peers), (123, 40, 3));
+        assert_eq!((r.progress_ratio, r.estimated_remaining_seconds), (Some(0.675), Some(240)));
+        let stripping = OpReturnProgress::from_json(&json!({"opreturn_prune": {"worker": "running", "blocks": 7}})).unwrap();
+        assert_eq!((stripping.blocks, stripping.restore, stripping.scan), (7, None, None));
+        let scanning = json!({"blocks": 973_593, "opreturn_prune": {
+            "worker": "running", "blocks": 4, "depth": 288, "examined_below_height": 262_640}});
+        assert_eq!(OpReturnProgress::from_json(&scanning).unwrap().scan, Some((262_640, 973_303)), "the daemon's target");
+        let hostile_depth = json!({"blocks": 10, "opreturn_prune": {"depth": u64::MAX, "examined_below_height": 0}});
+        assert_eq!(OpReturnProgress::from_json(&hostile_depth).unwrap().scan, Some((0, 0)), "no overflow");
+        let hostile = json!({"opreturn_prune": {"restore": {"progress_ratio": 7.5}}});
+        assert_eq!(OpReturnProgress::from_json(&hostile).unwrap().restore.unwrap().progress_ratio, Some(1.0));
     }
 
     #[test]

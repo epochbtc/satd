@@ -410,3 +410,48 @@ func TestFilterLeavesVinNilOnAMismatchedPrevout(t *testing.T) {
 		t.Errorf("vin = %d for a prevout the transaction does not spend", *hits.Spending[0].Vin)
 	}
 }
+
+// TestFilterReportsAStrippedMatchsOutputsUnavailable: a node that had stripped
+// the transaction's OP_RETURN payloads sends no bytes. The txid comes from the
+// match, the outputs are reported unavailable rather than unmatched, and a
+// retained spent prevout still matches.
+func TestFilterReportsAStrippedMatchsOutputsUnavailable(t *testing.T) {
+	w := NewPrefixWatcherWithScripts(spk(1))
+	prevTxid := [32]byte{0xbb}
+	raw := simpleTx(t, prevTxid, 3, txOutput{value: 500, scriptPubKey: spk(1)})
+	amount := uint64(999)
+	m := buildPrefixMatch(raw, SpentPrevout{
+		Outpoint:     Outpoint{Txid: prevTxid[:], Vout: 3},
+		ScriptPubkey: spk(1),
+		Amount:       &amount,
+	})
+	intact, err := w.Filter(m)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	if len(intact.Funding) != 1 || intact.OutputsUnavailable || intact.HasUnresolved() {
+		t.Fatalf("premise: the intact match funds the script: %+v", intact)
+	}
+
+	m.RawTx = nil
+	m.RawTxStripped = true
+	m.Txid = intact.Txid[:]
+	hits, err := w.Filter(m)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	if hits.Txid != intact.Txid {
+		t.Errorf("txid = %x, want %x", hits.Txid, intact.Txid)
+	}
+	if len(hits.Funding) != 0 || !hits.OutputsUnavailable || !hits.HasUnresolved() {
+		t.Errorf("outputs must be reported unavailable: %+v", hits)
+	}
+	if len(hits.Spending) != 1 || hits.Spending[0].Vin != nil {
+		t.Errorf("the spend still matches, with vin unknown: %+v", hits.Spending)
+	}
+
+	m.Txid = []byte{0x01}
+	if _, err := w.Filter(m); err == nil {
+		t.Error("a stripped match without a 32-byte txid must be a decode error")
+	}
+}

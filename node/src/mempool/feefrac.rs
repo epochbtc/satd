@@ -378,6 +378,9 @@ pub fn merge_linearizations(txs: &ClusterTxs, lin1: &[usize], lin2: &[usize]) ->
         } else {
             intersect(&c2, c1[0])
         };
+        // Each pass places at least one transaction of `todo`. A `best`
+        // outside it would repeat forever, `out` growing without bound.
+        assert!(best.0 & todo != 0, "merge_linearizations made no progress");
         // Core's `AppendTopo`: by ancestor count, then index.
         let mut picked: Vec<usize> = (0..n).filter(|i| best.0 & (1u64 << i) != 0).collect();
         picked.sort_by_key(|&i| (anc[i].count_ones(), i));

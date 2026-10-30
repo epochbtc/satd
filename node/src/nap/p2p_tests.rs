@@ -309,3 +309,47 @@ fn a_busy_store_serves_no_page() {
     assert_eq!(p.with_store_held(|| p.page(&req(None), MAX_NAPATT_SIZE)), None);
     assert_eq!(p.page(&req(None), MAX_NAPATT_SIZE).unwrap().attestations, atts);
 }
+
+// --- Specification vectors (docs/nap/protocol.md) ---------------------------
+
+#[test]
+fn the_specification_test_vectors_hold() {
+    use base64::Engine as _;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
+    let v = &vectors[0];
+    let msg = message::parse(v["message"].as_str().unwrap()).unwrap();
+    let sig = base64::engine::general_purpose::STANDARD.decode(v["signature"].as_str().unwrap()).unwrap();
+    let att = Attestation::new(
+        msg.outpoint,
+        msg.key,
+        msg.value,
+        msg.anchor_height,
+        msg.anchor_hash,
+        NapSignature::Legacy(sig.try_into().unwrap()),
+    )
+    .unwrap();
+    let att_hex = "0193972ac465f8d2aae3b4a1e13197918b0950bde5f24ebc6da12517413bacb69101\
+                   000000\
+                   1367312e636f72652e7369676e6d65737361676503796573dbff0400ec5728d557\
+                   bb448c031fa48e28780b6e8286344a38ebea03c2aad0a10000000002411fbc70da4341\
+                   e515181c1ec146d2fb6a29908e7d078af25bdfe8e2d22da3401cf03a5f4a3511612d98\
+                   47021dbd59364eadfba029a5a6d089442e8bbc32cac86008";
+    assert_eq!(hex::encode(att.to_bytes()), att_hex);
+    assert_eq!(att.to_bytes().len(), 164);
+    assert_eq!(att.id().to_string(), "196a69fcb0efc23124e0d7ef92323eb7d091df1e3d5f345d7316c397537cbac5");
+
+    assert_eq!(hex::encode(req(None).to_bytes()), "000000000000");
+    let cont = GetNapAtt {
+        anchor_height_min: 327_000,
+        keys: vec!["g1.core.signmessage".into()],
+        cursor: Some(att.outpoint()),
+    };
+    assert_eq!(
+        hex::encode(cont.to_bytes()),
+        "58fd0400011367312e636f72652e7369676e6d6573736167650193972ac465f8d2aae3\
+         b4a1e13197918b0950bde5f24ebc6da12517413bacb69101000000"
+    );
+    let last = NapAtt { attestations: vec![att], next_cursor: None };
+    assert_eq!(hex::encode(last.to_bytes()), format!("01{att_hex}00"));
+}

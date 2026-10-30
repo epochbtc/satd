@@ -5,7 +5,7 @@
 //! The Electrum protocol additionally needs:
 //! - block headers by height (`blockchain.block.header(s)`,
 //!   `blockchain.headers.{subscribe,get}`)
-//! - raw tx bytes by txid (`blockchain.transaction.get`)
+//! - a confirmed tx by txid, as stored (`blockchain.transaction.get`)
 //! - confirmed-tx location (block + height + position) for
 //!   `blockchain.transaction.get_merkle`
 //! - txid-by-position-within-block for
@@ -24,8 +24,7 @@
 use std::sync::Arc;
 
 use bitcoin::block::Header;
-use bitcoin::consensus::encode::serialize;
-use bitcoin::{BlockHash, Txid};
+use bitcoin::{BlockHash, Transaction, Txid, Wtxid};
 
 use node::chain::state::ChainState;
 
@@ -49,10 +48,9 @@ pub trait ElectrumExtras: Send + Sync {
     /// the chainstate is in a known-impossible state (no genesis).
     fn tip(&self) -> (u32, Header);
 
-    /// Raw consensus-encoded tx bytes for `txid`, or `None` if not
-    /// found / not indexed (txindex disabled, or txid never confirmed
-    /// and not in mempool).
-    fn raw_tx(&self, txid: &Txid) -> Option<Vec<u8>>;
+    /// The confirmed tx `txid` as stored, or `None` if not found / not
+    /// indexed (txindex disabled, or txid never confirmed).
+    fn stored_tx(&self, txid: &Txid) -> Option<StoredTx>;
 
     /// Confirmed location of `txid`. `None` for unconfirmed / unknown.
     fn confirmation(&self, txid: &Txid) -> Option<TxConfirmation>;
@@ -65,6 +63,22 @@ pub trait ElectrumExtras: Send + Sync {
     /// `None` if either is out of range. Used by
     /// `blockchain.transaction.id_from_pos`.
     fn txid_at_pos(&self, height: u32, tx_pos: u32) -> Option<Txid>;
+}
+
+/// A confirmed transaction as stored, from [`ElectrumExtras::stored_tx`].
+///
+/// For a transaction in an OP_RETURN-stripped block, `tx` is the filled form:
+/// its size, weight, inputs and output values are the original's, but its
+/// bytes are not the transaction's, so they must never be served as such.
+/// `txid` and `wtxid` come from the strip record.
+#[derive(Debug, Clone)]
+pub struct StoredTx {
+    pub tx: Transaction,
+    pub txid: Txid,
+    pub wtxid: Wtxid,
+    /// `(vout, original script length)` of each stripped output; `None`
+    /// when the transaction is intact.
+    pub stripped: Option<Vec<(u32, u64)>>,
 }
 
 /// Confirmation details attached to a tx by [`ElectrumExtras::confirmation`].
@@ -123,21 +137,27 @@ impl ElectrumExtras for RocksElectrumExtras {
         (height, header)
     }
 
-    fn raw_tx(&self, txid: &Txid) -> Option<Vec<u8>> {
+    // Every read below goes through `get_stored_block`, and every txid comes
+    // from the stored block: an OP_RETURN-stripped transaction's is in its
+    // strip record, and its filled bytes hash to something else.
+
+    fn stored_tx(&self, txid: &Txid) -> Option<StoredTx> {
         let hash = self.chain.get_tx_location(txid)?;
-        let block = self.chain.get_block(&hash)?;
-        let tx = block.txdata.iter().find(|t| t.compute_txid() == *txid)?;
-        Some(serialize(tx))
+        let mut stored = self.chain.get_stored_block(&hash)?;
+        let i = stored.txids().iter().position(|t| t == txid)?;
+        Some(StoredTx {
+            txid: *txid,
+            wtxid: stored.wtxid(i),
+            stripped: stored.tx_is_stripped(i).then(|| stored.stripped_outputs(i)),
+            tx: stored.block.txdata.swap_remove(i),
+        })
     }
 
     fn confirmation(&self, txid: &Txid) -> Option<TxConfirmation> {
         let block_hash = self.chain.get_tx_location(txid)?;
-        let block = self.chain.get_block(&block_hash)?;
+        let stored = self.chain.get_stored_block(&block_hash)?;
         let entry = self.chain.get_block_index(&block_hash)?;
-        let position = block
-            .txdata
-            .iter()
-            .position(|t| t.compute_txid() == *txid)? as u32;
+        let position = stored.txids().iter().position(|t| t == txid)? as u32;
         Some(TxConfirmation {
             block_hash,
             height: entry.height,
@@ -148,13 +168,10 @@ impl ElectrumExtras for RocksElectrumExtras {
 
     fn tx_merkle(&self, txid: &Txid) -> Option<TxMerkleProof> {
         let block_hash = self.chain.get_tx_location(txid)?;
-        let block = self.chain.get_block(&block_hash)?;
+        let stored = self.chain.get_stored_block(&block_hash)?;
         let entry = self.chain.get_block_index(&block_hash)?;
-        let position = block
-            .txdata
-            .iter()
-            .position(|t| t.compute_txid() == *txid)? as u32;
-        let txids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+        let txids = stored.txids();
+        let position = txids.iter().position(|t| t == txid)? as u32;
         let branch = compute_merkle_branch(&txids, position as usize);
         Some(TxMerkleProof {
             block_hash,
@@ -166,8 +183,8 @@ impl ElectrumExtras for RocksElectrumExtras {
 
     fn txid_at_pos(&self, height: u32, tx_pos: u32) -> Option<Txid> {
         let hash = self.chain.get_block_hash_by_height(height)?;
-        let block = self.chain.get_block(&hash)?;
-        let tx = block.txdata.get(tx_pos as usize)?;
-        Some(tx.compute_txid())
+        let stored = self.chain.get_stored_block(&hash)?;
+        let i = tx_pos as usize;
+        (i < stored.block.txdata.len()).then(|| stored.txid(i))
     }
 }

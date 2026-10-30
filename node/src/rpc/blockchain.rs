@@ -136,6 +136,84 @@ impl PruneMode {
 }
 
 /// Build the `getblockchaininfo` response from real chain state.
+/// The OP_RETURN pruning report: `getblockchaininfo.opreturn_prune`, and with
+/// `detailed` the whole of `getopreturnpruneinfo` (plan §2.13). `detailed`
+/// stats the block files, so it belongs off the async workers.
+pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
+    let config = chain_state.opreturn_prune_config();
+    let meta = chain_state.opreturn_strip_meta();
+    // `getblockchaininfo` runs on the RPC executor: it reports the totals as
+    // last added up and never reads the whole CF itself.
+    let summary = if detailed {
+        chain_state.opreturn_strip_summary().unwrap_or_default()
+    } else {
+        chain_state.opreturn_strip_summary_last()
+    };
+    let mut out = json!({
+        "enabled": config.is_some(),
+        "depth": config.map(|c| c.depth).or(meta.map(|m| m.depth)),
+        "min_size": config.map(|c| c.size_threshold).or(meta.map(|m| m.size_threshold)),
+        "examined_below_height": meta.map_or(0, |m| m.next_height),
+        "blocks": summary.blocks,
+        "transactions": summary.transactions,
+        "outputs": summary.outputs,
+        "bytes_zeroed": summary.bytes_zeroed,
+        "bytes_freed_estimate": summary.bytes_freed_estimate,
+        // A lock read each: cheap enough for `getblockchaininfo` too, which
+        // is what sat-tui polls.
+        "worker": chain_state.opreturn_strip_worker_status().label(),
+    });
+    // `-restoreopreturns` (plan §11.6): the download's counts, once a pass
+    // has started; zeros before.
+    if chain_state.opreturn_restore_requested() {
+        let p = chain_state.opreturn_restore_progress().unwrap_or_default();
+        let pending = chain_state.opreturn_restore_pending();
+        let remaining = if pending { p.remaining_blocks } else { 0 };
+        out["restore"] = json!({
+            "total_blocks": p.total_blocks,
+            "remaining_blocks": remaining,
+            "restored_blocks": p.restored_blocks,
+            "bytes_downloaded": p.bytes_downloaded,
+            "remaining_bytes": if pending { p.remaining_bytes } else { 0 },
+            "in_flight": p.in_flight,
+            "peers": p.peers,
+            // Of the current pass. A pass that starts over (blocks every peer
+            // refused) counts from its own start.
+            "progress_ratio": match (pending, p.total_blocks) {
+                (false, _) => 1.0,
+                (true, 0) => 0.0,
+                (true, total) => total.saturating_sub(remaining) as f64 / total as f64,
+            },
+            "estimated_remaining_seconds": if pending { p.estimated_remaining_seconds } else { Some(0) },
+        });
+    }
+    if detailed {
+        out["peers"] = json!(chain_state.opreturn_prune_peers().as_str());
+        // The height the worker's scan is heading for: every block below it
+        // is past the strip depth.
+        out["examine_target_height"] = json!(config.map(|c| {
+            chain_state.tip_height().saturating_sub(c.depth.saturating_add(2))
+        }));
+        out["filesystem_block_size"] = json!(chain_state.opreturn_strip_fs_block());
+        out["probe"] = match (config, chain_state.opreturn_strip_fs_block()) {
+            (_, Some(_)) => json!("ok"),
+            (None, None) => json!("not run"),
+            (Some(_), None) => match chain_state.probe_opreturn_strip() {
+                Ok(_) => json!("ok"),
+                Err(e) => json!(e.to_string()),
+            },
+        };
+        match chain_state.blocks_dir_usage() {
+            Ok((apparent, allocated)) => {
+                out["blocks_dir_apparent_bytes"] = json!(apparent);
+                out["blocks_dir_allocated_bytes"] = json!(allocated);
+            }
+            Err(e) => out["blocks_dir_error"] = json!(e.to_string()),
+        }
+    }
+    out
+}
+
 pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value {
     let chain = match chain_state.network {
         Network::Regtest => "regtest",
@@ -217,6 +295,11 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
         // `PRUNE_TARGET_MANUAL`, and `prune_target_size` is emitted only
         // alongside a true one.
         out["automatic_pruning"] = json!(prune.target_mb().is_some());
+    }
+    // satd extension (plan §2.13): OP_RETURN pruning, only on a node that
+    // strips or still holds stripped blocks. `pruned` keeps its Core meaning.
+    if chain_state.opreturn_prune_active() {
+        out["opreturn_prune"] = opreturn_prune_json(chain_state, false);
     }
     if let Some(mib) = prune.target_mb() {
         // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes
@@ -659,18 +742,25 @@ pub fn get_block(
         }
     };
 
+    let stored = chain_state
+        .get_stored_block(&hash)
+        .ok_or_else(block_unavailable_msg)?;
+
     if verbosity == 0 {
-        let block = chain_state
-            .get_block(&hash)
-            .ok_or_else(block_unavailable_msg)?;
-        let raw = serialize(&block);
+        // The raw block is exactly what stripping removed: its filled form
+        // would hash right and carry the wrong txids, so it is never served.
+        // The message is Core's for a block whose data is gone.
+        if stored.is_stripped() {
+            return Err("Block not available (pruned data)".to_string());
+        }
+        let raw = serialize(&stored.block);
         return Ok(Value::String(hex::encode(raw)));
     }
 
-    // verbosity >= 1: JSON response
-    let block = chain_state
-        .get_block(&hash)
-        .ok_or_else(block_unavailable_msg)?;
+    // verbosity >= 1: JSON response. A stripped block answers from its
+    // filled form, whose sizes and weight equal the original's, and from
+    // the txids its strip record holds.
+    let block = &stored.block;
 
     let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
@@ -686,37 +776,30 @@ pub fn get_block(
             .read_undo(&hash)
             .map_err(|_| crate::rpc::rawtx::UNDO_UNREADABLE.to_string())?;
         let per_tx = match &undo {
-            Some(u) => Some(crate::rpc::rawtx::undo_by_tx(&block, u)?),
+            Some(u) => Some(crate::rpc::rawtx::undo_by_tx(block, u)?),
             None => None,
         };
-        let txs: Vec<Value> = block
-            .txdata
-            .iter()
-            .enumerate()
-            .map(|(i, tx)| {
-                crate::rpc::rawtx::decode_transaction_verbose_net(
-                    tx,
+        let txs: Vec<Value> = (0..block.txdata.len())
+            .map(|i| {
+                crate::rpc::rawtx::stored_tx_verbose(
+                    &stored,
+                    i,
                     None,
                     per_tx.as_ref().and_then(|p| p[i]),
                     verbosity >= 3,
-                    true,
                     chain_state.network,
                 )
             })
             .collect();
         Value::Array(txs)
     } else {
-        let txids: Vec<String> = block
-            .txdata
-            .iter()
-            .map(|tx| tx.compute_txid().to_string())
-            .collect();
+        let txids: Vec<String> = stored.txids().iter().map(|t| t.to_string()).collect();
         json!(txids)
     };
 
     let difficulty = target_to_difficulty(entry.header.bits);
     let chainwork_hex = hex::encode(entry.chainwork);
-    let block_size = serialize(&block).len();
+    let block_size = serialize(block).len();
 
     let prev_hash = if entry.height > 0 {
         Some(entry.header.prev_blockhash.to_string())
@@ -772,8 +855,23 @@ pub fn get_block(
     if let Some(nh) = next_hash {
         result["nextblockhash"] = Value::String(nh);
     }
+    if let Some(record) = stored.record() {
+        result["opreturn_stripped"] = opreturn_stripped_summary(record);
+    }
 
     Ok(result)
+}
+
+/// What stripping removed from a block, for `getblock`: the transactions and
+/// outputs it touched, and the payload bytes it zeroed. Each output keeps its
+/// `OP_RETURN` opcode, so a script of `n` bytes lost `n - 1`.
+fn opreturn_stripped_summary(record: &crate::storage::opreturn_strip::StripRecord) -> Value {
+    let outputs = record.txs.iter().flat_map(|t| &t.outputs);
+    json!({
+        "transactions": record.txs.len(),
+        "outputs": outputs.clone().count(),
+        "bytes": outputs.map(|o| o.script_len.saturating_sub(1)).sum::<u64>(),
+    })
 }
 
 /// `getblockheader` — return block header data.
@@ -969,7 +1067,121 @@ pub fn get_tx_out_view(
     Ok(response)
 }
 
-/// `gettxoutsetinfo` — return UTXO set statistics.
+/// `gettxoutsetinfo`'s optional arguments, as the caller supplied them
+/// (`None` = omitted or `null`).
+#[derive(Debug, Default, Clone)]
+pub struct TxOutSetInfoArgs {
+    pub hash_type: Option<String>,
+    /// A height (JSON number) or a block hash (JSON string); Core declares it
+    /// with `skip_type_check`, so the shape is checked here.
+    pub hash_or_height: Option<Value>,
+    pub use_index: Option<bool>,
+}
+
+/// Core's `RPC_INVALID_PARAMETER` for a `hash_or_height` without
+/// coinstatsindex (`src/rpc/blockchain.cpp`, `gettxoutsetinfo`). satd keeps
+/// no per-height UTXO stats, so any block but the tip gets it.
+const SPECIFIC_HEIGHT_NEEDS_INDEX: &str = "Querying specific block heights requires coinstatsindex";
+
+/// Core's `ParseHashOrHeight` (`src/rpc/blockchain.cpp`): a number is a
+/// height on the active chain, anything else is read as a block hash.
+fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> Result<BlockHash, (i32, String)> {
+    if let Value::Number(n) = param {
+        // `getInt<int>`: a fraction or a value outside `int` is refused.
+        let height = n
+            .as_i64()
+            .and_then(|h| i32::try_from(h).ok())
+            .ok_or((-1, "JSON integer out of range".to_string()))?;
+        if height < 0 {
+            return Err((-8, format!("Target block height {height} is negative")));
+        }
+        let tip = chain_state.tip_height();
+        if height as u32 > tip {
+            return Err((-8, format!("Target block height {height} after current tip {tip}")));
+        }
+        return chain_state
+            .get_block_hash_by_height(height as u32)
+            .ok_or((-5, "Block not found".to_string()));
+    }
+    let Value::String(s) = param else {
+        // `ParseHashV` calls `get_str()`, whose type error Core answers as
+        // `RPC_MISC_ERROR`.
+        return Err((
+            -1,
+            format!(
+                "JSON value of type {} is not of expected type string",
+                crate::rpc::params::json_type_name(param)
+            ),
+        ));
+    };
+    let hash: BlockHash = crate::rpc::util::parse_hash_v(s, "hash_or_height")?;
+    if chain_state.get_block_index(&hash).is_none() {
+        return Err((-5, "Block not found".to_string()));
+    }
+    Ok(hash)
+}
+
+/// `gettxoutsetinfo` — return UTXO set statistics for the tip.
+///
+/// satd keeps no UTXO-set hash and no per-height stats, so the arguments that
+/// ask for them are refused by name rather than accepted and answered with
+/// the tip (#896): a `hash_or_height` naming any block but the tip, and an
+/// explicit `hash_type` of `muhash` or `hash_serialized_3`. An omitted
+/// `hash_type`, or `"none"`, keeps the reply plain callers have always had.
+/// Errors that Core itself raises are Core's, in Core's order.
+pub fn get_tx_out_set_info_with(
+    chain_state: &ChainState,
+    args: &TxOutSetInfoArgs,
+) -> Result<Value, (i32, String)> {
+    // Core's `ParseHashType` comes first.
+    let hash_type = args.hash_type.as_deref();
+    if let Some(t) = hash_type
+        && !matches!(t, "hash_serialized_3" | "muhash" | "none")
+    {
+        return Err((-8, format!("'{t}' is not a valid hash_type")));
+    }
+    let target = match &args.hash_or_height {
+        None => None,
+        Some(param) => {
+            let hash = parse_hash_or_height(chain_state, param)?;
+            if hash != chain_state.tip_hash() {
+                return Err((-8, SPECIFIC_HEIGHT_NEEDS_INDEX.to_string()));
+            }
+            // Core's two checks for a specific block, which hold for the tip
+            // named explicitly as well.
+            if hash_type == Some("hash_serialized_3") {
+                return Err((
+                    -8,
+                    "hash_serialized_3 hash type cannot be queried for a specific block".to_string(),
+                ));
+            }
+            if args.use_index == Some(false) {
+                return Err((
+                    -8,
+                    "Cannot set use_index to false when querying for a specific block".to_string(),
+                ));
+            }
+            Some(hash)
+        }
+    };
+    if let Some(t @ ("muhash" | "hash_serialized_3")) = hash_type {
+        return Err((
+            -8,
+            format!("satd does not compute a UTXO set hash; hash_type '{t}' is not supported (use 'none')"),
+        ));
+    }
+    let response = get_tx_out_set_info(chain_state)?;
+    // A block that connected after the check above makes the named block no
+    // longer the tip, and the stats just read are for the new one.
+    if let Some(hash) = target
+        && response["bestblock"].as_str() != Some(hash.to_string().as_str())
+    {
+        return Err((-8, SPECIFIC_HEIGHT_NEEDS_INDEX.to_string()));
+    }
+    Ok(response)
+}
+
+/// `gettxoutsetinfo` with no arguments: UTXO set statistics for the tip.
 pub fn get_tx_out_set_info(chain_state: &ChainState) -> Result<Value, (i32, String)> {
     // One consistent view: tip, coin count, total amount and the height
     // histogram are read under the chain's accept lock (after a cache
@@ -1163,9 +1375,13 @@ pub fn get_block_stats(
     let entry = chain_state
         .get_block_index(&hash)
         .ok_or("Block not found")?;
+    // A stripped block's filled form has the original's sizes, weights and
+    // output values, and its fees come from undo data, so every statistic
+    // is the same as before the strip.
     let block = chain_state
-        .get_block(&hash)
-        .ok_or("Block data not available")?;
+        .get_stored_block(&hash)
+        .ok_or("Block data not available")?
+        .block;
 
     let block_bytes = serialize(&block);
     let total_size = block_bytes.len();
@@ -1862,9 +2078,11 @@ pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) ->
             return json!(false);
         };
         // Level 1+: the body must be readable, unless the operator pruned it.
+        // A stripped body is readable: the read verifies its filled form's
+        // hash and its txids against the merkle root.
         if check_level >= 1
             && !chain_state.is_pruned(&hash)
-            && chain_state.get_block(&hash).is_none()
+            && chain_state.get_stored_block(&hash).is_none()
         {
             return json!(false);
         }

@@ -1683,6 +1683,43 @@ fn test_getnetworkinfo_connections() {
     node.stop();
 }
 
+/// #896: through the RPC layer, positional and named, `gettxoutsetinfo`
+/// refuses a block other than the tip and an explicit UTXO-set hash type,
+/// and still answers the tip and `hash_type` `"none"`.
+#[test]
+fn test_gettxoutsetinfo_refuses_what_it_cannot_honour() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_ok("generatetoaddress", vec![json!(3), json!(addr)]);
+    let tip = node.rpc_ok("getbestblockhash", vec![]);
+
+    let ok = node.rpc_ok("gettxoutsetinfo", vec![json!("none"), json!(3)]);
+    assert_eq!(ok["height"], 3, "{ok}");
+    let ok = node.rpc_ok("gettxoutsetinfo", vec![json!("none"), tip.clone()]);
+    assert_eq!(ok["bestblock"], tip, "{ok}");
+
+    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(1)]).unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "Querying specific block heights requires coinstatsindex");
+    let r = node
+        .rpc_call_with_named_params("gettxoutsetinfo", json!({"hash_or_height": 2}))
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    for t in ["muhash", "hash_serialized_3"] {
+        let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!(t)]).unwrap();
+        assert_eq!(r["error"]["code"], -8, "{t}: {r}");
+    }
+    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("sha256")]).unwrap();
+    assert_eq!(r["error"]["message"], "'sha256' is not a valid hash_type", "{r}");
+    // A mistyped `use_index` is Core's type error, not ignored.
+    let r = node
+        .rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(null), json!("yes")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -3, "{r}");
+    node.stop();
+}
+
 #[test]
 fn test_gettxoutsetinfo() {
     let mut node = TestNode::start(&[]);
@@ -8033,8 +8070,16 @@ fn a_reindex_over_a_missing_block_file_raises_reindex_short() {
     );
     std::fs::remove_file(blocks.join("blk00001.dat")).unwrap();
 
-    let mut node =
-        TestNode::start_with_datadir(&datadir, rpcport, &["--fastprune=1", "--reindex"]);
+    // #884: the warning is raised during startup, and `-alertnotify` must run
+    // for it as Core's would.
+    let notify_dir = fresh_test_datadir("satd-reindex-short-alert");
+    let alerts = notify_dir.join("alertnotify.log");
+    let alertnotify = format!("--alertnotify=echo %s >> {}", alerts.display());
+    let mut node = TestNode::start_with_datadir(
+        &datadir,
+        rpcport,
+        &["--fastprune=1", "--reindex", &alertnotify],
+    );
     let height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap();
     assert!(
         height > 0 && height < 600,
@@ -8059,8 +8104,20 @@ fn a_reindex_over_a_missing_block_file_raises_reindex_short() {
             || short["context"]["first_orphan_file"] == "blk00002.dat",
         "the warning must locate the hole: {short}"
     );
+    let read = || std::fs::read_to_string(&alerts).unwrap_or_default();
+    let deadline = Instant::now() + test_timeout(30);
+    while !read().contains("reindex.short") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = read();
+    assert_eq!(
+        log.matches("reindex.short").count(),
+        1,
+        "-alertnotify runs once for the reindex.short raised during startup: {log:?}"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
+    let _ = std::fs::remove_dir_all(&notify_dir);
 }
 
 #[test]
@@ -20108,6 +20165,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         "getorphantxs",
         "getrawaddrman",
         "sendmsgtopeer",
+        "stripopreturns",
         "unsubscribemempool",
     ];
     let mut missing: Vec<&str> = registered

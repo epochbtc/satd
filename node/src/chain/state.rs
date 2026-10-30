@@ -14,9 +14,17 @@ use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_fo
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::{FlatFileManager, FlatFilePos, PendingRecord};
+use crate::storage::opreturn_strip::{self, StoredBlock, StoredBlockError, StripRecord};
 use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
+
+#[path = "state_strip.rs"]
+mod strip;
+pub use strip::{
+    FAILPOINT_ENV, PassReport, RestoreItem, RestoreProgress, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus,
+    run_strip_worker,
+};
 
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
@@ -104,6 +112,11 @@ pub enum ChainError {
     DecodeFailed,
     #[error("checkpoint mismatch at height {0}")]
     CheckpointMismatch(u32),
+    /// A new header forks off the chain below the last checkpoint the block
+    /// index holds (Core v29's `BLOCK_CHECKPOINT`, raised in
+    /// `ContextualCheckBlockHeader`). The height is the refused header's.
+    #[error("bad-fork-prior-to-checkpoint")]
+    ForkBeforeCheckpoint(u32),
     #[error("{0}")]
     Validation(#[from] validation::ValidationError),
     #[error("{0}")]
@@ -376,15 +389,21 @@ pub struct ChainState {
     /// Whether the checkpoint set is enforced (Core `-checkpoints`, default
     /// true). Set to false by `-checkpoints=0` to skip checkpoint validation.
     enforce_checkpoints: bool,
-    /// Highest header height stored (may be ahead of connected block tip during IBD).
+    /// Height of [`Self::best_header`], the most-work header (Core's
+    /// `m_best_header->nHeight`); may be ahead of the connected tip during
+    /// IBD. Written only together with `best_header`, never as a height
+    /// high-water mark: a tall chain of low-work headers is stored (there is
+    /// no presync yet) but must not raise this, or every reader of the
+    /// header lag — `is_ibd`, `getblockchaininfo.headers`, readiness — takes
+    /// the node to be far behind a chain it will never follow.
     headers_tip_height: AtomicU32,
     /// Most-work header chain tip seen so far — `(hash, chainwork)` — analogous
     /// to Bitcoin Core's `pindexBestHeader`. Updated by `accept_header` /
     /// `accept_headers` whenever a header carries strictly more work. Used to
-    /// drive fork-aware block requests: unlike `headers_tip_height` (a height,
-    /// monotonic via `fetch_max`) and `get_block_hash_by_height` (the pollutable
-    /// "best-known-at-height" index), this names the actual most-work chain, so
-    /// a competing chain that is heavier-but-shorter is still pursued.
+    /// drive fork-aware block requests: unlike `get_block_hash_by_height` (the
+    /// pollutable "best-known-at-height" index), this names the actual
+    /// most-work chain, so a competing chain that is heavier-but-shorter is
+    /// still pursued.
     best_header: RwLock<(BlockHash, [u8; 32])>,
     /// Height-index rows above the tip that the last best-header change
     /// rewrote (`Some(hash)`) or dropped (`None`), waiting for the IBD
@@ -507,6 +526,12 @@ pub struct ChainState {
     /// `chain_gen`, so a reader would certify its half-published coins as
     /// settled. Any new mutator must take `accept_lock` first.
     mutation_depth: AtomicU32,
+    /// Bumped by every tip write that is not a one-block extension of the
+    /// tip it replaces: a disconnect, a reorg, a rollback, a multi-block
+    /// jump. A reader pinned to a tip uses it to tell a chain that only grew
+    /// on top of that tip, whose history at and below it is unchanged, from
+    /// one that moved under it. See [`Self::view_change`].
+    tip_retreats: AtomicU64,
 
     connect_heartbeat: AtomicU64,
     /// Lock-free monotonic counter bumped on every iteration of the
@@ -633,6 +658,12 @@ pub struct ChainState {
     /// [`Self::set_startup_stop`]. Unset in tests that do not need it, and
     /// then never requested.
     startup_stop: std::sync::OnceLock<crate::shutdown::StartupStop>,
+    /// Whether the chainstate is in `BulkLoad` write mode, mirrored from
+    /// [`Self::set_write_mode`]: IBD and the startup replays. Stripping
+    /// waits for it to end.
+    bulk_load: std::sync::atomic::AtomicBool,
+    /// OP_RETURN stripping ([`Self::strip_block`]).
+    strip: strip::StripState,
 }
 
 /// RAII clear for [`ChainState::snapshot_load_active`]. The flag must drop
@@ -763,6 +794,33 @@ impl Drop for ChainMutationGuard<'_> {
     }
 }
 
+/// The tip a reader started from, and the chainstate generation it was
+/// published under. See [`ChainState::begin_view`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainView {
+    pub tip_hash: BlockHash,
+    pub tip_height: u32,
+    generation: u64,
+    retreats: u64,
+}
+
+/// How the chainstate changed since a [`ChainView`] was taken. See
+/// [`ChainState::view_change`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewChange {
+    /// No mutation has run.
+    Unchanged,
+    /// Only blocks connected on top of the view's tip: everything at and
+    /// below its height reads as it did.
+    Extended,
+    /// The tip was replaced by something other than a child: blocks were
+    /// disconnected, and what the view's height range holds may have
+    /// changed.
+    Retreated,
+    /// A mutation is in flight; ask again once it finishes.
+    InFlight,
+}
+
 /// How many times [`ChainState::coherent_read`] re-runs its read before giving
 /// up. A connect that lands between the two samples costs one retry; the cap is
 /// generous enough that only a chain advancing continuously exhausts it.
@@ -838,28 +896,6 @@ impl ChainState {
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
             && let Some(entry) = store.get_block_index(&tip_hash) {
-                // Find the highest stored header via binary search.
-                // Headers may be ahead of blocks if we crashed during IBD.
-                let mut htip = entry.height;
-                // First, probe exponentially to find an upper bound
-                let mut probe = 1u32;
-                while store.get_block_hash_by_height(htip + probe).is_some() {
-                    htip += probe;
-                    probe *= 2;
-                }
-                // Binary search between htip and htip + probe
-                let mut lo = htip;
-                let mut hi = htip + probe;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if store.get_block_hash_by_height(mid + 1).is_some() {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                htip = lo;
-
                 // Seed the best-header pointer from the highest-CHAINWORK
                 // header in the index — NOT the highest-height header, which
                 // the pollutable best-known-at-height index would give and
@@ -897,6 +933,12 @@ impl ChainState {
                 })?;
                 let tips: std::collections::HashSet<BlockHash> =
                     all.difference(&parents).copied().collect();
+                // The header tip is the best header's height, as it is at
+                // run time (Core's `m_best_header->nHeight`). Headers may be
+                // ahead of blocks if we crashed during IBD.
+                let htip = store
+                    .get_block_index(&best_header.0)
+                    .map_or(entry.height, |e| e.height);
                 // Rows dropped mid-scan (bad key / bad value) don't return
                 // Err but DO mean the best-header seed may have missed a
                 // heavier branch — surface them instead of masking.
@@ -953,6 +995,7 @@ impl ChainState {
                     chain_event_tx: parking_lot::Mutex::new(None),
                     chain_gen: AtomicU64::new(0),
                     mutation_depth: AtomicU32::new(0),
+                    tip_retreats: AtomicU64::new(0),
                     connect_heartbeat: AtomicU64::new(0),
                     manager_heartbeat: AtomicU64::new(0),
                     connect_phases: std::sync::Arc::new(
@@ -965,6 +1008,8 @@ impl ChainState {
                     pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
                     startup_stop: std::sync::OnceLock::new(),
+                    bulk_load: std::sync::atomic::AtomicBool::new(false),
+                    strip: Default::default(),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -1042,6 +1087,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: 1,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &address_index,
             sp_index: &sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -1089,6 +1135,7 @@ impl ChainState {
             chain_event_tx: parking_lot::Mutex::new(None),
             chain_gen: AtomicU64::new(0),
             mutation_depth: AtomicU32::new(0),
+            tip_retreats: AtomicU64::new(0),
             connect_heartbeat: AtomicU64::new(0),
             manager_heartbeat: AtomicU64::new(0),
             connect_phases: std::sync::Arc::new(
@@ -1101,6 +1148,8 @@ impl ChainState {
             pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
             startup_stop: std::sync::OnceLock::new(),
+            bulk_load: std::sync::atomic::AtomicBool::new(false),
+            strip: Default::default(),
         })
     }
 
@@ -1148,9 +1197,16 @@ impl ChainState {
     /// Enable or disable enforcement of the built-in block checkpoints
     /// (Core `-checkpoints`, default enabled). Call once, before the
     /// `ChainState` is shared (wrapped in an `Arc`). `-checkpoints=0`
-    /// disables checkpoint validation in `connect_block`.
+    /// disables checkpoint validation in `connect_block` and the
+    /// `bad-fork-prior-to-checkpoint` rule on new headers.
     pub fn set_enforce_checkpoints(&mut self, enforce: bool) {
         self.enforce_checkpoints = enforce;
+    }
+
+    /// Replace the checkpoint set, for tests that pin a regtest chain.
+    #[cfg(test)]
+    pub(crate) fn set_checkpoints_for_test(&mut self, checkpoints: Vec<Checkpoint>) {
+        self.checkpoints = checkpoints;
     }
 
     /// The signet challenge this node validates against: the configured
@@ -1594,8 +1650,9 @@ impl ChainState {
         {
             self.set_tip(anchor.blockhash, anchor.height);
         }
-        self.headers_tip_height
-            .fetch_max(anchor.height, Ordering::Relaxed);
+        // The base header is in the index (checked above), so the best
+        // header already out-works it; this only covers a pointer that lags.
+        self.refresh_best_header_to_tip();
 
         // A snapshot brings a UTXO set with no history behind it. The
         // address and spend indexes hold nothing for anything below the
@@ -1977,6 +2034,17 @@ impl ChainState {
             "tip moved to {hash} at height {height} outside a chain-mutation guard; \
              readers pairing a coin read with the tip cannot detect this change"
         );
+        // Mutators are serialized, so the tip read here is the one this
+        // write replaces.
+        let current = self.tip_snapshot();
+        let extends = height == current.1.wrapping_add(1)
+            && self
+                .store
+                .get_block_index(&hash)
+                .is_some_and(|e| e.header.prev_blockhash == current.0);
+        if !extends {
+            self.tip_retreats.fetch_add(1, Ordering::Release);
+        }
         let mut tip = self.tip.write();
         tip.hash = hash;
         tip.height = height;
@@ -2026,6 +2094,62 @@ impl ChainState {
         match self.coherent_attempt(&read) {
             Attempt::Read(value) => Some(value),
             Attempt::Moved | Attempt::Stuck => None,
+        }
+    }
+
+    /// Start a read that must see a single chainstate, for a reader that
+    /// cannot run inside [`coherent_read`](Self::coherent_read)'s closure --
+    /// an async request handler, say. `None` while a mutation is in flight:
+    /// wait and ask again.
+    ///
+    /// The returned view names the tip the read is answering for. Once the
+    /// read is done, [`view_is_current`](Self::view_is_current) says whether
+    /// the chainstate it read is still that one; if not, discard the answer.
+    pub fn begin_view(&self) -> Option<ChainView> {
+        let generation = self.chain_gen.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return None;
+        }
+        let retreats = self.tip_retreats.load(Ordering::Acquire);
+        let (tip_hash, tip_height) = self.tip_snapshot();
+        // A tip write between the two loads above would pair its retreat
+        // count with the tip it replaced, and `view_change` could then call a
+        // read of the new chainstate an extension of the old tip. Every tip
+        // write is inside a mutation, so an unchanged generation rules that
+        // out.
+        if self.chain_gen.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(ChainView {
+            tip_hash,
+            tip_height,
+            generation,
+            retreats,
+        })
+    }
+
+    /// What has happened to the chainstate since `view` was taken by
+    /// [`begin_view`](Self::begin_view).
+    ///
+    /// [`ViewChange::Unchanged`]: every store read made in between saw the
+    /// chainstate whose tip `view` names. [`ViewChange::Extended`]: only
+    /// blocks on top of that tip connected, so a read bounded to heights at
+    /// or below it saw what it would have seen at the view. Anything else
+    /// may have changed what the view's heights hold.
+    pub fn view_change(&self, view: &ChainView) -> ViewChange {
+        let generation = self.chain_gen.load(Ordering::Acquire);
+        if generation == view.generation {
+            return ViewChange::Unchanged;
+        }
+        if !generation.is_multiple_of(2) {
+            return ViewChange::InFlight;
+        }
+        // Every tip write of a finished mutation happened before the
+        // generation went even, so its retreat is visible here.
+        if self.tip_retreats.load(Ordering::Acquire) == view.retreats {
+            ViewChange::Extended
+        } else {
+            ViewChange::Retreated
         }
     }
 
@@ -2502,6 +2626,48 @@ impl ChainState {
             .unwrap_or(false)
     }
 
+    /// The height of the highest checkpoint whose block is in the index,
+    /// header-only or not: Core v29's `BlockManager::GetLastCheckpoint`.
+    /// `None` when checkpoints are not enforced (`-checkpoints=0`), the
+    /// network has none, or the index holds none of them yet, as on a node
+    /// whose header sync has not reached the first one past genesis.
+    fn last_checkpoint_in_index(&self) -> Option<u32> {
+        if !self.enforce_checkpoints {
+            return None;
+        }
+        self.checkpoints
+            .iter()
+            .filter(|cp| self.store.get_block_index(&cp.hash).is_some())
+            .map(|cp| cp.height)
+            .max()
+    }
+
+    /// Core v29's checkpoint rule in `ContextualCheckBlockHeader`: "Don't
+    /// accept any forks from the main chain prior to last checkpoint". A new
+    /// header at `height` below `last_checkpoint` branches off below a block
+    /// the chain is pinned to, so its fork can never become the best chain,
+    /// and storing it would only let a peer fill the block index with
+    /// early-chain headers that cost almost nothing to mine. Callers apply it
+    /// only to a header the index does not hold yet, after the
+    /// already-known check, as `AcceptBlockHeader` does: a main-chain header
+    /// sent again stays harmless.
+    fn check_fork_after_checkpoint(
+        height: u32,
+        last_checkpoint: Option<u32>,
+    ) -> Result<(), ChainError> {
+        match last_checkpoint {
+            Some(cp) if height < cp => {
+                tracing::debug!(
+                    height,
+                    last_checkpoint = cp,
+                    "header refused: forked chain older than last checkpoint"
+                );
+                Err(ChainError::ForkBeforeCheckpoint(height))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Accept a block header without block data (for headers-first sync).
     /// Validates PoW and difficulty but does not process transactions.
     pub fn accept_header(&self, header: &bitcoin::block::Header) -> Result<BlockHash, ChainError> {
@@ -2534,6 +2700,10 @@ impl ChainState {
             |h| self.store.get_block_index(h),
         )?;
 
+        // `bad-fork-prior-to-checkpoint`, where Core checks it: after the
+        // difficulty, before the time and version rules.
+        Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
+
         // The rest of Core's `ContextualCheckBlockHeader`: time-too-old,
         // time-too-new and bad-version. Core applies them in
         // `AcceptBlockHeader`, so no header that breaks them is indexed; a
@@ -2565,7 +2735,7 @@ impl ChainState {
         let batch_index = std::collections::HashMap::from([(hash, entry)]);
         // The height->hash rows this header may earn are decided in one
         // place for both acceptance paths; see `commit_accepted_headers`.
-        self.commit_accepted_headers(batch, &batch_index, Some((hash, chainwork)), new_height)?;
+        self.commit_accepted_headers(batch, &batch_index, Some((hash, chainwork)))?;
 
         Ok(hash)
     }
@@ -2600,10 +2770,9 @@ impl ChainState {
         batch: crate::storage::StoreBatch,
         batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
         best_in_batch: Option<(BlockHash, [u8; 32])>,
-        max_height: u32,
     ) -> Result<(), StoreError> {
         let _accept_guard = self.accept_lock.lock();
-        self.commit_accepted_headers_locked(batch, batch_index, best_in_batch, max_height)
+        self.commit_accepted_headers_locked(batch, batch_index, best_in_batch)
     }
 
     /// [`Self::commit_accepted_headers`] for a caller that already holds
@@ -2614,7 +2783,6 @@ impl ChainState {
         mut batch: crate::storage::StoreBatch,
         batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
         best_in_batch: Option<(BlockHash, [u8; 32])>,
-        max_height: u32,
     ) -> Result<(), StoreError> {
         // Stands in for `AssertLockHeld`, as in `recalculate_best_header`.
         debug_assert!(
@@ -2641,10 +2809,13 @@ impl ChainState {
             }
         }
         self.write_chain_batch(batch)?;
-        // Track highest header for locator construction.
-        self.headers_tip_height.fetch_max(max_height, Ordering::Relaxed);
-        if let Some((h, w)) = new_best {
-            self.update_best_header(h, w);
+        // `headers_tip_height` moves with `best_header` and nothing else: a
+        // header that is merely higher, on a chain with less work, must not
+        // raise it (see the field).
+        if let Some((h, w)) = new_best
+            && let Some(height) = batch_index.get(&h).map(|e| e.height)
+        {
+            self.update_best_header(h, w, height);
         }
         // Publish the re-keyed rows last: only after the write that made them
         // true, and after `best_header` names the chain they were derived
@@ -2767,13 +2938,12 @@ impl ChainState {
                 None => break,
             }
         }
-        // `headers_tip_height` is a high-water mark, so it bounds where a
-        // heavier-but-shorter switch can have left rows behind.
-        let ceiling = self.headers_tip_height().max(best_height);
-        for h in (best_height + 1)..=ceiling {
-            if self.store.get_block_hash_by_height(h).is_some() {
-                batch.height_hash_removes.push(h);
-            }
+        // Rows above the best header that a heavier-but-shorter switch left
+        // behind form a contiguous run from just above it.
+        let mut h = best_height + 1;
+        while self.store.get_block_hash_by_height(h).is_some() {
+            batch.height_hash_removes.push(h);
+            h += 1;
         }
         let counts = (batch.height_hash_puts.len(), batch.height_hash_removes.len());
         if counts != (0, 0) {
@@ -2798,7 +2968,6 @@ impl ChainState {
         let mut batch_index: std::collections::HashMap<BlockHash, BlockIndexEntry> =
             std::collections::HashMap::new();
         let mut accepted = 0u32;
-        let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
         let now = unix_now_secs();
         // The first header refused. The headers before it in the batch are
@@ -2806,6 +2975,10 @@ impl ChainState {
         // header it accepted before the one that failed: a batch whose last
         // header is ahead of our clock must not lose the rest.
         let mut refused: Option<ChainError> = None;
+        // The last checkpoint in the index, raised below when this batch
+        // stages a checkpoint's header: Core accepts a batch one header at a
+        // time, so a checkpoint earlier in the batch already counts.
+        let mut last_checkpoint = self.last_checkpoint_in_index();
 
         for header in headers {
             let hash = header.block_hash();
@@ -2827,7 +3000,6 @@ impl ChainState {
                     && self.store.get_block_hash_by_height(existing.height).is_none()
                 {
                     batch.height_hash_puts.push((existing.height, hash));
-                    max_height = max_height.max(existing.height);
                 }
                 continue; // skip block_index write — entry already exists
             }
@@ -2875,6 +3047,11 @@ impl ChainState {
                 break;
             }
 
+            if let Err(e) = Self::check_fork_after_checkpoint(new_height, last_checkpoint) {
+                refused = Some(e);
+                break;
+            }
+
             // Time and version, as in `accept_header`. The MTP walk resolves
             // ancestors the same way the difficulty check does: this batch's
             // predecessors first, then the store.
@@ -2911,11 +3088,16 @@ impl ChainState {
 
             batch.block_index_puts.push((hash, entry.clone()));
             batch_index.insert(hash, entry);
+            if self.enforce_checkpoints
+                && self.checkpoints.iter().any(|cp| cp.hash == hash)
+                && last_checkpoint.is_none_or(|h| new_height > h)
+            {
+                last_checkpoint = Some(new_height);
+            }
             // Staged for the in-batch retarget lookup only. Which heights get a
             // height->hash row is decided once, from the best-header chain, in
             // `commit_accepted_headers`.
             accepted += 1;
-            max_height = max_height.max(new_height);
             if best_in_batch
                 .as_ref()
                 .is_none_or(|(_, w)| compare_u256(&chainwork, w) > 0)
@@ -2926,7 +3108,7 @@ impl ChainState {
 
         if (accepted > 0 || !batch.height_hash_puts.is_empty())
             && let Err(e) =
-                self.commit_accepted_headers(batch, &batch_index, best_in_batch, max_height)
+                self.commit_accepted_headers(batch, &batch_index, best_in_batch)
         {
             return (0, Some(e.into()));
         }
@@ -3009,22 +3191,52 @@ impl ChainState {
     }
 
     /// Advance the best-header pointer if `chainwork` is strictly more than the
-    /// current best (first-seen wins ties, matching consensus).
-    fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32]) {
+    /// current best (first-seen wins ties, matching consensus), and the header
+    /// tip height with it. `height` is `hash`'s height; it may be lower than
+    /// the previous header tip (a heavier-but-shorter chain), and the tip
+    /// follows it down, as Core's `m_best_header->nHeight` does.
+    fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32], height: u32) {
         let mut best = self.best_header.write();
         if compare_u256(&chainwork, &best.1) > 0 {
             *best = (hash, chainwork);
+            // Under the pointer's write lock, so two racing advances cannot
+            // leave the height of the one that lost.
+            self.headers_tip_height.store(height, Ordering::Relaxed);
         }
+    }
+
+    /// Give every block of the active chain `factor` times its own work, as
+    /// if each had been mined at a higher difficulty. Regtest mints every
+    /// header at the same work, so a test that needs a shorter chain to
+    /// out-work a taller one rewrites the index rows the work is read from.
+    /// Leaves `best_header` alone; [`Self::refresh_best_header_to_tip`]
+    /// moves it onto the reweighted tip.
+    #[cfg(test)]
+    pub(crate) fn scale_active_chain_work_for_test(&self, factor: u32) {
+        use crate::storage::blockindex::{add_u256, work_for_bits};
+        let genesis = self.get_block_hash_by_height(0).expect("genesis row");
+        let mut work = self.get_block_index(&genesis).expect("genesis entry").chainwork;
+        let mut batch = crate::storage::StoreBatch::default();
+        for h in 1..=self.tip_height() {
+            let hash = self.get_block_hash_by_height(h).expect("active row");
+            let mut entry = self.get_block_index(&hash).expect("active entry");
+            let block_work = work_for_bits(entry.header.bits);
+            for _ in 0..factor {
+                work = add_u256(&work, &block_work);
+            }
+            entry.chainwork = work;
+            batch.block_index_puts.push((hash, entry));
+        }
+        self.store.write_batch(batch).expect("reweighted rows written");
     }
 
     /// Core's `ChainstateManager::RecalculateBestHeader`: rescan the block
     /// index for the highest-work entry that is not on a failed branch and
     /// move the header tip to it.
     ///
-    /// Both halves of that tip only ever move *up* in normal operation —
-    /// `best_header` takes the higher chainwork, `headers_tip_height` is a
-    /// `fetch_max` high-water mark — which is right while headers only ever
-    /// arrive. Invalidating a branch is the one event that can move it down,
+    /// That tip's chainwork only ever moves *up* in normal operation —
+    /// `best_header` takes the higher chainwork, and `headers_tip_height`
+    /// follows it — which is right while headers only ever arrive. Invalidating a branch is the one event that can move it down,
     /// and it has to: `getblockchaininfo.headers`, the initial-block-download
     /// heuristic, the scheduler's target height and the stall detector all
     /// read the distance between this and the active tip, and leaving it on
@@ -3049,8 +3261,8 @@ impl ChainState {
     /// **Caller must hold `accept_lock`**, which is Core's `AssertLockHeld(
     /// cs_main)` on `RecalculateBestHeader`. Both halves of the header tip
     /// are published here as a plain overwrite, because lowering them is the
-    /// whole point — a chainwork-guarded write or a `fetch_max` would leave
-    /// the tip on the branch just invalidated. That makes the scan and the
+    /// whole point — a chainwork-guarded write would leave the tip on the
+    /// branch just invalidated. That makes the scan and the
     /// publish a read-modify-write that must not interleave with
     /// `commit_accepted_headers`, the only other writer of either half:
     /// a batch landing in the window would be clobbered back to the stale
@@ -3102,8 +3314,11 @@ impl ChainState {
         // Both an unguarded overwrite: this is the one path allowed to move
         // the header tip *down*, and `accept_lock` (held by the caller) keeps
         // a `headers` batch from landing between the scan and here.
-        *self.best_header.write() = (best.0, best.1);
-        self.headers_tip_height.store(best.2, Ordering::Relaxed);
+        {
+            let mut pointer = self.best_header.write();
+            *pointer = (best.0, best.1);
+            self.headers_tip_height.store(best.2, Ordering::Relaxed);
+        }
         tracing::debug!(
             "recalculate_best_header: header tip is now {} at height {}",
             best.0,
@@ -3187,7 +3402,7 @@ impl ChainState {
     pub fn refresh_best_header_to_tip(&self) {
         let tip_hash = self.tip_hash();
         if let Some(entry) = self.get_block_index(&tip_hash) {
-            self.update_best_header(tip_hash, entry.chainwork);
+            self.update_best_header(tip_hash, entry.chainwork, entry.height);
         }
     }
 
@@ -3877,7 +4092,16 @@ impl ChainState {
                  block index entries may become durable ahead of their data"
             );
         }
+        // Raised before the store enters BulkLoad and lowered only once it has
+        // left, so a strip never sees Normal while writes run WAL-less.
+        let bulk = mode == crate::storage::WriteMode::BulkLoad;
+        if bulk {
+            self.bulk_load.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.store.set_write_mode(mode);
+        if !bulk {
+            self.bulk_load.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Force all cached writes to durable storage. Intended to be called
@@ -4588,6 +4812,7 @@ impl ChainState {
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -4665,7 +4890,24 @@ impl ChainState {
         );
     }
 
-    pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
+    /// The block as stored: intact, or OP_RETURN-stripped with its record
+    /// applied, so a stripped block comes back in its filled form with the
+    /// original txids.
+    ///
+    /// The bytes are read before the record is looked up. The strip worker
+    /// commits a record before it punches the bytes it describes, so a read
+    /// that found no record read the bytes before the record existed, and
+    /// therefore before any punch: they are intact. A read that found the
+    /// record zero-fills the spans, so bytes punched or torn under it do not
+    /// matter. Looking the record up first would let a strip land in between
+    /// and serve the zeroed bytes as an intact block.
+    pub fn get_stored_block(&self, hash: &BlockHash) -> Option<StoredBlock> {
+        self.read_stored_block(hash, true)
+    }
+
+    /// [`Self::get_stored_block`], which may retry once when the block's
+    /// entry moved under it.
+    fn read_stored_block(&self, hash: &BlockHash, may_retry: bool) -> Option<StoredBlock> {
         let entry = self.store.get_block_index(hash)?;
         // HeaderOnly/Pruned entries never carry local block data. An `Invalid`
         // block (set only by `invalidate_block`) KEEPS its data on disk, and
@@ -4698,47 +4940,115 @@ impl ChainState {
         // signal. `None` is still the return value, because that is what the
         // callers are built around; what changes is that the condition is now
         // *reported*.
-        let data = match self.flat_files.lock().read_block(&pos) {
+        let (read, xor_key) = {
+            let mut flat_files = self.flat_files.lock();
+            (flat_files.read_block(&pos), flat_files.xor_key())
+        };
+        let data = match read {
             Ok(data) => data,
             Err(e) => {
                 self.report_corrupt_block_data(hash, &entry, &pos, &format!("read failed: {e}"));
                 return None;
             }
         };
-        let block: Block = match bitcoin::consensus::deserialize(&data) {
-            Ok(block) => block,
+        // The record lookup comes second; see the function doc.
+        let record = match self.store.get_opreturn_strip(hash) {
+            Ok(None) => None,
+            Ok(Some(bytes)) => match StripRecord::decode(&bytes) {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    self.report_corrupt_block_data(
+                        hash,
+                        &entry,
+                        &pos,
+                        &format!("strip record does not decode: {e}"),
+                    );
+                    return None;
+                }
+            },
+            // Not "no record": that would serve punched bytes as the block.
             Err(e) => {
                 self.report_corrupt_block_data(
                     hash,
                     &entry,
                     &pos,
-                    &format!("record does not deserialize ({} bytes on disk): {e}", data.len()),
+                    &format!("strip record could not be read: {e}"),
                 );
                 return None;
             }
         };
-        // Verify the record we landed on is the block we asked for.
-        //
-        // The recorded offset can describe the wrong record — that is the
-        // whole failure class the flat-file durability work addresses, and a
-        // mis-recorded offset lands on another record's *start*, not on
-        // garbage, so deserialization succeeds and returns a different block
-        // under the requested hash. Without this check `getblock` serves the
-        // wrong block, `block_data_readable` reports a broken entry as
-        // healthy, and `getblockfrompeer` refuses to repair it.
-        if block.block_hash() != *hash {
-            self.report_corrupt_block_data(
-                hash,
-                &entry,
-                &pos,
-                &format!(
-                    "record holds a different block ({}); the entry points at the wrong offset",
-                    block.block_hash()
-                ),
-            );
-            return None;
+        let on_disk = data.len();
+        match StoredBlock::from_bytes(data, record, hash) {
+            // A lost record leaves the punched bytes looking intact, and
+            // nothing above checks their txids: only the header hash. So a
+            // block with no record but an OP_RETURN payload shaped like a
+            // punch (zeros, read through the xor key) must still reproduce
+            // its merkle root. A genuine payload of that shape does; punched
+            // bytes do not. Only such blocks pay for the check.
+            Ok(stored)
+                if !stored.is_stripped()
+                    && opreturn_strip::has_punched_op_return(&stored.block, &xor_key)
+                    && !stored.verify_merkle() =>
+            {
+                // A repair can drop the record between this reader's byte
+                // read and its record lookup: by pointing the entry at a
+                // fresh copy in the same batch, or by restoring the block in
+                // place and only then removing the record. Either way the
+                // reader holds the old, punched bytes and no record, on a
+                // store that is consistent. Read again: the second read
+                // finds the fresh copy, the restored bytes, or the same
+                // missing record, which is then real.
+                if may_retry {
+                    return self.read_stored_block(hash, false);
+                }
+                self.report_corrupt_block_data(
+                    hash,
+                    &entry,
+                    &pos,
+                    "an OP_RETURN payload reads as punched, no strip record names it, and the \
+                     txids miss the merkle root (a lost strip record?)",
+                );
+                None
+            }
+            Ok(stored) => Some(stored),
+            Err(e) => {
+                let detail = match e {
+                    StoredBlockError::Deserialize(e) => {
+                        format!("record does not deserialize ({on_disk} bytes on disk): {e}")
+                    }
+                    // The recorded offset can describe the wrong record —
+                    // that is the whole failure class the flat-file
+                    // durability work addresses, and a mis-recorded offset
+                    // lands on another record's *start*, not on garbage, so
+                    // deserialization succeeds and returns a different block
+                    // under the requested hash. Without this check
+                    // `getblock` serves the wrong block,
+                    // `block_data_readable` reports a broken entry as
+                    // healthy, and `getblockfrompeer` refuses to repair it.
+                    StoredBlockError::WrongHash { got, .. } => format!(
+                        "record holds a different block ({got}); the entry points at the wrong offset"
+                    ),
+                    // The record does not fit the bytes it was found with:
+                    // spans that are not OP_RETURN outputs of the recorded
+                    // sizes, a filled form that hashes wrong, or txids that
+                    // miss the header's merkle root.
+                    e => format!("strip record does not match the stored bytes: {e}"),
+                };
+                self.report_corrupt_block_data(hash, &entry, &pos, &detail);
+                None
+            }
         }
-        Some(block)
+    }
+
+    /// The block, only if it is stored intact.
+    ///
+    /// A stripped block is `None`, and that is not corruption, so no warning
+    /// is raised for it: stripping is a choice the operator made. Callers that
+    /// can serve a stripped block use [`Self::get_stored_block`]; every other
+    /// caller sees "unavailable", never a block whose recomputed txids are
+    /// wrong.
+    pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
+        self.get_stored_block(hash).and_then(StoredBlock::into_intact)
     }
 
     /// Report a live `block_index` entry whose block data is unusable.
@@ -4806,7 +5116,59 @@ impl ChainState {
 
     /// Read a block from flat files without acquiring the flat_files mutex.
     /// Safe because read_block() opens a fresh file handle each time.
+    ///
+    /// Unaware of strip records, as IBD needs: a stripped block reads as its
+    /// zeroed bytes. Replays read through [`Self::read_stored_block_direct`].
     fn read_block_direct(&self, pos: &FlatFilePos) -> Option<Block> {
+        let data = self.read_block_bytes_direct(pos)?;
+        match bitcoin::consensus::deserialize(&data) {
+            Ok(block) => Some(block),
+            Err(e) => {
+                tracing::warn!(
+                    file_number = pos.file_number,
+                    pos = pos.data_pos,
+                    size = data.len(),
+                    "read_block_direct: deserialize failed: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// [`Self::read_block_direct`] for a replay: the block `hash` as stored,
+    /// with its strip record applied if it has one, so a stripped block
+    /// comes back in its filled form with its recorded txids.
+    ///
+    /// `Ok(None)` is bytes that could not be read (already logged). A block
+    /// with no record decodes exactly as `read_block_direct` decodes it, and
+    /// whether it is the block `hash` names is left to the caller's
+    /// `require_planned_block`, as before.
+    fn read_stored_block_direct(
+        &self,
+        pos: &FlatFilePos,
+        hash: &BlockHash,
+    ) -> Result<Option<StoredBlock>, opreturn_strip::ReplayReadError> {
+        let Some(data) = self.read_block_bytes_direct(pos) else {
+            return Ok(None);
+        };
+        match opreturn_strip::decode_for_replay(&*self.store, data, hash, &self.blocks_xor_key) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(opreturn_strip::ReplayReadError::Deserialize(e)) => {
+                tracing::warn!(
+                    file_number = pos.file_number,
+                    pos = pos.data_pos,
+                    "read_stored_block_direct: deserialize failed: {}",
+                    e
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The raw bytes of the block record at `pos`, xor-decoded.
+    fn read_block_bytes_direct(&self, pos: &FlatFilePos) -> Option<Vec<u8>> {
         let path = self.blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
@@ -4837,13 +5199,7 @@ impl ChainState {
             return None;
         }
         crate::storage::flatfile::xor_in_place(&mut data, &self.blocks_xor_key, pos.data_pos as u64 + 8);
-        match bitcoin::consensus::deserialize(&data) {
-            Ok(block) => Some(block),
-            Err(e) => {
-                tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: deserialize failed: {}", e);
-                None
-            }
-        }
+        Some(data)
     }
 
     /// Core's `CheckTransaction` for every transaction, and the finality and
@@ -4955,6 +5311,13 @@ impl ChainState {
             self.network,
             |h| store_ref.get_block_index(h),
         )?;
+
+        // A block that arrives without its header accepted first is held to
+        // the header rule `AcceptBlockHeader` would have applied to it; one
+        // whose header is in the index passed it then.
+        if self.store.get_block_index(&block_hash).is_none() {
+            Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
+        }
 
         // Time and version (Core's `ContextualCheckBlockHeader`). A block
         // whose header was accepted has passed these already; one stored
@@ -5068,7 +5431,15 @@ impl ChainState {
             {
                 batch.height_hash_puts.push((new_height, block_hash));
             }
+            // The entry now points at a fresh full copy, which supersedes
+            // any strip record left from an earlier copy (one a `-reindex`
+            // could not find, say).
+            batch.opreturn_strip_removes.push(block_hash);
+            let had_record = self.holds_strip_record(&block_hash);
             self.write_chain_batch(batch)?;
+            if had_record {
+                self.forget_strip_summary();
+            }
             // Core's `ReceivedBlockTransactions`, called under the same lock
             // that made the data durable: this block's arrival order is now
             // fixed, and so is that of any descendant it just unblocked.
@@ -5217,6 +5588,24 @@ impl ChainState {
             return Ok(BlockDataRepair::AlreadyPresent { height });
         }
 
+        // An OP_RETURN-stripped copy is restored in place when the peer's
+        // block is the one its strip record describes (plan §2.12): no second
+        // copy, no new slack.
+        if let Some(restored) = self.restore_stripped_in_place(block, height)? {
+            return Ok(restored);
+        }
+        self.repair_block_data_by_append(block, height)
+    }
+
+    /// The general half of [`Self::repair_block_data`], once `block` has
+    /// passed its checks at `height`: append a fresh copy and point the entry
+    /// at it.
+    pub(super) fn repair_block_data_by_append(
+        &self,
+        block: &Block,
+        height: u32,
+    ) -> Result<BlockDataRepair, ChainError> {
+        let hash = block.block_hash();
         // Append the record BEFORE taking `accept_lock`. `write_block_durable`
         // takes the flat-file mutex, and `store_block` holds `accept_lock`
         // while writing its batch *after* releasing that mutex — acquiring
@@ -5270,7 +5659,14 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, repaired));
+        // The entry now points at the appended full copy; a strip record of
+        // the old one no longer describes it.
+        batch.opreturn_strip_removes.push(hash);
+        let had_record = self.holds_strip_record(&hash);
         self.write_chain_batch(batch)?;
+        if had_record {
+            self.forget_strip_summary();
+        }
         // Readable data where there was none can unblock a reorg that failed
         // on it, so `activate_best_stored_chain` should look again.
         self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
@@ -5481,6 +5877,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6040,17 +6437,20 @@ impl ChainState {
                 file_number: entry.file_number,
                 data_pos: entry.data_pos,
             };
-            let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
-                tracing::error!(
-                    height = h,
-                    block = %hash,
-                    file_number = flat_pos.file_number,
-                    data_pos = flat_pos.data_pos,
-                    "reindex: cannot read a block in the MTP window from the flat files"
-                );
-                ChainError::FlatFile("cannot read MTP-window block during reindex".into())
-            })?;
-            self.require_planned_block(h, hash, &block, &entry.header, flat_pos)?;
+            let stored = self
+                .read_stored_block_direct(&flat_pos, &hash)
+                .map_err(|e| unreplayable_record(h, &hash, &e))?
+                .ok_or_else(|| {
+                    tracing::error!(
+                        height = h,
+                        block = %hash,
+                        file_number = flat_pos.file_number,
+                        data_pos = flat_pos.data_pos,
+                        "reindex: cannot read a block in the MTP window from the flat files"
+                    );
+                    ChainError::FlatFile("cannot read MTP-window block during reindex".into())
+                })?;
+            self.require_planned_block(h, hash, &stored.block, &entry.header, flat_pos)?;
         }
         Ok(())
     }
@@ -6082,7 +6482,13 @@ impl ChainState {
         self.require_extends_tip(&pre.block.header, pre.height)?;
         // Normally already done by the prefetch worker, off this thread.
         if !pre.context_free_checked {
-            validation::block::check_block(&pre.block, self.network, pre.height)?;
+            validation::block::check_block_with_hashes(
+                &pre.block,
+                &pre.txids,
+                pre.wtxids.as_deref(),
+                self.network,
+                pre.height,
+            )?;
         }
         // Core's `ConnectBlock` re-runs `CheckBlock`, signet solution
         // included, on every block it connects from disk. So a chainstate
@@ -6098,6 +6504,7 @@ impl ChainState {
         } else {
             Some(&pre.script_verified_txs)
         };
+        let script_skip = (!pre.script_skip_txs.is_empty()).then_some(&pre.script_skip_txs);
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: Some(plan),
             store: &*self.store,
@@ -6111,6 +6518,7 @@ impl ChainState {
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
+            script_skip_txs: script_skip,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6144,16 +6552,21 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
-            tracing::error!(
-                height,
-                block = %hash,
-                file_number = flat_pos.file_number,
-                data_pos = flat_pos.data_pos,
-                "reindex: cannot read block from the flat files"
-            );
-            ChainError::FlatFile("cannot read block during reindex".into())
-        })?;
+        let stored = self
+            .read_stored_block_direct(&flat_pos, &hash)
+            .map_err(|e| unreplayable_record(height, &hash, &e))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    height,
+                    block = %hash,
+                    file_number = flat_pos.file_number,
+                    data_pos = flat_pos.data_pos,
+                    "reindex: cannot read block from the flat files"
+                );
+                ChainError::FlatFile("cannot read block during reindex".into())
+            })?;
+        let replay = ReplayHashes::of(&stored);
+        let block = &stored.block;
         // Validate the record BEFORE anything reads a header, then work from
         // `block.header` alone. The indexed header was the sole input to the
         // extends-tip guard and the parent lookup, and it is not trustworthy
@@ -6165,16 +6578,16 @@ impl ChainState {
         // `connect_block` received a differently-parented block, and the
         // cumulative chainwork would be measured from whatever entry that
         // forged link named.
-        self.require_planned_block(height, hash, &block, &entry.header, flat_pos)?;
+        self.require_planned_block(height, hash, block, &entry.header, flat_pos)?;
         self.require_extends_tip(&block.header, height)?;
         // The flat-file record framing carries no checksum, so a bit flipped
         // inside a transaction payload survives every check above: the 80-byte
         // header still hashes to the planned block. Only re-deriving the block
         // from its own bytes catches it (issue #505).
-        validation::block::check_block(&block, self.network, height)?;
+        replay.check_block(block, self.network, height)?;
         // As on the prefetched path: Core verifies a signet solution on every
         // connect from disk.
-        self.check_signet_solution(&block)?;
+        self.check_signet_solution(block)?;
         let parent = self
             .store
             .get_block_index(&block.header.prev_blockhash)
@@ -6200,7 +6613,7 @@ impl ChainState {
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: Some(plan),
             store: &*self.store,
-            block: &block,
+            block,
             height,
             parent_chainwork: &parent.chainwork,
             flat_pos,
@@ -6209,7 +6622,8 @@ impl ChainState {
             network: self.network,
             pre_verified_txs: None,
             num_threads: self.num_threads,
-            precomputed_txids: None,
+            precomputed_txids: replay.txids(),
+            script_skip_txs: replay.script_skip_txs(),
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -6828,11 +7242,21 @@ impl ChainState {
             let height = parent.height + 1;
 
             // Re-read the raw block from disk; we only kept the header during
-            // phase 1.
-            let Some(block) = self.read_block_direct(&entry.pos) else {
-                halted = Some((hash, height, "block data unreadable on disk".to_string()));
-                break;
+            // phase 1. A stripped block comes back in its filled form, with
+            // the txids its strip record holds.
+            let stored = match self.read_stored_block_direct(&entry.pos, &hash) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    halted = Some((hash, height, "block data unreadable on disk".to_string()));
+                    break;
+                }
+                Err(e) => {
+                    halted = Some((hash, height, e.to_string()));
+                    break;
+                }
             };
+            let replay = ReplayHashes::of(&stored);
+            let block = &stored.block;
             // `plan_reindex_chain` builds the path by walking parent pointers,
             // so this holds by construction — which is exactly why it is worth
             // asserting: it is the guard that keeps a future change to the
@@ -6843,13 +7267,13 @@ impl ChainState {
             // carries no checksum, and the scan read only the header and
             // checked that the length fits the file; this is what validates
             // the payload (issue #505).
-            if let Err(e) = validation::block::check_block(&block, self.network, height) {
+            if let Err(e) = replay.check_block(block, self.network, height) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
             }
             // Core's `-reindex` runs `CheckBlock` on every block it loads, so
             // a signet solution is verified here as on every other path.
-            if let Err(e) = self.check_signet_solution(&block) {
+            if let Err(e) = self.check_signet_solution(block) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
             }
@@ -6863,7 +7287,7 @@ impl ChainState {
             let batch = match connect::connect_block(&connect::ConnectParams {
                 replay_plan: None,
                 store: &*self.store,
-                block: &block,
+                block,
                 height,
                 parent_chainwork: &parent.chainwork,
                 flat_pos: entry.pos,
@@ -6872,7 +7296,8 @@ impl ChainState {
                 network: self.network,
                 pre_verified_txs: None,
                 num_threads: self.num_threads,
-                precomputed_txids: None,
+                precomputed_txids: replay.txids(),
+                script_skip_txs: replay.script_skip_txs(),
                 address_index: &self.address_index,
                 sp_index: &self.sp_index,
                 #[cfg(feature = "block-filter-index")]
@@ -7230,15 +7655,30 @@ impl ChainState {
             // `num_tx` is not derivable from the 80-byte header phase 1 kept,
             // so read the block back. Side-chain blocks are a handful even on a
             // long-lived mainnet node, so this stays cheap.
-            let Some(block) = self.read_block_direct(&entry.pos) else {
-                tracing::warn!(
-                    block = %hash,
-                    height,
-                    "reindex: side-chain block unreadable from flat file; not indexing"
-                );
-                skipped += 1;
-                continue;
+            let stored = match self.read_stored_block_direct(&entry.pos, hash) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    tracing::warn!(
+                        block = %hash,
+                        height,
+                        "reindex: side-chain block unreadable from flat file; not indexing"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block = %hash,
+                        height,
+                        error = %e,
+                        "reindex: side-chain block's strip record does not verify; not indexing"
+                    );
+                    skipped += 1;
+                    continue;
+                }
             };
+            let replay = ReplayHashes::of(&stored);
+            let block = &stored.block;
             if block.block_hash() != *hash || block.header != entry.header {
                 tracing::warn!(
                     block = %hash,
@@ -7251,7 +7691,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = validation::block::check_block(&block, self.network, *height) {
+            if let Err(e) = replay.check_block(block, self.network, *height) {
                 tracing::warn!(
                     block = %hash,
                     height,
@@ -7261,7 +7701,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = self.check_signet_solution(&block) {
+            if let Err(e) = self.check_signet_solution(block) {
                 tracing::warn!(
                     block = %hash,
                     height,
@@ -7464,6 +7904,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &no_address_index,
             sp_index: &no_sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -7588,6 +8029,13 @@ impl ChainState {
             |h| store_ref.get_block_index(h),
         )?;
 
+        // A block that arrives without its header accepted first is held to
+        // the header rule `AcceptBlockHeader` would have applied to it; one
+        // whose header is in the index passed it then.
+        if self.store.get_block_index(&block_hash).is_none() {
+            Self::check_fork_after_checkpoint(new_height, self.last_checkpoint_in_index())?;
+        }
+
         // Timestamp check (median time past). The MTP ancestor walk follows the
         // candidate block's own parent pointers (not the active-chain height
         // index), so a block on a competing branch is judged against its own
@@ -7707,13 +8155,19 @@ impl ChainState {
             // above the tip follow the new best header.
             let mut batch = crate::storage::StoreBatch::default();
             batch.block_index_puts.push((block_hash, entry.clone()));
+            // A fresh full copy supersedes any strip record (see
+            // `commit_block_store`).
+            batch.opreturn_strip_removes.push(block_hash);
+            let had_record = self.holds_strip_record(&block_hash);
             let batch_index = std::collections::HashMap::from([(block_hash, entry.clone())]);
             self.commit_accepted_headers_locked(
                 batch,
                 &batch_index,
                 Some((block_hash, new_chainwork)),
-                new_height,
             )?;
+            if had_record {
+                self.forget_strip_summary();
+            }
             // Core's `ReceivedBlockTransactions`: fix this block's place in
             // the arrival order before anything can consult the tie-break.
             let newly_connectable = self.note_block_data_arrived(block_hash, &entry);
@@ -7782,7 +8236,7 @@ impl ChainState {
                 // As at the end of the connect below: a block that arrived
                 // without its header announced first (`submitblock`) must not
                 // leave the tip out-working the best header.
-                self.update_best_header(target.header.block_hash(), target.chainwork);
+                self.update_best_header(target.header.block_hash(), target.chainwork, target.height);
                 return Ok(
                     if self.active_chain_hash_at_height(new_height) == Some(block_hash) {
                         BlockAcceptance::Connected(block_hash)
@@ -7900,11 +8354,9 @@ impl ChainState {
                         ChainError::FlatFile("block index entry missing for reorg connect".into())
                     })?;
                     side_failed_at = Some((*side_hash, side_entry.height));
-                    let side_block = self
-                        .get_block(side_hash)
-                        .ok_or(ChainError::FlatFile(
-                            "block data missing for reorg connect".to_string(),
-                        ))?;
+                    let side_block = self.get_block(side_hash).ok_or_else(|| {
+                        self.reorg_read_error(side_hash, side_entry.height, "block data missing for reorg connect")
+                    })?;
                     let parent_entry = self
                         .store
                         .get_block_index(&side_entry.header.prev_blockhash)
@@ -7948,6 +8400,7 @@ impl ChainState {
                         pre_verified_txs: None,
                         num_threads: 1,
                         precomputed_txids: None,
+                        script_skip_txs: None,
                         address_index: &self.address_index,
                         sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -8110,6 +8563,7 @@ impl ChainState {
             pre_verified_txs: None,
             num_threads: self.num_threads,
             precomputed_txids: None,
+            script_skip_txs: None,
             address_index: &self.address_index,
             sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
@@ -8151,6 +8605,11 @@ impl ChainState {
             }
         };
 
+        // The connect points the entry at the copy written above, which
+        // supersedes any strip record (see `commit_block_store`).
+        let mut batch = batch;
+        batch.opreturn_strip_removes.push(block_hash);
+        let had_record = self.holds_strip_record(&block_hash);
         let _chain_mutation = self.begin_chain_mutation();
         if let Err(e) = self.write_chain_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
@@ -8167,6 +8626,9 @@ impl ChainState {
                 );
             }
             return Err(e.into());
+        }
+        if had_record {
+            self.forget_strip_summary();
         }
 
         // Update in-memory tip
@@ -8363,7 +8825,7 @@ impl ChainState {
         // `accept_header`, so without this the pointer would lag the tip after
         // mining and `missing_blocks_for_best_header_chain` would compare
         // against a stale work value.
-        self.update_best_header(block_hash, new_chainwork);
+        self.update_best_header(block_hash, new_chainwork, new_height);
 
         Ok(BlockAcceptance::Connected(block_hash))
     }
@@ -8553,8 +9015,9 @@ impl ChainState {
             let entry = self.store.get_block_index(&current)
                 .ok_or(ChainError::BadPrevBlock)?;
 
-            let block = self.get_block(&current)
-                .ok_or(ChainError::FlatFile("block data missing for reorg".to_string()))?;
+            let block = self.get_block(&current).ok_or_else(|| {
+                self.reorg_read_error(&current, entry.height, "block data missing for reorg")
+            })?;
 
             let undo = self.store.get_undo(&current)
                 .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
@@ -8650,6 +9113,24 @@ impl ChainState {
             disconnected_txs,
         })
     }
+    /// Whether `hash` has an OP_RETURN strip record, for choosing an error
+    /// message. A record that cannot be read counts as none: the read that
+    /// failed already failed closed.
+    fn has_strip_record(&self, hash: &BlockHash) -> bool {
+        matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
+    }
+
+    /// The error for a reorg path that could not read block `hash`: the
+    /// stripped-data message when the block is OP_RETURN-stripped, which
+    /// `get_block` reads as unavailable, and `generic` otherwise.
+    fn reorg_read_error(&self, hash: &BlockHash, height: u32, generic: &str) -> ChainError {
+        if self.has_strip_record(hash) {
+            ChainError::FlatFile(stripped_block_message_for(self, hash, height))
+        } else {
+            ChainError::FlatFile(generic.to_string())
+        }
+    }
+
     // --- invalidateblock / reconsiderblock (Bitcoin Core parity) ----------
 
     /// Mark `hash` (and every data-carrying descendant) invalid, then
@@ -8667,6 +9148,12 @@ impl ChainState {
     /// Returns [`ChainError::BlockNotFound`] for an unknown hash and
     /// [`ChainError::InvalidArgument`] when asked to invalidate genesis.
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        // The strip lock first, in its order (before `accept_lock`): a strip
+        // commits its record before it takes `accept_lock`, so without it a
+        // record could land between the stripped-block check below and the
+        // invalid marks, and the marks would stand over a rollback that then
+        // fails on that block.
+        let _strip_guard = self.strip.lock.lock();
         let _accept_guard = self.accept_lock.lock();
         self.check_no_snapshot_load()?;
 
@@ -8695,6 +9182,26 @@ impl ChainState {
                 "cannot invalidate a block at or below the AssumeUTXO snapshot height ({})",
                 bg.snapshot_height()
             )));
+        }
+
+        // Refuse before marking anything when the rollback would have to
+        // disconnect an OP_RETURN-stripped block: disconnect cannot run on one
+        // (its bytes are the filled form), and marking first would leave the
+        // branch invalid with the tip still on it.
+        if self.active_chain_contains(&hash, entry.height) {
+            let (mut cursor, _) = self.tip_snapshot();
+            loop {
+                let e = self.store.get_block_index(&cursor).ok_or(ChainError::BadPrevBlock)?;
+                if e.height < entry.height {
+                    break;
+                }
+                // A record that cannot be read refuses too: the marks would
+                // otherwise land before the disconnect hit the same fault.
+                if self.store.get_opreturn_strip(&cursor)?.is_some() {
+                    return Err(ChainError::InvalidArgument(stripped_block_message_for(self, &cursor, e.height)));
+                }
+                cursor = e.header.prev_blockhash;
+            }
         }
 
         // Flush block-index writes still buffered in the coin cache to the
@@ -9816,9 +10323,9 @@ impl ChainState {
                     ChainError::FlatFile("block index entry missing for reorg connect".into())
                 })?;
                 reconnect_failed_at = Some((*h, e.height));
-                let block = self.get_block(h).ok_or(ChainError::FlatFile(
-                    "block data missing for reorg connect".to_string(),
-                ))?;
+                let block = self.get_block(h).ok_or_else(|| {
+                    self.reorg_read_error(h, e.height, "block data missing for reorg connect")
+                })?;
                 let parent_entry = self
                     .store
                     .get_block_index(&e.header.prev_blockhash)
@@ -9850,6 +10357,7 @@ impl ChainState {
                     pre_verified_txs: None,
                     num_threads: 1,
                     precomputed_txids: None,
+                    script_skip_txs: None,
                     address_index: &self.address_index,
                     sp_index: &self.sp_index,
                     #[cfg(feature = "block-filter-index")]
@@ -10100,6 +10608,7 @@ impl ChainState {
         }
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
+        let mut removes_a_record = false;
         // The files that can hold a record the scan missed (see the plan
         // above). A `repair_block_data` writes a block below the cut into the
         // file being appended to and then repoints its entry there, out of
@@ -10166,16 +10675,21 @@ impl ChainState {
                 }
                 tracing::debug!(file = file_num, height = entry.height, "Block data pruned");
                 batch.block_index_puts.push((*hash, entry));
+                // The bytes a strip record describes are gone with the file.
+                removes_a_record |= self.holds_strip_record(hash);
+                batch.opreturn_strip_removes.push(*hash);
             }
             deleted += 1;
             tracing::info!(file = file_num, "Deleted block file");
         }
         drop(flat_files);
 
-        if !batch.block_index_puts.is_empty()
-            && let Err(e) = self.write_chain_batch(batch)
-        {
-            tracing::error!("Failed to update block index after pruning: {}", e);
+        if !batch.block_index_puts.is_empty() {
+            match self.write_chain_batch(batch) {
+                Ok(()) if removes_a_record => self.forget_strip_summary(),
+                Ok(()) => {}
+                Err(e) => tracing::error!("Failed to update block index after pruning: {}", e),
+            }
         }
 
         // Record the new floor for `getblockchaininfo`'s `pruneheight`.
@@ -10282,6 +10796,15 @@ mod ctxcheck_tests;
 #[path = "state_assumevalid_tests.rs"]
 mod assumevalid_tests;
 
+#[cfg(test)]
+#[path = "state_ckptfork_tests.rs"]
+mod ckptfork_tests;
+
+// Unix only: the tests overwrite block files in place with `FileExt`.
+#[cfg(all(test, unix))]
+#[path = "state_opreturn_strip_tests.rs"]
+mod opreturn_strip_tests;
+
 /// Read-side surface for the silent-payment tweak index (the
 /// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
 /// and the D4 rescan fast path). Backed by the same durable rows the connect
@@ -10351,6 +10874,110 @@ struct ReindexPlan {
     /// Genesis-reachable blocks off that branch, as `(hash, height,
     /// chainwork-relative-to-genesis)`. Indexed but never connected.
     side: Vec<(BlockHash, u32, [u8; 32])>,
+}
+
+/// The hashes a replay gives `check_block` and `connect_block` for one
+/// block read through `read_stored_block_direct`.
+///
+/// An intact block gets none: `check_block` and `connect_block` compute them
+/// from the block, exactly as before. A stripped block gets its recorded
+/// txids and wtxids, and the indices of its stripped transactions, whose
+/// scripts `connect_block` skips.
+struct ReplayHashes {
+    stripped: Option<StrippedHashes>,
+}
+
+struct StrippedHashes {
+    txids: Vec<bitcoin::Txid>,
+    wtxids: Vec<bitcoin::Wtxid>,
+    script_skip_txs: std::collections::HashSet<usize>,
+}
+
+impl ReplayHashes {
+    fn of(stored: &StoredBlock) -> Self {
+        let stripped = stored.is_stripped().then(|| StrippedHashes {
+            txids: stored.txids(),
+            wtxids: stored.wtxids(),
+            script_skip_txs: stored.stripped_tx_indices(),
+        });
+        Self { stripped }
+    }
+
+    fn check_block(
+        &self,
+        block: &Block,
+        network: Network,
+        height: u32,
+    ) -> Result<(), crate::validation::ValidationError> {
+        match &self.stripped {
+            Some(s) => validation::block::check_block_with_hashes(
+                block,
+                &s.txids,
+                Some(&s.wtxids),
+                network,
+                height,
+            ),
+            None => validation::block::check_block(block, network, height),
+        }
+    }
+
+    fn txids(&self) -> Option<&[bitcoin::Txid]> {
+        self.stripped.as_ref().map(|s| s.txids.as_slice())
+    }
+
+    fn script_skip_txs(&self) -> Option<&std::collections::HashSet<usize>> {
+        self.stripped.as_ref().map(|s| &s.script_skip_txs)
+    }
+}
+
+/// The error a replay stops with on a block whose strip record does not
+/// verify. It never connects such a block: without the record its txids are
+/// unknown.
+/// Why a reorg or `invalidateblock` cannot go through block `hash`: it is
+/// OP_RETURN-stripped, and disconnecting or reconnecting a block needs its
+/// full data (plan §2.10).
+fn stripped_block_message(hash: &BlockHash, height: u32) -> String {
+    format!(
+        "block {hash} at height {height} has stripped OP_RETURN data; a reorg that \
+         disconnects or reconnects it is not possible without re-downloading it \
+         (getblockfrompeer)"
+    )
+}
+
+/// [`stripped_block_message`], naming the depth when `-pruneopreturn` is on:
+/// a reorg deeper than it cannot go through without the full blocks.
+fn stripped_block_message_for(chain: &ChainState, hash: &BlockHash, height: u32) -> String {
+    match chain.opreturn_prune_config() {
+        Some(c) => format!(
+            "block {hash} at height {height} has stripped OP_RETURN data; a reorg deeper than \
+             -pruneopreturn={} blocks is not possible without re-downloading it \
+             (getblockfrompeer)",
+            c.depth
+        ),
+        None => stripped_block_message(hash, height),
+    }
+}
+
+fn unreplayable_record(
+    height: u32,
+    hash: &BlockHash,
+    e: &opreturn_strip::ReplayReadError,
+) -> ChainError {
+    tracing::error!(
+        height,
+        block = %hash,
+        error = %e,
+        "reindex: cannot replay a block whose OP_RETURN data is stripped"
+    );
+    // `getblockfrompeer` needs a running node, which a failed
+    // `-reindex-chainstate` leaves behind it: its rebuild marker refuses a
+    // plain start. `-reindex` stops at this block instead, and the node then
+    // fetches it again from peers; a fresh copy supersedes the record.
+    ChainError::FlatFile(format!(
+        "block {hash} at height {height}: {e}. Restart with -reindex, which stops at \
+         this block and fetches it again from peers, or restore it with getblockfrompeer \
+         on a running node"
+    ))
 }
 
 /// Compare two big-endian U256 values. Returns -1, 0, or 1.
@@ -10773,6 +11400,66 @@ pub(crate) mod tests {
             COHERENT_READ_ATTEMPTS as u32,
             "every attempt should have been spent before giving up"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `begin_view` / `view_change` are `coherent_read` split in two: no view
+    /// while a mutation is open, and a view taken before a mutation is no
+    /// longer `Unchanged` once one has run, even one that left the tip where
+    /// it was.
+    #[test]
+    fn a_view_is_refused_mid_mutation_and_changed_after_one() {
+        let (cs, dir) = make_chain_state();
+
+        let view = cs.begin_view().expect("a settled chainstate gives a view");
+        assert_eq!((view.tip_hash, view.tip_height), cs.tip_snapshot());
+        assert_eq!(cs.view_change(&view), ViewChange::Unchanged);
+
+        let guard = cs.begin_chain_mutation();
+        assert!(cs.begin_view().is_none(), "no view while a mutation is open");
+        assert_eq!(cs.view_change(&view), ViewChange::InFlight);
+        drop(guard);
+
+        assert_eq!(
+            cs.view_change(&view),
+            ViewChange::Extended,
+            "a mutation that moved no tip leaves the view's heights as they were"
+        );
+        let after = cs.begin_view().expect("settled again");
+        assert_eq!(cs.view_change(&after), ViewChange::Unchanged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blocks connected on the view's tip are an extension; a disconnect, or a
+    /// reorg that comes back to a tip of the same height, is a retreat.
+    #[test]
+    fn connects_extend_a_view_and_disconnects_retreat_it() {
+        let (cs, dir) = make_chain_state();
+        let genesis = cs.tip_hash();
+        let a1 = build_test_block(genesis, 1, 1_708_000_600);
+        cs.accept_block(&a1).unwrap();
+
+        let view = cs.begin_view().unwrap();
+        let a2 = build_test_block(a1.block_hash(), 2, 1_708_001_200);
+        cs.accept_block(&a2).unwrap();
+        let a3 = build_test_block(a2.block_hash(), 3, 1_708_001_800);
+        cs.accept_block(&a3).unwrap();
+        assert_eq!(cs.view_change(&view), ViewChange::Extended);
+
+        // Replace a1..a3 with a longer branch from genesis: a reorg below the
+        // view's tip.
+        let at_three = cs.begin_view().unwrap();
+        let mut parent = genesis;
+        for h in 1..=4 {
+            let b = build_test_block(parent, h, 1_708_000_601 + 600 * (h - 1));
+            cs.accept_block(&b).unwrap();
+            parent = b.block_hash();
+        }
+        assert_eq!(cs.tip_snapshot(), (parent, 4), "the longer branch won");
+        assert_eq!(cs.view_change(&at_three), ViewChange::Retreated);
+        assert_eq!(cs.view_change(&view), ViewChange::Retreated);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11641,6 +12328,84 @@ pub(crate) mod tests {
         );
         assert!(puts.is_empty());
         assert_eq!(removes, vec![6, 5]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1119: the header tip is the best header's height, not the highest
+    /// header stored. A taller chain with less work is stored (there is no
+    /// presync yet) but leaves the tip alone; a shorter chain with more work
+    /// takes the tip down to its own height, as Core's
+    /// `m_best_header->nHeight` does.
+    ///
+    /// Fails with the height high-water mark: the tip read 10 after the
+    /// low-work headers, and stayed there after the heavier switch.
+    #[test]
+    fn the_header_tip_is_the_most_work_header_not_the_highest() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        cs.scale_active_chain_work_for_test(100);
+        cs.refresh_best_header_to_tip();
+        assert_eq!(cs.best_header_hash(), tip);
+        assert_eq!(cs.headers_tip_height(), 3);
+
+        // Ten headers from genesis: taller than the tip, far less work.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut parent = genesis;
+        let fork: Vec<bitcoin::block::Header> = (1..=10)
+            .map(|h| {
+                let b = build_test_block(parent, h, 1_400_000_000 + h);
+                parent = b.block_hash();
+                b.header
+            })
+            .collect();
+        let (accepted, err) = cs.accept_headers(&fork);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(accepted, 10);
+        assert!(cs.get_block_index(&parent).is_some(), "stored: no work threshold in this PR");
+        assert_eq!(cs.best_header_hash(), tip);
+        assert_eq!(cs.headers_tip_height(), 3, "a low-work header chain raised the header tip");
+
+        // One header on the reweighted tip out-works the fork.
+        let b4 = build_test_block(tip, 4, 1_500_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        assert_eq!(cs.best_header_hash(), b4.block_hash());
+        assert_eq!(cs.headers_tip_height(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: a header tip on a taller chain follows the best
+    /// header down when a shorter chain overtakes it in work.
+    ///
+    /// Fails with the height high-water mark: the tip stayed at 8.
+    #[test]
+    fn a_heavier_but_shorter_header_chain_lowers_the_header_tip() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        let mut parent = tip;
+        let tall: Vec<bitcoin::block::Header> = (4..=8)
+            .map(|h| {
+                let b = build_test_block(parent, h, 1_400_000_000 + h);
+                parent = b.block_hash();
+                b.header
+            })
+            .collect();
+        let (accepted, err) = cs.accept_headers(&tall);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(accepted, 5);
+        assert_eq!(cs.headers_tip_height(), 8);
+
+        // Reweight the connected chain: anything built on its tip now
+        // out-works the five lighter headers above it.
+        cs.scale_active_chain_work_for_test(100);
+        let b4 = build_test_block(tip, 4, 1_500_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        assert_eq!(cs.best_header_hash(), b4.block_hash());
+        assert_eq!(cs.headers_tip_height(), 4, "the header tip stayed on the lighter, taller chain");
+        assert_eq!(cs.get_block_hash_by_height(5), None, "rows above the new best are dropped");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12654,6 +13419,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -12937,7 +13704,7 @@ pub(crate) mod tests {
     /// while the lock is held.
     /// Core's `InvalidateBlock` ends with `RecalculateBestHeader()`, and
     /// `ResetBlockFailureFlags` mirrors it. satd's header tip only ever moved
-    /// up — `best_header` takes the higher chainwork, `headers_tip_height` is
+    /// up — `best_header` took the higher chainwork, `headers_tip_height` was
     /// a `fetch_max` high-water mark — so after an `invalidateblock` it stayed
     /// on the branch that had just been refused, and `getblockchaininfo`
     /// reported a `headers` figure the node would never reach. It then grew
@@ -13677,6 +14444,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -14414,6 +15183,8 @@ pub(crate) mod tests {
             mtp: 0,
             txids: b3.txdata.iter().map(|t| t.compute_txid()).collect(),
             script_verified_txs: Default::default(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: true,
             entry,
             parent,
@@ -18786,6 +19557,8 @@ pub(crate) mod tests {
             mtp: cs.get_median_time_past(6),
             txids: Vec::new(),
             script_verified_txs: HashSet::new(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: false,
         };
 
@@ -20085,6 +20858,8 @@ pub(crate) mod tests {
             flat_pos,
             mtp: cs.get_median_time_past(1),
             script_verified_txs: std::collections::HashSet::new(),
+            wtxids: None,
+            script_skip_txs: Default::default(),
             context_free_checked: false,
         };
 

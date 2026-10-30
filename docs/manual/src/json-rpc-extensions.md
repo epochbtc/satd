@@ -176,11 +176,77 @@ reaches the node; for the streaming firehose with cursor replay, and the
 integrator guide to every silent-payment consumption mode, see
 [Silent Payments (BIP 352)](silent-payments.md).
 
+## OP_RETURN-pruned blocks
+
+On a node running with `pruneopreturn` (see
+[OP_RETURN data pruning](disk-footprint.md#opreturn-data-pruning)), old blocks
+can hold transactions whose large OP_RETURN payloads were stripped from disk.
+The RPCs read such a block through its strip record:
+
+*   `getblock` at verbosity 1 is unchanged, txids and sizes included, and adds
+    `"opreturn_stripped": {"transactions": k, "outputs": m, "bytes": b}` on a
+    stripped block. At verbosity 0 a stripped block is refused with Core's
+    `-1 Block not available (pruned data)`.
+*   A stripped transaction, in `getblock` 2 and 3 and verbose
+    `getrawtransaction`, has its real `txid` and `hash`, no `hex`, and
+    `"opreturn_stripped": true`. Each stripped output's `scriptPubKey` reads as
+    the bare `OP_RETURN` it keeps (`asm` `OP_RETURN`, `hex` `6a`, type
+    `nulldata`), plus `"stripped_size"`, the original length. Fees and
+    prevouts come from undo data and are unchanged.
+*   `getrawtransaction` hex, and `gettxspendingprevout`'s `spendingtx`, refuse
+    a stripped transaction with `-1 Transaction data not available (OP_RETURN
+    data stripped)`.
+*   `gettxoutproof`, `verifytxoutproof`, `getblockstats` and `verifychain` work
+    as on an intact block.
+*   A reorg or `invalidateblock` that would disconnect a stripped block fails
+    naming it; `invalidateblock` checks first and changes nothing (`-8`).
+*   `getblockfrompeer` restores a stripped block in place.
+
+`getopreturnpruneinfo` (no arguments) reports the feature:
+
+```json
+{
+  "enabled": true, "depth": 4320, "min_size": 4096,
+  "examined_below_height": 912345, "examine_target_height": 912345,
+  "blocks": 123, "transactions": 140, "outputs": 141,
+  "bytes_zeroed": 9876543, "bytes_freed_estimate": 9400000,
+  "peers": "limited", "worker": "running",
+  "filesystem_block_size": 4096, "probe": "ok",
+  "blocks_dir_apparent_bytes": 812345678901, "blocks_dir_allocated_bytes": 812336278901
+}
+```
+
+Under `restoreopreturns` the response also carries `restore`, the download's
+counts, and `worker` is one of `restoring`, `waiting_for_peers`,
+`waiting_for_disk`, `waiting_for_tip` or `restored`:
+
+```json
+"restore": {
+  "total_blocks": 123, "remaining_blocks": 40, "restored_blocks": 83,
+  "bytes_downloaded": 96000000, "remaining_bytes": 47000000,
+  "in_flight": 32, "peers": 2,
+  "progress_ratio": 0.675, "estimated_remaining_seconds": 240
+}
+```
+
+`progress_ratio` is over the current pass. `estimated_remaining_seconds` is
+`null` until the first block is restored, then the blocks left at the block
+rate so far: a rough guide, since block sizes change along the chain. Once
+the last block is restored, `restore` keeps the last pass's counts until the
+node finishes.
+
+`getblockchaininfo` carries the first nine of these, `worker` and `restore`
+under `opreturn_prune`, only on a node that strips or still holds stripped
+blocks.
+
 ## Node attestation (NAP)
 
 `createnapattestation`, `submitnapattestation`, `listnapattestations` and
 `removenapattestation` publish coin-weighted statements signed by holders,
-with `-nap=1`. They have a chapter of their own:
+with `-nap=1`, and `listnapaggregate` lists those collected from publishers,
+with `-napaggregator=1`. `getnapreport` reports the weight behind each value
+of each key in the collected set, and `replaynapsnapshot` the same for a
+snapshot that `exportnapsnapshot` wrote. They have a chapter of their own:
 [Node Attestation (NAP)](nap.md).
 
 ## BIP 322 message verification

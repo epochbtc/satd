@@ -40,6 +40,9 @@ pub trait SeedTarget: Send + Sync {
     fn full_outbound_count(&self) -> usize;
     /// Add a seed's address to the book, as a learned address.
     fn add_seed(&self, addr: &PeerAddr);
+    /// Queue an `addr-fetch` connection to a seed by name, for the proxy to
+    /// resolve: Core's `AddAddrFetch`.
+    fn add_addr_fetch(&self, host: &str, port: u16);
     /// Run the automatic dial pass over what was added.
     fn dial(&self);
 }
@@ -56,6 +59,9 @@ impl SeedTarget for std::sync::Arc<crate::net::manager::PeerManager> {
     }
     fn add_seed(&self, addr: &PeerAddr) {
         self.add_learned_peer_addr(addr);
+    }
+    fn add_addr_fetch(&self, host: &str, port: u16) {
+        crate::net::manager::PeerManager::add_addr_fetch(self, host.to_string(), port);
     }
     fn dial(&self) {
         self.dial_learned_peers();
@@ -89,6 +95,12 @@ impl SeedTimings {
 /// queries three seeds at a time with a wait between; satd queries them
 /// together.
 ///
+/// `fetch` is the seeds to reach by name through the proxy rather than
+/// resolve: with `-proxy` set, Core makes an `addr-fetch` connection to each
+/// DNS seed's host name, which the proxy resolves, instead of a local DNS
+/// query (`ThreadDNSAddressSeed`, `HaveNameProxy()`). They are queued at the
+/// point Core queries the seeds, and only then.
+///
 /// Returns the number of addresses the seeds gave, `None` if it did not
 /// query them.
 pub async fn dns_seed<T, F, Fut>(
@@ -96,6 +108,7 @@ pub async fn dns_seed<T, F, Fut>(
     force: bool,
     timings: SeedTimings,
     resolve: F,
+    fetch: Vec<(String, u16)>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<usize>
 where
@@ -131,6 +144,10 @@ where
         target.add_seed(&addr);
     }
     tracing::info!("{n} addresses found from DNS seeds");
+    for (host, port) in &fetch {
+        tracing::info!("Loading addresses from DNS seed {host}");
+        target.add_addr_fetch(host, *port);
+    }
     target.dial();
     Some(n)
 }
@@ -192,6 +209,7 @@ mod tests {
         stale: AtomicUsize,
         outbound: AtomicUsize,
         dials: AtomicUsize,
+        fetches: Mutex<Vec<(String, u16)>>,
     }
 
     impl SeedTarget for Book {
@@ -209,6 +227,9 @@ mod tests {
         }
         fn dial(&self) {
             self.dials.fetch_add(1, Ordering::Relaxed);
+        }
+        fn add_addr_fetch(&self, host: &str, port: u16) {
+            self.fetches.lock().unwrap().push((host.to_string(), port));
         }
     }
 
@@ -235,7 +256,7 @@ mod tests {
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&book, false, FAST, || async { vec![seed(1), seed(2)] }, running()).await;
+        let got = dns_seed(&book, false, FAST, || async { vec![seed(1), seed(2)] }, Vec::new(), running()).await;
         assert_eq!(got, Some(2));
         assert!(started.elapsed() >= FAST.dns_few_peers, "queried before the wait");
         assert_eq!(book.addrs.lock().unwrap().len(), 2);
@@ -247,7 +268,7 @@ mod tests {
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
         book.outbound.store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
-        let got = dns_seed(&book, false, FAST, || async { panic!("seeds queried with enough peers") }, running()).await;
+        let got = dns_seed(&book, false, FAST, || async { panic!("seeds queried with enough peers") }, Vec::new(), running()).await;
         assert_eq!(got, None);
     }
 
@@ -258,7 +279,7 @@ mod tests {
         let book = std::sync::Arc::new(Book::default());
         book.stale.store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&*book, false, FAST, || async { vec![seed(1)] }, running()).await;
+        let got = dns_seed(&*book, false, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await;
         assert_eq!(got, Some(1));
         assert!(started.elapsed() >= FAST.dns_many_peers);
 
@@ -270,7 +291,7 @@ mod tests {
             b.outbound.store(2, Ordering::Relaxed);
         });
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&*book, false, FAST, || async { panic!("seeds queried with enough peers") }, running()).await;
+        let got = dns_seed(&*book, false, FAST, || async { panic!("seeds queried with enough peers") }, Vec::new(), running()).await;
         assert_eq!(got, None);
         assert!(started.elapsed() < FAST.dns_many_peers, "it waited out the whole interval");
     }
@@ -279,11 +300,11 @@ mod tests {
     async fn an_empty_book_or_forcednsseed_queries_at_once() {
         let book = Book::default();
         let started = tokio::time::Instant::now();
-        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, running()).await, Some(1));
+        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await, Some(1));
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
         book.outbound.store(8, Ordering::Relaxed);
-        assert_eq!(dns_seed(&book, true, FAST, || async { vec![seed(1)] }, running()).await, Some(1));
+        assert_eq!(dns_seed(&book, true, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await, Some(1));
         assert!(started.elapsed() < FAST.dns_few_peers);
     }
 
@@ -316,7 +337,28 @@ mod tests {
         book.stale.store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
-        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, rx.clone()).await, None);
+        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, Vec::new(), rx.clone()).await, None);
         assert!(!fixed_seed(&book, true, FAST, vec![seed(9)], rx).await);
+    }
+
+    /// #994: under `-proxy` the DNS seeds are reached by name, as `addr-fetch`
+    /// connections the proxy resolves, queued when Core would query them and
+    /// not when enough peers made seeding unnecessary. Perturbation: drop the
+    /// `add_addr_fetch` loop and nothing is queued.
+    #[tokio::test]
+    async fn proxied_seeds_are_queued_by_name_when_the_seeds_are_queried() {
+        let names = vec![("seed.example".to_string(), 8333), ("seed2.example".to_string(), 8333)];
+        let book = Book::default();
+        book.stale.store(50, Ordering::Relaxed);
+        let got = dns_seed(&book, false, FAST, || async { Vec::new() }, names.clone(), running()).await;
+        assert_eq!(got, Some(0));
+        assert_eq!(*book.fetches.lock().unwrap(), names);
+        assert_eq!(book.dials.load(Ordering::Relaxed), 1);
+
+        let book = Book::default();
+        book.stale.store(50, Ordering::Relaxed);
+        book.outbound.store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
+        assert_eq!(dns_seed(&book, false, FAST, || async { Vec::new() }, names, running()).await, None);
+        assert!(book.fetches.lock().unwrap().is_empty(), "queued with enough peers");
     }
 }

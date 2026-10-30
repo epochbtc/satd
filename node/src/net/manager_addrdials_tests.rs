@@ -626,7 +626,7 @@ fn a_full_book_replaces_a_terrible_entry() {
 
     let stale = addr_at(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(stale);
+        pm.addrman.write().mark_attempt(stale, now_unix_secs() - 120);
     }
     pm.add_learned_addr_from(fresh, 9, source);
     assert!(pm.addrman.read().contains(&fresh), "the new address takes the terrible one's place");
@@ -670,7 +670,7 @@ fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
 
     let stale = in_group(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(stale);
+        pm.addrman.write().mark_attempt(stale, now_unix_secs() - 120);
     }
     pm.reconnect_backoff.write().insert(stale, ReconnectState::new());
     pm.add_learned_addr_from(fresh, 9, source);
@@ -691,11 +691,14 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
     let long_ago = crate::time::now_secs() - 31 * 24 * 60 * 60;
     {
         let mut book = pm.addrman.write();
+        // A /16 each, so neither table's per-group bound refuses one; an
+        // address whose tried slot another took stays new.
         for i in 0..full {
-            let a = SocketAddr::from(([11 + (i / 65536) as u8, ((i / 256) % 256) as u8, (i % 256) as u8, 1], 8333));
+            let a = SocketAddr::from(([11 + (i / 256) as u8, (i % 256) as u8, 1, 1], 8333));
             book.mark_good(a, long_ago);
         }
-        assert_eq!(book.len(), full, "fixture: the book is full of tried entries");
+        assert_eq!(book.len(), full, "fixture: the book is full");
+        assert!(book.iter().filter(|e| e.tried).count() > full / 2, "fixture: mostly tried");
     }
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, IpAddr::from([198, 51, 100, 1]));
@@ -763,4 +766,275 @@ fn an_address_book_of_unreachable_addresses_does_not_count() {
     pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
     assert!(!pm.addrman_is_empty(), "the clearnet entry is still in the book");
     assert!(!pm.addrman_has_reachable(), "but it is not on a reachable network");
+}
+
+// ---- Services an outbound peer states (Core's `SetServices`) ----
+
+/// Dial a listener as an outbound full-relay peer and run our side of the
+/// handshake against a remote that states `services`. Returns the
+/// handshake's result and the book's services for the address afterwards.
+async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, String>, u64) {
+    use bitcoin::p2p::Magic;
+    use bitcoin::p2p::address::Address;
+
+    let (pm, _dir) = mk_pm();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    pm.addrman.write().add_from(target, now_unix_secs(), 1 | 8, "198.51.100.7".parse().unwrap());
+    let (dialed, accepted) = tokio::join!(tokio::net::TcpStream::connect(target), listener.accept());
+    let (dialed, (accepted, _)) = (dialed.unwrap(), accepted.unwrap());
+    let mut info = peer(1, target, Direction::Outbound);
+    info.state = PeerState::Connecting;
+    info.conn_type = ConnType::OutboundFullRelay;
+    add_peer(&pm, info);
+    let mut ours = Connection::with_magic(dialed, Magic::REGTEST);
+    let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
+
+    let handshake = pm.perform_handshake(1, &mut ours, Direction::Outbound, crate::time::now_secs());
+    let remote = async {
+        loop {
+            if matches!(theirs.recv().await, Ok(NetworkMessage::Version(_)) | Err(_)) {
+                break;
+            }
+        }
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let _ = theirs
+            .send(NetworkMessage::Version(VersionMessage {
+                version: 70016,
+                services,
+                timestamp: crate::time::now_secs() as i64,
+                receiver: Address::new(&zero, ServiceFlags::NONE),
+                sender: Address::new(&zero, services),
+                nonce: 0x5eed,
+                user_agent: "/remote/".into(),
+                start_height: 0,
+                relay: true,
+            }))
+            .await;
+        let _ = theirs.send(NetworkMessage::Verack).await;
+        // Read until our side verack's or hangs up.
+        while let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_secs(2), theirs.recv()).await {
+            if matches!(msg, NetworkMessage::Verack) {
+                break;
+            }
+        }
+    };
+    let (result, ()) = tokio::join!(handshake, remote);
+    let book = pm.addrman.read().iter().find(|e| e.addr == target).map(|e| e.services).unwrap();
+    (result, book)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outbound_peers_version_sets_its_addresss_services() {
+    let stated = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let (result, book) = handshake_stating(stated).await;
+    result.expect("the handshake completes");
+    assert_eq!(book, stated.to_u64(), "the book holds what the peer stated, not what gossip said");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_dropped_for_lacking_services_is_recorded_as_lacking_them() {
+    let (result, book) = handshake_stating(ServiceFlags::WITNESS).await;
+    assert!(result.is_err(), "an automatic peer without NODE_NETWORK is dropped");
+    assert_eq!(book, ServiceFlags::WITNESS.to_u64());
+}
+
+#[test]
+fn a_peer_the_book_first_learns_by_connecting_keeps_its_stated_services() {
+    use bitcoin::p2p::address::Address;
+    // A manual or seed peer: dialled without a book entry, which
+    // `mark_good` creates once it connects.
+    let (pm, _dir) = mk_pm();
+    let target: SocketAddr = "203.0.113.9:18444".parse().unwrap();
+    let mut info = peer(1, target, Direction::Outbound);
+    info.conn_type = ConnType::Manual;
+    add_peer(&pm, info);
+    let stated = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    pm.handle_peer_connected(
+        1,
+        VersionMessage {
+            version: 70016,
+            services: stated,
+            timestamp: crate::time::now_secs() as i64,
+            receiver: Address::new(&zero, ServiceFlags::NONE),
+            sender: Address::new(&zero, stated),
+            nonce: 0x5eed,
+            user_agent: "/remote/".into(),
+            start_height: 0,
+            relay: true,
+        },
+    );
+    let book = pm.addrman.read().iter().find(|e| e.addr == target).map(|e| e.services);
+    assert_eq!(book, Some(stated.to_u64()));
+}
+
+/// A distinct 56-character onion host for index `i`.
+fn onion_host(i: usize) -> String {
+    format!("{i:0>56}.onion")
+}
+
+fn onions_listed(pm: &PeerManager) -> usize {
+    pm.connect_peer_addrs.read().iter().filter(|a| a.is_onion()).count()
+}
+
+/// #1120: one source's `getaddr` answer used to fill the onion list on its
+/// first message and keep every later onion out for the life of the
+/// process. A source now holds at most its share, and the next source's
+/// onions are still learned.
+#[test]
+fn one_source_cannot_fill_the_onion_list() {
+    let (pm, _dir) = mk_pm();
+    let source = Some(b"g\x2c\x01".to_vec());
+    for i in 0..MAX_ONION_CONNECT_ADDRS + 10 {
+        pm.add_onion_candidate(onion_host(i), 9333, source.clone());
+    }
+    assert_eq!(onions_listed(&pm), MAX_ONION_ADDRS_PER_SOURCE);
+    let other = Some(b"g\x2d\x01".to_vec());
+    pm.add_onion_candidate(onion_host(10_000), 9333, other);
+    assert_eq!(onions_listed(&pm), MAX_ONION_ADDRS_PER_SOURCE + 1, "another source's onion is learned");
+    // A seed counts against no source.
+    pm.add_onion_connect_addr(onion_host(10_001), 9333);
+    assert_eq!(onions_listed(&pm), MAX_ONION_ADDRS_PER_SOURCE + 2);
+}
+
+/// #1120: a full list of onions that never answered makes room for a new
+/// one, as Core's `AddSingle` overwrites a terrible entry; while none is
+/// terrible, the new one is refused. A peer the operator named is never
+/// the one dropped.
+#[test]
+fn a_full_list_of_dead_onions_makes_room_for_a_new_one() {
+    let (pm, _dir) = mk_pm();
+    let named = PeerAddr::Onion { host: onion_host(99_999), port: 9333 };
+    assert!(pm.add_peer_addr(named.clone()));
+    let sources = MAX_ONION_CONNECT_ADDRS / MAX_ONION_ADDRS_PER_SOURCE;
+    for i in 0..MAX_ONION_CONNECT_ADDRS - 1 {
+        let source = Some(vec![b'g', (i % sources) as u8]);
+        pm.add_onion_candidate(onion_host(i), 9333, source);
+    }
+    assert_eq!(pm.connect_peer_addrs.read().len(), MAX_ONION_CONNECT_ADDRS, "fixture: full");
+    // A learned onion the operator then names is manual from then on.
+    let renamed = PeerAddr::Onion { host: onion_host(1), port: 9333 };
+    assert!(!pm.add_peer_addr(renamed.clone()), "already listed");
+
+    let fresh = onion_host(50_000);
+    pm.add_onion_candidate(fresh.clone(), 9333, Some(b"gnew".to_vec()));
+    let listed = |h: &str| {
+        pm.connect_peer_addrs.read().iter().any(|a| matches!(a, PeerAddr::Onion { host, .. } if host == h))
+    };
+    assert!(!listed(&fresh), "nothing terrible: refused");
+
+    // Every learned onion fails three dials and never connects.
+    for i in 0..MAX_ONION_CONNECT_ADDRS - 1 {
+        let target = PeerAddr::Onion { host: onion_host(i), port: 9333 };
+        pm.onion_reconnect_backoff.write().insert(target.to_string(), ReconnectState::new());
+        for _ in 0..3 {
+            pm.note_onion_dial(&onion_host(i), false);
+        }
+    }
+    pm.add_onion_candidate(fresh.clone(), 9333, Some(b"gnew".to_vec()));
+    assert!(!listed(&fresh), "within a minute of their last dial, none is terrible yet");
+    // One that failed as often but connected once is not terrible.
+    pm.note_onion_dial(&onion_host(0), true);
+    pm.note_onion_dial(&onion_host(0), false);
+    pm.note_onion_dial(&onion_host(0), false);
+    // Past Core's minute of grace after the last dial.
+    let fresh_tries: Vec<String> = pm.onion_candidates.read().keys().cloned().collect();
+    {
+        let mut candidates = pm.onion_candidates.write();
+        for h in &fresh_tries {
+            candidates.get_mut(h).unwrap().last_try -= 120;
+        }
+    }
+
+    pm.add_onion_candidate(fresh.clone(), 9333, Some(b"gnew".to_vec()));
+    assert!(listed(&fresh), "a dead onion gave up its place");
+    assert_eq!(pm.connect_peer_addrs.read().len(), MAX_ONION_CONNECT_ADDRS);
+    assert!(listed(&onion_host(0)), "an onion that once connected stays");
+    assert!(!listed(&onion_host(2)), "the first dead one went");
+    assert!(!pm.onion_candidates.read().contains_key(&onion_host(2)));
+    assert!(
+        !pm.onion_reconnect_backoff.read().contains_key(&format!("{}:9333", onion_host(2))),
+        "its backoff went with it"
+    );
+    assert!(pm.connect_peer_addrs.read().contains(&named), "the named peer stays");
+    assert!(pm.connect_peer_addrs.read().contains(&renamed), "and so does the renamed one");
+
+    // Room is made one entry at a time, and only from what is terrible.
+    for i in 0..MAX_ONION_CONNECT_ADDRS {
+        pm.add_onion_candidate(onion_host(60_000 + i), 9333, Some(vec![b'h', (i % sources) as u8]));
+    }
+    assert_eq!(pm.connect_peer_addrs.read().len(), MAX_ONION_CONNECT_ADDRS);
+    assert!(listed(&onion_host(0)) && pm.connect_peer_addrs.read().contains(&named));
+    assert!(pm.connect_peer_addrs.read().contains(&renamed));
+}
+
+/// The source of an announced onion: a clearnet announcer's network group,
+/// or an onion announcer's own host.
+#[test]
+fn an_onions_source_is_the_announcers_group_or_its_host() {
+    let (pm, _dir) = mk_pm();
+    add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 2, 3], 8333)), Direction::Outbound));
+    add_peer(&pm, peer(2, SocketAddr::from(([44, 1, 9, 9], 8333)), Direction::Outbound));
+    let mut via_tor = peer(3, SocketAddr::from(([0, 0, 0, 0], 0)), Direction::Outbound);
+    via_tor.onion_host = Some(onion_host(7));
+    add_peer(&pm, via_tor);
+    assert_eq!(pm.onion_source(1), pm.onion_source(2), "one /16, one source");
+    assert_ne!(pm.onion_source(3), pm.onion_source(1));
+    assert_eq!(pm.onion_source(3), [b"o".as_slice(), onion_host(7).as_bytes()].concat());
+    // A peer gone mid-message is a source of its own, not an unbounded one.
+    assert_ne!(pm.onion_source(42), pm.onion_source(43));
+    assert_eq!(pm.onion_source(42), pm.onion_source(42));
+}
+
+/// The reconnect loop's onion dials feed the record that decides whether an
+/// onion is terrible. With no proxy here every onion dial fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_onion_dial_counts_against_the_onion() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let host = onion_host(5);
+    pm.add_onion_candidate(host.clone(), 9333, Some(b"g\x2c\x01".to_vec()));
+    pm.reconnect_tick();
+    let tried = || pm.onion_reconnect_backoff.read().contains_key(&format!("{host}:9333"));
+    wait_for(&pm, tried, "the onion is dialled").await;
+    settle(&pm).await;
+    assert_eq!(pm.onion_candidates.read()[&host].attempts, 1);
+    assert_eq!(pm.onion_candidates.read()[&host].last_success, 0);
+}
+
+/// A manual onion on another port of a learned host shares the host's
+/// record; removing it must leave the learned entry's record, or that entry
+/// could never become terrible and would hold its place for good.
+#[test]
+fn removing_a_manual_twin_keeps_the_learned_onions_record() {
+    let (pm, _dir) = mk_pm();
+    let host = onion_host(3);
+    pm.add_onion_candidate(host.clone(), 9333, Some(b"g\x2c\x01".to_vec()));
+    let twin = PeerAddr::Onion { host: host.clone(), port: 9444 };
+    assert!(pm.add_peer_addr(twin.clone()));
+    assert!(pm.remove_peer_addr(&twin));
+    assert!(pm.onion_candidates.read().contains_key(&host));
+    // With the last entry for the host gone, the record goes too.
+    assert!(pm.remove_peer_addr(&PeerAddr::Onion { host: host.clone(), port: 9333 }));
+    assert!(!pm.onion_candidates.read().contains_key(&host));
+}
+
+/// A dial to an onion that left the list while it ran leaves no backoff
+/// behind, as for a clearnet address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_onion_dropped_mid_dial_leaves_no_backoff() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let gone = PeerAddr::Onion { host: onion_host(8), port: 9333 };
+    let slot = pm.reserve_dial(DialBudget::Automatic).unwrap();
+    pm.spawn_redial(gone.clone(), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+    settle(&pm).await;
+    assert!(!pm.onion_reconnect_backoff.read().contains_key(&gone.to_string()));
+    // A listed one gets its backoff, as before.
+    let listed = onion_host(9);
+    pm.add_onion_candidate(listed.clone(), 9333, None);
+    pm.reconnect_tick();
+    let key = format!("{listed}:9333");
+    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the listed onion backs off").await;
 }
