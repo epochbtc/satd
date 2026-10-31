@@ -40,8 +40,9 @@ satd is free software under the [MIT License](../../LICENSE).
   JSON-RPC wire shape, CLI flag names/defaults, `bitcoin.conf` keys, on-disk
   layout, Electrum/Esplora surfaces) are governed by
   [`STABILITY_POLICY.md`](../../STABILITY_POLICY.md). satd follows
-  [semantic versioning](https://semver.org/spec/v2.0.0.html); while in the
-  `0.x` pre-1.0 line, deprecations may be accelerated (see the policy).
+  [semantic versioning](https://semver.org/spec/v2.0.0.html): each feature
+  release raises the minor version, and deprecations may be accelerated (see
+  the policy).
 - **Security & disclosure** — report vulnerabilities per
   [`SECURITY.md`](../../SECURITY.md). Consensus-affecting bugs are treated as
   P0 with same-day acknowledgement.

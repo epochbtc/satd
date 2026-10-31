@@ -13,7 +13,7 @@ treat it as P0 and expect a same-day acknowledgement.
 
 ## Supported versions
 
-satd is pre-1.0; only the latest release line receives security
+Only the latest release line receives security
 fixes. Operators tracking master should expect to upgrade promptly
 when a fix lands.
 
