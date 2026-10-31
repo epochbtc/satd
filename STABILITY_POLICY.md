@@ -2,8 +2,8 @@
 
 This document defines satd's stability contract with integrators — BTCPayServer, NBXplorer, Umbrel, Start9, Sparrow, Electrum-personality clients, Fulcrum-personality clients, block explorers, any BDK-based wallet pointed at our APIs. It governs when we can change what, how removals are staged, and what invariants we hold across upgrades.
 
-### Pre-1.0 (`0.x`) Application
-While `satd` is in its `0.x` pre-1.0 phase, we strive to follow these rules to the greatest extent possible. However, to maintain development velocity, we reserve the right to accelerate deprecations (e.g., removing a surface in a subsequent `0.x` release rather than waiting 4 full releases). We will, however, always endeavor to provide clean migration paths and adhere to the state-management invariants described below. Once `1.0` is reached, the full deprecation cycles will be strictly enforced.
+### Versioning and accelerated deprecations
+satd versions are `0.MINOR.PATCH`, and there is no planned `1.0`. Each feature release raises the minor version, as each Bitcoin Core release raises its major version; patch releases carry fixes only. We strive to follow the rules below to the greatest extent possible. However, to maintain development velocity, we reserve the right to accelerate deprecations (e.g., removing a surface in the next minor release rather than waiting 4 full releases). We will, however, always endeavor to provide clean migration paths and adhere to the state-management invariants described below.
 
 Every rule here is grounded in real-world observations from Bitcoin ecosystem release cycles. Each rule is annotated with the specific historical context it addresses. This is a binding policy on satd releases.
 
