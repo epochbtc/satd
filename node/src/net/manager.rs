@@ -4173,12 +4173,21 @@ impl PeerManager {
             .find(|(_, handle)| handle.info.addr_string() == addr)
             .map(|(id, _)| *id);
         match id {
-            Some(id) => self.disconnect_by_id(id),
+            Some(id) => self.disconnect_on_request(id),
             None => false,
         }
     }
 
-    /// Disconnect a peer by its `getpeerinfo` id. Returns whether one matched.
+    /// `disconnectnode` by id: [`Self::disconnect_by_id`], logged as an RPC
+    /// request. Only the RPC calls this; the node's own disconnects go through
+    /// `disconnect_by_id`, so their log line no longer claims to be one (#1152).
+    pub fn disconnect_on_request(&self, id: PeerId) -> bool {
+        self.disconnect_peer(id, "rpc_request")
+    }
+
+    /// Disconnect a peer by its `getpeerinfo` id, for the node's own reasons.
+    /// Returns whether one matched. The caller logs why; this logs that the
+    /// peer went, as `reason="internal"`.
     ///
     /// Dropping the `PeerHandle` is what actually closes the connection: it
     /// closes the peer task's `msg_rx`, which the write loop treats as
@@ -4187,6 +4196,10 @@ impl PeerManager {
     /// runs the rest of the teardown (IBD reassignment, background-range
     /// requeue) exactly as an organic disconnect would.
     pub fn disconnect_by_id(&self, id: PeerId) -> bool {
+        self.disconnect_peer(id, "internal")
+    }
+
+    fn disconnect_peer(&self, id: PeerId, reason: &'static str) -> bool {
         let removed = self.peers.write().remove(&id);
         match removed {
             Some(handle) => {
@@ -4204,8 +4217,8 @@ impl PeerManager {
                 tracing::info!(
                     id,
                     addr = %handle.info.addr_string(),
-                    reason = "rpc_request",
-                    "Disconnecting peer on request"
+                    reason,
+                    "Disconnecting peer"
                 );
                 true
             }
@@ -5713,7 +5726,7 @@ impl PeerManager {
                             .peers
                             .read()
                             .get(&peer_id)
-                            .map(|h| h.info.addr.to_string())
+                            .map(|h| h.info.addr_string())
                             .unwrap_or_else(|| "<gone>".to_string());
                         tracing::warn!(
                             peer_id,
@@ -5937,7 +5950,7 @@ impl PeerManager {
                 }
                 tracing::info!(
                     id,
-                    addr = %handle.info.addr,
+                    addr = %handle.info.addr_string(),
                     user_agent = %handle.info.user_agent,
                     height = handle.info.best_height,
                     "Peer connected"
@@ -5965,7 +5978,7 @@ impl PeerManager {
         let mut peers = self.peers.write();
         let mut nap_pull = None;
         if let Some(handle) = peers.remove(&id) {
-            tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
+            tracing::info!(id, addr = %handle.info.addr_string(), "Peer disconnected");
             tracing::debug!("Cleared nodestate for peer={id}");
             if handle.info.conn_type == ConnType::NapPull {
                 nap_pull = Some(handle.info.addr_string());

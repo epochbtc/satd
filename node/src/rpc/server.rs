@@ -3540,7 +3540,7 @@ pub async fn start(
         let disconnected = match (&addr_str, node_id) {
             (Some(addr), None) => ctx.peer_manager.disconnect_by_addr(addr),
             (_, Some(id)) if addr_str.as_deref().unwrap_or("").is_empty() => {
-                ctx.peer_manager.disconnect_by_id(id)
+                ctx.peer_manager.disconnect_on_request(id)
             }
             _ => {
                 return Err(ErrorObjectOwned::owned(

@@ -11,9 +11,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet — 0.7.0 was cut on 2026-10-30. Add a one-line bullet here for every
-user-facing change, and the full write-up to the next
-`docs/release-notes/<version>-pre.md` (bound for 0.8.0).
+On `release/0.7.x`, bound for **0.7.1**. This is an index: every item below is written up in
+full in the in-development
+[`docs/release-notes/0.7.1-pre.md`](docs/release-notes/0.7.1-pre.md).
+
+- RPC: any request `Content-Type` is read as JSON, as in Core (#824).
+- RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
+- P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
+- P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
+- Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 
 ## Releases
 
