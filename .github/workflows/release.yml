@@ -333,7 +333,7 @@ jobs:
           # packager who needs an x86_64 darwin build can cross-build
           # from an arm64 darwin host.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           # musl: built via cargo-zigbuild on the amd64 Linux host —
           # no container, no musl-cross-gcc on the runner. zig brings
           # its own libc + cross-compiler for both x86_64 and aarch64
@@ -576,9 +576,9 @@ jobs:
           # PACKAGING.md commits to .tar.zst as the artifact format.
           #
           # macOS ships BSD tar as `tar`; the reproducible-friendly
-          # flags (--owner, --mtime, --sort) are GNU-only. Both
-          # macos-13 + macos-14 hosted runners include gnu-tar via
-          # Homebrew under the name `gtar`. Pick whichever exists.
+          # flags (--owner, --mtime, --sort) are GNU-only. The
+          # macos-15 hosted runner includes gnu-tar via Homebrew under
+          # the name `gtar`. Pick whichever exists.
           if command -v gtar >/dev/null 2>&1; then
             TAR=gtar
           else
