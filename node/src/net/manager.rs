@@ -7674,6 +7674,11 @@ impl PeerManager {
     /// Only when no such peer is connected, the `NODE_NETWORK_LIMITED` peers
     /// with `NODE_INTACT_BLOCKS` instead: one may have stripped the block,
     /// and a re-fetch does not track a `notfound` to move on from it.
+    ///
+    /// This is the rule for choosing a peer when the caller named none. A
+    /// peer the operator names (`getblockfrompeer`) goes through
+    /// [`Self::request_block_from_peer`], which needs only `NODE_WITNESS`;
+    /// Core checks neither flag there.
     pub fn block_serving_peer_ids(&self) -> Vec<PeerId> {
         let peers = self.peers.read();
         let (mut full, mut intact) = (Vec::new(), Vec::new());
@@ -7737,6 +7742,11 @@ impl PeerManager {
         }
 
         let outcome = self.chain_state.repair_block_data(block);
+        let readable_at = match &outcome {
+            Ok(crate::chain::state::BlockDataRepair::Repaired { height })
+            | Ok(crate::chain::state::BlockDataRepair::AlreadyPresent { height }) => Some(*height),
+            Err(_) => None,
+        };
         if outcome.is_ok() {
             // The block is readable now; other asked peers' replies are
             // ordinary duplicates.
@@ -7781,6 +7791,15 @@ impl PeerManager {
             Err(e) => {
                 tracing::warn!(%hash, id, error = %e, "getblockfrompeer: repair failed locally");
             }
+        }
+        // A re-fetch armed during IBD can answer a height the scheduler also
+        // has in flight. This path returns before `handle_block_ibd`, so
+        // release the slot here, as that path would, or the peer's slot stays
+        // taken until the download times out (#547).
+        if let Some(height) = readable_at
+            && let Some(scheduler) = self.ibd.write().as_mut()
+        {
+            scheduler.block_received(id, height, hash);
         }
         true
     }
