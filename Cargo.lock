@@ -657,15 +657,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcoinconsensus"
-version = "0.106.0+26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e12cba9cce5043cdda968e07b9df6d05ec6b0b38aa27a9a40bb575cf3e521ae9"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "bitcoincore-rpc"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,6 +678,15 @@ dependencies = [
  "bitcoin",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bitcoinkernel"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "998431c4dbcccf0a6736e7a7729c4bf6ada90ef93bdc41ee46ba7c9e72da7972"
+dependencies = [
+ "libbitcoinkernel-sys",
 ]
 
 [[package]]
@@ -1050,7 +1050,7 @@ name = "consensus"
 version = "0.8.0-pre"
 dependencies = [
  "bitcoin",
- "bitcoinconsensus",
+ "bitcoinkernel",
  "criterion",
  "hex",
  "pprof",
@@ -2712,6 +2712,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "libbitcoinkernel-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "345d18a1ce19a1becfcaaa066e3a60e9c7813ef5c23ea8c20704ca4ba1a46339"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2987,7 +2996,7 @@ dependencies = [
  "bincode",
  "bip324",
  "bitcoin",
- "bitcoinconsensus",
+ "bitcoinkernel",
  "bytes",
  "consensus",
  "crossbeam-channel",
@@ -2999,6 +3008,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "jsonrpsee",
+ "libbitcoinkernel-sys",
  "libc",
  "lru",
  "miniscript",

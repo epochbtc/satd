@@ -1,6 +1,6 @@
-//! Naming a libbitcoinconsensus rejection.
+//! Naming a libbitcoinkernel rejection.
 //!
-//! libbitcoinconsensus reports a coarse `ERR_SCRIPT`; Bitcoin Core, calling
+//! libbitcoinkernel reports a coarse `ERR_SCRIPT`; Bitcoin Core, calling
 //! `VerifyScript` directly, names the script error (`ScriptErrorString`,
 //! src/script/script_error.cpp). satd asks its own engine for the name. That
 //! takes only the input that failed, and the caller decides when to do it.
@@ -47,7 +47,7 @@ fn script(op: u8) -> ScriptBuf {
 }
 
 /// Only the input that failed is run to name it. Input 0 here fails too,
-/// but naming input 1's failure must not depend on it: libbitcoinconsensus
+/// but naming input 1's failure must not depend on it: libbitcoinkernel
 /// already passed every input before the one it rejected, and running them
 /// again only repeats that work.
 #[test]

@@ -61,10 +61,10 @@ const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 /// accept a solution Core rejects (consensus divergence on a custom
 /// signet): `P2SH | WITNESS | DERSIG | NULLDUMMY`.
 fn block_script_verify_flags() -> u32 {
-    bitcoinconsensus::VERIFY_P2SH
-        | bitcoinconsensus::VERIFY_WITNESS
-        | bitcoinconsensus::VERIFY_DERSIG
-        | bitcoinconsensus::VERIFY_NULLDUMMY
+    bitcoinkernel::VERIFY_P2SH
+        | bitcoinkernel::VERIFY_WITNESS
+        | bitcoinkernel::VERIFY_DERSIG
+        | bitcoinkernel::VERIFY_NULLDUMMY
 }
 
 /// Derive the P2P network magic for a signet from its challenge, the way
@@ -339,21 +339,10 @@ pub fn check_signet_block_solution(
         }
     };
 
-    let spent = &txs.to_spend.output[0];
-    let to_sign_bytes = bitcoin::consensus::serialize(&txs.to_sign);
-    let spk = spent.script_pubkey.as_bytes();
-    let utxo = bitcoinconsensus::Utxo {
-        script_pubkey: spk.as_ptr(),
-        script_pubkey_len: spk.len() as u32,
-        value: 0,
-    };
-
-    match bitcoinconsensus::verify_with_flags(
-        spk,
-        0,
-        &to_sign_bytes,
-        Some(&[utxo]),
-        0,
+    // `to_sign` spends `to_spend`'s single, zero-value output.
+    match crate::validation::script::kernel_verify_transaction(
+        &txs.to_sign,
+        &txs.to_spend.output[..1],
         block_script_verify_flags(),
     ) {
         Ok(()) => Ok(()),
@@ -582,10 +571,10 @@ mod tests {
         // Core's BLOCK_SCRIPT_VERIFY_FLAGS = P2SH | WITNESS | DERSIG |
         // NULLDUMMY. Pin the mask so a future edit can't silently drop a
         // flag and make satd accept solutions Core rejects.
-        let expected = bitcoinconsensus::VERIFY_P2SH
-            | bitcoinconsensus::VERIFY_WITNESS
-            | bitcoinconsensus::VERIFY_DERSIG
-            | bitcoinconsensus::VERIFY_NULLDUMMY;
+        let expected = bitcoinkernel::VERIFY_P2SH
+            | bitcoinkernel::VERIFY_WITNESS
+            | bitcoinkernel::VERIFY_DERSIG
+            | bitcoinkernel::VERIFY_NULLDUMMY;
         assert_eq!(block_script_verify_flags(), expected);
     }
 

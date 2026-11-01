@@ -157,8 +157,9 @@ never looser.
 
 ## Consensus engine & shadow verification
 
-satd ships two independent script-verification engines: the C++
-`libbitcoinconsensus` FFI and a from-scratch Rust verifier. It can run both
+satd ships two independent script-verification engines: Bitcoin Core's C++
+script interpreter, built from Core's source through `libbitcoinkernel`, and a
+from-scratch Rust verifier. It can run both
 together and verify every script twice. Bitcoin Core has no equivalent.
 
 Read a mode name as "which engine is the shadow". In `<engine>-shadow`, the
@@ -173,21 +174,22 @@ background and logs any disagreement. So:
 
 | Mode | Primary (authoritative) | Shadow |
 |---|---|---|
-| `rust-shadow` (default) | C++ `libbitcoinconsensus` | Rust (logs mismatches) |
+| `rust-shadow` (default) | C++ (`libbitcoinkernel`) | Rust (logs mismatches) |
 | `cpp-shadow` | Rust | C++ (logs mismatches) |
-| `cpp` | C++ `libbitcoinconsensus` | none (single engine) |
+| `cpp` | C++ (`libbitcoinkernel`) | none (single engine) |
 | `rust` | Rust | none (single engine) |
 
 The Rust engine passes Bitcoin Core's script test suite. Shadow verification
-against `libbitcoinconsensus` across the whole mainnet chain, genesis to about
-height 945,000, found zero divergence. The Rust engine is also usually faster
-than the C++ FFI: it avoids per-call FFI marshaling and uses a process-global,
-verification-only cached `secp256k1` context. `cpp-shadow` (Rust primary, C++
-shadow) is therefore the high-performance pairing.
+against Core's C++ interpreter (then `libbitcoinconsensus`) across the whole
+mainnet chain, genesis to about height 945,000, found zero divergence. Both
+engines hash a transaction's signature data once and reuse it for every input,
+as Core's own `CheckInputScripts` does. (Up to 0.7.x the C++ engine was
+`libbitcoinconsensus`, whose API made it redo that work for every input, so a
+transaction with many inputs cost time quadratic in their number.)
 
 `rust-shadow` (C++ primary) stays the default out of conservatism. Running two
 independently written engines against each other is satd's core safety
-property, and `libbitcoinconsensus` is the most widely deployed implementation.
+property, and Core's interpreter is the most widely deployed implementation.
 The plan is to promote the Rust engine to primary as it accumulates production
 mileage; `cpp-shadow` is that step. Treat the single-engine `rust` mode with
 care. The engine itself is proven, but either single-engine mode gives up the

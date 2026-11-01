@@ -15,6 +15,8 @@
 //! `OP_CSV` opcode aliases, and an optional `spend` object that sets the
 //! spending transaction's `locktime`, `sequence`, `version` and `n_outputs`.
 
+mod kernel_ref;
+
 mod helpers;
 
 use bitcoin::absolute::LockTime;
@@ -132,13 +134,13 @@ fn rbitcoin_script_corpus() {
         if script_flags & !CPP_FLAGS == 0 {
             let mut bytes = Vec::new();
             spend.consensus_encode(&mut bytes).unwrap();
-            let utxos = [bitcoinconsensus::Utxo {
+            let utxos = [kernel_ref::Utxo {
                 script_pubkey: script_pubkey.as_ptr(),
                 script_pubkey_len: script_pubkey.len() as u32,
                 value: amount as i64,
             }];
             let cpp_ok =
-                bitcoinconsensus::verify_with_flags(&script_pubkey, amount, &bytes, Some(&utxos), 0, script_flags).is_ok();
+                kernel_ref::verify_with_flags(&script_pubkey, amount, &bytes, Some(&utxos), 0, script_flags).is_ok();
             cpp_checked += 1;
             if cpp_ok != expect_ok {
                 wrong.push(format!("{id}: expected {}, libbitcoinconsensus {}", field(3), if cpp_ok { "accepts" } else { "rejects" }));

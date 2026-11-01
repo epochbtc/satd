@@ -22,6 +22,8 @@
 //! the same input is also run through libbitcoinconsensus (Core's own
 //! interpreter, via the `bitcoinconsensus` crate) as a check on this harness.
 
+mod kernel_ref;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -125,9 +127,9 @@ fn asset_test(test: &Value, all_flags: &[u32], failures: &mut Vec<Failure>) -> u
 
         let mut ser = Vec::new();
         tx.consensus_encode(&mut ser).unwrap();
-        let utxos: Vec<bitcoinconsensus::Utxo> = prevouts
+        let utxos: Vec<kernel_ref::Utxo> = prevouts
             .iter()
-            .map(|p| bitcoinconsensus::Utxo {
+            .map(|p| kernel_ref::Utxo {
                 script_pubkey: p.script_pubkey.as_bytes().as_ptr(),
                 script_pubkey_len: p.script_pubkey.len() as u32,
                 value: p.value.to_sat() as i64,
@@ -157,7 +159,7 @@ fn asset_test(test: &Value, all_flags: &[u32], failures: &mut Vec<Failure>) -> u
                     got: format!("{res:?}"),
                 });
             }
-            let cpp = bitcoinconsensus::verify_with_flags(
+            let cpp = kernel_ref::verify_with_flags(
                 &spk,
                 prevouts[idx].value.to_sat(),
                 &ser,

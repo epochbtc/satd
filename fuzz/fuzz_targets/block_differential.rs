@@ -7,7 +7,7 @@
 //! header *version*; the harness owns prev/bits/time/merkle/nonce), then:
 //!
 //!   * run satd's REAL validation IN-PROCESS — `check_block` +
-//!     `check_block_version` + `connect_block` (with the bitcoinconsensus
+//!     `check_block_version` + `connect_block` (with the libbitcoinkernel
 //!     script verifier, matching Core) — so libFuzzer's coverage feedback is
 //!     driven by satd's actual consensus code, and a satd panic / UB is caught
 //!     directly; and

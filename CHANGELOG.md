@@ -31,6 +31,11 @@ It includes every fix shipped in 0.7.1:
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
+- The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
+  instead of `libbitcoinconsensus`, which redid a transaction's signature
+  hashing for every input. About 27x faster on a 3,373-input signet block,
+  2.3x on a typical mainnet block (#874). Building from source now needs cmake
+  and the Boost headers.
 
 ## Releases
 

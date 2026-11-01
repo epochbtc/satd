@@ -3,6 +3,8 @@
 //!
 //! This is the key validation that our implementation matches Bitcoin Core.
 
+mod kernel_ref;
+
 mod helpers;
 
 use bitcoin::absolute::LockTime;
@@ -56,15 +58,15 @@ fn verify_both(
     };
 
     let cpp_result = if let Some(prevs) = prev_outputs_for_taproot {
-        let utxos: Vec<bitcoinconsensus::Utxo> = prevs
+        let utxos: Vec<kernel_ref::Utxo> = prevs
             .iter()
-            .map(|(spk, val)| bitcoinconsensus::Utxo {
+            .map(|(spk, val)| kernel_ref::Utxo {
                 script_pubkey: spk.as_ptr(),
                 script_pubkey_len: spk.len() as u32,
                 value: *val as i64,
             })
             .collect();
-        bitcoinconsensus::verify_with_flags(
+        kernel_ref::verify_with_flags(
             spent_output_script,
             amount,
             spending_tx_bytes,
@@ -73,7 +75,7 @@ fn verify_both(
             flags,
         )
     } else {
-        bitcoinconsensus::verify_with_flags(
+        kernel_ref::verify_with_flags(
             spent_output_script,
             amount,
             spending_tx_bytes,
@@ -143,13 +145,13 @@ fn serialize_tx(tx: &Transaction) -> Vec<u8> {
 
 /// The flags that bitcoinconsensus recognizes (it rejects unknown flag bits).
 /// It only recognizes the 8 flags in its public API, not the full 21 we support.
-const CPP_RECOGNIZED_FLAGS: u32 = bitcoinconsensus::VERIFY_P2SH
-    | bitcoinconsensus::VERIFY_DERSIG
-    | bitcoinconsensus::VERIFY_NULLDUMMY
-    | bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
-    | bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
-    | bitcoinconsensus::VERIFY_WITNESS
-    | bitcoinconsensus::VERIFY_TAPROOT;
+const CPP_RECOGNIZED_FLAGS: u32 = kernel_ref::VERIFY_P2SH
+    | kernel_ref::VERIFY_DERSIG
+    | kernel_ref::VERIFY_NULLDUMMY
+    | kernel_ref::VERIFY_CHECKLOCKTIMEVERIFY
+    | kernel_ref::VERIFY_CHECKSEQUENCEVERIFY
+    | kernel_ref::VERIFY_WITNESS
+    | kernel_ref::VERIFY_TAPROOT;
 
 /// Filter flags to only those recognized by the C++ bitcoinconsensus API.
 fn cpp_safe_flags(flags: u32) -> u32 {
@@ -220,7 +222,7 @@ fn differential_script_tests() {
 
         // Build prev outputs for taproot
         let prevs = vec![(script_pubkey.clone(), n_value)];
-        let has_taproot = safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+        let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
         let (rust_ok, cpp_ok, ok) = verify_both(
             &script_pubkey,
@@ -317,7 +319,7 @@ fn differential_tx_valid() {
         let excluded = parse_flags(flags_str);
         let verify_flags = fill_flags(!excluded & consensus::flags::ALL_FLAGS);
         let safe_flags = cpp_safe_flags(verify_flags);
-        let has_taproot = safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+        let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
         // Build prev_outputs array for all inputs
         let prevs: Vec<(Vec<u8>, u64)> = tx.input.iter().map(|inp| {
@@ -388,7 +390,7 @@ fn differential_tx_invalid() {
 
         let verify_flags = fill_flags(parse_flags(flags_str));
         let safe_flags = cpp_safe_flags(verify_flags);
-        let has_taproot = safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+        let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
         let prevs: Vec<(Vec<u8>, u64)> = tx.input.iter().map(|inp| {
             let key = (inp.previous_output.txid, inp.previous_output.vout);
@@ -445,9 +447,9 @@ fn differential_bip341_key_path() {
         (spk, amount)
     }).collect();
 
-    let flags = bitcoinconsensus::VERIFY_P2SH
-        | bitcoinconsensus::VERIFY_WITNESS
-        | bitcoinconsensus::VERIFY_TAPROOT;
+    let flags = kernel_ref::VERIFY_P2SH
+        | kernel_ref::VERIFY_WITNESS
+        | kernel_ref::VERIFY_TAPROOT;
 
     let mut matched = 0;
     let mut mismatched = 0;
@@ -479,12 +481,12 @@ fn differential_bip341_key_path() {
 #[test]
 fn differential_p2sh_p2wpkh_nonstandard_sighash() {
     // Flags matching block height 508k+ (post-segwit, pre-taproot)
-    let flags = bitcoinconsensus::VERIFY_P2SH
-        | bitcoinconsensus::VERIFY_DERSIG
-        | bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
-        | bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
-        | bitcoinconsensus::VERIFY_WITNESS
-        | bitcoinconsensus::VERIFY_NULLDUMMY;
+    let flags = kernel_ref::VERIFY_P2SH
+        | kernel_ref::VERIFY_DERSIG
+        | kernel_ref::VERIFY_CHECKLOCKTIMEVERIFY
+        | kernel_ref::VERIFY_CHECKSEQUENCEVERIFY
+        | kernel_ref::VERIFY_WITNESS
+        | kernel_ref::VERIFY_NULLDUMMY;
 
     // (spend_tx_hex, prev_scriptpubkey_hex, prev_value_sats)
     let cases: &[(&str, &str, u64)] = &[

@@ -54,14 +54,14 @@ impl ScriptError {
 /// skip primary verify) would override the user's chosen authority.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PrimaryEngine {
-    /// Bitcoin Core's libbitcoinconsensus (C++ FFI).
+    /// Bitcoin Core's script interpreter, through libbitcoinkernel (C++ FFI).
     Cpp,
     /// Pure Rust consensus engine.
     Rust,
 }
 
 /// Trait abstracting script/transaction verification. Implemented by
-/// `ConsensusVerifier` (bitcoinconsensus FFI), `RustVerifier` (native), and
+/// `ConsensusVerifier` (libbitcoinkernel FFI), `RustVerifier` (native), and
 /// `ShadowVerifier` (parity-checked dual-engine).
 pub trait ScriptVerifier: Send + Sync {
     /// Verify all inputs of a transaction against their previous outputs.
@@ -180,7 +180,7 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
         },
         // Testnet3. Taproot is gated with segwit rather than at 0: a taproot
         // spend is a witness spend, so the flag is inert below the witness
-        // gate, and libconsensus rejects TAPROOT-without-WITNESS flag sets.
+        // gate, and a TAPROOT-without-WITNESS flag set is incoherent.
         Network::Testnet => ActivationHeights {
             p2sh: 395,
             bip34: 21_111,
@@ -279,17 +279,13 @@ impl ActivationHeights {
 // to feed either one. Both mirror Core's script-flag bits; pin it at
 // compile time.
 const _: () = {
-    assert!(consensus::VERIFY_P2SH == bitcoinconsensus::VERIFY_P2SH);
-    assert!(consensus::VERIFY_DERSIG == bitcoinconsensus::VERIFY_DERSIG);
-    assert!(consensus::VERIFY_NULLDUMMY == bitcoinconsensus::VERIFY_NULLDUMMY);
-    assert!(
-        consensus::VERIFY_CHECKLOCKTIMEVERIFY == bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
-    );
-    assert!(
-        consensus::VERIFY_CHECKSEQUENCEVERIFY == bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
-    );
-    assert!(consensus::VERIFY_WITNESS == bitcoinconsensus::VERIFY_WITNESS);
-    assert!(consensus::VERIFY_TAPROOT == bitcoinconsensus::VERIFY_TAPROOT);
+    assert!(consensus::VERIFY_P2SH == bitcoinkernel::VERIFY_P2SH);
+    assert!(consensus::VERIFY_DERSIG == bitcoinkernel::VERIFY_DERSIG);
+    assert!(consensus::VERIFY_NULLDUMMY == bitcoinkernel::VERIFY_NULLDUMMY);
+    assert!(consensus::VERIFY_CHECKLOCKTIMEVERIFY == bitcoinkernel::VERIFY_CHECKLOCKTIMEVERIFY);
+    assert!(consensus::VERIFY_CHECKSEQUENCEVERIFY == bitcoinkernel::VERIFY_CHECKSEQUENCEVERIFY);
+    assert!(consensus::VERIFY_WITNESS == bitcoinkernel::VERIFY_WITNESS);
+    assert!(consensus::VERIFY_TAPROOT == bitcoinkernel::VERIFY_TAPROOT);
 };
 
 /// Script-verification flags for a block at `height` on `network`.
@@ -350,8 +346,8 @@ pub const STANDARD_SCRIPT_VERIFY_FLAGS: u32 = {
 
 /// Core's `PolicyScriptChecks`: every input under
 /// [`STANDARD_SCRIPT_VERIFY_FLAGS`]. It runs on the Rust engine whatever
-/// `-consensus` selects, because libconsensus refuses any flag outside the
-/// consensus set (`bitcoinconsensus.cpp`, `verify_flags`). The node's own
+/// `-consensus` selects, because libbitcoinkernel's verify call refuses any
+/// flag outside the consensus set (`btck_ScriptVerificationFlags_ALL`). The node's own
 /// verifier then checks the same inputs under the block's flags, as Core's
 /// `ConsensusScriptChecks` does, and stays the authority on validity.
 pub fn verify_policy_scripts(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), ScriptError> {
@@ -359,8 +355,15 @@ pub fn verify_policy_scripts(tx: &Transaction, prev_outputs: &[TxOut]) -> Result
         .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
 }
 
-/// Script verifier backed by Bitcoin Core's libconsensus via FFI.
-/// Supports all consensus rules including taproot.
+/// Script verifier backed by Bitcoin Core's script interpreter through
+/// libbitcoinkernel's C API. Supports all consensus rules including taproot.
+///
+/// Like Core's `CheckInputScripts`, it parses the transaction and builds its
+/// `PrecomputedTransactionData` (txid, wtxid, and the BIP 143 / BIP 341
+/// hashes of prevouts, amounts, scripts, sequences and outputs) once, and
+/// every input's check reuses them. libbitcoinconsensus, which this replaced,
+/// redid all of that for every input, so a transaction cost time quadratic in
+/// its input count (#874).
 pub struct ConsensusVerifier {
     network: Network,
 }
@@ -371,21 +374,21 @@ impl ConsensusVerifier {
     }
 }
 
-/// Name the script error behind a libbitcoinconsensus rejection.
+/// Name the script error behind a libbitcoinkernel rejection.
 ///
-/// The C API cannot tell us: `bitcoinconsensus_verify_script` reports a
-/// coarse `ERR_SCRIPT` and the `ScriptError_t` that VerifyScript actually
-/// produced never crosses the FFI boundary. Bitcoin Core, calling
+/// The C API cannot tell us: `btck_script_pubkey_verify` reports a bare
+/// failure (surfaced here as a coarse `ERR_SCRIPT`) and the `ScriptError_t`
+/// that VerifyScript actually produced never crosses the FFI boundary. Bitcoin Core, calling
 /// VerifyScript directly, puts that specific name in the rejection —
 /// `mempool-script-verify-flag-failed (Non-canonical DER signature)` — and
 /// every client and test that reads a rejection reads the name.
 ///
 /// So the native engine, which computes the same thing and carries Core's
 /// `ScriptErrorString` table, is asked for the name. The *verdict* is not
-/// revisited: libconsensus has already rejected this input and that stands.
+/// revisited: the kernel has already rejected this input and that stands.
 /// This runs only on the failure path, and only to write the message.
 ///
-/// Only the input that failed is run. libconsensus has already passed every
+/// Only the input that failed is run. The kernel has already passed every
 /// input before it, so running those again would repeat that work for
 /// nothing.
 ///
@@ -436,7 +439,7 @@ impl ScriptVerifier for ConsensusVerifier {
             .map_err(|e| self.name_failure(tx, prev_outputs, height, e))
     }
 
-    /// libconsensus alone. A failure carries its coarse `ERR_SCRIPT`.
+    /// libbitcoinkernel alone. A failure carries its coarse `ERR_SCRIPT`.
     fn verify_transaction_unnamed(
         &self,
         tx: &Transaction,
@@ -455,45 +458,8 @@ impl ScriptVerifier for ConsensusVerifier {
             });
         }
 
-        let tx_bytes = bitcoin::consensus::serialize(tx);
-
         let flags = script_verify_flags(self.network, height);
-
-        // Build spent outputs array for taproot (needed for signature hash)
-        let script_bytes: Vec<Vec<u8>> = prev_outputs
-            .iter()
-            .map(|o| o.script_pubkey.as_bytes().to_vec())
-            .collect();
-
-        let utxos: Vec<bitcoinconsensus::Utxo> = prev_outputs
-            .iter()
-            .enumerate()
-            .map(|(i, o)| bitcoinconsensus::Utxo {
-                script_pubkey: script_bytes[i].as_ptr(),
-                script_pubkey_len: script_bytes[i].len() as u32,
-                value: o.value.to_sat() as i64,
-            })
-            .collect();
-
-        for (input_index, prev_out) in prev_outputs.iter().enumerate().take(tx.input.len()) {
-            let script_pubkey = prev_out.script_pubkey.as_bytes();
-            let amount = prev_out.value.to_sat();
-
-            bitcoinconsensus::verify_with_flags(
-                script_pubkey,
-                amount,
-                &tx_bytes,
-                Some(&utxos),
-                input_index,
-                flags,
-            )
-            .map_err(|e| ScriptError::VerifyFailed {
-                input: input_index,
-                reason: format!("{e:?}"),
-            })?;
-        }
-
-        Ok(())
+        kernel_verify_transaction(tx, prev_outputs, flags)
     }
 
     fn name_failure(
@@ -509,6 +475,59 @@ impl ScriptVerifier for ConsensusVerifier {
             Some(reason) => ScriptError::VerifyFailed { input, reason },
             None => err,
         }
+    }
+}
+
+/// Verify every input of `tx` with libbitcoinkernel under `flags`, parsing the
+/// transaction and building its precomputed data once. The caller has checked
+/// that `prev_outputs` has one entry per input.
+pub(crate) fn kernel_verify_transaction(
+    tx: &Transaction,
+    prev_outputs: &[TxOut],
+    flags: u32,
+) -> Result<(), ScriptError> {
+    use bitcoinkernel::prelude::TxOutExt;
+    use bitcoinkernel::{PrecomputedTransactionData, ScriptPubkey};
+
+    let setup = |reason: &str| ScriptError::VerifyFailed { input: 0, reason: reason.to_string() };
+    let ktx = bitcoinkernel::Transaction::new(&bitcoin::consensus::serialize(tx))
+        .map_err(|_| setup("ERR_TX_DESERIALIZE"))?;
+    let mut spent = Vec::with_capacity(prev_outputs.len());
+    for out in prev_outputs {
+        let spk = ScriptPubkey::new(out.script_pubkey.as_bytes())
+            .map_err(|_| setup("ERR_TX_DESERIALIZE"))?;
+        spent.push(bitcoinkernel::TxOut::new(&spk, out.value.to_sat() as i64));
+    }
+    // Every spent output goes in whatever the flags: BIP 341's signature
+    // hash commits to all of them, and the other sighash forms ignore them.
+    let txdata = PrecomputedTransactionData::new(&ktx, &spent)
+        .map_err(|_| setup("ERR_SPENT_OUTPUTS_MISMATCH"))?;
+
+    for (input, out) in spent.iter().enumerate() {
+        let spk = out.script_pubkey();
+        bitcoinkernel::verify(&spk, Some(out.value()), &ktx, input, Some(flags), &txdata).map_err(
+            |e| ScriptError::VerifyFailed { input, reason: kernel_error_name(&e).to_string() },
+        )?;
+    }
+    Ok(())
+}
+
+/// The libbitcoinconsensus-style name for a libbitcoinkernel verify error, so
+/// log lines and coarse rejection reasons keep the names they had.
+fn kernel_error_name(e: &bitcoinkernel::KernelError) -> &'static str {
+    use bitcoinkernel::{KernelError, ScriptVerifyError};
+    match e {
+        KernelError::ScriptVerify(ScriptVerifyError::Invalid) => "ERR_SCRIPT",
+        KernelError::ScriptVerify(ScriptVerifyError::TxInputIndex) => "ERR_TX_INDEX",
+        KernelError::ScriptVerify(ScriptVerifyError::InvalidFlags)
+        | KernelError::ScriptVerify(ScriptVerifyError::InvalidFlagsCombination) => {
+            "ERR_INVALID_FLAGS"
+        }
+        KernelError::ScriptVerify(ScriptVerifyError::SpentOutputsRequired) => {
+            "ERR_SPENT_OUTPUTS_REQUIRED"
+        }
+        KernelError::MismatchedOutputsSize => "ERR_SPENT_OUTPUTS_MISMATCH",
+        _ => "ERR_SCRIPT",
     }
 }
 
@@ -1010,6 +1029,86 @@ mod tests {
         assert_eq!(cpp_shadow.primary_engine(), PrimaryEngine::Rust);
     }
 
+    /// Three spends from mainnet block 974,146, with the outputs they spend:
+    /// two P2TR inputs; six inputs mixing P2WSH and P2SH; two P2PKH inputs.
+    fn mainnet_spends() -> Vec<(Transaction, Vec<TxOut>)> {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/mainnet_974146_spends.json")).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let hex = t["hex"].as_str().unwrap();
+                let tx = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
+                let prevs = t["prevouts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| TxOut {
+                        value: bitcoin::Amount::from_sat(p[1].as_u64().unwrap()),
+                        script_pubkey: bitcoin::ScriptBuf::from_hex(p[0].as_str().unwrap())
+                            .unwrap(),
+                    })
+                    .collect();
+                (tx, prevs)
+            })
+            .collect()
+    }
+
+    /// The kernel engine accepts real mainnet spends of every input type, and
+    /// agrees with the Rust engine on them.
+    #[test]
+    fn kernel_engine_accepts_mainnet_spends() {
+        let cpp = ConsensusVerifier::new(Network::Bitcoin);
+        let rust = RustVerifier::new(Network::Bitcoin);
+        for (tx, prevs) in mainnet_spends() {
+            let txid = tx.compute_txid();
+            if let Err(e) = cpp.verify_transaction(&tx, &prevs, 974_146) {
+                panic!("kernel rejects {txid}: {e:?}");
+            }
+            if let Err(e) = rust.verify_transaction(&tx, &prevs, 974_146) {
+                panic!("rust rejects {txid}: {e:?}");
+            }
+        }
+    }
+
+    /// A spent amount one satoshi off breaks the signatures that commit to
+    /// it, and the failure is reported against the first of them. A segwit v0
+    /// signature commits to its own input's amount (BIP 143); a taproot one
+    /// commits to every input's (BIP 341). This pins that each input is
+    /// checked against its own spent output out of the shared
+    /// per-transaction data.
+    #[test]
+    fn kernel_engine_reports_the_input_whose_amount_changed() {
+        let cpp = ConsensusVerifier::new(Network::Bitcoin);
+        for (tx, prevs) in mainnet_spends() {
+            for k in 0..prevs.len() {
+                let first_broken = (0..prevs.len()).find(|&i| {
+                    let taproot = prevs[i].script_pubkey.is_p2tr();
+                    // Native or P2SH-wrapped segwit v0.
+                    let v0 = !taproot && !tx.input[i].witness.is_empty();
+                    taproot || (i == k && v0)
+                });
+                let mut bad = prevs.clone();
+                bad[k].value += bitcoin::Amount::from_sat(1);
+                let got = cpp.verify_transaction_unnamed(&tx, &bad, 974_146);
+                let txid = tx.compute_txid();
+                if let Some(want) = first_broken {
+                    match got {
+                        Err(ScriptError::VerifyFailed { input, reason }) => {
+                            let got = (input, reason.as_str());
+                            assert_eq!(got, (want, "ERR_SCRIPT"), "{txid} input {k}");
+                        }
+                        other => panic!("{txid} input {k}: changed amount gave {other:?}"),
+                    }
+                } else if prevs[k].script_pubkey.is_p2pkh() {
+                    // A legacy signature does not commit to the amount.
+                    assert!(got.is_ok(), "{txid} input {k}: {got:?}");
+                }
+            }
+        }
+    }
+
     // Pin the per-network activation heights against Bitcoin Core's
     // chainparams.cpp buried-deployment heights. Round-tripping our own
     // table proves nothing; these literals were checked against Core.
@@ -1101,7 +1200,8 @@ mod tests {
             assert_eq!(script_verify_flags(net, 1), all, "{net}");
         }
         // WITNESS implies P2SH and TAPROOT implies WITNESS at every height
-        // on every network — libconsensus rejects flag sets violating this.
+        // on every network. The kernel rejects WITNESS without P2SH, and a
+        // taproot spend is a witness spend, so TAPROOT alone is incoherent.
         for net in [
             Network::Bitcoin,
             Network::Testnet,

@@ -1,6 +1,8 @@
 //! The BIP 341 signature message on the script path, against libbitcoinconsensus,
 //! and its cost when one input makes many signature checks over a large annex.
 
+mod kernel_ref;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
@@ -93,12 +95,12 @@ fn verify_both(tx: &Transaction, prevouts: &[TxOut], index: usize) -> (bool, boo
         .iter()
         .map(|o| consensus::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
         .collect();
-    let cpp_utxos: Vec<bitcoinconsensus::Utxo> = prevouts
+    let cpp_utxos: Vec<kernel_ref::Utxo> = prevouts
         .iter()
-        .map(|o| bitcoinconsensus::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
+        .map(|o| kernel_ref::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
         .collect();
     let rust = consensus::verify_with_flags(spk, VALUE, &bytes, Some(&rust_utxos), index, FLAGS).is_ok();
-    let cpp = bitcoinconsensus::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
+    let cpp = kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
     (rust, cpp)
 }
 
@@ -161,10 +163,21 @@ fn script_path_signatures_match_core_for_every_hash_type() {
 
 /// A tapscript leaf of `checks` signature checks, `OP_DUP <pk>
 /// OP_CHECKSIGVERIFY` repeated and a final `<pk> OP_CHECKSIG`, spent with
-/// one signature and an annex of `annex_len` bytes.
-fn many_checks_spend(checks: usize, annex_len: usize) -> (Transaction, Vec<TxOut>) {
+/// one signature and an annex of `annex_len` bytes. `pad` bytes of 520-byte
+/// pushes in an unexecuted `OP_0 OP_IF ... OP_ENDIF` go first, so a spend can
+/// carry the witness weight its signature-check budget needs without a large
+/// annex.
+fn many_checks_spend(checks: usize, annex_len: usize, pad: usize) -> (Transaction, Vec<TxOut>) {
     let pk = xonly();
     let mut leaf = Vec::new();
+    if pad > 0 {
+        leaf.extend([0x00, 0x63]); // OP_0 OP_IF
+        for _ in 0..pad.div_ceil(523) {
+            leaf.extend([0x4d, 0x08, 0x02]); // OP_PUSHDATA2 520
+            leaf.extend([0u8; 520]);
+        }
+        leaf.push(0x68); // OP_ENDIF
+    }
     for _ in 0..checks - 1 {
         leaf.push(0x76);
         leaf.extend(push(&pk));
@@ -186,18 +199,24 @@ fn many_checks_spend(checks: usize, annex_len: usize) -> (Transaction, Vec<TxOut
     (tx, prevouts)
 }
 
-fn time_both(tx: &Transaction, prevouts: &[TxOut]) -> (Duration, Duration) {
+fn time_rust(tx: &Transaction, prevouts: &[TxOut]) -> Duration {
     let mut bytes = Vec::new();
     tx.consensus_encode(&mut bytes).unwrap();
     let spk = prevouts[0].script_pubkey.as_bytes();
-    let rust_utxos = [consensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
-    let cpp_utxos = [bitcoinconsensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
+    let utxos = [consensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
     let t = Instant::now();
-    assert!(consensus::verify_with_flags(spk, VALUE, &bytes, Some(&rust_utxos), 0, FLAGS).is_ok());
-    let rust = t.elapsed();
+    assert!(consensus::verify_with_flags(spk, VALUE, &bytes, Some(&utxos), 0, FLAGS).is_ok());
+    t.elapsed()
+}
+
+fn time_core(tx: &Transaction, prevouts: &[TxOut]) -> Duration {
+    let mut bytes = Vec::new();
+    tx.consensus_encode(&mut bytes).unwrap();
+    let spk = prevouts[0].script_pubkey.as_bytes();
+    let utxos = [kernel_ref::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
     let t = Instant::now();
-    assert!(bitcoinconsensus::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), 0, FLAGS).is_ok());
-    (rust, t.elapsed())
+    assert!(kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&utxos), 0, FLAGS).is_ok());
+    t.elapsed()
 }
 
 /// The annex is hashed once per input, as Core does, not once per signature
@@ -205,16 +224,27 @@ fn time_both(tx: &Transaction, prevouts: &[TxOut]) -> (Duration, Duration) {
 /// 1 GB, several times Core's cost, and the gap grew with the square of the
 /// witness size (43 s against Core's 2.5 s for a 3.3 MB witness in a
 /// release build). Signature verification now dominates on both engines.
+///
+/// The engine is timed against itself, the same 8,000 checks with a
+/// 100-byte annex and the witness weight moved into unexecuted script,
+/// rather than against Core: the C++ engine is built
+/// optimized whatever the test profile (libbitcoinkernel's cmake build),
+/// so in a debug test build a comparison with it measures the profile.
+/// Core's time is printed for reference; in a release build the two match.
 #[test]
 fn many_checks_over_a_large_annex_cost_what_they_cost_core() {
-    let (tx, prevouts) = many_checks_spend(8_000, 128_000);
+    let (tx, prevouts) = many_checks_spend(8_000, 128_000, 0);
+    let (small_tx, small_prevouts) = many_checks_spend(8_000, 100, 128_000);
     // Warm both engines' one-time setup (the secp256k1 contexts).
-    let (small_tx, small_prevouts) = many_checks_spend(2, 100);
-    time_both(&small_tx, &small_prevouts);
-    let (rust, cpp) = time_both(&tx, &prevouts);
-    eprintln!("8000 checks over a 128 kB annex: rust {rust:?}, libbitcoinconsensus {cpp:?}");
+    let (warm_tx, warm_prevouts) = many_checks_spend(2, 100, 0);
+    time_rust(&warm_tx, &warm_prevouts);
+    time_core(&warm_tx, &warm_prevouts);
+    let small = time_rust(&small_tx, &small_prevouts);
+    let large = time_rust(&tx, &prevouts);
+    let core = time_core(&tx, &prevouts);
+    eprintln!("8000 checks: rust {small:?} (100 B annex), {large:?} (128 kB annex); core {core:?} (128 kB)");
     assert!(
-        rust < cpp * 3 + Duration::from_millis(500),
-        "the engine took {rust:?} where libbitcoinconsensus took {cpp:?}"
+        large < small * 3 / 2 + Duration::from_millis(100),
+        "a 128 kB annex took {large:?} where a 100-byte one took {small:?}"
     );
 }

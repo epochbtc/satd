@@ -69,6 +69,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Build deps:
 #   - clang + libclang-dev: rocksdb-sys bindgen
 #   - cmake + make + g++ + pkg-config: rocksdb / zstd / lz4 native code
+#   - cmake + libboost-dev: libbitcoinkernel-sys builds Bitcoin Core's
+#     kernel (the script interpreter) with cmake, against the Boost headers
 #   - libssl-dev: reqwest's default TLS backend is `native-tls`, which
 #     pulls openssl-sys on Linux. We deliberately don't switch the
 #     workspace to rustls-only: that requires auditing every transitive
@@ -86,6 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         curl \
         git \
+        libboost-dev \
         libclang-dev \
         libssl-dev \
         pkg-config \

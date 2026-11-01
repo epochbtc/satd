@@ -50,7 +50,7 @@ satd is built with these priorities in mind:
 ## Features
 
 ### Consensus & Network
-*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback and runtime script-level shadow validation between the two. Shadow verification has zero wall clock cost in most cases because it's performed async and non-blocking on the critical path. Validated from genesis to tip on mainnet, signet and testnet4 to date.
+*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, with Bitcoin Core's own C++ script interpreter (through `libbitcoinkernel`) as the conservative primary and runtime script-level shadow validation between the two. Shadow verification has zero wall clock cost in most cases because it's performed async and non-blocking on the critical path. Validated from genesis to tip on mainnet, signet and testnet4 to date.
 *   **Differential Block-Acceptance Testing:** Beyond script verification, the full block-acceptance pipeline (PoW, merkle/witness commitments, sigops, BIP 34, value conservation, maturity, timestamps, locktime/BIP 68) is checked against Core by static fixtures ported from Core's own tests and a generative fuzzer that dual-submits adversarial blocks to `satd` and a live `bitcoind`.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 encrypted transport (`-v2transport`, on by default; opt-in `-v2only` anti-surveillance mode), Tor v3 (hardcoded `.onion` seeds), SOCKS5 `-proxy`.
@@ -121,7 +121,7 @@ keep the named volume) to resume the sync later.
 
 ### Building
 
-Requires Rust (stable, edition 2024), a C/C++ compiler, and clang/LLVM libraries (for `rocksdb-sys` bindgen).
+Requires Rust (stable, edition 2024), a C/C++ compiler, clang/LLVM libraries (for `rocksdb-sys` bindgen), cmake, and the Boost headers 1.74 or later (for `libbitcoinkernel-sys`, which builds Bitcoin Core's kernel: `apt install libboost-dev`, `brew install boost`).
 
 ```sh
 ./configure          # detect dependencies, generate .cargo/config.toml

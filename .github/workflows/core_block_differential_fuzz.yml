@@ -67,7 +67,9 @@ jobs:
       triaged: ${{ steps.triaged.outputs.done }}
     runs-on: ubuntu-24.04
     # Setup takes ~4 min, the two cold builds below ~30 (up from ~20 in
-    # mid-October), and fuzzing MAX_TOTAL_TIME (30 min by default). 60 minutes
+    # mid-October; libbitcoinkernel, which replaced libbitcoinconsensus in
+    # 0.8.0, adds a cmake build of Core's kernel to each), and fuzzing
+    # MAX_TOTAL_TIME (30 min by default). 60 minutes
     # stopped being enough on 2026-10-19 and every nightly after it was
     # cancelled mid-fuzz. 100 leaves ~35 minutes for the build to keep growing.
     #
@@ -161,7 +163,7 @@ jobs:
       # CANCELLATION is handled too, because GitHub *cancels* rather than fails
       # a job that exceeds `timeout-minutes`, and `failure()` is false for a
       # cancelled job. This job has no dependency cache, so a cold run builds
-      # cargo-fuzz, then node+rocksdb+bitcoinconsensus for gen_corpus, then the
+      # cargo-fuzz, then node+rocksdb+libbitcoinkernel for gen_corpus, then the
       # whole tree again under ASan, before fuzzing for 30 minutes — see the
       # `timeout-minutes` note above for how close that is to the ceiling. `cancel-in-progress` can cancel it too
       # (a workflow_dispatch on master supersedes the running nightly). A
@@ -315,7 +317,7 @@ jobs:
           - Commit: \`$COMMIT_SHA\`
 
           The job has no dependency cache, so every run cold-builds
-          \`cargo-fuzz\`, then \`node\` + rocksdb + bitcoinconsensus for
+          \`cargo-fuzz\`, then \`node\` + rocksdb + libbitcoinkernel for
           \`gen_corpus\`, then the whole tree again under ASan, and only then
           fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). If the build has
           grown past the headroom \`timeout-minutes\` leaves, this trips every
