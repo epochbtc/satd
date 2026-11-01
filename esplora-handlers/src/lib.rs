@@ -34,7 +34,7 @@ pub use blocking::work_permits_for;
 pub use config::{EsploraAuth, EsploraConfig};
 pub use error::EsploraError;
 pub use router::{RouterBuildError, build_router};
-pub use serve::{serve_plain, serve_tls};
+pub use serve::{serve_plain, serve_tls, tls_handshake_timeout};
 pub use state::EsploraState;
 // Re-export the shared TLS-config surface so callers that already
 // depend on this crate (e.g. `satd/main.rs`) don't also need a direct

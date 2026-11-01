@@ -1414,39 +1414,96 @@ async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = stop.wait_for(|v| *v).await;
 }
 
+/// Most connections the plain metrics listener serves at once, the TLS
+/// listener's cap. It is loopback by default, but nothing stops an operator
+/// binding it wider, and a client holding sockets open must run into a cap
+/// rather than the process's file-descriptor limit.
+pub const METRICS_HTTP_MAX_CONNECTIONS: usize = 64;
+
 /// The plain listener's accept loop, returning the listener when `stop`
 /// fires.
 async fn accept_http(
     listener: tokio::net::TcpListener,
     answerer: Answerer,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::net::TcpListener {
+    accept_http_limited(
+        listener,
+        answerer,
+        stop,
+        METRICS_HTTP_MAX_CONNECTIONS,
+        METRICS_HEADER_READ_TIMEOUT,
+    )
+    .await
+}
+
+/// [`accept_http`] with its connection cap and header budget as arguments,
+/// so a test can use small ones.
+async fn accept_http_limited(
+    listener: tokio::net::TcpListener,
+    answerer: Answerer,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    max_connections: usize,
+    header_read_timeout: std::time::Duration,
 ) -> tokio::net::TcpListener {
     let one_request = answerer.one_request_per_connection();
+    let conn_cap = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let at_capacity = crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+    let accept_errors = crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                match accept {
-                    Ok((stream, _addr)) => {
-                        let answerer = answerer.clone();
-                        let conn_stop = stop.clone();
-                        tokio::spawn(async move {
-                            let io = hyper_util::rt::TokioIo::new(stream);
-                            let svc = hyper::service::service_fn(move |req| {
-                                let answerer = answerer.clone();
-                                async move { Ok::<_, std::convert::Infallible>(respond(&answerer, req)) }
-                            });
-                            let conn = hyper::server::conn::http1::Builder::new()
-                                .keep_alive(!one_request)
-                                .serve_connection(io, svc);
-                            if let Err(e) = serve_until(conn, one_request, conn_stop).await {
-                                tracing::debug!("Metrics HTTP connection error: {}", e);
-                            }
-                        });
-                    }
+                let (stream, peer) = match accept {
+                    Ok(v) => v,
                     Err(e) => {
-                        tracing::error!("Metrics HTTP accept error: {}", e);
+                        if let Some(suppressed) = accept_errors.tick() {
+                            tracing::error!(error = %e, suppressed, "Metrics HTTP accept error");
+                        }
+                        // Back off so a persistent error (fd exhaustion)
+                        // does not busy-loop a runtime worker.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
                     }
-                }
+                };
+                // Taken at accept and held for the connection, so a socket
+                // that sends nothing counts.
+                let Ok(permit) = conn_cap.clone().try_acquire_owned() else {
+                    if let Some(suppressed) = at_capacity.tick() {
+                        tracing::warn!(
+                            %peer,
+                            suppressed,
+                            "Metrics HTTP at-capacity rejection ({max_connections} max)",
+                        );
+                    }
+                    continue;
+                };
+                let answerer = answerer.clone();
+                let conn_stop = stop.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    // hyper has no write timer: a client that stops reading
+                    // mid-response would hold its slot until it hung up.
+                    let stream = crate::http_serve::WriteDeadline::new(
+                        stream,
+                        Some(crate::http_serve::WRITE_STALL_TIMEOUT),
+                    );
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req| {
+                        let answerer = answerer.clone();
+                        async move { Ok::<_, std::convert::Infallible>(respond(&answerer, req)) }
+                    });
+                    // The header timer closes a socket that never completes a
+                    // request head, and a kept-alive one that sends no next
+                    // request; without a timer hyper has neither.
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(header_read_timeout)
+                        .keep_alive(!one_request)
+                        .serve_connection(io, svc);
+                    if let Err(e) = serve_until(conn, one_request, conn_stop).await {
+                        tracing::debug!("Metrics HTTP connection error: {}", e);
+                    }
+                });
             }
             _ = stopped(&mut stop) => break,
         }
@@ -1482,9 +1539,10 @@ pub const METRICS_TLS_MAX_CONNECTIONS: usize = 64;
 /// How long a client gets to finish the TLS handshake.
 const METRICS_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a client gets to send its request headers once the handshake is
-/// done. Without it a client dribbling header bytes pins a connection slot.
-const METRICS_TLS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a client gets to send its request headers (on the TLS listener,
+/// once the handshake is done). Without it a client dribbling header bytes,
+/// or sending none, pins a connection slot.
+const METRICS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Native TLS for the metrics listener (`--metricstlsbind`). Built once at
 /// startup and shared by the startup status server and the running node's
@@ -1523,8 +1581,8 @@ impl MetricsTls {
 
 /// Serve the same endpoints as [`serve_metrics_http`] over TLS, on a listener
 /// the caller has already bound (so a bind failure is the caller's startup
-/// error). Unlike the plain listener, which is meant for loopback, this one
-/// bounds concurrent connections, the handshake and the header read.
+/// error). Like the plain listener it bounds concurrent connections and the
+/// header read, and it bounds the handshake too.
 pub async fn serve_metrics_https(
     ctx: MetricsContext,
     listener: tokio::net::TcpListener,
@@ -1561,6 +1619,7 @@ async fn accept_https(
 ) -> tokio::net::TcpListener {
     let one_request = answerer.one_request_per_connection();
     let conn_cap = Arc::new(tokio::sync::Semaphore::new(METRICS_TLS_MAX_CONNECTIONS));
+    let accept_errors = crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
 
     loop {
         tokio::select! {
@@ -1570,7 +1629,9 @@ async fn accept_https(
                     Err(e) => {
                         // Back off so a persistent error (fd exhaustion)
                         // does not busy-loop a runtime worker.
-                        tracing::warn!(error = %e, "Metrics HTTPS accept error");
+                        if let Some(suppressed) = accept_errors.tick() {
+                            tracing::warn!(error = %e, suppressed, "Metrics HTTPS accept error");
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
@@ -1592,6 +1653,12 @@ async fn accept_https(
                 let conn_stop = stop.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    // Beneath TLS, as on the other listeners: a stalled write
+                    // closes the connection (see `http_serve::WriteDeadline`).
+                    let stream = crate::http_serve::WriteDeadline::new(
+                        stream,
+                        Some(crate::http_serve::WRITE_STALL_TIMEOUT),
+                    );
                     let tls_stream = match tokio::time::timeout(
                         METRICS_TLS_HANDSHAKE_TIMEOUT,
                         tls.acceptor.accept(stream),
@@ -1626,7 +1693,7 @@ async fn accept_https(
                     });
                     let conn = hyper::server::conn::http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(METRICS_TLS_HEADER_READ_TIMEOUT)
+                        .header_read_timeout(METRICS_HEADER_READ_TIMEOUT)
                         .keep_alive(!one_request)
                         .serve_connection(io, svc);
                     if let Err(e) = serve_until(conn, one_request, conn_stop).await {
@@ -2423,6 +2490,53 @@ mod tests {
         let (head, body) = raw.split_once("\r\n\r\n").unwrap();
         let status = head[9..12].parse().unwrap();
         (status, head.to_ascii_lowercase(), body.to_string())
+    }
+
+    /// The plain listener caps open sockets at accept and closes a socket
+    /// that sends no request head within the header budget. It had neither:
+    /// a silent socket was held forever, and any number of them were.
+    #[tokio::test]
+    async fn the_plain_listener_caps_sockets_and_closes_a_silent_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(accept_http_limited(
+            listener,
+            Answerer::Startup(startup_status(false)),
+            stop_rx,
+            1,
+            std::time::Duration::from_millis(300),
+        ));
+
+        // A silent socket takes the one slot.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The next is dropped at accept: no answer, just EOF.
+        let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = refused.write_all(b"GET /healthz HTTP/1.1\r\nHost: satd\r\n\r\n").await;
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refused.read_to_end(&mut raw),
+        )
+        .await
+        .expect("a socket over the cap is closed");
+        assert!(raw.is_empty(), "over the cap: {:?}", String::from_utf8_lossy(&raw));
+
+        // The silent socket is closed once the header budget runs out...
+        let mut buf = [0u8; 16];
+        let closed = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(closed, "a silent socket must be closed after the header budget");
+        // ...which frees its slot.
+        let (code, _, body) = get(addr, "/healthz").await;
+        assert_eq!((code, body.as_str()), (200, "ok\n"));
+
+        stop.send(true).unwrap();
+        let _ = task.await;
     }
 
     #[tokio::test]

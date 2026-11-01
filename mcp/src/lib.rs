@@ -746,7 +746,11 @@ pub async fn serve_http(
                         // Brief backoff so a persistent accept error (e.g.
                         // EMFILE / fd exhaustion) doesn't busy-loop a core
                         // runtime worker and flood the log. Matches RPC.
-                        tracing::warn!(error = %e, "MCP accept error");
+                        static ACCEPT_ERRORS: node::warn_budget::WarnBudget =
+                            node::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+                        if let Some(suppressed) = ACCEPT_ERRORS.tick() {
+                            tracing::warn!(error = %e, suppressed, "MCP accept error");
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
@@ -775,6 +779,13 @@ pub async fn serve_http(
                 let conn_shutdown = conn_shutdown_template.clone();
                 tokio::spawn(async move {
                             let _permit = permit;
+                            // A write that makes no progress closes the
+                            // connection, so a client that stops reading
+                            // mid-response gives its slot back.
+                            let stream = node::http_serve::WriteDeadline::new(
+                                stream,
+                                Some(node::http_serve::WRITE_STALL_TIMEOUT),
+                            );
                             let svc = hyper::service::service_fn(move |req| {
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();
@@ -824,11 +835,19 @@ pub async fn serve_http(
                                             return;
                                         }
                                         Err(_) => {
-                                            tracing::warn!(
-                                                peer = %addr,
-                                                timeout_secs = tls.handshake_timeout.as_secs(),
-                                                "MCP TLS handshake timed out — closing connection",
-                                            );
+                                            static TIMEOUTS: node::warn_budget::WarnBudget =
+                                                node::warn_budget::WarnBudget::new(
+                                                    5,
+                                                    std::time::Duration::from_secs(60),
+                                                );
+                                            if let Some(suppressed) = TIMEOUTS.tick() {
+                                                tracing::warn!(
+                                                    peer = %addr,
+                                                    timeout_secs = tls.handshake_timeout.as_secs(),
+                                                    suppressed,
+                                                    "MCP TLS handshake timed out — closing connection",
+                                                );
+                                            }
                                             return;
                                         }
                                     };

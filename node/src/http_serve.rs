@@ -18,6 +18,16 @@
 //!   timer on the connection builder. `axum::serve` builds hyper without
 //!   one, and hyper then discards its own default, so a connection served
 //!   that way stays open for as long as the client keeps the socket.
+//! - **A write timeout.** A write that makes no progress for
+//!   `write_timeout` fails and closes the connection (see
+//!   [`WriteDeadline`]), so a client that asks for a large response, or
+//!   opens an SSE stream or a WebSocket, and then stops reading gives its
+//!   slot back instead of holding it for as long as the send buffer stays
+//!   full.
+//!
+//! At shutdown the loop stops accepting and every connection is told to
+//! finish: idle keep-alive connections close, and an SSE response, which
+//! would otherwise never finish, ends its stream (see [`EndAtShutdown`]).
 //!
 //! [`serve_http_listener`] is the accept loop; [`serve_http_connection`]
 //! serves one connection and is shared with the JSON-RPC listeners, which
@@ -89,8 +99,31 @@ pub fn clamp_cap(max: usize) -> usize {
     max.min(CAP_CEILING)
 }
 
-/// A listener's socket cap and idle budget. Cloning shares the socket cap
-/// (see [`SocketCap`]).
+/// The largest timeout satd hands to hyper. hyper arms its header timer as
+/// `Instant::now() + timeout`, which panics on overflow, and the timeout
+/// options accept any number of seconds: `-rpcservertimeout` above about
+/// 9.2e18 panicked every connection task, so the listener answered nothing.
+/// A year is as good as forever for a connection, so the ceiling only
+/// catches mistakes.
+pub const TIMEOUT_CEILING: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// `timeout` clamped to [`TIMEOUT_CEILING`].
+pub fn clamp_timeout(timeout: Duration) -> Duration {
+    timeout.min(TIMEOUT_CEILING)
+}
+
+/// How long a write on a satd-only HTTP surface (Esplora, streamws) may make
+/// no progress before the connection is closed. The JSON-RPC listeners use
+/// `-rpcservertimeout`, as Core's libevent server does for writes, and this
+/// when that is `0`.
+///
+/// It bounds a stall, not a response: every byte the client reads restarts
+/// it, and an SSE stream or WebSocket waiting for its next event has no write
+/// pending, so a long-lived stream is never cut while its client keeps up.
+pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A listener's socket cap, idle budget and write budget. Cloning shares the
+/// socket cap (see [`SocketCap`]).
 #[derive(Clone, Debug)]
 pub struct ListenerLimits {
     /// Open sockets, counted at accept.
@@ -99,6 +132,10 @@ pub struct ListenerLimits {
     /// is closed. `None` leaves an idle connection open until the client
     /// closes it, which with a cap means an idle client keeps its slot.
     pub idle_timeout: Option<Duration>,
+    /// How long a write may make no progress before the connection is
+    /// closed (see [`WriteDeadline`]). `None` lets a write wait for as long
+    /// as the client leaves its receive window shut.
+    pub write_timeout: Option<Duration>,
 }
 
 /// Accept connections on `listener` until `shutdown` flips, serving each
@@ -121,21 +158,29 @@ pub async fn serve_http_listener<S, B>(
         + Send
         + 'static,
     S::Error: Into<tower::BoxError>,
-    S::Future: Send,
+    S::Future: Send + 'static,
     B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
     B::Error: Into<tower::BoxError>,
 {
     let cap = limits.sockets.permits.clone();
     let transport = Arc::new(transport);
-    // One budget per listener, so a flood on one surface does not silence
-    // another's report.
-    let at_capacity = Arc::new(WarnBudget::new(5, Duration::from_secs(60)));
+    let service = EndStreamsAtShutdown {
+        inner: service,
+        shutdown: shutdown.clone(),
+    };
+    // One budget per listener for each line a flood can drive, so a flood on
+    // one surface does not silence another's report.
+    let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
+    let accept_errors = WarnBudget::new(5, Duration::from_secs(60));
+    let handshake_timeouts = Arc::new(WarnBudget::new(5, Duration::from_secs(60)));
     loop {
         let (stream, peer) = tokio::select! {
             res = listener.accept() => match res {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(surface, error = %e, "accept error");
+                    if let Some(suppressed) = accept_errors.tick() {
+                        tracing::warn!(surface, error = %e, suppressed, "accept error");
+                    }
                     // Brief sleep on a transient error (EMFILE, ECONNABORTED)
                     // so the loop does not spin.
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -166,10 +211,13 @@ pub async fn serve_http_listener<S, B>(
         };
         let service = service.clone();
         let transport = transport.clone();
+        let handshake_timeouts = handshake_timeouts.clone();
         let mut conn_shutdown = shutdown.clone();
         // The permit rides with the socket (see `Permitted`), through the
         // handshake, the HTTP connection, and any upgrade that outlives it.
-        let stream = Permitted::new(stream, permit);
+        // The write deadline sits beneath TLS, on the socket itself, so it
+        // sees the bytes the kernel will not take.
+        let stream = Permitted::new(WriteDeadline::new(stream, limits.write_timeout), permit);
         tokio::spawn(async move {
             let stopped = async move {
                 let _ = conn_shutdown.changed().await;
@@ -185,7 +233,9 @@ pub async fn serve_http_listener<S, B>(
                 Transport::Tls(tls) => {
                     // The handshake runs on this task, not the accept loop,
                     // so a slow client stalls only itself.
-                    let Some(tls_stream) = tls_accept(surface, tls, stream, peer).await else {
+                    let Some(tls_stream) =
+                        tls_accept(surface, tls, stream, peer, &handshake_timeouts).await
+                    else {
                         return;
                     };
                     if let Err(e) =
@@ -202,12 +252,17 @@ pub async fn serve_http_listener<S, B>(
 
 /// Complete a TLS handshake under the transport's budget and apply the mTLS
 /// checks. `None` means the connection was dropped (already logged).
+///
+/// `timeouts` is the listener's budget for the timed-out line: a client can
+/// open sockets and send nothing at the rate of cap ÷ handshake budget, and
+/// one line per socket is that many lines a second.
 async fn tls_accept(
     surface: &'static str,
     tls: &TlsTransport,
-    stream: Permitted<TcpStream>,
+    stream: Permitted<WriteDeadline<TcpStream>>,
     peer: std::net::SocketAddr,
-) -> Option<tokio_rustls::server::TlsStream<Permitted<TcpStream>>> {
+    timeouts: &WarnBudget,
+) -> Option<tokio_rustls::server::TlsStream<Permitted<WriteDeadline<TcpStream>>>> {
     let tls_stream =
         match tokio::time::timeout(tls.handshake_timeout, tls.acceptor.accept(stream)).await {
             Ok(Ok(s)) => s,
@@ -216,12 +271,15 @@ async fn tls_accept(
                 return None;
             }
             Err(_) => {
-                tracing::warn!(
-                    surface,
-                    peer = %peer,
-                    timeout_secs = tls.handshake_timeout.as_secs(),
-                    "TLS handshake timed out — closing connection",
-                );
+                if let Some(suppressed) = timeouts.tick() {
+                    tracing::warn!(
+                        surface,
+                        peer = %peer,
+                        timeout_secs = tls.handshake_timeout.as_secs(),
+                        suppressed,
+                        "TLS handshake timed out — closing connection",
+                    );
+                }
                 return None;
             }
         };
@@ -293,7 +351,7 @@ where
 
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.keep_alive(true);
-    if let Some(timeout) = header_read_timeout {
+    if let Some(timeout) = header_read_timeout.map(clamp_timeout) {
         // hyper's timer is armed each time a request head is awaited, the
         // first one included, so this covers a connection that sends
         // nothing, a request head that stalls part-way, and the idle gap
@@ -389,6 +447,222 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Permitted<I> {
     }
 }
 
+/// A socket whose writes fail once one has made no progress for the budget.
+///
+/// A client that stops reading leaves the server's write pending once the
+/// kernel's send buffer fills, and nothing else ends that wait: hyper's
+/// header timer covers only the wait for a request, and an upgraded socket
+/// or a streaming response has no timer at all. The write then holds the
+/// socket, and its slot under the listener's cap, for as long as the client
+/// keeps the connection open.
+///
+/// The clock starts when a write (or flush, or shutdown) first returns
+/// `Pending` and stops at the next one that completes, so it measures a
+/// stall, not a response: a large body to a slow reader is fine as long as
+/// the reader keeps reading. When it runs out the pending call returns
+/// `TimedOut`, which ends the HTTP connection or the WebSocket on it.
+pub struct WriteDeadline<I> {
+    inner: I,
+    budget: Option<Duration>,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<I> WriteDeadline<I> {
+    /// `budget` of `None` is a plain pass-through.
+    pub fn new(inner: I, budget: Option<Duration>) -> Self {
+        Self {
+            inner,
+            budget,
+            stalled: None,
+        }
+    }
+
+    /// Account for the outcome of one write-side call.
+    fn progress<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        poll: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+        let Poll::Pending = poll else {
+            self.stalled = None;
+            return poll;
+        };
+        let Some(budget) = self.budget else {
+            return Poll::Pending;
+        };
+        // `tokio::time::sleep` saturates a deadline past the end of time, so
+        // no budget can overflow here.
+        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
+        if stalled.as_mut().poll(cx).is_ready() {
+            self.stalled = None;
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("write made no progress for {}s", budget.as_secs()),
+            )));
+        }
+        Poll::Pending
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteDeadline<I> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<I> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.progress(cx, poll)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.progress(cx, poll)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.progress(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.progress(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// Whether `response` is a Server-Sent Events stream.
+fn is_event_stream<B>(response: &hyper::Response<B>) -> bool {
+    response
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .get(.."text/event-stream".len())
+                .is_some_and(|t| t.eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+/// The listener's service, with every SSE response body wrapped in
+/// [`EndAtShutdown`].
+///
+/// hyper's graceful shutdown lets the response in flight finish, and an SSE
+/// response never does: without this an open `/sse` (streamws) or Esplora
+/// SSE stream kept its connection, and the client got no end-of-stream,
+/// until the process exited. Recognised by its content type, so every SSE
+/// route on a listener is covered without each handler having to plumb the
+/// shutdown signal through. Any other response is left to finish.
+#[derive(Clone)]
+struct EndStreamsAtShutdown<S> {
+    inner: S,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl<S, B> tower::Service<hyper::Request<hyper::body::Incoming>> for EndStreamsAtShutdown<S>
+where
+    S: tower::Service<hyper::Request<hyper::body::Incoming>, Response = hyper::Response<B>>,
+    S::Future: Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+{
+    type Response = hyper::Response<EndAtShutdown<B>>;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        let fut = self.inner.call(req);
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            let response = fut.await?;
+            let stream = is_event_stream(&response);
+            Ok(response.map(|body| EndAtShutdown::new(body, stream.then_some(shutdown))))
+        })
+    }
+}
+
+/// A response body that, when given a shutdown signal, ends cleanly once the
+/// signal fires: the client reads the end of the chunked stream, and hyper,
+/// whose graceful shutdown was waiting on this response, closes the
+/// connection. Without a signal it passes the body through untouched.
+pub struct EndAtShutdown<B> {
+    inner: std::pin::Pin<Box<B>>,
+    stop: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+impl<B> EndAtShutdown<B> {
+    fn new(inner: B, shutdown: Option<watch::Receiver<bool>>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            stop: shutdown.map(|mut rx| {
+                Box::pin(async move {
+                    // A dropped sender is a shutdown too: nothing is left to
+                    // signal one.
+                    let _ = rx.wait_for(|stopping| *stopping).await;
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            }),
+        }
+    }
+}
+
+impl<B: hyper::body::Body> hyper::body::Body for EndAtShutdown<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(stop) = self.stop.as_mut()
+            && stop.as_mut().poll(cx).is_ready()
+        {
+            return std::task::Poll::Ready(None);
+        }
+        self.inner.as_mut().poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +704,7 @@ mod tests {
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(2),
             idle_timeout: None,
+            write_timeout: None,
         })
         .await;
         let mut c1 = TcpStream::connect(addr).await.unwrap();
@@ -475,6 +750,7 @@ mod tests {
         let limits = ListenerLimits {
             sockets: SocketCap::new(1),
             idle_timeout: None,
+            write_timeout: None,
         };
         let (a, sd_a) = start(limits.clone()).await;
         let (b, sd_b) = start(limits).await;
@@ -510,6 +786,7 @@ mod tests {
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_millis(200)),
+            write_timeout: None,
         })
         .await;
         let mut c = TcpStream::connect(addr).await.unwrap();
@@ -526,6 +803,7 @@ mod tests {
         let (addr, sd_tx2) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: None,
+            write_timeout: None,
         })
         .await;
         let mut c = TcpStream::connect(addr).await.unwrap();
@@ -543,6 +821,7 @@ mod tests {
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_millis(200)),
+            write_timeout: None,
         })
         .await;
         let mut c = TcpStream::connect(addr).await.unwrap();
@@ -561,6 +840,7 @@ mod tests {
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_millis(200)),
+            write_timeout: None,
         })
         .await;
         let mut c = TcpStream::connect(addr).await.unwrap();
@@ -662,6 +942,7 @@ mod tests {
             ListenerLimits {
                 sockets: SocketCap::new(1),
                 idle_timeout: None,
+                write_timeout: None,
             },
             sd_rx,
         ));
@@ -763,6 +1044,7 @@ mod tests {
             ListenerLimits {
                 sockets: SocketCap::new(0),
                 idle_timeout: Some(Duration::from_millis(200)),
+                write_timeout: None,
             },
             sd_rx,
         ));
@@ -798,6 +1080,7 @@ mod tests {
             ListenerLimits {
                 sockets: SocketCap::new(0),
                 idle_timeout: Some(Duration::from_millis(200)),
+                write_timeout: None,
             },
             sd_rx,
         ));
@@ -809,12 +1092,169 @@ mod tests {
         let _ = sd_tx.send(true);
     }
 
+    /// A timeout too large for `Instant` is clamped rather than handed to
+    /// hyper, which computes `now + timeout` and panicked the connection
+    /// task, so the listener answered nothing.
+    #[tokio::test]
+    async fn a_huge_idle_timeout_is_clamped_not_panicking() {
+        assert_eq!(clamp_timeout(Duration::from_secs(u64::MAX)), TIMEOUT_CEILING);
+        assert_eq!(clamp_timeout(Duration::from_secs(30)), Duration::from_secs(30));
+        let (addr, sd_tx) = start(ListenerLimits {
+            sockets: SocketCap::new(0),
+            idle_timeout: Some(Duration::from_secs(u64::MAX)),
+            write_timeout: Some(Duration::from_secs(u64::MAX)),
+        })
+        .await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let resp = ping(&mut c).await;
+        assert!(
+            resp.as_deref().is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+            "a huge timeout must still serve: {resp:?}"
+        );
+        let _ = sd_tx.send(true);
+    }
+
+    /// A write with nowhere to go fails once it has made no progress for the
+    /// budget; a reader that keeps reading, however slowly, gets everything.
+    #[tokio::test]
+    async fn a_stalled_write_times_out_and_a_slow_reader_does_not() {
+        use tokio::io::AsyncWriteExt as _;
+        let budget = Duration::from_millis(200);
+
+        // Nobody reads: the 64-byte pipe fills and the write stalls.
+        let (a, _b) = tokio::io::duplex(64);
+        let mut w = WriteDeadline::new(a, Some(budget));
+        let err = tokio::time::timeout(Duration::from_secs(5), w.write_all(&[0u8; 4096]))
+            .await
+            .expect("the write must fail, not hang")
+            .expect_err("a stalled write must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // A reader taking 64 bytes every 50 ms: the whole write takes far
+        // longer than the budget, but no single wait does.
+        let (a, mut b) = tokio::io::duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut got = 0;
+            let mut buf = [0u8; 64];
+            while got < 1024 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                got += b.read(&mut buf).await.unwrap();
+            }
+            got
+        });
+        let mut w = WriteDeadline::new(a, Some(budget));
+        w.write_all(&[0u8; 1024]).await.expect("a slow reader is not a stall");
+        assert_eq!(reader.await.unwrap(), 1024);
+    }
+
+    /// A client that requests a large response and stops reading gives its
+    /// slot back once the write has stalled for the budget. Before, it held
+    /// the slot for as long as it kept the socket open.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_frees_its_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Far more than the kernel buffers on both ends hold, so the write
+        // stalls with most of the body unsent.
+        let router = Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .route("/big", get(|| async { vec![0u8; 64 << 20] }));
+        let (sd_tx, sd_rx) = watch::channel(false);
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            router,
+            ListenerLimits {
+                sockets: SocketCap::new(1),
+                idle_timeout: None,
+                write_timeout: Some(Duration::from_millis(300)),
+            },
+            sd_rx,
+        ));
+
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled.write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        // The client never reads. The next socket waits for the slot.
+        let mut admitted = false;
+        for _ in 0..100 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            if ping(&mut c).await.is_some_and(|r| r.starts_with("HTTP/1.1 200")) {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(admitted, "a client that stopped reading must not keep its slot");
+        drop(stalled);
+        let _ = sd_tx.send(true);
+    }
+
+    /// Shutdown ends an SSE response: the client reads the end of the
+    /// chunked stream and then EOF, rather than an open stream that hyper's
+    /// graceful shutdown would wait on until the process exited. A response
+    /// that is not an event stream is not touched.
+    #[tokio::test]
+    async fn shutdown_ends_an_sse_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/sse",
+            get(|| async {
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::new(TickBody(ticker(1000, Duration::from_millis(100)))))
+                    .unwrap()
+            }),
+        );
+        let (sd_tx, sd_rx) = watch::channel(false);
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            router,
+            ListenerLimits {
+                sockets: SocketCap::new(0),
+                idle_timeout: None,
+                write_timeout: None,
+            },
+            sd_rx,
+        ));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /sse HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut got = read_ticks(&mut c, 2).await;
+        let _ = sd_tx.send(true);
+        let mut buf = [0u8; 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let ended = loop {
+            match tokio::time::timeout_at(deadline, c.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(n)) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break false,
+            }
+        };
+        assert!(ended, "shutdown must end an open SSE stream: {got:?}");
+        assert!(got.ends_with("0\r\n\r\n"), "the stream ends cleanly: {got:?}");
+    }
+
+    #[test]
+    fn event_streams_are_recognised_by_content_type() {
+        let resp = |ct: &str| hyper::Response::builder().header("content-type", ct).body(()).unwrap();
+        assert!(is_event_stream(&resp("text/event-stream")));
+        assert!(is_event_stream(&resp("Text/Event-Stream; charset=utf-8")));
+        assert!(!is_event_stream(&resp("application/json")));
+        assert!(!is_event_stream(&resp("text/event")));
+        assert!(!is_event_stream(&hyper::Response::new(())));
+    }
+
     /// Shutdown stops the accept loop and closes idle connections.
     #[tokio::test]
     async fn shutdown_closes_idle_connections() {
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: None,
+            write_timeout: None,
         })
         .await;
         let mut c = TcpStream::connect(addr).await.unwrap();

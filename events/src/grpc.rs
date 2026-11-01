@@ -474,12 +474,17 @@ impl EventSink for GrpcEventSink {
                                     return;
                                 }
                                 Err(_) => {
-                                    warn!(
-                                        target: "events::grpc",
-                                        peer = ?peer,
-                                        timeout_secs = tls.handshake_timeout.as_secs(),
-                                        "events gRPC TLS handshake timed out — dropping connection",
-                                    );
+                                    static TIMEOUTS: node::warn_budget::WarnBudget =
+                                        node::warn_budget::WarnBudget::new(5, Duration::from_secs(60));
+                                    if let Some(suppressed) = TIMEOUTS.tick() {
+                                        warn!(
+                                            target: "events::grpc",
+                                            peer = ?peer,
+                                            timeout_secs = tls.handshake_timeout.as_secs(),
+                                            suppressed,
+                                            "events gRPC TLS handshake timed out — dropping connection",
+                                        );
+                                    }
                                     return;
                                 }
                             };

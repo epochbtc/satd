@@ -21,7 +21,10 @@ in the [Terminal UI](tui.md) chapter.
 The metrics and health server starts only when a port is set. Use
 `--metricsport=<port>` to enable it. `--metricsbind=<addr>` sets the bind
 address alone (default `127.0.0.1`) and does not enable the server on its own.
-The listener binds `<metricsbind>:<metricsport>`.
+The listener binds `<metricsbind>:<metricsport>`. It serves at most 64
+connections at once, counted at accept, and closes a connection that sends no
+request head within 30 s or stops reading a response for 60 s, so a client
+holding sockets open cannot exhaust the process's file descriptors. The TLS listener below has the same limits.
 
 ### Over TLS
 

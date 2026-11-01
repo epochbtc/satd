@@ -21,6 +21,20 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
+/// The TLS handshake budget when `--esplorarequesttimeout=0`: the option's
+/// own default. `0` leaves idle connections open; it must not also leave a
+/// handshake no time at all, which made TLS on Esplora impossible to use.
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The TLS listener's handshake budget for `--esplorarequesttimeout`
+/// (seconds): the same value, or [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] for `0`.
+pub fn tls_handshake_timeout(request_timeout_secs: u64) -> Duration {
+    match request_timeout_secs {
+        0 => DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+        secs => node::http_serve::clamp_timeout(Duration::from_secs(secs)),
+    }
+}
+
 /// Serve `router` on the plain listener until `shutdown` flips.
 pub async fn serve_plain(
     listener: TcpListener,
@@ -65,10 +79,20 @@ mod tests {
     use std::io::Write;
     use tls_config::{ClientAuthPolicy, build_acceptor};
 
+    /// `--esplorarequesttimeout=0` leaves idle connections open; the TLS
+    /// handshake still gets a budget, so TLS can complete.
+    #[test]
+    fn a_zero_request_timeout_keeps_a_handshake_budget() {
+        assert_eq!(tls_handshake_timeout(0), DEFAULT_TLS_HANDSHAKE_TIMEOUT);
+        assert_eq!(tls_handshake_timeout(7), Duration::from_secs(7));
+        assert_eq!(tls_handshake_timeout(u64::MAX), node::http_serve::TIMEOUT_CEILING);
+    }
+
     fn no_limits() -> ListenerLimits {
         ListenerLimits {
             sockets: node::http_serve::SocketCap::new(0),
             idle_timeout: None,
+            write_timeout: None,
         }
     }
 
@@ -373,6 +397,7 @@ mod tests {
             ListenerLimits {
                 sockets: node::http_serve::SocketCap::new(2),
                 idle_timeout: None,
+                write_timeout: None,
             },
             sd_rx,
         ));
