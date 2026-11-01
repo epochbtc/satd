@@ -291,9 +291,9 @@ fn preflight_caps_the_fee_rate() {
 
 #[test]
 fn preflight_caps_the_fee_of_a_transaction_only_a_policy_admits() {
-    // Two dust outputs make the transaction non-standard, so the dry run
-    // refuses it; the `allow` rule forgives that on submission. The cap
-    // must hold on the transaction the submission would admit.
+    // Two dust outputs make the transaction non-standard; the `allow` rule
+    // forgives that on submission, and since #999 in the dry run too. The
+    // cap must hold on the transaction the submission would admit.
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
     let rs = satd_policy::parse_ruleset("version 1\nallow mine when tx.source == rpc")
         .expect("ruleset");
@@ -301,8 +301,8 @@ fn preflight_caps_the_fee_of_a_transaction_only_a_policy_admits() {
     // 50,000 sat in fees.
     let tx = spend(prev(1), &[(1, 2), (1, 3), (COIN_VALUE - 50_002, 4)]);
     assert!(
-        mp.test_accept(&tx, &cs, &NoopVerifier).is_err(),
-        "the fixture must be one the dry run refuses"
+        mp.test_accept(&tx, &cs, &NoopVerifier).is_ok(),
+        "the dry run forgives what the allow rule forgives (#999)"
     );
 
     assert_eq!(
