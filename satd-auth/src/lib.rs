@@ -46,5 +46,5 @@ pub use quota::{
     Accounting, LocalAccounting, LocalQuotaStore, LocalRateLimiter, QuotaExceeded, QuotaStore,
     RateDecision, RateLimiter, RatePolicy, UnlimitedAccounting, WatchLease,
 };
-pub use store::{ReloadDelta, TokenEntry, TokenStore, TokenTable};
+pub use store::{ReloadDelta, TokenEntry, TokenStore, TokenTable, token_digest};
 pub use verify::Verifier;
