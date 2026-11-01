@@ -803,6 +803,15 @@ fn layer_b_allow_rule_forgives_nonstandard() {
         let (mut plain, _w, _p) = start_funded(None, &[]);
         let outputs: Vec<TxOut> = (0..5).map(|_| dust_output(&wallet)).collect();
         let (raw, _txid) = build_spend(&plain, &wallet, 1, outputs, 1_000);
+        // `testmempoolaccept` gives the same answer (#999).
+        let tested = plain
+            .rpc_call_with_params("testmempoolaccept", vec![json!([raw])])
+            .expect("testmempoolaccept rpc");
+        assert_eq!(
+            tested["result"][0]["allowed"],
+            json!(false),
+            "no-policy testmempoolaccept should refuse non-standard dust: {tested}"
+        );
         let resp = plain
             .rpc_call_with_params("sendrawtransaction", vec![json!(raw)])
             .expect("sendrawtransaction rpc");
@@ -819,6 +828,16 @@ fn layer_b_allow_rule_forgives_nonstandard() {
     let (mut node, _w, _pf) = start_funded(Some(ALLOW_FORGIVES_DUST), &[]);
     let outputs: Vec<TxOut> = (0..5).map(|_| dust_output(&wallet)).collect();
     let (raw, txid) = build_spend(&node, &wallet, 1, outputs, 1_000);
+    // `testmempoolaccept` must agree with `sendrawtransaction` (#999): it
+    // used to return the standardness refusal before the policy ran.
+    let tested = node
+        .rpc_call_with_params("testmempoolaccept", vec![json!([raw])])
+        .expect("testmempoolaccept rpc");
+    assert_eq!(
+        tested["result"][0]["allowed"],
+        json!(true),
+        "testmempoolaccept should forgive what the allow rule forgives: {tested}"
+    );
     let resp = node
         .rpc_call_with_params("sendrawtransaction", vec![json!(raw)])
         .expect("sendrawtransaction rpc");

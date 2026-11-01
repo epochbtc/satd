@@ -1596,6 +1596,11 @@ struct TestPrechecked {
     /// The fee with any `prioritisetransaction` delta.
     modified_fee: u64,
     cfg: MempoolConfig,
+    /// A standardness failure an `allow` rule could forgive, held for the
+    /// policy dry run in [`Mempool::test_finish_scoped`], as admission holds
+    /// its `deferred_nonstd` (§6.2). Only set when the ruleset has an
+    /// `allow` rule.
+    deferred_nonstd: Option<MempoolError>,
 }
 
 /// How [`Mempool::accept_package`] has a member judged, or how a reorg has a
@@ -6228,6 +6233,18 @@ impl Mempool {
         let txid = tx.compute_txid();
         let cfg = self.config.read().clone();
 
+        // As on admission: with an `allow` rule loaded, a failure in the
+        // exemptable standardness set is recorded rather than returned, and
+        // the policy dry run in `test_finish_scoped` forgives it on an
+        // `Allow` verdict (§6.2). Without one, failures refuse here as
+        // before (#999).
+        let has_allow = self
+            .policy
+            .load_full()
+            .as_ref()
+            .is_some_and(|r| !r.is_empty() && r.has_allow());
+        let mut deferred_nonstd: Option<MempoolError> = None;
+
         crate::validation::tx::check_transaction(tx)
             .map_err(|e| MempoolError::Validation(e.to_string()))?;
 
@@ -6237,7 +6254,11 @@ impl Mempool {
 
         let weight = tx.weight().to_wu() as usize;
         if weight > MAX_STANDARD_TX_WEIGHT {
-            return Err(MempoolError::Validation("tx-size".to_string()));
+            let e = MempoolError::Validation("tx-size".to_string());
+            if !has_allow {
+                return Err(e);
+            }
+            deferred_nonstd = Some(e);
         }
 
         // Standardness checks (dust, etc.) are deferred until after the fee
@@ -6390,9 +6411,25 @@ impl Mempool {
         // `sendrawtransaction` does — so it has to run here too, and in the
         // same place: before the relay floor, so a zero-fee dusty transaction
         // still reports "min relay fee not met".
+        //
+        // With an `allow` rule each failure is recorded instead, in
+        // admission's order: `check_standardness` runs first there, so its
+        // failure is the one reported if the verdict does not forgive it.
         if !cfg.accept_non_std_txn {
-            Self::check_spend_standardness(tx, &prev_outputs)?;
-            Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
+            if has_allow {
+                for result in [
+                    Self::check_standardness(tx, &cfg, weight),
+                    Self::check_spend_standardness(tx, &prev_outputs),
+                    Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee),
+                ] {
+                    if let Err(e) = result {
+                        deferred_nonstd.get_or_insert(e);
+                    }
+                }
+            } else {
+                Self::check_spend_standardness(tx, &prev_outputs)?;
+                Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
+            }
         }
         Self::check_sigop_cost(sigop_cost)?;
 
@@ -6418,7 +6455,8 @@ impl Mempool {
 
         // Standardness checks (dust, OP_RETURN, etc.) — deferred until after
         // the fee rate check so 0-fee txs get "min relay fee not met" (Core).
-        if !cfg.accept_non_std_txn {
+        // With an `allow` rule they were recorded above instead.
+        if !cfg.accept_non_std_txn && !has_allow {
             Self::check_standardness(tx, &cfg, weight)?;
         }
 
@@ -6469,6 +6507,7 @@ impl Mempool {
             conflicts,
             modified_fee: effective_fee,
             cfg,
+            deferred_nonstd,
         })
     }
 
@@ -6506,7 +6545,17 @@ impl Mempool {
     ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
         let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
-            txid, vsize, fee, fee_rate, weight, prev_outputs, prev_is_coinbase, mut ancestors, cfg, ..
+            txid,
+            vsize,
+            fee,
+            fee_rate,
+            weight,
+            prev_outputs,
+            prev_is_coinbase,
+            mut ancestors,
+            cfg,
+            mut deferred_nonstd,
+            ..
         } = pre;
         // Script verification, consensus then policy, as on admission
         // (tip + 1 = next block height).
@@ -6527,10 +6576,10 @@ impl Mempool {
         // quarantined in-mempool ancestor) is refused, exactly as
         // `accept_transaction` does, with `allowquarantined` defaulting off as
         // for `sendrawtransaction`. A template-only quarantine still relays, so it
-        // stays `allowed: true`. Standardness is not re-litigated here (this dry
-        // run already ran the standardness pass above), so deferred-standardness
-        // forgiveness is moot — this only ever surfaces the relay refusal, never
-        // adds a false one. Counters are left untouched: this is not a real eval.
+        // stays `allowed: true`. A standardness failure `test_prechecks`
+        // deferred is resolved here as admission resolves it (§6.2): an
+        // `Allow` verdict forgives it, `Pass` and `Quarantine` let it stand
+        // (#999). Counters are left untouched: this is not a real eval.
         if let Some(rs) = self.policy.load_full().as_ref().filter(|r| !r.is_empty()) {
             let inner = self.inner.read();
             // Transitive in-mempool ancestor set (for infectious propagation).
@@ -6557,10 +6606,20 @@ impl Mempool {
                 source, false,
             );
             let (mut scope, own_rule) = match &verdict {
-                satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
+                satd_policy::Verdict::Allow { .. } => {
+                    deferred_nonstd = None;
+                    (QuarantineScope::acting(), None)
+                }
+                satd_policy::Verdict::Pass => {
+                    if let Some(e) = deferred_nonstd.take() {
+                        return Err(e);
+                    }
                     (QuarantineScope::acting(), None)
                 }
                 satd_policy::Verdict::Quarantine { rule, scope } => {
+                    if let Some(e) = deferred_nonstd.take() {
+                        return Err(e);
+                    }
                     (policy_engine::map_scope(*scope), Some(rule.clone()))
                 }
             };
@@ -6581,6 +6640,11 @@ impl Mempool {
                 ));
             }
             final_scope = scope;
+        }
+        // A ruleset reloaded since the prechecks without its `allow` rules
+        // forgives nothing.
+        if let Some(e) = deferred_nonstd {
+            return Err(e);
         }
 
         Ok((txid, vsize, fee, final_scope))
@@ -12058,6 +12122,61 @@ mod tests {
             0,
             "nonstandard tx must not land in quarantine"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_agrees_with_admission_under_allow_rule() {
+        // #999: `testmempoolaccept` answers "would `sendrawtransaction`
+        // accept this?", so under an `allow` rule that forgives a
+        // standardness failure the two must agree. The same two-dust
+        // transaction goes through both, on one mempool.
+        let op = outpoint(0xa6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nallow mine when tx.source == rpc");
+
+        let tx = two_dust_spend(op, 100_000);
+        let (tested, _, _) = mp
+            .test_accept(&tx, &cs, &NoopVerifier)
+            .expect("test_accept must forgive what the allow rule forgives on admission");
+        let admitted = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("allow forgives the dust nonstandardness");
+        assert_eq!(tested, admitted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_refuses_nonstandard_the_allow_rule_does_not_forgive() {
+        // The must-still-refuse side of #999, and the same answer from both
+        // paths each time: with no policy, and with an `allow` rule that
+        // does not match (deferral on, verdict `Pass`), the dust refusal
+        // stands.
+        let op = outpoint(0xa7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = two_dust_spend(op, 100_000);
+
+        for rules in [None, Some("version 1\nallow mine when tx.source == mcp")] {
+            match rules {
+                Some(r) => set_ruleset(&mp, r),
+                None => mp.clear_policy(),
+            }
+            let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
+            assert!(matches!(tested, MempoolError::Dust), "{rules:?}: test_accept got {tested:?}");
+            let admitted = mp
+                .accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+                .unwrap_err();
+            assert!(matches!(admitted, MempoolError::Dust), "{rules:?}: admission got {admitted:?}");
+        }
+
+        // A matching quarantine rule does not forgive it either: the
+        // quarantine class is not a dumping ground (§6.2).
+        set_ruleset(
+            &mp,
+            "version 1\nallow mine when tx.source == mcp\nquarantine catch when tx.version == 2",
+        );
+        let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
+        assert!(matches!(tested, MempoolError::Dust), "quarantine: test_accept got {tested:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

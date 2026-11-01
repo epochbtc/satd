@@ -17,6 +17,7 @@ full in the in-development
 
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
+- RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
