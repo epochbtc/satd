@@ -351,6 +351,7 @@ where
             // session decides for all of them (they share the upgrade's
             // extensions).
             let mut verdict: Option<Result<Option<Principal>, ()>> = None;
+            let mut dropped = false;
             let mut entries = Vec::with_capacity(batch.len());
             for entry in batch.into_iter() {
                 let entry = match entry {
@@ -370,14 +371,20 @@ where
                             ),
                             // A notification gets no reply; one on a revoked
                             // token is dropped.
-                            (Err(()), BatchEntry::Notification(_)) => continue,
+                            (Err(()), BatchEntry::Notification(_)) => {
+                                dropped = true;
+                                continue;
+                            }
                         }
                     }
                     Err(err) => Err(err),
                 };
                 entries.push(entry);
             }
-            if entries.is_empty() {
+            // Nothing left because every entry was a dropped notification:
+            // no reply, as for a batch of notifications. An empty batch as
+            // sent goes on, to be answered `-32600` beneath.
+            if entries.is_empty() && dropped {
                 return MethodResponse::notification();
             }
             inner.batch(Batch::from(entries)).await
@@ -1204,6 +1211,29 @@ mod tests {
             assert_eq!(r["error"]["code"], TOKEN_REVOKED_CODE, "{r}");
         }
         assert_eq!(dispatched.load(Ordering::SeqCst), 2, "nothing dispatched after revocation");
+    }
+
+    /// An empty batch (`[]`) is still answered `-32600` by the layers
+    /// beneath; only a batch emptied by dropping a revoked token's
+    /// notifications gets no reply.
+    #[tokio::test]
+    async fn an_empty_batch_is_still_invalid_behind_the_recheck() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = TokenRecheck { inner: BatchRateFilter { inner: Recorder { dispatched: dispatched.clone() } } };
+        let rp = svc.batch(Batch::from(vec![])).await;
+        assert!(rp.as_json().get().contains("-32600"), "{}", rp.as_json().get());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ws_authfile(dir.path(), "");
+        let store = Arc::new(satd_auth::TokenStore::load(&path).unwrap());
+        let session = BearerSession::new(store.clone(), satd_auth::token_digest("ws-tok"));
+        std::fs::write(&path, "version = 1\n").unwrap();
+        store.reload().unwrap();
+        let mut note = jsonrpsee::types::Notification::new("getblockcount".into(), None);
+        note.extensions.insert(session);
+        let rp = svc.batch(Batch::from(vec![Ok(BatchEntry::Notification(note))])).await;
+        assert!(rp.is_notification(), "no reply: {}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     /// A call with no session -- a plain HTTP request, or the operator --
