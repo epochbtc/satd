@@ -13767,10 +13767,18 @@ fn test_esplora_address_txs_mempool_visibility() {
     node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
 
     // dest's `/txs/mempool` must include the unconfirmed tx; `/txs/chain` must not.
-    let mempool_resp: Vec<serde_json::Value> =
-        esplora_get(esplora_port, &format!("/address/{}/txs/mempool", dest_addr))
-            .json()
-            .unwrap();
+    // The address index learns of a mempool transaction from the mempool's
+    // event stream, after `sendrawtransaction` has returned, so wait for it.
+    let mempool_resp: Vec<serde_json::Value> = serde_json::from_value(common::poll_until_json(
+        || {
+            esplora_get(esplora_port, &format!("/address/{}/txs/mempool", dest_addr))
+                .json()
+                .unwrap()
+        },
+        |v| v.as_array().is_some_and(|a| !a.is_empty()),
+        30,
+    ))
+    .unwrap();
     let mempool_txids: Vec<String> = mempool_resp
         .iter()
         .map(|v| v["txid"].as_str().unwrap_or_default().to_string())
