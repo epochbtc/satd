@@ -6252,8 +6252,10 @@ impl Mempool {
             return Err(MempoolError::Validation("coinbase not accepted".to_string()));
         }
 
+        // `tx-size` is part of `check_standardness` on admission, so
+        // `-acceptnonstdtxn` lifts it here as it does there.
         let weight = tx.weight().to_wu() as usize;
-        if weight > MAX_STANDARD_TX_WEIGHT {
+        if weight > MAX_STANDARD_TX_WEIGHT && !cfg.accept_non_std_txn {
             let e = MempoolError::Validation("tx-size".to_string());
             if !has_allow {
                 return Err(e);
@@ -12178,6 +12180,36 @@ mod tests {
         let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
         assert!(matches!(tested, MempoolError::Dust), "quarantine: test_accept got {tested:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_agrees_with_admission_on_oversize_under_acceptnonstdtxn() {
+        // `-acceptnonstdtxn` lifts `tx-size` on admission (it lives in
+        // `check_standardness`), so `testmempoolaccept` must lift it too:
+        // with no policy, and with an `allow` rule that does not match.
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+        for (tag, rules) in [(0xa8u8, None), (0xa9, Some("version 1\nallow mine when tx.source == mcp"))] {
+            let op = outpoint(tag);
+            let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+            mp.config.write().accept_non_std_txn = true;
+            if let Some(r) = rules {
+                set_ruleset(&mp, r);
+            }
+            let mut tx = spend(op, 99_000, 0x22);
+            let mut data = vec![0x6a, 0x4e];
+            data.extend_from_slice(&(100_300u32).to_le_bytes());
+            data.extend(std::iter::repeat_n(0u8, 100_300));
+            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(data) });
+            // Over the standard weight, under the 101 kvB cluster limit.
+            let w = tx.weight().to_wu() as usize;
+            assert!(w > MAX_STANDARD_TX_WEIGHT && w < 404_000, "fixture: oversize, weight {w}");
+
+            let tested = mp.test_accept(&tx, &cs, &NoopVerifier);
+            let admitted = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+            assert!(tested.is_ok(), "{rules:?}: test_accept got {tested:?}");
+            assert!(admitted.is_ok(), "{rules:?}: admission got {admitted:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
