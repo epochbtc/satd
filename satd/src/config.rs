@@ -103,15 +103,16 @@ fn default_auto_max_mb() -> usize {
 /// the single-engine modes forgo that cross-check.
 /// - `rust-shadow` *(default)*: both engines, cpp authoritative, rust shadow
 /// - `cpp-shadow`: both engines, rust authoritative, cpp shadow
-/// - `cpp`: C++ libbitcoinconsensus FFI only (single engine)
+/// - `cpp`: Bitcoin Core's C++ interpreter (libbitcoinkernel FFI) only (single engine)
 /// - `rust`: pure Rust consensus engine only (single engine)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusEngine {
-    /// C++ libbitcoinconsensus FFI, single engine (no shadow cross-check).
+    /// Bitcoin Core's C++ interpreter through libbitcoinkernel, single engine
+    /// (no shadow cross-check).
     Cpp,
     /// Pure Rust consensus engine, single engine (no shadow cross-check).
     /// The Rust engine passes Core's script test suite and is shadow-validated
-    /// against libbitcoinconsensus across mainnet history; the caution here is
+    /// against Bitcoin Core's C++ interpreter across mainnet history; the caution here is
     /// only that single-engine mode forgoes the dual-engine cross-check.
     Rust,
     /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged (default).

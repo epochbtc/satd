@@ -1309,8 +1309,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         ConsensusEngine::Rust => {
             tracing::warn!(
                 "Consensus: rust (single engine, no shadow cross-check). The Rust engine passes \
-                 Bitcoin Core's script test suite and is shadow-validated against \
-                 libbitcoinconsensus across mainnet history with zero divergence — but running \
+                 Bitcoin Core's script test suite and is shadow-validated against Core's C++ \
+                 interpreter across mainnet history with zero divergence — but running \
                  either engine alone forgoes the dual-engine cross-check. Default 'rust-shadow' \
                  is recommended."
             );

@@ -180,7 +180,7 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
         },
         // Testnet3. Taproot is gated with segwit rather than at 0: a taproot
         // spend is a witness spend, so the flag is inert below the witness
-        // gate, and libconsensus rejects TAPROOT-without-WITNESS flag sets.
+        // gate, and a TAPROOT-without-WITNESS flag set is incoherent.
         Network::Testnet => ActivationHeights {
             p2sh: 395,
             bip34: 21_111,
@@ -377,18 +377,18 @@ impl ConsensusVerifier {
 /// Name the script error behind a libbitcoinkernel rejection.
 ///
 /// The C API cannot tell us: `btck_script_pubkey_verify` reports a bare
-/// failure (surfaced here as a coarse `ERR_SCRIPT`) and the `ScriptError_t` that VerifyScript actually
-/// produced never crosses the FFI boundary. Bitcoin Core, calling
+/// failure (surfaced here as a coarse `ERR_SCRIPT`) and the `ScriptError_t`
+/// that VerifyScript actually produced never crosses the FFI boundary. Bitcoin Core, calling
 /// VerifyScript directly, puts that specific name in the rejection —
 /// `mempool-script-verify-flag-failed (Non-canonical DER signature)` — and
 /// every client and test that reads a rejection reads the name.
 ///
 /// So the native engine, which computes the same thing and carries Core's
 /// `ScriptErrorString` table, is asked for the name. The *verdict* is not
-/// revisited: libconsensus has already rejected this input and that stands.
+/// revisited: the kernel has already rejected this input and that stands.
 /// This runs only on the failure path, and only to write the message.
 ///
-/// Only the input that failed is run. libconsensus has already passed every
+/// Only the input that failed is run. The kernel has already passed every
 /// input before it, so running those again would repeat that work for
 /// nothing.
 ///
@@ -504,8 +504,10 @@ pub(crate) fn kernel_verify_transaction(
         .map_err(|_| setup("ERR_SPENT_OUTPUTS_MISMATCH"))?;
 
     for (input, out) in spent.iter().enumerate() {
-        bitcoinkernel::verify(&out.script_pubkey(), Some(out.value()), &ktx, input, Some(flags), &txdata)
-            .map_err(|e| ScriptError::VerifyFailed { input, reason: kernel_error_name(&e).to_string() })?;
+        let spk = out.script_pubkey();
+        bitcoinkernel::verify(&spk, Some(out.value()), &ktx, input, Some(flags), &txdata).map_err(
+            |e| ScriptError::VerifyFailed { input, reason: kernel_error_name(&e).to_string() },
+        )?;
     }
     Ok(())
 }
@@ -1036,14 +1038,16 @@ mod tests {
             .unwrap()
             .iter()
             .map(|t| {
-                let tx = bitcoin::consensus::encode::deserialize_hex(t["hex"].as_str().unwrap()).unwrap();
+                let hex = t["hex"].as_str().unwrap();
+                let tx = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
                 let prevs = t["prevouts"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|p| TxOut {
                         value: bitcoin::Amount::from_sat(p[1].as_u64().unwrap()),
-                        script_pubkey: bitcoin::ScriptBuf::from_hex(p[0].as_str().unwrap()).unwrap(),
+                        script_pubkey: bitcoin::ScriptBuf::from_hex(p[0].as_str().unwrap())
+                            .unwrap(),
                     })
                     .collect();
                 (tx, prevs)
@@ -1092,7 +1096,8 @@ mod tests {
                 if let Some(want) = first_broken {
                     match got {
                         Err(ScriptError::VerifyFailed { input, reason }) => {
-                            assert_eq!((input, reason.as_str()), (want, "ERR_SCRIPT"), "{txid} input {k}");
+                            let got = (input, reason.as_str());
+                            assert_eq!(got, (want, "ERR_SCRIPT"), "{txid} input {k}");
                         }
                         other => panic!("{txid} input {k}: changed amount gave {other:?}"),
                     }
@@ -1195,7 +1200,8 @@ mod tests {
             assert_eq!(script_verify_flags(net, 1), all, "{net}");
         }
         // WITNESS implies P2SH and TAPROOT implies WITNESS at every height
-        // on every network — libconsensus rejects flag sets violating this.
+        // on every network. The kernel rejects WITNESS without P2SH, and a
+        // taproot spend is a witness spend, so TAPROOT alone is incoherent.
         for net in [
             Network::Bitcoin,
             Network::Testnet,

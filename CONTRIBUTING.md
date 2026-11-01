@@ -91,7 +91,8 @@ are not required to. Verification details are in `SECURITY.md`.
   asserting the wire shape for a representative request.
 - Consensus-adjacent changes — extend the shadow-verifier coverage if
   applicable; mismatches must produce a structured `ShadowMismatch`.
-  Script evaluation is shadow-checked against `libbitcoinconsensus`; the
+  Script evaluation is shadow-checked against Bitcoin Core's interpreter
+  (`libbitcoinkernel`); the
   block-acceptance pipeline around it is covered by the differential
   battery — static fixtures in `node/tests/feature_block_consensus.rs`
   and the live-Core differential / fuzzer (`satd/tests/core_block_differential.rs`,

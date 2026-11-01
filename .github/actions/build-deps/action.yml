@@ -1,8 +1,9 @@
 name: Install Linux build deps
 description: >
   Install the apt packages a satd build needs (rocksdb-sys wants libclang for
-  bindgen and cmake for its C++ build; openssl-sys wants libssl-dev), from a
-  cache of the downloaded .deb files when one exists.
+  bindgen and cmake for its C++ build; libbitcoinkernel-sys wants cmake and the
+  Boost headers; openssl-sys wants libssl-dev), from a cache of the downloaded
+  .deb files when one exists.
 
 # Why the .deb files are cached: the runners' Ubuntu mirror has served these
 # packages at ~50 KB/s, so a cold install of libclang-18-dev (29 MB) and cmake
@@ -25,7 +26,7 @@ inputs:
   packages:
     description: Space-separated apt packages to install.
     required: false
-    default: clang cmake libclang-dev libssl-dev pkg-config
+    default: clang cmake libboost-dev libclang-dev libssl-dev pkg-config
 
 runs:
   using: composite

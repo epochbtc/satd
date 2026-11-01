@@ -141,10 +141,14 @@
           # bindgen-generated bindings either way, so a minor-version
           # mismatch is fine; a major API change would surface as a
           # compile error in the bindgen output.
+          # `boost` supplies the headers (and their cmake config) that
+          # libbitcoinkernel-sys's cmake build of Bitcoin Core's kernel
+          # needs; the kernel uses no compiled Boost library.
           buildInputs = with pkgs; [
             openssl
             zlib
             rocksdb
+            boost
             llvmPackages_19.libclang  # libclang.so for bindgen via clang-sys
           ];
 

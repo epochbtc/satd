@@ -371,7 +371,10 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/build-deps
         with:
-          packages: clang cmake libclang-dev pkg-config llvm
+          # libboost-dev only for the native builds: a zig (musl) build
+          # takes its Boost headers from their own prefix (below), so the
+          # host's /usr/include never reaches the musl compile.
+          packages: ${{ matrix.use_zigbuild && 'clang cmake libclang-dev pkg-config llvm' || 'clang cmake libboost-dev libclang-dev pkg-config llvm' }}
 
       # macOS: librocksdb-sys's build-script binary is linked against
       # libclang.dylib at @rpath. dyld's search list includes
@@ -390,6 +393,12 @@ jobs:
           sudo ln -sf "${libclang_dir}/libclang.dylib" /usr/local/lib/libclang.dylib
           # LIBCLANG_PATH is the bindgen-side hint; harmless to also set.
           echo "LIBCLANG_PATH=${libclang_dir}" >> "$GITHUB_ENV"
+
+      # libbitcoinkernel-sys builds Bitcoin Core's kernel with cmake, which
+      # needs the Boost headers. Core's cmake asks Homebrew for the prefix.
+      - name: Install Boost headers (macOS)
+        if: runner.os == 'macOS'
+        run: brew install boost
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master as of 2026-09-12
@@ -420,6 +429,47 @@ jobs:
           # --version flag); the top-level binary is `cargo-zigbuild`.
           cargo-zigbuild --version
           python -m ziglang version
+
+      # libbitcoinkernel-sys runs cmake itself and ignores the CC_<target>
+      # variables cargo-zigbuild sets, so without this it builds Core's
+      # kernel with the host's glibc g++ and the musl link fails. A cmake
+      # toolchain file (read from the environment) points that one cmake
+      # build at zig and touches no other compile. zig defines NDEBUG at
+      # -O2, and Core refuses to build without assertions, hence -UNDEBUG.
+      # The Boost headers come from their own prefix, so the host's
+      # /usr/include stays off the musl compile.
+      - name: Point the kernel's cmake build at zig (musl)
+        if: matrix.use_zigbuild == true
+        env:
+          BOOST_URL: https://github.com/boostorg/boost/releases/download/boost-1.89.0/boost-1.89.0-cmake.tar.xz
+          BOOST_SHA256: 67acec02d0d118b5de9eb441f5fb707b3a1cdd884be00ca24b9a73c995511f74
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSLf -o boost.tar.xz "$BOOST_URL"
+          echo "$BOOST_SHA256  boost.tar.xz" | sha256sum -c -
+          tar xf boost.tar.xz
+          cmake -S boost-1.89.0 -B boost-build -DBOOST_INCLUDE_LIBRARIES="multi_index;signals2" \
+            -DBOOST_INSTALL_LAYOUT=system -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/boost" -DBUILD_TESTING=OFF >/dev/null
+          cmake --install boost-build >/dev/null
+          rm -rf boost.tar.xz boost-1.89.0 boost-build
+
+          zig="$(python -c 'import os, ziglang; print(os.path.join(os.path.dirname(ziglang.__file__), "zig"))')"
+          triple="${{ matrix.target }}"; triple="${triple%%-*}-linux-musl"
+          mkdir -p "$RUNNER_TEMP/zigcmake"
+          printf '#!/bin/sh\nexec "%s" cc -target %s -fno-sanitize=all "$@"\n' "$zig" "$triple" > "$RUNNER_TEMP/zigcmake/cc"
+          printf '#!/bin/sh\nexec "%s" c++ -target %s -fno-sanitize=all "$@"\n' "$zig" "$triple" > "$RUNNER_TEMP/zigcmake/c++"
+          chmod +x "$RUNNER_TEMP/zigcmake/cc" "$RUNNER_TEMP/zigcmake/c++"
+          cat > "$RUNNER_TEMP/zigcmake/toolchain.cmake" <<EOF
+          set(CMAKE_C_COMPILER "$RUNNER_TEMP/zigcmake/cc")
+          set(CMAKE_CXX_COMPILER "$RUNNER_TEMP/zigcmake/c++")
+          set(CMAKE_C_FLAGS_INIT "-UNDEBUG")
+          set(CMAKE_CXX_FLAGS_INIT "-UNDEBUG")
+          EOF
+          {
+            echo "CMAKE_TOOLCHAIN_FILE=$RUNNER_TEMP/zigcmake/toolchain.cmake"
+            echo "Boost_ROOT=$RUNNER_TEMP/boost"
+          } >> "$GITHUB_ENV"
 
       - name: Cache Cargo registry + git
         uses: actions/cache@v6

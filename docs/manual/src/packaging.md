@@ -511,7 +511,8 @@ rustup and the flake read it; there is no second place to update.
 |---|---|
 | `rocksdb-sys` bindgen output | `rustPlatform.bindgenHook` sets up libclang + the stdenv's system include paths so bindgen's translation-unit parse is reproducible. Output is deterministic for a fixed libclang version. |
 | RocksDB native code | The flake links nixpkgs's pre-built `rocksdb` (via `ROCKSDB_LIB_DIR` / `ROCKSDB_INCLUDE_DIR`) instead of the C++ tree vendored by librocksdb-sys. nixpkgs builds rocksdb portably, without `-march=native`, so CPU variance across runners does not affect the output. The trade-off is a minor version mismatch between librocksdb-sys's pinned 10.4.2 and whatever nixpkgs ships; bindings are regenerated either way, and major API drift would surface as a compile error. |
-| `cc-rs` C/C++ compiles (secp256k1, bitcoinconsensus) | Compiler version pinned via nixpkgs; `SOURCE_DATE_EPOCH` respected by cc-rs for any timestamped output. |
+| `cc-rs` C/C++ compiles (secp256k1, zstd, lz4) | Compiler version pinned via nixpkgs; `SOURCE_DATE_EPOCH` respected by cc-rs for any timestamped output. |
+| `libbitcoinkernel-sys` cmake build of Bitcoin Core's kernel | Compiler pinned via nixpkgs, Boost headers from nixpkgs `boost`. The vendored Core tree is not a git checkout, so Core's build-info step embeds no commit, and its `-fmacro-prefix-map` maps the source path out of `__FILE__`. |
 | `OUT_DIR` paths in generated code | crane builds inside a content-addressed `/build/source`; paths are stable across hosts. |
 | Linker build-id | `RUSTFLAGS=-C link-arg=-Wl,--build-id=none` drops the per-build random ID. |
 | Cargo `--release` profile | `CARGO_PROFILE_RELEASE_STRIP=symbols` strips deterministically inside the derivation. |

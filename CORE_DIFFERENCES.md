@@ -36,7 +36,7 @@ These surfaces match Bitcoin Core. We treat any user-visible deviation
 as a bug unless explicitly enumerated below.
 
 - **Consensus rules** — full P0 parity; script evaluation is mainnet
-  shadow-validated against `libbitcoinconsensus` from genesis through
+  shadow-validated against Bitcoin Core's C++ interpreter from genesis through
   ~945k blocks (zero divergence). The block-acceptance pipeline around
   scripts is held to Core by a differential test battery: static fixtures
   ported from Core's own block-acceptance tests, plus a generative fuzzer
@@ -80,7 +80,7 @@ artifacts, signing stack) but no protocol consequences.
 | Surface | Bitcoin Core | satd |
 |---|---|---|
 | **Implementation language** | C++ | Rust (edition 2024) |
-| **Script verification** | `libbitcoinconsensus` (C++) | `bitcoinconsensus` FFI primary + native Rust verifier as parity-validated shadow |
+| **Script verification** | `CheckInputScripts` (C++), one `PrecomputedTransactionData` per transaction | Core's interpreter through `libbitcoinkernel` (same per-transaction precomputed data) primary + native Rust verifier as parity-validated shadow |
 | **Storage backend** | LevelDB (chainstate, indices) + flat block files | RocksDB (chainstate + all indices, single instance, zstd + lz4) + flat block files; jemalloc allocator |
 | **Async runtime** | `boost::asio` + `std::thread` mix | `tokio` for all I/O |
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |

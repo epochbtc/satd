@@ -102,7 +102,7 @@ pub(super) fn evicted(rx: &mut broadcast::Receiver<MempoolEvent>) -> Vec<Txid> {
     out
 }
 
-/// Fails every transaction's scripts, as libconsensus does a forged signature.
+/// Fails every transaction's scripts, as the kernel does a forged signature.
 struct Refuses;
 
 impl ScriptVerifier for Refuses {
@@ -367,7 +367,7 @@ fn eviction_cost_follows_what_it_evicts() {
     assert!(took < std::time::Duration::from_secs(2), "evicting {EVICT} of {N} took {took:?}");
 }
 
-/// Fails every transaction with libbitcoinconsensus's coarse reason, and
+/// Fails every transaction with the kernel engine's coarse reason, and
 /// records whether the pool was free when asked to name the failure.
 struct NamesWhenAsked<'a> {
     mp: &'a Mempool,
