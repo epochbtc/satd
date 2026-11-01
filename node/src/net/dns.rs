@@ -60,46 +60,309 @@ const SIGNET_SEEDS: &[&str] = &[
 /// DNS seeds for regtest (none - local network only).
 const REGTEST_SEEDS: &[&str] = &[];
 
-/// Hardcoded Tor v3 `.onion` seed nodes for mainnet.
-///
-/// Refreshed 2026-06-05: harvested from live `addrv2` gossip and each verified
-/// over Tor with a real handshake (mainnet magic, `NODE_NETWORK`, chain height
-/// at the tip). The previous list had gone stale — 7 of its 8 entries were
-/// unreachable. These bootstrap a proxy-only node; once any one connects,
-/// `addrv2` TorV3 gossip discovery grows the peer set from there (see the
-/// AddrV2 handler in `manager.rs`). Seeds inevitably churn, so this is a
-/// best-effort point-in-time snapshot, not a guarantee of liveness.
+// The `.onion` seeds below are the Tor v3 entries of Bitcoin Core v31.2's
+// fixed seeds (`contrib/seeds/nodes_<net>.txt`, the input to
+// `chainparamsseeds.h`), plus satd's earlier lists, kept only where each
+// node answered a version handshake over Tor on 2026-10-31 with the
+// network's magic and `NODE_NETWORK` (#1162). Seeds churn, so this is a
+// point-in-time snapshot; once any one connects, `addrv2` TorV3 gossip grows
+// the peer set (see the AddrV2 handler in `manager.rs`). Before this, a
+// Tor-only (`-onlynet=onion`) node on testnet4 or testnet3 had no address to
+// dial at all.
+
+/// Tor v3 `.onion` seed nodes for mainnet.
 const MAINNET_ONION_SEEDS: &[(&str, u16)] = &[
-    ("26c74c5xnpvadacn2uubs7v2iuf6qm4vn3wccyk36lwkxwklsulkyead.onion", 8333),
     ("26jfbxrdnsbxlai7qonraijp3sa2sybizmx75ry6dyr3s3dampmwufyd.onion", 8333),
     ("2ca656itamfkipcwcdh3bpdbd5mn5xo5ii7vw3oawve44meshol6sxid.onion", 8333),
-    ("2de3byew2d3cjqmux357khiqyp3c67qcxeloi3vpko4mojjdnxa37rqd.onion", 8333),
-    ("2fwcqag4zp5mzwvo3segz6r55ogib4ueinuzfi7tn5cndgdduk2qrmyd.onion", 8333),
-    ("2g4d23kmoegzn3xqgso5fkrozhcclhamefy4xsbnzfyp4vtqa6rtjdqd.onion", 8333),
-    ("2glboh4yrv43tuxdox4emdqdtvmvs74ngtbge3hozwdtjlcbf76rrgqd.onion", 8333),
-    ("2iqjfak6fykasmimpst2qujiaphxjweg6jgsfuvqfmqynlxdz7fnliad.onion", 8333),
+    ("2ezowyspxovboz4vh6gapgrum33exbcchfkczkdgwbwuuilg4eg6dbad.onion", 8333),
+    ("2gmwpdjjjdjo4qnwtx3ywrxsxquwtlxr3okxq4l7mieym34qv4x27lqd.onion", 8333),
     ("2l465kxadtqllf2wxledetrz4d3ya46zkyw6zy3vyjkqqnwls2mvtyqd.onion", 8333),
-    ("2nemrcmvpoaqjl3jq4de5dion5p55sw4txuwwcyyrp67f34tmt5x7qyd.onion", 8333),
+    ("2mgi53r3olnwx7sgpfnb5xpkvyl3kayii2gvel4adfwaglkiwsgwamqd.onion", 8333),
     ("2ptbjwtj7bi4u4jcifnawrkrli6yqbsnncpftla4nkuzhyvelvuwg7ad.onion", 8333),
-    ("2rpqi26jltpqxghloljkfvpywqyiztklvqe2j6g535ct4qc5cfi6wcid.onion", 8333),
-    ("2rtsgzkzj6ffft56ja75oxk246lxujpudo5mzgdmku67y32dqtw6vfad.onion", 8333),
-    ("2ukffrxtqhzgx4g7dvhzvh2dohperls7ukmqfcycz7yjszewggtwe7ad.onion", 8333),
-    ("2v7zzpxnkdwoyagjbzvqzdpyc3t5l7ppwwxffwxzgm7pmwsxk6mkxyid.onion", 8333),
-    ("2va7vyqugpvwyz3i3urgtplnyz6wsvnt5avg26hcmgla3gbazkk65dqd.onion", 8333),
-    ("2w2x2ohgqxjsjzt7nwc6nz55rxxjzwagphio33niud7fc2zil6hb5hqd.onion", 8333),
+    ("32djhc6hjaff2ohueoytojgahm4f4acij7hmcrlyjeattar2ihz35uad.onion", 8333),
     ("35kcii6eyanzvlbitmgxd6gmpanuyojib2z6rcwptbbtrnl5izgxrxid.onion", 8333),
     ("35lmqbnvj5cxmiewccr3ui77pjd7bftlcfxrpw5os4ukxgsv63hkoayd.onion", 8333),
     ("35okkasj3syxb2zwnlp6k2bsjatfhovyyvzgld7acoryjd3blz4dxbad.onion", 8333),
+    ("3cu7ae4jil536wjsdqjdpet5vfdgocip4i6azaakxjpeiuhe5vqwsayd.onion", 8333),
+    ("3ddlxdzl4sbzqnxnuasuovtvevsmmxqlh6koamn2y4otoykuk2mdzuad.onion", 8333),
+    ("3rx7ekxlz7win4wke62j5sk6pxft6w7aycazbfxhixgqvku5cbxc22id.onion", 8333),
+    ("3xjuckzzvmh6yewxnqggsohws77dqnhwmdrqdc6itz42tkb4o3tpdwqd.onion", 8333),
+    ("3z3zwvf4geonjor6w4ulv2243hpccai6u2iri4nn2tb2674y4myhf2qd.onion", 8333),
+    ("462llr6zevwmvkuhsercdigxu7gy3rt6hhcjij73a5nbaxmwq4z5cpyd.onion", 8333),
+    ("46cl6zhwzsjxstkxrljpavd6f6xlomyeitoeax5tj32p2voaxgax5uqd.onion", 8333),
+    ("4jg7uabqh3zsprvx7zubkilbjylllcifvnlmnqeqxbticupx5lyzduqd.onion", 8333),
+    ("5jw5x32jypyivibetbie6lkmxshoduz46auota3w65qptpthsdg7apyd.onion", 8333),
+    ("5lnzkfqlq56mpmxkstef3xj26qgaa7bu4bzvfs5rfwgrvr764bfgmxqd.onion", 8333),
+    ("5pewkpzkmxobeese64uinpvwnlcitokutllxaii6jptpqqkuelvswtad.onion", 8333),
+    ("5pjnfvwjawegbdffowe3estdhcbyo6dhtepw7vzc4eq7bxz7tuo2yjid.onion", 8333),
+    ("5yqo4k3ilzbvygfzspslh3sye3d3h27ewbd736oj3qssoe3jgq7jrgqd.onion", 8333),
+    ("5z56m27m73te57egak7ulmgcw6b22vryp6eawlx5lxghx5pto2lccxyd.onion", 8333),
+    ("6c4zr2uzyubml6dcyrr76fptd366oajrh4uezksbbs36x52szx4lknyd.onion", 8333),
+    ("6xxntj2njzgfcow3z3puyhcsl7ewe4lwgtqndso5djnd5jp7ivrvhoad.onion", 8333),
+    ("74m3lpfqc55v2yrjbtgldt3jdrg4gdelhiaxe2ijaqypjk2l5gtnrvid.onion", 8333),
+    ("7fpt5pv6ywtkdoakyoktyqdnqlycjlpkjwsz4nposnng5ndg25hwr6qd.onion", 8333),
+    ("7wl4hcvrqmd6zd6477k4phjx4kxos5ua7lnnysvb6hdcwwqintearoyd.onion", 8333),
+    ("7wt2hx3f3ci7uwn6w4csly6cv7l7qfm45b37fw2mv7qfrykdcy4vuwid.onion", 8333),
+    ("alpomv43bt4yb4i63wkajueoafvjgruetfcq6emnzfmda3c4etv2gsad.onion", 8333),
+    ("ayqofpmapnj2yyslsq2cqlzriaune7fzpnwpzb3ck2ucods7r5egjcyd.onion", 8333),
+    ("bt5xf6afgdjh7hyeb23jcnwoipz2s7dartjzcrxvlmxujbddvbrv4fid.onion", 8333),
+    ("cfee34r6sb4qrisyo7t44uozjvyfajocq6atl7htdarn3tgjxl635jqd.onion", 8333),
+    ("coxlgfjherkt6w5f6h6z642epurvqnv6vsw2bm4gdrg6gtmcle24ztqd.onion", 8333),
+    ("d73r5lnznhwk3e7xbopx3ic64zwyvmzqyted7kt5isiqtootqqzv7nid.onion", 8333),
+    ("d7icsp7naafsooy3jdalxqeqypfow674hzmt33z3zcvr7m6ohynbinyd.onion", 8333),
+    ("dczos4uwxk4zrnqzghekfwwfn2xoobjf46zi6tscyjisef5sqvvdzcad.onion", 8333),
+    ("dfm5ov3kmcc542ynj6dmvhoekqnjpbyt34auun65m34fampx5ckzwhid.onion", 8333),
+    ("dg7eht7volybfe5ksl7lg2drho3lf7fa3p66s2ivr2xida3fucc6urid.onion", 8333),
+    ("di2vurmytyvaa223vkoeekj2rkctiuufkgrwkzf7pwnulqfie7r32eyd.onion", 8333),
+    ("dxtynfs7ez367vemphccgumy3d3ke75aim4zuv56ytry7mcnbfvrcnqd.onion", 8333),
+    ("ehdxwh4z6gx3kmzuo5s2okdip6mjdzjkjsmnlyf5oxaslnrsvumus4ad.onion", 8333),
+    ("elba25chv5x6nolo5332ua2xkkb5d34prt6tmtl23vljc76wgikh2xqd.onion", 8333),
+    ("eohmgcepxqe5segzfdsgsdtvbdgvgc6od7fbidcnqas4uppjf3i3wrqd.onion", 8333),
+    ("eqlgno2eibpnsk7lajkint7ft4ol43fxqiadtlpvpdav6x76oxlb3aad.onion", 8333),
+    ("esbhnxhmsmaul6ecnvd6kvndba3t2fl6mq5npxmfhpfcce4ls5kmread.onion", 8333),
+    ("eygz4x4vgnjbsnwailoupv4ziv255tubwr5wv7u4hhpntdgevbjpx7id.onion", 8333),
+    ("fbbbf5i2hhkn4h6meyrrsod57sufmw5a4oj66yndstjnmxg3c3cwafyd.onion", 8333),
+    ("fk7s4uml2z5pvxgoorkkgcjw73lqztkj7dkled2dsncuzkhvqzsjcayd.onion", 8333),
+    ("g32e3acmzyqekmmfdsnqspspjeyw2uhdmmjpqkydjsslqkeipfnqntad.onion", 8333),
+    ("g4mdqyy5kvkvfnfbwouuw3rnhw75hx3ragqizkat43nlpmc5wsllfoad.onion", 8333),
+    ("gmc2dhkjxmlibkr2ka2hcqy7xfbnccfu4nnvlolq3m4kycwyjoikm5yd.onion", 8333),
+    ("gqzuercqjpx7kocl3o7bmq2lg7bvfk2qwpr65x57nuprsvunyhfjzoyd.onion", 8333),
+    ("gydqmwdrz2ly3uxkjbjrjkr2336zrd52irqh5tadif45s25riunsk7id.onion", 8333),
+    ("ha5jjdxx5ugmsi35ugkxjeogpksslao56bky7fp24xztlv2aoqhbynid.onion", 8333),
+    ("hbxqnq7y2bfb46dvkaedgcgb5qha2omsljmsrfogl6bu4sffydnxomqd.onion", 8333),
+    ("hgdyatewzn635qcb5x7wun7j7rtlplxactibeg5ht5xhl4wimem35zid.onion", 8333),
+    ("hwydtfysaq2dhi7n7gd7nmuweg3v62vzo4xnekaxeottoeyp6r72ayad.onion", 8333),
+    ("i3zkwfuni7rmfugnxisnxqtsm4j4vuwubuebmpaaqsmrr6uq52u7vdid.onion", 8333),
+    ("j3evn6bkkm74f7inrvqtjuxo47ia62hrfsnjbyhazjpaz7q3hzosurqd.onion", 8333),
+    ("jks32aib2ebuzpze6slsrlqwj2nektd3a64tf67xngmvkdtu3rvklryd.onion", 8333),
+    ("jltlsk6mvvwyk27cuwfzvbtocgg2hd6jzg5kuknnvrnsokpw76s5nvad.onion", 8333),
+    ("jrbnukzzpexnxm4mpdbjaqgrh26pl65brqe25adac5zwubuvfss4ilyd.onion", 8333),
+    ("jwoplqt3mvi7uszbt5ycnh2wk6j6e3vowrat7fmwbbn24agwovzqhuqd.onion", 8333),
+    ("kdhjyaqu5cgrlw2hdhc2a4rjzn4pukqvtmy66al3u7ml6t33kb5ti5id.onion", 8333),
+    ("ke736kvql5jfpc5kxeaepvnu7ysjuyslrsabbypx5pygvmugewuo4pqd.onion", 8333),
+    ("klhz4njqsy6dob7vu473nvquzvaupzng7mttgyxz4l2evuxzpavlq4yd.onion", 8333),
+    ("kmas6z5dnwg6vs4czqm3o7d3lcs6ihqiamxfue5irch72d25yjbgjead.onion", 8333),
+    ("ku5vzo4wyprye64cdsqxegygvquhxu6glzk6mbuqhiilgpe7xzlv2iad.onion", 8333),
+    ("l5b75umcnrjo2q42emfkwkgsb7maee3woou2nz26sqw57vxaczi6vvid.onion", 8333),
+    ("lec7f3iaa6phcjgtxwdcelmnkoc3xgyfiiui2ytcjd5zd3o2gjb53pqd.onion", 8333),
+    ("lvl4u4olowvqni7exa23ourvsvaifsjbsinqm567652cwq3gf4nxcbad.onion", 8333),
+    ("lwa5jhnrhaswseiert3jrhcu6at6rs4dj3rgvbfvcv7yy7tnv73rerqd.onion", 8333),
+    ("n2snxkqi2ukxmprp6xdxgluekiwa47rmfpjlwu2rji4os2jgqv4huaqd.onion", 8333),
+    ("n56w3dulod6mtfhit2jufyhyynfiqrp5dfnlpintbg4ptpfj2rlf33id.onion", 8333),
+    ("nismz4n6za3qk7tq5kxg5ccqzd7oytqpsqkalbqgg7w7miszcyoccyyd.onion", 8333),
+    ("nttkhv4xc7cqwffpdoenghpo2c7kzzgm2n6w7fqtjlvhm6yt5vxldbqd.onion", 8333),
+    ("nttzhooizmzgtmmoiekdcrkpah3fdh6bjhlsozudzyj42qk3uohq5lyd.onion", 8333),
+    ("o3znpc65ata5qtnpxsladsi5cjnaagvazwmju3yr4uywldbosayezdqd.onion", 8333),
+    ("oh2zlcpuu7kohkifsjmdrfptzchox6gabqwd45zmmtagbdutsju5v6yd.onion", 8333),
+    ("oi7myopz4egfch47gdhqrawhqyjd7msnbvmebxlmwkxj2oc3v7jgfpqd.onion", 8333),
+    ("ololrmd6nhdoagjzpfbdbxwcln7w6xbgsojngq2u7vs6i7fgbl2dacqd.onion", 8333),
+    ("ovt2cumfgbf75h67z6i5t5xq6wxhv7k4obhp7z7hmhfmo5e5pb3m3rid.onion", 8333),
+    ("pgghugjycg5gee6ebk52qcjxnrgvpo6evksnz56ldisom25ieg6yjuid.onion", 8333),
+    ("q5auzukt3wvmm33ggcwr2ajya2cwwlu2qfegcsolekej6vl3dhh7slid.onion", 8333),
+    ("qhvkfr7ws454yzil4we2z43pgdciaga7xiixzi2kwwab4pkgrppdzvad.onion", 8333),
+    ("qsauypffrmupw6puuoemfr65uyqbaxuyfbhtpzyc333o64lvwaiaywqd.onion", 8333),
+    ("qtwmgohfnmislgcndsrs6occpcbcfogvvlyp23yv4dx4fr326vmzw7yd.onion", 8333),
+    ("rhpozy2z5ut6hs4ukawjej6sn5vfqrsc7z5i4u6b3rtgv7anlmybf7yd.onion", 8333),
+    ("rky7zz76yvft4ofwmkdsprm2b4tbqxygxxqbvh4s2erhrjelr5wgcryd.onion", 8333),
+    ("rpv5jazbjgdxlxblvknadzu5sw6swlrs7sg6jsfpipjjg3omjxbz4cad.onion", 8333),
+    ("runbtcnd7trpbqkvqa4qwg2s6cnlnyc2ajxk5nxh2znk7fkrphysn4ad.onion", 8333),
+    ("runbtcndu6cirobkbrpfr3lyagmokzuvp2bxep7thzg6pdmn3mir36yd.onion", 8333),
+    ("rvkxwfgmnn52ubmyase7stexaxmq2mgeatjiw4kbelvqliq5nycqvead.onion", 8333),
+    ("s4ycyfms6rgyaovivdqbyttmf4nxmf4xx2rnebzjlm4iuzh2frvxjaid.onion", 8333),
+    ("sfyy2eqfn73did7ab3xjdr4nbp32kpsduhn342iah4peq5xy32e33rqd.onion", 8333),
+    ("shame2rrgqa2fq3esx4zudeerzpx4vzvmbjjhbclbnalxsluc32iikqd.onion", 8333),
+    ("sixrzjq7fnl2h2cvidvfii2z5yuvmcobkp74boffwc62fv3px35svkad.onion", 8333),
+    ("stw2v772blji7h6wc5zss5mjexzjc6fukpni3jbp3llodc2a5apqyoyd.onion", 8333),
+    ("stxz5a5n7lvro4jda2ugr4i3ufnhkvifqdw6c2xverdlipsrgonek5id.onion", 8333),
+    ("svezmh24cgqujtbgvp77rbutwu5b5detv5zddah42i7hypwqu62cvzqd.onion", 8333),
+    ("tjeiksr4gizw4jozvyilivrhd7dbik4asabja5nsc7j667mz4as4rhyd.onion", 8333),
+    ("tostega5we66duknqueqsgoxqokekwim2itgpktwryhlzdemwwcdhqqd.onion", 8333),
+    ("tw2gw2ownxt4a6wz534j74abjr3d4lxmxdsinddanh2vyys4ct4e3had.onion", 8333),
+    ("u2t3wm6qeivpsglk5ejk2mlmnykofv6nh7rslr3xhbtmeeuywefoosqd.onion", 8333),
+    ("u4dmemh54dwnagcn3s7nnfx4d2dhst4mnu4bqjzrscfuxujct46i6jqd.onion", 8333),
+    ("ugrktq7cvbxuiairsjg355otgo6sj5o6v4tdh6jgyfzhwot6hdk35vid.onion", 8333),
+    ("ugymttztvn2phtt7kri27znqce2ygztwd6esmnkhrdr666uoqsmdtxad.onion", 8333),
+    ("utroczdxvnhziozke5vu2mltn2nylckicvu2teyrbiujjzwbwzeha2yd.onion", 8333),
+    ("uzjmlb42mhl45ld6awhvk6pwdqif76jgzzq5hsmuk5pqdlzqawu3rsad.onion", 8333),
+    ("v6dk54o7eqt3qu6cyfh73whi4yojqfvljeric7a36bpuy677wzxu2hid.onion", 8333),
+    ("v6hdsumwmt72iecmhfpqieakg6u37t5yl6vzrzo5wzejmwv7ajnn6lid.onion", 8333),
+    ("vkrylooy2kphnalj743mhqobudi7fy3u3e2d4smluzmz3ocat7y3bpid.onion", 8333),
+    ("vmfpjx66xzxjou3feseelc2bvtd2rtxzri36odg66u7nfbrb5bew2pqd.onion", 8333),
+    ("vqfiycyhxoh44hciaznjyeasgevc7n3ht6sbo5ifbdazxyflq6xoidid.onion", 8333),
+    ("w3vecku6tbnlbxkhlauw25eh7ra2h4nfhxuozgmfzshwlz47bny45did.onion", 8333),
+    ("x6phkjxljpaxadss27tacebq4n4rgmothga4xvrdxsj5rxst2kr46uqd.onion", 8333),
+    ("xdsiekckqa4phxh5a3jvji2cicr2yr4hyy3omw5x73u45ipn4ajwdxad.onion", 8333),
+    ("xgoidfkdv43ogx3pzczcyjfzjjjnj4it7ssyuehqddcynl2chn3ahmqd.onion", 8333),
+    ("xj6ud77fdqlal7vpapmgnnpkzxdyiqlh6dq3grcxlittx7yvjwd72lid.onion", 8333),
+    ("xnt4oa23anc4hvsspz2sq7x3jxinqgr4j3ckj632akjpohan2p6vfhyd.onion", 8333),
+    ("xo6d4upsa6gu4ngxcekp5b6czcbx5ahuc5xajji5t5khkmr2b7ca5iyd.onion", 8333),
+    ("xogn4krs3iklbqdvrbztkmsxbyxyq4gncdosrudiwblob5qf33zpsvad.onion", 8333),
+    ("xtvkcpef4wsn2ysquuqohypuheko3fpwgyustgm7fsh5zk2z5w3wkqad.onion", 8333),
+    ("y2iaaicvyvqrt5gnqngbna2psl22c4zwvkupdzkxp6ysjeep74sgtdid.onion", 8333),
+    ("yadufpjilf7yflt7p4mmfi2xrjqipf3dt2njall2w4nkvz2jqyt6j3ad.onion", 8333),
+    ("yklmuva66pzp3o2znx5mkzboic6fm63pt5katvmbniok2fvo2yggf7qd.onion", 8333),
+    ("ypy6l6ifrdl4kfxfgvajji5fbscozvp3fuzjkb3fslr62on3fxh4s6qd.onion", 8333),
+    ("yqdsywyf6bict2e2jebxm7j4nhdikaswcalh4cbzgqk3sm44qzoh4aid.onion", 8333),
+    ("ysj5dkk6jxj3cmdvkakl4ex743dudy3xuu5yodltt5usufp5cf7kmuid.onion", 8333),
+    ("yvnxxe3ghte7lsz77izb5uygzgi7fyijhqfhvdzjhzkgakr5tkqydrqd.onion", 8333),
+    ("z4kf5t5rvcv6rssyp4tcr3rz2dfpowlp4wci5tnouzpxkxofwutnw3yd.onion", 8333),
+    ("zjff6dils67uzfbfflojgjha2qrscjbdx3xl33qxbu6s7ukcawnmytyd.onion", 8333),
+    ("zqm2s7pvssxlcbw7qqpb2jqgbzgy2jpz2ex6gghyazlqzwk6agcw6nad.onion", 8333),
+    ("zrggximdixhwt62lqktar4mjum3byusx36dc52kyqsv65apsmztabdad.onion", 8333),
+    ("zxx7rf4a44zjqrk42pq2ifygado7n4mc655jgtutkyyifca6z52xwcid.onion", 8333),
 ];
 
-/// Hardcoded .onion seed nodes for signet.
-///
-/// The second entry is the Tor v3 node Bitcoin Core seeds the default signet
-/// with via `SigNetParams` `vSeeds` (kernel/chainparams.cpp, v28.0). The first
-/// predates the Core-parity sync; it is kept as an extra fallback.
+/// Tor v3 `.onion` seed nodes for testnet3.
+const TESTNET_ONION_SEEDS: &[(&str, u16)] = &[
+    ("3dt6kgfrilc3nwliwy5wbmc6oa2b5y3t33nkxlrxrkunr2hoaj56kgyd.onion", 18333),
+    ("3rfphqncnepbm7tvnaqjetkaqvauj566nw3ys27fert6zx3q75zetoid.onion", 18333),
+    ("3vnbi5o3hyzk4cm3hhnyo3h7tclr6pybmhmqwkbyclslfhqtg72pq2id.onion", 18333),
+    ("6fdbuqf2kgeweeoeikmwfezauys657lzezzus4nxmekkumouptg5ezad.onion", 18333),
+    ("aesy6tfufadkut6flu2bsqgnw2422ur2ynjalguxlzuzuktg3zehttqd.onion", 18333),
+    ("bizdwmm7naqq5pehkbfggznqtena5eodz3kprvsbj4nkkax4fvxx53id.onion", 18333),
+    ("bjqttlyt5kxcn7sitpiavf2cuhdf6rlwigericlh7um7gzkqyyefqnqd.onion", 18333),
+    ("c6pk75ti4mjmoumlnxjwrcyr6u2qoltf3ywk2odweupz3sr55gqg6pqd.onion", 18333),
+    ("dskf46hfkefyr6nio5gtqp7em7rh6aqwrugdegfooaoxcux5ym6bkuqd.onion", 18333),
+    ("f472j4pynbgltb63mr2lhyvhecfqdjdcfmr2s2id4rreemyn32xtjuid.onion", 18333),
+    ("fl5wdp4jleymf2efplmos6hbj7py7nvwaps2yzfa6sfhvk6e7bd4umid.onion", 18333),
+    ("gggan3nuzxpd655lafnsunqfxgy56bvsxuuzucgmaowyvq3d7a7o7jad.onion", 18333),
+    ("gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion", 18333),
+    ("guudgx24aokistytvm3hj7u5cbvdkr2b643r5t33pa536ekfn2lfykid.onion", 18333),
+    ("gwtx5qluopwaxjhedlifnr6pptw2eihojzhq3stnv2gfbvqbgqdhi5qd.onion", 18333),
+    ("hjwzovgwou3py6ncemgmzpvcihay5cuzuxvqdn74axndmll25p4mwjqd.onion", 18333),
+    ("iradeaffnpqfhkuo4rqbq5dgdazymxyjifeb6jz4yq7rgqhnsflfhzqd.onion", 18333),
+    ("j53y5paeb7xcrptntut7epccjglduquldjlzjlho4lj2msabnygrljqd.onion", 18333),
+    ("jbgve7zi4vx5l7654ih4nzutspu36dvs66xlegciur2cpym4gdjigbyd.onion", 18333),
+    ("jtvqgaccxbtzshtulk5xlsb4wkoil3psmpn5avqyp2i5vm4hqh5cicyd.onion", 18333),
+    ("jun6gdmbgasr57bhr4zs3dfhc6pzpaw27nqb4dadbai7yrbq55zskeid.onion", 18333),
+    ("lh3wfz2n7xe2muwdjrz5vgnjwjx7lc6iifojhr2rh53ojkwo5dr66uyd.onion", 18333),
+    ("lka74booetkbmat2q64haawcytbwx7mnctvo63ww4jgi4yuqnl6p3kad.onion", 18333),
+    ("lwfecq35ocqjfbdq4h2qmcwl3cfcyiyycxtvrz36ihdbuczehi3bmrad.onion", 18333),
+    ("mdj4zxy5afohbhm5qdwcbzzpqsdi5w6ur24obkkjcctzj76dgtkedqqd.onion", 18333),
+    ("mh2bq22jchtolmufub5abodq2l36kmrg26owlb634hsv5h5eagyuekyd.onion", 18333),
+    ("nkqgfcw3esmr2nbflt5h4zhfhrzqh2txoh2crq6cyq3as5dra7m4vkyd.onion", 18333),
+    ("nyrekcbm2ici6wv2umogtmwg7o2ivu4vm7bpcge5fayos5l377zldlqd.onion", 18333),
+    ("o3zwhskjvuzbti3su3kfspgmvwoiq5iqw4drgo6jv6ehv2zfoyyy5nqd.onion", 18333),
+    ("o4zdqfdoe4jfvn35twqtjkzmptmk3bsg45sp46wuxanceg3euqtwdjqd.onion", 18333),
+    ("ppe2pepzphox3swftj5lbyi7ckigspbih5qnyuhrb3r6bn3g7k7bp4qd.onion", 18333),
+    ("q2kkfl42elsu3f4c4yqxbgqc4tn3khtwdomi6ofznta3d22iits4i5id.onion", 18333),
+    ("s3bxrurro4bmvsmntw74qf4vw3xl25xtnvqegayvlwj3b6t7d76kkwid.onion", 18333),
+    ("t6hfkkujktjyzpepmphskoaivflu6fieyuxrshxfzwriwvoa2uccvvqd.onion", 18333),
+    ("urhagmjceyqbzhjitpa7j7mygivxw3wlwqzkibw6zezrxeantkikgcyd.onion", 18333),
+    ("vctlwaqgmu53eutz2hewuakcipfgtyljsd7czut4dd62xr3rp6fqezad.onion", 18333),
+    ("vi3z4khdvopuiljdjdhpetnxztuzsct2aacuzcm5ba27h4j3cfwsvjad.onion", 18333),
+    ("wgc4wp25gtnb54vd7x5h2xtetzrdoiizeyyh6fv3vxzp3bbalejbd3ad.onion", 18333),
+    ("xlx7k5qzawdld5xcfd5lhhasp5tiklc2z326lamcnkmoru56jv6os6ad.onion", 18333),
+    ("y4blifygwjgepjmnr6wlbqpgies4c2bdudifcfbplqnbjwzs2zrdnvyd.onion", 18333),
+    ("zsmxmusdzrcqusk5h6syfq6a3ph6lwx3wpiltun4dmkrt3pa2fp7qaid.onion", 18333),
+];
+
+/// Tor v3 `.onion` seed nodes for testnet4.
+const TESTNET4_ONION_SEEDS: &[(&str, u16)] = &[
+    ("2m4yjmxoamgtzskezmaqwrhfi5hnnzehv44q3fj3ryjwhtz5e53cqmyd.onion", 48333),
+    ("2sltzrq7ts5t4il5nimp75og2jksbwdjmgbdykz5ljeoqrxemzlakeyd.onion", 48333),
+    ("4uzerod2wrqtjuaea6vr43uddq2sg3cgfuk4khqotqsqdsxpwdmcphqd.onion", 48333),
+    ("5fkz5ijh76cgfwvxz4pyl4br4hekqflijz7d467ldey3xme2trqrgjad.onion", 48333),
+    ("5rh3ln6ypycmn57qlmke3dliffg2id3ziz4dhsujng4tk34oklnbqtyd.onion", 48333),
+    ("5sdzs2qu3ygb44jwo45y2kmbnqc6ijzpndaqn43zgngsiwq7mx6b7yyd.onion", 48333),
+    ("5wpcussznj2dg5222zrtfdsx5ttco6xlv7447azzaaywu2t5xukqcaqd.onion", 48333),
+    ("6g6dwtby74ic2ggnzkbfqy7saslopho7or6z4uad737c2tq24fj3ltyd.onion", 48333),
+    ("6po3e27t4nxgls3mwnostpy47crhtc3ae6fcsn4yyfh5dfcaq3q3q3yd.onion", 48333),
+    ("7jd422hqevrz334ax3fh77wzww7clnr4kpyos25oe64nifg623bjqfqd.onion", 48333),
+    ("7kwh7rg3a4e5lgjvybesixzhwzxvf6dqo3gc4h7k5vilwmdjvtzidtid.onion", 48333),
+    ("a3aej552sklp5nhrosr5wv7qylgkmnu5u7zh7se56vtllvhgctzkbjqd.onion", 48333),
+    ("a6yijgwn4vtmmhl7uybtbuyvtl7mtj7arld5f4csqsx4syeii4gt3vqd.onion", 48333),
+    ("aqabn424rm7qq5faw2ecckkzxfdw57oncivjrurrrn5wgjdqjqxvxjad.onion", 48333),
+    ("azccjliswzu5aycse7g7zu2bw3mqicd2mhszczitp332scjgltehrjqd.onion", 48333),
+    ("bv2uuihcluruxlt4zwedditinsjberjtaj7yciwd25nrhy3ufh7jjvqd.onion", 48333),
+    ("c7nbt6bs5c7foimwc4wmwlrqd7fg22r76i22nglv2inx7tsav677gzyd.onion", 48333),
+    ("clqr2to2r6fn4jo6f7xy3dppxgn4ewvnmwbxsdrrhnesyacmw5noaeqd.onion", 48333),
+    ("dnshzxr6osjf2l5gjsbattjtoefgkzmd3p3fdyatr5ltz243zspsilyd.onion", 48333),
+    ("ebhtfcmjhilcqtuls437pxu65dznqkpt5qv3yeq6zipnqd7ichz5htyd.onion", 48333),
+    ("f2tt2hdbqlbslvdlpworasoijtqfxlkkcabl2kbu7gptojc2synwq6qd.onion", 48333),
+    ("fsijrllgzgeg4pa5ebq4qy3swmplxkzvuvji5swt36quy42dznq3t3ad.onion", 48333),
+    ("fwsrcrhnggi3qy5rsfiad3cwep3bf7uovcupgockbntjcfvoqxzr75id.onion", 48333),
+    ("gc66muikqqzxwj2tdvvap6gpcbitthjvscawgkclim4vgmajrccjtmqd.onion", 48333),
+    ("gsw6sn27quwf6u3swgra6o7lrp5qau6kt3ymuyoxgkth6wntzm2bjwyd.onion", 48333),
+    ("gujxforhwszry5falvnarfcyajjxxsuvqevx6gk6meou5ordrxw3mdad.onion", 48333),
+    ("havkohvjhg5tglbdecf4ufhz5es3f33ctj3b6loebj4pi6qrtjemfbyd.onion", 48333),
+    ("i22efh4itlcfthvaavcz2rvigu4x6jqvlwuksz44bukslhg76bsgrxqd.onion", 48333),
+    ("irwyrdkcrcdgwtsltcrqexqylwc3ezjhhra7u4i3gkwktezcut36buqd.onion", 48333),
+    ("jspxdo33gyrh3tewi55mn2fo5spczzgipq6ao7fa5qu6fj2ezr7bizid.onion", 48333),
+    ("kf6q2wza2ebo7cxln5ejcjjwvrew4vb2hf4vd5wo4nyzbnjv3yccduqd.onion", 48333),
+    ("ko55e2ityiaqeckthmnnbcv6bbwll7rtdiv527muoqdpg4hye2it2pyd.onion", 48333),
+    ("kolvizpy2tctu7tyq5qlquodwcsljtfbmowcxqsihfrlvwlihpsijwad.onion", 48333),
+    ("mavvwxts5f3axuz4cyjqpz75veijkdkdueavekb5hia67zk257eg7tqd.onion", 48333),
+    ("mdiwdijucocysdvx5dk2iyo5wsav3ehyiggegzfk3ezfcce6nstp4nid.onion", 48333),
+    ("prilx36yi6wiz4ll77tapskzwzh5onphrnn6w5d56zrzdat4kjo3q3yd.onion", 48333),
+    ("qhzfac4qvomln4ikp6xgfwgb2koxdgjsbeut3iplvsu5o33yf4ewf2ad.onion", 48333),
+    ("qmd5qvyhnanqj6wyf4klrvfqoypuz6xjajhx2n272vr5il7nlwyoosqd.onion", 48333),
+    ("qmw73e4zh2i6pvmlgx5642vwtynibghgvjdoox574hjxxv7fvd2oxyid.onion", 48333),
+    ("rb2ekvp77t4hhhipt7dfuriwges4efybffrb5qurk3xrokgo5or5z2yd.onion", 48333),
+    ("vfqxysj7olxstghkohezoembjnsyvpp2ph7kc4jaatvszyx2ajz627ad.onion", 48333),
+    ("vh72vs4kp4mf4c6dopdprfavuuuq56vgtltozx5qik7awvy335h7btqd.onion", 48333),
+    ("vizb74h32bx3u6zksgsi6seq6hcqdhok5pd4z2x5yj3ll72tu7pcu7id.onion", 48333),
+    ("wkvaxtftpwmmvrptqavx6mwhrcwiecbodtshuenvot3cjgxsycuurcid.onion", 48333),
+    ("yiolb6ahgjry66g3vt4dtlnybhdgy4udakakbjxuekj33ligd57mdlqd.onion", 48333),
+    ("zdh7vrzykdv7474yioe5jiv3kgajky727t5phxsbt47lefjseo3ypaqd.onion", 48333),
+    ("zjttaesjhj7ail437ag4emdufr775h5rtgoohlbca5rwc4re6dr5k7ad.onion", 48333),
+    ("zmd4eq6svwn3qgm56dyodktagzi3xo4smxebgjdk2jbjkbmvn7gjm5qd.onion", 48333),
+    ("zu3gjmendiuoogirxm6udfpympmchh2lxl3aeifzu7ahyuas3pzkgzid.onion", 48333),
+];
+
+/// Tor v3 `.onion` seed nodes for signet. Includes the node Core seeds the
+/// default signet with through `SigNetParams` `vSeeds`
+/// (`v7ajjeirttkbnt32wpy3c6w3emwnfr3fkla7hpxcfokr3ysd3kqtzmqd.onion`). satd's
+/// other earlier entry was 55 characters, not a v3 address, and is dropped.
 const SIGNET_ONION_SEEDS: &[(&str, u16)] = &[
-    ("6megrst422lxzsqvshkqkg6z2zl2f6n532vy7t5hj5xmfoauoygzqad.onion", 38333),
+    ("2uqd5pbaxn26o7fl7nqtm2khetqocislppxtxrpqg55wtbcqdrf2y5qd.onion", 38333),
+    ("2ycyu2aba3xsqjr35beqporp5f64ntqs2sau2amn5ztq4j5q76amhqyd.onion", 38333),
+    ("3qeedpzgciv65tdy2tsdmjxswhyep4aj65jtboznf5nnwcyo2lbmiyqd.onion", 38333),
+    ("3xvum5nnvcchvfxwlbc2it7nbfxhml6ovt7xehjw2potempk2om4eoqd.onion", 38333),
+    ("43nk7wpojel47fmc2il4sunwkpj4d2sh5rpeconlymplvuf7mwvnidqd.onion", 38333),
+    ("4jbenbcdlfoiauayz4bdpfueobo3klbjtmdkbnwojq2awhhl74ngbkad.onion", 38333),
+    ("6fy45vxzgc6siecr7en4k6oft4k4ix47jvkxqyzopalzwyphqc3hv2ad.onion", 38333),
+    ("75ucqkuqndevjaqjnyfgyhzdfgcnknr6ki3skvkqjlxnrcfqc6wxqbad.onion", 38333),
+    ("a7mvea5xgpknsqaifyvfstdn2utjvph564i6ti3nbdr2cksby5jhykid.onion", 38333),
+    ("b3sbqhjstq34ae7lsrw3syhxcjdu2ssuf3f3kvbnyrvbp7cvuuopmbqd.onion", 38333),
+    ("bxc4ubehjtw4hl7yfz6erdok5z2h76s7f7jlx2amtzxil2fxxcm64byd.onion", 38333),
+    ("ckbugjazj2iotosxah7odbxfozxivuk6zu5npf3iwfphvoh5brdjfqad.onion", 38333),
+    ("e6xhvtrt2ppjfxckbinu7a4jxmy7usjnvjx6st2cipmvlnnhxg7krbid.onion", 38333),
+    ("ecx2z3x4nwbzjh6dh6vyccljkhnxya2o2o2tz3pzvetxfjjmujxhctid.onion", 38333),
+    ("ejgeimjypsfuijpxzy5xpwmmjmkr4izwze6od5pw74csjglflib6nsid.onion", 38333),
+    ("evesnuatxlbwi3soc3dq7ebxgpsn6apluntne4smlnuepdbax346f4qd.onion", 38333),
+    ("fo7cekwzd3ibyoxuo53mfqoxffgfaupg5ydxbl3rofvwxtzbvgy3ciqd.onion", 38333),
+    ("fqyzt7wikf6g6yxu6i2yar3lkqxbf6fu3c3pjnbg2oibt57usfmq42id.onion", 38333),
+    ("gd4gyokpcnnqqodklhltjimcrhhmqj7otwlzrolw76aag4leqsyolxad.onion", 38333),
+    ("hztyx76iaz4h3emavmzbuizqfg3q37ehfwr2k3afadtcmcepjsxhmeqd.onion", 38333),
+    ("immdwqfyz2hhcmxmyypstz7syq2cygaklr43mqjmqefnmtcyuspwkbad.onion", 38333),
+    ("jgn75dy52o2lt5wr5qkf4z2cg7gupz4jc4z5az53srhxxyvkipqqqpid.onion", 38333),
+    ("jnr2iysiyijy7u7uihytbjiq3b254g4i2eaaeod7w7pkrja6ukghx2qd.onion", 38333),
+    ("jw6d7rlkcz252f6wv6cirzzrknzuu7xwxnzirab4c5x7wfzl2uzvezad.onion", 38333),
+    ("k4d6h4eyeqjn35b3x46f4s3g3eykn4bms52paxuxenkre6nmhfvy6bqd.onion", 38333),
+    ("kklfzzodnlinc3toltn7dlft4vzjf2ckmdw2n3dn4lx3pzw5di2womyd.onion", 38333),
+    ("kpeo6tc2gix6bxt2bvcsum2g5z5ifgrvt64hatlxztogydyo4tj3pwad.onion", 38333),
+    ("lbfzxmkog5ntvcmo7ncsp7ye62onxprf3a42hdzxkjw4inulizd4ccid.onion", 38333),
+    ("litqgemqmpesu6gi2ctd4ubrpxdn4mcm2t6p7xhkfxnkk7lzpdx75vyd.onion", 38333),
+    ("lkgnafoa5nfd34pzyxpz5gnmpwkbdk5a5h6h7hk3rs53soh6nkb3snqd.onion", 38333),
+    ("n6tf5dfz25i4pprczevdkyo5bkpgfa3xigenn6skpjqqynbxpxzilfid.onion", 38333),
+    ("nhpn5jnzl64wuhke22bl3avgm7liycl2h2fqh5a5tjtejez6upze4tid.onion", 38333),
+    ("o2fumu43ugk6xayo2nvadn7ohqlxharakt4flqh3hjgxdbwzrwignmyd.onion", 38333),
+    ("oowqbk36g76cs37sk7myfoq62e7ly42etcfugol3p7haw6ewyn5qhiqd.onion", 38333),
+    ("pmjm644pzkp2khwixyis2c7mnfbte33bnmwxdx5lk6t6owvtmapdbhqd.onion", 38333),
+    ("qbjhndk6zjpzxfetanqjud3u6kiuspnjfapinw2r5cou6o5ae5mxdzid.onion", 38333),
+    ("r4y5pqyvdzq3bzg2fqu46ql4a32fadkftwejtxzckeyohd7wvqnnwtqd.onion", 38333),
+    ("tev7cdwka3av6ektydsjfpofmcam3r6qcw7sxbpkohckjvihtzp7hgyd.onion", 38333),
+    ("tsq7clffbfe636zfszymheqgy6tyzbsjogad2qet7qeijua5c53ye6ad.onion", 38333),
     ("v7ajjeirttkbnt32wpy3c6w3emwnfr3fkla7hpxcfokr3ysd3kqtzmqd.onion", 38333),
+    ("w7d4rwjt5igozi5v7z2m3in2wm3zsf2lhsizqqohkyrokbbie5equoad.onion", 38333),
+    ("wevmujl2p6mckcwaxnmtusweros7bu3bxf2g3lzutnfdkjl5gwbu36yd.onion", 38333),
+    ("ww4jycomjwnf7jtrrrngeahokqkcl32iufmjzvvk272svieavabjyiqd.onion", 38333),
+    ("xbulvl2bb4wvnlafmq3j3fzrjhsmnfz7ubyvl6yy3syeded4tqiubkad.onion", 38333),
+    ("xm4kxluodmeolmaugmaxnexnefrg3vsxnqo2ezu7rqmdct7i7xevcxad.onion", 38333),
+    ("yjhagyj65xcxu6b5yktu6ntkwsyd5rhjlrsb7sexq5lzchatdqmoqnqd.onion", 38333),
+    ("ypi6qgnmabcqlmjfkcnqzpjdjihwmebxkd32tjwt6mrhgm2strfml6ad.onion", 38333),
+    ("zgkvv542e4ewviremw3qp4bi52f2sxt4g4mrjrbwonbnfb5oujd44lid.onion", 38333),
 ];
 
 /// Returns the default P2P port for the given network.
@@ -167,8 +430,10 @@ fn seeds_for_network(network: Network) -> &'static [&'static str] {
 fn onion_seeds_for_network(network: Network) -> &'static [(&'static str, u16)] {
     match network {
         Network::Bitcoin => MAINNET_ONION_SEEDS,
+        Network::Testnet => TESTNET_ONION_SEEDS,
+        Network::Testnet4 => TESTNET4_ONION_SEEDS,
         Network::Signet => SIGNET_ONION_SEEDS,
-        _ => &[],
+        Network::Regtest => &[],
     }
 }
 
@@ -600,6 +865,32 @@ mod tests {
         for (host, port) in seeds {
             assert!(host.ends_with(".onion"));
             assert_eq!(*port, 8333);
+        }
+    }
+
+    /// Every public network has `.onion` seeds, each a well-formed Tor v3
+    /// address (56 base32 characters) on the network's default port, with no
+    /// duplicates, so a Tor-only node can bootstrap on any of them (#1162).
+    #[test]
+    fn every_public_network_has_well_formed_onion_seeds() {
+        for (network, at_least) in [
+            (Network::Bitcoin, 100),
+            (Network::Testnet, 20),
+            (Network::Testnet4, 20),
+            (Network::Signet, 20),
+        ] {
+            let seeds = onion_seeds_for_network(network);
+            assert!(seeds.len() >= at_least, "{network}: only {} onion seeds", seeds.len());
+            let mut seen = std::collections::HashSet::new();
+            for (host, port) in seeds {
+                let label = host.strip_suffix(".onion").unwrap_or_else(|| panic!("{network}: {host} is not .onion"));
+                assert!(
+                    label.len() == 56 && label.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+                    "{network}: {host} is not a Tor v3 address"
+                );
+                assert_eq!(*port, default_port(network), "{network}: {host}");
+                assert!(seen.insert(*host), "{network}: {host} listed twice");
+            }
         }
     }
 
