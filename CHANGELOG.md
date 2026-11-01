@@ -14,8 +14,23 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 Bound for **0.8.0**. This is an index: every item below is (or will be)
 written up in full in the in-development
 [`docs/release-notes/0.8.0-pre.md`](docs/release-notes/0.8.0-pre.md).
+It includes every fix shipped in 0.7.1:
 
-Nothing yet.
+- RPC: any request `Content-Type` is read as JSON, as in Core (#824).
+- RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
+- RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
+- RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
+- RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
+- RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
+- Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
+- P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
+- P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
+- P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
+- P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
+- Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
+- Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
+- Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
+- Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 
 ## Releases
 
