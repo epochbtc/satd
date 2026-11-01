@@ -83,7 +83,7 @@ jobs:
 
       # A prebuilt binary, as deny.yml installs cargo-deny.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.88.0
         with:
           tool: cargo-llvm-cov@${{ env.LLVM_COV_VERSION }}
 
