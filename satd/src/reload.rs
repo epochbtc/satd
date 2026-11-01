@@ -1068,6 +1068,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("stallwatchdogsecs", stall_watchdog_secs),
         restart!("stallabortsecs", stall_abort_secs),
         restart!("shadowqueuesize", shadow_queue_size),
+        restart!("shadowqueuemb", shadow_queue_mb),
         restart!("shadowworkers", shadow_workers),
         // ---- Mining ----
         restart!("blockmaxweight", blockmaxweight),
