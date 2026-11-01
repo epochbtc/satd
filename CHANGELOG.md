@@ -21,6 +21,11 @@ full in the in-development
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
+- RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
+- RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
+- Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
+- Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
+- Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 
 ## Releases
 

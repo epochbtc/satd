@@ -2914,6 +2914,15 @@ impl Mempool {
         cfg: &MempoolConfig,
         weight: usize,
     ) -> Result<(), MempoolError> {
+        // Core's `IsStandardTx` checks the version first: below
+        // `TX_MIN_STANDARD_VERSION` (1) or above `TX_MAX_STANDARD_VERSION` (3)
+        // is non-standard, reason `version` (src/policy/policy.cpp). Core
+        // reads the field as `uint32_t`, rust-bitcoin as `i32`, so 0x80000000
+        // and above are negative here and caught by the lower bound.
+        if !(1..=3).contains(&tx.version.0) {
+            return Err(MempoolError::Validation("version".to_string()));
+        }
+
         // Standard tx weight ceiling (oversize relay check).
         if weight > MAX_STANDARD_TX_WEIGHT {
             return Err(MempoolError::Validation("tx-size".to_string()));
@@ -9836,6 +9845,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Core's `IsStandardTx` version range, 1 to 3 (src/policy/policy.cpp):
+    /// 0, 4 and 0xffffffff are refused with reason `version`, through the
+    /// admission path as well as the check itself, and `-acceptnonstdtxn`
+    /// lifts the rule.
+    #[test]
+    fn standardness_refuses_versions_outside_one_to_three() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let tx_with = |version: i32| Transaction {
+            version: transaction::Version(version),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xcc; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])),
+            }],
+        };
+        let cfg = MempoolConfig::default();
+        let is_version = |r: &Result<(), MempoolError>| {
+            matches!(r, Err(MempoolError::Validation(reason)) if reason == "version")
+        };
+        for (version, standard) in [(0, false), (1, true), (2, true), (3, true), (4, false), (-1, false)] {
+            let tx = tx_with(version);
+            let weight = tx.weight().to_wu() as usize;
+            let result = Mempool::check_standardness(&tx, &cfg, weight);
+            assert_eq!(!is_version(&result), standard, "version {version:#x}: {result:?}", version = version as u32);
+            if standard {
+                assert!(result.is_ok(), "version {version}: {result:?}");
+            }
+        }
+
+        let (cs, mp, dir) = make_test_env();
+        let result = mp.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
+            "version 4 must be refused as non-standard, got {result:?}"
+        );
+        let nonstd = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
+        let result = nonstd.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            !matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
+            "-acceptnonstdtxn must lift the version rule, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn accept_non_std_txn_bypasses_standardness_checks() {
         use bitcoin::blockdata::locktime::absolute::LockTime;
@@ -13756,9 +13824,13 @@ mod tests {
 
     #[test]
     fn a_high_bit_version_still_enforces_bip68_at_admission() {
-        // Core's version gate is unsigned; 0x80000002 enforces.
+        // Core's version gate is unsigned; 0x80000002 enforces. Such a version
+        // is non-standard (`IsStandardTx`, reason `version`, #1070), so the
+        // pool takes non-standard transactions to reach the BIP 68 check,
+        // which `-acceptnonstdtxn` does not lift.
         let op = outpoint(0xEA);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let (cs, _, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let mp = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
         let tx = spend_with(op, 40_000, 0x2A, 0x8000_0002u32 as i32, 1, 0);
         let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");

@@ -154,8 +154,13 @@ from NBXplorer, which speaks satd's JSON-RPC and P2P. See
 ## Local overrides
 
 `satd-init` rewrites `bitcoin.conf` on every start, so edits to it are lost.
-Put additions in `conf.d/local.conf` inside the data volume instead; they
-are appended last, and satd takes the last value for a repeated key.
+Put additions in `conf.d/local.conf` inside the data volume instead.
+`satd-init` places its top-level lines ahead of everything it renders, so
+they override the keys it writes: satd, like Bitcoin Core, takes the first
+value of a repeated key in a config file. Keys that take several values, such
+as `rpcallowip`, add to the rendered ones rather than replacing them. Any
+`[section]` blocks in the file are kept at the end, where a value in the
+active chain's section wins anyway.
 
 ```sh
 docker compose exec satd sh -c 'mkdir -p /var/lib/satd/conf.d && \
