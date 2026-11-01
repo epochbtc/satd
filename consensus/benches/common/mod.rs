@@ -8,6 +8,9 @@
 
 #![allow(dead_code)] // Not every bench uses every helper.
 
+#[path = "../../tests/kernel_ref/mod.rs"]
+pub mod kernel_ref;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
@@ -43,13 +46,13 @@ pub struct WorkloadCase {
 }
 
 /// The flags bitcoinconsensus recognises — it rejects unknown flag bits.
-pub const CPP_RECOGNIZED_FLAGS: u32 = bitcoinconsensus::VERIFY_P2SH
-    | bitcoinconsensus::VERIFY_DERSIG
-    | bitcoinconsensus::VERIFY_NULLDUMMY
-    | bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY
-    | bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY
-    | bitcoinconsensus::VERIFY_WITNESS
-    | bitcoinconsensus::VERIFY_TAPROOT;
+pub const CPP_RECOGNIZED_FLAGS: u32 = kernel_ref::VERIFY_P2SH
+    | kernel_ref::VERIFY_DERSIG
+    | kernel_ref::VERIFY_NULLDUMMY
+    | kernel_ref::VERIFY_CHECKLOCKTIMEVERIFY
+    | kernel_ref::VERIFY_CHECKSEQUENCEVERIFY
+    | kernel_ref::VERIFY_WITNESS
+    | kernel_ref::VERIFY_TAPROOT;
 
 pub fn cpp_safe_flags(f: u32) -> u32 {
     f & CPP_RECOGNIZED_FLAGS
@@ -93,7 +96,7 @@ pub fn verify_rust(c: &WorkloadCase) -> bool {
 #[inline]
 pub fn verify_cpp(c: &WorkloadCase) -> bool {
     let result = if c.prev_outputs.is_empty() {
-        bitcoinconsensus::verify_with_flags(
+        kernel_ref::verify_with_flags(
             &c.script_pubkey,
             c.amount,
             &c.tx_bytes,
@@ -102,16 +105,16 @@ pub fn verify_cpp(c: &WorkloadCase) -> bool {
             c.flags,
         )
     } else {
-        let utxos: Vec<bitcoinconsensus::Utxo> = c
+        let utxos: Vec<kernel_ref::Utxo> = c
             .prev_outputs
             .iter()
-            .map(|(spk, val)| bitcoinconsensus::Utxo {
+            .map(|(spk, val)| kernel_ref::Utxo {
                 script_pubkey: spk.as_ptr(),
                 script_pubkey_len: spk.len() as u32,
                 value: *val as i64,
             })
             .collect();
-        bitcoinconsensus::verify_with_flags(
+        kernel_ref::verify_with_flags(
             &c.script_pubkey,
             c.amount,
             &c.tx_bytes,
@@ -348,7 +351,7 @@ pub fn load_script_tests() -> Vec<WorkloadCase> {
             shorten(script_pubkey_str, 40)
         );
 
-        let prev_outputs = if safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0 {
+        let prev_outputs = if safe_flags & kernel_ref::VERIFY_TAPROOT != 0 {
             vec![(script_pubkey.clone(), n_value)]
         } else {
             Vec::new()
@@ -407,11 +410,11 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
     // Start permissive; fall back if the engines disagree.
     let candidate_flags = [
         CPP_RECOGNIZED_FLAGS, // everything the C++ engine knows
-        bitcoinconsensus::VERIFY_P2SH
-            | bitcoinconsensus::VERIFY_WITNESS
-            | bitcoinconsensus::VERIFY_TAPROOT,
-        bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
-        bitcoinconsensus::VERIFY_P2SH,
+        kernel_ref::VERIFY_P2SH
+            | kernel_ref::VERIFY_WITNESS
+            | kernel_ref::VERIFY_TAPROOT,
+        kernel_ref::VERIFY_P2SH | kernel_ref::VERIFY_WITNESS,
+        kernel_ref::VERIFY_P2SH,
         0,
     ];
 
@@ -454,7 +457,7 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
             // Probe for the widest flag set that both engines accept.
             let mut chosen_flags: Option<u32> = None;
             for &flags in &candidate_flags {
-                let has_taproot = flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+                let has_taproot = flags & kernel_ref::VERIFY_TAPROOT != 0;
                 let test = WorkloadCase {
                     name: String::new(),
                     script_pubkey: spk.clone(),
@@ -478,7 +481,7 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
                 None => continue, // neither engine accepts this input — skip
             };
 
-            let has_taproot = flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+            let has_taproot = flags & kernel_ref::VERIFY_TAPROOT != 0;
             cases.push(WorkloadCase {
                 name: format!("h{height}_tx{tx_idx}_in{i}"),
                 script_pubkey: spk,
@@ -521,9 +524,9 @@ pub fn load_bip341_keypath_cases() -> Vec<WorkloadCase> {
         })
         .collect();
 
-    let flags = bitcoinconsensus::VERIFY_P2SH
-        | bitcoinconsensus::VERIFY_WITNESS
-        | bitcoinconsensus::VERIFY_TAPROOT;
+    let flags = kernel_ref::VERIFY_P2SH
+        | kernel_ref::VERIFY_WITNESS
+        | kernel_ref::VERIFY_TAPROOT;
 
     let mut cases = Vec::new();
     for (i, prev) in prevs.iter().enumerate() {
@@ -643,7 +646,7 @@ pub fn load_tx_valid_cases() -> Vec<WorkloadCase> {
         let excluded = parse_flags(flags_str);
         let verify_flags = fill_flags(!excluded & consensus::flags::ALL_FLAGS);
         let safe_flags = cpp_safe_flags(verify_flags);
-        let has_taproot = safe_flags & bitcoinconsensus::VERIFY_TAPROOT != 0;
+        let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
         // Build prev_outputs for the whole tx (required for taproot sighash).
         let prev_outputs: Vec<(Vec<u8>, u64)> = tx

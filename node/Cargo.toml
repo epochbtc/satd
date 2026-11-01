@@ -24,7 +24,8 @@ thiserror = { workspace = true }
 rocksdb = { workspace = true }
 hex = { workspace = true }
 bincode = { workspace = true }
-bitcoinconsensus = { workspace = true }
+bitcoinkernel = { workspace = true }
+libbitcoinkernel-sys = { workspace = true }
 zeroize = { workspace = true }
 tokio-socks = { workspace = true }
 lru = { workspace = true }

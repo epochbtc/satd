@@ -1,6 +1,8 @@
 //! Every opcode in a tapscript leaf, against libbitcoinconsensus (Core's
 //! interpreter), plus pay-to-anchor through `verify_script`.
 
+mod kernel_ref;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
@@ -75,12 +77,12 @@ fn rust_verify(s: &LeafSpend, script_flags: u32) -> Result<(), ScriptError> {
 fn cpp_verify(s: &LeafSpend, script_flags: u32) -> bool {
     let mut ser = Vec::new();
     s.tx.consensus_encode(&mut ser).unwrap();
-    let utxos = [bitcoinconsensus::Utxo {
+    let utxos = [kernel_ref::Utxo {
         script_pubkey: s.spk.as_ptr(),
         script_pubkey_len: s.spk.len() as u32,
         value: s.prevouts[0].value.to_sat() as i64,
     }];
-    bitcoinconsensus::verify_with_flags(
+    kernel_ref::verify_with_flags(
         &s.spk,
         s.prevouts[0].value.to_sat(),
         &ser,

@@ -1,6 +1,8 @@
 //! The BIP 341 signature message on the script path, against libbitcoinconsensus,
 //! and its cost when one input makes many signature checks over a large annex.
 
+mod kernel_ref;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
@@ -93,12 +95,12 @@ fn verify_both(tx: &Transaction, prevouts: &[TxOut], index: usize) -> (bool, boo
         .iter()
         .map(|o| consensus::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
         .collect();
-    let cpp_utxos: Vec<bitcoinconsensus::Utxo> = prevouts
+    let cpp_utxos: Vec<kernel_ref::Utxo> = prevouts
         .iter()
-        .map(|o| bitcoinconsensus::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
+        .map(|o| kernel_ref::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
         .collect();
     let rust = consensus::verify_with_flags(spk, VALUE, &bytes, Some(&rust_utxos), index, FLAGS).is_ok();
-    let cpp = bitcoinconsensus::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
+    let cpp = kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
     (rust, cpp)
 }
 
@@ -191,12 +193,12 @@ fn time_both(tx: &Transaction, prevouts: &[TxOut]) -> (Duration, Duration) {
     tx.consensus_encode(&mut bytes).unwrap();
     let spk = prevouts[0].script_pubkey.as_bytes();
     let rust_utxos = [consensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
-    let cpp_utxos = [bitcoinconsensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
+    let cpp_utxos = [kernel_ref::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
     let t = Instant::now();
     assert!(consensus::verify_with_flags(spk, VALUE, &bytes, Some(&rust_utxos), 0, FLAGS).is_ok());
     let rust = t.elapsed();
     let t = Instant::now();
-    assert!(bitcoinconsensus::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), 0, FLAGS).is_ok());
+    assert!(kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), 0, FLAGS).is_ok());
     (rust, t.elapsed())
 }
 

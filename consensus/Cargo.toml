@@ -17,7 +17,7 @@ ripemd = "0.1"
 serde_json = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
-bitcoinconsensus = { workspace = true }
+bitcoinkernel = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
 
