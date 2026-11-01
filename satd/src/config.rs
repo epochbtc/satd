@@ -1184,6 +1184,9 @@ pub struct Config {
     pub consensus: ConsensusEngine,
     /// Shadow verification queue capacity (default: 4_194_304).
     pub shadow_queue_size: usize,
+    /// Shadow verification queue byte budget in MiB (default: 128; `0` for
+    /// no byte bound).
+    pub shadow_queue_mb: usize,
     /// Shadow verification worker threads (default: 4).
     pub shadow_workers: usize,
     // MCP server
@@ -4600,6 +4603,10 @@ impl Config {
                 .shadowqueuesize
                 .or_else(|| file_get("shadowqueuesize").and_then(|v| v.parse().ok()))
                 .unwrap_or(4_194_304),
+            shadow_queue_mb: cli
+                .shadowqueuemb
+                .or_else(|| file_get("shadowqueuemb").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::validation::script::DEFAULT_SHADOW_QUEUE_MB),
             shadow_workers: cli
                 .shadowworkers
                 .or_else(|| file_get("shadowworkers").and_then(|v| v.parse().ok()))
@@ -6542,6 +6549,13 @@ pub struct CliArgs {
         help = "Shadow verification queue capacity (default: 4194304)"
     )]
     pub shadowqueuesize: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Memory the shadow verification queue may hold, in MiB; 0 for no byte bound (default: 128)"
+    )]
+    pub shadowqueuemb: Option<usize>,
 
     #[arg(
         long,
@@ -9780,6 +9794,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stallwatchdogsecs",
     "stallabortsecs",
     "shadowqueuesize",
+    "shadowqueuemb",
     "shadowworkers",
     // Mining
     "blockmaxweight",
@@ -12781,6 +12796,7 @@ testactivationheight=bip34@2
             stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
+            shadowqueuemb: None,
             shadowworkers: None,
             rpcextendederrors: Some(false),
             maxshutdownsecs: None,
@@ -13101,6 +13117,7 @@ testactivationheight=bip34@2
             stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
+            shadowqueuemb: None,
             shadowworkers: None,
             rpcextendederrors: Some(false),
             maxshutdownsecs: None,

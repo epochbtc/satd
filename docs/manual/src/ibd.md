@@ -195,17 +195,27 @@ dual-engine cross-verification. satd prints a caution at startup when the
 single-engine `rust` mode is selected.
 
 The shadow engine runs on a bounded background worker pool, so it consumes
-spare CPU without slowing block connection. Two flags tune it:
+spare CPU without slowing block connection. Three flags tune it:
 
 - `-shadowworkers=<n>` (default 4): background shadow-verification threads.
-- `-shadowqueuesize=<n>` (default 4194304): shadow work-queue capacity. When
-  the queue is full, shadow work is dropped, and an aggregated WARN is logged
-  at most once per 5 s. The primary engine still verifies every script, so
-  correctness is unaffected.
+- `-shadowqueuesize=<n>` (default 4194304): the most transactions the shadow
+  work queue holds.
+- `-shadowqueuemb=<n>` (default 128): the most memory, in MiB, the queued
+  work may hold. Each queued transaction holds its serialized bytes and a copy
+  of every output it spends. On a host with few cores the shadow engine can
+  fall behind the primary for hours during IBD, and this budget, not the
+  entry count, is what keeps the queue from growing into the process's memory
+  limit. `0` removes the byte bound and leaves only `-shadowqueuesize`.
+
+When either bound is reached, shadow work is dropped, and an aggregated WARN
+is logged at most once per 5 s with the queue's depth and bytes. The primary
+engine still verifies every script, so correctness is unaffected. Frequent
+drops mean the shadow engine cannot keep up on this host; `-consensus=rust` or
+`-consensus=cpp` runs a single engine.
 
 > **Difference from Bitcoin Core.** Core has a single C++ engine and no shadow
 > mode. satd's default runs both engines at once. `-consensus`,
-> `-shadowworkers`, and `-shadowqueuesize` are satd-specific.
+> `-shadowworkers`, `-shadowqueuesize` and `-shadowqueuemb` are satd-specific.
 
 ## IBD performance & storage tuning
 
@@ -510,7 +520,7 @@ at height H can only be spent at or above H.
 - `assumevalid=all` with `assumevalidage`: verify-recent-only mode. Core takes
   a hash or `0`.
 - Dual-engine shadow verification (`-consensus`, `-shadowworkers`,
-  `-shadowqueuesize`): the default runs the C++ and Rust engines together.
+  `-shadowqueuesize`, `-shadowqueuemb`): the default runs the C++ and Rust engines together.
   Core has one engine.
 - `--fast-start` / `--fast-start-sha256`: one-flag AssumeUTXO
   download-verify-load. Core requires a manual `loadtxoutset`.

@@ -577,6 +577,12 @@ pub struct ShadowVerifier {
     /// `None` once `drop` has closed the queue.
     shadow_tx: Option<crossbeam_channel::Sender<ShadowWork>>,
     queue_size: usize,
+    /// The most bytes the queued work may hold (`-shadowqueuemb`); `0` for
+    /// no byte bound, leaving only the entry count (#1145).
+    queue_bytes: usize,
+    /// Bytes held by queued work: charged on enqueue, released by the worker
+    /// that dequeues it.
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Set by `drop`: a worker discards what is still queued and exits.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -587,10 +593,15 @@ pub struct ShadowVerifier {
     dropped: std::sync::atomic::AtomicU64,
     /// Unix-epoch seconds of the last aggregated drop-report WARN emitted.
     last_drop_log_epoch: std::sync::atomic::AtomicU64,
+    /// Every drop since start, never reset (`dropped` is, by the reporter).
+    dropped_total: std::sync::atomic::AtomicU64,
 }
 
 /// Minimum seconds between aggregated drop-report WARN emissions.
 const SHADOW_DROP_LOG_INTERVAL_SECS: u64 = 5;
+
+/// Default byte budget of the shadow queue (`-shadowqueuemb`), in MiB.
+pub const DEFAULT_SHADOW_QUEUE_MB: usize = 128;
 
 /// Work item for the shadow verification background pool.
 struct ShadowWork {
@@ -598,6 +609,30 @@ struct ShadowWork {
     prev_outputs: Vec<TxOut>,
     height: u32,
     txid: bitcoin::Txid,
+    /// What [`ShadowWork::cost`] charged the byte budget on enqueue.
+    charge: usize,
+}
+
+impl ShadowWork {
+    fn new(tx: &Transaction, prev_outputs: &[TxOut], height: u32, charge: usize) -> Self {
+        ShadowWork {
+            tx_bytes: bitcoin::consensus::serialize(tx),
+            prev_outputs: prev_outputs.to_vec(),
+            height,
+            txid: tx.compute_txid(),
+            charge,
+        }
+    }
+
+    /// The bytes an item for `tx` holds while it waits: the serialized
+    /// transaction, the prevout vector and each prevout's script. Computed
+    /// from the inputs, so a drop costs no allocation.
+    fn cost(tx: &Transaction, prev_outputs: &[TxOut]) -> usize {
+        std::mem::size_of::<ShadowWork>()
+            + tx.total_size()
+            + std::mem::size_of_val(prev_outputs)
+            + prev_outputs.iter().map(|o| o.script_pubkey.len()).sum::<usize>()
+    }
 }
 
 impl ShadowVerifier {
@@ -615,6 +650,7 @@ impl ShadowVerifier {
         let (tx, rx) = crossbeam_channel::bounded::<ShadowWork>(queue_size);
         let shadow = std::sync::Arc::new(shadow);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let primary_label = primary_name.to_string();
         let shadow_label = shadow_name.to_string();
 
@@ -627,6 +663,7 @@ impl ShadowVerifier {
         for n in 0..num_workers {
             let w_rx = rx.clone();
             let w_stop = stop.clone();
+            let w_queued_bytes = queued_bytes.clone();
             let w_shadow = shadow.clone();
             let w_primary_label = primary_label.clone();
             let w_shadow_label = shadow_label.clone();
@@ -638,6 +675,7 @@ impl ShadowVerifier {
                     .name(format!("shadow-{}", n))
                     .spawn(move || {
                 while let Ok(work) = w_rx.recv() {
+                    w_queued_bytes.fetch_sub(work.charge, std::sync::atomic::Ordering::Relaxed);
                     if w_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
@@ -696,21 +734,62 @@ impl ShadowVerifier {
             primary,
             shadow_tx: Some(tx),
             queue_size,
+            queue_bytes: DEFAULT_SHADOW_QUEUE_MB << 20,
+            queued_bytes,
             stop,
             workers,
             dropped: std::sync::atomic::AtomicU64::new(0),
             last_drop_log_epoch: std::sync::atomic::AtomicU64::new(0),
+            dropped_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Queue `work` for the shadow pool, counting it as dropped when the queue
-    /// is full.
-    fn enqueue(&self, work: ShadowWork) {
-        let height = work.height;
-        if let Some(shadow_tx) = &self.shadow_tx
-            && let Err(crossbeam_channel::TrySendError::Full(_)) = shadow_tx.try_send(work)
-        {
+    /// Bound the queued work to `bytes` (`-shadowqueuemb`); `0` leaves only
+    /// the entry count. [`DEFAULT_SHADOW_QUEUE_MB`] until set.
+    pub fn with_queue_bytes(mut self, bytes: usize) -> Self {
+        self.queue_bytes = bytes;
+        tracing::info!(queue_bytes = bytes, "Shadow verification queue byte budget");
+        self
+    }
+
+    /// Bytes the queued work holds now.
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every transaction dropped since start because the queue was full.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Queue `work` for the shadow pool, counting it as dropped when the
+    /// queue is full: by entry count, or by bytes (#1145). An empty queue
+    /// takes any one item, so a transaction larger than the budget is still
+    /// checked when the shadow engine has caught up.
+    ///
+    /// The byte check runs before the item is built, so a full queue costs
+    /// the hot path no serialization or prevout copy.
+    fn enqueue(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
+        use std::sync::atomic::Ordering;
+        let Some(shadow_tx) = &self.shadow_tx else {
+            return;
+        };
+        let charge = ShadowWork::cost(tx, prev_outputs);
+        let before = self.queued_bytes.fetch_add(charge, Ordering::Relaxed);
+        if self.queue_bytes != 0 && before != 0 && before.saturating_add(charge) > self.queue_bytes {
+            self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
             self.report_drop(height);
+            return;
+        }
+        match shadow_tx.try_send(ShadowWork::new(tx, prev_outputs, height, charge)) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
+                self.report_drop(height);
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
+            }
         }
     }
 
@@ -726,6 +805,7 @@ impl ShadowVerifier {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.dropped_total.fetch_add(1, Ordering::Relaxed);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -745,14 +825,20 @@ impl ShadowVerifier {
         }
         let total = self.dropped.swap(0, Ordering::Relaxed);
         if total > 0 {
+            let queued = self.shadow_tx.as_ref().map_or(0, |t| t.len());
             tracing::warn!(
                 height,
+                queued,
                 queue_size = self.queue_size,
+                queued_bytes = self.queued_bytes(),
+                queue_bytes = self.queue_bytes,
                 dropped = total,
                 interval_secs = SHADOW_DROP_LOG_INTERVAL_SECS,
                 "Shadow verification queue full — dropping tx (aggregated). \
-                 Consider increasing --shadowworkers or --shadowqueuesize, \
-                 or using --consensus=rust if the shadow engine isn't needed."
+                 The shadow engine is not keeping up; consider increasing \
+                 --shadowworkers (or --shadowqueuemb on a host with memory to \
+                 spare), or using --consensus=rust if the shadow engine isn't \
+                 needed."
             );
         }
     }
@@ -770,12 +856,7 @@ impl ScriptVerifier for ShadowVerifier {
 
         // On primary success, dispatch shadow verification asynchronously.
         if result.is_ok() {
-            self.enqueue(ShadowWork {
-                tx_bytes: bitcoin::consensus::serialize(tx),
-                prev_outputs: prev_outputs.to_vec(),
-                height,
-                txid: tx.compute_txid(),
-            });
+            self.enqueue(tx, prev_outputs, height);
         }
 
         result
@@ -806,12 +887,7 @@ impl ScriptVerifier for ShadowVerifier {
     }
 
     fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
-        self.enqueue(ShadowWork {
-            tx_bytes: bitcoin::consensus::serialize(tx),
-            prev_outputs: prev_outputs.to_vec(),
-            height,
-            txid: tx.compute_txid(),
-        });
+        self.enqueue(tx, prev_outputs, height);
     }
 
     fn primary_engine(&self) -> PrimaryEngine {
@@ -1188,5 +1264,117 @@ mod tests {
             "drop must return only after every worker has exited"
         );
         assert_eq!(started.load(SeqCst), 1, "the four still queued must be discarded");
+    }
+
+    /// A shadow engine that blocks every verification until the test
+    /// releases the gate, counting the ones it starts.
+    struct GatedShadow {
+        gate: std::sync::Arc<parking_lot::Mutex<()>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptVerifier for GatedShadow {
+        fn verify_transaction(
+            &self,
+            _tx: &Transaction,
+            _prev_outputs: &[TxOut],
+            _height: u32,
+        ) -> Result<(), ScriptError> {
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(self.gate.lock());
+            Ok(())
+        }
+    }
+
+    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The shadow queue is bounded by bytes as well as entries (#1145).
+    /// With the one worker stuck in the shadow engine and a budget of three
+    /// items, the fourth and fifth are dropped although the entry cap has
+    /// room for a thousand. The worker releases each item's bytes when it
+    /// takes it, so the queue drains back to zero and takes work again.
+    ///
+    /// Perturbation: without the byte check in `enqueue`, nothing is
+    /// dropped and the queue holds five items' bytes.
+    #[test]
+    fn shadow_queue_drops_work_past_its_byte_budget() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let gate = std::sync::Arc::new(parking_lot::Mutex::new(()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![TxOut::NULL],
+        };
+        let prevs = vec![TxOut {
+            value: bitcoin::Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51; 200]),
+        }];
+        let cost = ShadowWork::cost(&tx, &prevs);
+        let verifier = ShadowVerifier::new(
+            Box::new(NoopVerifier),
+            Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),
+            "noop",
+            "gated",
+            1_000,
+            1,
+        )
+        .with_queue_bytes(3 * cost);
+
+        let held = gate.lock();
+        verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+        wait_for("the worker to take the first item", || started.load(SeqCst) == 1);
+        assert_eq!(verifier.queued_bytes(), 0, "a dequeued item no longer counts");
+
+        for _ in 0..5 {
+            verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+        }
+        assert_eq!(verifier.dropped_total(), 2, "two items past the byte budget are dropped");
+        assert_eq!(verifier.queued_bytes(), 3 * cost);
+
+        drop(held);
+        wait_for("the queue to drain", || started.load(SeqCst) == 4 && verifier.queued_bytes() == 0);
+        verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+        wait_for("the drained queue to take work again", || started.load(SeqCst) == 5);
+        assert_eq!(verifier.dropped_total(), 2);
+    }
+
+    /// `-shadowqueuemb=0` leaves only the entry count, as before #1145.
+    #[test]
+    fn a_zero_byte_budget_leaves_only_the_entry_cap() {
+        let gate = std::sync::Arc::new(parking_lot::Mutex::new(()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![TxOut::NULL],
+        };
+        let verifier = ShadowVerifier::new(
+            Box::new(NoopVerifier),
+            Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),
+            "noop",
+            "gated",
+            4,
+            1,
+        )
+        .with_queue_bytes(0);
+        let held = gate.lock();
+        verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+        wait_for("the worker to take the first item", || {
+            started.load(std::sync::atomic::Ordering::SeqCst) == 1
+        });
+        for _ in 0..6 {
+            verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+        }
+        assert_eq!(verifier.dropped_total(), 2, "only the entry cap of 4 applies");
+        drop(held);
     }
 }
