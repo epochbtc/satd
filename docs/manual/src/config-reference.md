@@ -140,7 +140,7 @@ startup error.
 | `rpcpassword` | none | hot | core | RPC password. |
 | `rpcthreads` | 16 | restart | core | Max concurrent in-flight RPC method calls. |
 | `rpcworkqueue` | 64 | restart | core | Max queued RPC requests beyond `rpcthreads` before HTTP 429 (Core returns 503; documented divergence). |
-| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed. 0 disables. An open connection holds one of the listener's 100 connection slots until it closes, so with 0 an idle client keeps its slot indefinitely; see [Scaling the API surfaces](api-scaling.md). |
+| `rpcservertimeout` | 30 | restart | core | Seconds a client may take to deliver a complete request (head and body), or sit idle between keep-alive requests, before the connection is closed; also how long a write may make no progress (a client that stopped reading) before the connection is closed. 0 disables the request and idle budget; a stalled write is then closed after 60 s. Values above a year are treated as a year. An open connection holds one of the listener's 100 connection slots until it closes, so with 0 an idle client keeps its slot indefinitely; see [Scaling the API surfaces](api-scaling.md). |
 | `apithreads` | `max(2, cores/4)` | restart | satd | Worker threads for the isolated API runtime (Esplora/Electrum/events gRPC/metrics). |
 | `rpcreadonlybind` | none | restart | satd | Bind an opt-in read-only JSON-RPC listener (reads + mempool submit) on the API runtime. |
 | `rpcreadonlyport` | 8330 | restart | satd | Default port for `rpcreadonlybind` entries without an explicit port. |
@@ -306,7 +306,7 @@ startup error.
 | `esploramtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
 | `esploraprefix` | `/` | restart | satd | URL prefix to mount the API under (`/api` for blockstream-style). |
 | `esploracors` | none | restart | satd | Allowed CORS origin (repeatable). |
-| `esplorarequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). |
+| `esplorarequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds); also the TLS handshake budget and the idle budget between keep-alive requests. With `0` idle connections stay open and the TLS handshake gets 30 s. Values above a year are treated as a year. A write that makes no progress for 60 s closes the connection. |
 | `esploramaxconns` | 256 | restart | satd | Hard cap on concurrent in-flight Esplora requests. |
 | `esplorasseconns` | = `esploramaxconns` | restart | satd | Hard cap on simultaneously-open SSE streams (`0` disables SSE). |
 | `esploramaxsockets` | 1024 | restart | satd | Hard cap on open sockets across both Esplora listeners, counted at accept with idle keep-alive connections included; over the cap a socket is dropped. `esploramaxconns` bounds requests in flight and never sees a socket that sends nothing. `0` disables. A keep-alive connection idle for longer than `esplorarequesttimeout` is closed. |
@@ -537,7 +537,7 @@ the taxonomy and the details each event carries.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `metricsport` | none | restart | satd | Enable Prometheus `/metrics` + `/healthz` + `/readyz` on this port (unauthenticated). |
-| `metricsbind` | `127.0.0.1` | restart | satd | Metrics/health HTTP bind address. |
+| `metricsbind` | `127.0.0.1` | restart | satd | Metrics/health HTTP bind address. The listener serves at most 64 connections at once and closes one that sends no request head within 30 s. |
 | `metricstlsbind` | none | restart | satd | Also serve the metrics/health endpoints over TLS on this `addr:port` (requires `metricsport`, cert and key). |
 | `metricstlscert` | none | restart | satd | PEM certificate for the metrics TLS listener. |
 | `metricstlskey` | none | restart | satd | PEM private key for the metrics TLS listener. |

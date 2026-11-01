@@ -293,6 +293,11 @@ restart-classified; `0` means unlimited.
 Admission shedding runs before authentication and request-body buffering. A
 connection flood, authenticated or not, is bounded before it does any work.
 
+A `/ws` or `/sse` client that stops reading is disconnected once a write to it
+has made no progress for 60 s, and gives its socket back. At shutdown an open
+`/ws` socket gets a `1001 Going Away` close frame and an `/sse` stream ends its
+response, so a client sees a clean close rather than a dropped connection.
+
 ## Bitcoin Core ZMQ compatibility
 
 satd also publishes Bitcoin Core's ZMQ notifications, for software written

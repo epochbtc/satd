@@ -224,25 +224,38 @@ impl ElectrumServer {
                     return;
                 }
                 accept = self.listener.accept() => {
-                    self.handle_plain_accept(accept, &shutdown);
+                    if !self.handle_plain_accept(accept, &shutdown) {
+                        // Brief backoff on a failed accept (EMFILE), so the
+                        // loop does not spin.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
                 accept = tls_accept => {
-                    self.handle_tls_accept(accept, &shutdown);
+                    if !self.handle_tls_accept(accept, &shutdown) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         }
     }
 
+    /// Handle one accept on the plain listener. `false` means the accept
+    /// itself failed, and the loop should back off.
     fn handle_plain_accept(
         &self,
         accept: io::Result<(TcpStream, SocketAddr)>,
         shutdown: &watch::Receiver<bool>,
-    ) {
+    ) -> bool {
         let (stream, peer) = match accept {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "Electrum accept error");
-                return;
+                // This function serves the one plain listener, so a `static`
+                // budget is that listener's.
+                static ACCEPT_ERRORS: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = ACCEPT_ERRORS.tick() {
+                    tracing::warn!(error = %e, suppressed, "Electrum accept error");
+                }
+                return false;
             }
         };
         match self.semaphore.clone().try_acquire_owned() {
@@ -276,23 +289,28 @@ impl ElectrumServer {
                 });
             }
         }
+        true
     }
 
+    /// Handle one accept on the TLS listener; see [`Self::handle_plain_accept`].
     fn handle_tls_accept(
         &self,
         accept: io::Result<(TcpStream, SocketAddr)>,
         shutdown: &watch::Receiver<bool>,
-    ) {
+    ) -> bool {
         let (stream, peer) = match accept {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "Electrum TLS accept error");
-                return;
+                static ACCEPT_ERRORS: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                if let Some(suppressed) = ACCEPT_ERRORS.tick() {
+                    tracing::warn!(error = %e, suppressed, "Electrum TLS accept error");
+                }
+                return false;
             }
         };
         let acceptor = match &self.tls {
             Some((_, a)) => a.clone(),
-            None => return, // unreachable when accept arm is gated
+            None => return true, // unreachable when accept arm is gated
         };
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
@@ -316,12 +334,18 @@ impl ElectrumServer {
                             return;
                         }
                         Err(_elapsed) => {
-                            tracing::warn!(
-                                target = "electrum::server",
-                                peer = %peer,
-                                timeout_secs = handshake_timeout.as_secs(),
-                                "TLS handshake timed out — closing connection",
-                            );
+                            // One line per silent socket is a client's to
+                            // drive, so it is budgeted.
+                            static TIMEOUTS: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                            if let Some(suppressed) = TIMEOUTS.tick() {
+                                tracing::warn!(
+                                    target = "electrum::server",
+                                    peer = %peer,
+                                    timeout_secs = handshake_timeout.as_secs(),
+                                    suppressed,
+                                    "TLS handshake timed out — closing connection",
+                                );
+                            }
                             return;
                         }
                     };
@@ -380,6 +404,7 @@ impl ElectrumServer {
                 });
             }
         }
+        true
     }
 }
 
