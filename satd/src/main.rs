@@ -1325,7 +1325,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "rust",
                 config.shadow_queue_size,
                 config.shadow_workers,
-            ))
+            )
+            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
         ConsensusEngine::CppShadow => {
             tracing::info!("Consensus: cpp-shadow (rust authoritative, cpp shadow)");
@@ -1336,7 +1337,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "cpp",
                 config.shadow_queue_size,
                 config.shadow_workers,
-            ))
+            )
+            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
     };
     let chain_state = match ChainState::new(

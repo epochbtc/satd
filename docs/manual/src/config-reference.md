@@ -382,6 +382,7 @@ startup error.
 | `stallwatchdogsecs` | 300 (`0` disables) | restart | satd | Stall-watchdog forensic-dump threshold (seconds without tip advance). |
 | `stallabortsecs` | 300 | restart | satd | Additional grace after the forensics dump before `abort()`. |
 | `shadowqueuesize` | 4194304 | restart | satd | Shadow-verification queue capacity. |
+| `shadowqueuemb` | 128 (`0` disables) | restart | satd | Memory the shadow-verification queue may hold, in MiB; work past it is dropped. |
 | `shadowworkers` | 4 | restart | satd | Shadow-verification worker threads. |
 
 ## Mining
