@@ -4144,8 +4144,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // load the cert/key + bind the TLS port synchronously so
             // a misconfigured TLS surface is a startup-fatal error
             // rather than a logged warning on the first handshake.
+            // `--esplorarequesttimeout`, or its default when that is 0 (which
+            // leaves idle connections open but must not zero the handshake).
             let tls_handshake_timeout =
-                std::time::Duration::from_secs(config.esplora_request_timeout);
+                esplora_handlers::tls_handshake_timeout(config.esplora_request_timeout);
             let tls_setup = match (
                 config.esplora_tls_bind.as_ref(),
                 config.esplora_tls_cert.as_ref(),
@@ -4226,11 +4228,13 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // One `--esploramaxsockets` cap shared by both listeners: the
             // limits are cloned into each, and a clone draws on the same
             // pool. Both close a keep-alive connection that idles for longer
-            // than `--esplorarequesttimeout` (0 leaves idle connections open).
+            // than `--esplorarequesttimeout` (0 leaves idle connections open),
+            // and one whose client stops reading a response or SSE stream.
             let esplora_limits = node::http_serve::ListenerLimits {
                 sockets: node::http_serve::SocketCap::new(config.esplora_max_sockets),
                 idle_timeout: (config.esplora_request_timeout > 0)
                     .then(|| std::time::Duration::from_secs(config.esplora_request_timeout)),
+                write_timeout: Some(node::http_serve::WRITE_STALL_TIMEOUT),
             };
             // The plain and TLS arms share the same `router` (axum's
             // Router is Clone-cheap). They observe the same shutdown

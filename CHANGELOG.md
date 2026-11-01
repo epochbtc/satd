@@ -30,6 +30,13 @@ full in the in-development
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
+- HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).
+- HTTP: shutdown closes streamws WebSockets with `1001 Going Away` and ends SSE streams on streamws and Esplora (#822).
+- Operator: TLS handshake timeouts and accept errors are logged under a per-listener budget, and Stratum's V1, V1-TLS and V2 listeners report at-capacity refusals separately (#825).
+- RPC: a bearer token without a method's capability gets `-32004` before the method's parameters are checked (#826).
+- Esplora: `-esplorarequesttimeout=0` no longer zeroes the TLS handshake budget (#826).
+- HTTP: `-rpcservertimeout` and `-esplorarequesttimeout` above a year are treated as a year, instead of failing every connection (#826).
+- Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
 
 ## Releases
 
