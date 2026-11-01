@@ -1,5 +1,4 @@
 use bitcoin::BlockHash;
-use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -57,7 +56,7 @@ pub struct IbdScheduler {
     phase: IbdPhase,
     target_height: u32,
 
-    /// Global pool of block heights still needing download, shuffled randomly.
+    /// Global pool of block heights still needing download, in height order.
     pending: VecDeque<u32>,
 
     /// Heights currently assigned to a peer (in-flight).
@@ -141,17 +140,21 @@ const FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(20);
 /// a peer gets dropped.
 pub const SILENT_PEER_FAILURE_THRESHOLD: u32 = 3;
 
+/// The heights just above the connect cursor that are always handed out,
+/// whatever the window says (see `assign_blocks_up_to`).
+const PRIORITY_ZONE: u32 = 256;
+
 impl IbdScheduler {
     /// Create a new scheduler for heights `(current_tip+1)..=target_height`.
-    /// Shuffles the pending pool randomly for BitTorrent-style distribution.
+    /// The pending pool is in height order: it is handed out from the bottom,
+    /// and no further than `max_ahead` above the connect cursor (#1154).
     pub fn new(
         target_height: u32,
         current_tip: u32,
         chain_state: &ChainState,
         max_ahead: u32,
     ) -> Self {
-        let mut heights: Vec<u32> = ((current_tip + 1)..=target_height).collect();
-        heights.shuffle(&mut rand::thread_rng());
+        let heights: Vec<u32> = ((current_tip + 1)..=target_height).collect();
 
         // Build height-to-hash mapping
         let mut height_to_hash = HashMap::with_capacity(heights.len());
@@ -255,6 +258,18 @@ impl IbdScheduler {
         self.max_ahead = max_ahead;
     }
 
+    /// Whether a block at `height` with `hash` is one the scheduler wants
+    /// stored now: one it has in flight, or any height inside its download
+    /// window (the priority zone or `max_ahead` above the cursor, whichever
+    /// reaches further), so a late delivery of a released height still
+    /// counts. Anything above the window is for later (#1154).
+    pub fn expects(&self, height: u32, hash: &BlockHash) -> bool {
+        if self.in_flight.contains_key(&height) && self.height_to_hash.get(&height) == Some(hash) {
+            return true;
+        }
+        height <= self.connect_cursor.saturating_add(self.max_ahead.max(PRIORITY_ZONE))
+    }
+
     /// Assign blocks to a peer for download. Returns hashes to request via GetData.
     /// Respects per-peer limits and the max-ahead window.
     /// Always prioritizes blocks near the connect cursor to avoid deadlocks.
@@ -308,7 +323,7 @@ impl IbdScheduler {
         // block, so the blocks just above it are always inside
         // (`nWindowEnd`, `net_processing.cpp:1436-1441`). The overshoot is
         // bounded by the zone's 256 heights.
-        let priority_end = (self.connect_cursor + 256).min(self.target_height).min(max_height);
+        let priority_end = (self.connect_cursor + PRIORITY_ZONE).min(self.target_height).min(max_height);
         for h in (self.connect_cursor + 1)..=priority_end {
             if hashes.len() >= budget {
                 break;
@@ -328,7 +343,22 @@ impl IbdScheduler {
             }
         }
 
-        // Then fill remaining budget from the shuffled pending pool
+        // Then fill the remaining budget from the pending pool, lowest height
+        // first and no higher than `max_ahead` above the cursor: Core's
+        // download window, `nWindowEnd` (net_processing.cpp). The pool was
+        // shuffled across every height up to the header tip, with only a
+        // count of blocks ahead as the limit, so once the window filled,
+        // each slot it freed went to a random height anywhere up to the
+        // header tip. Those blocks were stored beside the near-tip ones in
+        // every block file, and pruning, which deletes a file only once its
+        // highest block is below the cut, never deleted one during IBD
+        // (#1154).
+        //
+        // The pool stays in height order: it is built ascending, grows at
+        // the top, and every height pushed back to its front was popped
+        // from it earlier, so is below anything never handed out. So the
+        // first height above the window ends the pass.
+        let window_end = self.connect_cursor.saturating_add(self.max_ahead);
         let mut attempts = 0;
         while hashes.len() < budget && !self.pending.is_empty() {
             attempts += 1;
@@ -347,6 +377,10 @@ impl IbdScheduler {
                 Some(h) => h,
                 None => break,
             };
+            if height > window_end {
+                self.pending.push_front(height);
+                break;
+            }
 
             // Already connected: a released height can sit in the pool while
             // its block arrives late and is connected from disk.
@@ -372,11 +406,11 @@ impl IbdScheduler {
             }
         }
 
-        // Return cooldown-deferred heights to the pending pool so other peers
-        // can pick them up. Pushed to the back to give the shuffled queue a
-        // chance to rotate other candidates forward first.
-        for h in deferred {
-            self.pending.push_back(h);
+        // Return deferred heights to the front of the pool, in order, so
+        // another peer's next call claims them first and the pool stays in
+        // height order (the window check above relies on it).
+        for h in deferred.into_iter().rev() {
+            self.pending.push_front(h);
         }
 
         if !assigned_heights.is_empty() {
@@ -893,7 +927,7 @@ impl IbdScheduler {
     }
 
     /// Extend the target height as more headers arrive.
-    /// Adds newly available heights to the pending pool (shuffled).
+    /// Adds newly available heights to the top of the pending pool, in order.
     pub fn extend_target(&mut self, new_target: u32, chain_state: &ChainState) {
         if new_target <= self.target_height {
             return;
@@ -901,9 +935,7 @@ impl IbdScheduler {
         let old_target = self.target_height;
         self.target_height = new_target;
 
-        // Collect and shuffle new heights
-        let mut new_heights: Vec<u32> = ((old_target + 1)..=new_target).collect();
-        new_heights.shuffle(&mut rand::thread_rng());
+        let new_heights: Vec<u32> = ((old_target + 1)..=new_target).collect();
 
         // Build height-to-hash mapping for new heights
         for &h in &new_heights {
@@ -1086,18 +1118,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `expects`: a height in flight, or any height inside the window, is
+    /// wanted; one above both the priority zone and `max_ahead` is not.
     #[test]
-    fn test_randomized_distribution() {
-        let (cs, dir) = make_chain_state_with_headers(100);
-        let sched = IbdScheduler::new(100, 0, &cs, 50_000);
+    fn expects_covers_the_window_and_nothing_above() {
+        let (cs, dir) = make_chain_state_with_headers(2000);
+        let mut sched = IbdScheduler::new(2000, 0, &cs, 400);
+        let hash_at = |h: u32| cs.get_block_hash_by_height(h).unwrap();
+        assert!(sched.expects(1, &hash_at(1)));
+        assert!(sched.expects(400, &hash_at(400)));
+        assert!(!sched.expects(401, &hash_at(401)));
+        assert!(!sched.expects(1999, &hash_at(1999)));
+        let small = IbdScheduler::new(2000, 0, &cs, 20);
+        assert!(small.expects(256, &hash_at(256)), "the priority zone reaches further than a small window");
+        assert!(!small.expects(257, &hash_at(257)));
+        for h in 1..=1000 {
+            sched.mark_downloaded(h);
+        }
+        sched.connect_cursor_advanced(1000);
+        assert!(sched.expects(1400, &hash_at(1400)), "the window moves with the cursor");
+        assert!(!sched.expects(1401, &hash_at(1401)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Check that pending is not in sequential order
+    /// The pool is in height order, and stays so as the target grows: the
+    /// window check in `assign_blocks_up_to` stops at the first height above
+    /// the window (#1154).
+    #[test]
+    fn the_pending_pool_is_in_height_order() {
+        let (cs, dir) = make_chain_state_with_headers(150);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+        sched.extend_target(150, &cs);
         let heights: Vec<u32> = sched.pending.iter().copied().collect();
-        let mut sorted = heights.clone();
-        sorted.sort();
-        // With 100 elements shuffled, it's astronomically unlikely to be sorted
-        assert_ne!(heights, sorted, "Blocks should be shuffled, not sequential");
+        assert_eq!(heights, (1..=150).collect::<Vec<u32>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    /// No height above `cursor + max(max_ahead, 256)` is ever handed out,
+    /// however many peers ask, and the window moves with the cursor. The pool
+    /// was shuffled up to the header tip with only a count as the limit, so
+    /// blocks tens of thousands of heights above the tip were downloaded and
+    /// stored in every block file, and a pruned node never deleted one during
+    /// IBD (#1154).
+    #[test]
+    fn no_height_above_the_window_is_handed_out() {
+        let (cs, dir) = make_chain_state_with_headers(3000);
+        let max_ahead = 400;
+        let mut sched = IbdScheduler::new(3000, 0, &cs, max_ahead);
+        let height_of = |hash: &BlockHash| cs.get_block_index(hash).unwrap().height;
+        let mut assigned = 0;
+        for cursor in [0u32, 600, 1500] {
+            if cursor > 0 {
+                for h in 1..=cursor {
+                    sched.mark_downloaded(h);
+                }
+                sched.connect_cursor_advanced(cursor);
+            }
+            for peer in 1..=60 {
+                for hash in sched.assign_blocks(peer) {
+                    let h = height_of(&hash);
+                    assert!(
+                        h > cursor && h <= cursor + max_ahead.max(256),
+                        "height {h} handed out with the cursor at {cursor} and max_ahead {max_ahead}"
+                    );
+                    assigned += 1;
+                    let _ = sched.block_received(peer, h, hash);
+                }
+            }
+        }
+        assert!(assigned >= 3 * max_ahead as usize / 2, "the window was not filled: {assigned} handed out");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
