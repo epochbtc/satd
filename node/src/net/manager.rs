@@ -6914,8 +6914,16 @@ impl PeerManager {
         }
 
         if !blocks_to_get.is_empty() {
-            // Direct fetch (fast path when the block extends our tip)…
-            if self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get)) {
+            // Direct fetch (fast path when the block extends our tip)… but not
+            // during IBD, where an announced block is a new tip far above the
+            // download window, and storing it puts a block that cannot be
+            // connected for hours into the block file being written, which
+            // keeps that file from being pruned (#1154). Core asks for
+            // headers only (`net_processing.cpp`, the `inv` handler); the
+            // scheduler fetches the block when the window reaches it.
+            if self.ibd.read().is_none()
+                && self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get))
+            {
                 self.note_blocks_requested(id, &blocks_to_get);
             }
             // …plus rate-limited headers-first discovery: if the announced
@@ -7860,7 +7868,7 @@ impl PeerManager {
         // background catch-up requested also land here and are stored — we
         // notify the background connector from the same path.
         if self.ibd.read().is_some() {
-            self.handle_block_ibd(id, block);
+            self.handle_block_ibd(id, block, requested);
             return;
         }
         // Forward IBD inactive. If a background catch-up is active and this
@@ -7929,7 +7937,7 @@ impl PeerManager {
     /// advances the forward scheduler; if a background catch-up is also
     /// active, a stored historical block additionally wakes the background
     /// connector.
-    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block) {
+    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block, requested: bool) {
         // A non-canonical historical block (≤ snapshot_height) can arrive
         // unsolicited even during forward IBD; storing it would poison the
         // shared height→hash mapping the background connector relies on.
@@ -7942,6 +7950,25 @@ impl PeerManager {
             return;
         }
         let hash = block.block_hash();
+        // Core's `fTooFarAhead` (`AcceptBlock`, validation.cpp): a block
+        // nobody asked for is not stored when it is too far above the tip.
+        // Here "asked for" also covers the scheduler's own requests, and
+        // "too far" is above its download window, so a late delivery of a
+        // height the window holds is still kept. A far block stored now sits
+        // in the current block file until the tip reaches it, and keeps that
+        // file from being pruned (#1154).
+        if !requested
+            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+            && self.ibd.read().as_ref().is_some_and(|s| !s.expects(parent.height + 1, &hash))
+        {
+            tracing::debug!(
+                %hash,
+                height = parent.height + 1,
+                peer = id,
+                "IBD: dropping an unrequested block above the download window"
+            );
+            return;
+        }
         match self.chain_state.store_block(&block) {
             Ok((_, height)) => {
                 // Judged when the connector reaches it; remember who sent it.

@@ -27,6 +27,7 @@ full in the in-development
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
+- P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
 
 ## Releases
 
