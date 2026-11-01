@@ -172,10 +172,18 @@ impl TokenStore {
         if token.trim().is_empty() {
             return None;
         }
-        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        self.resolve_digest(&token_digest(token), now)
+    }
+
+    /// [`resolve`](Self::resolve) by `SHA-256(token)`, against the table as
+    /// it stands now. A long-lived session (a WebSocket) keeps the digest of
+    /// the token it was opened with and calls this per frame, so a token
+    /// removed by a reload, or one whose `expires` has passed, stops working
+    /// on an open session as it does on a new one (#821).
+    pub fn resolve_digest(&self, digest: &[u8; 32], now: i64) -> Option<Principal> {
         let table = self.snapshot();
-        let entry = table.get(&digest)?;
-        if !bool::from(entry.hash.ct_eq(&digest)) {
+        let entry = table.get(digest)?;
+        if !bool::from(entry.hash.ct_eq(digest)) {
             return None;
         }
         if let Some(exp) = entry.expires
@@ -196,6 +204,12 @@ impl TokenStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// `SHA-256(token)`, the key [`TokenStore::resolve_digest`] looks a token up
+/// by.
+pub fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 /// Open the file, enforce perms from the open handle (no TOCTOU), read, parse.
@@ -613,6 +627,32 @@ capabilities = ["stream:subscribe", "stream:watch"]
         // "bbb" is now revoked.
         let h: [u8; 32] = Sha256::digest(b"bbb").into();
         assert!(table.get(&h).is_none());
+    }
+
+    #[test]
+    fn resolve_digest_follows_reload_and_expiry() {
+        // #821: a session holding a token's digest sees the table as it is
+        // now, not as it was when the session opened.
+        let dir = tempfile::tempdir().unwrap();
+        let body = |expires: &str| {
+            format!(
+                "version = 1\n[[token]]\nid = \"ws\"\nhash = \"{}\"\ncapabilities = [\"rpc:read\"]\n{expires}",
+                sha256_hex("ws-secret")
+            )
+        };
+        let path = write_file(dir.path(), "auth.toml", &body("expires = 1000\n"), 0o600);
+        let store = TokenStore::load(&path).unwrap();
+        let digest = token_digest("ws-secret");
+        assert!(store.resolve_digest(&digest, 999).is_some(), "valid before expiry");
+        assert!(store.resolve_digest(&digest, 1000).is_none(), "refused at expiry");
+
+        write_file(dir.path(), "auth.toml", &body(""), 0o600);
+        store.reload().unwrap();
+        assert!(store.resolve_digest(&digest, 5000).is_some(), "the reload dropped the expiry");
+
+        write_file(dir.path(), "auth.toml", "version = 1\n", 0o600);
+        store.reload().unwrap();
+        assert!(store.resolve_digest(&digest, 5000).is_none(), "removed by the reload");
     }
 
     #[test]

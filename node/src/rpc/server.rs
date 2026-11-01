@@ -10,7 +10,7 @@ use crate::rpc::amounts::{
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
-use crate::rpc::capability::{BatchRateLayer, CapabilityLayer};
+use crate::rpc::capability::{BatchRateLayer, CapabilityLayer, TokenRecheckLayer};
 use crate::http_serve::serve_http_connection;
 use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
@@ -4046,8 +4046,13 @@ pub async fn start(
         "subscribemempool",
         "mempoolevent",
         "unsubscribemempool",
-        |_params, pending, ctx, _ext| async move {
+        |_params, pending, ctx, ext| async move {
             use jsonrpsee::core::SubscriptionError;
+            // A subscription opened with a bearer token ends once the token
+            // is removed or expires (#821): the socket's frames are
+            // rechecked by `TokenRecheckLayer`, and the events it pushes are
+            // rechecked here, before each one.
+            let session = ext.get::<crate::rpc::auth::BearerSession>().cloned();
             // Reject the subscription cleanly if the mempool wasn't
             // wired with an event sender (tests / startup race).
             let Some(mut rx) = ctx.mempool.subscribe_events() else {
@@ -4064,6 +4069,9 @@ pub async fn start(
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        if session.as_ref().is_some_and(|s| s.current().is_none()) {
+                            break;
+                        }
                         let raw = jsonrpsee::core::to_json_raw_value(&event)
                             .map_err(SubscriptionError::from)?;
                         if sink.send(raw).await.is_err() {
@@ -4930,6 +4938,9 @@ async fn spawn_tls_surface(
     // Charges a batch per call against the token's rate limit; must sit
     // outside every layer that splits a batch (see `BatchRateLayer`).
     let batch_rate = bearer.as_ref().map(|_| BatchRateLayer::new());
+    // Resolves a WebSocket's bearer token again per frame (#821); ahead of
+    // the rate charge and the capability filter, which read its principal.
+    let token_recheck = bearer.as_ref().map(|_| TokenRecheckLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
@@ -4943,7 +4954,10 @@ async fn spawn_tls_surface(
         .set_http_middleware(tls_middleware)
         .set_rpc_middleware(
             RpcServiceBuilder::new()
-                // Outermost, and only on a bearer surface: the per-call rate
+                // Only on a bearer surface: a socket's token, checked
+                // against the current authfile for every frame.
+                .option_layer(token_recheck)
+                // Next, and only on a bearer surface: the per-call rate
                 // charge for a batch, which has to see the batch whole.
                 .option_layer(batch_rate)
                 // Object `params` becomes positional `params` before
@@ -5296,6 +5310,9 @@ pub async fn spawn_plain_surface(
     // Charges a batch per call against the token's rate limit; must sit
     // outside every layer that splits a batch (see `BatchRateLayer`).
     let batch_rate = bearer.as_ref().map(|_| BatchRateLayer::new());
+    // Resolves a WebSocket's bearer token again per frame (#821); ahead of
+    // the rate charge and the capability filter, which read its principal.
+    let token_recheck = bearer.as_ref().map(|_| TokenRecheckLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
@@ -5311,7 +5328,10 @@ pub async fn spawn_plain_surface(
         // (after jsonrpsee has parsed the method + split batches).
         .set_rpc_middleware(
             RpcServiceBuilder::new()
-                // Outermost, and only on a bearer surface: the per-call rate
+                // Only on a bearer surface: a socket's token, checked
+                // against the current authfile for every frame.
+                .option_layer(token_recheck)
+                // Next, and only on a bearer surface: the per-call rate
                 // charge for a batch, which has to see the batch whole.
                 .option_layer(batch_rate)
                 // Object `params` becomes positional `params` before

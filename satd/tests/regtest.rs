@@ -1176,6 +1176,111 @@ fn test_rpc_bearer_websocket_frames_are_charged() {
     node.stop();
 }
 
+/// An open WebSocket on the JSON-RPC listener does not outlive its bearer
+/// token (#821). Two sockets are opened, one per token. A SIGHUP reload that
+/// removes the first token refuses that socket's next frame with `-32006`;
+/// the reload also gives the second token an `expires` a few seconds out,
+/// and that socket keeps working until then and is refused after.
+#[test]
+fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
+    let fixture = write_authfile(&[
+        TokenSpec {
+            id: "revoked",
+            token: "satd-test-ws-revoke-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "expiring",
+            token: "satd-test-ws-expire-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+    ]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let port = node.rpcport;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let call = |id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "getblockcount", "params": []});
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut revoked = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-revoke-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        let mut expiring = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-expire-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        for ws in [&mut revoked, &mut expiring] {
+            ws.send_control(call(0)).await;
+            let reply = ws.next_json(10).await;
+            assert!(reply.get("result").is_some(), "served before the reload: {reply}");
+        }
+
+        // Reload onto a file with only the second token, which now expires.
+        let expires = now() + 15;
+        let next = write_authfile(&[TokenSpec {
+            id: "expiring",
+            token: "satd-test-ws-expire-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        }]);
+        let mut body = std::fs::read_to_string(&next.authfile).unwrap();
+        body.push_str(&format!("expires = {expires}\n"));
+        std::fs::write(&next.authfile, body).unwrap();
+        std::fs::copy(&next.authfile, &fixture.authfile).unwrap();
+        send_sighup(&node);
+
+        // The removed token's socket is refused once the reload lands.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 1;
+        loop {
+            revoked.send_control(call(id)).await;
+            let reply = revoked.next_json(10).await;
+            if reply["error"]["code"] == -32006 {
+                break;
+            }
+            assert!(reply.get("result").is_some(), "{reply}");
+            assert!(Instant::now() < deadline, "the revoked token's socket was still served");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The other socket is served until its token expires, then refused.
+        if now() < expires - 3 {
+            expiring.send_control(call(100)).await;
+            let reply = expiring.next_json(10).await;
+            assert!(reply.get("result").is_some(), "served before its expiry: {reply}");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut id = 101;
+        loop {
+            expiring.send_control(call(id)).await;
+            let reply = expiring.next_json(10).await;
+            if reply["error"]["code"] == -32006 {
+                assert!(now() >= expires, "refused before its expiry");
+                break;
+            }
+            assert!(reply.get("result").is_some(), "{reply}");
+            assert!(Instant::now() < deadline, "the expired token's socket was still served");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
+    node.stop();
+}
+
 /// Every connection-cap option accepts any `usize`, and tokio's semaphore
 /// panics above `usize::MAX >> 3`. A node given the largest value for each
 /// cap still starts and serves: the caps are clamped, not handed through.

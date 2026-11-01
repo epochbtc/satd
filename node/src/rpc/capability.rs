@@ -20,13 +20,13 @@
 
 use std::future::Future;
 
-use jsonrpsee::server::middleware::rpc::{Batch, BatchEntry, Notification, RpcServiceT};
+use jsonrpsee::server::middleware::rpc::{Batch, BatchEntry, BatchEntryErr, Notification, RpcServiceT};
 use jsonrpsee::server::{BatchResponseBuilder, MethodResponse};
 use jsonrpsee::types::{ErrorObjectOwned, Request};
 use satd_auth::{Capability, Principal};
 
 use crate::rpc::access::{RpcAccess, classify};
-use crate::rpc::auth::HttpCharged;
+use crate::rpc::auth::{BearerSession, HttpCharged};
 
 /// JSON-RPC error code for a method the authenticated principal lacks the
 /// capability to call. In the implementation-defined server-error range
@@ -41,6 +41,12 @@ pub const CAPABILITY_DENIED_CODE: i32 = -32004;
 /// crosses the budget is answered in-band instead. The `data` field carries
 /// `retry_after_secs`, the same figure the HTTP `Retry-After` header carries.
 pub const RATE_LIMITED_CODE: i32 = -32005;
+
+/// JSON-RPC error code for a frame on an open WebSocket whose bearer token
+/// has since been removed from the authfile or has expired (#821). A new
+/// request with that token gets HTTP `401`; a frame on a socket opened
+/// before has no status line to carry one, so it is answered in-band.
+pub const TOKEN_REVOKED_CODE: i32 = -32006;
 
 /// The response-size bound used by the batch-response builder, matching the
 /// [`RPC_MAX_RESPONSE_SIZE`](crate::rpc::RPC_MAX_RESPONSE_SIZE) the inner
@@ -250,6 +256,154 @@ where
             match charge(n.extensions.get::<Principal>(), prepaid) {
                 Ok(()) => inner.notification(n).await,
                 Err(_) => MethodResponse::notification(),
+            }
+        }
+    }
+}
+
+fn token_revoked_error() -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        TOKEN_REVOKED_CODE,
+        "bearer token revoked or expired",
+        None::<()>,
+    )
+}
+
+/// Layer that resolves a WebSocket's bearer token again for every frame
+/// (#821). A call carrying a [`BearerSession`] -- every frame on a socket
+/// opened with a token -- has its [`Principal`] replaced by the token's
+/// principal as the store has it now, so a SIGHUP edit of its capabilities
+/// or rate limit applies too. A token that has been removed or has expired
+/// is answered [`TOKEN_REVOKED_CODE`] and its notifications are dropped,
+/// before anything is charged or dispatched. Calls without a session (a
+/// plain HTTP request, resolved by the HTTP layer moments before, or the
+/// operator) pass through untouched.
+///
+/// It is outermost, ahead of [`BatchRateLayer`], so a frame's rate charge
+/// and capability check see the current principal. A batch is one frame:
+/// its token is resolved once, for all its entries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokenRecheckLayer;
+
+impl TokenRecheckLayer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> tower::Layer<S> for TokenRecheckLayer {
+    type Service = TokenRecheck<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TokenRecheck { inner }
+    }
+}
+
+/// The wrapped service produced by [`TokenRecheckLayer`].
+#[derive(Clone, Debug)]
+pub struct TokenRecheck<S> {
+    inner: S,
+}
+
+/// The current principal for a call's session, `Ok(None)` for a call with
+/// no session, `Err` for a session whose token no longer resolves.
+fn recheck(ext: &jsonrpsee::types::Extensions) -> Result<Option<Principal>, ()> {
+    match ext.get::<BearerSession>() {
+        None => Ok(None),
+        Some(session) => session.current().map(Some).ok_or(()),
+    }
+}
+
+impl<S> RpcServiceT for TokenRecheck<S>
+where
+    S: RpcServiceT<
+            MethodResponse = MethodResponse,
+            BatchResponse = MethodResponse,
+            NotificationResponse = MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type MethodResponse = MethodResponse;
+    type BatchResponse = MethodResponse;
+    type NotificationResponse = MethodResponse;
+
+    fn call<'a>(&self, mut req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        let inner = self.inner.clone();
+        async move {
+            match recheck(&req.extensions) {
+                Ok(None) => inner.call(req).await,
+                Ok(Some(p)) => {
+                    req.extensions.insert(p);
+                    inner.call(req).await
+                }
+                Err(()) => MethodResponse::error(req.id.clone(), token_revoked_error())
+                    .with_extensions(req.extensions.clone()),
+            }
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        let inner = self.inner.clone();
+        async move {
+            // One frame, one resolution: the first entry that carries a
+            // session decides for all of them (they share the upgrade's
+            // extensions).
+            let mut verdict: Option<Result<Option<Principal>, ()>> = None;
+            let mut dropped = false;
+            let mut entries = Vec::with_capacity(batch.len());
+            for entry in batch.into_iter() {
+                let entry = match entry {
+                    Ok(mut e) => {
+                        let v = verdict.get_or_insert_with(|| recheck(e.extensions())).clone();
+                        match (v, &mut e) {
+                            (Ok(None), _) => Ok(e),
+                            (Ok(Some(p)), _) => {
+                                e.extensions_mut().insert(p);
+                                Ok(e)
+                            }
+                            (Err(()), BatchEntry::Call(req)) => Err(
+                                BatchEntryErr::new(
+                                    req.id.clone().into_owned(),
+                                    token_revoked_error(),
+                                ),
+                            ),
+                            // A notification gets no reply; one on a revoked
+                            // token is dropped.
+                            (Err(()), BatchEntry::Notification(_)) => {
+                                dropped = true;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                entries.push(entry);
+            }
+            // Nothing left because every entry was a dropped notification:
+            // no reply, as for a batch of notifications. An empty batch as
+            // sent goes on, to be answered `-32600` beneath.
+            if entries.is_empty() && dropped {
+                return MethodResponse::notification();
+            }
+            inner.batch(Batch::from(entries)).await
+        }
+    }
+
+    fn notification<'a>(
+        &self,
+        mut n: Notification<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        let inner = self.inner.clone();
+        async move {
+            match recheck(&n.extensions) {
+                Ok(None) => inner.notification(n).await,
+                Ok(Some(p)) => {
+                    n.extensions.insert(p);
+                    inner.notification(n).await
+                }
+                Err(()) => MethodResponse::notification(),
             }
         }
     }
@@ -966,6 +1120,129 @@ mod tests {
         let replies = batch_replies(&rp);
         assert_eq!(replies[0]["error"]["code"], -32600, "{}", replies[0]);
         assert!(replies[1].get("result").is_some(), "the call is prepaid: {}", replies[1]);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    /// An authfile holding one token, `ws-tok`, with `rpc:read` and the
+    /// given extra lines.
+    fn write_ws_authfile(dir: &std::path::Path, extra: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = dir.join("auth.toml");
+        let body = format!(
+            "version = 1\n[[token]]\nid = \"ws\"\nhash = \"sha256:{}\"\ncapabilities = [\"rpc:read\"]\n{extra}",
+            hex::encode(satd_auth::token_digest("ws-tok"))
+        );
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    /// A frame as jsonrpsee hands it over on a WebSocket: the upgrade's
+    /// principal (here a stale operator one, to show it is replaced) and
+    /// the session.
+    fn ws_frame(method: &'static str, session: &BearerSession) -> Request<'static> {
+        let mut r = req_with(method, Some(Principal::operator()));
+        r.extensions.insert(session.clone());
+        r
+    }
+
+    /// #821: every frame on a WebSocket resolves its token against the
+    /// store as it is now. The frame's principal is the token's current
+    /// one (a stale operator principal does not reach `sendrawtransaction`
+    /// on a read token); after a reload drops the token, or once it has
+    /// expired, calls are answered `-32006` and nothing is dispatched.
+    ///
+    /// Perturbation: without the layer's recheck the frames keep the
+    /// upgrade's principal, so `sendrawtransaction` and the post-revocation
+    /// calls are dispatched.
+    #[tokio::test]
+    async fn websocket_frames_are_rechecked_against_the_token_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ws_authfile(dir.path(), "");
+        let store = Arc::new(satd_auth::TokenStore::load(&path).unwrap());
+        let session = BearerSession::new(store.clone(), satd_auth::token_digest("ws-tok"));
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = TokenRecheck {
+            inner: BatchRateFilter {
+                inner: CapabilityFilter { inner: Recorder { dispatched: dispatched.clone() } },
+            },
+        };
+
+        let rp = svc.call(ws_frame("getblockcount", &session)).await;
+        assert!(rp.is_success(), "{}", rp.as_json().get());
+        let rp = svc.call(ws_frame("sendrawtransaction", &session)).await;
+        assert!(rp.as_json().get().contains("-32004"), "the token's own caps apply: {}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+
+        // Expired: the reload keeps the token but its `expires` has passed.
+        write_ws_authfile(dir.path(), "expires = 1\n");
+        store.reload().unwrap();
+        let rp = svc.call(ws_frame("getblockcount", &session)).await;
+        assert!(rp.as_json().get().contains("-32006"), "expired: {}", rp.as_json().get());
+
+        // Valid again, then removed.
+        write_ws_authfile(dir.path(), "");
+        store.reload().unwrap();
+        assert!(svc.call(ws_frame("getblockcount", &session)).await.is_success());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+        std::fs::write(&path, "version = 1\n").unwrap();
+        store.reload().unwrap();
+        let rp = svc.call(ws_frame("getblockcount", &session)).await;
+        assert!(rp.as_json().get().contains("-32006"), "revoked: {}", rp.as_json().get());
+
+        // A batch frame: every call refused, the notification dropped.
+        let mut note = jsonrpsee::types::Notification::new("getblockcount".into(), None);
+        note.extensions.insert(session.clone());
+        let rp = svc
+            .batch(Batch::from(vec![
+                Ok(BatchEntry::Call(ws_frame("getblockcount", &session))),
+                Ok(BatchEntry::Notification(note)),
+                Ok(BatchEntry::Call(ws_frame("getbestblockhash", &session))),
+            ]))
+            .await;
+        let replies = batch_replies(&rp);
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        for r in &replies {
+            assert_eq!(r["error"]["code"], TOKEN_REVOKED_CODE, "{r}");
+        }
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2, "nothing dispatched after revocation");
+    }
+
+    /// An empty batch (`[]`) is still answered `-32600` by the layers
+    /// beneath; only a batch emptied by dropping a revoked token's
+    /// notifications gets no reply.
+    #[tokio::test]
+    async fn an_empty_batch_is_still_invalid_behind_the_recheck() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = TokenRecheck { inner: BatchRateFilter { inner: Recorder { dispatched: dispatched.clone() } } };
+        let rp = svc.batch(Batch::from(vec![])).await;
+        assert!(rp.as_json().get().contains("-32600"), "{}", rp.as_json().get());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ws_authfile(dir.path(), "");
+        let store = Arc::new(satd_auth::TokenStore::load(&path).unwrap());
+        let session = BearerSession::new(store.clone(), satd_auth::token_digest("ws-tok"));
+        std::fs::write(&path, "version = 1\n").unwrap();
+        store.reload().unwrap();
+        let mut note = jsonrpsee::types::Notification::new("getblockcount".into(), None);
+        note.extensions.insert(session);
+        let rp = svc.batch(Batch::from(vec![Ok(BatchEntry::Notification(note))])).await;
+        assert!(rp.is_notification(), "no reply: {}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    /// A call with no session -- a plain HTTP request, or the operator --
+    /// passes the recheck untouched.
+    #[tokio::test]
+    async fn calls_without_a_session_pass_the_recheck() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let svc = TokenRecheck { inner: Recorder { dispatched: dispatched.clone() } };
+        assert!(svc.call(req_with("getblockcount", Some(Principal::operator()))).await.is_success());
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 }

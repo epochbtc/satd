@@ -175,6 +175,14 @@ Rules:
   table atomically, and removing a `[[token]]` revokes it immediately. A
   parse or permission error keeps the last-good table, so a bad reload never
   drops auth.
+- Revocation and expiry reach WebSockets that are already open. A
+  WebSocket on the JSON-RPC listener resolves its token again for every
+  frame, so after a reload removes the token, or once its `expires` has
+  passed, each call on the socket is answered in-band with error `-32006`
+  (`bearer token revoked or expired`), and a `subscribemempool`
+  subscription opened with it ends at its next event. A reload that changes
+  the token's capabilities or rate limit applies to open sockets the same
+  way.
 
 ## Presenting a token
 
