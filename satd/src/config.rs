@@ -4324,13 +4324,17 @@ impl Config {
             // (#840), so an operator who asked for a rebuild there got a
             // normal start instead. As in Core, a file value applies on
             // every start until it is removed.
+            // An empty value is true, as Core's `InterpretBool("")` reads it:
+            // `reindex=` asks for a rebuild there too.
             reindex: cli
                 .reindex
-                .or_else(|| file_get("reindex").and_then(|v| parse_bool(&v)))
+                .or_else(|| file_get("reindex").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) }))
                 .unwrap_or(false),
             reindex_chainstate: cli
                 .reindex_chainstate
-                .or_else(|| file_get("reindexchainstate").and_then(|v| parse_bool(&v)))
+                .or_else(|| {
+                    file_get("reindexchainstate").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) })
+                })
                 .unwrap_or(false),
             // Read from the config file as well as the command line: the
             // app-store packages turn it on in the `bitcoin.conf` they
@@ -11134,6 +11138,9 @@ blockmintxfee=0.00001
         assert_eq!(load(&[]), (false, true), "Core's hyphenated spelling");
         std::fs::write(dir.path().join("bitcoin.conf"), "reindex=0\n").unwrap();
         assert_eq!(load(&[]), (false, false));
+        // Core's `InterpretBool("")` is true.
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindex=\nreindexchainstate=\n").unwrap();
+        assert_eq!(load(&[]), (true, true), "an empty value asks for the rebuild, as in Core");
     }
 
     /// `-nap`, a satd extension: off by default, on from the command line in
