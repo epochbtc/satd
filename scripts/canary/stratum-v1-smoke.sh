@@ -16,8 +16,13 @@
 #
 # Speed: satd's V1 share difficulty is at least 1, so cpuminer submits only
 # hashes at difficulty 1 (about 2^32 hashes each), even though every such hash
-# is a regtest block. On a hosted runner that is about a minute per block, so
-# the canary waits for one and allows ten.
+# is a regtest block. A hosted runner hashes at 22-26 MH/s, so a block takes
+# about three minutes on average, and the wait for one is exponential: a
+# ten-minute allowance came up empty about one wait in 25, and the canary
+# waits twice (#1153). BLOCK_WAIT_SECS allows 25 minutes, about eight average
+# blocks, so an unlucky wait fails about one time in 4,000; a typical run is
+# unchanged. Each wait reports how long it took and the miner's hash rate.
+BLOCK_WAIT_SECS="${BLOCK_WAIT_SECS:-1500}"
 
 set -euo pipefail
 
@@ -38,6 +43,20 @@ cleanup() {
     stop_satd
 }
 trap cleanup EXIT
+
+# cpuminer's total hash rate, from the latest per-thread lines in its log.
+miner_rate() {
+    tail -n 40 "$WORK/minerd.log" | awk '/thread [0-9]+: .* khash\/s/ {
+        t = $4; sub(":", "", t); r[t] = $(NF - 1) } END { s = 0; for (t in r) s += r[t]; printf "%.1f MH/s", s / 1000 }'
+}
+
+# Why a wait for a block ended empty: the miner's rate and last lines, and
+# satd's Stratum counters, so the artifact tells luck from a broken job.
+explain_no_block() {
+    echo "cpuminer: $(miner_rate) at the end; last lines:" >&2
+    tail -n 12 "$WORK/minerd.log" >&2
+    sat_cli getstratuminfo | jq -c '{connections, channels, blocks_found, shares}' >&2 || true
+}
 
 echo "fetching cpuminer $CPUMINER_VERSION..."
 curl -fsSL --retry 3 -o "$WORK/cpuminer.tar.gz" \
@@ -76,7 +95,9 @@ wait_stratum '.connections >= 1 and .channels >= 1' 30 "cpuminer to authorize"
 echo "ok: cpuminer authorized"
 
 # ── 2. It finds a block that connects and pays the miner ──
-wait_stratum '.blocks_found >= 1' 600 "cpuminer to find a block"
+waited_from=$(date +%s)
+wait_stratum '.blocks_found >= 1' "$BLOCK_WAIT_SECS" "cpuminer to find a block" || { explain_no_block; exit 1; }
+echo "ok: first block after $(($(date +%s) - waited_from)) s at $(miner_rate)"
 [[ "$(sat_cli getblockcount)" -gt "$START_HEIGHT" ]] || { echo "the found block did not raise the tip" >&2; exit 1; }
 assert_last_block_pays_payout
 sat_cli getstratuminfo | jq -e '.shares.accepted >= 1 and .shares.rejected == 0' >/dev/null \
@@ -127,7 +148,8 @@ sat_cli generateblock "$STRATUM_PAYOUT_ADDR" '[]' >/dev/null
 FILLED_AT="$(sat_cli getblockcount)"
 found_before="$(stratum_found_hashes | wc -l)"
 kill -CONT "$MINERD_PID"
-deadline=$(($(date +%s) + 600))
+waited_from=$(date +%s)
+deadline=$((waited_from + BLOCK_WAIT_SECS))
 FULL=""
 while [[ $(date +%s) -lt $deadline ]]; do
     while read -r hash; do
@@ -137,7 +159,8 @@ while [[ $(date +%s) -lt $deadline ]]; do
     [[ -n "$FULL" ]] && break
     sleep 2
 done
-[[ -n "$FULL" ]] || { echo "cpuminer found no block on the filled mempool" >&2; exit 1; }
+[[ -n "$FULL" ]] || { echo "cpuminer found no block on the filled mempool in $BLOCK_WAIT_SECS s" >&2; explain_no_block; exit 1; }
+echo "ok: block on the filled mempool after $(($(date +%s) - waited_from)) s at $(miner_rate)"
 weight="$(sat_cli getblock "$FULL" | jq .weight)"
 txs="$(sat_cli getblock "$FULL" | jq '.tx | length')"
 [[ "$weight" -gt 3900000 ]] || { echo "block $FULL on a full mempool weighs only $weight WU ($txs txs)" >&2; exit 1; }
