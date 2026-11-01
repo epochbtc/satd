@@ -980,7 +980,9 @@ jobs:
     name: canary / Stratum V1
     needs: [build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Two waits for a block of up to 25 minutes each (BLOCK_WAIT_SECS in the
+    # script); a typical run takes under ten.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
