@@ -614,29 +614,24 @@ struct ShadowWork {
 }
 
 impl ShadowWork {
-    fn new(tx: &Transaction, prev_outputs: &[TxOut], height: u32) -> Self {
-        let mut work = ShadowWork {
+    fn new(tx: &Transaction, prev_outputs: &[TxOut], height: u32, charge: usize) -> Self {
+        ShadowWork {
             tx_bytes: bitcoin::consensus::serialize(tx),
             prev_outputs: prev_outputs.to_vec(),
             height,
             txid: tx.compute_txid(),
-            charge: 0,
-        };
-        work.charge = work.cost();
-        work
+            charge,
+        }
     }
 
-    /// The heap and inline bytes this item holds while it waits: the
-    /// serialized transaction, the prevout vector and each prevout's script.
-    fn cost(&self) -> usize {
+    /// The bytes an item for `tx` holds while it waits: the serialized
+    /// transaction, the prevout vector and each prevout's script. Computed
+    /// from the inputs, so a drop costs no allocation.
+    fn cost(tx: &Transaction, prev_outputs: &[TxOut]) -> usize {
         std::mem::size_of::<ShadowWork>()
-            + self.tx_bytes.capacity()
-            + self.prev_outputs.capacity() * std::mem::size_of::<TxOut>()
-            + self
-                .prev_outputs
-                .iter()
-                .map(|o| o.script_pubkey.len())
-                .sum::<usize>()
+            + tx.total_size()
+            + std::mem::size_of_val(prev_outputs)
+            + prev_outputs.iter().map(|o| o.script_pubkey.len()).sum::<usize>()
     }
 }
 
@@ -771,20 +766,22 @@ impl ShadowVerifier {
     /// queue is full: by entry count, or by bytes (#1145). An empty queue
     /// takes any one item, so a transaction larger than the budget is still
     /// checked when the shadow engine has caught up.
-    fn enqueue(&self, work: ShadowWork) {
+    ///
+    /// The byte check runs before the item is built, so a full queue costs
+    /// the hot path no serialization or prevout copy.
+    fn enqueue(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
         use std::sync::atomic::Ordering;
         let Some(shadow_tx) = &self.shadow_tx else {
             return;
         };
-        let height = work.height;
-        let charge = work.charge;
+        let charge = ShadowWork::cost(tx, prev_outputs);
         let before = self.queued_bytes.fetch_add(charge, Ordering::Relaxed);
         if self.queue_bytes != 0 && before != 0 && before.saturating_add(charge) > self.queue_bytes {
             self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
             self.report_drop(height);
             return;
         }
-        match shadow_tx.try_send(work) {
+        match shadow_tx.try_send(ShadowWork::new(tx, prev_outputs, height, charge)) {
             Ok(()) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
@@ -859,7 +856,7 @@ impl ScriptVerifier for ShadowVerifier {
 
         // On primary success, dispatch shadow verification asynchronously.
         if result.is_ok() {
-            self.enqueue(ShadowWork::new(tx, prev_outputs, height));
+            self.enqueue(tx, prev_outputs, height);
         }
 
         result
@@ -890,7 +887,7 @@ impl ScriptVerifier for ShadowVerifier {
     }
 
     fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
-        self.enqueue(ShadowWork::new(tx, prev_outputs, height));
+        self.enqueue(tx, prev_outputs, height);
     }
 
     fn primary_engine(&self) -> PrimaryEngine {
@@ -1320,7 +1317,7 @@ mod tests {
             value: bitcoin::Amount::from_sat(1_000),
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51; 200]),
         }];
-        let cost = ShadowWork::new(&tx, &prevs, 1).cost();
+        let cost = ShadowWork::cost(&tx, &prevs);
         let verifier = ShadowVerifier::new(
             Box::new(NoopVerifier),
             Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),
