@@ -5947,6 +5947,38 @@ fn test_config_peerblockfilters_forces_blockfilterindex() {
     node.stop();
 }
 
+/// Core's own RPC help examples call the server with
+/// `-H 'content-type: text/plain;'`, and plain `curl --data` sends a form
+/// type. Core reads the JSON body whatever the header says; satd answered
+/// 415 for anything but `application/json` (#824).
+#[test]
+fn test_rpc_accepts_any_request_content_type() {
+    let mut node = TestNode::start(&[]);
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let (user, pass) = node.cookie.split_once(':').unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let body = r#"{"jsonrpc": "2.0", "id": "curltest", "method": "getblockcount", "params": []}"#;
+    for ct in [
+        Some("text/plain;"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/json"),
+        None,
+    ] {
+        let mut req = client.post(&url).basic_auth(user, Some(pass)).body(body);
+        if let Some(ct) = ct {
+            req = req.header("Content-Type", ct);
+        }
+        let resp = req.send().unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "content-type {ct:?}");
+        let json: serde_json::Value = resp.json().unwrap();
+        assert_eq!(json["result"], serde_json::json!(0), "content-type {ct:?}: {json}");
+    }
+    node.stop();
+}
+
 #[test]
 fn test_multiple_rpc_concurrent() {
     // Make several RPC calls in parallel using threads and verify none

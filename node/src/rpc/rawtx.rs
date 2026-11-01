@@ -200,7 +200,23 @@ pub fn get_raw_transaction(
         }
     }
 
-    Err((-5, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.".to_string()))
+    let store = chain_state.store_ref();
+    Err((-5, not_found_message(store.has_txindex(), store.tx_index_complete()).to_string()))
+}
+
+/// The `getrawtransaction` not-found text when no block hash was given (#1066).
+///
+/// Core picks between "enable -txindex", "still being indexed" and "not in the
+/// mempool or the chain". satd writes txindex entries inline in
+/// `connect_block` and never backfills, so Core's middle case becomes an index
+/// that was switched on after blocks were connected without it: those blocks
+/// stay unindexed, and only a block hash can reach them.
+fn not_found_message(txindex: bool, complete: bool) -> &'static str {
+    match (txindex, complete) {
+        (false, _) => "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.",
+        (true, false) => "No such mempool transaction. The transaction index does not cover blocks connected before -txindex was enabled; provide a block hash to query those. Use gettransaction for wallet transactions.",
+        (true, true) => "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+    }
 }
 
 /// Validate a blockhash string for length and hex-ness, returning Core-compatible
