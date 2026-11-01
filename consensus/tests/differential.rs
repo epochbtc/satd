@@ -1,5 +1,6 @@
 //! Differential tests: run the same inputs through BOTH our Rust consensus
-//! library and the C++ bitcoinconsensus FFI, asserting identical results.
+//! library and Bitcoin Core's interpreter (libbitcoinkernel), asserting
+//! identical results.
 //!
 //! This is the key validation that our implementation matches Bitcoin Core.
 
@@ -18,6 +19,30 @@ use helpers::{parse_flags, parse_script, parse_witness_row, TAPROOT_OUTPUT_MARKE
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// The Rust engine on a serialized transaction: decode it, then verify one
+/// input. A transaction that does not decode fails, as it does in Core.
+fn rust_verify_bytes(
+    spent_output_script: &[u8],
+    amount: u64,
+    spending_tx_bytes: &[u8],
+    prev_outputs: &[(Vec<u8>, u64)],
+    input_index: usize,
+    flags: u32,
+) -> bool {
+    let Ok(tx) = bitcoin::consensus::deserialize::<Transaction>(spending_tx_bytes) else {
+        return false;
+    };
+    let spent: Vec<TxOut> = prev_outputs
+        .iter()
+        .map(|(spk, val)| TxOut { value: Amount::from_sat(*val), script_pubkey: ScriptBuf::from_bytes(spk.clone()) })
+        .collect();
+    let Ok(precomputed) = consensus::PrecomputedTransactionData::new(&tx, &spent) else {
+        return false;
+    };
+    let spk = bitcoin::Script::from_bytes(spent_output_script);
+    consensus::verify(spk, Amount::from_sat(amount), &tx, input_index, flags, &precomputed).is_ok()
+}
+
 /// Run a single verification through both engines and compare results.
 /// Returns (rust_ok, cpp_ok, matched).
 fn verify_both(
@@ -28,34 +53,14 @@ fn verify_both(
     flags: u32,
     prev_outputs_for_taproot: Option<&[(Vec<u8>, u64)]>,
 ) -> (bool, bool, bool) {
-    // Build Utxo arrays for both APIs
-    let rust_result = if let Some(prevs) = prev_outputs_for_taproot {
-        let utxos: Vec<consensus::Utxo> = prevs
-            .iter()
-            .map(|(spk, val)| consensus::Utxo {
-                script_pubkey: spk.as_ptr(),
-                script_pubkey_len: spk.len() as u32,
-                value: *val as i64,
-            })
-            .collect();
-        consensus::verify_with_flags(
-            spent_output_script,
-            amount,
-            spending_tx_bytes,
-            Some(&utxos),
-            input_index,
-            flags,
-        )
-    } else {
-        consensus::verify_with_flags(
-            spent_output_script,
-            amount,
-            spending_tx_bytes,
-            None,
-            input_index,
-            flags,
-        )
-    };
+    let rust_ok = rust_verify_bytes(
+        spent_output_script,
+        amount,
+        spending_tx_bytes,
+        prev_outputs_for_taproot.unwrap_or(&[]),
+        input_index,
+        flags,
+    );
 
     let cpp_result = if let Some(prevs) = prev_outputs_for_taproot {
         let utxos: Vec<kernel_ref::Utxo> = prevs
@@ -85,7 +90,6 @@ fn verify_both(
         )
     };
 
-    let rust_ok = rust_result.is_ok();
     let cpp_ok = cpp_result.is_ok();
     (rust_ok, cpp_ok, rust_ok == cpp_ok)
 }

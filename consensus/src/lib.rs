@@ -1,17 +1,22 @@
 #![allow(clippy::collapsible_if, clippy::needless_return, clippy::manual_range_contains)]
 //! Pure Rust Bitcoin script verification engine.
 //!
-//! A drop-in replacement for the `bitcoinconsensus` crate's C++ FFI, implementing
-//! the Bitcoin Script interpreter in idiomatic Rust. Designed to produce
-//! identical results to Bitcoin Core's libbitcoinconsensus for all transactions.
+//! Bitcoin Script's interpreter in Rust, built to give the same verdicts as
+//! Bitcoin Core's.
 //!
 //! # Public API
 //!
-//! The public API matches `bitcoinconsensus` exactly:
-//! - [`verify`] / [`verify_with_flags`] — verify a single input
-//! - [`Utxo`] — spent output data for taproot
-//! - [`Error`] — coarse verification error
+//! The entry points follow libbitcoinkernel's script verification, which is
+//! how Core's own `CheckInputScripts` works:
+//! - [`PrecomputedTransactionData`]: the per-transaction signature hash
+//!   state, built once for a transaction and shared by all its inputs
+//! - [`verify()`]: verify one input against it
+//! - [`verify_transaction`]: every input of a transaction, in order
+//! - [`Error`]: why verification failed, naming the script error
 //! - `VERIFY_*` flag constants
+//!
+//! [`verify::verify_script`] and [`sighash::TxSignatureChecker`] stay public
+//! for callers that need the interpreter itself.
 
 pub mod checker;
 pub mod condition;
@@ -31,36 +36,34 @@ pub use flags::{
     VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
 };
 
-use std::os::raw::{c_uchar, c_uint};
+use bitcoin::{Amount, Script, Transaction, TxOut};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-/// Spent output data for taproot signature hash computation.
-/// Layout matches `bitcoinconsensus::Utxo`.
-#[repr(C)]
-pub struct Utxo {
-    pub script_pubkey: *const c_uchar,
-    pub script_pubkey_len: c_uint,
-    pub value: i64,
-}
-
-/// Error type mirroring `bitcoinconsensus::Error`, except that a script
-/// failure carries *which* script error it was.
+/// Why verification failed.
 ///
-/// The C API cannot: `bitcoinconsensus_verify_script` returns a coarse
-/// `ERR_SCRIPT` and the specific `ScriptError_t` never crosses the FFI
-/// boundary. This engine is not the C API and already computes the specific
-/// error, so it reports it — Bitcoin Core names the script error in
+/// libbitcoinkernel reports a script failure as a bare
+/// `btck_ScriptVerifyStatus` with no reason: the specific `ScriptError_t`
+/// never crosses its C API. This engine computes the specific error, so it
+/// reports it. Bitcoin Core names the script error in
 /// `mempool-script-verify-flag-failed (...)` and every test that reads a
 /// rejection reads that name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
+    /// The script failed, and this is why.
     ErrScript(error::ScriptError),
+    /// The input index is past the transaction's last input.
     ErrTxIndex,
-    ErrTxSizeMismatch,
-    ErrTxDeserialize,
-    ErrAmountRequired,
+    /// A flag bit outside [`flags::ALL_FLAGS`].
     ErrInvalidFlags,
+    /// `VERIFY_TAPROOT` with no spent outputs: BIP 341 signature hashes
+    /// commit to all of them.
     ErrSpentOutputsRequired,
+    /// Spent outputs given, but not one per input.
     ErrSpentOutputsMismatch,
+    /// The precomputed data was built for a different transaction than the
+    /// one passed to [`verify()`].
+    ErrTxMismatch,
 }
 
 impl std::fmt::Display for Error {
@@ -70,125 +73,90 @@ impl std::fmt::Display for Error {
             // quotes.
             Self::ErrScript(e) => write!(f, "{}", e.as_str()),
             Self::ErrTxIndex => write!(f, "invalid input index"),
-            Self::ErrTxSizeMismatch => write!(f, "tx size mismatch"),
-            Self::ErrTxDeserialize => write!(f, "tx deserialization failed"),
-            Self::ErrAmountRequired => write!(f, "amount required for witness"),
             Self::ErrInvalidFlags => write!(f, "invalid flags"),
             Self::ErrSpentOutputsRequired => write!(f, "spent outputs required for taproot"),
             Self::ErrSpentOutputsMismatch => write!(f, "spent outputs count mismatch"),
+            Self::ErrTxMismatch => write!(f, "precomputed data is for another transaction"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Verify a single transaction input with automatic flag selection.
+/// A transaction's signature hash state, shared by all its inputs: Core's
+/// `PrecomputedTransactionData`, and libbitcoinkernel's
+/// `btck_PrecomputedTransactionData`.
 ///
-/// If `spent_outputs` is provided, taproot verification is enabled.
-pub fn verify(
-    spent_output_script: &[u8],
-    amount: u64,
-    spending_transaction: &[u8],
-    spent_outputs: Option<&[Utxo]>,
-    input_index: usize,
-) -> Result<(), Error> {
-    let flag_set = if spent_outputs.is_some() {
-        flags::VERIFY_ALL_PRE_TAPROOT | flags::VERIFY_TAPROOT
-    } else {
-        flags::VERIFY_ALL_PRE_TAPROOT
-    };
-    verify_with_flags(
-        spent_output_script,
-        amount,
-        spending_transaction,
-        spent_outputs,
-        input_index,
-        flag_set,
-    )
+/// The BIP 143 hashes (`hashPrevouts`, `hashSequence`, `hashOutputs`) and the
+/// BIP 341 ones (prevouts, amounts, scripts, sequences, outputs) are the same
+/// for every input of a transaction. Built once and passed to [`verify()`] for
+/// each input, they are computed once per transaction instead of once per
+/// input. Each is computed on first use.
+pub struct PrecomputedTransactionData<'a> {
+    tx: &'a Transaction,
+    spent_outputs: &'a [TxOut],
+    cache: sighash::SharedSighashCache<'a>,
 }
 
-/// Verify a single transaction input with explicit flag selection.
+impl<'a> PrecomputedTransactionData<'a> {
+    /// `spent_outputs` is the output each input spends, in input order, or
+    /// empty. It may be empty only when `VERIFY_TAPROOT` will not be set:
+    /// legacy and BIP 143 signature hashes read only the input's own amount,
+    /// which [`verify()`] takes. As in libbitcoinkernel, a non-empty list must
+    /// have one entry per input.
+    pub fn new(tx: &'a Transaction, spent_outputs: &'a [TxOut]) -> Result<Self, Error> {
+        if !spent_outputs.is_empty() && spent_outputs.len() != tx.input.len() {
+            return Err(Error::ErrSpentOutputsMismatch);
+        }
+        Ok(Self {
+            tx,
+            spent_outputs,
+            cache: Rc::new(RefCell::new(sighash::TxSighashCache::new(tx))),
+        })
+    }
+}
+
+/// Verify that input `input_index` of `tx` spends `script_pubkey`, worth
+/// `amount`, under `flag_set`: libbitcoinkernel's
+/// `btck_script_pubkey_verify`.
 ///
-/// This is the main entry point, matching `bitcoinconsensus::verify_with_flags()`.
-pub fn verify_with_flags(
-    spent_output_script: &[u8],
-    amount: u64,
-    spending_transaction: &[u8],
-    spent_outputs: Option<&[Utxo]>,
+/// `precomputed` must have been built for this `tx`.
+pub fn verify(
+    script_pubkey: &Script,
+    amount: Amount,
+    tx: &Transaction,
     input_index: usize,
     flag_set: u32,
+    precomputed: &PrecomputedTransactionData<'_>,
 ) -> Result<(), Error> {
-    // Validate flags
     if !flags::valid_flags(flag_set) {
         return Err(Error::ErrInvalidFlags);
     }
-
-    // Taproot requires spent outputs
-    if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) && spent_outputs.is_none() {
-        return Err(Error::ErrSpentOutputsRequired);
-    }
-
-    // Deserialize transaction
-    let tx: bitcoin::Transaction =
-        bitcoin::consensus::deserialize(spending_transaction).map_err(|_| Error::ErrTxDeserialize)?;
-
-    // Validate input index
     if input_index >= tx.input.len() {
         return Err(Error::ErrTxIndex);
     }
-
-    // Validate spent outputs count
-    if let Some(utxos) = spent_outputs {
-        if utxos.len() != tx.input.len() {
-            return Err(Error::ErrSpentOutputsMismatch);
-        }
+    if !std::ptr::eq(tx, precomputed.tx) {
+        return Err(Error::ErrTxMismatch);
+    }
+    if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) && precomputed.spent_outputs.is_empty() {
+        return Err(Error::ErrSpentOutputsRequired);
     }
 
-    // Build prev_outputs only when taproot is active — BIP341 sighash is the
-    // only code path that reads `self.prev_outputs` in `TxSignatureChecker`.
-    // For legacy / segwit-v0 verifies, we can pass an empty slice and skip
-    // the N× allocation that was building one TxOut per input.
-    let prev_outputs: Vec<bitcoin::TxOut> = if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) {
-        // Taproot requires a matching prev_output per input.
-        let utxos = spent_outputs.expect("VERIFY_TAPROOT requires spent_outputs (enforced above)");
-        utxos
-            .iter()
-            .map(|u| {
-                let script_bytes = unsafe {
-                    std::slice::from_raw_parts(u.script_pubkey, u.script_pubkey_len as usize)
-                };
-                bitcoin::TxOut {
-                    value: bitcoin::Amount::from_sat(u.value as u64),
-                    script_pubkey: bitcoin::ScriptBuf::from_bytes(script_bytes.to_vec()),
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Build checker
-    let tx_checker = sighash::TxSignatureChecker::new(
-        &tx,
+    // The same transaction (checked above), at the lifetime the shared
+    // cache holds.
+    let tx = precomputed.tx;
+    let tx_checker = sighash::TxSignatureChecker::with_cache(
+        tx,
         input_index,
-        bitcoin::Amount::from_sat(amount),
-        &prev_outputs,
+        amount,
+        precomputed.spent_outputs,
+        Rc::clone(&precomputed.cache),
     );
-
-    // Get witness
-    let witness_stack: Vec<Vec<u8>> = tx.input[input_index]
-        .witness
-        .iter()
-        .map(|w| w.to_vec())
-        .collect();
-
-    // Get scriptSig
-    let script_sig = tx.input[input_index].script_sig.as_bytes();
-
-    // Call VerifyScript
+    let input = &tx.input[input_index];
+    let witness_stack: Vec<Vec<u8>> = input.witness.iter().map(|w| w.to_vec()).collect();
     verify::verify_script(
-        script_sig,
-        spent_output_script,
+        input.script_sig.as_bytes(),
+        script_pubkey.as_bytes(),
         &witness_stack,
         flag_set,
         &tx_checker,
@@ -196,72 +164,32 @@ pub fn verify_with_flags(
     .map_err(Error::ErrScript)
 }
 
-/// Verify every input of a transaction in one batch.
+/// Verify every input of a transaction, in order, against one
+/// [`PrecomputedTransactionData`].
 ///
-/// Preferred over looping over `verify_with_flags` because it:
-/// - Accepts an already-decoded `Transaction` (avoids N× re-deserialization
-///   when verifying an N-input tx).
-/// - Shares a single `SighashCache` across all inputs — BIP143 and BIP341
-///   hash `hashPrevouts` / `hashSequence` / `hashOutputs` are tx-wide and
-///   otherwise recomputed per input.
-///
-/// Returns `Ok(())` if every input verifies.  On failure returns the zero-
-/// based index of the first failing input along with the error.
+/// Returns `Ok(())` if every input verifies. On failure returns the zero-
+/// based index of the first failing input along with the error. Errors that
+/// concern the whole call (flags, the spent-output count) report input 0.
 ///
 /// `prev_outputs` must have one entry per `tx.input`, in the same order.
 pub fn verify_transaction(
-    tx: &bitcoin::Transaction,
-    prev_outputs: &[bitcoin::TxOut],
+    tx: &Transaction,
+    prev_outputs: &[TxOut],
     flag_set: u32,
 ) -> Result<(), (usize, Error)> {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     if !flags::valid_flags(flag_set) {
         return Err((0, Error::ErrInvalidFlags));
     }
     if prev_outputs.len() != tx.input.len() {
         return Err((0, Error::ErrSpentOutputsMismatch));
     }
+    // Only reachable with no inputs, where no input's check would say it.
     if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) && prev_outputs.is_empty() {
         return Err((0, Error::ErrSpentOutputsRequired));
     }
-
-    // One SighashCache for the whole tx — the key optimisation of this API.
-    let cache = Rc::new(RefCell::new(sighash::TxSighashCache::new(tx)));
-
-    // TxSignatureChecker only reads prev_outputs in the BIP341 taproot path.
-    // For non-taproot verifies we can pass an empty slice to skip the
-    // unnecessary indirection.
-    let checker_prevs: &[bitcoin::TxOut] = if flags::has_flag(flag_set, flags::VERIFY_TAPROOT) {
-        prev_outputs
-    } else {
-        &[]
-    };
-
-    for (i, input) in tx.input.iter().enumerate() {
-        let prev = &prev_outputs[i];
-        let tx_checker = sighash::TxSignatureChecker::with_cache(
-            tx,
-            i,
-            prev.value,
-            checker_prevs,
-            Rc::clone(&cache),
-        );
-
-        let witness_stack: Vec<Vec<u8>> = input.witness.iter().map(|w| w.to_vec()).collect();
-        let script_sig = input.script_sig.as_bytes();
-        let spent_output_script = prev.script_pubkey.as_bytes();
-
-        verify::verify_script(
-            script_sig,
-            spent_output_script,
-            &witness_stack,
-            flag_set,
-            &tx_checker,
-        )
-        .map_err(|e| (i, Error::ErrScript(e)))?;
+    let precomputed = PrecomputedTransactionData::new(tx, prev_outputs).map_err(|e| (0, e))?;
+    for (i, prev) in prev_outputs.iter().enumerate() {
+        verify(&prev.script_pubkey, prev.value, tx, i, flag_set, &precomputed).map_err(|e| (i, e))?;
     }
-
     Ok(())
 }

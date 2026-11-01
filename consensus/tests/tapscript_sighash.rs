@@ -91,15 +91,12 @@ fn verify_both(tx: &Transaction, prevouts: &[TxOut], index: usize) -> (bool, boo
     let mut bytes = Vec::new();
     tx.consensus_encode(&mut bytes).unwrap();
     let spk = prevouts[index].script_pubkey.as_bytes();
-    let rust_utxos: Vec<consensus::Utxo> = prevouts
-        .iter()
-        .map(|o| consensus::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
-        .collect();
     let cpp_utxos: Vec<kernel_ref::Utxo> = prevouts
         .iter()
         .map(|o| kernel_ref::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
         .collect();
-    let rust = consensus::verify_with_flags(spk, VALUE, &bytes, Some(&rust_utxos), index, FLAGS).is_ok();
+    let precomputed = consensus::PrecomputedTransactionData::new(tx, prevouts).unwrap();
+    let rust = consensus::verify(&prevouts[index].script_pubkey, Amount::from_sat(VALUE), tx, index, FLAGS, &precomputed).is_ok();
     let cpp = kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
     (rust, cpp)
 }
@@ -200,12 +197,9 @@ fn many_checks_spend(checks: usize, annex_len: usize, pad: usize) -> (Transactio
 }
 
 fn time_rust(tx: &Transaction, prevouts: &[TxOut]) -> Duration {
-    let mut bytes = Vec::new();
-    tx.consensus_encode(&mut bytes).unwrap();
-    let spk = prevouts[0].script_pubkey.as_bytes();
-    let utxos = [consensus::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
     let t = Instant::now();
-    assert!(consensus::verify_with_flags(spk, VALUE, &bytes, Some(&utxos), 0, FLAGS).is_ok());
+    let precomputed = consensus::PrecomputedTransactionData::new(tx, prevouts).unwrap();
+    assert!(consensus::verify(&prevouts[0].script_pubkey, Amount::from_sat(VALUE), tx, 0, FLAGS, &precomputed).is_ok());
     t.elapsed()
 }
 
