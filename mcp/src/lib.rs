@@ -779,6 +779,13 @@ pub async fn serve_http(
                 let conn_shutdown = conn_shutdown_template.clone();
                 tokio::spawn(async move {
                             let _permit = permit;
+                            // A write that makes no progress closes the
+                            // connection, so a client that stops reading
+                            // mid-response gives its slot back.
+                            let stream = node::http_serve::WriteDeadline::new(
+                                stream,
+                                Some(node::http_serve::WRITE_STALL_TIMEOUT),
+                            );
                             let svc = hyper::service::service_fn(move |req| {
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();

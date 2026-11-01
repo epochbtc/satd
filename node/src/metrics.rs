@@ -1481,6 +1481,12 @@ async fn accept_http_limited(
                 let conn_stop = stop.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    // hyper has no write timer: a client that stops reading
+                    // mid-response would hold its slot until it hung up.
+                    let stream = crate::http_serve::WriteDeadline::new(
+                        stream,
+                        Some(crate::http_serve::WRITE_STALL_TIMEOUT),
+                    );
                     let io = hyper_util::rt::TokioIo::new(stream);
                     let svc = hyper::service::service_fn(move |req| {
                         let answerer = answerer.clone();
@@ -1647,6 +1653,12 @@ async fn accept_https(
                 let conn_stop = stop.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    // Beneath TLS, as on the other listeners: a stalled write
+                    // closes the connection (see `http_serve::WriteDeadline`).
+                    let stream = crate::http_serve::WriteDeadline::new(
+                        stream,
+                        Some(crate::http_serve::WRITE_STALL_TIMEOUT),
+                    );
                     let tls_stream = match tokio::time::timeout(
                         METRICS_TLS_HANDSHAKE_TIMEOUT,
                         tls.acceptor.accept(stream),
