@@ -155,6 +155,30 @@ impl ConnectError {
 /// Compute median time past (MTP) for a given height using the store directly.
 /// MTP is the median of the timestamps of the previous 11 blocks. See
 /// [`median_time_past_with_plan`].
+/// Debug builds: assert that `height`, about to be passed to `check_block`,
+/// is the block's own height, one above its parent's. Release builds do
+/// nothing.
+///
+/// `check_block` gates the BIP 141 witness rules on the height, and the gate
+/// only bites on mainnet and testnet3. Every test runs where segwit is active
+/// from height 0, so a call site passing a wrong height would pass the whole
+/// suite (#551). A block whose parent has no index entry is not checked.
+#[inline]
+pub(crate) fn debug_assert_block_height(store: &dyn Store, block: &Block, height: u32) {
+    #[cfg(debug_assertions)]
+    if let Some(parent) = store.get_block_index(&block.header.prev_blockhash) {
+        assert_eq!(
+            parent.height + 1,
+            height,
+            "check_block given height {height} for block {}, whose parent is at {}",
+            block.block_hash(),
+            parent.height
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (store, block, height);
+}
+
 pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> Result<u32, ConnectError> {
     median_time_past_with_plan(store, None, height)
 }

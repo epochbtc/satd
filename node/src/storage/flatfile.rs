@@ -172,6 +172,20 @@ impl Drop for PendingRecord {
     }
 }
 
+/// A clone of the append file's descriptor, for an fsync outside the
+/// manager's lock. See [`FlatFileManager::sync_handle`].
+pub struct SyncHandle {
+    file: File,
+    writes: u64,
+}
+
+impl SyncHandle {
+    /// Fsync the file's data.
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.file.sync_data()
+    }
+}
+
 /// Manages sequential block storage in blk*.dat files.
 pub struct FlatFileManager {
     blocks_dir: PathBuf,
@@ -184,6 +198,10 @@ pub struct FlatFileManager {
     /// being rotated out is fsync'd before its handle is dropped, so
     /// `sync_all` never has to chase closed files.
     dirty: bool,
+    /// Records appended since this manager opened. [`Self::mark_synced`]
+    /// compares it to the count a [`SyncHandle`] was taken at, so a write that
+    /// lands while the handle syncs outside the lock keeps the file dirty.
+    writes: u64,
     /// Cached read handles keyed by file number (small LRU).
     read_cache: std::collections::HashMap<u32, File>,
     /// Blocks-dir obfuscation key from `xor.dat` (Core v28+). The zero key
@@ -311,6 +329,7 @@ impl FlatFileManager {
             current_pos,
             write_handle: None,
             dirty: false,
+            writes: 0,
             read_cache: std::collections::HashMap::new(),
             xor_key,
             total_bytes,
@@ -396,7 +415,11 @@ impl FlatFileManager {
         // outgoing file first: it will never be written again, and syncing
         // it here keeps the "only the current file can be dirty" invariant
         // that lets `sync_all` ignore closed files.
-        if self.current_pos > 0 && self.current_pos + record_size > self.max_file_size {
+        //
+        // A loop, not one check: the resync below can land in a populated
+        // file whose length leaves no room either, and the record must not go
+        // past the cap there (#547).
+        while self.current_pos > 0 && self.current_pos + record_size > self.max_file_size {
             // Fsync the outgoing file first: it will never be written again,
             // and syncing it here keeps the "only the current file can be
             // dirty" invariant that lets `sync_all` ignore closed files.
@@ -519,6 +542,7 @@ impl FlatFileManager {
 
         self.current_pos += record_size;
         self.dirty = true;
+        self.writes += 1;
 
         Ok(pos)
     }
@@ -619,6 +643,35 @@ impl FlatFileManager {
             self.dirty = false;
         }
         Ok(())
+    }
+
+    /// A handle that syncs the current append file without this manager's
+    /// lock, or `None` when nothing is unsynced. [`Self::sync_all`] fsyncs
+    /// under the lock, and every block read waits on that lock; a caller
+    /// that needs one record durable can drop the lock, call
+    /// [`SyncHandle::sync`], then hand the handle back to
+    /// [`Self::mark_synced`].
+    ///
+    /// The handle is a clone of the append file's descriptor, so its fsync
+    /// covers every byte written to that file before the call, including
+    /// writes made after the handle was taken. If the file rotates in
+    /// between, the rotation has synced it already.
+    pub fn sync_handle(&mut self) -> std::io::Result<Option<SyncHandle>> {
+        if !self.dirty {
+            return Ok(None);
+        }
+        match &self.write_handle {
+            Some(f) => Ok(Some(SyncHandle { file: f.try_clone()?, writes: self.writes })),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that `handle` has synced. The file is clean again only if no
+    /// record was appended after the handle was taken.
+    pub fn mark_synced(&mut self, handle: SyncHandle) {
+        if handle.writes == self.writes {
+            self.dirty = false;
+        }
     }
 
     /// Whether the current append file has unsynced writes (test hook).
@@ -1553,6 +1606,49 @@ mod tests {
 
         mgr.delete_file(0).unwrap();
         assert_eq!(mgr.highest_height_written(0), None, "a deleted file is forgotten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rotation can resync into a populated file. When that file is too
+    /// full for the record too, the write rotates again rather than going
+    /// past the cap (#547).
+    #[test]
+    fn rotation_into_a_full_populated_file_rotates_again() {
+        let dir = temp_dir("rotate-full");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        mgr.write_block(&[0x11; 100], magic, 1).unwrap();
+        // File 1 already exists and is nearly full, as after a pruning gap.
+        std::fs::write(dir.join("blk00001.dat"), vec![0u8; (MAX_FILE_SIZE - 50) as usize]).unwrap();
+        mgr.current_pos = MAX_FILE_SIZE - 4;
+
+        let pos = mgr.write_block(&[0x22; 100], magic, 2).unwrap();
+
+        assert_eq!(pos.file_number, 2, "the record must skip the full file");
+        assert_eq!(std::fs::metadata(dir.join("blk00001.dat")).unwrap().len(), MAX_FILE_SIZE - 50);
+        assert_eq!(mgr.read_block(&pos).unwrap(), vec![0x22; 100]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`SyncHandle`] leaves the file dirty when a record lands after it
+    /// was taken, and clean otherwise.
+    #[test]
+    fn mark_synced_keeps_a_later_write_dirty() {
+        let dir = temp_dir("sync-handle");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        mgr.write_block(b"block one", magic, 1).unwrap();
+        let handle = mgr.sync_handle().unwrap().expect("dirty after a write");
+        mgr.write_block(b"block two", magic, 2).unwrap();
+        handle.sync().unwrap();
+        mgr.mark_synced(handle);
+        assert!(mgr.has_unsynced_writes(), "block two was written after the handle");
+
+        let handle = mgr.sync_handle().unwrap().unwrap();
+        handle.sync().unwrap();
+        mgr.mark_synced(handle);
+        assert!(!mgr.has_unsynced_writes());
+        assert!(mgr.sync_handle().unwrap().is_none(), "nothing left to sync");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
