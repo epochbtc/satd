@@ -850,6 +850,7 @@ fn field_specs() -> Vec<FieldSpec> {
             h.peer_manager.set_tx_announce_delay(c.txannouncedelay)
         }),
         restart!("onlynet", onlynet),
+        restart!("deprecatedrpc", deprecatedrpc),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),
         restart!("maxtipage", maxtipage),

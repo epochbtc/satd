@@ -2571,6 +2571,20 @@ impl PeerManager {
         *self.reachable.write() = nets;
     }
 
+    /// Whether automatic outbound connections may use `net`: Core's
+    /// `g_reachable_nets.Contains`, which `getnetworkinfo` reports. Onion also
+    /// needs a proxy that reaches Tor, as Core removes `NET_ONION` from the
+    /// set when it has none (`src/init.cpp`).
+    pub fn network_reachable(&self, net: crate::net::reachable::Network) -> bool {
+        let listed = self.reachable.read().contains(net);
+        match net {
+            crate::net::reachable::Network::Onion => {
+                listed && self.onion_routing_available() && !self.onion_disabled.load(Ordering::Relaxed)
+            }
+            _ => listed,
+        }
+    }
+
     /// Record a `.onion` peer learned from `addrv2` gossip so the reconnect
     /// loop can dial it. The addrman is `SocketAddr`-keyed and can't hold
     /// onion peers, so they live in `connect_peer_addrs` (in-memory, bounded

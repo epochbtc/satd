@@ -271,13 +271,9 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
         // a pruned node that it held the whole chain -- and a client reading
         // it would ask for a block that had been deleted.
         "pruned": prune.is_on(),
-        // Core ≥ v27 warnings is an array of strings. Preserves older
-        // behavior: if no active warnings, emit the empty-string form
-        // Core used historically; otherwise emit the Core-v27 array.
-        "warnings": match chain_state.warnings().as_strings() {
-            v if v.is_empty() => Value::String(String::new()),
-            v => Value::Array(v.into_iter().map(Value::String).collect()),
-        },
+        // Always an array, `[]` when empty, as in Core v28; the string form
+        // only under `-deprecatedrpc=warnings` (#956).
+        "warnings": crate::rpc::deprecated::warnings_value(chain_state.warnings().as_strings()),
     });
     if let Some(challenge) = chain_state.signet_challenge() {
         out["signet_challenge"] = json!(hex::encode(challenge));
