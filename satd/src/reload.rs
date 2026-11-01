@@ -850,6 +850,7 @@ fn field_specs() -> Vec<FieldSpec> {
             h.peer_manager.set_tx_announce_delay(c.txannouncedelay)
         }),
         restart!("onlynet", onlynet),
+        restart!("deprecatedrpc", deprecatedrpc),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),
         restart!("maxtipage", maxtipage),
@@ -1067,6 +1068,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("stallwatchdogsecs", stall_watchdog_secs),
         restart!("stallabortsecs", stall_abort_secs),
         restart!("shadowqueuesize", shadow_queue_size),
+        restart!("shadowqueuemb", shadow_queue_mb),
         restart!("shadowworkers", shadow_workers),
         // ---- Mining ----
         restart!("blockmaxweight", blockmaxweight),

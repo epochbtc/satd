@@ -393,6 +393,18 @@ fn write_request_object(out: &mut Vec<u8>, members: &mut Members<'_>, fix: Reque
     out.push(b'}');
 }
 
+/// Core reads the JSON-RPC body whatever the request's `Content-Type`
+/// says, or with none at all; jsonrpsee answers anything but
+/// `application/json` with 415. Core's own help examples send
+/// `content-type: text/plain;` (#824), so the request header is set to
+/// `application/json` unconditionally rather than only when it is missing.
+fn json_request_content_type(headers: &mut hyper::HeaderMap) {
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+}
+
 /// Rewrite a JSON response's `Content-Type` to Core's exact spelling.
 ///
 /// Bitcoin Core answers every RPC with literally `application/json`. jsonrpsee
@@ -641,15 +653,7 @@ where
                 return Ok(not_found());
             }
 
-            // Core does not require a Content-Type header on RPC requests;
-            // jsonrpsee does (`application/json`). Add a default when the
-            // client omitted it, matching Core's leniency.
-            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
-                parts.headers.insert(
-                    hyper::header::CONTENT_TYPE,
-                    hyper::header::HeaderValue::from_static("application/json"),
-                );
-            }
+            json_request_content_type(&mut parts.headers);
 
             inner.call(HttpRequest::from_parts(parts, body)).await
         })
@@ -744,15 +748,7 @@ where
 
             let (mut parts, body) = req.into_parts();
 
-            // Core does not require a Content-Type header on RPC requests;
-            // jsonrpsee does (`application/json`). Add a default when the
-            // client omitted it, matching Core's leniency.
-            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
-                parts.headers.insert(
-                    hyper::header::CONTENT_TYPE,
-                    hyper::header::HeaderValue::from_static("application/json"),
-                );
-            }
+            json_request_content_type(&mut parts.headers);
 
             // Reject before reading a byte if the declared length already
             // exceeds the cap. Covers the common DoS shape (a client

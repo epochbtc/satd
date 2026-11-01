@@ -160,6 +160,7 @@ startup error.
 | `rpcauthbearer` | false | restart | satd | Honor `Authorization: Bearer` tokens on the JSON-RPC listeners (requires `authfile`). |
 | `rpccookiefile` | `$DATADIR/.cookie` | restart | core | Override the auto-generated cookie file path. `-norpccookiefile` writes no cookie. |
 | `rpccookieperms` | owner (0600) | restart | core | Cookie file permissions: `owner`(0600)\|`group`(0640)\|`all`(0644). |
+| `deprecatedrpc` | none | restart | core | Bring back a deprecated RPC form (repeatable). satd knows `warnings`: `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` then report `warnings` as one string, the latest warning or `""`, instead of the array Core v28 and later return. Other names are warned about and ignored. |
 | `rpcdefaultunits` | btc | hot | satd | Default units for RPC amount fields: `btc` (Core-compatible) or `sats`. |
 | `rpcdisableauth` | false | restart | satd | Disable HTTP Basic auth on the JSON-RPC TLS surface; only valid with `rpcmtls=1`. |
 | `rpcextendederrors` | off | hot | satd | Emit structured error payloads (category/suggestion/debug) on RPC errors. |
@@ -362,8 +363,8 @@ startup error.
 | `pruneopreturnpeers` | limited | restart | satd | What a stripping node serves to peers. `limited`: only the last 288 blocks, as a pruned Core node. `intact`: any block it still holds intact, at any depth; `notfound` for stripped ones. Both advertise only NODE_NETWORK_LIMITED. |
 | `pruneopreturnsize` | 4096 | restart | satd | Strip only OP_RETURN outputs whose scriptPubKey is at least this size. Bytes, or with a suffix: `k`/`M` (1000s), `KiB`/`MiB` (1024s). |
 | `restoreopreturns` | 0 (off) | restart | satd | Download the blocks OP_RETURN pruning stripped again, from peers that keep every block, until none is left; the node then serves the full chain (NODE_NETWORK) without a restart. Refused with any `pruneopreturn*` option. Does nothing on a node with no stripped block. See [Restoring stripped blocks](disk-footprint.md#restoring-stripped-blocks). |
-| `reindex` | off | restart | core | Rebuild block index and chain state from block files on disk. |
-| `reindexchainstate` | off | restart | core | Rebuild the UTXO set from existing block files (Core `-reindex-chainstate`). |
+| `reindex` | off | restart | core | Rebuild block index and chain state from block files on disk. Set in the config file, it rebuilds on every start, as in Core: remove it once the rebuild is done. |
+| `reindexchainstate` | off | restart | core | Rebuild the UTXO set from existing block files (Core `-reindex-chainstate`). Same rule in the config file as `reindex`. |
 | `upgradechainstate` | off | restart | satd | Rebuild the UTXO set from the block files, unprompted, when the datadir's chainstate schema is older than this satd's or a previous rebuild did not finish; otherwise nothing. Safe to leave on. Pruned nodes are refused (they must resync), and a newer schema is never downgraded. The app-store packages set it. |
 | `checkblockindex` | off (on for regtest) | restart | core | Audit block-index / active-chain consistency at startup (Core `-checkblockindex`). |
 | `dbcache` | 450 MB (or `auto`) | restart | core | Total write-cache size in MB, or `auto` for adaptive sizing. |
@@ -381,6 +382,7 @@ startup error.
 | `stallwatchdogsecs` | 300 (`0` disables) | restart | satd | Stall-watchdog forensic-dump threshold (seconds without tip advance). |
 | `stallabortsecs` | 300 | restart | satd | Additional grace after the forensics dump before `abort()`. |
 | `shadowqueuesize` | 4194304 | restart | satd | Shadow-verification queue capacity. |
+| `shadowqueuemb` | 128 (`0` disables) | restart | satd | Memory the shadow-verification queue may hold, in MiB; work past it is dropped. |
 | `shadowworkers` | 4 | restart | satd | Shadow-verification worker threads. |
 
 ## Mining
@@ -567,7 +569,7 @@ warning names the satd equivalent where one exists. This covers the long tail:
 | `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the option has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
 | `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
-| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
+| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `settings`, `daemonwait`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)
 

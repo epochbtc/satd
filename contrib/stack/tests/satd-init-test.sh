@@ -91,6 +91,30 @@ else
     bad "TLS RPC refuses the LAN: $(grep -E '^rpc(allowip|tlsbind)' "$WORK/d/bitcoin.conf" | tr '\n' ' ')"
 fi
 
+echo "== satd-init: conf.d/local.conf overrides =="
+# satd takes the first value of a repeated config-file key, so an override of
+# a key satd-init writes must come before the rendered one (#843), and a
+# [section] block must come after every rendered key, or it would swallow them.
+mkdir -p "$WORK/e/conf.d"
+printf 'port=19444\ndbcache=4000\n[regtest]\nmaxconnections=12\n' > "$WORK/e/conf.d/local.conf"
+render "$WORK/new/satd" "$WORK/e"
+conf="$WORK/e/bitcoin.conf"
+first_port=$(grep -m1 '^port=' "$conf" || true)
+if [[ "$first_port" == "port=19444" ]] && [[ $(grep -c '^port=' "$conf") -eq 2 ]]; then
+    ok "a local.conf key satd-init also writes comes first"
+else
+    bad "first port line is '$first_port': $(grep -n '^port=' "$conf" | tr '\n' ' ')"
+fi
+section_line=$(grep -n '^\[regtest\]' "$conf" | cut -d: -f1)
+last_key_line=$(grep -n '^[a-z]' "$conf" | grep -v 'maxconnections=12' | tail -1 | cut -d: -f1)
+if [[ -n "$section_line" && "$section_line" -gt "$last_key_line" ]] && [[ $(tail -1 "$conf") == "maxconnections=12" ]]; then
+    ok "a local.conf [section] block comes after every rendered key"
+else
+    bad "section at line ${section_line:-none}, last rendered key at line $last_key_line"
+fi
+render "$WORK/new/satd" "$WORK/e"
+if [[ $(grep -c '^port=19444' "$conf") -eq 1 ]]; then ok "re-running does not duplicate it"; else bad "duplicated on re-run"; fi
+
 echo
 [[ "$fail" -eq 0 ]] || { echo "satd-init-test.sh: FAILED"; exit 1; }
 echo "satd-init-test.sh: all checks passed"

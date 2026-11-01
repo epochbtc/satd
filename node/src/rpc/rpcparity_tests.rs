@@ -153,6 +153,81 @@ fn getnetworkinfo_fee_floors_are_amounts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `networks` reports Core's `g_reachable_nets` (`GetNetworksInfo`,
+/// src/rpc/net.cpp): under `-onlynet=onion` with a proxy, ipv4 and ipv6 are
+/// limited and onion is reachable; with no proxy, onion is limited whatever
+/// `-onlynet` says. All five of Core's networks are listed, in its order.
+#[test]
+fn getnetworkinfo_networks_follow_the_reachable_set() {
+    use crate::net::reachable::ReachableNets;
+    let flags = |info: &Value| -> Vec<(String, bool, bool)> {
+        info["networks"]
+            .as_array()
+            .expect("networks")
+            .iter()
+            .map(|n| {
+                (
+                    n["name"].as_str().unwrap().to_string(),
+                    n["reachable"].as_bool().unwrap(),
+                    n["limited"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let row = |name: &str, reachable: bool| (name.to_string(), reachable, !reachable);
+
+    let (cs, dir) = make_chain_state();
+    let cs = Arc::new(cs);
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let pm = crate::net::manager::PeerManager::new(
+        cs.clone(),
+        Arc::new(pool()),
+        Arc::new(crate::mempool::fee::FeeEstimator::new()),
+        Network::Regtest,
+        shutdown_rx.clone(),
+    );
+    // No -onlynet and no proxy: clearnet only.
+    let info = network::get_network_info(&pm, 100, 1_000, Vec::new());
+    assert_eq!(
+        flags(&info),
+        vec![row("ipv4", true), row("ipv6", true), row("onion", false), row("i2p", false), row("cjdns", false)],
+        "{info}"
+    );
+
+    // -onlynet=onion -proxy=...: only onion.
+    let pm = crate::net::manager::PeerManager::with_config(
+        cs,
+        Arc::new(pool()),
+        Arc::new(crate::mempool::fee::FeeEstimator::new()),
+        Network::Regtest,
+        shutdown_rx,
+        0,
+        125,
+        3,
+        86400,
+        Some("127.0.0.1:9050".to_string()),
+        None,
+        1,
+        50_000,
+        0,
+        None,
+    );
+    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
+    let info = network::get_network_info(&pm, 100, 1_000, Vec::new());
+    assert_eq!(
+        flags(&info),
+        vec![row("ipv4", false), row("ipv6", false), row("onion", true), row("i2p", false), row("cjdns", false)],
+        "{info}"
+    );
+    assert_eq!(info["networks"][2]["proxy"], "127.0.0.1:9050", "{info}");
+
+    // -onion=0 keeps onion limited even with a proxy.
+    pm.set_onion_disabled(true);
+    let info = network::get_network_info(&pm, 100, 1_000, Vec::new());
+    assert_eq!(flags(&info)[2], row("onion", false), "{info}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The version 2 PSBT path reports `fee` the way the version 0 path does:
 /// `ValueFromAmount` in `decodepsbt` and `analyzepsbt` (src/rpc/rawtransaction.cpp).
 #[test]

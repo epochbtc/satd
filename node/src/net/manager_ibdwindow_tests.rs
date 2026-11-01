@@ -122,7 +122,7 @@ fn restore_block_files(dir: &tempfile::TempDir) {
 fn a_local_write_failure_does_not_charge_the_sender() {
     type Store = fn(&PeerManager, PeerId, bitcoin::Block);
     let paths: [(&str, Store, u32); 2] = [
-        ("forward IBD", |pm, id, b| pm.handle_block_ibd(id, b), 10),
+        ("forward IBD", |pm, id, b| pm.handle_block_ibd(id, b, true), 10),
         ("background catch-up", |pm, id, b| pm.store_bg_block(id, b), 5),
     ];
     for (path, store, penalty) in paths {
@@ -387,4 +387,52 @@ fn the_sweeps_notfound_record_is_dropped_with_the_peer_and_the_block() {
     pm.sweep_not_found.write().insert(bitcoin::BlockHash::all_zeros(), vec![1]);
     pm.sweep_missing_blocks(&[2]);
     assert!(pm.sweep_not_found.read().is_empty(), "a record for a block not missing stayed");
+}
+
+/// During IBD a block `inv` is answered with `getheaders` only, as in Core;
+/// the scheduler fetches the block when its window reaches it. Outside IBD
+/// the announced block is still fetched directly (#1154).
+#[test]
+fn a_block_inv_during_ibd_is_not_fetched_directly() {
+    let chain = blocks(6);
+    let announced = chain[5].block_hash();
+    for (ibd, expect_fetch) in [(true, false), (false, true)] {
+        let (pm, _dir) = mk_pm();
+        for b in &chain[..5] {
+            pm.chain_state.accept_header(&b.header).unwrap();
+        }
+        if ibd {
+            *pm.ibd.write() = Some(IbdScheduler::new(5, 0, &pm.chain_state, 1024));
+        }
+        let mut rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 6);
+        pm.handle_inv(1, vec![Inventory::Block(announced)]);
+        let asked = blocks_asked(&drain(&mut rx));
+        assert_eq!(asked.contains(&announced), expect_fetch, "ibd={ibd}: asked for {asked:?}");
+    }
+}
+
+/// During IBD a block nobody asked for is not stored when it lies above the
+/// download window (Core's `fTooFarAhead`), and is stored inside it or when
+/// it was requested (#1154).
+#[test]
+fn an_unrequested_block_above_the_ibd_window_is_not_stored() {
+    let chain = blocks(400);
+    // Window: max(max_ahead 20, the 256-height priority zone) above the cursor at 0.
+    let cases = [
+        ("unrequested, above the window", 300, false, false),
+        ("unrequested, inside the window", 100, false, true),
+        ("requested, above the window", 300, true, true),
+    ];
+    for (what, height, requested, stored) in cases {
+        let (pm, _dir) = mk_pm();
+        for b in &chain {
+            pm.chain_state.accept_header(&b.header).unwrap();
+        }
+        *pm.ibd.write() = Some(IbdScheduler::new(400, 0, &pm.chain_state, 20));
+        let _rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 400);
+        let block = chain[height - 1].clone();
+        let hash = block.block_hash();
+        pm.handle_block_ibd(1, block, requested);
+        assert_eq!(pm.chain_state.has_block_data(&hash), stored, "{what}");
+    }
 }

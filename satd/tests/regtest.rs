@@ -1176,6 +1176,111 @@ fn test_rpc_bearer_websocket_frames_are_charged() {
     node.stop();
 }
 
+/// An open WebSocket on the JSON-RPC listener does not outlive its bearer
+/// token (#821). Two sockets are opened, one per token. A SIGHUP reload that
+/// removes the first token refuses that socket's next frame with `-32006`;
+/// the reload also gives the second token an `expires` a few seconds out,
+/// and that socket keeps working until then and is refused after.
+#[test]
+fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
+    let fixture = write_authfile(&[
+        TokenSpec {
+            id: "revoked",
+            token: "satd-test-ws-revoke-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+        TokenSpec {
+            id: "expiring",
+            token: "satd-test-ws-expire-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        },
+    ]);
+    let mut node = TestNode::start(&[
+        &format!("--authfile={}", fixture.authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let port = node.rpcport;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let call = |id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "getblockcount", "params": []});
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut revoked = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-revoke-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        let mut expiring = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-expire-token-v1")
+            .await
+            .expect("the upgrade is admitted");
+        for ws in [&mut revoked, &mut expiring] {
+            ws.send_control(call(0)).await;
+            let reply = ws.next_json(10).await;
+            assert!(reply.get("result").is_some(), "served before the reload: {reply}");
+        }
+
+        // Reload onto a file with only the second token, which now expires.
+        let expires = now() + 15;
+        let next = write_authfile(&[TokenSpec {
+            id: "expiring",
+            token: "satd-test-ws-expire-token-v1",
+            capabilities: &["rpc:read"],
+            rate_limit: None,
+            watch_quota: None,
+        }]);
+        let mut body = std::fs::read_to_string(&next.authfile).unwrap();
+        body.push_str(&format!("expires = {expires}\n"));
+        std::fs::write(&next.authfile, body).unwrap();
+        std::fs::copy(&next.authfile, &fixture.authfile).unwrap();
+        send_sighup(&node);
+
+        // The removed token's socket is refused once the reload lands.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 1;
+        loop {
+            revoked.send_control(call(id)).await;
+            let reply = revoked.next_json(10).await;
+            if reply["error"]["code"] == -32006 {
+                break;
+            }
+            assert!(reply.get("result").is_some(), "{reply}");
+            assert!(Instant::now() < deadline, "the revoked token's socket was still served");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The other socket is served until its token expires, then refused.
+        if now() < expires - 3 {
+            expiring.send_control(call(100)).await;
+            let reply = expiring.next_json(10).await;
+            assert!(reply.get("result").is_some(), "served before its expiry: {reply}");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut id = 101;
+        loop {
+            expiring.send_control(call(id)).await;
+            let reply = expiring.next_json(10).await;
+            if reply["error"]["code"] == -32006 {
+                assert!(now() >= expires, "refused before its expiry");
+                break;
+            }
+            assert!(reply.get("result").is_some(), "{reply}");
+            assert!(Instant::now() < deadline, "the expired token's socket was still served");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
+    node.stop();
+}
+
 /// Every connection-cap option accepts any `usize`, and tokio's semaphore
 /// panics above `usize::MAX >> 3`. A node given the largest value for each
 /// cap still starts and serves: the caps are clamped, not handed through.
@@ -5944,6 +6049,58 @@ fn test_config_peerblockfilters_forces_blockfilterindex() {
     assert_eq!(bfi["enabled"].as_bool(), Some(true));
     assert_eq!(bfi["peer_serve"].as_bool(), Some(true));
 
+    node.stop();
+}
+
+/// Core's own RPC help examples call the server with
+/// `-H 'content-type: text/plain;'`, and plain `curl --data` sends a form
+/// type. Core reads the JSON body whatever the header says; satd answered
+/// 415 for anything but `application/json` (#824).
+/// `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo`
+/// is always an array, `[]` on a node with none, as in Core v28 and later;
+/// `-deprecatedrpc=warnings` brings back the single-string form (#956).
+#[test]
+fn test_rpc_warnings_field_is_an_array_unless_deprecated() {
+    let methods = ["getblockchaininfo", "getnetworkinfo", "getmininginfo"];
+    let mut node = TestNode::start(&[]);
+    for m in methods {
+        let r = node.rpc_ok(m, vec![]);
+        assert_eq!(r["warnings"], serde_json::json!([]), "{m}: {r}");
+    }
+    node.stop();
+    let mut node = TestNode::start(&["--deprecatedrpc=warnings"]);
+    for m in methods {
+        let r = node.rpc_ok(m, vec![]);
+        assert_eq!(r["warnings"], serde_json::json!(""), "{m} under -deprecatedrpc=warnings: {r}");
+    }
+    node.stop();
+}
+
+#[test]
+fn test_rpc_accepts_any_request_content_type() {
+    let mut node = TestNode::start(&[]);
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let (user, pass) = node.cookie.split_once(':').unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let body = r#"{"jsonrpc": "2.0", "id": "curltest", "method": "getblockcount", "params": []}"#;
+    for ct in [
+        Some("text/plain;"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/json"),
+        None,
+    ] {
+        let mut req = client.post(&url).basic_auth(user, Some(pass)).body(body);
+        if let Some(ct) = ct {
+            req = req.header("Content-Type", ct);
+        }
+        let resp = req.send().unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "content-type {ct:?}");
+        let json: serde_json::Value = resp.json().unwrap();
+        assert_eq!(json["result"], serde_json::json!(0), "content-type {ct:?}: {json}");
+    }
     node.stop();
 }
 

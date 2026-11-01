@@ -1596,6 +1596,11 @@ struct TestPrechecked {
     /// The fee with any `prioritisetransaction` delta.
     modified_fee: u64,
     cfg: MempoolConfig,
+    /// A standardness failure an `allow` rule could forgive, held for the
+    /// policy dry run in [`Mempool::test_finish_scoped`], as admission holds
+    /// its `deferred_nonstd` (§6.2). Only set when the ruleset has an
+    /// `allow` rule.
+    deferred_nonstd: Option<MempoolError>,
 }
 
 /// How [`Mempool::accept_package`] has a member judged, or how a reorg has a
@@ -2909,6 +2914,15 @@ impl Mempool {
         cfg: &MempoolConfig,
         weight: usize,
     ) -> Result<(), MempoolError> {
+        // Core's `IsStandardTx` checks the version first: below
+        // `TX_MIN_STANDARD_VERSION` (1) or above `TX_MAX_STANDARD_VERSION` (3)
+        // is non-standard, reason `version` (src/policy/policy.cpp). Core
+        // reads the field as `uint32_t`, rust-bitcoin as `i32`, so 0x80000000
+        // and above are negative here and caught by the lower bound.
+        if !(1..=3).contains(&tx.version.0) {
+            return Err(MempoolError::Validation("version".to_string()));
+        }
+
         // Standard tx weight ceiling (oversize relay check).
         if weight > MAX_STANDARD_TX_WEIGHT {
             return Err(MempoolError::Validation("tx-size".to_string()));
@@ -6228,6 +6242,18 @@ impl Mempool {
         let txid = tx.compute_txid();
         let cfg = self.config.read().clone();
 
+        // As on admission: with an `allow` rule loaded, a failure in the
+        // exemptable standardness set is recorded rather than returned, and
+        // the policy dry run in `test_finish_scoped` forgives it on an
+        // `Allow` verdict (§6.2). Without one, failures refuse here as
+        // before (#999).
+        let has_allow = self
+            .policy
+            .load_full()
+            .as_ref()
+            .is_some_and(|r| !r.is_empty() && r.has_allow());
+        let mut deferred_nonstd: Option<MempoolError> = None;
+
         crate::validation::tx::check_transaction(tx)
             .map_err(|e| MempoolError::Validation(e.to_string()))?;
 
@@ -6235,9 +6261,15 @@ impl Mempool {
             return Err(MempoolError::Validation("coinbase not accepted".to_string()));
         }
 
+        // `tx-size` is part of `check_standardness` on admission, so
+        // `-acceptnonstdtxn` lifts it here as it does there.
         let weight = tx.weight().to_wu() as usize;
-        if weight > MAX_STANDARD_TX_WEIGHT {
-            return Err(MempoolError::Validation("tx-size".to_string()));
+        if weight > MAX_STANDARD_TX_WEIGHT && !cfg.accept_non_std_txn {
+            let e = MempoolError::Validation("tx-size".to_string());
+            if !has_allow {
+                return Err(e);
+            }
+            deferred_nonstd = Some(e);
         }
 
         // Standardness checks (dust, etc.) are deferred until after the fee
@@ -6390,9 +6422,25 @@ impl Mempool {
         // `sendrawtransaction` does — so it has to run here too, and in the
         // same place: before the relay floor, so a zero-fee dusty transaction
         // still reports "min relay fee not met".
+        //
+        // With an `allow` rule each failure is recorded instead, in
+        // admission's order: `check_standardness` runs first there, so its
+        // failure is the one reported if the verdict does not forgive it.
         if !cfg.accept_non_std_txn {
-            Self::check_spend_standardness(tx, &prev_outputs)?;
-            Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
+            if has_allow {
+                for result in [
+                    Self::check_standardness(tx, &cfg, weight),
+                    Self::check_spend_standardness(tx, &prev_outputs),
+                    Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee),
+                ] {
+                    if let Err(e) = result {
+                        deferred_nonstd.get_or_insert(e);
+                    }
+                }
+            } else {
+                Self::check_spend_standardness(tx, &prev_outputs)?;
+                Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
+            }
         }
         Self::check_sigop_cost(sigop_cost)?;
 
@@ -6418,7 +6466,8 @@ impl Mempool {
 
         // Standardness checks (dust, OP_RETURN, etc.) — deferred until after
         // the fee rate check so 0-fee txs get "min relay fee not met" (Core).
-        if !cfg.accept_non_std_txn {
+        // With an `allow` rule they were recorded above instead.
+        if !cfg.accept_non_std_txn && !has_allow {
             Self::check_standardness(tx, &cfg, weight)?;
         }
 
@@ -6469,6 +6518,7 @@ impl Mempool {
             conflicts,
             modified_fee: effective_fee,
             cfg,
+            deferred_nonstd,
         })
     }
 
@@ -6506,7 +6556,17 @@ impl Mempool {
     ) -> Result<(Txid, usize, u64, QuarantineScope), MempoolError> {
         let mut final_scope = QuarantineScope::acting();
         let TestPrechecked {
-            txid, vsize, fee, fee_rate, weight, prev_outputs, prev_is_coinbase, mut ancestors, cfg, ..
+            txid,
+            vsize,
+            fee,
+            fee_rate,
+            weight,
+            prev_outputs,
+            prev_is_coinbase,
+            mut ancestors,
+            cfg,
+            mut deferred_nonstd,
+            ..
         } = pre;
         // Script verification, consensus then policy, as on admission
         // (tip + 1 = next block height).
@@ -6527,10 +6587,10 @@ impl Mempool {
         // quarantined in-mempool ancestor) is refused, exactly as
         // `accept_transaction` does, with `allowquarantined` defaulting off as
         // for `sendrawtransaction`. A template-only quarantine still relays, so it
-        // stays `allowed: true`. Standardness is not re-litigated here (this dry
-        // run already ran the standardness pass above), so deferred-standardness
-        // forgiveness is moot — this only ever surfaces the relay refusal, never
-        // adds a false one. Counters are left untouched: this is not a real eval.
+        // stays `allowed: true`. A standardness failure `test_prechecks`
+        // deferred is resolved here as admission resolves it (§6.2): an
+        // `Allow` verdict forgives it, `Pass` and `Quarantine` let it stand
+        // (#999). Counters are left untouched: this is not a real eval.
         if let Some(rs) = self.policy.load_full().as_ref().filter(|r| !r.is_empty()) {
             let inner = self.inner.read();
             // Transitive in-mempool ancestor set (for infectious propagation).
@@ -6557,10 +6617,20 @@ impl Mempool {
                 source, false,
             );
             let (mut scope, own_rule) = match &verdict {
-                satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
+                satd_policy::Verdict::Allow { .. } => {
+                    deferred_nonstd = None;
+                    (QuarantineScope::acting(), None)
+                }
+                satd_policy::Verdict::Pass => {
+                    if let Some(e) = deferred_nonstd.take() {
+                        return Err(e);
+                    }
                     (QuarantineScope::acting(), None)
                 }
                 satd_policy::Verdict::Quarantine { rule, scope } => {
+                    if let Some(e) = deferred_nonstd.take() {
+                        return Err(e);
+                    }
                     (policy_engine::map_scope(*scope), Some(rule.clone()))
                 }
             };
@@ -6581,6 +6651,11 @@ impl Mempool {
                 ));
             }
             final_scope = scope;
+        }
+        // A ruleset reloaded since the prechecks without its `allow` rules
+        // forgives nothing.
+        if let Some(e) = deferred_nonstd {
+            return Err(e);
         }
 
         Ok((txid, vsize, fee, final_scope))
@@ -9770,6 +9845,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Core's `IsStandardTx` version range, 1 to 3 (src/policy/policy.cpp):
+    /// 0, 4 and 0xffffffff are refused with reason `version`, through the
+    /// admission path as well as the check itself, and `-acceptnonstdtxn`
+    /// lifts the rule.
+    #[test]
+    fn standardness_refuses_versions_outside_one_to_three() {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let tx_with = |version: i32| Transaction {
+            version: transaction::Version(version),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xcc; 32]),
+                    ),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])),
+            }],
+        };
+        let cfg = MempoolConfig::default();
+        let is_version = |r: &Result<(), MempoolError>| {
+            matches!(r, Err(MempoolError::Validation(reason)) if reason == "version")
+        };
+        for (version, standard) in [(0, false), (1, true), (2, true), (3, true), (4, false), (-1, false)] {
+            let tx = tx_with(version);
+            let weight = tx.weight().to_wu() as usize;
+            let result = Mempool::check_standardness(&tx, &cfg, weight);
+            assert_eq!(!is_version(&result), standard, "version {version:#x}: {result:?}", version = version as u32);
+            if standard {
+                assert!(result.is_ok(), "version {version}: {result:?}");
+            }
+        }
+
+        let (cs, mp, dir) = make_test_env();
+        let result = mp.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
+            "version 4 must be refused as non-standard, got {result:?}"
+        );
+        let nonstd = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
+        let result = nonstd.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            !matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
+            "-acceptnonstdtxn must lift the version rule, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn accept_non_std_txn_bypasses_standardness_checks() {
         use bitcoin::blockdata::locktime::absolute::LockTime;
@@ -12062,6 +12196,91 @@ mod tests {
     }
 
     #[test]
+    fn test_accept_agrees_with_admission_under_allow_rule() {
+        // #999: `testmempoolaccept` answers "would `sendrawtransaction`
+        // accept this?", so under an `allow` rule that forgives a
+        // standardness failure the two must agree. The same two-dust
+        // transaction goes through both, on one mempool.
+        let op = outpoint(0xa6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        set_ruleset(&mp, "version 1\nallow mine when tx.source == rpc");
+
+        let tx = two_dust_spend(op, 100_000);
+        let (tested, _, _) = mp
+            .test_accept(&tx, &cs, &NoopVerifier)
+            .expect("test_accept must forgive what the allow rule forgives on admission");
+        let admitted = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("allow forgives the dust nonstandardness");
+        assert_eq!(tested, admitted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_refuses_nonstandard_the_allow_rule_does_not_forgive() {
+        // The must-still-refuse side of #999, and the same answer from both
+        // paths each time: with no policy, and with an `allow` rule that
+        // does not match (deferral on, verdict `Pass`), the dust refusal
+        // stands.
+        let op = outpoint(0xa7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let tx = two_dust_spend(op, 100_000);
+
+        for rules in [None, Some("version 1\nallow mine when tx.source == mcp")] {
+            match rules {
+                Some(r) => set_ruleset(&mp, r),
+                None => mp.clear_policy(),
+            }
+            let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
+            assert!(matches!(tested, MempoolError::Dust), "{rules:?}: test_accept got {tested:?}");
+            let admitted = mp
+                .accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+                .unwrap_err();
+            assert!(matches!(admitted, MempoolError::Dust), "{rules:?}: admission got {admitted:?}");
+        }
+
+        // A matching quarantine rule does not forgive it either: the
+        // quarantine class is not a dumping ground (§6.2).
+        set_ruleset(
+            &mp,
+            "version 1\nallow mine when tx.source == mcp\nquarantine catch when tx.version == 2",
+        );
+        let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
+        assert!(matches!(tested, MempoolError::Dust), "quarantine: test_accept got {tested:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_agrees_with_admission_on_oversize_under_acceptnonstdtxn() {
+        // `-acceptnonstdtxn` lifts `tx-size` on admission (it lives in
+        // `check_standardness`), so `testmempoolaccept` must lift it too:
+        // with no policy, and with an `allow` rule that does not match.
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+        for (tag, rules) in [(0xa8u8, None), (0xa9, Some("version 1\nallow mine when tx.source == mcp"))] {
+            let op = outpoint(tag);
+            let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+            mp.config.write().accept_non_std_txn = true;
+            if let Some(r) = rules {
+                set_ruleset(&mp, r);
+            }
+            let mut tx = spend(op, 99_000, 0x22);
+            let mut data = vec![0x6a, 0x4e];
+            data.extend_from_slice(&(100_300u32).to_le_bytes());
+            data.extend(std::iter::repeat_n(0u8, 100_300));
+            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(data) });
+            // Over the standard weight, under the 101 kvB cluster limit.
+            let w = tx.weight().to_wu() as usize;
+            assert!(w > MAX_STANDARD_TX_WEIGHT && w < 404_000, "fixture: oversize, weight {w}");
+
+            let tested = mp.test_accept(&tx, &cs, &NoopVerifier);
+            let admitted = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+            assert!(tested.is_ok(), "{rules:?}: test_accept got {tested:?}");
+            assert!(admitted.is_ok(), "{rules:?}: admission got {admitted:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn no_allow_rules_rejects_nonstandard_early() {
         // A single dust output is standard (Core's MAX_DUST_OUTPUTS_PER_TX),
         // so nothing is deferred here at all and input resolution is the first
@@ -13605,9 +13824,13 @@ mod tests {
 
     #[test]
     fn a_high_bit_version_still_enforces_bip68_at_admission() {
-        // Core's version gate is unsigned; 0x80000002 enforces.
+        // Core's version gate is unsigned; 0x80000002 enforces. Such a version
+        // is non-standard (`IsStandardTx`, reason `version`, #1070), so the
+        // pool takes non-standard transactions to reach the BIP 68 check,
+        // which `-acceptnonstdtxn` does not lift.
         let op = outpoint(0xEA);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let (cs, _, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let mp = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
         let tx = spend_with(op, 40_000, 0x2A, 0x8000_0002u32 as i32, 1, 0);
         let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");

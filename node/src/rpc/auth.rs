@@ -262,6 +262,41 @@ pub struct HttpCharged;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcUser(pub Arc<str>);
 
+/// The bearer token a WebSocket was opened with, by digest, and the store it
+/// was resolved against.
+///
+/// jsonrpsee copies the upgrade request's extensions onto every frame, so the
+/// [`Principal`](satd_auth::Principal) resolved at the upgrade would
+/// otherwise ride every call for as long as the socket stays open, past the
+/// token's removal on a SIGHUP reload and past its `expires` (#821).
+/// [`AuthMiddleware`] puts this on a bearer upgrade, and
+/// [`TokenRecheckLayer`](crate::rpc::capability::TokenRecheckLayer)
+/// resolves the token again for each frame. The digest is what the authfile
+/// itself stores, never the token.
+#[derive(Clone)]
+pub struct BearerSession {
+    store: Arc<satd_auth::TokenStore>,
+    digest: [u8; 32],
+}
+
+impl BearerSession {
+    pub fn new(store: Arc<satd_auth::TokenStore>, digest: [u8; 32]) -> Self {
+        Self { store, digest }
+    }
+
+    /// The token's principal as the store has it now, or `None` once the
+    /// token is removed or expired.
+    pub fn current(&self) -> Option<satd_auth::Principal> {
+        self.store.resolve_digest(&self.digest, now_unix())
+    }
+}
+
+impl std::fmt::Debug for BearerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerSession").finish_non_exhaustive()
+    }
+}
+
 /// The address of the peer a request came from. The RPC listeners' accept
 /// loops put it on every request, since jsonrpsee does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,13 +416,19 @@ where
             // `-rpcwhitelist` restricts; a bearer token names no such user and
             // is scoped by its own capabilities instead.
             let rpc_user: Option<String> = header.as_deref().and_then(|h| auth.validate_user(h));
+            let mut session: Option<BearerSession> = None;
             let principal: Option<satd_auth::Principal> = match &header {
                 Some(_) if rpc_user.is_some() => Some(satd_auth::Principal::operator()),
                 Some(h) => bearer.as_ref().and_then(|store| {
                     let mut scratch = String::new();
                     match satd_auth::Credential::from_authorization(h, &mut scratch) {
                         Some(satd_auth::Credential::Bearer { token }) => {
-                            store.resolve(token, now_unix())
+                            let p = store.resolve(token, now_unix())?;
+                            session = Some(BearerSession::new(
+                                store.clone(),
+                                satd_auth::token_digest(token),
+                            ));
+                            Some(p)
                         }
                         _ => None,
                     }
@@ -418,6 +459,11 @@ where
                     }
                     if !jsonrpsee::server::ws::is_upgrade_request(&req) {
                         req.extensions_mut().insert(HttpCharged);
+                    } else if let Some(session) = session {
+                        // A plain HTTP request is resolved here, once, for
+                        // the one call it carries; a socket's frames are
+                        // resolved again, each, by `TokenRecheckLayer`.
+                        req.extensions_mut().insert(session);
                     }
                     inner.call(req).await
                 }

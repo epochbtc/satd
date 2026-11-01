@@ -452,6 +452,19 @@ const CORE_RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_sec
 /// only matters for a forced compaction still running.
 const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Worker threads for the core runtime: tokio's default (one per CPU), but
+/// never fewer than 2. With one worker, a single blocking call on it stops
+/// JSON-RPC and P2P together; on a 1-CPU host during IBD that froze both for
+/// minutes at a time (#1144). The blocking call itself is still a defect;
+/// this keeps one stall from taking every surface down with it.
+fn core_runtime_workers() -> usize {
+    core_runtime_workers_for(std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+fn core_runtime_workers_for(cpus: usize) -> usize {
+    cpus.max(2)
+}
+
 /// The core runtime is built here rather than by `#[tokio::main]` so that the
 /// process ends with a bounded runtime shutdown and `_exit`, not with libc's
 /// `exit()`. `exit()` runs the C++ static destructors, RocksDB's among them,
@@ -462,6 +475,7 @@ const MAINTENANCE_THREADS_SHUTDOWN: std::time::Duration = std::time::Duration::f
 fn main() {
     node::set_private_umask();
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(core_runtime_workers())
         .enable_all()
         .build()
         .expect("Failed to build the core runtime");
@@ -699,6 +713,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Configure server-wide default RPC amount unit before any RPC starts.
     node::rpc::amounts::set_default(config.rpc_default_units);
+    // `-deprecatedrpc`, read by the RPC handlers from here on.
+    node::rpc::deprecated::set(&config.deprecatedrpc);
     if config.rpc_default_units != node::rpc::amounts::AmountUnit::Btc {
         tracing::info!(
             units = config.rpc_default_units.as_str(),
@@ -1309,7 +1325,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "rust",
                 config.shadow_queue_size,
                 config.shadow_workers,
-            ))
+            )
+            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
         ConsensusEngine::CppShadow => {
             tracing::info!("Consensus: cpp-shadow (rust authoritative, cpp shadow)");
@@ -1320,7 +1337,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "cpp",
                 config.shadow_queue_size,
                 config.shadow_workers,
-            ))
+            )
+            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
     };
     let chain_state = match ChainState::new(
@@ -6093,6 +6111,17 @@ mod startup_tests {
         assert!(index_refuses_incomplete_chain_tx(false, true, false));
         assert!(index_refuses_incomplete_chain_tx(false, false, true));
         assert!(index_refuses_incomplete_chain_tx(false, true, true));
+    }
+
+    /// A 1-CPU host still gets two core workers, so one blocked worker
+    /// cannot stop RPC and P2P together (#1144); larger hosts keep tokio's
+    /// one-per-CPU default.
+    #[test]
+    fn core_runtime_has_at_least_two_workers() {
+        use super::core_runtime_workers_for;
+        assert_eq!(core_runtime_workers_for(1), 2);
+        assert_eq!(core_runtime_workers_for(2), 2);
+        assert_eq!(core_runtime_workers_for(16), 16);
     }
 }
 

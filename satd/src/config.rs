@@ -1096,6 +1096,9 @@ pub struct Config {
     pub listenonion: bool,
     /// `-onlynet` as given, for `getconfig`-style dumps and the reload diff.
     pub onlynet: Vec<String>,
+    /// `-deprecatedrpc`: deprecated RPC behaviours to bring back. satd knows
+    /// `warnings` (#956); other names are warned about and ignored.
+    pub deprecatedrpc: Vec<String>,
     /// The networks automatic outbound connections may use, resolved from
     /// `-onlynet` (Core's `g_reachable_nets`).
     pub reachable: node::net::reachable::ReachableNets,
@@ -1181,6 +1184,9 @@ pub struct Config {
     pub consensus: ConsensusEngine,
     /// Shadow verification queue capacity (default: 4_194_304).
     pub shadow_queue_size: usize,
+    /// Shadow verification queue byte budget in MiB (default: 128; `0` for
+    /// no byte bound).
+    pub shadow_queue_mb: usize,
     /// Shadow verification worker threads (default: 4).
     pub shadow_workers: usize,
     // MCP server
@@ -3975,6 +3981,21 @@ impl Config {
         pending_notes.extend(
             zmq.notes.into_iter().map(|message| ConfigNote { level: NoteLevel::Warn, message }),
         );
+        // `-deprecatedrpc`. Core takes any name without checking it; satd
+        // warns about a name it has no deprecated form for, so a migrated
+        // `deprecatedrpc=` line is not silently a no-op.
+        let deprecatedrpc = merge_list(cli.deprecatedrpc.clone(), file_get_all("deprecatedrpc"), None);
+        for name in &deprecatedrpc {
+            if !node::rpc::deprecated::KNOWN.contains(&name.as_str()) {
+                pending_notes.push(ConfigNote {
+                    level: NoteLevel::Warn,
+                    message: format!(
+                        "-deprecatedrpc={name}: satd has no deprecated form of that; ignored (known: {})",
+                        node::rpc::deprecated::KNOWN.join(", ")
+                    ),
+                });
+            }
+        }
         // Surface warnings for recognized-but-unsupported Core keys that were
         // skipped (drop-in bitcoin.conf compatibility) so the operator knows
         // each ignored line, even though the node started.
@@ -4301,12 +4322,26 @@ impl Config {
             peerblockfilters,
             prune,
             prune_manual,
-            reindex: cli.reindex.unwrap_or(false),
-            reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
+            // Read from the config file as well as the command line, as Core
+            // does. Both keys were accepted in the file and then ignored
+            // (#840), so an operator who asked for a rebuild there got a
+            // normal start instead. As in Core, a file value applies on
+            // every start until it is removed.
+            // An empty value is true, as Core's `InterpretBool("")` reads it:
+            // `reindex=` asks for a rebuild there too.
+            reindex: cli
+                .reindex
+                .or_else(|| file_get("reindex").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) }))
+                .unwrap_or(false),
+            reindex_chainstate: cli
+                .reindex_chainstate
+                .or_else(|| {
+                    file_get("reindexchainstate").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) })
+                })
+                .unwrap_or(false),
             // Read from the config file as well as the command line: the
             // app-store packages turn it on in the `bitcoin.conf` they
-            // generate, and a key that is accepted and ignored there would
-            // be the silent failure `reindex=1` is (#840).
+            // generate.
             upgradechainstate: cli
                 .upgradechainstate
                 .or_else(|| file_get("upgradechainstate").and_then(|v| parse_bool(&v)))
@@ -4430,6 +4465,7 @@ impl Config {
             torpassword: cli.torpassword.or_else(|| file_get("torpassword")),
             listenonion,
             onlynet: onlynet_raw,
+            deprecatedrpc,
             reachable,
             noonion,
             blockmaxweight,
@@ -4567,6 +4603,10 @@ impl Config {
                 .shadowqueuesize
                 .or_else(|| file_get("shadowqueuesize").and_then(|v| v.parse().ok()))
                 .unwrap_or(4_194_304),
+            shadow_queue_mb: cli
+                .shadowqueuemb
+                .or_else(|| file_get("shadowqueuemb").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::validation::script::DEFAULT_SHADOW_QUEUE_MB),
             shadow_workers: cli
                 .shadowworkers
                 .or_else(|| file_get("shadowworkers").and_then(|v| v.parse().ok()))
@@ -6358,6 +6398,13 @@ pub struct CliArgs {
     )]
     pub onlynet: Vec<String>,
 
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Bring back a deprecated RPC behaviour, as Core's -deprecatedrpc (repeatable). satd knows: warnings"
+    )]
+    pub deprecatedrpc: Vec<String>,
+
     // Mining flags
     #[arg(
         long,
@@ -6502,6 +6549,13 @@ pub struct CliArgs {
         help = "Shadow verification queue capacity (default: 4194304)"
     )]
     pub shadowqueuesize: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Memory the shadow verification queue may hold, in MiB; 0 for no byte bound (default: 128)"
+    )]
+    pub shadowqueuemb: Option<usize>,
 
     #[arg(
         long,
@@ -8935,6 +8989,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "torpassword",
         "listenonion",
         "onlynet",
+        "deprecatedrpc",
         "blockmaxweight",
         "blockmintxfee",
         "blockversion",
@@ -9603,6 +9658,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "txannouncedelay",
     "timeout",
     "onlynet",
+    "deprecatedrpc",
     "signetseednode",
     "signetchallenge",
     // Proxy / Tor
@@ -9738,6 +9794,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stallwatchdogsecs",
     "stallabortsecs",
     "shadowqueuesize",
+    "shadowqueuemb",
     "shadowworkers",
     // Mining
     "blockmaxweight",
@@ -11050,6 +11107,55 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "txannouncedelay=0\n").unwrap();
         assert!(!load(&[]), "from the file");
         assert!(load(&["-txannouncedelay=1"]), "the command line wins");
+    }
+
+    /// `-deprecatedrpc` from either source, repeatable; a name satd has no
+    /// deprecated form for is kept but warned about (#956).
+    #[test]
+    fn deprecatedrpc_is_read_and_unknown_names_warned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .expect("loads")
+        };
+        assert!(load(&[]).deprecatedrpc.is_empty());
+        assert_eq!(load(&["-deprecatedrpc=warnings"]).deprecatedrpc, vec!["warnings"]);
+        std::fs::write(dir.path().join("bitcoin.conf"), "deprecatedrpc=warnings\ndeprecatedrpc=create_bdb\n").unwrap();
+        let c = load(&[]);
+        assert_eq!(c.deprecatedrpc, vec!["warnings", "create_bdb"]);
+        let notes: Vec<&str> = c.pending_notes.iter().map(|n| n.message.as_str()).collect();
+        assert!(notes.iter().any(|m| m.contains("-deprecatedrpc=create_bdb")), "{notes:?}");
+        assert!(!notes.iter().any(|m| m.contains("-deprecatedrpc=warnings")), "{notes:?}");
+    }
+
+    /// `reindex` and `reindexchainstate` are read from the file, as Core
+    /// reads them (#840), in Core's hyphenated spelling too, and the command
+    /// line still wins.
+    #[test]
+    fn reindex_keys_are_read_from_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            let c = Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+                .expect("loads");
+            (c.reindex, c.reindex_chainstate)
+        };
+        assert_eq!(load(&[]), (false, false));
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindex=1\n").unwrap();
+        assert_eq!(load(&[]), (true, false), "reindex from the file");
+        assert_eq!(load(&["-reindex=0"]), (false, false), "the command line wins");
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindexchainstate=1\n").unwrap();
+        assert_eq!(load(&[]), (false, true), "reindexchainstate from the file");
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindex-chainstate=1\n").unwrap();
+        assert_eq!(load(&[]), (false, true), "Core's hyphenated spelling");
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindex=0\n").unwrap();
+        assert_eq!(load(&[]), (false, false));
+        // Core's `InterpretBool("")` is true.
+        std::fs::write(dir.path().join("bitcoin.conf"), "reindex=\nreindexchainstate=\n").unwrap();
+        assert_eq!(load(&[]), (true, true), "an empty value asks for the rebuild, as in Core");
     }
 
     /// `-nap`, a satd extension: off by default, on from the command line in
@@ -12654,6 +12760,7 @@ testactivationheight=bip34@2
             torpassword: None,
             listenonion: None,
             onlynet: vec![],
+            deprecatedrpc: vec![],
             mcp: Some(false),
             mcpport: None,
             mcpbind: None,
@@ -12689,6 +12796,7 @@ testactivationheight=bip34@2
             stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
+            shadowqueuemb: None,
             shadowworkers: None,
             rpcextendederrors: Some(false),
             maxshutdownsecs: None,
@@ -12973,6 +13081,7 @@ testactivationheight=bip34@2
             torpassword: None,
             listenonion: None,
             onlynet: vec![],
+            deprecatedrpc: vec![],
             mcp: Some(false),
             mcpport: None,
             mcpbind: None,
@@ -13008,6 +13117,7 @@ testactivationheight=bip34@2
             stallabortsecs: None,
             consensus: None,
             shadowqueuesize: None,
+            shadowqueuemb: None,
             shadowworkers: None,
             rpcextendederrors: Some(false),
             maxshutdownsecs: None,

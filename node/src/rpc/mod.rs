@@ -49,6 +49,7 @@ pub mod auth;
 pub mod blockchain;
 pub mod capability;
 pub mod compat;
+pub mod deprecated;
 pub mod descriptor;
 pub mod error;
 pub mod indexes;

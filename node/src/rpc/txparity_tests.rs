@@ -217,3 +217,29 @@ fn getrawtransaction_needs_no_txindex_for_the_fee() {
     assert_eq!(v["vin"][0]["prevout"]["height"], json!(1), "{v}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The not-found text says what the node actually searched (#1066). With
+/// `-txindex` on, satd told the caller to enable it. Core v31's
+/// `getrawtransaction` (src/rpc/rawtransaction.cpp) picks its text by index
+/// state; satd's "incomplete" index stands in for Core's still-syncing one.
+#[test]
+fn getrawtransaction_not_found_text_follows_the_index() {
+    use bitcoin::hashes::Hash;
+    let missing = bitcoin::Txid::from_byte_array([0x5a; 32]).to_string();
+    let cases = [
+        ((false, false), "No such mempool transaction. Use -txindex or provide a block hash"),
+        ((true, false), "No such mempool transaction. The transaction index does not cover blocks"),
+        ((true, true), "No such mempool or blockchain transaction. Use gettransaction"),
+    ];
+    for ((enabled, complete), want) in cases {
+        let store = ControllableStore::new();
+        store.controls().set_txindex(enabled, complete);
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let pool = Mempool::new(1_000_000, 0);
+        let (code, msg) = rawtx::get_raw_transaction(&cs, &pool, &missing, false, 0, None).unwrap_err();
+        assert_eq!(code, -5, "txindex={enabled} complete={complete}");
+        assert!(msg.starts_with(want), "txindex={enabled} complete={complete}: {msg}");
+        assert!(msg.ends_with("Use gettransaction for wallet transactions."), "{msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

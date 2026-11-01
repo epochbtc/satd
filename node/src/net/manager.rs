@@ -2571,6 +2571,20 @@ impl PeerManager {
         *self.reachable.write() = nets;
     }
 
+    /// Whether automatic outbound connections may use `net`: Core's
+    /// `g_reachable_nets.Contains`, which `getnetworkinfo` reports. Onion also
+    /// needs a proxy that reaches Tor, as Core removes `NET_ONION` from the
+    /// set when it has none (`src/init.cpp`).
+    pub fn network_reachable(&self, net: crate::net::reachable::Network) -> bool {
+        let listed = self.reachable.read().contains(net);
+        match net {
+            crate::net::reachable::Network::Onion => {
+                listed && self.onion_routing_available() && !self.onion_disabled.load(Ordering::Relaxed)
+            }
+            _ => listed,
+        }
+    }
+
     /// Record a `.onion` peer learned from `addrv2` gossip so the reconnect
     /// loop can dial it. The addrman is `SocketAddr`-keyed and can't hold
     /// onion peers, so they live in `connect_peer_addrs` (in-memory, bounded
@@ -4173,12 +4187,21 @@ impl PeerManager {
             .find(|(_, handle)| handle.info.addr_string() == addr)
             .map(|(id, _)| *id);
         match id {
-            Some(id) => self.disconnect_by_id(id),
+            Some(id) => self.disconnect_on_request(id),
             None => false,
         }
     }
 
-    /// Disconnect a peer by its `getpeerinfo` id. Returns whether one matched.
+    /// `disconnectnode` by id: [`Self::disconnect_by_id`], logged as an RPC
+    /// request. Only the RPC calls this; the node's own disconnects go through
+    /// `disconnect_by_id`, so their log line no longer claims to be one (#1152).
+    pub fn disconnect_on_request(&self, id: PeerId) -> bool {
+        self.disconnect_peer(id, "rpc_request")
+    }
+
+    /// Disconnect a peer by its `getpeerinfo` id, for the node's own reasons.
+    /// Returns whether one matched. The caller logs why; this logs that the
+    /// peer went, as `reason="internal"`.
     ///
     /// Dropping the `PeerHandle` is what actually closes the connection: it
     /// closes the peer task's `msg_rx`, which the write loop treats as
@@ -4187,6 +4210,10 @@ impl PeerManager {
     /// runs the rest of the teardown (IBD reassignment, background-range
     /// requeue) exactly as an organic disconnect would.
     pub fn disconnect_by_id(&self, id: PeerId) -> bool {
+        self.disconnect_peer(id, "internal")
+    }
+
+    fn disconnect_peer(&self, id: PeerId, reason: &'static str) -> bool {
         let removed = self.peers.write().remove(&id);
         match removed {
             Some(handle) => {
@@ -4204,8 +4231,8 @@ impl PeerManager {
                 tracing::info!(
                     id,
                     addr = %handle.info.addr_string(),
-                    reason = "rpc_request",
-                    "Disconnecting peer on request"
+                    reason,
+                    "Disconnecting peer"
                 );
                 true
             }
@@ -5713,7 +5740,7 @@ impl PeerManager {
                             .peers
                             .read()
                             .get(&peer_id)
-                            .map(|h| h.info.addr.to_string())
+                            .map(|h| h.info.addr_string())
                             .unwrap_or_else(|| "<gone>".to_string());
                         tracing::warn!(
                             peer_id,
@@ -5937,7 +5964,7 @@ impl PeerManager {
                 }
                 tracing::info!(
                     id,
-                    addr = %handle.info.addr,
+                    addr = %handle.info.addr_string(),
                     user_agent = %handle.info.user_agent,
                     height = handle.info.best_height,
                     "Peer connected"
@@ -5965,7 +5992,7 @@ impl PeerManager {
         let mut peers = self.peers.write();
         let mut nap_pull = None;
         if let Some(handle) = peers.remove(&id) {
-            tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
+            tracing::info!(id, addr = %handle.info.addr_string(), "Peer disconnected");
             tracing::debug!("Cleared nodestate for peer={id}");
             if handle.info.conn_type == ConnType::NapPull {
                 nap_pull = Some(handle.info.addr_string());
@@ -6887,8 +6914,16 @@ impl PeerManager {
         }
 
         if !blocks_to_get.is_empty() {
-            // Direct fetch (fast path when the block extends our tip)…
-            if self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get)) {
+            // Direct fetch (fast path when the block extends our tip)… but not
+            // during IBD, where an announced block is a new tip far above the
+            // download window, and storing it puts a block that cannot be
+            // connected for hours into the block file being written, which
+            // keeps that file from being pruned (#1154). Core asks for
+            // headers only (`net_processing.cpp`, the `inv` handler); the
+            // scheduler fetches the block when the window reaches it.
+            if self.ibd.read().is_none()
+                && self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get))
+            {
                 self.note_blocks_requested(id, &blocks_to_get);
             }
             // …plus rate-limited headers-first discovery: if the announced
@@ -7833,7 +7868,7 @@ impl PeerManager {
         // background catch-up requested also land here and are stored — we
         // notify the background connector from the same path.
         if self.ibd.read().is_some() {
-            self.handle_block_ibd(id, block);
+            self.handle_block_ibd(id, block, requested);
             return;
         }
         // Forward IBD inactive. If a background catch-up is active and this
@@ -7902,7 +7937,7 @@ impl PeerManager {
     /// advances the forward scheduler; if a background catch-up is also
     /// active, a stored historical block additionally wakes the background
     /// connector.
-    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block) {
+    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block, requested: bool) {
         // A non-canonical historical block (≤ snapshot_height) can arrive
         // unsolicited even during forward IBD; storing it would poison the
         // shared height→hash mapping the background connector relies on.
@@ -7915,6 +7950,25 @@ impl PeerManager {
             return;
         }
         let hash = block.block_hash();
+        // Core's `fTooFarAhead` (`AcceptBlock`, validation.cpp): a block
+        // nobody asked for is not stored when it is too far above the tip.
+        // Here "asked for" also covers the scheduler's own requests, and
+        // "too far" is above its download window, so a late delivery of a
+        // height the window holds is still kept. A far block stored now sits
+        // in the current block file until the tip reaches it, and keeps that
+        // file from being pruned (#1154).
+        if !requested
+            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+            && self.ibd.read().as_ref().is_some_and(|s| !s.expects(parent.height + 1, &hash))
+        {
+            tracing::debug!(
+                %hash,
+                height = parent.height + 1,
+                peer = id,
+                "IBD: dropping an unrequested block above the download window"
+            );
+            return;
+        }
         match self.chain_state.store_block(&block) {
             Ok((_, height)) => {
                 // Judged when the connector reaches it; remember who sent it.
