@@ -713,6 +713,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Configure server-wide default RPC amount unit before any RPC starts.
     node::rpc::amounts::set_default(config.rpc_default_units);
+    // `-deprecatedrpc`, read by the RPC handlers from here on.
+    node::rpc::deprecated::set(&config.deprecatedrpc);
     if config.rpc_default_units != node::rpc::amounts::AmountUnit::Btc {
         tracing::info!(
             units = config.rpc_default_units.as_str(),

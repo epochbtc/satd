@@ -5951,6 +5951,26 @@ fn test_config_peerblockfilters_forces_blockfilterindex() {
 /// `-H 'content-type: text/plain;'`, and plain `curl --data` sends a form
 /// type. Core reads the JSON body whatever the header says; satd answered
 /// 415 for anything but `application/json` (#824).
+/// `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo`
+/// is always an array, `[]` on a node with none, as in Core v28 and later;
+/// `-deprecatedrpc=warnings` brings back the single-string form (#956).
+#[test]
+fn test_rpc_warnings_field_is_an_array_unless_deprecated() {
+    let methods = ["getblockchaininfo", "getnetworkinfo", "getmininginfo"];
+    let mut node = TestNode::start(&[]);
+    for m in methods {
+        let r = node.rpc_ok(m, vec![]);
+        assert_eq!(r["warnings"], serde_json::json!([]), "{m}: {r}");
+    }
+    node.stop();
+    let mut node = TestNode::start(&["--deprecatedrpc=warnings"]);
+    for m in methods {
+        let r = node.rpc_ok(m, vec![]);
+        assert_eq!(r["warnings"], serde_json::json!(""), "{m} under -deprecatedrpc=warnings: {r}");
+    }
+    node.stop();
+}
+
 #[test]
 fn test_rpc_accepts_any_request_content_type() {
     let mut node = TestNode::start(&[]);

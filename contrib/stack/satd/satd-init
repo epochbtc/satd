@@ -250,13 +250,26 @@ if "$SATD_BIN" --help 2>/dev/null | grep -q -- '--upgradechainstate'; then
     } >> "$CONF.new"
 fi
 
-# Operator additions, appended last so they win where satd takes the last
-# value. Documented in the README; absent by default.
+# Operator additions, documented in the README; absent by default. satd, like
+# Core, takes the FIRST value of a repeated key in a config file, so the
+# top-level lines of local.conf go ahead of everything rendered above, where
+# they win. Its `[section]` blocks, if any, go at the end: a value in the
+# active chain's section beats a top-level one wherever it sits, and a block
+# placed first would swallow the rendered keys that follow it (#843).
 LOCAL_CONF="$DATADIR/conf.d/local.conf"
 if [[ -s "$LOCAL_CONF" ]]; then
-    echo "satd-init: appending $LOCAL_CONF"
-    printf '\n# --- appended from conf.d/local.conf ---\n' >> "$CONF.new"
-    cat "$LOCAL_CONF" >> "$CONF.new"
+    echo "satd-init: merging $LOCAL_CONF"
+    {
+        printf '# --- top level of conf.d/local.conf: first, so these win ---\n'
+        awk '/^[[:space:]]*\[/ { exit } { print }' "$LOCAL_CONF"
+        printf '# --- end of conf.d/local.conf top level ---\n\n'
+        cat "$CONF.new"
+        if grep -q '^[[:space:]]*\[' "$LOCAL_CONF"; then
+            printf '\n# --- sections of conf.d/local.conf ---\n'
+            awk 'f || /^[[:space:]]*\[/ { f = 1; print }' "$LOCAL_CONF"
+        fi
+    } > "$CONF.merged"
+    mv "$CONF.merged" "$CONF.new"
 fi
 
 chmod 0644 "$CONF.new"

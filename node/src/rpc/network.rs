@@ -143,7 +143,6 @@ pub fn get_network_info(
     let connections = peer_manager.connection_count();
     let connections_in = peer_manager.inbound_count();
     let connections_out = peer_manager.outbound_count();
-    let onion_reachable = peer_manager.onion_routing_available();
     let randomize = peer_manager.proxy_randomize();
     let clearnet_proxy = peer_manager.proxy_addr().unwrap_or_default();
     let onion_proxy = peer_manager.onion_proxy_addr().unwrap_or_default();
@@ -151,6 +150,34 @@ pub fn get_network_info(
     // actually routes through a proxy.
     let clearnet_randomize = randomize && !clearnet_proxy.is_empty();
     let onion_randomize = randomize && !onion_proxy.is_empty();
+    // One entry per network, in Core's `Network` order, with the flags from
+    // the set that drives outbound selection (`GetNetworksInfo`,
+    // src/rpc/net.cpp). These were hardcoded reachable for ipv4 and ipv6, so
+    // a node under `-onlynet=onion` reported clearnet as in use. satd has no
+    // I2P transport, so i2p is never reachable and has no proxy; CJDNS goes
+    // through the clearnet proxy, as Core's `-proxy` sets it.
+    let networks: Vec<Value> = {
+        use crate::net::reachable::Network;
+        [
+            ("ipv4", Network::Ipv4, clearnet_proxy.clone(), clearnet_randomize),
+            ("ipv6", Network::Ipv6, clearnet_proxy.clone(), clearnet_randomize),
+            ("onion", Network::Onion, onion_proxy, onion_randomize),
+            ("i2p", Network::I2p, String::new(), false),
+            ("cjdns", Network::Cjdns, clearnet_proxy, clearnet_randomize),
+        ]
+        .into_iter()
+        .map(|(name, net, proxy, randomize)| {
+            let reachable = peer_manager.network_reachable(net);
+            json!({
+                "name": name,
+                "limited": !reachable,
+                "reachable": reachable,
+                "proxy": proxy,
+                "proxy_randomize_credentials": randomize
+            })
+        })
+        .collect()
+    };
     let local_addresses: Vec<Value> = peer_manager
         .local_addresses()
         .into_iter()
@@ -188,29 +215,7 @@ pub fn get_network_info(
         "connections": connections,
         "connections_in": connections_in,
         "connections_out": connections_out,
-        "networks": [
-            {
-                "name": "ipv4",
-                "limited": false,
-                "reachable": true,
-                "proxy": clearnet_proxy.clone(),
-                "proxy_randomize_credentials": clearnet_randomize
-            },
-            {
-                "name": "ipv6",
-                "limited": false,
-                "reachable": true,
-                "proxy": clearnet_proxy,
-                "proxy_randomize_credentials": clearnet_randomize
-            },
-            {
-                "name": "onion",
-                "limited": !onion_reachable,
-                "reachable": onion_reachable,
-                "proxy": onion_proxy,
-                "proxy_randomize_credentials": onion_randomize
-            }
-        ],
+        "networks": networks,
         // The node's *configured* floors, not a constant. satd's defaults are
         // 100 sat/kvB (Core v31 agrees), so the fixed `0.00001000` was ten
         // times high before an operator set anything -- and `getmempoolinfo`
@@ -232,10 +237,7 @@ pub fn get_network_info(
         // This was `""` unconditionally, so a node warning about an unknown
         // softfork said nothing here — on the RPC an operator polls precisely
         // to see whether the node is unhappy.
-        "warnings": match warnings {
-            v if v.is_empty() => Value::String(String::new()),
-            v => Value::Array(v.into_iter().map(Value::String).collect()),
-        }
+        "warnings": crate::rpc::deprecated::warnings_value(warnings)
     });
     crate::rpc::amounts::annotate_units(&mut response, unit);
     response
