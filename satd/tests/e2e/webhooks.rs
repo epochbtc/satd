@@ -27,6 +27,8 @@ use crate::common::StreamingNode;
 pub struct Received {
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// When the receiver finished reading the request.
+    pub at: std::time::Instant,
 }
 
 impl Received {
@@ -345,6 +347,7 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Received> {
     Some(Received {
         headers,
         body: String::from_utf8_lossy(&body).to_string(),
+        at: std::time::Instant::now(),
     })
 }
 
@@ -813,14 +816,26 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     // a restart takes. The queued blocks go with it.
     write_alertfile(&dir, &receiver, "chain", "\"chain\"", true);
     crate::streaming::sighup_with_conf(&sn, "").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let reloaded = std::time::Instant::now();
 
-    // Nothing from the missed span comes back...
-    let after = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
-    assert_eq!(
-        after, before,
-        "the missed span was re-sent; a best-effort hook resumes at the head and \
-         does not carry history across a reload"
+    // Nothing from the missed span comes back... Judged by arrival time, not
+    // by a count taken before the reload: a retry already in flight at the
+    // reload can land just after it without any history having crossed the
+    // reload (#794). Two seconds of grace cover that, and the reload itself; a
+    // generation that did carry its queue retries again within the window
+    // below (backoff 1, 2, 4, 8 s).
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let late: Vec<_> = receiver
+        .all_attempts()
+        .await
+        .into_iter()
+        .filter(|r| missed(r) && r.at > reloaded + Duration::from_secs(2))
+        .map(|r| r.json()["body"]["height"].clone())
+        .collect();
+    assert!(
+        late.is_empty(),
+        "the missed span was re-sent after the reload (heights {late:?}); a best-effort \
+         hook resumes at the head and does not carry history across a reload"
     );
 
     // ...and no in-band notice is synthesized about it either.
