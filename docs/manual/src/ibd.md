@@ -66,7 +66,10 @@ the background. satd's implementation is shipped and Bitcoin Core-compatible.
   no snapshot reports a single fully-validated chainstate. After `loadtxoutset`
   it reports a second, background chainstate, and the snapshot entry carries
   `snapshot_blockhash` and `validated: false` until background validation
-  finishes.
+  finishes. The same progress is on `/metrics`, and a background validation
+  that stalls, fails its handoff or proves the snapshot invalid raises an
+  alert: see [AssumeUTXO background validation](observability.md#assumeutxo-background-validation)
+  and [Node-health alerts](observability.md#node-health-alerts).
 - **`dumptxoutset <path>`** (RPC) writes a Bitcoin Core-compatible UTXO
   snapshot from your own node.
 

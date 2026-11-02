@@ -162,6 +162,27 @@ lists each miner instead. A miner that stops hashing shows as
 `satd_stratum_miners` holding steady while the accepted-share rate falls to
 zero.
 
+### AssumeUTXO background validation
+
+While an [AssumeUTXO snapshot](ibd.md#assumeutxo-fast-sync) is loaded, the node
+serves the tip from it and validates the history behind it in the background.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `satd_assumeutxo_background_attached` | gauge | 1 while a snapshot is loaded and its history is being validated, 0 otherwise. |
+| `satd_assumeutxo_snapshot_rejected` | gauge | 1 once background validation has proven the snapshot invalid. |
+| `satd_assumeutxo_background_tip_height` | gauge | Height background validation has connected up to. Present only while a snapshot is loaded. |
+| `satd_assumeutxo_snapshot_height` | gauge | The snapshot's base height, where background validation hands off. Present only while a snapshot is loaded. |
+
+The first two are exported on every node, so a rule can exist before a snapshot
+is ever loaded. Progress is
+`satd_assumeutxo_background_tip_height / satd_assumeutxo_snapshot_height`. A
+background tip that stops moving while `satd_assumeutxo_background_attached`
+is 1 is the stall that
+[`assumeutxo_catchup_stalled`](#node-health-alerts) reports, and
+`satd_alert_active{kind="assumeutxo_validation_failed"}` reads 1 alongside
+`satd_assumeutxo_snapshot_rejected`.
+
 ## Status page
 
 `--statuspage=1` adds a browser page to the metrics listener, a simplified,
@@ -302,8 +323,8 @@ pre-registers at 0 (see [below](#node-health-alerts)).
 ## Node-health alerts
 
 Metrics tell you what the node is doing; health alerts tell you when it has
-stopped doing it. satd watches six conditions about *itself* and reports each
-one through three surfaces at once, so they can never disagree:
+stopped doing it. satd watches the conditions in the table below about *itself*
+and reports each one through three surfaces at once, so they can never disagree:
 
 *   a `status` event on the [Streaming Consumption API](streaming.md) (category
     bit 16 — see §7.8 of the wire spec),
@@ -358,6 +379,9 @@ keep updating, and the node log carries every one in full.
 | `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
 | `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks (default `3` on mainnet, `10` on test networks, off on regtest) | one-shot |
 | `template_invalid` | critical | a block template the node built failed its validity check — a block found on it would be rejected. This is a node bug; the log line names the reject reason and the offending transaction | a template passes again: the full check, if the full check was the one that failed |
+| `assumeutxo_catchup_stalled` | critical | AssumeUTXO background validation cannot advance: a historical block has failed to connect 30 times in a row (`reason=connect_failing`; the node keeps retrying), or a block failed validation and the catch-up stopped (`reason=invalid_block`) | the next background block connects, or background validation ends |
+| `assumeutxo_handoff_failing` | critical | the handoff at the snapshot height has been failing for 10 s (an I/O error while flushing or hashing the background UTXO set; the node keeps retrying with backoff) | a handoff attempt completes, or the snapshot is replaced |
+| `assumeutxo_validation_failed` | critical | background validation proved the loaded snapshot invalid: its UTXO-set hash (`reason=utxo_hash_mismatch`) or the block at its base height (`reason=base_mismatch`) does not match the anchor | never, in the process that raised it; the snapshot is marked rejected and the next start refuses to serve it |
 
 Every standing condition raises **once** on entry and clears **once** on
 recovery — you get a pair of events, not a stream of repeats — and the gap
@@ -371,6 +395,19 @@ they are one-shot: they never clear, and for the same reason they never enter
 poll, and has no threshold to configure. It is evaluated whenever a template is
 built — by `getblocktemplate`, the `generate` RPCs or the Stratum server — so
 after a restart it stands again only once a template fails again.
+
+The three `assumeutxo_*` conditions are raised by
+[AssumeUTXO](ibd.md#assumeutxo-fast-sync) background validation itself and
+have no threshold either. They exist only while a snapshot is loaded. Before
+`assumeutxo_catchup_stalled` is raised, every tenth failed attempt at one height
+records a `getwarnings` entry `assumeutxo.connect_retry` (severity warn), the
+counterpart of the IBD connector's `connect.retry`; it clears when the block
+connects. A block that fails validation is not retried: the bytes are the
+canonical block for that height, so connecting them again can only fail again.
+The connector stops, and the snapshot stays unvalidated (not rejected) until a
+restart. The gauges in
+[AssumeUTXO background validation](#assumeutxo-background-validation) show how
+far it has got.
 
 Thresholds are configured with the `alert*` keys in the
 [Configuration Reference](config-reference.md#health-alerts); all of them are
@@ -471,7 +508,7 @@ never what anyone meant to configure. It selects from the node's firehose:
 
 | Category | Delivers | Rate |
 |---|---|---|
-| `status` | node-health transitions (the six conditions above) | a handful per week on a healthy node |
+| `status` | node-health transitions (the conditions above) | a handful per week on a healthy node |
 | `chain` | every block connect, disconnect, and reorg | one per block |
 | `mempool` | every transaction entering or leaving the mempool — **all** of them, not just yours | thousands per minute on mainnet |
 | `heartbeat` | liveness pings, downsampled to `heartbeat_interval_secs` | whatever interval you set |

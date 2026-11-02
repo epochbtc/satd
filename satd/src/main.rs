@@ -3700,6 +3700,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         publisher: event_publisher.clone(),
         health: health_state.clone(),
     });
+    // AssumeUTXO background validation (catch-up stalled, handoff failing,
+    // snapshot proven invalid) reports through the same path. Anything it
+    // raised before this point is sent out now.
+    chain_state.background_alerts().install_sink(node::health::AlertSink {
+        warnings: chain_state.warnings().clone(),
+        publisher: event_publisher.clone(),
+        health: health_state.clone(),
+    });
     {
         let _api_guard = api_handle.enter();
         chain_state.template_validity().install_full_checker(

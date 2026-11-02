@@ -746,6 +746,17 @@ enum StatusKind {
   // working it would have found a block the node rejects. Clears when a
   // template validates again.
   STATUS_KIND_TEMPLATE_INVALID = 7;
+  // AssumeUTXO background validation is not advancing: a historical block
+  // keeps failing to connect (raised once the connector's retry budget is
+  // spent; it keeps retrying), or a block failed validation and the catch-up
+  // stopped. Clears when the next background block connects.
+  STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED = 8;
+  // The AssumeUTXO handoff at the snapshot height keeps failing (I/O while
+  // flushing or hashing the background UTXO set). Clears when it completes.
+  STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING = 9;
+  // Background validation proved the loaded AssumeUTXO snapshot invalid. Stands
+  // for the life of the process.
+  STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED = 10;
 }
 
 // Level-triggered lifecycle of a condition.

@@ -3443,6 +3443,9 @@ fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
         K::PeerFloor => pb::StatusKind::PeerFloor,
         K::DeepReorg => pb::StatusKind::DeepReorg,
         K::TemplateInvalid => pb::StatusKind::TemplateInvalid,
+        K::AssumeutxoCatchupStalled => pb::StatusKind::AssumeutxoCatchupStalled,
+        K::AssumeutxoHandoffFailing => pb::StatusKind::AssumeutxoHandoffFailing,
+        K::AssumeutxoValidationFailed => pb::StatusKind::AssumeutxoValidationFailed,
     };
     let state = match ev.state {
         St::Raised => pb::StatusState::Raised,
