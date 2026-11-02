@@ -509,6 +509,16 @@ func (s *ResilientSubscription) connectOnce(ctx context.Context) (*Stream, *uint
 	if err != nil {
 		return nil, nil, err
 	}
+	// No anchor of its own yet: adopt the position this stream started from,
+	// so the next reconnect resumes there instead of starting live and losing
+	// what was in flight. See [Stream.HeadCursor].
+	if resume == nil {
+		s.mu.Lock()
+		if s.resume == nil {
+			s.resume = stream.HeadCursor()
+		}
+		s.mu.Unlock()
+	}
 	var expect *uint32
 	if resume != nil {
 		h := resume.Height + 1

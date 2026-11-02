@@ -34,6 +34,18 @@
 //!   caller can escalate to a full resnapshot — the exception, not the rule.
 //! - **Cursor persistence** — confirmed cursors are committed-on-poll to a
 //!   shared [`CursorStore`], so a resume survives reconnects and restarts.
+//!
+//!   The node stamps a cursor on a connected block and a confirmed match only.
+//!   For the window before the first one, satd 0.7.1 and later report the
+//!   stream's head cursor in the response headers
+//!   ([`EventStream::head_cursor`](crate::EventStream::head_cursor)); a watch
+//!   with no anchor of its own (no
+//!   [`from_cursor`](ResilientWatchConfig::from_cursor), an empty store,
+//!   nothing confirmed yet) adopts it, and the next reconnect re-anchors there.
+//!   Against an older node, or one with no block source, a reconnect in that
+//!   window sends no `set_cursor` and resumes live; pass `from_cursor` to close
+//!   it there (a [`Cursor`] with only `height` set is enough, since confirmed
+//!   replay does not check `instance_id`).
 //! - **Refused adds** — when the server answers an add with
 //!   [`Event::WatchAddRejected`] for its rate limit, the items stay in the mirror
 //!   and are re-sent after the server's retry hint, within the backoff budget;
@@ -1930,6 +1942,14 @@ impl ResilientWatch {
         debug_assert!(self.pending_reanchor.is_none());
         if let Some(c) = self.resume {
             handle.set_cursor(c).await?;
+        }
+        // With no anchor of its own (no `from_cursor`, an empty store, nothing
+        // confirmed yet), adopt the position this stream started from. Nothing
+        // is sent for it now (the stream already starts there), but the next
+        // reconnect re-anchors to it, so what this stream was about to deliver
+        // when it dropped is replayed rather than lost (#777).
+        if self.resume.is_none() {
+            self.resume = stream.head_cursor().copied();
         }
         self.handle = Some(handle);
         self.stream = Some(stream);

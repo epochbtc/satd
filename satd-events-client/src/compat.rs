@@ -92,6 +92,27 @@ pub(crate) fn schema_from(md: &MetadataMap) -> u32 {
     }
 }
 
+/// Response metadata key carrying the stream's head cursor,
+/// `<height>:<tx_index>:<mempool_seq>:<instance_id>` in decimal (see
+/// `docs/api/streaming.md`).
+pub(crate) const HEAD_CURSOR_HEADER: &str = "satd-head-cursor";
+
+/// The stream's head cursor from the response headers. `None` when the node
+/// sent none (no block source, or a node older than 0.7.1) or one that does not
+/// parse: a malformed anchor must never be presented back to the node.
+pub(crate) fn head_cursor_from(md: &MetadataMap) -> Option<crate::event::Cursor> {
+    let raw = md.get(HEAD_CURSOR_HEADER)?.to_str().ok()?;
+    let mut it = raw.trim().split(':');
+    let height = it.next()?.parse().ok()?;
+    let tx_index = it.next()?.parse().ok()?;
+    let mempool_seq = it.next()?.parse().ok()?;
+    let instance_id = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(crate::event::Cursor { height, tx_index, mempool_seq, instance_id })
+}
+
 /// How a node version is shown in the warning and the `NodeTooOld` error.
 pub(crate) fn display_node_version(raw: Option<&str>) -> String {
     match raw {
