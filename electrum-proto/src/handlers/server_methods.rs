@@ -250,7 +250,7 @@ mod tests {
     /// batch; a smaller cap refuses the page whole (#1069).
     #[test]
     fn the_default_batch_cap_holds_sparrows_largest_page() {
-        assert!(crate::config::DEFAULT_MAX_BATCH_REQUESTS >= 250);
+        const { assert!(crate::config::DEFAULT_MAX_BATCH_REQUESTS >= 250) };
     }
 
     #[test]
