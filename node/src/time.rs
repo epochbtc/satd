@@ -13,9 +13,8 @@
 //!
 //! Only time that changes *node behaviour*: block-template timestamps, the
 //! `time-too-new` future-block check, mempool entry time and expiry, and the
-//! tip-age test that decides whether the node considers itself in initial
-//! block download (`ChainState::tip_time_is_ibd`, which gates the per-block
-//! coin-cache flush and `getblockchaininfo`'s `initialblockdownload`). That
+//! tip-age test (`ChainState::tip_time_is_stale`, which gates the per-block
+//! coin-cache flush and is half of `ChainState::is_initial_block_download`). That
 //! last one is not optional: it compares against a block header's timestamp,
 //! and headers are stamped from this clock, so leaving it on the system clock
 //! would put the two sides of the comparison on different clocks.

@@ -242,10 +242,9 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
             (bitcoin::CompactTarget::from_consensus(0), 0.0, 0u64, 0u64, "0".to_string())
         };
 
-    // IBD heuristic: if tip is more than 24 hours behind wall clock, we're
-    // in IBD. Shares one definition with the per-block flush gate in
-    // `ChainState` (see `tip_time_is_ibd` / issue #262).
-    let is_ibd = ChainState::tip_time_is_ibd(time as u32);
+    // Core's latched `IsInitialBlockDownload`: tip age and minimum chain
+    // work, and once out it stays out (#1071).
+    let is_ibd = chain_state.is_initial_block_download();
 
     let mut out = json!({
         "chain": chain,

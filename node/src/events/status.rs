@@ -41,11 +41,11 @@ pub enum StatusKind {
     /// the next block connects.
     ///
     /// Deliberately *not* suppressed during initial block download:
-    /// `is_initial_block_download()` compares the tip header's timestamp
-    /// against the wall clock rather than tracking sync progress, so a node
-    /// that was caught up and then wedged re-enters it exactly when the
-    /// operator most needs paging. A node that is genuinely syncing connects
-    /// blocks continuously and never crosses the threshold on its own.
+    /// `is_initial_block_download()` does not track sync progress, and a
+    /// node restarted while wedged reads its stale tip as IBD exactly when
+    /// the operator most needs paging. A node that is genuinely syncing
+    /// connects blocks continuously and never crosses the threshold on its
+    /// own.
     TipStall,
     /// Free space on the data (or blocks) directory fell below the configured
     /// floor. Clears with hysteresis above it.

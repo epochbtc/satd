@@ -4641,8 +4641,8 @@ impl PeerManager {
     }
 
     /// Re-send `feefilter` where the value a peer holds is out of date: at
-    /// once when the node leaves or re-enters initial block download, and
-    /// when the floor has moved outside Core's 3/4..4/3 band.
+    /// once when the node leaves initial block download, and when the floor
+    /// has moved outside Core's 3/4..4/3 band.
     fn maybe_send_fee_filters(&self) {
         let ids: Vec<(PeerId, Option<u64>)> = self
             .peers

@@ -141,9 +141,8 @@ struct HookChannel {
 struct DispatcherState {
     /// Whether this node has ever been observed out of initial block download.
     ///
-    /// `is_initial_block_download()` is the tip header's age, not a sync flag,
-    /// so a node whose tip stops advancing crosses back into "IBD" a day later.
-    /// This keeps a flapping predicate from re-suppressing a caught-up node.
+    /// `is_initial_block_download()` now latches false itself (#1071), so
+    /// this mirrors it; it is kept because the gate reads it per event.
     ///
     /// It is deliberately not load-bearing. The latch lives in this process, so
     /// a node restarted while already wedged never observes a non-IBD tip and
@@ -240,13 +239,12 @@ async fn fan_in(
                     // locally.
                     //
                     // Scoped to chain events, and that scope is what makes the
-                    // gate safe. `is_initial_block_download()` is the tip
-                    // header's age, not a sync flag, so a node that is fully
-                    // caught up and then *stops* reads as "syncing" a day later
-                    // — and a node restarted while already wedged reads that way
-                    // from its first event, with no chance to latch. An earlier
-                    // version gated everything on that predicate and so went
-                    // totally dark on a stalled node: no status, no mempool, and
+                    // gate safe. `is_initial_block_download()` is not a sync
+                    // flag: a node restarted while already wedged reads its
+                    // stale tip as "syncing" from its first event, with no
+                    // chance to latch. An earlier version gated everything on
+                    // that predicate and so went totally dark on a stalled
+                    // node: no status, no mempool, and
                     // watch matches destroyed outright since they have no replay
                     // to recover them. The one thing a stalled node is *not*
                     // producing is chain events, so suppressing only those costs

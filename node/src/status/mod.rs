@@ -345,7 +345,7 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
     let mainnet = ctx.network == Network::Bitcoin;
 
     let readyz = crate::metrics::readiness(cs.warnings(), tip_height, cs.headers_tip_height());
-    let headers_stale = crate::chain::state::ChainState::time_is_ibd_at(header_time, now);
+    let headers_stale = crate::chain::state::ChainState::time_is_stale_at(header_time, now);
 
     let background = cs.background().map(|bg| {
         let snapshot_height = bg.snapshot_height();
