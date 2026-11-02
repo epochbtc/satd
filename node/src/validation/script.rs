@@ -402,21 +402,11 @@ fn name_script_failure(
     flags: u32,
     input: usize,
 ) -> Option<String> {
-    let (txin, prev) = (tx.input.get(input)?, prev_outputs.get(input)?);
-    // The BIP 341 signature hash commits to every spent output; nothing
-    // else reads them (as in `consensus::verify_transaction`).
-    let checker_prevs: &[TxOut] =
-        if flags & consensus::VERIFY_TAPROOT != 0 { prev_outputs } else { &[] };
-    let checker = consensus::sighash::TxSignatureChecker::new(tx, input, prev.value, checker_prevs);
-    let witness: Vec<Vec<u8>> = txin.witness.iter().map(|w| w.to_vec()).collect();
-    match consensus::verify::verify_script(
-        txin.script_sig.as_bytes(),
-        prev.script_pubkey.as_bytes(),
-        &witness,
-        flags,
-        &checker,
-    ) {
-        Err(e) => Some(e.as_str().to_string()),
+    let prev = prev_outputs.get(input)?;
+    let precomputed = consensus::PrecomputedTransactionData::new(tx, prev_outputs).ok()?;
+    match consensus::verify(&prev.script_pubkey, prev.value, tx, input, flags, &precomputed) {
+        Err(consensus::Error::ErrScript(e)) => Some(e.as_str().to_string()),
+        Err(_) => None,
         Ok(()) => {
             tracing::debug!(
                 input,

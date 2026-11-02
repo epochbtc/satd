@@ -28,7 +28,7 @@ mod helpers;
 use helpers::{parse_flags, parse_script};
 
 /// A prepared benchmark case: everything needed to call
-/// `verify_with_flags` on either engine, with no per-iter allocation.
+/// either engine's verify, with no per-iter allocation of its own.
 pub struct WorkloadCase {
     pub name: String,
     /// The spent output's script_pubkey.
@@ -39,7 +39,7 @@ pub struct WorkloadCase {
     pub tx_bytes: Vec<u8>,
     /// Input index in the spending tx (always 0 for synthetic workloads).
     pub input_index: usize,
-    /// Flags to pass to verify_with_flags.
+    /// Script verification flags.
     pub flags: u32,
     /// Prev outputs required for taproot (spk, value). Empty for non-taproot.
     pub prev_outputs: Vec<(Vec<u8>, u64)>,
@@ -58,41 +58,26 @@ pub fn cpp_safe_flags(f: u32) -> u32 {
     f & CPP_RECOGNIZED_FLAGS
 }
 
-/// Verify with the Rust consensus engine.
+/// Verify with the Rust consensus engine. It decodes the transaction on
+/// every call, as the C++ side does, so the two do the same work.
 #[inline]
 pub fn verify_rust(c: &WorkloadCase) -> bool {
-    let result = if c.prev_outputs.is_empty() {
-        consensus::verify_with_flags(
-            &c.script_pubkey,
-            c.amount,
-            &c.tx_bytes,
-            None,
-            c.input_index,
-            c.flags,
-        )
-    } else {
-        let utxos: Vec<consensus::Utxo> = c
-            .prev_outputs
-            .iter()
-            .map(|(spk, val)| consensus::Utxo {
-                script_pubkey: spk.as_ptr(),
-                script_pubkey_len: spk.len() as u32,
-                value: *val as i64,
-            })
-            .collect();
-        consensus::verify_with_flags(
-            &c.script_pubkey,
-            c.amount,
-            &c.tx_bytes,
-            Some(&utxos),
-            c.input_index,
-            c.flags,
-        )
+    let Ok(tx) = bitcoin::consensus::deserialize::<Transaction>(&c.tx_bytes) else {
+        return false;
     };
-    result.is_ok()
+    let spent: Vec<TxOut> = c
+        .prev_outputs
+        .iter()
+        .map(|(spk, val)| TxOut { value: Amount::from_sat(*val), script_pubkey: ScriptBuf::from_bytes(spk.clone()) })
+        .collect();
+    let Ok(precomputed) = consensus::PrecomputedTransactionData::new(&tx, &spent) else {
+        return false;
+    };
+    let spk = bitcoin::Script::from_bytes(&c.script_pubkey);
+    consensus::verify(spk, Amount::from_sat(c.amount), &tx, c.input_index, c.flags, &precomputed).is_ok()
 }
 
-/// Verify with the C++ bitcoinconsensus FFI.
+/// Verify with Bitcoin Core's interpreter (libbitcoinkernel).
 #[inline]
 pub fn verify_cpp(c: &WorkloadCase) -> bool {
     let result = if c.prev_outputs.is_empty() {

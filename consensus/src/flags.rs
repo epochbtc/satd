@@ -97,8 +97,8 @@ pub const ALL_FLAGS: u32 = (1u32 << (MAX_FLAGS_BIT + 1)) - 1;
 /// consensus).
 ///
 /// It is deliberately outside [`ALL_FLAGS`], so [`valid_flags`] refuses it and
-/// the libconsensus-shaped entry points (`verify`, `verify_with_flags`,
-/// `verify_transaction`) answer `ErrInvalidFlags` if it is ever passed. Block
+/// the crate's entry points (`verify`, `verify_transaction`) answer
+/// `ErrInvalidFlags` if it is ever passed. Block
 /// and mempool validation go through those, so they cannot set it. Only a
 /// caller of [`crate::verify::verify_script`] can. Core's script-test flag
 /// sets are built from `ALL_FLAGS` and never include it either.

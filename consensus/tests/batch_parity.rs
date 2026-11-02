@@ -1,8 +1,9 @@
 //! Batch-vs-per-input parity tests for `consensus::verify_transaction`.
 //!
-//! Regression pin for the batch API added in PR #55: a tx that all existing
-//! per-input verify paths accept (via `verify_with_flags` called in a loop)
-//! MUST produce the same result through `verify_transaction`. And a tx with
+//! Regression pin for the batch API added in PR #55: a tx whose inputs each
+//! verify on their own (`verify` with precomputed data of their own) MUST
+//! produce the same result through `verify_transaction`, which shares one
+//! `PrecomputedTransactionData` across the inputs. And a tx with
 //! a single bad input MUST be rejected with the correct failing index.
 //!
 //! We reuse the tx_valid.json Bitcoin Core test vectors so the fixtures
@@ -59,39 +60,16 @@ fn fill_flags(mut f: u32) -> u32 {
     f
 }
 
-/// Call the per-input API across every input, aggregating pass/fail.
-fn per_input_all_ok(tx_bytes: &[u8], _tx: &Transaction, prev_outputs: &[TxOut], flag_set: u32) -> bool {
+/// Verify every input, each against precomputed data of its own, so no
+/// signature hash state is shared between inputs. Spent outputs are passed
+/// only when taproot needs them.
+fn per_input_all_ok(tx: &Transaction, prev_outputs: &[TxOut], flag_set: u32) -> bool {
     let has_taproot = flag_set & consensus::flags::VERIFY_TAPROOT != 0;
-    let utxos: Option<Vec<consensus::Utxo>> = if has_taproot {
-        Some(
-            prev_outputs
-                .iter()
-                .map(|o| consensus::Utxo {
-                    script_pubkey: o.script_pubkey.as_bytes().as_ptr(),
-                    script_pubkey_len: o.script_pubkey.as_bytes().len() as u32,
-                    value: o.value.to_sat() as i64,
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
-    for (i, prev) in prev_outputs.iter().enumerate() {
-        let script_pubkey = prev.script_pubkey.as_bytes();
-        let amount = prev.value.to_sat();
-        let result = consensus::verify_with_flags(
-            script_pubkey,
-            amount,
-            tx_bytes,
-            utxos.as_deref(),
-            i,
-            flag_set,
-        );
-        if result.is_err() {
-            return false;
-        }
-    }
-    true
+    let spent: &[TxOut] = if has_taproot { prev_outputs } else { &[] };
+    prev_outputs.iter().enumerate().all(|(i, prev)| {
+        let precomputed = consensus::PrecomputedTransactionData::new(tx, spent).unwrap();
+        consensus::verify(&prev.script_pubkey, prev.value, tx, i, flag_set, &precomputed).is_ok()
+    })
 }
 
 #[test]
@@ -173,9 +151,8 @@ fn batch_and_per_input_agree_on_tx_valid_vectors() {
             continue;
         }
 
-        // Ground truth: per-input verify_with_flags across every input.
-        let per_input_ok =
-            per_input_all_ok(&tx_bytes, &tx, &prev_outputs, flag_set);
+        // Ground truth: every input verified on its own.
+        let per_input_ok = per_input_all_ok(&tx, &prev_outputs, flag_set);
 
         // Batch path: single call over the whole tx.
         let batch_result = consensus::verify_transaction(&tx, &prev_outputs, flag_set);

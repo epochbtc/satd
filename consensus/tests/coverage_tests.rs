@@ -1,7 +1,7 @@
 //! Comprehensive coverage tests for previously-untested code paths.
 //!
 //! Tests are grouped by the gap they close:
-//! 1. Public API (verify / verify_with_flags)
+//! 1. Public API (PrecomputedTransactionData / verify)
 //! 2. P2SH-wrapped witness (P2SH-P2WPKH, P2SH-P2WSH)
 //! 3. Annex handling
 //! 4. Tapscript validation weight budget
@@ -24,7 +24,7 @@ use consensus::error::ScriptError;
 use consensus::flags;
 use consensus::sighash::TxSignatureChecker;
 use consensus::verify::verify_script;
-use consensus::{Error, Utxo};
+use consensus::{Error, PrecomputedTransactionData};
 use sha2::Digest;
 
 const TEST_SECKEY: &str = "6b973d88838f27366ed61c9ad6367663045cb456e28335c109e30717ae0c6baa";
@@ -95,12 +95,6 @@ fn hash160(data: &[u8]) -> [u8; 20] {
 
 fn sha256_hash(data: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(data).into()
-}
-
-fn serialize_tx(tx: &Transaction) -> Vec<u8> {
-    let mut buf = Vec::new();
-    tx.consensus_encode(&mut buf).unwrap();
-    buf
 }
 
 // ===== Taproot helpers =====
@@ -222,106 +216,94 @@ fn verify_taproot_spend(
 }
 
 // =========================================================================
-// 1. PUBLIC API: verify() / verify_with_flags()
+// 1. PUBLIC API: PrecomputedTransactionData / verify()
 // =========================================================================
 
+/// Verify input `index` of `tx` against `spent`, with precomputed data built
+/// from `spent` for `tx`.
+fn api_verify(tx: &Transaction, spent: &[TxOut], index: usize, flags: u32) -> Result<(), Error> {
+    let precomputed = PrecomputedTransactionData::new(tx, spent)?;
+    let out = &spent[0];
+    consensus::verify(&out.script_pubkey, out.value, tx, index, flags, &precomputed)
+}
+
 #[test]
-fn test_api_verify_with_flags_valid() {
-    // Build a trivial P2PKH-like: scriptPubKey = OP_1, scriptSig = empty
-    let spk = vec![0x51u8]; // OP_1
-    let c = credit_tx(&spk, 50_000);
+fn test_api_verify_valid() {
+    // scriptPubKey = OP_1, scriptSig = empty
+    let c = credit_tx(&[0x51], 50_000);
     let tx = spend_tx(&c, &[], &[]);
-    let tx_bytes = serialize_tx(&tx);
-
-    let result = consensus::verify_with_flags(&spk, 50_000, &tx_bytes, None, 0, 0);
-    assert!(result.is_ok());
+    assert_eq!(api_verify(&tx, &c.output, 0, 0), Ok(()));
 }
 
 #[test]
-fn test_api_verify_with_flags_invalid_flags() {
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 0);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
+fn test_api_verify_invalid_flags() {
+    let c = credit_tx(&[0x51], 0);
+    let tx = spend_tx(&c, &[], &[]);
     // Set an unrecognized flag bit
-    let result = consensus::verify_with_flags(&spk, 0, &tx_bytes, None, 0, 1 << 30);
-    assert_eq!(result, Err(Error::ErrInvalidFlags));
+    assert_eq!(api_verify(&tx, &c.output, 0, 1 << 30), Err(Error::ErrInvalidFlags));
 }
 
 #[test]
-fn test_api_verify_with_flags_bad_tx() {
-    let result = consensus::verify_with_flags(&[0x51], 0, &[0xff; 10], None, 0, 0);
-    assert_eq!(result, Err(Error::ErrTxDeserialize));
-}
-
-#[test]
-fn test_api_verify_with_flags_bad_index() {
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 0);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
+fn test_api_verify_bad_index() {
+    let c = credit_tx(&[0x51], 0);
+    let tx = spend_tx(&c, &[], &[]);
     // Input index 5 is out of range (only 1 input)
-    let result = consensus::verify_with_flags(&spk, 0, &tx_bytes, None, 5, 0);
-    assert_eq!(result, Err(Error::ErrTxIndex));
+    assert_eq!(api_verify(&tx, &c.output, 5, 0), Err(Error::ErrTxIndex));
 }
 
 #[test]
-fn test_api_verify_with_flags_taproot_needs_spent_outputs() {
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 0);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
-    let result = consensus::verify_with_flags(&spk, 0, &tx_bytes, None, 0, flags::VERIFY_TAPROOT);
-    assert_eq!(result, Err(Error::ErrSpentOutputsRequired));
+fn test_api_verify_taproot_needs_spent_outputs() {
+    let c = credit_tx(&[0x51], 0);
+    let tx = spend_tx(&c, &[], &[]);
+    let precomputed = PrecomputedTransactionData::new(&tx, &[]).unwrap();
+    let out = &c.output[0];
+    let verify = |flags| consensus::verify(&out.script_pubkey, out.value, &tx, 0, flags, &precomputed);
+    assert_eq!(verify(flags::VERIFY_TAPROOT), Err(Error::ErrSpentOutputsRequired));
+    // Without taproot, no spent outputs are needed: the amount is passed.
+    assert_eq!(verify(0), Ok(()));
 }
 
 #[test]
-fn test_api_verify_with_flags_spent_outputs_mismatch() {
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 0);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
-    // Provide 2 UTXOs for a 1-input tx
-    let utxos = vec![
-        Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: 0 },
-        Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: 0 },
-    ];
-    let result = consensus::verify_with_flags(
-        &spk, 0, &tx_bytes, Some(&utxos), 0,
-        flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
-    );
-    assert_eq!(result, Err(Error::ErrSpentOutputsMismatch));
+fn test_api_verify_spent_outputs_mismatch() {
+    let c = credit_tx(&[0x51], 0);
+    let tx = spend_tx(&c, &[], &[]);
+    // 2 spent outputs for a 1-input tx
+    let two = vec![c.output[0].clone(), c.output[0].clone()];
+    assert!(matches!(
+        PrecomputedTransactionData::new(&tx, &two),
+        Err(Error::ErrSpentOutputsMismatch)
+    ));
 }
 
 #[test]
 fn test_api_verify_with_spent_outputs() {
     // OP_1 script, verify with spent outputs (taproot flag enabled)
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 50_000);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
-    let utxos = vec![
-        Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: 50_000 },
-    ];
-    let result = consensus::verify_with_flags(
-        &spk, 50_000, &tx_bytes, Some(&utxos), 0,
-        flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
-    );
-    assert!(result.is_ok(), "verify with spent outputs failed: {:?}", result);
+    let c = credit_tx(&[0x51], 50_000);
+    let tx = spend_tx(&c, &[], &[]);
+    let result = api_verify(&tx, &c.output, 0, flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT);
+    assert_eq!(result, Ok(()));
 }
 
 #[test]
-fn test_api_verify_auto_flags() {
-    let spk = vec![0x51u8];
-    let c = credit_tx(&spk, 50_000);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
-    // verify() without spent_outputs → no taproot flag
-    let result = consensus::verify(&spk, 50_000, &tx_bytes, None, 0);
-    assert!(result.is_ok());
+fn test_api_verify_refuses_precomputed_data_of_another_tx() {
+    let c = credit_tx(&[0x51], 50_000);
+    let tx = spend_tx(&c, &[], &[]);
+    // An identical copy is still another transaction: the data is checked by
+    // identity, so a caller cannot verify one input against a different
+    // transaction's hashes.
+    let copy = tx.clone();
+    let precomputed = PrecomputedTransactionData::new(&copy, &c.output).unwrap();
+    let out = &c.output[0];
+    assert_eq!(consensus::verify(&out.script_pubkey, out.value, &tx, 0, 0, &precomputed), Err(Error::ErrTxMismatch));
+    assert_eq!(consensus::verify(&out.script_pubkey, out.value, &copy, 0, 0, &precomputed), Ok(()));
 }
 
 #[test]
 fn test_api_verify_script_failure() {
     // OP_0 → eval_false
-    let spk = vec![0x00u8];
-    let c = credit_tx(&spk, 0);
-    let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
-    let result = consensus::verify_with_flags(&spk, 0, &tx_bytes, None, 0, 0);
+    let c = credit_tx(&[0x00], 0);
+    let tx = spend_tx(&c, &[], &[]);
+    let result = api_verify(&tx, &c.output, 0, 0);
     // The specific script error, not a coarse "it failed": Core names it in
     // the rejection reason and every test that reads one reads that name.
     assert_eq!(
