@@ -19,6 +19,11 @@ peer does:
   - answers: ping -> pong, getheaders -> empty headers. Nothing else is
     answered; getaddr in particular gets no reply.
 
+Whether the node under test was in initial block download is recorded
+(--peer-ibd, --peer-height), since some clients announce less while
+syncing and most real peers are synced. Capture a node out of IBD where it
+can mine a block; where it cannot, the fixture says so.
+
 After the handshake it waits --wait seconds (default 10) and records every
 message. Unless --no-probes is given it then runs the benign probes from
 the peer behavior plan, one at a time, each with a --probe-wait window:
@@ -373,7 +378,7 @@ def capture(args):
         "implementation_version": args.implementation_version,
         "network": args.network,
         "connection": connection,
-        "peer_state": args.peer_state,
+        "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
         "recorder": {"protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
                      "user_agent": USER_AGENT, "passive_wait_s": args.wait,
                      "probe_wait_s": args.probe_wait if args.probes else None},
@@ -397,7 +402,10 @@ def main():
     ap.add_argument("--label", required=True, help="fixture label, e.g. core-31.2")
     ap.add_argument("--implementation", required=True, help="family, e.g. core, btcd")
     ap.add_argument("--implementation-version", required=True)
-    ap.add_argument("--peer-state", default="", help="free text: the node's tip when captured, e.g. 'regtest height 1, out of IBD'")
+    ap.add_argument("--peer-ibd", required=True, choices=["yes", "no", "unknown"],
+                    help="whether the node under test was in initial block download (its own RPC says)")
+    ap.add_argument("--peer-height", type=int, required=True, help="the node's block height when captured")
+    ap.add_argument("--peer-note", default="", help="free text, e.g. how the node left IBD")
     ap.add_argument("--wait", type=float, default=10.0, help="passive seconds after the handshake (default 10)")
     ap.add_argument("--no-probes", dest="probes", action="store_false")
     ap.add_argument("--probe-wait", type=float, default=5.0, help="seconds to wait for each probe's answer (default 5)")
