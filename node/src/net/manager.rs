@@ -8010,7 +8010,13 @@ impl PeerManager {
                 height
             });
         let size = block.total_size();
-        let job = crate::net::ibd_store::IbdStoreJob { peer: id, block, arrived_at, in_flight, size };
+        let job = crate::net::ibd_store::IbdStoreJob {
+            peer: id,
+            block: Box::new(block),
+            arrived_at,
+            in_flight,
+            size,
+        };
         if let Err(job) = self.ibd_store_queue.try_push(job) {
             // The queue is at its bound: the store cannot keep up, and
             // storing here holds the P2P task as it always did.
@@ -16612,7 +16618,7 @@ mod tests {
             !pm.join_connectors(Duration::from_millis(200)),
             "without a shutdown signal the connectors keep running"
         );
-        assert_eq!(pm.connector_threads.lock().len(), 2, "both threads must be kept");
+        assert_eq!(pm.connector_threads.lock().len(), 3, "all three threads must be kept");
 
         shutdown_tx.send_replace(true);
         assert!(pm.join_connectors(Duration::from_secs(10)));

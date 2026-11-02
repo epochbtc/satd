@@ -32,7 +32,8 @@ pub const IBD_STORE_QUEUE_MAX_BYTES: usize = 128 * 1024 * 1024;
 /// One block waiting to be stored.
 pub struct IbdStoreJob {
     pub peer: PeerId,
-    pub block: bitcoin::Block,
+    /// Boxed: the job travels by value through `try_push`'s error.
+    pub block: Box<bitcoin::Block>,
     /// The height the scheduler credited the block's arrival at, if it did:
     /// the store's outcome settles that height.
     pub arrived_at: Option<u32>,
@@ -139,7 +140,7 @@ mod tests {
     fn job(size: usize) -> IbdStoreJob {
         IbdStoreJob {
             peer: 1,
-            block: bitcoin::constants::genesis_block(bitcoin::Network::Regtest),
+            block: Box::new(bitcoin::constants::genesis_block(bitcoin::Network::Regtest)),
             arrived_at: None,
             in_flight: InFlight::adopt(None),
             size,
