@@ -115,7 +115,16 @@ struct WsState {
     /// Script-prefix watch granularity bounds (§7.5).
     prefix_min_bits: u8,
     prefix_max_bits: u8,
+    /// The listener's shutdown signal, set by [`WsStreamServer::serve`]. An
+    /// upgraded `/ws` socket has left hyper's connection, so hyper's graceful
+    /// shutdown never reaches it: the socket's own loop watches this and
+    /// closes with `1001 Going Away`.
+    shutdown: Option<watch::Receiver<bool>>,
 }
+
+/// How long a `/ws` client gets to take the close frame at shutdown before
+/// the socket is dropped anyway.
+const WS_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The `--streamws` JSON/WS + SSE transport. Bind early (so a bind failure
 /// is reported at startup), then [`WsStreamServer::serve`] on the API
@@ -201,6 +210,7 @@ impl WsStreamServer {
                 },
                 prefix_min_bits: limits.prefix_min_bits,
                 prefix_max_bits: limits.prefix_max_bits,
+                shutdown: None,
             },
         })
     }
@@ -213,10 +223,17 @@ impl WsStreamServer {
     /// Serve until `shutdown` flips. Intended to be spawned on the API
     /// runtime.
     pub async fn serve(self, shutdown: watch::Receiver<bool>) {
+        let state = WsState {
+            shutdown: Some(shutdown.clone()),
+            ..self.state
+        };
+        // An `/sse` stream is ended at shutdown by the shared loop (it
+        // recognises an event stream by its content type); a `/ws` socket by
+        // its own loop, from `state.shutdown`.
         let app = Router::new()
             .route("/ws", get(ws_upgrade))
             .route("/sse", get(sse_firehose))
-            .with_state(self.state);
+            .with_state(state);
         info!(target: "events::ws", addr = %self.addr, "streamws server starting");
         // The shared capped loop: a permit per socket, taken at accept, and
         // an idle budget on keep-alive connections. `axum::serve` bounded
@@ -230,6 +247,9 @@ impl WsStreamServer {
             node::http_serve::ListenerLimits {
                 sockets: node::http_serve::SocketCap::new(self.max_sockets),
                 idle_timeout: Some(STREAMWS_IDLE_TIMEOUT),
+                // A `/ws` or `/sse` client that stops reading is cut off
+                // rather than holding its socket behind a full send buffer.
+                write_timeout: Some(node::http_serve::WRITE_STALL_TIMEOUT),
             },
             shutdown,
         )
@@ -668,12 +688,24 @@ async fn ws_conn(
     // idle-connection reaping.
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shutdown = state.shutdown.clone();
     loop {
         // The client vanished mid-replay — skip the live loop, fall to cleanup.
         if replay_aborted {
             break;
         }
         tokio::select! {
+            () = stopping(&mut shutdown) => {
+                // A clean close at shutdown: the client learns the server is
+                // going away rather than seeing the socket drop.
+                let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: axum::extract::ws::close_code::AWAY,
+                    reason: "server shutting down".into(),
+                }));
+                let _ = tokio::time::timeout(WS_CLOSE_GRACE, sender.send(close)).await;
+                debug!(target: "events::ws", "streamws connection closed for shutdown");
+                break;
+            }
             _ = ping.tick() => {
                 let idle = now_unix().saturating_sub(last_activity.load(Ordering::Relaxed));
                 if idle > WS_IDLE_TIMEOUT_SECS {
@@ -776,6 +808,17 @@ async fn ws_conn(
     // `handle` + `watch_set` drop here → deregister the watch-set and release
     // the quota together; `_permit` drops too, freeing the connection slot.
     debug!(target: "events::ws", "streamws connection closed");
+}
+
+/// Resolve once `shutdown` reads `true` or its sender is gone; never without
+/// a signal.
+async fn stopping(shutdown: &mut Option<watch::Receiver<bool>>) {
+    match shutdown {
+        Some(rx) => {
+            let _ = rx.wait_for(|stopping| *stopping).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// JSON control messages a `/ws` client sends to manage its watch-set —
@@ -1738,6 +1781,97 @@ fn mark_raw_tx_stripped(v: &mut serde_json::Value, stripped: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bind a streamws server on a free loopback port and serve it until the
+    /// returned sender flips.
+    async fn serve_ws() -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let publisher = EventPublisher::new(node::events::EdgeIdentity::new([0xab; 16], None).unwrap(), 64);
+        let server = WsStreamServer::bind(
+            "127.0.0.1:0",
+            false,
+            publisher,
+            Arc::new(WatchRegistry::new()),
+            None,
+            None,
+            WsLimits {
+                max_conns: 0,
+                max_sockets: 0,
+                max_subscriptions: 0,
+                max_message_bytes: 0,
+                prefix_min_bits: 8,
+                prefix_max_bits: 32,
+            },
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let task = tokio::spawn(server.serve(sd_rx));
+        (addr, sd_tx, task)
+    }
+
+    /// Read server frames (unmasked, so a fixed header) until one with
+    /// `opcode` arrives; `None` on EOF or after five seconds.
+    async fn read_until_opcode(c: &mut tokio::net::TcpStream, opcode: u8) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let read = async {
+            loop {
+                let mut head = [0u8; 2];
+                c.read_exact(&mut head).await.ok()?;
+                let len = match head[1] & 0x7f {
+                    126 => {
+                        let mut ext = [0u8; 2];
+                        c.read_exact(&mut ext).await.ok()?;
+                        u16::from_be_bytes(ext) as usize
+                    }
+                    127 => {
+                        let mut ext = [0u8; 8];
+                        c.read_exact(&mut ext).await.ok()?;
+                        u64::from_be_bytes(ext) as usize
+                    }
+                    n => n as usize,
+                };
+                let mut payload = vec![0u8; len];
+                c.read_exact(&mut payload).await.ok()?;
+                if head[0] & 0x0f == opcode {
+                    return Some(payload);
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), read).await.ok().flatten()
+    }
+
+    /// An upgraded `/ws` socket is closed at shutdown with `1001 Going
+    /// Away`. It has left hyper's connection, so the listener's graceful
+    /// shutdown never reached it, and it stayed open until the process
+    /// exited.
+    #[tokio::test]
+    async fn shutdown_closes_an_upgraded_ws_socket_with_going_away() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, sd_tx, task) = serve_ws().await;
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        // The 101 head, byte by byte so no frame byte is consumed with it.
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            c.read_exact(&mut b).await.unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        // The first keep-alive ping: the socket's loop is running.
+        assert!(read_until_opcode(&mut c, 0x9).await.is_some(), "a ping first");
+
+        let _ = sd_tx.send(true);
+        let close = read_until_opcode(&mut c, 0x8).await.expect("a close frame at shutdown");
+        assert_eq!(close.get(..2), Some(&1001u16.to_be_bytes()[..]), "{close:?}");
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
 
     #[test]
     fn mask_defaults_to_all() {

@@ -4960,18 +4960,23 @@ async fn spawn_tls_surface(
                 // Next, and only on a bearer surface: the per-call rate
                 // charge for a batch, which has to see the batch whole.
                 .option_layer(batch_rate)
-                // Object `params` becomes positional `params` before
-                // anything downstream inspects them, so the filters and
-                // every handler see one shape. Answers a batch by splitting
-                // it into single calls on the layers beneath.
-                .layer(NamedParamsLayer::new())
-                // Inside the rewrite but outside the filters: a request that
-                // is about to be *rejected* is not executing, so it has no
-                // business appearing in `getrpcinfo`; one that is dispatched
-                // is tracked for exactly as long as its handler runs.
-                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new())
+                // The method filters come before anything reads the
+                // parameters, as Core's `-rpcwhitelist` check does: a caller
+                // that may not use a method is told so, not that it named a
+                // parameter wrongly. They read only the method name, and
+                // each gates a batch entry by entry.
                 .option_layer(rpc_filter)
-                .option_layer(capability_filter),
+                .option_layer(capability_filter)
+                // Object `params` becomes positional `params` before any
+                // handler sees them, so every handler reads one shape.
+                // Answers a batch by splitting it into single calls on the
+                // layers beneath.
+                .layer(NamedParamsLayer::new())
+                // Inside the filters and the rewrite: a request that is
+                // *rejected* is not executing, so it has no business
+                // appearing in `getrpcinfo`; one that is dispatched is
+                // tracked for exactly as long as its handler runs.
+                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new()),
         )
         .to_service_builder()
         .build(methods, stop_handle.clone());
@@ -5007,6 +5012,13 @@ async fn spawn_tls_surface(
     // silence the others' reports.
     let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
     let denied = WarnBudget::new(5, Duration::from_secs(60));
+    let accept_errors = WarnBudget::new(5, Duration::from_secs(60));
+    let handshake_timeouts = Arc::new(WarnBudget::new(5, Duration::from_secs(60)));
+    // A write that makes no progress for `-rpcservertimeout` closes the
+    // connection, as libevent's write timeout does in Core; with the option
+    // at 0 a stalled write still gets a fixed budget, so a client that stops
+    // reading cannot keep its slot.
+    let write_timeout = header_read_timeout.unwrap_or(crate::http_serve::WRITE_STALL_TIMEOUT);
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -5014,7 +5026,9 @@ async fn spawn_tls_surface(
                 res = tcp.accept() => match res {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(error = %e, "RPC TLS accept error");
+                        if let Some(suppressed) = accept_errors.tick() {
+                            tracing::warn!(error = %e, suppressed, "RPC TLS accept error");
+                        }
                         // Match esplora/electrum: brief sleep on
                         // transient accept errors so an EMFILE storm
                         // doesn't busy-loop.
@@ -5068,8 +5082,12 @@ async fn spawn_tls_surface(
             // handshake, the HTTP connection, and a WebSocket upgrade that
             // outlives both (see `http_serve::Permitted`). An early `return`
             // below drops the socket and so releases it.
-            let stream = crate::http_serve::Permitted::new(stream, permit);
+            let stream = crate::http_serve::Permitted::new(
+                crate::http_serve::WriteDeadline::new(stream, Some(write_timeout)),
+                permit,
+            );
             let acceptor = acceptor.clone();
+            let handshake_timeouts = handshake_timeouts.clone();
             let rpc_svc = rpc_svc.clone();
             let conn_stop = accept_stop.clone();
             let allow = allow.clone();
@@ -5087,11 +5105,16 @@ async fn spawn_tls_surface(
                             return;
                         }
                         Err(_) => {
-                            tracing::warn!(
-                                peer = %peer,
-                                timeout_secs = handshake_timeout.as_secs(),
-                                "RPC TLS handshake timed out — closing connection",
-                            );
+                            // Budgeted: a client can drive this line at the
+                            // cap ÷ handshake budget, one per silent socket.
+                            if let Some(suppressed) = handshake_timeouts.tick() {
+                                tracing::warn!(
+                                    peer = %peer,
+                                    timeout_secs = handshake_timeout.as_secs(),
+                                    suppressed,
+                                    "RPC TLS handshake timed out — closing connection",
+                                );
+                            }
                             return;
                         }
                     };
@@ -5334,16 +5357,15 @@ pub async fn spawn_plain_surface(
                 // Next, and only on a bearer surface: the per-call rate
                 // charge for a batch, which has to see the batch whole.
                 .option_layer(batch_rate)
-                // Object `params` becomes positional `params` before
-                // anything downstream inspects them, so the filters and
-                // every handler see one shape. Answers a batch by splitting
-                // it into single calls on the layers beneath.
-                .layer(NamedParamsLayer::new())
-                // See the TLS builder above for the placement.
-                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new())
+                // See the TLS builder above for the placement of the
+                // filters, the parameter rewrite and the tracker. The warmup
+                // answer comes first, as Core's `-28` does, ahead of the
+                // whitelist and the named-parameter transform.
                 .option_layer(warmup)
                 .option_layer(rpc_filter)
-                .option_layer(capability_filter),
+                .option_layer(capability_filter)
+                .layer(NamedParamsLayer::new())
+                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new()),
         )
         .to_service_builder()
         .build(methods, stop_handle.clone());
@@ -5375,6 +5397,9 @@ pub async fn spawn_plain_surface(
     // silence the others' reports.
     let at_capacity = WarnBudget::new(5, Duration::from_secs(60));
     let denied = WarnBudget::new(5, Duration::from_secs(60));
+    let accept_errors = WarnBudget::new(5, Duration::from_secs(60));
+    // See the TLS surface: `-rpcservertimeout` bounds a stalled write too.
+    let write_timeout = header_read_timeout.unwrap_or(crate::http_serve::WRITE_STALL_TIMEOUT);
     let accept_stop = stop_handle.clone();
     tokio::spawn(async move {
         loop {
@@ -5382,7 +5407,9 @@ pub async fn spawn_plain_surface(
                 res = tcp.accept() => match res {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(error = %e, "RPC accept error");
+                        if let Some(suppressed) = accept_errors.tick() {
+                            tracing::warn!(error = %e, suppressed, "RPC accept error");
+                        }
                         // Brief backoff so an EMFILE storm can't busy-loop.
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -5478,7 +5505,10 @@ pub async fn spawn_plain_surface(
             // closes, including after a WebSocket upgrade, when this serve
             // future has already completed.
             tokio::spawn(serve_http_connection(
-                crate::http_serve::Permitted::new(stream, permit),
+                crate::http_serve::Permitted::new(
+                    crate::http_serve::WriteDeadline::new(stream, Some(write_timeout)),
+                    permit,
+                ),
                 svc,
                 conn_stop.shutdown(),
                 header_read_timeout,

@@ -302,6 +302,75 @@ pub struct StratumServer {
     peers: Option<Arc<PeerManager>>,
     #[cfg(feature = "stratum-v2")]
     v2: Option<V2Listener>,
+    warnings: AcceptWarnings,
+}
+
+/// Which of the server's listeners a connection arrived on.
+#[derive(Clone, Copy, Debug)]
+enum Arm {
+    V1,
+    V1Tls,
+    V2,
+}
+
+impl Arm {
+    fn label(self) -> &'static str {
+        match self {
+            Arm::V1 => "v1",
+            Arm::V1Tls => "v1-tls",
+            Arm::V2 => "v2",
+        }
+    }
+}
+
+/// The accept loop's warning budgets, one set per listener. The three
+/// listeners share one connection semaphore, but a flood on one must not
+/// silence the others' reports: a `static` in the reporting function was a
+/// single budget for all three.
+struct AcceptWarnings {
+    at_capacity: [crate::warn_budget::WarnBudget; 3],
+    accept_errors: [crate::warn_budget::WarnBudget; 3],
+}
+
+impl AcceptWarnings {
+    fn new() -> Self {
+        let budget = || crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
+        Self {
+            at_capacity: [budget(), budget(), budget()],
+            accept_errors: [budget(), budget(), budget()],
+        }
+    }
+
+    /// Report a connection refused at `--stratummaxconns`, under `arm`'s
+    /// budget. Returns whether a line was logged.
+    fn at_capacity(&self, arm: Arm, peer: SocketAddr, max: usize) -> bool {
+        let Some(suppressed) = self.at_capacity[arm as usize].tick() else {
+            return false;
+        };
+        tracing::warn!(
+            target: "node::stratum",
+            %peer,
+            suppressed,
+            max,
+            listener = arm.label(),
+            "Stratum connection refused: at --stratummaxconns"
+        );
+        true
+    }
+
+    /// Report a failed `accept` under `arm`'s budget. During fd exhaustion
+    /// every accept fails, so unbudgeted this is a line per retry.
+    fn accept_error(&self, arm: Arm, e: &io::Error) {
+        if let Some(suppressed) = self.accept_errors[arm as usize].tick() {
+            tracing::warn!(
+                target: "node::stratum",
+                error = %e,
+                suppressed,
+                listener = arm.label(),
+                "Stratum accept error"
+            );
+        }
+    }
 }
 
 impl StratumServer {
@@ -389,6 +458,7 @@ impl StratumServer {
             peers,
             #[cfg(feature = "stratum-v2")]
             v2,
+            warnings: AcceptWarnings::new(),
         })
     }
 
@@ -431,9 +501,9 @@ impl StratumServer {
                 biased;
                 _ = shutdown.changed() => return,
                 accept = self.listener.accept() => {
-                    let Some((stream, peer)) = self.admit(accept) else { continue };
+                    let Some((stream, peer)) = self.admit(Arm::V1, accept).await else { continue };
                     let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
-                        self.at_capacity(peer);
+                        self.at_capacity(Arm::V1, peer);
                         continue;
                     };
                     let shared = self.shared.clone();
@@ -444,17 +514,17 @@ impl StratumServer {
                     });
                 }
                 accept = self.accept_v2() => {
-                    let Some((stream, peer)) = self.admit(accept) else { continue };
+                    let Some((stream, peer)) = self.admit(Arm::V2, accept).await else { continue };
                     let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
-                        self.at_capacity(peer);
+                        self.at_capacity(Arm::V2, peer);
                         continue;
                     };
                     self.spawn_v2(stream, peer, permit, shutdown.clone());
                 }
                 accept = accept_tls(self.tls.as_ref()) => {
-                    let Some((stream, peer)) = self.admit(accept) else { continue };
+                    let Some((stream, peer)) = self.admit(Arm::V1Tls, accept).await else { continue };
                     let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
-                        self.at_capacity(peer);
+                        self.at_capacity(Arm::V1Tls, peer);
                         continue;
                     };
                     let acceptor = self.tls.as_ref().expect("arm is gated on tls").1.clone();
@@ -509,31 +579,28 @@ impl StratumServer {
     ) {
     }
 
-    fn admit(&self, accept: io::Result<(TcpStream, SocketAddr)>) -> Option<(TcpStream, SocketAddr)> {
+    async fn admit(
+        &self,
+        arm: Arm,
+        accept: io::Result<(TcpStream, SocketAddr)>,
+    ) -> Option<(TcpStream, SocketAddr)> {
         match accept {
             Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 Some((stream, peer))
             }
             Err(e) => {
-                tracing::warn!(target: "node::stratum", error = %e, "Stratum accept error");
+                self.warnings.accept_error(arm, &e);
+                // Brief backoff on a transient error (EMFILE, ECONNABORTED),
+                // as the other accept loops have, so the loop does not spin.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 None
             }
         }
     }
 
-    fn at_capacity(&self, peer: SocketAddr) {
-        static AT_CAPACITY: crate::warn_budget::WarnBudget =
-            crate::warn_budget::WarnBudget::new(5, std::time::Duration::from_secs(60));
-        if let Some(suppressed) = AT_CAPACITY.tick() {
-            tracing::warn!(
-                target: "node::stratum",
-                %peer,
-                suppressed,
-                max = self.shared.config.max_conns,
-                "Stratum connection refused: at --stratummaxconns"
-            );
-        }
+    fn at_capacity(&self, arm: Arm, peer: SocketAddr) {
+        self.warnings.at_capacity(arm, peer, self.shared.config.max_conns);
     }
 }
 
@@ -944,6 +1011,19 @@ pub fn submit_block(chain: &ChainState, mempool: &Mempool, block: &Block) -> Res
 mod tests {
     use super::*;
     use crate::mining::validity::tests::{admit, funded, spend};
+
+    /// Each listener reports its own at-capacity refusals: a flood on the V1
+    /// port that has used up its budget leaves V1-TLS and V2 their first
+    /// lines, rather than one shared budget silencing all three.
+    #[test]
+    fn each_listener_has_its_own_at_capacity_budget() {
+        let w = AcceptWarnings::new();
+        let peer: SocketAddr = "192.0.2.1:3333".parse().unwrap();
+        let logged = (0..10).filter(|_| w.at_capacity(Arm::V1, peer, 1)).count();
+        assert_eq!(logged, 5, "the V1 flood is budgeted");
+        assert!(w.at_capacity(Arm::V2, peer, 1), "V2 is not silenced by a V1 flood");
+        assert!(w.at_capacity(Arm::V1Tls, peer, 1), "V1-TLS is not silenced by a V1 flood");
+    }
     use crate::mining::validity::{Check, FullChecker};
     use crate::validation::script::RustVerifier;
 
