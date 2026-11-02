@@ -117,7 +117,7 @@ Unknown `oneof` arms and fields MUST be ignored by older readers (forward-compat
 for rolling upgrades), exactly as the existing `categories` bitfield already
 tolerates unknown bits.
 
-Every `Subscribe` and `Watch` response carries two gRPC **response headers**,
+Every `Subscribe` and `Watch` response carries these gRPC **response headers**,
 sent as soon as the stream is set up (before any event, so a quiet `Watch`
 still delivers them):
 
@@ -125,6 +125,31 @@ still delivers them):
 |---|---|
 | `satd-version` | The node's version string, e.g. `0.6.0` or `0.6.0-pre`. |
 | `satd-events-schema` | `schema_version` as a decimal string (`1`). |
+| `satd-head-cursor` | The stream's **head cursor**: `<height>:<tx_index>:<mempool_seq>:<instance_id>`, four unsigned decimals (`u32`, `u32`, `u64`, `u64`), e.g. `841234:0:5521:10668472255784430265`. Since 0.7.1, and only on a node with a block source. |
+
+The head cursor is the position the stream starts from. It is the cursor a
+`BlockConnected` at the current tip would carry (§6): the tip height,
+`tx_index` 0, the publisher's envelope sequence as the mempool watermark, and
+the node's `instance_id`. Every event after it is delivered on the stream, and
+presenting it as `SetCursor` (on `Watch`) or `from_cursor` (on `Subscribe`)
+replays what a dropped stream would have delivered next: blocks above `height`
+and the retained mempool transitions after `mempool_seq`. The node reads it
+*after* the stream has subscribed to the live event bus, so nothing above it can
+fall between the stream and the replay; a block that connects while the stream
+is being set up can be both delivered live and replayed once, which a client
+already tolerates as a cursor at or behind its high-water.
+
+It exists for the window before a client's first confirmed event. Confirmed
+bodies are the only events stamped with a cursor (§6), so a client that has
+received only heartbeats, mempool events or unconfirmed matches has no position
+to resume from of its own. The first-party resilient SDK types
+(`ResilientWatch`, `ResilientSubscription`, Rust and Go) adopt the head cursor as
+their resume anchor when they have none (no `from_cursor`, an empty cursor store,
+nothing confirmed yet) and re-anchor to it on the next reconnect; they never send
+it on the stream it came from. A client that ignores the header, and a node that
+predates it or has no block source (where a re-anchor cannot replay anyway),
+behave as before: no anchor until the first confirmed event. A header that does
+not parse must be ignored, never presented back.
 
 Nodes before 0.6.0 send neither header. The first-party SDKs compare the node's
 major/minor version against their own and warn when the node is one minor version
@@ -133,7 +158,10 @@ A schema mismatch is always refused. The full rule, including the obligation tha
 new request fields degrade to a superset when an older node ignores them, is in
 [`STABILITY_POLICY.md` → Streaming API & SDK compatibility](../../STABILITY_POLICY.md#streaming-api--sdk-compatibility).
 The WebSocket/SSE carrier does not send these headers; its JSON envelope carries
-`schema_version` on every event.
+`schema_version` on every event. No first-party resilient type runs over it, so
+it has no head cursor either; the additive equivalent would be the same
+`satd-head-cursor` value as an HTTP response header on the upgrade or the SSE
+response.
 
 ## 5. Event envelope
 

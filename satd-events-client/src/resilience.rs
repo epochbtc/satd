@@ -642,6 +642,15 @@ impl ResilientSubscription {
         let mut opts = self.base.clone();
         opts.from_cursor = self.resume;
         let stream = self.client.subscribe(opts).await?;
+        // Arm the truncation check (below) from the anchor this request asked
+        // for, before the head cursor can fill `resume`.
+        let requested = self.resume;
+        // No anchor of its own yet: adopt the position this stream started
+        // from, so the next reconnect resumes there instead of starting live
+        // and losing what was in flight (#777).
+        if self.resume.is_none() {
+            self.resume = stream.head_cursor().copied();
+        }
         self.stream = Some(stream);
         // Arm the truncation check for the first confirmed event of this resume
         // (only when we actually asked to replay).
@@ -652,7 +661,7 @@ impl ResilientSubscription {
         // only `BlockConnected` for the confirmed span. The check below therefore
         // matches `BlockConnected`; if a future carrier reordered replay this
         // would need to key on the first confirmed-cursor-bearing event instead.
-        self.expect_first_height = self.resume.map(|c| c.height.saturating_add(1));
+        self.expect_first_height = requested.map(|c| c.height.saturating_add(1));
         Ok(())
     }
 }

@@ -1264,3 +1264,78 @@ func TestRateLimitedAddIsReSent(t *testing.T) {
 		t.Error("a rate-limited script left the mirror")
 	}
 }
+
+// headNode is a same-version node that reports a head cursor on every stream.
+func headNode(head string) func() nodeHeaders {
+	return func() nodeHeaders {
+		h := sameVersionNode()
+		h.head = head
+		return h
+	}
+}
+
+// mempoolEnter is a cursor-less event, as every mempool event is.
+func mempoolEnter() *eventspb.NodeEvent {
+	return &eventspb.NodeEvent{Body: &eventspb.NodeEvent_Mempool{Mempool: &eventspb.MempoolEvent{
+		Body: &eventspb.MempoolEvent_Enter{Enter: &eventspb.MempoolEnter{}},
+	}}}
+}
+
+// TestReconnectBeforeAnyCursorReAnchorsToTheHead: a watch that has seen only
+// cursor-less events when the stream drops re-anchors to the head cursor the
+// node reported when the stream opened, instead of resuming live and losing
+// what was in flight (#777). A node that reports no head keeps the old
+// behaviour: no SetCursor.
+//
+// Perturbation: removing the HeadCursor seeding in connectOnce leaves the
+// reconnect with no SetCursor and the first half fails.
+func TestReconnectBeforeAnyCursorReAnchorsToTheHead(t *testing.T) {
+	for _, tc := range []struct {
+		head string
+		want *eventspb.Cursor
+	}{
+		{"7:0:3:99", &eventspb.Cursor{Height: 7, MempoolSeq: 3, InstanceId: 99}},
+		{"", nil},
+		{"7:0:nope:99", nil},
+	} {
+		srv := &scriptedWatch{legs: []func(*watchLeg, eventspb.NodeEventStream_WatchServer) error{
+			func(_ *watchLeg, s eventspb.NodeEventStream_WatchServer) error {
+				if err := s.Send(mempoolEnter()); err != nil {
+					return err
+				}
+				time.Sleep(100 * time.Millisecond)
+				return nil
+			},
+			parkLeg,
+		}}
+		client := startServerAs(t, srv, headNode(tc.head))
+		w := client.ResilientWatch(context.Background(), ResilientWatchConfig{
+			Backoff: Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Multiplier: 2},
+		})
+		if _, ok := nextWatch(t, w).(*MempoolEnter); !ok {
+			t.Fatalf("head %q: the first event is not the mempool admission", tc.head)
+		}
+		// The reconnect's leg; give its controls a moment to land.
+		deadline := time.Now().Add(5 * time.Second)
+		for srv.leg(1) == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		var got *eventspb.Cursor
+		for _, m := range srv.leg(1).controls() {
+			if sc, ok := m.Msg.(*eventspb.SubscribeControl_SetCursor); ok {
+				got = sc.SetCursor.GetCursor()
+			}
+		}
+		switch {
+		case tc.want == nil && got != nil:
+			t.Errorf("head %q: the reconnect re-anchored to %v with no usable head", tc.head, got)
+		case tc.want != nil && got == nil:
+			t.Errorf("head %q: the reconnect sent no SetCursor", tc.head)
+		case tc.want != nil && (got.GetHeight() != tc.want.Height ||
+			got.GetMempoolSeq() != tc.want.MempoolSeq || got.GetInstanceId() != tc.want.InstanceId):
+			t.Errorf("head %q: re-anchored to %v, want %v", tc.head, got, tc.want)
+		}
+		_ = w.Close()
+	}
+}
