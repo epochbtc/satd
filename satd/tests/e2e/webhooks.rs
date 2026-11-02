@@ -817,14 +817,29 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     write_alertfile(&dir, &receiver, "chain", "\"chain\"", true);
     crate::streaming::sighup_with_conf(&sn, "").await;
 
-    // The hook is live: the next block still arrives. Deliveries are serial and
-    // in order, so the old generation, still retrying heights 2..=5, cannot
-    // have delivered it: height 6 arriving means the new generation is running.
-    // That is the reload instant the check below is judged from.
-    crate::streaming::mine_n(&sn, 1).await;
-    receiver
-        .wait_for(60, |r| r.json()["body"]["height"] == 6)
-        .await;
+    // The hook is live: new blocks still arrive. Deliveries are serial and in
+    // order, so the old generation, still retrying heights 2..=5, cannot
+    // deliver a later block: the first one to arrive means the new generation
+    // is running. That is the reload instant the check below is judged from.
+    // A block mined before the reload subscribed the new generation reaches
+    // only the old one and is dropped with it, so keep mining until one lands.
+    let mut probes = 0;
+    loop {
+        crate::streaming::mine_n(&sn, 1).await;
+        probes += 1;
+        let arrived = async {
+            loop {
+                if receiver.all_attempts().await.iter().any(|r| r.json()["body"]["height"].as_u64() >= Some(6)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), arrived).await.is_ok() {
+            break;
+        }
+        assert!(probes < 12, "no block after the reload reached the hook");
+    }
     let reloaded = std::time::Instant::now();
 
     // Nothing from the missed span comes back. Judged by arrival time rather
