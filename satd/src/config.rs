@@ -900,7 +900,7 @@ pub struct Config {
     pub electrum_banner: Option<String>,
     /// Override for the server name reported by `server.version` and
     /// `server.features.server_version`. `None` reports
-    /// `satd-electrs-compatible/<version>`.
+    /// `satd-electrs-electrumx-compatible/<version>`.
     ///
     /// The reason the default carries `electrs`: Electrum has no capability
     /// field, so clients feature-detect on this string, and Cake Wallet probes
@@ -6037,7 +6037,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "TEXT",
-        help = "Server name reported by server.version (default satd-electrs-compatible/<version>)"
+        help = "Server name reported by server.version (default satd-electrs-electrumx-compatible/<version>)"
     )]
     pub electrumservername: Option<String>,
 
