@@ -538,8 +538,9 @@ During initial block download the server accepts connections and answers
 `subscribe`, `configure` and `authorize`, but sends no work: a block built on
 a tip days behind the network is worthless. It logs
 `stratum: not issuing work during initial block download` once and sends work
-as soon as the node catches up. Regtest is exempt, because a fresh regtest
-chain's genesis block is from 2011.
+as soon as the node catches up. Once the node has left initial block download
+it does not re-enter it, so work keeps flowing if the tip later goes stale.
+Regtest is exempt, because a fresh regtest chain's genesis block is from 2011.
 
 The server does not wait for peers. Outside regtest it logs a warning the
 first time it issues work with no peer connected, since a block found then
