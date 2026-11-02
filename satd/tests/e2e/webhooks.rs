@@ -840,22 +840,31 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
         }
         assert!(probes < 12, "no block after the reload reached the hook");
     }
-    let reloaded = std::time::Instant::now();
+    // Stamped from the probe's own arrival, not from when the loop noticed it.
+    let reloaded = receiver
+        .all_attempts()
+        .await
+        .iter()
+        .filter(|r| r.json()["body"]["height"].as_u64() >= Some(6))
+        .map(|r| r.at)
+        .min()
+        .expect("a probe arrived");
 
     // Nothing from the missed span comes back. Judged by arrival time rather
     // than by a count taken before the reload: a retry already in flight at
     // the reload can land just after it without any history having crossed the
     // reload (#794); two seconds of grace cover that. A generation that did
     // carry its queue would retry each height again after `retry_delay` of the
-    // attempts it had made, plus up to 25 % jitter, so the window is sized from
-    // the most attempts any missed height has had.
+    // attempts it had made, plus up to 25 % jitter. The window is sized one
+    // step past the most attempts any missed height has had, so it still holds
+    // the next retry when one more attempt lands inside the grace.
     let attempts = receiver.all_attempts().await;
     let most = (2..=5u64)
         .map(|h| attempts.iter().filter(|r| r.json()["body"]["height"] == h).count())
         .max()
         .unwrap_or(0) as u32;
-    let window = satd_alert::retry_delay(most.max(1)).mul_f64(1.25) + Duration::from_secs(3);
-    tokio::time::sleep(window).await;
+    let window = satd_alert::retry_delay(most + 1).mul_f64(1.25) + Duration::from_secs(3);
+    tokio::time::sleep(window.saturating_sub(reloaded.elapsed())).await;
     let late: Vec<_> = receiver
         .all_attempts()
         .await
