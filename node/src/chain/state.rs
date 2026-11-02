@@ -5404,9 +5404,10 @@ impl ChainState {
         // The above-tip test and the write are atomic w.r.t. block connection:
         // hold `accept_lock` so a concurrent `accept_block` (submitblock /
         // internal mine) can't advance the tip onto this height between the test
-        // and the commit. (This path runs on the single P2P block thread, which
-        // does not otherwise hold the lock, so the acquisition is uncontended on
-        // the normal IBD path and contends only with a racing RPC submit.)
+        // and the commit. During IBD this does contend: the IBD connector holds
+        // the lock for a whole connect, scripts included, so a store waits for
+        // the block being connected. That is why IBD stores run on a thread of
+        // their own and not on the P2P task (#875, `net::ibd_store`).
         {
             let _accept_guard = self.accept_lock.lock();
             // The duplicate check in `stage_block_store` ran without the lock,
@@ -5758,8 +5759,10 @@ impl ChainState {
         // committed blocks along with its own. Eight blocks of UTXOs were
         // destroyed and the node wedged.
         //
-        // Cost: uncontended in steady-state IBD and on the reindex path
-        // (single connector thread). It contends only against `submitblock` /
+        // Cost: on the reindex path, uncontended (single connector thread). In
+        // IBD the block store waits on it for every block that arrives during a
+        // connect; it runs on its own thread for that reason, off the P2P task
+        // (#875). It contends otherwise against `submitblock` /
         // internal mining, header-acceptance height commits, and
         // invalidate/reconsider — for the last of which the wait can be tens
         // of seconds on a large block index, matching what Core's `cs_main`
