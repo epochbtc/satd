@@ -28,7 +28,7 @@
 #
 # Optional env:
 #   SATD_MINISIGN_KEY    path to encrypted minisign secret key file
-#                        (default: ~/devel/epoch/.keys/satd-primary.key)
+#                        (default: ~/.minisign/minisign.key, minisign's own default)
 #   SATD_MINISIGN_PUBKEY base64 pubkey string for verification round-trip
 #                        (default: primary pubkey from SECURITY.md)
 #   SATD_SIGN_DIR        working directory for the tarball path
@@ -42,7 +42,9 @@
 #   both the release's fresh SHA256SUMS and the asset digest GitHub reports,
 #   and keeps every .minisig that still verifies. The script refuses a
 #   directory it does not own, a symlink, or one that group or others can
-#   write to. --images uses a temporary directory, as before.
+#   write to, and it uses (and later deletes) only a directory it created
+#   itself: an existing directory without its marker file is refused, never
+#   chmod'd or removed. --images uses a temporary directory, as before.
 
 set -euo pipefail
 
@@ -67,7 +69,7 @@ if [[ -z "$TAG" ]]; then
     exit 64
 fi
 
-KEY="${SATD_MINISIGN_KEY:-${HOME}/devel/epoch/.keys/satd-primary.key}"
+KEY="${SATD_MINISIGN_KEY:-${HOME}/.minisign/minisign.key}"
 PUBKEY="${SATD_MINISIGN_PUBKEY:-RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3}"
 
 if [[ ! -f "$KEY" ]]; then
@@ -222,28 +224,68 @@ if [[ ! "$TAG" =~ ^[A-Za-z0-9._+-]+$ || "$TAG" == "." || "$TAG" == ".." ]]; then
 fi
 
 work="${SATD_SIGN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/satd-sign/$TAG}"
+# "/path/link/" would make every test below look through the symlink.
+while [[ "$work" == */ && "$work" != / ]]; do work="${work%/}"; done
+
+# The script deletes this directory after a successful run, so it must only
+# ever use one it made. It drops this marker in a directory when it creates
+# it; an existing directory without the marker (an operator's own directory
+# named by SATD_SIGN_DIR, say) is refused, and is never chmod'd or removed.
+MARKER=".sign-tarballs-workdir"
 
 # The default path is predictable, and so is anything an operator points
 # SATD_SIGN_DIR at under /tmp. Another local user who pre-creates it could
 # swap a tarball between the hash check and the signature. Only a directory
 # this user owns, that is not a symlink, and that nobody else can write to is
 # used.
-(umask 077 && mkdir -p -- "$work")
-if [[ -L "$work" || ! -d "$work" ]]; then
-    echo "refusing $work: not a plain directory" >&2
+check_dir() {
+    # $1: the path to test, $2: the name to report it under.
+    local owner mode
+    owner="$(stat -c %u -- "$1")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "refusing $2: owned by uid $owner, not $(id -u)" >&2
+        exit 1
+    fi
+    mode="$(stat -c %a -- "$1")"
+    if (( 8#$mode & 8#022 )); then
+        echo "refusing $2: mode $mode lets group or others write to it" >&2
+        exit 1
+    fi
+    if [[ ! -f "$1/$MARKER" || -L "$1/$MARKER" ]]; then
+        echo "refusing $2: it exists but this script did not create it (no $MARKER)." >&2
+        echo "Point SATD_SIGN_DIR at a path that does not exist yet; the script creates it." >&2
+        exit 1
+    fi
+}
+
+if [[ ! -e "$work" && ! -L "$work" ]]; then
+    (umask 077 && mkdir -p -- "$(dirname -- "$work")")
+    mkdir -m 700 -- "$work"
+    : > "$work/$MARKER"
+fi
+if [[ -L "$work" ]]; then
+    echo "refusing $work: is a symlink" >&2
     exit 1
 fi
-if [[ "$(stat -c %u -- "$work")" != "$(id -u)" ]]; then
-    echo "refusing $work: owned by uid $(stat -c %u -- "$work"), not $(id -u)" >&2
+if [[ ! -d "$work" ]]; then
+    echo "refusing $work: not a directory" >&2
     exit 1
 fi
-mode="$(stat -c %a -- "$work")"
-if (( 8#$mode & 8#022 )); then
-    echo "refusing $work: mode $mode lets group or others write to it" >&2
-    exit 1
-fi
+check_dir "$work" "$work"
+expect="$(cd -- "$(dirname -- "$work")" && pwd -P)/$(basename -- "$work")"
+expect="${expect#/}"; expect="/$expect"
 chmod 700 -- "$work"
-work="$(cd "$work" && pwd -P)"
+
+# The checks above went by name. If the parent directory is writable by
+# someone else, the name can be pointed somewhere else before the cd, so
+# check again where the cd actually landed.
+cd -- "$work"
+if [[ "$(pwd -P)" != "$expect" ]]; then
+    echo "refusing $work: it changed between the check and the cd (now $(pwd -P))" >&2
+    exit 1
+fi
+check_dir . "$work"
+work="$expect"
 
 finished=0
 on_exit() {
@@ -256,7 +298,6 @@ on_exit() {
     fi
 }
 trap on_exit EXIT
-cd "$work"
 echo ">> Working directory: $work"
 
 # Both tarballs (*.tar.zst) and CycloneDX SBOMs (*.cdx.json) are signed with

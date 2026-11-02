@@ -97,7 +97,20 @@ else
     [[ -f "$sig" && "$(cat "$sig")" == "sig:$sum" ]] || { echo "Signature verification failed" >&2; exit 1; }
 fi
 STUB
-chmod +x "$BIN/gh" "$BIN/minisign"
+# chmod stub: the real chmod, and then, when SWAP_DIR names the directory it
+# just changed, the swap a local attacker who can write to the parent would
+# make between the script's checks and its cd: SWAP_DIR becomes a symlink to
+# SWAP_TO.
+cat > "$BIN/chmod" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/bin:/bin chmod "$@"
+if [[ -n "${SWAP_DIR:-}" && "${!#}" == "$SWAP_DIR" ]]; then
+    mv "$SWAP_DIR" "$SWAP_DIR.orig"
+    ln -s "$SWAP_TO" "$SWAP_DIR"
+fi
+STUB
+chmod +x "$BIN/gh" "$BIN/minisign" "$BIN/chmod"
 
 touch "$WORK/key"
 export PATH="$BIN:$PATH" SATD_MINISIGN_KEY="$WORK/key" GH_LOG="$WORK/gh.log" MS_LOG="$WORK/ms.log"
@@ -192,10 +205,12 @@ if grep -q upload "$GH_LOG"; then fail "dry run does not upload"; else pass "dry
 [[ ! -e "$SATD_SIGN_DIR" ]] && pass "directory removed after a dry run" || fail "directory removed after a dry run"
 
 # --- (c) unsafe directories are refused --------------------------------------
+# refused <name> [<message regex>] [script args...]
 refused() {
-    local name="$1"
-    if run right v9.9.9; then fail "$name" "$(cat "$WORK/out")"
-    elif ! grep -q '^refusing' "$WORK/out"; then fail "$name" "$(cat "$WORK/out")"
+    local name="$1" want="${2:-^refusing}"
+    shift 2 2>/dev/null || shift
+    if run right "$@" v9.9.9; then fail "$name" "$(cat "$WORK/out")"
+    elif ! grep -qE "$want" "$WORK/out"; then fail "$name" "$(cat "$WORK/out")"
     elif [[ -s "$GH_LOG" ]]; then fail "$name (downloaded before refusing)" "$(cat "$GH_LOG")"
     else pass "$name"; fi
 }
@@ -207,10 +222,39 @@ mkdir -p "$SATD_SIGN_DIR"; chmod 770 "$SATD_SIGN_DIR"
 refused "group-writable directory is refused"
 assert_eq "a refused directory keeps its mode" "770" "$(stat -c %a "$SATD_SIGN_DIR")"
 
-mkdir -p "$WORK/elsewhere"; chmod 700 "$WORK/elsewhere"
+# The symlink's target is a directory an earlier run made, so it passes every
+# other check: only the symlink refusal stands between the script and it.
+export SATD_SIGN_DIR="$WORK/elsewhere"
+run wrong v9.9.9 || true
 ln -s "$WORK/elsewhere" "$WORK/cache/link"
 export SATD_SIGN_DIR="$WORK/cache/link"
-refused "symlinked directory is refused"
+refused "symlinked directory is refused" '^refusing .*: is a symlink$'
+export SATD_SIGN_DIR="$WORK/cache/link/"
+refused "symlinked directory named with a trailing slash is refused" '^refusing .*: is a symlink$'
+export SATD_SIGN_DIR="$WORK/cache/link//"
+refused "symlinked directory named with two trailing slashes is refused" '^refusing .*: is a symlink$'
+
+# An operator's own directory is never used, chmod'd or deleted, even on a
+# --dry-run, which removes the directory it worked in.
+mkdir -p "$WORK/mine"; chmod 755 "$WORK/mine"; echo keep > "$WORK/mine/keep.txt"
+export SATD_SIGN_DIR="$WORK/mine"
+refused "existing directory the script did not create is refused" 'did not create it' --dry-run
+[[ -f "$WORK/mine/keep.txt" ]] && pass "refused directory keeps its contents" || fail "refused directory keeps its contents"
+assert_eq "refused directory is not chmod'd" "755" "$(stat -c %a "$WORK/mine")"
+mkdir -p "$WORK/mine-empty"; chmod 700 "$WORK/mine-empty"
+export SATD_SIGN_DIR="$WORK/mine-empty"
+refused "existing empty directory the script did not create is refused" 'did not create it' --dry-run
+[[ -d "$WORK/mine-empty" ]] && pass "refused empty directory is not removed" || fail "refused empty directory is not removed"
+
+# The directory is swapped for a symlink between the checks and the cd. The
+# target is one an earlier run made, so only the re-check after the cd sees it.
+export SATD_SIGN_DIR="$WORK/attacker"
+run wrong v9.9.9 || true
+export SATD_SIGN_DIR="$WORK/cache/race"
+run wrong v9.9.9 || true
+SWAP_DIR="$SATD_SIGN_DIR" SWAP_TO="$WORK/attacker" \
+    refused "directory swapped before the cd is refused" 'changed between the check and the cd'
+unset SWAP_DIR SWAP_TO
 
 if [[ "$(id -u)" -ne 0 ]]; then
     # / exists, is not writable by others, and belongs to root.
@@ -218,6 +262,16 @@ if [[ "$(id -u)" -ne 0 ]]; then
     refused "directory owned by another user is refused"
 else
     echo "skip — directory owned by another user (running as root)"
+fi
+
+# The key defaults to minisign's own location, not to any one machine's layout.
+mkdir -p "$WORK/home"
+if HOME="$WORK/home" SATD_MINISIGN_KEY= run right --dry-run v9.9.9; then
+    fail "missing default key fails the run"
+elif grep -qx "minisign key file not found: $WORK/home/.minisign/minisign.key" "$WORK/out"; then
+    pass "key defaults to ~/.minisign/minisign.key"
+else
+    fail "key defaults to ~/.minisign/minisign.key" "$(cat "$WORK/out")"
 fi
 
 unset SATD_SIGN_DIR
