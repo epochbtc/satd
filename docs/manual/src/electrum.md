@@ -42,11 +42,11 @@ the address index for scripthash history (on by default) and
 | `--electrummaxconns=<n>` | `64` | Hard cap on simultaneously-open connections. |
 | `--electrummaxsubsperconn=<n>` | `10000` | Per-connection scripthash subscription cap. See [Subscription limits](#subscription-limits) for how it relates to the server-wide `--addrindexsubscriptions`. |
 | `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. A request still running after this long is answered with a `request timed out` error and its connection is closed. The handler's work cannot be interrupted, so the connection keeps its `--electrummaxconns` slot until that work ends. |
-| `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets such as Sparrow batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
+| `--electrummaxbatchrequests=<n>` | `345` | Max requests per JSON-RPC batch line. A batch over the cap is refused whole. Sparrow sends up to 250 `blockchain.transaction.get_merkle` calls in one batch when it verifies a wallet's transactions, so a cap below 250 fails verification for a wallet with more than that many. 345 is Fulcrum's default. |
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
 | `--electrumbanner=<text>` | `powered by satd <version>` | Override for `server.banner`. |
-| `--electrumservername=<text>` | `satd-electrs-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs). |
+| `--electrumservername=<text>` | `satd-electrs-electrumx-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs-and-electrumx). |
 
 The server runs on satd's [isolated API runtime](api-scaling.md)
 (`--api-threads`), so Electrum load cannot starve block connection. Each
@@ -328,10 +328,11 @@ progress marker advance without the server writing ~700k lines. A chunk ends
 after 60 seconds of wall clock at a height boundary; clients resubscribe from the
 next unscanned height, which is what `done` is for.
 
-### The server name, and why it says `electrs`
+### The server name, and why it says `electrs` and `electrumx`
 
-satd reports `satd-electrs-compatible/<version>` from `server.version` and
-`server.features.server_version`.
+satd reports `satd-electrs-electrumx-compatible/<version>` from
+`server.version` and `server.features.server_version`. Before 0.7.1 the
+default was `satd-electrs-compatible/<version>`.
 
 Cake Wallet feature-detects by matching on that string rather than on
 `server.features`, and will not probe
@@ -340,6 +341,14 @@ Cake Wallet feature-detects by matching on that string rather than on
 matches. Carrying the token is what makes silent-payment support work out of the
 box for those clients.
 
+Sparrow decides from the same string whether to batch its requests: it
+batches, and calls `blockchain.scripthash.unsubscribe` and `server.features`,
+only when the name contains `electrumx` (or names one of a few other servers).
+Without the token Sparrow sends one request per script hash, and wallet scans
+and refreshes are much slower. satd serves batches and both calls. Sparrow
+sends up to 250 `get_merkle` calls in one batch, which is why
+`--electrummaxbatchrequests` defaults to 345.
+
 The name leads with satd's own identity and states a claim about the *protocol*,
 in the same way every browser still sends `Mozilla` at the front of its
 user-agent long after that stopped saying anything about who wrote the browser.
@@ -347,8 +356,8 @@ It is scoped to this surface: peers on the P2P network see satd's own user agent
 (`/satd:<version>/`, reported by `getnetworkinfo` as `subversion`), which this
 setting cannot change.
 
-Override it if you would rather not advertise the token, or need a different one
-for another client:
+Override it if you would rather not advertise the tokens, or need a different
+one for another client:
 
 ```ini
 electrumservername=satd/0.6.0
