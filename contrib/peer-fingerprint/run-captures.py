@@ -30,6 +30,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CAPTURE = os.path.join(HERE, "capture.py")
 REGTEST_P2PKH = "n2qxEYSYBgrHY7i2mkzakRR674xe6di61W"  # any regtest address; nothing is ever spent
 NODE_P2P, NODE_RPC, RECORDER = 19601, 19602, 19603
+# accept (120) + handshake (30) + passive (10) + probes (20) + a second
+# session (20 + its own handshake, passive and probes), with room to spare
+CAPTURE_TIMEOUT = 420
 
 
 def rpc_http(url, user, password, method, params=None, timeout=10, bearer=None):
@@ -478,10 +481,18 @@ def run(impl, outdir, version, extra, suffix=""):
                 impl.mine()
             path = os.path.join(outdir, f"{impl.name}-{version}-inbound{suffix}.json")
             cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound{suffix}", version, extra)
-            time.sleep(1)
-            impl.connect_live(f"127.0.0.1:{RECORDER}")
-            rc = cap.wait(timeout=240)
-            results.append(("inbound", rc, set_state(path, impl, note) if rc == 0 else None))
+            try:
+                time.sleep(1)
+                impl.connect_live(f"127.0.0.1:{RECORDER}")
+                rc = cap.wait(timeout=CAPTURE_TIMEOUT)
+                results.append(("inbound", rc, set_state(path, impl, note) if rc == 0 else None))
+            except subprocess.TimeoutExpired:
+                results.append(("inbound", "timeout", None))
+            finally:
+                # Never leave a recorder holding the port for the next capture.
+                if cap.poll() is None:
+                    cap.kill()
+                    cap.wait()
         finally:
             impl.stop()
     elif impl.dials:
@@ -490,7 +501,7 @@ def run(impl, outdir, version, extra, suffix=""):
         time.sleep(1)
         impl.start(connect=f"127.0.0.1:{RECORDER}")
         try:
-            rc = cap.wait(timeout=240)
+            rc = cap.wait(timeout=CAPTURE_TIMEOUT)
             state = None
             if rc == 0:
                 try:
@@ -500,9 +511,11 @@ def run(impl, outdir, version, extra, suffix=""):
                 state = set_state(path, impl, note)
             results.append(("inbound", rc, state))
         except subprocess.TimeoutExpired:
-            cap.kill()
             results.append(("inbound", "timeout", None))
         finally:
+            if cap.poll() is None:
+                cap.kill()
+                cap.wait()
             impl.stop()
     return results
 

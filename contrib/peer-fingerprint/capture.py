@@ -39,7 +39,7 @@ can mine a block; where it cannot, the fixture says so.
 After the handshake it waits --wait seconds (default 10) and records every
 message. Unless --no-probes is given it then runs the benign probes from
 the peer behavior plan, one at a time, each with a --probe-wait window:
-ping, getheaders from genesis, getdata for a random wtxid, and an unknown
+ping, getheaders from genesis, getdata for a random txid (MSG_WITNESS_TX), and an unknown
 message type. The unknown message goes last, since a peer may disconnect
 on it.
 
@@ -402,7 +402,8 @@ class Recorder:
             plan = [
                 ("ping", "ping", struct.pack("<Q", random.getrandbits(64)), "pong"),
                 ("getheaders", "getheaders", self.getheaders_payload(), "headers"),
-                ("getdata_unknown_wtx", "getdata",
+                # MSG_WITNESS_TX: a txid the peer cannot have.
+                ("getdata_unknown_tx", "getdata",
                  csize_write(1) + struct.pack("<I", 0x40000001) + os.urandom(32), "notfound"),
                 ("unknown_message", unknown, b"", None),
             ]
@@ -461,22 +462,32 @@ def accept_v2(args, srv):
     """--v2 listen: accept one connection and speak whichever transport the
     peer opens with, as satd does."""
     sock, _ = srv.accept()
-    deadline = time.monotonic() + 30
-    buf = b""
-    prefix = v1_prefix(args)
-    while len(buf) < 16 and buf == prefix[:len(buf)]:
-        sock.settimeout(max(0.1, deadline - time.monotonic()))
-        chunk = sock.recv(16 - len(buf))
-        if not chunk:
-            raise Closed
-        buf += chunk
-    if buf == prefix:
-        conn = Conn(sock, bytes.fromhex(MAGIC[args.network]))
-        conn.buf, conn.first = buf, False
-        return sock, conn, "v1"
-    conn = V2Conn(sock, args.network, initiating=False, prefix=buf)
-    conn.handshake(deadline)
-    return sock, conn, "v2"
+    try:
+        deadline = time.monotonic() + 30
+        buf = b""
+        prefix = v1_prefix(args)
+        while len(buf) < 16 and buf == prefix[:len(buf)]:
+            sock.settimeout(max(0.1, deadline - time.monotonic()))
+            chunk = sock.recv(16 - len(buf))
+            if not chunk:
+                raise Closed
+            buf += chunk
+        if buf == prefix:
+            conn = Conn(sock, bytes.fromhex(MAGIC[args.network]))
+            conn.buf, conn.first = buf, False
+            return sock, conn, "v1"
+        conn = V2Conn(sock, args.network, initiating=False, prefix=buf)
+        conn.handshake(deadline)
+        return sock, conn, "v2"
+    except (Closed, TimeoutError, ValueError, AssertionError, OSError) as e:
+        # Neither a v1 version nor a v2 handshake that completes: a
+        # fixture that says so, not a crashed recorder.
+        sock.close()
+        raise HandshakeFailed(f"{type(e).__name__} {e}".strip())
+
+
+class HandshakeFailed(Exception):
+    pass
 
 
 def capture(args, srv=None):
@@ -491,6 +502,12 @@ def capture(args, srv=None):
             sock, conn, transport = accept_v2(args, srv)
         except socket.timeout:
             sys.exit(f"no connection on port {args.listen} within {args.accept_timeout} s")
+        except HandshakeFailed as e:
+            d = fixture_head(args, "inbound", 0)
+            d.update({"transport": None, "inbound_handshake": f"failed: {e}",
+                      "version": None, "commands": [], "received": [], "sent": [], "probes": [],
+                      "closed_by_peer": None, "error": f"inbound handshake failed: {e}"})
+            return d
         connection = "inbound"
     elif args.v2:
         host, port = args.dial.rsplit(":", 1)

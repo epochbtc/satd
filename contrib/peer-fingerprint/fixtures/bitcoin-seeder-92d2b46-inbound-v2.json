@@ -146,7 +146,7 @@
       "answered": false
     },
     {
-      "probe": "getdata_unknown_wtx",
+      "probe": "getdata_unknown_tx",
       "command": "getdata",
       "expect": "notfound",
       "disconnected": false,

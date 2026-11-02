@@ -10,7 +10,7 @@ a client behaves.
   does in the same direction (the greeting is in its docstring and was
   measured from satd's own fixtures here), records every message for 10 s,
   then runs four probes one at a time: `ping`, `getheaders` from genesis,
-  `getdata` for a random wtxid, and an unknown message type. Over v1 it
+  `getdata` for a random txid (`MSG_WITNESS_TX`), and an unknown message type. Over v1 it
   needs nothing beyond Python 3. `--v2` speaks BIP324, using the
   pure-Python implementation in Bitcoin Core's functional test framework
   (`--core-functional` names a Core checkout's `test/functional`).
@@ -62,7 +62,7 @@ implementation that speaks both.
   and `getheaders`, except bitcoin-seeder, which answered no probe and
   closed the connection 30 s after it opened. No implementation
   disconnected on a probe. Floresta and bitnodes leave the `getdata` for an
-  unknown wtxid unanswered; the rest send `notfound`. Core 31.2 logs the
+  unknown txid unanswered; the rest send `notfound`. Core 31.2 logs the
   unknown message as `Unknown message type` and nothing else: no
   misbehaviour, no disconnect.
 
