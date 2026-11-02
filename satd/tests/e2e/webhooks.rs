@@ -816,15 +816,31 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     // a restart takes. The queued blocks go with it.
     write_alertfile(&dir, &receiver, "chain", "\"chain\"", true);
     crate::streaming::sighup_with_conf(&sn, "").await;
+
+    // The hook is live: the next block still arrives. Deliveries are serial and
+    // in order, so the old generation, still retrying heights 2..=5, cannot
+    // have delivered it: height 6 arriving means the new generation is running.
+    // That is the reload instant the check below is judged from.
+    crate::streaming::mine_n(&sn, 1).await;
+    receiver
+        .wait_for(60, |r| r.json()["body"]["height"] == 6)
+        .await;
     let reloaded = std::time::Instant::now();
 
-    // Nothing from the missed span comes back... Judged by arrival time, not
-    // by a count taken before the reload: a retry already in flight at the
-    // reload can land just after it without any history having crossed the
-    // reload (#794). Two seconds of grace cover that, and the reload itself; a
-    // generation that did carry its queue retries again within the window
-    // below (backoff 1, 2, 4, 8 s).
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    // Nothing from the missed span comes back. Judged by arrival time rather
+    // than by a count taken before the reload: a retry already in flight at
+    // the reload can land just after it without any history having crossed the
+    // reload (#794); two seconds of grace cover that. A generation that did
+    // carry its queue would retry each height again after `retry_delay` of the
+    // attempts it had made, plus up to 25 % jitter, so the window is sized from
+    // the most attempts any missed height has had.
+    let attempts = receiver.all_attempts().await;
+    let most = (2..=5u64)
+        .map(|h| attempts.iter().filter(|r| r.json()["body"]["height"] == h).count())
+        .max()
+        .unwrap_or(0) as u32;
+    let window = satd_alert::retry_delay(most.max(1)).mul_f64(1.25) + Duration::from_secs(3);
+    tokio::time::sleep(window).await;
     let late: Vec<_> = receiver
         .all_attempts()
         .await
@@ -834,8 +850,8 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
         .collect();
     assert!(
         late.is_empty(),
-        "the missed span was re-sent after the reload (heights {late:?}); a best-effort \
-         hook resumes at the head and does not carry history across a reload"
+        "the missed span was re-sent after the reload (heights {late:?}, watched {window:?}); \
+         a best-effort hook resumes at the head and does not carry history across a reload"
     );
 
     // ...and no in-band notice is synthesized about it either.
@@ -847,12 +863,6 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
             .any(|r| r.json()["body"]["category"] == "lagged"),
         "a lagged body was delivered; gap accounting was removed with the cursor"
     );
-
-    // The hook is live: the next block still arrives.
-    crate::streaming::mine_n(&sn, 1).await;
-    receiver
-        .wait_for(60, |r| r.json()["body"]["height"] == 6)
-        .await;
 }
 
 /// **Release criterion: what a webhook *does* carry across a daemon restart.**
