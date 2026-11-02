@@ -34,6 +34,18 @@
 //!   caller can escalate to a full resnapshot — the exception, not the rule.
 //! - **Cursor persistence** — confirmed cursors are committed-on-poll to a
 //!   shared [`CursorStore`], so a resume survives reconnects and restarts.
+//!
+//!   The node stamps a cursor on a connected block and a confirmed match only,
+//!   and the stream sends none when it opens, so a watch with no
+//!   [`from_cursor`](ResilientWatchConfig::from_cursor) and an empty store has
+//!   no anchor until its first confirmed event arrives
+//!   ([`resume_cursor`](ResilientWatch::resume_cursor) is `None`). A reconnect
+//!   in that window sends no `set_cursor`, so no [`Event::CursorAccepted`]
+//!   follows, the outage's chain events are not replayed, and an event in
+//!   flight at the drop is not delivered. Pass `from_cursor` to close it: a
+//!   [`Cursor`] with only `height` set to the height the consumer is caught up
+//!   to is enough: confirmed replay does not check `instance_id`, and a
+//!   foreign one replays the node's retained mempool window as well.
 //! - **Refused adds** — when the server answers an add with
 //!   [`Event::WatchAddRejected`] for its rate limit, the items stay in the mirror
 //!   and are re-sent after the server's retry hint, within the backoff budget;

@@ -141,6 +141,25 @@ var ErrNoLoader = errors.New("satdevents: reload requires a WatchSetLoader")
 // Rust SDK has; it is spelled out here because nothing about the reconnect
 // suggests it.
 //
+// # Before the first confirmed event there is no anchor
+//
+// The node stamps a resume cursor on a connected block and on a confirmed match
+// only. Heartbeats, mempool events and unconfirmed matches carry none, and the
+// Watch stream sends no cursor when it opens. So a watch started with no
+// [ResilientWatchConfig.FromCursor] and nothing in its [CursorStore] has no
+// anchor until its first confirmed event arrives, and
+// [ResilientWatch.ResumeCursor] returns nil until then.
+//
+// A reconnect in that window re-registers the watch-set and sends no SetCursor,
+// so no [CursorAccepted] follows and the outage's chain events are not
+// replayed: the stream resumes live, and an event in flight when the connection
+// dropped (the block that confirms a payment whose mempool match had just
+// arrived, say) is never delivered. Nothing reports the gap, because there is
+// no anchor to measure it from. A consumer that cannot afford that should pass
+// FromCursor. A [Cursor] with only Height set, to the height the consumer is
+// caught up to, is enough: confirmed replay does not check InstanceID, and a
+// foreign InstanceID replays the node's retained mempool window as well.
+//
 // # Cancel safety
 //
 // As with [ResilientSubscription], the reconnect state machine runs on its own
