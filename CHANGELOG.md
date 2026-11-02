@@ -32,6 +32,16 @@ It includes every fix shipped in 0.7.1:
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
+- HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).
+- HTTP: shutdown closes streamws WebSockets with `1001 Going Away` and ends SSE streams on streamws and Esplora (#822).
+- Operator: TLS handshake timeouts and accept errors are logged under a per-listener budget, and Stratum's V1, V1-TLS and V2 listeners report at-capacity refusals separately (#825).
+- RPC: a bearer token without a method's capability gets `-32004` before the method's parameters are checked (#826).
+- Esplora: `-esplorarequesttimeout=0` no longer zeroes the TLS handshake budget (#826).
+- HTTP: `-rpcservertimeout` and `-esplorarequesttimeout` above a year are treated as a year, instead of failing every connection (#826).
+- Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
+- Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
+- Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
+- Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

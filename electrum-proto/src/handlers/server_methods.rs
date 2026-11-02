@@ -153,11 +153,14 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     }))
 }
 
+/// The default server name, before `/<version>`. See [`server_name`].
+pub const DEFAULT_SERVER_NAME_PREFIX: &str = "satd-electrs-electrumx-compatible";
+
 /// The name reported to clients, as `server.version`'s first element and
 /// `server.features.server_version`.
 ///
-/// Defaults to `satd-electrs-compatible/<version>`: identity first, then a
-/// compatibility token, on the same principle that keeps `Mozilla` at the front
+/// Defaults to `satd-electrs-electrumx-compatible/<version>`: identity first,
+/// then compatibility tokens, on the same principle that keeps `Mozilla` at the front
 /// of every browser user-agent long after it stopped meaning anything about who
 /// wrote the browser. The token is load-bearing rather than decorative: Cake
 /// Wallet decides whether to probe `blockchain.tweaks.subscribe` by testing
@@ -165,10 +168,16 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 /// probe at all without it. Spelling it `electrum` would read the same to a
 /// human and signal nothing to the client.
 ///
-/// (Narrowly Cake's behaviour, not Electrum's in general: `server.features` is
-/// used as a capability channel elsewhere -- Frigate advertises
-/// `silent_payments` there and Sparrow reads it. Cake is the client that gates
-/// on the version string.)
+/// The `electrumx` token is for Sparrow, which batches requests, and calls
+/// `blockchain.scripthash.unsubscribe` and `server.features`, only for a name
+/// it recognises; a name that contains `electrumx` is one (#1069). Without it
+/// Sparrow sends one request per script hash, and a wallet scan is far slower.
+/// satd serves all three. Sparrow pages its `get_merkle` batches at 250, which
+/// is why the default batch cap is 345.
+///
+/// (`server.features` is used as a capability channel too -- Frigate
+/// advertises `silent_payments` there and Sparrow reads it. Cake and Sparrow
+/// are the clients that gate on the version string.)
 ///
 /// **Both halves of the shape matter.** Leading with `satd-` is not just an
 /// identity preference: several clients test `starts_with("electrs")` rather
@@ -190,7 +199,7 @@ fn server_name(state: &ElectrumState) -> String {
         .config
         .server_name
         .clone()
-        .unwrap_or_else(|| format!("satd-electrs-compatible/{}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| format!("{DEFAULT_SERVER_NAME_PREFIX}/{}", env!("CARGO_PKG_VERSION")))
 }
 
 /// `server.peers.subscribe()` — always returns `[]`. We're not part of
@@ -215,6 +224,34 @@ fn version_in_range(min: &str, max: &str, ours: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default name satisfies every client that reads it (#1069). The
+    /// rules are ported from each client's source:
+    /// - Sparrow (`ElectrumServer.getServerCapability`): batching, unsubscribe
+    ///   and `server.features` for a lowercased name containing `electrumx`.
+    /// - BlueWallet (`BlueElectrum.ts`): batching off for a name starting
+    ///   with `ElectrumPersonalServer`, `electrs` or `Fulcrum`.
+    /// - Cake Wallet (`electrum_wallet.dart`, `getNodeIsElectrs`): tweak
+    ///   probing only for a lowercased name containing `electrs`.
+    #[test]
+    fn the_default_server_name_suits_sparrow_bluewallet_and_cake() {
+        let name = format!("{DEFAULT_SERVER_NAME_PREFIX}/{}", env!("CARGO_PKG_VERSION"));
+        let lower = name.to_lowercase();
+        assert!(lower.contains("electrumx"), "Sparrow batches only for electrumx: {name}");
+        assert!(
+            !["ElectrumPersonalServer", "electrs", "Fulcrum"].iter().any(|p| name.starts_with(p)),
+            "BlueWallet turns batching off for this prefix: {name}"
+        );
+        assert!(lower.contains("electrs"), "Cake probes tweaks only for electrs: {name}");
+        assert!(name.starts_with("satd-"), "identity first: {name}");
+    }
+
+    /// Sparrow pages `blockchain.transaction.get_merkle` at 250 requests per
+    /// batch; a smaller cap refuses the page whole (#1069).
+    #[test]
+    fn the_default_batch_cap_holds_sparrows_largest_page() {
+        const { assert!(crate::config::DEFAULT_MAX_BATCH_REQUESTS >= 250) };
+    }
 
     #[test]
     fn version_compare_basic() {

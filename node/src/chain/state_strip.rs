@@ -421,6 +421,7 @@ impl ChainState {
                 // Never strip a copy that does not verify: the record's
                 // txids would come from bytes that do not match the header.
                 // This also refuses punched bytes whose record was lost.
+                crate::chain::connect::debug_assert_block_height(&*self.store, &block, entry.height);
                 validation::block::check_block(&block, self.network, entry.height)
                     .map_err(|e| corrupt(format!("the stored copy fails check_block: {e:?}")))?;
                 let Some((record, _filled)) = StripRecord::build(&bytes, &block, threshold)

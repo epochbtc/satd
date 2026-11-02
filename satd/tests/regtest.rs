@@ -985,6 +985,35 @@ fn test_rpc_bearer_submit_capability() {
         "denial names rpc:submit: {json}"
     );
 
+    // The capability check comes before the parameters are read: a token
+    // that may not call the method is told so, not that it named a
+    // parameter wrongly (#826). Alone and inside a batch.
+    let named = |body: serde_json::Value| -> serde_json::Value {
+        client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .bearer_auth("satd-test-submit-ro-token-v1")
+            .send()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+    let bogus = serde_json::json!({
+        "jsonrpc": "2.0", "id": "t", "method": "sendrawtransaction",
+        "params": {"not_a_parameter": 1},
+    });
+    let json = named(bogus.clone());
+    assert_eq!(json["error"]["code"], DENIED, "denied before the params are read: {json}");
+    let json = named(serde_json::json!([bogus]));
+    assert_eq!(json[0]["error"]["code"], DENIED, "the same inside a batch: {json}");
+    // A method the token may call still has its parameters checked.
+    let json = named(serde_json::json!({
+        "jsonrpc": "2.0", "id": "t", "method": "getblockhash",
+        "params": {"not_a_parameter": 1},
+    }));
+    assert_eq!(json["error"]["code"], -8, "named-parameter errors still apply: {json}");
+
     // A token minted with only `rpc:write` keeps broadcasting.
     let (status, json) = call("satd-test-submit-write-token-v1", "sendrawtransaction");
     assert_eq!(status, 200);
@@ -13767,10 +13796,18 @@ fn test_esplora_address_txs_mempool_visibility() {
     node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
 
     // dest's `/txs/mempool` must include the unconfirmed tx; `/txs/chain` must not.
-    let mempool_resp: Vec<serde_json::Value> =
-        esplora_get(esplora_port, &format!("/address/{}/txs/mempool", dest_addr))
-            .json()
-            .unwrap();
+    // The address index learns of a mempool transaction from the mempool's
+    // event stream, after `sendrawtransaction` has returned, so wait for it.
+    let mempool_resp: Vec<serde_json::Value> = serde_json::from_value(common::poll_until_json(
+        || {
+            esplora_get(esplora_port, &format!("/address/{}/txs/mempool", dest_addr))
+                .json()
+                .unwrap()
+        },
+        |v| v.as_array().is_some_and(|a| !a.is_empty()),
+        30,
+    ))
+    .unwrap();
     let mempool_txids: Vec<String> = mempool_resp
         .iter()
         .map(|v| v["txid"].as_str().unwrap_or_default().to_string())
