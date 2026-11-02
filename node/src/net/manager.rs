@@ -1393,6 +1393,10 @@ pub struct PeerManager {
     ibd: Arc<parking_lot::RwLock<Option<IbdScheduler>>>,
     /// Signal to wake the connect thread when a block is stored.
     connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
+    /// Blocks that arrived during IBD, waiting for the store thread
+    /// (`ibd-store`), so that a store waiting behind the connector does not
+    /// hold up the P2P task (#875).
+    ibd_store_queue: Arc<crate::net::ibd_store::IbdStoreQueue>,
     /// AssumeUTXO background catch-up download tracker. Drives downloading
     /// historical block data (genesis→`snapshot_height`) for the
     /// background validator. Idle (empty) unless a snapshot is loaded.
@@ -1405,9 +1409,9 @@ pub struct PeerManager {
     opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<RestoreWork>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
-    /// The block processor and background catch-up threads, named. Both
-    /// exit once shutdown is signalled; [`Self::join_connectors`] waits
-    /// for them.
+    /// The block processor, background catch-up and IBD store threads,
+    /// named. All exit once shutdown is signalled; [`Self::join_connectors`]
+    /// waits for them.
     connector_threads: parking_lot::Mutex<Vec<(&'static str, std::thread::JoinHandle<()>)>>,
     /// SOCKS5 proxy for all outbound connections (e.g. "127.0.0.1:9050").
     proxy: Option<String>,
@@ -1561,6 +1565,7 @@ impl PeerManager {
         // them before it flushes (see `join_connectors`).
         let bg_shutdown = shutdown.clone();
         let connect_shutdown = shutdown.clone();
+        let store_shutdown = shutdown.clone();
 
         // Check for IBD resume: if headers are ahead of tip, create scheduler
         let tip_height = chain_state.tip_height();
@@ -1667,6 +1672,7 @@ impl PeerManager {
             broadcast_confirm_peers: AtomicU64::new(DEFAULT_BROADCAST_CONFIRM_PEERS),
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
+            ibd_store_queue: Arc::new(crate::net::ibd_store::IbdStoreQueue::default()),
             bg_downloader: RwLock::new(BgDownloader::new(
                 BG_CATCHUP_WINDOW,
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
@@ -1752,8 +1758,19 @@ impl PeerManager {
                 Self::bg_catchup_connect_loop(&cs, &bg_connect_signal, &bg_shutdown);
             })
             .expect("failed to spawn the background catch-up thread");
-        *mgr.connector_threads.lock() =
-            vec![("block-processor", block_processor), ("bg-catchup", bg_catchup)];
+        // IBD block store: stores the blocks `handle_block_ibd` queues, off
+        // the P2P task (#875).
+        let store_queue = mgr.ibd_store_queue.clone();
+        let pm_for_store = Arc::downgrade(&mgr);
+        let ibd_store = std::thread::Builder::new()
+            .name("ibd-store".into())
+            .spawn(move || Self::ibd_store_loop(&store_queue, &pm_for_store, &store_shutdown))
+            .expect("failed to spawn the IBD store thread");
+        *mgr.connector_threads.lock() = vec![
+            ("block-processor", block_processor),
+            ("bg-catchup", bg_catchup),
+            ("ibd-store", ibd_store),
+        ];
 
         mgr
     }
@@ -1788,8 +1805,9 @@ impl PeerManager {
     }
 
     /// Wait up to `timeout` for the block connector threads to exit: the
-    /// block processor, which also runs the IBD connect loop, and the
-    /// background catch-up loop. They exit once shutdown has been signalled
+    /// block processor, which also runs the IBD connect loop, the
+    /// background catch-up loop, and the IBD store thread, which writes
+    /// index entries too. They exit once shutdown has been signalled
     /// on the watch this manager was built with, each after finishing the
     /// block in hand; the caller signals it first.
     ///
@@ -1805,6 +1823,7 @@ impl PeerManager {
             *lock.lock() = true;
             cvar.notify_all();
         }
+        self.ibd_store_queue.wake();
         let mut threads = self.connector_threads.lock();
         let running = crate::shutdown::join_within(std::mem::take(&mut *threads), timeout);
         if running.is_empty() {
@@ -7868,7 +7887,7 @@ impl PeerManager {
         // background catch-up requested also land here and are stored — we
         // notify the background connector from the same path.
         if self.ibd.read().is_some() {
-            self.handle_block_ibd(id, block, requested);
+            self.handle_block_ibd(id, block, requested, in_flight);
             return;
         }
         // Forward IBD inactive. If a background catch-up is active and this
@@ -7933,11 +7952,22 @@ impl PeerManager {
         )
     }
 
-    /// Block arrival during forward IBD swarm. Stores the block and
-    /// advances the forward scheduler; if a background catch-up is also
-    /// active, a stored historical block additionally wakes the background
-    /// connector.
-    fn handle_block_ibd(&self, id: PeerId, block: bitcoin::Block, requested: bool) {
+    /// Block arrival during forward IBD swarm. Credits the delivery to the
+    /// scheduler and queues the block for the store thread, which stores it
+    /// and advances the scheduler ([`Self::store_ibd_block`]).
+    ///
+    /// The store takes `accept_lock`, which the IBD connector holds for a
+    /// whole connect. Stored here, on the P2P task, a block arriving during a
+    /// long connect stopped all peer message handling until the connect
+    /// finished (#875). `in_flight` travels with the block, so a pong the
+    /// peer sent behind it still waits for the store.
+    fn handle_block_ibd(
+        &self,
+        id: PeerId,
+        block: bitcoin::Block,
+        requested: bool,
+        in_flight: crate::net::flow::InFlight,
+    ) {
         // A non-canonical historical block (≤ snapshot_height) can arrive
         // unsolicited even during forward IBD; storing it would poison the
         // shared height→hash mapping the background connector relies on.
@@ -7969,7 +7999,126 @@ impl PeerManager {
             );
             return;
         }
-        match self.chain_state.store_block(&block) {
+        // Credit the delivery now: the store may wait behind the connector,
+        // and the peer has done its part (see `IbdScheduler::block_arrived`).
+        let arrived_at = self
+            .chain_state
+            .get_block_index(&block.header.prev_blockhash)
+            .map(|parent| parent.height + 1)
+            .filter(|&height| {
+                self.ibd.write().as_mut().is_some_and(|s| s.block_arrived(id, height, hash))
+            });
+        let size = block.total_size();
+        let job = crate::net::ibd_store::IbdStoreJob {
+            peer: id,
+            block: Box::new(block),
+            arrived_at,
+            in_flight,
+            size,
+        };
+        if let Err(job) = self.ibd_store_queue.try_push(job) {
+            // The queue is at its bound: the store cannot keep up, and
+            // storing here holds the P2P task as it always did.
+            tracing::debug!(%hash, peer = id, "IBD store queue full; storing inline");
+            self.store_ibd_block(job);
+        }
+    }
+
+    /// Wait, up to 10 s, for the IBD store thread to store everything
+    /// queued. Panics at the deadline.
+    #[cfg(test)]
+    pub(crate) fn wait_for_ibd_stores(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.ibd_store_queue.is_idle() {
+            assert!(Instant::now() < deadline, "the IBD store queue did not drain");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The IBD store thread: stores the blocks `handle_block_ibd` queued,
+    /// one at a time, until shutdown or until the manager is gone. Blocks
+    /// still queued then are dropped; they are downloads, and the next start
+    /// asks for them again.
+    ///
+    /// However the thread ends, a panic included, the queue is closed on
+    /// the way out: later blocks are stored inline, as before the queue
+    /// existed, and the heights of the blocks it still held are owed again,
+    /// so another peer is asked for them rather than the download waiting on
+    /// stores that will never run.
+    fn ibd_store_loop(
+        queue: &crate::net::ibd_store::IbdStoreQueue,
+        peer_manager: &std::sync::Weak<PeerManager>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) {
+        struct CloseOnExit<'a> {
+            queue: &'a crate::net::ibd_store::IbdStoreQueue,
+            peer_manager: &'a std::sync::Weak<PeerManager>,
+            /// The arrival of the block being stored, if one was recorded:
+            /// a panic mid-store strands it too.
+            current: std::cell::Cell<Option<(u32, bitcoin::BlockHash)>>,
+        }
+        impl Drop for CloseOnExit<'_> {
+            fn drop(&mut self) {
+                let stranded = self.queue.close();
+                if std::thread::panicking() {
+                    tracing::error!(
+                        stranded = stranded.len(),
+                        "IBD store thread panicked; storing blocks on the P2P task from now on"
+                    );
+                }
+                let Some(pm) = self.peer_manager.upgrade() else {
+                    return;
+                };
+                let mut ibd = pm.ibd.write();
+                let Some(scheduler) = ibd.as_mut() else {
+                    return;
+                };
+                let current = self.current.take();
+                for (height, hash) in stranded
+                    .iter()
+                    .filter_map(|job| job.arrived_at.map(|h| (h, job.block.block_hash())))
+                    .chain(current)
+                {
+                    scheduler.block_store_failed(height, hash);
+                }
+            }
+        }
+        let close = CloseOnExit { queue, peer_manager, current: std::cell::Cell::new(None) };
+        loop {
+            if *shutdown.borrow() || peer_manager.strong_count() == 0 {
+                return;
+            }
+            let Some(job) = queue.pop(Duration::from_millis(500)) else {
+                continue;
+            };
+            let Some(pm) = peer_manager.upgrade() else {
+                return;
+            };
+            close.current.set(job.arrived_at.map(|h| (h, job.block.block_hash())));
+            pm.store_ibd_block(job);
+            close.current.set(None);
+            drop(pm);
+            queue.done();
+        }
+    }
+
+    /// Store a block that arrived during forward IBD and advance the forward
+    /// scheduler; if a background catch-up is also active, a stored
+    /// historical block additionally wakes the background connector. Runs on
+    /// the IBD store thread, or inline when its queue is full.
+    fn store_ibd_block(&self, job: crate::net::ibd_store::IbdStoreJob) {
+        let crate::net::ibd_store::IbdStoreJob { peer: id, block, arrived_at, in_flight, size: _ } = job;
+        let hash = block.block_hash();
+        let result = self.chain_state.store_block(&block);
+        // A failed store leaves the height owed again, to time out and go to
+        // another peer as it would have before the block arrived.
+        if !matches!(result, Ok(_) | Err(crate::chain::state::ChainError::Duplicate))
+            && let Some(height) = arrived_at
+            && let Some(scheduler) = self.ibd.write().as_mut()
+        {
+            scheduler.block_store_failed(height, hash);
+        }
+        match result {
             Ok((_, height)) => {
                 // Judged when the connector reaches it; remember who sent it.
                 self.block_sources.lock().record(hash, id);
@@ -8029,6 +8178,8 @@ impl PeerManager {
                 tracing::warn!(%hash, id, "IBD block could not be stored: {}", e);
             }
         }
+        // Stored, or refused: the message is done with.
+        drop(in_flight);
     }
 
     /// Store a downloaded historical block for the background catch-up
@@ -16506,7 +16657,7 @@ mod tests {
             !pm.join_connectors(Duration::from_millis(200)),
             "without a shutdown signal the connectors keep running"
         );
-        assert_eq!(pm.connector_threads.lock().len(), 2, "both threads must be kept");
+        assert_eq!(pm.connector_threads.lock().len(), 3, "all three threads must be kept");
 
         shutdown_tx.send_replace(true);
         assert!(pm.join_connectors(Duration::from_secs(10)));

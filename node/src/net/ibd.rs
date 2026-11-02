@@ -72,6 +72,20 @@ pub struct IbdScheduler {
     /// just been handed it (#972).
     requested_at: HashMap<u32, Instant>,
 
+    /// In-flight heights whose block has arrived and waits to be stored,
+    /// with the hash delivered (#875). Storage runs off the P2P task and can
+    /// wait behind the connector for as long as it spends on one block, so
+    /// the scheduler hears of a delivery twice: [`Self::block_arrived`] when
+    /// the block comes in, [`Self::block_received`] (or
+    /// [`Self::block_store_failed`]) once the store is done. Between the two
+    /// the height stays in flight, holding its peer's slot, but the peer no
+    /// longer owes it: neither the stall check nor the per-height timeouts
+    /// count it against the peer, which has done its part. The count is of
+    /// the copies recorded and not yet settled: a holder can deliver the
+    /// same block twice, and the height is owed again only once every copy
+    /// has failed to store.
+    arrived: HashMap<u32, (BlockHash, u32)>,
+
     /// How long a peer may hold blocks without delivering one before it is
     /// disconnected. Core's adaptive `m_block_stalling_timeout`: doubled,
     /// up to [`STALL_TIMEOUT_MAX`], each time a peer is dropped for stalling,
@@ -171,6 +185,7 @@ impl IbdScheduler {
             in_flight: HashMap::new(),
             in_flight_at: HashMap::new(),
             requested_at: HashMap::new(),
+            arrived: HashMap::new(),
             stall_timeout: STALL_TIMEOUT_BASE,
             downloaded: HashSet::new(),
             peer_slots: HashMap::new(),
@@ -456,6 +471,9 @@ impl IbdScheduler {
     ///
     /// Returns `true` if the peer has capacity for more work.
     pub fn block_received(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) -> bool {
+        // Credited for the delivery when it arrived; the store finishing
+        // says nothing new about the peer.
+        let credited = self.take_arrival(height, &hash);
         let holder = if self.height_to_hash.get(&height) == Some(&hash) {
             self.in_flight.get(&height).copied()
         } else {
@@ -480,18 +498,91 @@ impl IbdScheduler {
 
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
             if holder == Some(peer_id) {
-                // The peer delivered what it was asked for: it is alive.
                 slots.blocks_received += 1;
-                slots.last_activity = Instant::now();
-                slots.last_delivery = Some(slots.last_activity);
-                slots.quiet_since = slots.last_activity;
-                slots.timed_out_since_delivery = false;
-                slots.consecutive_failures = 0;
-                slots.last_failure_at = None;
+                if !credited {
+                    Self::credit_delivery(slots);
+                }
             }
             return (slots.assigned.len() as u32) < self.per_peer_limit / 2;
         }
         false
+    }
+
+    /// Record that the block this scheduler wants at `height` has arrived
+    /// from the peer holding it, ahead of its store (see `arrived`). The peer
+    /// is credited with the delivery now, as Core credits it when the block
+    /// message is processed: a store that waits behind the connector must
+    /// not make a peer that has delivered look like one that is stalling.
+    /// The height stays in flight until [`Self::block_received`] or
+    /// [`Self::block_store_failed`] settles it.
+    ///
+    /// The same checks as `block_received`: the delivered hash must be the
+    /// one wanted at `height`, and only the holder is credited. Returns
+    /// whether the arrival was recorded; only a store of a recorded arrival
+    /// may report its failure ([`Self::block_store_failed`]), so that a
+    /// failed store of another copy cannot make a height owed while the
+    /// holder's copy still waits to be stored.
+    pub fn block_arrived(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) -> bool {
+        if self.height_to_hash.get(&height) != Some(&hash)
+            || self.in_flight.get(&height) != Some(&peer_id)
+        {
+            return false;
+        }
+        match self.arrived.get_mut(&height) {
+            Some((recorded, copies)) if *recorded == hash => *copies += 1,
+            _ => {
+                self.arrived.insert(height, (hash, 1));
+            }
+        }
+        if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
+            Self::credit_delivery(slots);
+        }
+        true
+    }
+
+    /// The block that arrived for `height` could not be stored. The height
+    /// is owed again: its timeouts, which kept running, apply to it once
+    /// more, and release it to another peer as they would have before it
+    /// arrived.
+    ///
+    /// Only once no other recorded copy is still waiting: while one is, the
+    /// block may yet be stored.
+    pub fn block_store_failed(&mut self, height: u32, hash: BlockHash) {
+        if let Some((recorded, copies)) = self.arrived.get_mut(&height)
+            && *recorded == hash
+        {
+            *copies -= 1;
+            if *copies == 0 {
+                self.arrived.remove(&height);
+            }
+        }
+    }
+
+    /// Clear the arrival of `hash` at `height`, every copy of it, if that is
+    /// the block that arrived there: it is stored. Returns whether it was.
+    fn take_arrival(&mut self, height: u32, hash: &BlockHash) -> bool {
+        if self.arrived.get(&height).is_some_and(|(recorded, _)| recorded == hash) {
+            self.arrived.remove(&height);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether `height` is in flight with its block arrived and waiting to
+    /// be stored.
+    pub fn is_arrived(&self, height: u32) -> bool {
+        self.arrived.contains_key(&height)
+    }
+
+    /// The peer delivered what it was asked for: it is alive.
+    fn credit_delivery(slots: &mut PeerSlots) {
+        slots.last_activity = Instant::now();
+        slots.last_delivery = Some(slots.last_activity);
+        slots.quiet_since = slots.last_activity;
+        slots.timed_out_since_delivery = false;
+        slots.consecutive_failures = 0;
+        slots.last_failure_at = None;
     }
 
     /// Handle peer disconnection: return in-flight heights to the pending pool.
@@ -506,6 +597,12 @@ impl IbdScheduler {
     pub fn peer_disconnected(&mut self, peer_id: PeerId) {
         if let Some(slots) = self.peer_slots.remove(&peer_id) {
             for height in slots.assigned {
+                // A block that arrived is in hand: it stays in flight, under
+                // a holder that is gone, until its store settles it. Asking
+                // another peer for it would only fetch it twice.
+                if self.arrived.contains_key(&height) {
+                    continue;
+                }
                 self.in_flight.remove(&height);
                 // in_flight_at is kept — see doc comment above. The holder's
                 // own request time goes with the holder.
@@ -553,7 +650,7 @@ impl IbdScheduler {
                 // The download timeout stands on its own: the stall clock
                 // restarts on every reassignment, and a peer whose heights
                 // keep timing out and coming back to it may never reach it.
-                !slots.assigned.is_empty()
+                slots.assigned.iter().any(|h| !self.arrived.contains_key(h))
                     && (now.duration_since(slots.quiet_since) > QUIET_DOWNLOAD_TIMEOUT
                         || (now.duration_since(slots.last_activity) > self.stall_timeout
                             && self.another_peer_delivered_within(id, now, self.stall_timeout)))
@@ -619,6 +716,8 @@ impl IbdScheduler {
         let stale: Vec<(u32, PeerId, bool, bool)> = self
             .in_flight
             .iter()
+            // An arrived block is no longer owed (see `arrived`).
+            .filter(|&(h, _)| !self.arrived.contains_key(h))
             .filter_map(|(&h, &p)| {
                 let holder_timeout = if h > self.connect_cursor && h <= near_cursor_end {
                     near_cursor_timeout
@@ -807,7 +906,8 @@ impl IbdScheduler {
             Some(&p) => p,
             None => return false,
         };
-        if owned_by != owner_peer {
+        // A notfound for a block already in hand changes nothing.
+        if owned_by != owner_peer || self.arrived.contains_key(&height) {
             return false;
         }
         self.in_flight.remove(&height);
@@ -848,6 +948,7 @@ impl IbdScheduler {
     pub fn mark_downloaded(&mut self, height: u32) {
         self.downloaded.insert(height);
         self.in_flight.remove(&height);
+        self.arrived.remove(&height);
         // Keep in_flight_at in sync with in_flight — otherwise it's a
         // slow memory leak in crash-resume paths, and a stale
         // in_flight_at entry with no matching in_flight makes
@@ -918,6 +1019,7 @@ impl IbdScheduler {
         let Some(peer_id) = self.in_flight.remove(&height) else {
             return false;
         };
+        self.arrived.remove(&height);
         self.in_flight_at.remove(&height);
         self.requested_at.remove(&height);
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
@@ -2072,6 +2174,113 @@ mod tests {
         }
 
         assert!(sched.is_complete());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The heights `peer` holds, with the hash wanted at each.
+    fn held_by(sched: &IbdScheduler, peer: PeerId) -> Vec<(u32, BlockHash)> {
+        sched.peer_slots[&peer].assigned.iter().map(|&h| (h, sched.height_to_hash[&h])).collect()
+    }
+
+    /// Wind back every clock a stall or timeout judgement reads, by `secs`.
+    fn age_everything(sched: &mut IbdScheduler, secs: u64) {
+        let then = Instant::now() - Duration::from_secs(secs);
+        for slots in sched.peer_slots.values_mut() {
+            slots.last_activity = then;
+            slots.quiet_since = then;
+        }
+        for at in sched.in_flight_at.values_mut().chain(sched.requested_at.values_mut()) {
+            *at = then;
+        }
+    }
+
+    /// #875: a block that has arrived and is waiting for its store is not
+    /// owed any more. However long the store takes, its peer is not judged
+    /// stalling for it and the height is not handed to another peer; a
+    /// disconnect leaves it in flight for the store to settle. A store that
+    /// fails makes the height owed again, under the clocks that kept running.
+    ///
+    /// Perturbation: drop the `arrived` filter from `take_stalled_peer` and
+    /// peer 1 is dropped; drop it from `release_stale_inflight` and its
+    /// heights are released.
+    #[test]
+    fn an_arrived_block_waiting_for_its_store_is_not_owed() {
+        let (cs, dir) = make_chain_state_with_headers(50);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let held = held_by(&sched, 1);
+        assert!(held.len() >= 3, "precondition: peer 1 holds several heights");
+        for &(h, hash) in &held {
+            sched.block_arrived(1, h, hash);
+        }
+        sched.note_delivering_peer(2);
+        age_everything(&mut sched, 700);
+        sched.note_delivering_peer(2);
+
+        assert_eq!(sched.take_stalled_peer(), None, "peer 1 owes nothing");
+        assert_eq!(sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)), 0);
+        for &(h, _) in &held {
+            assert!(sched.is_arrived(h));
+        }
+
+        // A store fails: that height is owed again, long overdue.
+        let (failed, failed_hash) = held[0];
+        sched.block_store_failed(failed, failed_hash);
+        assert_eq!(sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)), 1);
+        assert!(!sched.in_flight.contains_key(&failed));
+
+        // The peer goes; the blocks it delivered stay in flight, and their
+        // stores settle them.
+        sched.peer_disconnected(1);
+        let asked_of_3 = sched.assign_blocks(3);
+        for &(h, hash) in &held[1..] {
+            assert_eq!(sched.in_flight.get(&h), Some(&1), "height {h} stays in flight");
+            assert!(!asked_of_3.contains(&hash), "height {h} is not asked for again");
+            sched.block_received(1, h, hash);
+            assert!(!sched.in_flight.contains_key(&h));
+            assert!(!sched.is_arrived(h));
+            assert!(sched.downloaded.contains(&h), "height {h} is downloaded");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #875: the arrival credits the peer. A peer whose clock has run past
+    /// the stall timeout, and which then delivers one of the blocks it owes,
+    /// is alive, although that block's store has not finished and the peer
+    /// still owes the rest. Only the holder is credited, and only for the
+    /// block wanted at the height.
+    ///
+    /// Perturbation: drop `credit_delivery` from `block_arrived` and peer 1
+    /// is dropped.
+    #[test]
+    fn an_arrival_credits_its_peer_before_the_store() {
+        let (cs, dir) = make_chain_state_with_headers(50);
+        let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
+        sched.assign_blocks(1);
+        let held = held_by(&sched, 1);
+        sched.note_delivering_peer(2);
+        age_everything(&mut sched, 120);
+        sched.note_delivering_peer(2);
+
+        // Not the holder, and not the wanted block: no credit.
+        let (h, hash) = held[0];
+        assert!(!sched.block_arrived(3, h, hash), "not the holder");
+        assert!(!sched.block_arrived(1, h, held[1].1), "not the wanted block");
+        assert!(!sched.is_arrived(h));
+
+        assert!(sched.block_arrived(1, h, hash));
+        assert!(sched.is_arrived(h));
+
+        // The holder sends it again, and the first copy fails to store: the
+        // second may still be stored, so the height is not owed yet.
+        assert!(sched.block_arrived(1, h, hash));
+        sched.block_store_failed(h, hash);
+        assert!(sched.is_arrived(h), "a second copy is still waiting");
+        sched.block_store_failed(h, hash);
+        assert!(!sched.is_arrived(h), "owed again once every copy has failed");
+        assert_eq!(sched.take_stalled_peer(), None, "peer 1 has just delivered");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

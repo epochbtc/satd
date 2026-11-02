@@ -10,6 +10,7 @@ pub mod connection;
 pub mod dns;
 pub mod flow;
 pub mod ibd;
+pub mod ibd_store;
 pub mod limits;
 pub mod manager;
 pub mod opreturn_restore;

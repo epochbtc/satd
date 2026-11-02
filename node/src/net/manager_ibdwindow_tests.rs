@@ -122,7 +122,10 @@ fn restore_block_files(dir: &tempfile::TempDir) {
 fn a_local_write_failure_does_not_charge_the_sender() {
     type Store = fn(&PeerManager, PeerId, bitcoin::Block);
     let paths: [(&str, Store, u32); 2] = [
-        ("forward IBD", |pm, id, b| pm.handle_block_ibd(id, b, true), 10),
+        ("forward IBD", |pm, id, b| {
+            pm.handle_block_ibd(id, b, true, InFlight::adopt(None));
+            pm.wait_for_ibd_stores();
+        }, 10),
         ("background catch-up", |pm, id, b| pm.store_bg_block(id, b), 5),
     ];
     for (path, store, penalty) in paths {
@@ -432,7 +435,53 @@ fn an_unrequested_block_above_the_ibd_window_is_not_stored() {
         let _rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 400);
         let block = chain[height - 1].clone();
         let hash = block.block_hash();
-        pm.handle_block_ibd(1, block, requested);
+        pm.handle_block_ibd(1, block, requested, InFlight::adopt(None));
+        pm.wait_for_ibd_stores();
         assert_eq!(pm.chain_state.has_block_data(&hash), stored, "{what}");
     }
+}
+
+/// #875: a block that arrives during IBD while a connect holds `accept_lock`
+/// does not hold up the P2P task. `handle_block_ibd` returns with the block
+/// queued and its arrival credited; the store finishes once the lock is
+/// free. The message stays counted in flight until then, so a pong the peer
+/// sent behind the block still comes back after it is stored.
+///
+/// Perturbation: store inline in `handle_block_ibd` and the call waits on
+/// the lock.
+#[test]
+fn an_ibd_block_arriving_during_a_connect_does_not_hold_up_the_p2p_task() {
+    let chain = blocks(30);
+    let (pm, _dir) = mk_pm();
+    for b in &chain {
+        pm.chain_state.accept_header(&b.header).unwrap();
+    }
+    *pm.ibd.write() = Some(IbdScheduler::new(30, 0, &pm.chain_state, 20));
+    let _rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 30);
+    pm.ibd.write().as_mut().unwrap().assign_blocks(1);
+    let block = chain[0].clone();
+    let hash = block.block_hash();
+    let flow = Arc::new(crate::net::flow::PeerFlow::new());
+
+    let held = pm.chain_state.hold_accept_lock_for_test();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    {
+        let pm = pm.clone();
+        let in_flight = InFlight::new(Some(flow.clone()));
+        std::thread::spawn(move || {
+            pm.handle_block_ibd(1, block, true, in_flight);
+            let _ = done_tx.send(());
+        });
+    }
+    let returned = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    assert!(returned, "handle_block_ibd waited for accept_lock");
+    assert!(!pm.chain_state.has_block_data(&hash), "the store waits for the lock");
+    assert!(pm.ibd.read().as_ref().unwrap().is_arrived(1), "the arrival is credited");
+    assert_eq!(flow.in_flight(), 1, "the block message is still in flight");
+
+    drop(held);
+    pm.wait_for_ibd_stores();
+    assert!(pm.chain_state.has_block_data(&hash), "stored once the lock is free");
+    assert!(!pm.ibd.read().as_ref().unwrap().is_arrived(1), "the store settled the height");
+    assert!(flow.is_idle(), "the block message is done with");
 }
