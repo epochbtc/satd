@@ -85,7 +85,20 @@ sits idle between requests and returns its slot; with `-rpcservertimeout=0`
 an idle connection holds its slot until the client closes it, so 100 idle
 connections from any client that can reach the listener lock out every other
 client, `sat-cli` on loopback included. Keep the listener private
-(`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on. A peer
+(`-rpcbind` on loopback, or `-rpcallowip`) and leave the timeout on.
+
+A client that stops reading does not keep its slot either. A write that makes
+no progress for `-rpcservertimeout` closes a JSON-RPC connection, as
+libevent's write timeout does in Core, and 60 s does on Esplora and streamws
+and on JSON-RPC with `-rpcservertimeout=0`. The clock runs only while a write
+is stuck, so a large response to a slow reader, or an SSE stream or
+WebSocket waiting for its next event, is not cut off. Timeouts above a year
+are treated as a year.
+
+At shutdown the listeners stop accepting and close their connections: idle
+ones at once, a request in flight once it is answered, an SSE stream with
+the end of its response, and a streamws WebSocket with a `1001 Going Away`
+close frame. A peer
 outside the listener's allowlist (`-rpcallowip`, or `-rpcreadonlyallowip`
 on the read-only listeners) never takes a slot: the allowlist is checked at
 accept, before the cap. On a plain-HTTP listener the peer is answered `403`
