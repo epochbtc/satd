@@ -6689,14 +6689,57 @@ impl ChainState {
     /// on mainnet but is the wrong metric, and a difficulty-transition fork
     /// can make the shorter branch the heavier one.
     ///
+    /// Every block is held to the header rules before the walk descends
+    /// into it (issue #506): `check` is given the block's hash, its header,
+    /// its parent's entry and a lookup for its ancestors, and a block it
+    /// refuses is left out of the plan together with every block built on
+    /// it, exactly as `accept_header` keeps such a header, and so its
+    /// descendants, out of the block index. Neither the replayed chain nor the
+    /// side chains can then hold a block the live path would refuse on its
+    /// header, which matters because nothing after the plan checks those
+    /// rules again: `connect_block` checks neither the proof of work nor the
+    /// difficulty, and the reorg that may later connect an indexed side
+    /// branch goes through `connect_block`. The production rules are
+    /// [`Self::check_reindex_header`]; the ancestor lookup resolves only
+    /// blocks the walk has already accepted, so the difficulty schedule and
+    /// the median time past are those of the block's own branch.
+    ///
     /// Both walks are iterative — a mainnet chain is ~1M blocks deep and
-    /// recursion would overflow the stack.
+    /// recursion would overflow the stack. The heights of the accepted blocks
+    /// are held for the ancestor lookup while planning (~78 MB on mainnet,
+    /// freed on return).
     fn plan_reindex_chain(
         children: &std::collections::HashMap<BlockHash, Vec<BlockHash>>,
         header_by_hash: &std::collections::HashMap<BlockHash, ReindexHeaderRef>,
         genesis: BlockHash,
+        genesis_header: &bitcoin::block::Header,
+        check: &ReindexHeaderCheck<'_>,
     ) -> ReindexPlan {
-        use std::collections::{HashSet, VecDeque};
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        // Accepted blocks by hash, with their heights: genesis, and every
+        // block `check` passed. Blocks enter it parents first, since the walk
+        // is breadth-first from genesis.
+        let mut heights: HashMap<BlockHash, u32> = HashMap::new();
+        heights.insert(genesis, 0);
+        let entry_of = |heights: &HashMap<BlockHash, u32>, hash: &BlockHash| {
+            let height = *heights.get(hash)?;
+            let header = if *hash == genesis {
+                *genesis_header
+            } else {
+                header_by_hash.get(hash)?.header
+            };
+            Some(BlockIndexEntry {
+                header,
+                height,
+                status: BlockStatus::DataStored,
+                num_tx: 0,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            })
+        };
+        let mut rejected = 0usize;
 
         // Pass 1: breadth-first from genesis, carrying each block's height and
         // its chainwork relative to genesis (the genesis term is a constant
@@ -6732,6 +6775,9 @@ impl ChainState {
             let Some(child_hashes) = children.get(&hash) else {
                 continue;
             };
+            let Some(parent) = entry_of(&heights, &hash) else {
+                continue;
+            };
             for child in child_hashes {
                 // Every non-genesis node in `children` came from a scanned
                 // record, so its header is present; skip defensively rather
@@ -6739,6 +6785,18 @@ impl ChainState {
                 let Some(entry) = header_by_hash.get(child) else {
                     continue;
                 };
+                if let Err(e) = check(child, &entry.header, &parent, &|h| entry_of(&heights, h)) {
+                    tracing::warn!(
+                        block = %child,
+                        height = height + 1,
+                        error = %e,
+                        "reindex: block header breaks a consensus rule; not replaying or \
+                         indexing it, or any block built on it"
+                    );
+                    rejected += 1;
+                    continue;
+                }
+                heights.insert(*child, height + 1);
                 let child_work = add_u256(&work, &work_for_bits(entry.header.bits));
                 queue.push_back((*child, height + 1, child_work));
             }
@@ -6789,6 +6847,10 @@ impl ChainState {
                 continue;
             };
             for child in child_hashes {
+                // Only into blocks pass 1 accepted.
+                if !heights.contains_key(child) {
+                    continue;
+                }
                 let Some(entry) = header_by_hash.get(child) else {
                     continue;
                 };
@@ -6801,7 +6863,96 @@ impl ChainState {
             path,
             tip_height,
             side,
+            rejected,
         }
+    }
+
+    /// The header rules a flat-file reindex holds every block to while it
+    /// plans the replay (issue #506): the parts of `accept_header` that do not
+    /// depend on the network or the clock, in the order it applies them.
+    ///
+    /// * The difficulty bits against the retarget schedule
+    ///   (`check_difficulty`, with testnet4's timewarp rule and, since #838,
+    ///   signet's schedule).
+    /// * `bad-fork-prior-to-checkpoint`: below the highest checkpoint the
+    ///   block files hold, only that checkpoint's ancestors pass.
+    ///   `checkpoint_chain` holds them by height; see
+    ///   [`Self::reindex_checkpoint_chain`].
+    /// * `time-too-old` against the median time past of the block's own
+    ///   branch, and `bad-version`.
+    /// * The checkpoint hashes, which the live path checks in `accept_block`.
+    ///
+    /// The proof of work, bounded by the network's limit, was checked when
+    /// the scan read the header. The signet block solution needs the block
+    /// body and is checked where the block is read. `time-too-new` is not
+    /// applied: it judges a block against the clock at the moment it arrives,
+    /// and every block in the files arrived once; the live path does not
+    /// apply it to stored blocks either (`connect_stored_block`, the reorg),
+    /// and a clock that is now behind the files would otherwise drop blocks
+    /// that are valid.
+    fn check_reindex_header(
+        &self,
+        hash: &BlockHash,
+        header: &bitcoin::block::Header,
+        parent: &BlockIndexEntry,
+        ancestor: &dyn Fn(&BlockHash) -> Option<BlockIndexEntry>,
+        checkpoint_chain: Option<&[BlockHash]>,
+    ) -> Result<(), ChainError> {
+        let height = parent.height + 1;
+        validation::pow::check_difficulty(header, parent, self.network, ancestor)?;
+        if let Some(chain) = checkpoint_chain
+            && chain.get(height as usize) != Some(hash)
+        {
+            Self::check_fork_after_checkpoint(height, Some(chain.len() as u32 - 1))?;
+        }
+        let mtp = validation::pow::median_time_past_of(parent, ancestor);
+        connect::check_header_time_and_version(header, height, mtp, self.network)?;
+        if self.enforce_checkpoints
+            && !checkpoints::check_against_checkpoints(height, hash, &self.checkpoints)
+        {
+            return Err(ChainError::CheckpointMismatch(height));
+        }
+        Ok(())
+    }
+
+    /// The chain of the highest enforced checkpoint the block files hold, by
+    /// height from genesis: what `bad-fork-prior-to-checkpoint` measures a
+    /// reindexed block against. On the live path the rule refuses a new header
+    /// below the last checkpoint in the block index, whose ancestors are all
+    /// in the index already; here every block is new, so the ancestors are
+    /// named explicitly. A checkpoint whose ancestry does not reach genesis in
+    /// the files does not count, as it could not be in a live node's index.
+    /// `None` when checkpoints are not enforced or the files hold none past
+    /// genesis.
+    fn reindex_checkpoint_chain(
+        &self,
+        header_by_hash: &std::collections::HashMap<BlockHash, ReindexHeaderRef>,
+        genesis: BlockHash,
+    ) -> Option<Vec<BlockHash>> {
+        if !self.enforce_checkpoints {
+            return None;
+        }
+        let mut found: Vec<&Checkpoint> = self
+            .checkpoints
+            .iter()
+            .filter(|cp| cp.height > 0 && header_by_hash.contains_key(&cp.hash))
+            .collect();
+        found.sort_by_key(|cp| std::cmp::Reverse(cp.height));
+        'checkpoint: for cp in found {
+            let mut chain = vec![genesis; cp.height as usize + 1];
+            let mut cursor = cp.hash;
+            for h in (1..=cp.height).rev() {
+                let Some(entry) = header_by_hash.get(&cursor) else {
+                    continue 'checkpoint;
+                };
+                chain[h as usize] = cursor;
+                cursor = entry.header.prev_blockhash;
+            }
+            if cursor == genesis {
+                return Some(chain);
+            }
+        }
+        None
     }
 
     /// Rebuild the block index and UTXO set by streaming `blk*.dat` files.
@@ -6954,8 +7105,9 @@ impl ChainState {
                     // and persisted as the tip. Checking the hash against the
                     // claimed target closes that off: a harder target the block
                     // does not meet is rejected, and an easier one only lowers
-                    // its own score.
-                    if validation::pow::check_proof_of_work(&header).is_err() {
+                    // its own score. The target must also be one the network
+                    // allows (`powLimit`), as in `accept_header`.
+                    if validation::pow::check_proof_of_work_bounded(&header, self.network).is_err() {
                         tracing::warn!(
                             block = %hash,
                             "reindex: flat-file record fails proof of work; not indexing it"
@@ -7037,7 +7189,17 @@ impl ChainState {
         // project to a height that will never be connected. Derive the true
         // target from the block tree instead: the most-work branch's tip is the
         // block Phase 3 will actually connect to.
-        let plan = Self::plan_reindex_chain(&children, &header_by_hash, genesis_hash);
+        let checkpoint_chain = self.reindex_checkpoint_chain(&header_by_hash, genesis_hash);
+        let plan = Self::plan_reindex_chain(
+            &children,
+            &header_by_hash,
+            genesis_hash,
+            &bitcoin::constants::genesis_block(self.network).header,
+            &|hash, header, parent, ancestor| {
+                self.check_reindex_header(hash, header, parent, ancestor, checkpoint_chain.as_deref())
+            },
+        );
+        drop(checkpoint_chain);
         // Always state which chain was selected, even when there is no fork.
         //
         // The failure this replay path exists to fix was "it replayed the wrong
@@ -7054,6 +7216,7 @@ impl ChainState {
             tip_height = plan.tip_height,
             connecting = plan.path.len(),
             side_chain_blocks = plan.side.len(),
+            rejected_headers = plan.rejected,
             scanned = total,
             "Phase 2: selected the most-work branch to replay"
         );
@@ -7618,34 +7781,27 @@ impl ChainState {
     /// flat-file reindex found but did not connect.
     ///
     /// Deliberately narrow:
-    ///   * Proof of work is re-checked. Re-checking PoW is what stops a
-    ///     doctored flat file from injecting an index entry claiming more
-    ///     chainwork than it did the work for, which is the property that
-    ///     matters for selection: work cannot be forged, so such a branch
-    ///     cannot *win*.
+    ///   * The header rules were applied by the planner (issue #506): every
+    ///     block in `side` passed [`Self::check_reindex_header`] — the
+    ///     difficulty schedule, the checkpoints, `time-too-old` and
+    ///     `bad-version` — and the scan's bounded proof-of-work check. That is
+    ///     what makes these entries safe to activate later: `reorg_to`
+    ///     connects through `connect::connect_block`, which checks neither the
+    ///     proof of work nor the difficulty. The proof of work is checked
+    ///     again here, at no cost worth counting.
     ///   * The record is reconciled with the entry about to be written, and
-    ///     run through `check_block`. This path is the only producer of
-    ///     `DataStored` entries whose bytes were never validated — on the live
-    ///     path `accept_block` checks a block before it is written to the flat
-    ///     files. It matters because nothing downstream re-derives them:
-    ///     `connect_stored_block` reads `flat_pos` and connects, without
-    ///     comparing the bytes to the entry's hash or header and without
-    ///     `check_block`. So a mispointed or corrupt record indexed here is
-    ///     applied verbatim if the branch is ever activated, while the tip
-    ///     advances to the *indexed* hash.
-    ///   * Contextual validity is still not checked — see the note below.
-    ///
-    ///     Note what this does NOT buy. An earlier version of this comment
-    ///     said the reorg path validates before connecting; it does not.
-    ///     `reorg_to` connects through `connect::connect_block`, which runs
-    ///     neither `check_proof_of_work` nor `check_difficulty` — every
-    ///     difficulty-schedule, timestamp and checkpoint rule lives in
-    ///     `accept_header`/`accept_block`, which the reindex bypasses. So a
-    ///     side entry with wrong `bits` for its retarget window can be indexed
-    ///     and, if later extended, connected, where the live path would have
-    ///     rejected it. The main-chain reindex path has the same gap and
-    ///     always has, so this is not a regression — but it is not covered by
-    ///     the reorg path either.
+    ///     run through `check_block` and the signet solution check. This path
+    ///     is the only producer of `DataStored` entries whose bytes were never
+    ///     validated — on the live path `accept_block` checks a block before
+    ///     it is written to the flat files. It matters because nothing
+    ///     downstream re-derives them: `connect_stored_block` reads `flat_pos`
+    ///     and connects, without comparing the bytes to the entry's hash or
+    ///     header and without `check_block`. So a mispointed or corrupt record
+    ///     indexed here is applied verbatim if the branch is ever activated,
+    ///     while the tip advances to the *indexed* hash.
+    ///   * A block whose parent was not indexed is not indexed either, as
+    ///     `accept_header` refuses a header whose parent it does not hold.
+    ///     `side` lists parents before children, so one pass settles it.
     ///   * No `height_hash` entry is ever written. The height→hash index names
     ///     the *active* chain; letting a losing branch write there is the
     ///     bad-cb-height pollution that wedged a mainnet node (#322).
@@ -7669,18 +7825,32 @@ impl ChainState {
         let mut batch = crate::storage::StoreBatch::default();
         let mut indexed = 0u64;
         let mut skipped = 0u64;
+        // Side blocks left unindexed, whose children must stay unindexed too.
+        let mut not_indexed: std::collections::HashSet<BlockHash> = std::collections::HashSet::new();
         for (hash, height, work) in side {
             let Some(entry) = header_by_hash.get(hash) else {
                 skipped += 1;
+                not_indexed.insert(*hash);
                 continue;
             };
-            if validation::pow::check_proof_of_work(&entry.header).is_err() {
+            if not_indexed.contains(&entry.header.prev_blockhash) {
+                tracing::warn!(
+                    block = %hash,
+                    height,
+                    "reindex: side-chain block's parent was not indexed; not indexing"
+                );
+                skipped += 1;
+                not_indexed.insert(*hash);
+                continue;
+            }
+            if validation::pow::check_proof_of_work_bounded(&entry.header, self.network).is_err() {
                 tracing::warn!(
                     block = %hash,
                     height,
                     "reindex: side-chain block fails proof of work; not indexing"
                 );
                 skipped += 1;
+                not_indexed.insert(*hash);
                 continue;
             }
             // `num_tx` is not derivable from the 80-byte header phase 1 kept,
@@ -7695,6 +7865,7 @@ impl ChainState {
                         "reindex: side-chain block unreadable from flat file; not indexing"
                     );
                     skipped += 1;
+                    not_indexed.insert(*hash);
                     continue;
                 }
                 Err(e) => {
@@ -7705,6 +7876,7 @@ impl ChainState {
                         "reindex: side-chain block's strip record does not verify; not indexing"
                     );
                     skipped += 1;
+                    not_indexed.insert(*hash);
                     continue;
                 }
             };
@@ -7720,6 +7892,7 @@ impl ChainState {
                     "reindex: side-chain record does not match the header scanned from it;                      not indexing"
                 );
                 skipped += 1;
+                not_indexed.insert(*hash);
                 continue;
             }
             crate::chain::connect::debug_assert_block_height(&*self.store, block, *height);
@@ -7731,6 +7904,7 @@ impl ChainState {
                     "reindex: side-chain block fails context-free validation; not indexing"
                 );
                 skipped += 1;
+                not_indexed.insert(*hash);
                 continue;
             }
             if let Err(e) = self.check_signet_solution(block) {
@@ -7741,6 +7915,7 @@ impl ChainState {
                     "reindex: side-chain block fails its signet solution; not indexing"
                 );
                 skipped += 1;
+                not_indexed.insert(*hash);
                 continue;
             }
             batch.block_index_puts.push((
@@ -10908,7 +11083,20 @@ struct ReindexPlan {
     /// Genesis-reachable blocks off that branch, as `(hash, height,
     /// chainwork-relative-to-genesis)`. Indexed but never connected.
     side: Vec<(BlockHash, u32, [u8; 32])>,
+    /// Blocks left out because their header breaks a rule (issue #506),
+    /// not counting the blocks built on them.
+    rejected: usize,
 }
+
+/// The header rules [`ChainState::plan_reindex_chain`] holds each block to:
+/// `(hash, header, parent, ancestor lookup)`.
+type ReindexHeaderCheck<'a> = dyn Fn(
+        &BlockHash,
+        &bitcoin::block::Header,
+        &BlockIndexEntry,
+        &dyn Fn(&BlockHash) -> Option<BlockIndexEntry>,
+    ) -> Result<(), ChainError>
+    + 'a;
 
 /// The hashes a replay gives `check_block` and `connect_block` for one
 /// block read through `read_stored_block_direct`.
@@ -20214,6 +20402,20 @@ pub(crate) mod tests {
                 2,
             )
             .expect("write corrupt sibling record");
+        // A block built on the corrupt sibling, intact itself. Its parent is
+        // never indexed, so neither may it be (issue #506): `accept_header`
+        // refuses a header whose parent it does not hold. Perturbation: drop
+        // the `not_indexed` parent check in `index_reindex_side_chain` and the
+        // child is indexed, failing its assertion.
+        let child = build_test_block(sibling_hash, 3, 1_709_001_000);
+        cs.flat_files
+            .lock()
+            .write_block(
+                &bitcoin::consensus::serialize(&child),
+                network_magic(Network::Regtest),
+                3,
+            )
+            .expect("write the sibling's child");
 
         cs.flush_coin_cache().expect("flush before snapshotting");
         cs.store.flush().unwrap();
@@ -20227,6 +20429,10 @@ pub(crate) mod tests {
         assert!(
             re.store.get_block_index(&sibling_hash).is_none(),
             "a block whose bytes fail validation was indexed as DataStored —              `connect_stored_block` would apply them verbatim if the branch won"
+        );
+        assert!(
+            re.store.get_block_index(&child.block_hash()).is_none(),
+            "a side block whose parent was not indexed was indexed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -20695,7 +20901,11 @@ pub(crate) mod tests {
         re.flush_coin_cache().expect("flush reindexed state");
         assert_eq!(re.store.coin_count(), expected_coins);
 
-        // A's abandoned tail (a3..a5) is indexed but not on the active chain.
+        // A's abandoned tail (a3..a5) is indexed but not on the active chain,
+        // with the chainwork the live node had for it: selection compares it
+        // with the active chain's should the branch be extended (#507).
+        // Perturbation: drop `genesis_work` from the side-chain entries and
+        // the chainwork assertion fails.
         for (i, h) in a_hashes.iter().enumerate().skip(2) {
             let e = re
                 .store
@@ -20703,6 +20913,12 @@ pub(crate) mod tests {
                 .expect("abandoned branch must stay indexed");
             assert_eq!(e.status, BlockStatus::DataStored);
             assert_eq!(e.height, i as u32 + 1);
+            assert_eq!(
+                e.chainwork,
+                cs.get_block_index(h).expect("live entry").chainwork,
+                "side-chain chainwork at height {} differs from the live node's",
+                i + 1
+            );
             assert_ne!(
                 re.store.get_block_hash_by_height(i as u32 + 1),
                 Some(*h),
@@ -21301,6 +21517,81 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The prefetch half of the test above (#507): the MTP a prefetch worker
+    /// hands the connect thread (`PreprocessedBlock::mtp`, which
+    /// `reindex_connect_prefetched` passes to `connect_block`) must be the
+    /// replayed branch's, resolved through the plan, and not the one the
+    /// polluted height→hash rows give.
+    ///
+    /// Same fixture: a stale sibling owns height 10's row, which drags the
+    /// height-index median below block 13's locktime.
+    ///
+    /// Perturbation: pass `None` instead of `plan` to
+    /// `median_time_past_with_plan` in `prefetch_block` and the worker reports
+    /// the polluted median, failing the `pre.mtp` assertion.
+    #[test]
+    fn reindex_prefetch_takes_mtp_from_the_plan_not_the_height_index() {
+        const BASE: u32 = 1_705_500_000;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut hashes = vec![genesis_hash];
+        for h in 1..=12u32 {
+            let b = build_test_block(parent, h, BASE + 100 * h);
+            parent = cs.accept_block(&b).expect("accept main block").hash();
+            hashes.push(parent);
+        }
+        let stale = build_test_block(hashes[9], 10, BASE + 650);
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
+        assert_eq!(cs.tip_hash(), hashes[12], "the sibling must not win the tip");
+
+        let bogus = OutPoint {
+            txid: stale.txdata[0].compute_txid(),
+            vout: 7,
+        };
+        let b13 = build_test_block_timelocked(hashes[12], 13, BASE + 1300, bogus, BASE + 680);
+        let h13 = b13.block_hash();
+        store_block_without_connecting(&cs, &b13, 13);
+
+        let plan = crate::chain::replay_plan::plan_replay_from_block_index(
+            &*cs.store,
+            genesis_hash,
+            Some(hashes[12]),
+        )
+        .expect("plan the replay");
+        assert_eq!(plan.hash_at(13), Some(h13), "plan must reach block 13");
+
+        pollute_height_hash(&cs, 10, stale_hash);
+        cs.mtp_cache.lock().clear();
+        assert_eq!(
+            cs.get_median_time_past(13),
+            BASE + 650,
+            "fixture: the polluted rows must give a different median"
+        );
+
+        let pre = crate::chain::prefetch::prefetch_block(
+            &*cs.store,
+            cs.blocks_dir(),
+            &cs.blocks_xor_key,
+            Some(&plan),
+            13,
+            false,
+            cs.primary_engine(),
+            Network::Regtest,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("the worker must preprocess block 13");
+        assert_eq!(pre.hash, h13);
+        assert_eq!(
+            pre.mtp,
+            BASE + 700,
+            "the prefetch worker took MTP from the height index, not the plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The indexed header must match the header in the block file.
     ///
     /// `get_block_index` keys on the block hash, but nothing constrains the
@@ -21496,66 +21787,28 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Side-chain blocks are indexed without a height→hash row because that row
-    /// names the active chain. `accept_headers` restores a "missing" row for
-    /// any `DataStored` entry whose height is vacant, so a side block ABOVE the
-    /// selected tip would get one written on the next headers message —
-    /// re-creating the active-chain pollution the omission exists to prevent.
-    /// Those blocks must be left unindexed.
-    #[test]
-    fn reindex_from_flat_files_does_not_index_side_blocks_above_the_tip() {
-        let (cs, dir) = make_chain_state();
-        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
-
-        // Main chain to 5, then a competing branch from block 2 that overtakes
-        // to 8 — so after the reorg the abandoned A-branch tail sits at heights
-        // 3..5, all at or below the winning tip.
-        let mut parent = genesis_hash;
-        let mut a_hashes = Vec::new();
-        for h in 1..=5u32 {
-            let b = build_test_block(parent, h, 1_704_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept A block").hash();
-            a_hashes.push(parent);
-        }
-        let mut parent = a_hashes[1];
-        for h in 3..=8u32 {
-            let b = build_test_block(parent, h, 1_704_100_000 + h);
-            parent = cs.accept_block(&b).expect("accept B block").hash();
-        }
-        let b_tip = parent;
-        assert_eq!(cs.tip_hash(), b_tip);
-
-        let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
-        assert_eq!(re.tip_height(), 8);
-
-        // Every indexed side block must sit at a height the active chain also
-        // occupies, so `accept_headers` can never see a vacant height for one.
-        for h in a_hashes.iter().skip(2) {
-            let e = re.store.get_block_index(h).expect("side block indexed");
-            assert!(
-                e.height <= re.tip_height(),
-                "indexed a side block above the tip at height {}",
-                e.height
-            );
-            assert!(
-                re.store.get_block_hash_by_height(e.height).is_some(),
-                "height {} is vacant, so accept_headers would claim it for the side block",
-                e.height
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A block can legitimately appear on disk more than once (crash-resume
-    /// re-write, re-download). Phase 1 must collapse the copies: a repeated
-    /// `children` edge makes the planner re-walk that block's whole subtree per
-    /// copy and emit duplicate side-chain index entries.
+    /// re-write, re-download). Phase 1 must collapse the copies, keeping the
+    /// first: a repeated `children` edge makes the planner re-walk that
+    /// block's whole subtree per copy, which is exponential in the number of
+    /// duplicated ancestors.
+    ///
+    /// What the scan's first-copy-wins guard leaves observable is the record
+    /// each block is replayed from, so that is what this pins: every block is
+    /// indexed at its first copy. The fixture also carries the shape a
+    /// production datadir had, three records of genesis. Nothing walks the
+    /// children of genesis's null parent, so those copies are harmless to the
+    /// planner with or without the guard; they are here so the replay is
+    /// shown to finish over them.
+    ///
+    /// Perturbation: delete the `header_by_hash.contains_key` guard in the
+    /// scan and blocks 2 and 3 are replayed from their second copies, so the
+    /// position assertion fails.
     #[test]
     fn reindex_from_flat_files_tolerates_duplicate_records() {
         let (cs, dir) = make_chain_state();
-        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
 
         let mut parent = genesis_hash;
         let mut blocks = Vec::new();
@@ -21567,11 +21820,23 @@ pub(crate) mod tests {
         let main_tip = parent;
         cs.flush_coin_cache().expect("flush before snapshotting");
         let expected_coins = cs.store.coin_count();
+        let first_copies: Vec<(u32, u32)> = blocks
+            .iter()
+            .map(|b| {
+                let e = cs.get_block_index(&b.block_hash()).expect("indexed");
+                (e.file_number, e.data_pos)
+            })
+            .collect();
 
-        // Append second copies of blocks 2 and 3 to the flat files, mimicking
-        // the duplicate records a real datadir accumulates.
+        // Append second copies of genesis (twice) and of blocks 2 and 3 to the
+        // flat files, mimicking the duplicate records a real datadir
+        // accumulates.
         {
             let mut flat = cs.flat_files.lock();
+            for _ in 0..2 {
+                flat.write_block(&serialize(&genesis), network_magic(Network::Regtest), 0)
+                    .expect("write duplicate genesis record");
+            }
             for (b, height) in blocks[1..3].iter().zip(2..) {
                 flat.write_block(&serialize(b), network_magic(Network::Regtest), height)
                     .expect("write duplicate record");
@@ -21590,6 +21855,16 @@ pub(crate) mod tests {
             expected_coins,
             "a duplicate record must not double-apply its UTXO delta"
         );
+        for (i, (b, first)) in blocks.iter().zip(&first_copies).enumerate() {
+            let e = re.get_block_index(&b.block_hash()).expect("replayed");
+            assert_eq!(
+                (e.file_number, e.data_pos),
+                *first,
+                "block {} was replayed from a later copy, not the first: the scan \
+                 let a duplicate record replace the one it had kept",
+                i + 1
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -21621,6 +21896,401 @@ pub(crate) mod tests {
         assert!(
             re.store.get_block_index(&stale_hash).is_none(),
             "a halted replay must not index side-chain blocks it did not reach"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `block` with its nonce moved until its hash misses its own target: a
+    /// record a flipped nonce byte leaves behind, which still parses.
+    fn failing_proof_of_work(mut block: Block) -> Block {
+        while validation::pow::check_proof_of_work(&block.header).is_ok() {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
+
+    /// Write `blocks` as consecutive records of `dir/blocks/blk00000.dat`.
+    fn blocks_in_one_file(dir: &std::path::Path, blocks: &[Block]) {
+        let blocks_dir = dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        let bytes: Vec<u8> = blocks.iter().flat_map(blk_record).collect();
+        std::fs::write(blocks_dir.join("blk00000.dat"), bytes).unwrap();
+    }
+
+    /// A regtest chain of `n` blocks on genesis, built but not accepted.
+    fn chain_not_accepted(n: u32, time_base: u32) -> Vec<Block> {
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        (1..=n)
+            .map(|h| {
+                let b = build_test_block(parent, h, time_base + h);
+                parent = b.block_hash();
+                b
+            })
+            .collect()
+    }
+
+    /// Issue #507, item 4: a record that fails the scan's proof-of-work
+    /// check is dropped, which severs its children from the tree and ends the
+    /// plan at its parent. The replay must stop there, connect nothing at or
+    /// above the dropped record, and say that the files ended short.
+    ///
+    /// Perturbation: delete the scan's proof-of-work check and the dropped
+    /// record is planned and connected at height 3 (`connect_block` checks no
+    /// proof of work), failing the tip assertion.
+    #[test]
+    fn a_reindex_over_a_record_that_fails_proof_of_work_stops_below_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut blocks = chain_not_accepted(6, 1_709_400_000);
+        let bad = failing_proof_of_work(blocks[2].clone());
+        let bad_hash = bad.block_hash();
+        blocks[2] = bad;
+        blocks_in_one_file(tmp.path(), &blocks);
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6))
+            .expect("the node can sync the rest from peers, so a short replay must not fail");
+        assert_eq!(
+            re.tip_height(),
+            2,
+            "the replay went past a record that fails proof of work"
+        );
+        assert_eq!(re.tip_hash(), blocks[1].block_hash());
+        assert!(
+            re.store.get_block_index(&bad_hash).is_none(),
+            "a record that fails proof of work was indexed"
+        );
+        for (i, b) in blocks.iter().enumerate().skip(3) {
+            assert!(
+                re.store.get_block_index(&b.block_hash()).is_none(),
+                "block {} lost its parent and must not be indexed",
+                i + 1
+            );
+        }
+        let short = reindex_warning(&re, "reindex.short")
+            .expect("a replay the dropped record cut short must say so");
+        assert!(short.message.contains("height 2, below height 6"), "{}", short.message);
+        assert_eq!(
+            short.context["orphaned_blocks"], 1,
+            "block 4 is where the stored chain picks up without its parent"
+        );
+    }
+
+    /// Issue #507, item 4, at its limit: when the dropped record is block 1,
+    /// nothing in the files chains from genesis. The `plan.path.is_empty()`
+    /// guard is all that keeps that from passing for a completed reindex at
+    /// height 0.
+    ///
+    /// Perturbation: delete the `plan.path.is_empty() && total > 0` guard and
+    /// the replay returns `Ok` at height 0, failing the `expect_err`.
+    #[test]
+    fn a_reindex_whose_first_block_fails_proof_of_work_fails_rather_than_finish_at_genesis() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut blocks = chain_not_accepted(4, 1_709_500_000);
+        blocks[0] = failing_proof_of_work(blocks[0].clone());
+        blocks_in_one_file(tmp.path(), &blocks);
+
+        let re = reindexing_chain_state_over(tmp.path());
+        let err = re
+            .reindex_from_flat_files(None, None, None)
+            .expect_err("block files with no chain out of genesis must not pass for a reindex");
+        assert!(matches!(err, ChainError::BadPrevBlock), "unexpected error: {err:?}");
+        assert_eq!(re.tip_height(), 0);
+    }
+
+    /// Issue #507, item 7: a side branch the reindex indexed must be one the
+    /// node can still reorg onto. Extend it past the active tip after the
+    /// reindex and the node must move to it, with the UTXO set to match.
+    /// Selection reads the side entries' chainwork and the reorg reads their
+    /// block data, both written by `index_reindex_side_chain`.
+    ///
+    /// Perturbation: drop `genesis_work` from the side-chain entries and the
+    /// extended branch ties the active chain instead of beating it, so the node
+    /// stays put and the tip assertion fails.
+    #[test]
+    fn a_side_branch_indexed_by_a_reindex_is_activated_once_extended_past_the_tip() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut a = Vec::new();
+        for h in 1..=5u32 {
+            let b = build_test_block(parent, h, 1_709_600_000 + h);
+            parent = cs.accept_block(&b).expect("accept A block").hash();
+            a.push(b);
+        }
+        // Side branch off a2: s3, s4, below the tip, so the live node keeps A.
+        let mut parent = a[1].block_hash();
+        let mut s = Vec::new();
+        for h in 3..=4u32 {
+            let b = build_test_block(parent, h, 1_709_700_000 + h);
+            parent = cs.accept_block(&b).expect("store side block").hash();
+            s.push(b);
+        }
+        assert_eq!(cs.tip_hash(), a[4].block_hash());
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), a[4].block_hash());
+        for b in &s {
+            assert_eq!(
+                re.store.get_block_index(&b.block_hash()).map(|e| e.status),
+                Some(BlockStatus::DataStored)
+            );
+        }
+
+        // Extend the side branch to height 6, one past the active tip.
+        let mut parent = s[1].block_hash();
+        for h in 5..=6u32 {
+            let b = build_test_block(parent, h, 1_709_700_000 + h);
+            parent = re.accept_block(&b).expect("extend the side branch").hash();
+        }
+        assert_eq!(
+            re.tip_hash(),
+            parent,
+            "the node did not reorg onto the reindexed side branch extended past its tip"
+        );
+        assert_eq!(re.tip_height(), 6);
+        re.flush_coin_cache().expect("flush");
+        let coinbase = |b: &Block| OutPoint {
+            txid: b.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        assert!(re.get_coin(&coinbase(&s[0])).is_some(), "s3's coinbase must be live");
+        assert!(re.get_coin(&coinbase(&a[2])).is_none(), "a3's coinbase must be gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #507: every end-to-end fixture above has one fork point, and the
+    /// datadir behind #491 had seventeen. This one has a fork at genesis, a
+    /// side branch, and a branch off that side branch, and the replay must
+    /// still follow the main chain, leave the UTXO set as the live node had
+    /// it, and index every side block at its height with the live node's
+    /// chainwork.
+    ///
+    /// Perturbation: in the planner's side-chain pass, stop descending into
+    /// the children of blocks off the selected path; `s4` and `t4` (a side
+    /// block's children) are then not indexed and the loop fails.
+    #[test]
+    fn reindex_from_flat_files_handles_a_tree_with_several_fork_points() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main = Vec::new();
+        for h in 1..=6u32 {
+            let b = build_test_block(parent, h, 1_709_800_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block").hash();
+            main.push(parent);
+        }
+        let main_tip = parent;
+        let accept = |parent: BlockHash, h: u32, t: u32| {
+            let b = build_test_block(parent, h, t);
+            cs.accept_block(&b).expect("store side block").hash()
+        };
+        // A fork at genesis.
+        let x1 = accept(genesis_hash, 1, 1_709_900_001);
+        // A side branch off main block 2, and a branch off that branch.
+        let s3 = accept(main[1], 3, 1_709_910_003);
+        let s4 = accept(s3, 4, 1_709_910_004);
+        let t4 = accept(s3, 4, 1_709_920_004);
+        assert_eq!(cs.tip_hash(), main_tip);
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        let expected_coins = cs.store.coin_count();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), main_tip);
+        re.flush_coin_cache().expect("flush reindexed state");
+        assert_eq!(re.store.coin_count(), expected_coins);
+        for (i, h) in main.iter().enumerate() {
+            assert_eq!(re.store.get_block_hash_by_height(i as u32 + 1), Some(*h));
+        }
+        for (name, hash, height) in [("x1", x1, 1), ("s3", s3, 3), ("s4", s4, 4), ("t4", t4, 4)] {
+            let e = re
+                .store
+                .get_block_index(&hash)
+                .unwrap_or_else(|| panic!("side block {name} was not indexed"));
+            assert_eq!(e.status, BlockStatus::DataStored, "{name}");
+            assert_eq!(e.height, height, "{name}");
+            assert_eq!(
+                e.chainwork,
+                cs.get_block_index(&hash).unwrap().chainwork,
+                "{name}'s chainwork differs from the live node's"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `block` re-mined at `bits`: a block that did the work its header
+    /// claims, whatever the schedule says its bits should be.
+    fn mined_at_bits(mut block: Block, bits: u32) -> Block {
+        block.header.bits = bitcoin::pow::CompactTarget::from_consensus(bits);
+        block.header.nonce = 0;
+        while validation::pow::check_proof_of_work_bounded(&block.header, Network::Regtest).is_err() {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    /// Append `block` to `cs`'s block files without accepting it: a record
+    /// the live path would have refused, as hostile or damaged files can hold.
+    fn write_unaccepted(cs: &ChainState, block: &Block, height: u32) {
+        cs.flat_files
+            .lock()
+            .write_block(&serialize(block), network_magic(Network::Regtest), height)
+            .expect("write record");
+    }
+
+    /// Main chain of `n` accepted blocks on `cs`, returning their hashes.
+    fn accepted_main_chain(cs: &ChainState, n: u32, time_base: u32) -> Vec<BlockHash> {
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        (1..=n)
+            .map(|h| {
+                let b = build_test_block(parent, h, time_base + h);
+                parent = cs.accept_block(&b).expect("accept main block").hash();
+                parent
+            })
+            .collect()
+    }
+
+    /// Issue #506: the replay must not follow a branch whose difficulty bits
+    /// break the schedule, however much work it carries. Regtest never
+    /// retargets, so a block at harder bits than the network's does real work
+    /// (the scan's proof-of-work check passes it) and outweighs several
+    /// regtest blocks, yet `accept_header` refuses it as `bad-diffbits`.
+    /// Before the planner applied the header rules, the branch won selection
+    /// on its work and was connected, since `connect_block` checks no
+    /// difficulty; it is now left out, and the honest chain is replayed.
+    ///
+    /// Perturbation: drop the `check_difficulty` call from
+    /// `check_reindex_header` and the heavy block becomes the tip at height 3,
+    /// failing the tip assertion.
+    #[test]
+    fn a_reindex_does_not_follow_a_heavier_branch_whose_bits_are_off_schedule() {
+        let (cs, dir) = make_chain_state();
+        let main = accepted_main_chain(&cs, 5, 1_710_000_000);
+        let heavy = mined_at_bits(build_test_block(main[1], 3, 1_710_100_003), 0x2000_ffff);
+        assert!(
+            cs.accept_block(&heavy).is_err(),
+            "fixture: the live path must refuse the off-schedule block"
+        );
+        let easy = work_for_bits(bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff));
+        let three_easy = add_u256(&add_u256(&easy, &easy), &easy);
+        assert!(
+            compare_u256(&work_for_bits(heavy.header.bits), &three_easy) > 0,
+            "fixture: the off-schedule block must outweigh the three main blocks above the fork"
+        );
+        write_unaccepted(&cs, &heavy, 3);
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(
+            re.tip_hash(),
+            main[4],
+            "the replay followed a branch whose bits break the difficulty schedule"
+        );
+        assert_eq!(re.tip_height(), 5);
+        assert!(
+            re.store.get_block_index(&heavy.block_hash()).is_none(),
+            "a block with off-schedule bits was indexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #506: a side block whose timestamp is not above its branch's
+    /// median time past (`time-too-old`) must not be indexed, and nor may a
+    /// block built on it, which `accept_header` would refuse for want of a
+    /// parent.
+    ///
+    /// Perturbation: drop the `check_header_time_and_version` call from
+    /// `check_reindex_header` and both blocks are indexed as side chain,
+    /// failing the first `is_none` assertion.
+    #[test]
+    fn a_reindex_does_not_index_a_side_block_older_than_its_median_time_past() {
+        const BASE: u32 = 1_710_200_000;
+        let (cs, dir) = make_chain_state();
+        let main = accepted_main_chain(&cs, 5, BASE);
+        // a3's MTP is the median of genesis, a1, a2 and a3: a2's time.
+        let old = build_test_block(main[2], 4, BASE + 2);
+        assert!(
+            cs.accept_block(&old).is_err(),
+            "fixture: the live path must refuse the block as time-too-old"
+        );
+        let child = build_test_block(old.block_hash(), 5, BASE + 100);
+        write_unaccepted(&cs, &old, 4);
+        write_unaccepted(&cs, &child, 5);
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), main[4]);
+        assert!(
+            re.store.get_block_index(&old.block_hash()).is_none(),
+            "a side block older than its median time past was indexed"
+        );
+        assert!(
+            re.store.get_block_index(&child.block_hash()).is_none(),
+            "a block built on a refused side block was indexed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #506: the checkpoint rules. A side block at a checkpoint's height
+    /// that is not the checkpoint is refused (`accept_block`'s checkpoint
+    /// check), and so is a side block below the highest checkpoint the files
+    /// hold (`bad-fork-prior-to-checkpoint`), while that checkpoint's own
+    /// ancestors replay as normal.
+    ///
+    /// Perturbation: drop the `check_against_checkpoints` test from
+    /// `check_reindex_header` and the first run indexes the sibling; drop the
+    /// `check_fork_after_checkpoint` call and the second run does.
+    #[test]
+    fn a_reindex_does_not_index_side_blocks_the_checkpoints_rule_out() {
+        let (cs, dir) = make_chain_state();
+        let main = accepted_main_chain(&cs, 5, 1_710_300_000);
+        let sibling = build_test_block(main[1], 3, 1_710_400_003);
+        let sibling_hash = cs.accept_block(&sibling).expect("store the sibling").hash();
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        // A checkpoint at the sibling's own height, naming the main block.
+        let mut re = reindexing_chain_state_over(&dir);
+        re.set_checkpoints_for_test(vec![Checkpoint { height: 3, hash: main[2] }]);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), main[4]);
+        assert!(
+            re.store.get_block_index(&sibling_hash).is_none(),
+            "a side block contradicting the checkpoint at its height was indexed"
+        );
+
+        // A checkpoint above the sibling: it forks below the last checkpoint.
+        let mut re = reindexing_chain_state_over(&dir);
+        re.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: main[3] }]);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(re.tip_hash(), main[4], "the checkpoint's ancestors must replay");
+        assert!(
+            re.store.get_block_index(&sibling_hash).is_none(),
+            "a side block forking below the last checkpoint was indexed"
+        );
+
+        // With checkpoints off, the same sibling is an ordinary side block.
+        let mut re = reindexing_chain_state_over(&dir);
+        re.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: main[3] }]);
+        re.set_enforce_checkpoints(false);
+        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        assert_eq!(
+            re.store.get_block_index(&sibling_hash).map(|e| e.status),
+            Some(BlockStatus::DataStored)
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -22258,6 +22928,23 @@ pub(crate) mod tests {
         (children, headers)
     }
 
+    /// [`ChainState::plan_reindex_chain`] with no header rules: the planner
+    /// tests below are about branch selection, over synthetic hashes that no
+    /// header hashes to.
+    fn plan_permissively(
+        children: &std::collections::HashMap<BlockHash, Vec<BlockHash>>,
+        headers: &std::collections::HashMap<BlockHash, ReindexHeaderRef>,
+        genesis: BlockHash,
+    ) -> ReindexPlan {
+        ChainState::plan_reindex_chain(
+            children,
+            headers,
+            genesis,
+            &bitcoin::constants::genesis_block(Network::Regtest).header,
+            &|_, _, _, _| Ok(()),
+        )
+    }
+
     fn test_hash(n: u8) -> BlockHash {
         BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([n; 32]))
     }
@@ -22296,7 +22983,7 @@ pub(crate) mod tests {
             (x, y, EASY),
         ]);
 
-        let plan = ChainState::plan_reindex_chain(&children, &headers, genesis);
+        let plan = plan_permissively(&children, &headers, genesis);
         assert_eq!(
             plan.tip_height, 4,
             "connect target must be the deepest genesis-reachable block"
@@ -22318,6 +23005,16 @@ pub(crate) mod tests {
     /// Selection is by cumulative chainwork, not depth. A single block at a
     /// harder target outweighs two at an easy one; picking by depth would
     /// replay the wrong branch across a difficulty transition.
+    ///
+    /// This is also the test of the `height <= tip_height` filter on side
+    /// blocks: a lighter-but-longer branch is the only shape that puts a side
+    /// block above the selected tip, and that shape needs blocks of differing
+    /// work. Regtest's difficulty never changes, so no regtest chain of valid
+    /// blocks has it, and this cannot be built from real flat files (#507).
+    ///
+    /// Perturbation: select by depth (compare heights instead of work) and the
+    /// path assertion fails; drop `&& height <= tip_height` from the side
+    /// filter and `deep2` is reported, failing the side assertion.
     #[test]
     fn plan_reindex_chain_picks_most_work_not_deepest() {
         const EASY: u32 = 0x207fffff; // regtest floor — work ≈ 2
@@ -22332,7 +23029,7 @@ pub(crate) mod tests {
             (genesis, heavy, HARD),
         ]);
 
-        let plan = ChainState::plan_reindex_chain(&children, &headers, genesis);
+        let plan = plan_permissively(&children, &headers, genesis);
         assert_eq!(
             plan.path,
             vec![heavy],
@@ -22354,11 +23051,19 @@ pub(crate) mod tests {
     /// Scoped to same-height siblings on purpose — see `plan_reindex_chain`:
     /// across differing depths BFS order makes the shallower tip win, not the
     /// first-seen one.
+    ///
+    /// The sibling seen first has the HIGHER hash, so a lowest-hash tie-break
+    /// (the rule `replay_plan::plan_replay_from_block_index` uses) would pick
+    /// the other one: the test tells the two rules apart.
+    ///
+    /// Perturbation: compare with `>= 0` instead of `> 0` and the later sibling
+    /// wins; break ties on the lower hash and the later sibling wins too.
     #[test]
     fn plan_reindex_chain_equal_work_keeps_first_seen() {
         const EASY: u32 = 0x207fffff;
         let genesis = test_hash(0);
-        let (a, first, second) = (test_hash(1), test_hash(2), test_hash(3));
+        let (a, first, second) = (test_hash(1), test_hash(3), test_hash(2));
+        assert!(second < first, "the fixture needs the first-seen sibling to hash higher");
 
         let (children, headers) = synthetic_reindex_tree(&[
             (genesis, a, EASY),
@@ -22366,7 +23071,7 @@ pub(crate) mod tests {
             (a, second, EASY),
         ]);
 
-        let plan = ChainState::plan_reindex_chain(&children, &headers, genesis);
+        let plan = plan_permissively(&children, &headers, genesis);
         assert_eq!(plan.path, vec![a, first]);
         let side: Vec<_> = plan.side.iter().map(|s| s.0).collect();
         assert_eq!(side, vec![second]);
@@ -22381,7 +23086,7 @@ pub(crate) mod tests {
         let genesis = test_hash(0);
         let children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
         let headers: HashMap<BlockHash, ReindexHeaderRef> = HashMap::new();
-        let plan = ChainState::plan_reindex_chain(&children, &headers, genesis);
+        let plan = plan_permissively(&children, &headers, genesis);
         assert_eq!(plan.tip_height, 0);
         assert!(plan.path.is_empty());
         assert!(plan.side.is_empty());

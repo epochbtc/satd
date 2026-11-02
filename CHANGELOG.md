@@ -41,6 +41,7 @@ full in the in-development
 - Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
 - Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
+- Consensus: `-reindex` holds every block in the block files to the header rules header sync applies (difficulty schedule, median time past, version, checkpoints), and neither replays nor indexes one that breaks them, or any block built on it (#506).
 
 ## Releases
 
