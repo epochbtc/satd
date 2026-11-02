@@ -19,23 +19,23 @@
 # Bitcoin Core: the P2P interop canary and the block-acceptance differential
 # (canary, nightly fuzz, satd/tests/common/core_node.rs, the fuzz target).
 # The Bitcoin Core project's own image; lncm/bitcoind stopped at v28.
-CORE_IMAGE=bitcoin/bitcoin:31.1@sha256:da25cedc66b1daefff9f412ee196c901a899c3fa68a33b20849c3e08b5c40d63
+CORE_IMAGE=bitcoin/bitcoin:32.1@sha256:d2454aaf2ff4ce1ebbc49f4aa05ed044c907b849a80a3f4c0ad23e488e50bbe0
 
 # LND as a Neutrino light client.
-LND_IMAGE=lightninglabs/lnd:v0.21.3-beta@sha256:d29074335f3bffb2ac0e789b0d023c24fbb85ce67ecbfb7d677399842fe0535c
+LND_IMAGE=lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8
 
 # Core Lightning over the bcli plugin.
-CLN_IMAGE=elementsproject/lightningd:v26.06.7@sha256:0421a5f0d1b2e1ad639edfa17d777816040e3850d91bae7f2d32186d9c1e6da4
+CLN_IMAGE=elementsproject/lightningd:v26.06.9@sha256:de74289ddcccb68cd60543b08b2b8594002d819125d200492e17a95166d56577
 
 # NBXplorer, alone and under BTCPay Server.
-NBXPLORER_IMAGE=nicolasdorier/nbxplorer:2.6.14@sha256:51b0f1a614e8dab54ccc847519e54be4e8dab6363af6d1dda4ebaca6ff4bbb5b
+NBXPLORER_IMAGE=nicolasdorier/nbxplorer:2.6.21@sha256:117b061886f7b1f0a9ebdb0792c0195c77abda855b76dd51b0481bb4cae3fdc3
 
 # BTCPay Server.
-BTCPAY_IMAGE=btcpayserver/btcpayserver:2.4.4@sha256:c264aa08cd32a469bd30d41978b73dc8bb2de1503ce67bdb0ab8fd5d934fb614
+BTCPAY_IMAGE=btcpayserver/btcpayserver:2.4.7@sha256:313b6178d8566784b8ec1811b80836df9157b9ee821098785bb0853ed1ef9df0
 
 # Electrum, the reference wallet: the AppImage and its SHA-256.
-ELECTRUM_VERSION=4.8.2
-ELECTRUM_APPIMAGE_SHA256=6310ebd0b7965196ecc3eb7e1bfead260cdc9033a8847204561b9762e62a87c0
+ELECTRUM_VERSION=4.8.3
+ELECTRUM_APPIMAGE_SHA256=aabe3bb2c99ffca172a004b0fd6f4afdf1b204079f7691b65f23bc5b63a9de0c
 
 # The Stratum canaries.
 #   cpuminer: the Stratum V1 CPU miner the Stratum V2 Reference
@@ -46,9 +46,9 @@ CPUMINER_SHA256=5fc7219fbb72dad32d64f11cd579383e53d8872f95309594fad2a07554a541f7
 #   The Stratum V2 Reference Implementation (github.com/stratum-mining/sv2-apps):
 #   the tag and commit the canary workflow builds mining_device from, and the
 #   Job Declaration client image. The JD canary's template source is CORE_IMAGE.
-SRI_TAG=v0.7.0
-SRI_COMMIT=d7d556d1a3c7e1c26dfccd076b491a38c038a5e0
-SRI_JD_CLIENT_IMAGE=stratumv2/jd_client_sv2:v0.7.0@sha256:485853aa8e58bc75c2cef2fb45f537880b047e3b3c4eac352ca8576d07415f2b
+SRI_TAG=v0.8.0
+SRI_COMMIT=7f49074357e54da4f5b13acfcc29dc3cbb9e541f
+SRI_JD_CLIENT_IMAGE=stratumv2/jd_client_sv2:v0.8.0@sha256:95bfe11b224c1985f25188a0efc58c1e798458fe838b053d4d10ed86dba3a715
 
 # Sidecars. Their major versions are chosen, not tracked: the weekly check
 # does not report them, and a bump refreshes the digest.
@@ -71,16 +71,17 @@ ELECTRUM_BASE_IMAGE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701
 WARNET_COMMIT=c89fa2ecdc9e54aee3929e3f2d977e6a9b917063
 WARNET_CORE_IMAGE=bitcoindevproject/bitcoin:31.0@sha256:d6f7c80579a846949986894f2e80a63178535ab14f9db62e25ad7077de89757e
 WARNET_COMMANDER_IMAGE=bitcoindevproject/commander:latest@sha256:5a3d88c2d50a1a7d48f98cf0a94e17e72497e0cfbe1c8cc2dafc90ac2e1865f4
-#   The cluster: kind, and the kubectl and helm Warnet drives it with (helm is
-#   the version Warnet's own installer names). Each download is checked
+#   The cluster: kind, and the kubectl and helm Warnet drives it with. helm
+#   started at the version Warnet's own installer names and is now tracked
+#   against helm's releases like the other pins. Each download is checked
 #   against its SHA-256.
 KIND_VERSION=v0.33.0
 KIND_SHA256=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
 KIND_NODE_IMAGE=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 KUBECTL_VERSION=v1.37.1
 KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
-HELM_VERSION=v4.2.2
-HELM_SHA256=9adafecab4d406853bba163a70e9f104f47dbbf65ce24b7653bae7e36150bcb6
+HELM_VERSION=v4.3.1
+HELM_SHA256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
 
 # rbitcoin (github.com/reardencode/rbitcoin), for the nightly three-implementation
 # Warnet rig. rbitcoin publishes no image; scripts/canary/warnet/build-rbitcoin.sh
