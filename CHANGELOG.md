@@ -40,6 +40,7 @@ full in the in-development
 - Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
 - Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
 - Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
+- Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 
 ## Releases
 
