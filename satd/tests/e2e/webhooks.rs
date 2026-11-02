@@ -27,6 +27,8 @@ use crate::common::StreamingNode;
 pub struct Received {
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// When the receiver finished reading the request.
+    pub at: std::time::Instant,
 }
 
 impl Received {
@@ -345,6 +347,7 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Received> {
     Some(Received {
         headers,
         body: String::from_utf8_lossy(&body).to_string(),
+        at: std::time::Instant::now(),
     })
 }
 
@@ -813,14 +816,66 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     // a restart takes. The queued blocks go with it.
     write_alertfile(&dir, &receiver, "chain", "\"chain\"", true);
     crate::streaming::sighup_with_conf(&sn, "").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Nothing from the missed span comes back...
-    let after = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
-    assert_eq!(
-        after, before,
-        "the missed span was re-sent; a best-effort hook resumes at the head and \
-         does not carry history across a reload"
+    // The hook is live: new blocks still arrive. Deliveries are serial and in
+    // order, so the old generation, still retrying heights 2..=5, cannot
+    // deliver a later block: the first one to arrive means the new generation
+    // is running. That is the reload instant the check below is judged from.
+    // A block mined before the reload subscribed the new generation reaches
+    // only the old one and is dropped with it, so keep mining until one lands.
+    let mut probes = 0;
+    loop {
+        crate::streaming::mine_n(&sn, 1).await;
+        probes += 1;
+        let arrived = async {
+            loop {
+                if receiver.all_attempts().await.iter().any(|r| r.json()["body"]["height"].as_u64() >= Some(6)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), arrived).await.is_ok() {
+            break;
+        }
+        assert!(probes < 12, "no block after the reload reached the hook");
+    }
+    // Stamped from the probe's own arrival, not from when the loop noticed it.
+    let reloaded = receiver
+        .all_attempts()
+        .await
+        .iter()
+        .filter(|r| r.json()["body"]["height"].as_u64() >= Some(6))
+        .map(|r| r.at)
+        .min()
+        .expect("a probe arrived");
+
+    // Nothing from the missed span comes back. Judged by arrival time rather
+    // than by a count taken before the reload: a retry already in flight at
+    // the reload can land just after it without any history having crossed the
+    // reload (#794); two seconds of grace cover that. A generation that did
+    // carry its queue would retry each height again after `retry_delay` of the
+    // attempts it had made, plus up to 25 % jitter. The window is sized one
+    // step past the most attempts any missed height has had, so it still holds
+    // the next retry when one more attempt lands inside the grace.
+    let attempts = receiver.all_attempts().await;
+    let most = (2..=5u64)
+        .map(|h| attempts.iter().filter(|r| r.json()["body"]["height"] == h).count())
+        .max()
+        .unwrap_or(0) as u32;
+    let window = satd_alert::retry_delay(most + 1).mul_f64(1.25) + Duration::from_secs(3);
+    tokio::time::sleep(window.saturating_sub(reloaded.elapsed())).await;
+    let late: Vec<_> = receiver
+        .all_attempts()
+        .await
+        .into_iter()
+        .filter(|r| missed(r) && r.at > reloaded + Duration::from_secs(2))
+        .map(|r| r.json()["body"]["height"].clone())
+        .collect();
+    assert!(
+        late.is_empty(),
+        "the missed span was re-sent after the reload (heights {late:?}, watched {window:?}); \
+         a best-effort hook resumes at the head and does not carry history across a reload"
     );
 
     // ...and no in-band notice is synthesized about it either.
@@ -832,12 +887,6 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
             .any(|r| r.json()["body"]["category"] == "lagged"),
         "a lagged body was delivered; gap accounting was removed with the cursor"
     );
-
-    // The hook is live: the next block still arrives.
-    crate::streaming::mine_n(&sn, 1).await;
-    receiver
-        .wait_for(60, |r| r.json()["body"]["height"] == 6)
-        .await;
 }
 
 /// **Release criterion: what a webhook *does* carry across a daemon restart.**
