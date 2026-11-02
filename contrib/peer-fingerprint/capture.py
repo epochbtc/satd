@@ -45,7 +45,9 @@ on it.
 
 A peer that opens with a v2 (BIP324) handshake is recorded as a v2
 attempt and the connection closed; in --listen mode the recorder then
-waits for the peer's v1 retry.
+waits --v1-retry-wait seconds for the peer's v1 retry. A peer that never
+retries gets a fixture with "v1_after_v2": false and no transcript, which is
+all a v1-only node learns from it.
 
 The fixture holds commands, sizes, timings and decoded fields. It never
 holds an address: the version message's address fields and nonce are
@@ -339,6 +341,29 @@ class Recorder:
         return probes
 
 
+def fixture_head(args, connection, v2_attempts):
+    return {
+        "capture_format": CAPTURE_FORMAT,
+        "label": args.label,
+        "implementation": args.implementation,
+        "implementation_version": args.implementation_version,
+        "network": args.network,
+        "connection": connection,
+        "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
+        "recorder": {"greeting": GREETING, "protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
+                     "user_agent": USER_AGENT, "passive_wait_s": args.wait,
+                     "probe_wait_s": args.probe_wait if args.probes else None},
+        "v2_attempts_before_v1": v2_attempts,
+    }
+
+
+def no_v1_result(args, v2_attempts):
+    d = fixture_head(args, "inbound", v2_attempts)
+    d.update({"v1_after_v2": False, "version": None, "commands": [], "received": [], "sent": [],
+              "probes": [], "closed_by_peer": None, "error": None})
+    return d
+
+
 def capture(args):
     magic = bytes.fromhex(MAGIC[args.network])
     v2_attempts = 0
@@ -352,6 +377,11 @@ def capture(args):
             try:
                 sock, _ = srv.accept()
             except socket.timeout:
+                if v2_attempts:
+                    # The peer tried v2 and did not come back over v1: that
+                    # is the whole transcript a v1-only node gets.
+                    srv.close()
+                    return no_v1_result(args, v2_attempts)
                 sys.exit(f"no connection on port {args.listen} within {args.accept_timeout} s")
             conn = Conn(sock, magic)
             try:
@@ -360,6 +390,7 @@ def capture(args):
             except NotV1:
                 v2_attempts += 1
                 sock.close()
+                srv.settimeout(args.v1_retry_wait)
                 if v2_attempts > 2:
                     sys.exit("peer kept opening non-v1 connections")
             except (Closed, TimeoutError):
@@ -395,18 +426,9 @@ def capture(args):
         if m["phase"] != "handshake" and m["phase"] != "passive":
             break
         handshake_cmds.append(m["command"])
-    return {
-        "capture_format": CAPTURE_FORMAT,
-        "label": args.label,
-        "implementation": args.implementation,
-        "implementation_version": args.implementation_version,
-        "network": args.network,
-        "connection": connection,
-        "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
-        "recorder": {"greeting": GREETING, "protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
-                     "user_agent": USER_AGENT, "passive_wait_s": args.wait,
-                     "probe_wait_s": args.probe_wait if args.probes else None},
-        "v2_attempts_before_v1": v2_attempts,
+    d = fixture_head(args, connection, v2_attempts)
+    d.update({
+        "v1_after_v2": True if v2_attempts else None,
         "version": version,
         "commands": handshake_cmds,
         "received": rec.received,
@@ -414,7 +436,8 @@ def capture(args):
         "probes": probes,
         "closed_by_peer": rec.closed,
         "error": error,
-    }
+    })
+    return d
 
 
 def main():
@@ -435,6 +458,8 @@ def main():
     ap.add_argument("--probe-wait", type=float, default=5.0, help="seconds to wait for each probe's answer (default 5)")
     ap.add_argument("--unknown-command", default="fpprobe", help="command name for the unknown-message probe")
     ap.add_argument("--accept-timeout", type=float, default=120.0)
+    ap.add_argument("--v1-retry-wait", type=float, default=30.0,
+                    help="after a v2 attempt, how long to wait for the peer to retry over v1 (default 30)")
     ap.add_argument("--out", help="write the fixture here (default stdout)")
     args = ap.parse_args()
     result = capture(args)
