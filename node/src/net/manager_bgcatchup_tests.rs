@@ -40,8 +40,9 @@ impl Rig {
         Rig { cs: Arc::new(cs), dir, health, rx, shutdown_tx, thread: None }
     }
 
-    /// Run the real connector loop on its own thread, waiting 1 ms (rather
-    /// than 1 s) between two attempts of one height.
+    /// Run the real connector loop on its own thread with its clocks shrunk:
+    /// 1 ms between two connect attempts, a handoff that escalates after
+    /// 200 ms of failing and retries every 10 ms.
     fn start(&mut self) {
         let cs = self.cs.clone();
         let signal = Arc::new((parking_lot::Mutex::new(false), Condvar::new()));
@@ -51,7 +52,13 @@ impl Rig {
                 &cs,
                 &signal,
                 &shutdown,
-                Duration::from_millis(1),
+                BgCatchupTiming {
+                    connect_retry_wait: Duration::from_millis(1),
+                    handoff_warn_after: Duration::from_millis(200),
+                    handoff_min_backoff: Duration::from_millis(10),
+                    handoff_max_backoff: Duration::from_millis(10),
+                    handoff_poll: Duration::from_millis(10),
+                },
             );
         }));
     }
@@ -271,4 +278,91 @@ fn a_replaced_snapshot_does_not_inherit_the_old_failures() {
         "the new snapshot's count starts at zero"
     );
     rig.cs.bg_connect_faults.0.store(0, Ordering::Relaxed);
+}
+
+/// Collect status events until `done` holds of what has been seen.
+fn collect_until(rig: &mut Rig, what: &str, done: impl Fn(&[StatusEvent]) -> bool) -> Vec<StatusEvent> {
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done(&seen) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}: {seen:?}");
+        seen.extend(rig.status_events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    seen
+}
+
+fn handoff(e: &StatusEvent, state: StatusState) -> bool {
+    e.kind == StatusKind::AssumeutxoHandoffFailing && e.state == state
+}
+
+fn attempts(e: &StatusEvent) -> u32 {
+    e.details.get("attempts").and_then(|a| a.parse().ok()).expect("attempts detail")
+}
+
+/// A replacement at the same height, mid-handoff, clears the standing handoff
+/// alert and starts its own failing-since clock.
+///
+/// Perturbation: keying the snapshot check on the height alone (as the
+/// handoff branch's own check did) leaves the old alert standing through the
+/// replacement, no `cleared` arrives, and this times out.
+#[test]
+fn a_same_height_replacement_clears_the_handoff_alert() {
+    let mut rig = Rig::new(3);
+    rig.cs.bg_handoff_faults.store(u32::MAX, Ordering::Relaxed);
+    rig.start();
+    collect_until(&mut rig, "the handoff alert", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
+
+    // Same height, another anchor block.
+    let other = rig.cs.get_block_hash_by_height(2).unwrap();
+    rig.cs
+        .attach_background(rig.dir.join("chainstate_background2"), 3, other, [7; 32], 64, -1)
+        .unwrap();
+    let seen = collect_until(&mut rig, "a clear and a fresh raise", |s| {
+        s.iter().position(|e| handoff(e, StatusState::Cleared)).is_some_and(|i| {
+            s[i..].iter().any(|e| handoff(e, StatusState::Raised))
+        })
+    });
+    let raised = seen.iter().rev().find(|e| handoff(e, StatusState::Raised)).unwrap();
+    assert_eq!(raised.details.get("height").map(String::as_str), Some("3"));
+}
+
+/// A snapshot detached and attached again starts a fresh handoff episode: its
+/// alert waits out the escalation delay again, counting its own attempts, not
+/// the old one's.
+///
+/// Perturbation: removing `reset_episode!()` from both the `None` arm and the
+/// snapshot check carries the old failing-since clock and attempt count
+/// across, so the second raise comes at once with more attempts than the
+/// first episode had, and the last assertion fails.
+#[test]
+fn a_reattached_snapshot_starts_a_fresh_handoff_episode() {
+    let mut rig = Rig::new(3);
+    rig.cs.bg_handoff_faults.store(u32::MAX, Ordering::Relaxed);
+    let snapshot = rig.cs.tip_hash();
+    let anchor = utxo_anchor(&rig.cs);
+    rig.start();
+    collect_until(&mut rig, "the handoff alert", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
+    // Let the first episode run up its count well past the escalation point.
+    std::thread::sleep(Duration::from_millis(600));
+    let first = rig
+        .cs
+        .warnings()
+        .list()
+        .into_iter()
+        .find(|w| w.id == StatusKind::AssumeutxoHandoffFailing.warning_id())
+        .and_then(|w| w.context["attempts"].as_str().and_then(|a| a.parse::<u32>().ok()))
+        .expect("the standing entry counts attempts");
+
+    rig.cs.detach_background_for_test();
+    collect_until(&mut rig, "the clear", |s| s.iter().any(|e| handoff(e, StatusState::Cleared)));
+    rig.cs
+        .attach_background(rig.dir.join("chainstate_background2"), 3, snapshot, anchor, 64, -1)
+        .unwrap();
+    let seen = collect_until(&mut rig, "the second raise", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
+    let second = attempts(seen.iter().find(|e| handoff(e, StatusState::Raised)).unwrap());
+    assert!(
+        second < first,
+        "the second episode reported {second} attempts, the first had {first} when it ended"
+    );
 }

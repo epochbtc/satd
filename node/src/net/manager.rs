@@ -497,6 +497,46 @@ const CONNECT_RETRY_WARN_EVERY: u32 = 10;
 /// Wait between two connect attempts of one height.
 const CONNECT_RETRY_WAIT: Duration = Duration::from_secs(1);
 
+/// The clocks of the AssumeUTXO background connector
+/// (`PeerManager::bg_catchup_connect_loop`). Production uses
+/// [`Self::PRODUCTION`]; tests shrink them.
+#[derive(Clone, Copy)]
+struct BgCatchupTiming {
+    /// Wait between two connect attempts of one height.
+    connect_retry_wait: Duration,
+    /// How long the handoff must keep failing before the condition is
+    /// escalated to an alert. Long enough that a brief disk hiccup resolves
+    /// without paging anyone, short enough that a real stall is reported in
+    /// well under a minute.
+    ///
+    /// Measured in elapsed time rather than in attempts, because an attempt
+    /// count is not a clock here: the wait between attempts is a timeout, not a
+    /// period, and `note_bg_block_stored` wakes it on every stored background
+    /// block, duplicates included, which a peer can send at will. Counting
+    /// attempts would let a peer turn a 200ms hiccup into a page by feeding us
+    /// blocks we already have.
+    handoff_warn_after: Duration,
+    /// Floor between two handoff attempts, doubling up to
+    /// `handoff_max_backoff` while the failure persists. Without it those same
+    /// peer-driven wakeups spin `retry_background_handoff` as fast as blocks
+    /// arrive, and that call flushes the coin cache and can rehash the whole
+    /// background UTXO set.
+    handoff_min_backoff: Duration,
+    handoff_max_backoff: Duration,
+    /// The longest the handoff branch sleeps before it looks again.
+    handoff_poll: Duration,
+}
+
+impl BgCatchupTiming {
+    const PRODUCTION: Self = Self {
+        connect_retry_wait: CONNECT_RETRY_WAIT,
+        handoff_warn_after: Duration::from_secs(10),
+        handoff_min_backoff: Duration::from_secs(1),
+        handoff_max_backoff: Duration::from_secs(30),
+        handoff_poll: Duration::from_secs(1),
+    };
+}
+
 /// Record (or refresh) a connector's retry notice: the block it cannot connect
 /// and how many times it has tried. Both connectors use it, each under its own
 /// id, and clear that id when a block connects.
@@ -8569,60 +8609,53 @@ impl PeerManager {
             chain_state,
             bg_connect_signal,
             shutdown,
-            CONNECT_RETRY_WAIT,
+            BgCatchupTiming::PRODUCTION,
         );
     }
 
-    /// [`Self::bg_catchup_connect_loop`] with the wait between two connect
-    /// attempts of one height as a parameter, so a test can run the whole
-    /// retry budget without waiting it out.
+    /// [`Self::bg_catchup_connect_loop`] with its clocks as a parameter, so a
+    /// test can run the retry budget and the handoff escalation without
+    /// waiting them out.
     fn bg_catchup_connect_loop_with(
         chain_state: &Arc<ChainState>,
         bg_connect_signal: &Arc<(parking_lot::Mutex<bool>, Condvar)>,
         shutdown: &tokio::sync::watch::Receiver<bool>,
-        connect_retry_wait: Duration,
+        timing: BgCatchupTiming,
     ) {
         use crate::events::{StatusEvent, StatusKind};
         let mut since_flush: u64 = 0;
-        /// How long the handoff must keep failing before the condition is
-        /// escalated to a warning. Long enough that a brief disk hiccup
-        /// resolves without paging anyone, short enough that a real stall is
-        /// reported in well under a minute.
-        ///
-        /// Measured in elapsed time rather than in attempts, because an attempt
-        /// count is not a clock here: the wait below is a 1s *timeout*, not a
-        /// period, and `note_bg_block_stored` wakes it on every stored
-        /// background block — including duplicates, which a peer can send at
-        /// will. Counting attempts would let a peer turn a 200ms hiccup into a
-        /// page by feeding us blocks we already have.
-        const HANDOFF_RETRY_WARN_AFTER: Duration = Duration::from_secs(10);
-        /// Floor between two handoff attempts, doubling up to a ceiling while
-        /// the failure persists. Without it those same peer-driven wakeups spin
-        /// `retry_background_handoff` as fast as blocks arrive — and that call
-        /// flushes the coin cache and can rehash the whole background UTXO set,
-        /// which is not something to run in a hot loop on a node that is
-        /// already failing its I/O.
-        const HANDOFF_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(1);
-        const HANDOFF_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
         /// The `getwarnings` id of the every-tenth-retry notice, kept apart
         /// from the IBD connector's `connect.retry`: the two connectors run at
         /// the same time, and each clears its own id on progress.
         const BG_CONNECT_RETRY_WARNING_ID: &str = "assumeutxo.connect_retry";
         let alerts = chain_state.background_alerts();
         let warnings = chain_state.warnings();
+        // Per-snapshot episode state, for the connect retries and the handoff
+        // retries alike. Both are about one snapshot's blocks, so both start
+        // over together whenever the snapshot changes or goes away.
+        //
+        // `retry_count` counts failed connect attempts toward the next report
+        // and starts over after each one, like the IBD connector's (whose
+        // restart does the same); `connect_failures` is the total since the
+        // last block connected, for the report.
+        let mut retry_count: u32 = 0;
+        let mut connect_failures: u32 = 0;
         let mut handoff_retry_failures: u32 = 0;
         let mut handoff_first_failure: Option<Instant> = None;
         let mut handoff_last_attempt: Option<Instant> = None;
-        let mut handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
-        let mut handoff_snapshot: Option<u32> = None;
-        // Failed connect attempts at the current height: `retry_count` counts
-        // toward the next report and starts over after each one, like the IBD
-        // connector's (whose restart does the same); `connect_failures` is the
-        // total since the last block connected, for the report.
-        let mut retry_count: u32 = 0;
-        let mut connect_failures: u32 = 0;
-        // The snapshot the counters above and the stall alert describe.
-        let mut connect_snapshot: Option<(u32, bitcoin::BlockHash)> = None;
+        let mut handoff_backoff = timing.handoff_min_backoff;
+        // The snapshot the state above and the two alerts describe.
+        let mut episode_snapshot: Option<(u32, bitcoin::BlockHash)> = None;
+        macro_rules! reset_episode {
+            () => {
+                retry_count = 0;
+                connect_failures = 0;
+                handoff_retry_failures = 0;
+                handoff_first_failure = None;
+                handoff_last_attempt = None;
+                handoff_backoff = timing.handoff_min_backoff;
+            };
+        }
         loop {
             if *shutdown.borrow() {
                 return;
@@ -8634,9 +8667,8 @@ impl PeerManager {
                     // was ever loaded), so neither condition can stand, and
                     // nothing the counters count is left to retry.
                     warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
-                    retry_count = 0;
-                    connect_failures = 0;
-                    connect_snapshot = None;
+                    reset_episode!();
+                    episode_snapshot = None;
                     alerts.clear(
                         warnings,
                         StatusKind::AssumeutxoCatchupStalled,
@@ -8669,23 +8701,25 @@ impl PeerManager {
                 return;
             }
 
-            // A `loadtxoutset` can replace the snapshot under us. The retry
-            // notice, the stall and the failure count are about the old one's
-            // blocks; carrying them over would report the old snapshot's
-            // failures against the new one.
+            // A `loadtxoutset` can replace the snapshot under us, at the same
+            // height or another. The retry notice, both alerts and every
+            // counter and clock are about the old one; carrying them over
+            // would report the old snapshot's failures, and its failing-since
+            // clock, against the new one. Keyed on the anchor hash as well as
+            // the height, so a same-height replacement counts.
             let snapshot_id = (bg.snapshot_height(), bg.snapshot_hash());
-            if connect_snapshot != Some(snapshot_id) {
-                if connect_snapshot.is_some() {
+            if episode_snapshot != Some(snapshot_id) {
+                if episode_snapshot.is_some() {
                     warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
-                    alerts.clear(
-                        warnings,
+                    for kind in [
                         StatusKind::AssumeutxoCatchupStalled,
-                        "the AssumeUTXO snapshot was replaced",
-                    );
+                        StatusKind::AssumeutxoHandoffFailing,
+                    ] {
+                        alerts.clear(warnings, kind, "the AssumeUTXO snapshot was replaced");
+                    }
                 }
-                retry_count = 0;
-                connect_failures = 0;
-                connect_snapshot = Some(snapshot_id);
+                reset_episode!();
+                episode_snapshot = Some(snapshot_id);
             }
 
             let next_height = bg.tip_height() + 1;
@@ -8703,22 +8737,8 @@ impl PeerManager {
                 // retrying and nothing reported. That is issue #545's "halts
                 // silently and permanently", reached without any connect ever
                 // failing.
-                // A `loadtxoutset` can replace the snapshot under us. Counting
-                // the new one's failures on top of the old one's would report
-                // the wrong total for the wrong height, so start clean.
-                if handoff_snapshot != Some(bg.snapshot_height()) {
-                    alerts.clear(
-                        warnings,
-                        StatusKind::AssumeutxoHandoffFailing,
-                        "the AssumeUTXO snapshot was replaced",
-                    );
-                    handoff_snapshot = Some(bg.snapshot_height());
-                    handoff_retry_failures = 0;
-                    handoff_first_failure = None;
-                    handoff_last_attempt = None;
-                    handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
-                }
-
+                // A replaced snapshot starts its own handoff episode: see the
+                // snapshot check above.
                 let due = handoff_last_attempt.is_none_or(|at| at.elapsed() >= handoff_backoff);
                 if due {
                     handoff_last_attempt = Some(Instant::now());
@@ -8746,7 +8766,7 @@ impl PeerManager {
                             );
                             handoff_retry_failures = 0;
                             handoff_first_failure = None;
-                            handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
+                            handoff_backoff = timing.handoff_min_backoff;
                         }
                         Err(e) => {
                             // Transient by assumption (disk full, a failed
@@ -8759,8 +8779,8 @@ impl PeerManager {
                             let failing_since =
                                 *handoff_first_failure.get_or_insert_with(Instant::now);
                             handoff_backoff =
-                                (handoff_backoff * 2).min(HANDOFF_RETRY_MAX_BACKOFF);
-                            if failing_since.elapsed() >= HANDOFF_RETRY_WARN_AFTER {
+                                (handoff_backoff * 2).min(timing.handoff_max_backoff);
+                            if failing_since.elapsed() >= timing.handoff_warn_after {
                                 // Raised again on every failure, not only the
                                 // first: a repeat raise refreshes the
                                 // `getwarnings` entry's `count`, `last_seen`
@@ -8800,7 +8820,7 @@ impl PeerManager {
                 let (lock, cvar) = &**bg_connect_signal;
                 let mut ready = lock.lock();
                 *ready = false;
-                let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                let _ = cvar.wait_for(&mut ready, timing.handoff_poll);
                 continue;
             }
 
@@ -9010,7 +9030,7 @@ impl PeerManager {
                     // A plain sleep, not a wait on `bg_connect_signal`: that
                     // is poked by every stored background block, duplicates
                     // included, and the retry budget is meant to be a clock.
-                    let until = Instant::now() + connect_retry_wait;
+                    let until = Instant::now() + timing.connect_retry_wait;
                     while Instant::now() < until && !*shutdown.borrow() {
                         std::thread::sleep(
                             until

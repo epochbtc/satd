@@ -655,6 +655,10 @@ pub struct ChainState {
     /// third with a structural refusal (`bad-prevblk`).
     #[cfg(test)]
     pub(crate) bg_connect_faults: (AtomicU32, AtomicU32, AtomicU32),
+    /// Test-only: each count makes the next handoff attempt fail with an I/O
+    /// error before it hashes anything.
+    #[cfg(test)]
+    pub(crate) bg_handoff_faults: AtomicU32,
     /// Custom signet challenge script (BIP 325), set via
     /// `-signetchallenge`. When present (signet only), every accepted
     /// block's signet solution is verified against it and the P2P magic
@@ -1101,6 +1105,8 @@ impl ChainState {
                     background_alerts: Default::default(),
                     #[cfg(test)]
                     bg_connect_faults: Default::default(),
+                    #[cfg(test)]
+                    bg_handoff_faults: Default::default(),
                     signet_challenge: None,
                     genesis_hash,
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
@@ -1244,6 +1250,8 @@ impl ChainState {
             background_alerts: Default::default(),
             #[cfg(test)]
             bg_connect_faults: Default::default(),
+            #[cfg(test)]
+            bg_handoff_faults: Default::default(),
             signet_challenge: None,
             genesis_hash,
             accept_lock: std::sync::Arc::new(Mutex::new(())),
@@ -1599,6 +1607,14 @@ impl ChainState {
         bg: &Arc<crate::chain::background::BackgroundChainState>,
     ) -> Result<(), ChainError> {
         use crate::chain::background::HandoffOutcome;
+        #[cfg(test)]
+        if self
+            .bg_handoff_faults
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ChainError::FlatFile("injected handoff flush failure".into()));
+        }
         match bg.verify_at_snapshot()? {
             HandoffOutcome::Validated => {
                 tracing::info!(
