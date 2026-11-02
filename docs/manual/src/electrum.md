@@ -46,7 +46,7 @@ the address index for scripthash history (on by default) and
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
 | `--electrumbanner=<text>` | `powered by satd <version>` | Override for `server.banner`. |
-| `--electrumservername=<text>` | `satd-electrs-electrumx-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs). |
+| `--electrumservername=<text>` | `satd-electrs-electrumx-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs-and-electrumx). |
 
 The server runs on satd's [isolated API runtime](api-scaling.md)
 (`--api-threads`), so Electrum load cannot starve block connection. Each
