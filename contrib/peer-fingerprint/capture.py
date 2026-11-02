@@ -43,8 +43,12 @@ ping, getheaders from genesis, getdata for a random wtxid, and an unknown
 message type. The unknown message goes last, since a peer may disconnect
 on it.
 
-A peer that opens with a v2 (BIP324) handshake is recorded as a v2
-attempt and the connection closed; in --listen mode the recorder then
+With --v2 the recorder speaks BIP324 v2, using the pure-Python
+implementation in Bitcoin Core's functional test framework
+(--core-functional names Core's test/functional directory): it dials with
+v2, and when listening it answers in whichever transport the peer opens
+with. Without --v2 it speaks v1 only: a peer that opens with a v2
+handshake is recorded as a v2 attempt and the connection closed; in --listen mode the recorder then
 waits --v1-retry-wait seconds for the peer's v1 retry. A peer that never
 retries gets a fixture with "v1_after_v2": false and no transcript, which is
 all a v1-only node learns from it.
@@ -55,7 +59,7 @@ dropped, and addr/addrv2 bodies are reduced to a count.
 
 No third-party dependencies.
 """
-import argparse, hashlib, json, os, random, socket, struct, sys, time
+import argparse, hashlib, io, json, os, random, socket, struct, sys, time
 
 MAGIC = {
     "mainnet": "f9beb4d9",
@@ -150,6 +154,91 @@ class Conn:
         payload = self.buf[24:24 + length]
         self.buf = self.buf[24 + length:]
         return command, payload
+
+
+class V2Conn:
+    """BIP324 transport over a socket, using the pure-Python implementation
+    in Bitcoin Core's functional test framework (--core-functional). Same
+    interface as Conn: send(command, payload) and recv(deadline)."""
+
+    def __init__(self, sock, network, initiating, prefix=b""):
+        from test_framework.v2_p2p import EncryptedP2PState, SHORTID, MSGTYPE_TO_SHORTID
+        self.sock = sock
+        self.buf = prefix
+        self.shortid = SHORTID
+        self.to_shortid = MSGTYPE_TO_SHORTID
+        self.state = EncryptedP2PState(initiating=initiating, net=network)
+
+    def _more(self, deadline):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        self.sock.settimeout(left)
+        try:
+            chunk = self.sock.recv(65536)
+        except socket.timeout:
+            raise TimeoutError
+        except (ConnectionResetError, BrokenPipeError):
+            raise Closed
+        if not chunk:
+            raise Closed
+        self.buf += chunk
+
+    def _need(self, n, deadline):
+        while len(self.buf) < n:
+            self._more(deadline)
+
+    def handshake(self, deadline):
+        """Run the BIP324 handshake. A responder is built with the bytes
+        already read (fewer than 16, or 16 that are not a v1 version
+        header)."""
+        st = self.state
+        if st.initiating:
+            self.sock.sendall(st.initiate_v2_handshake())
+        else:
+            used, ours = st.respond_v2_handshake(io.BytesIO(self.buf))
+            if ours == -1 or ours == b"":
+                raise ValueError("responder called without a v2 prefix")
+            self.buf = self.buf[used:]
+            self.sock.sendall(ours)
+        need = 64 - len(st.received_prefix)
+        self._need(need, deadline)
+        used, out = st.complete_handshake(io.BytesIO(self.buf[:need]))
+        self.buf = self.buf[used:]
+        self.sock.sendall(out)
+        while not st.tried_v2_handshake:
+            try:
+                used, ok = st.authenticate_handshake(self.buf)
+            except AssertionError:
+                raise ValueError("peer's v2 version packet is not empty")
+            if not ok:
+                raise ValueError("v2 handshake failed to authenticate")
+            self.buf = self.buf[used:]
+            if not st.tried_v2_handshake:
+                self._more(deadline)
+
+    def send(self, command, payload=b""):
+        sid = self.to_shortid.get(command.encode())
+        head = bytes([sid]) if sid else b"\x00" + command.encode().ljust(12, b"\x00")
+        self.sock.sendall(self.state.v2_enc_packet(head + payload))
+
+    def recv(self, deadline):
+        while True:
+            used, contents = self.state.v2_receive_packet(self.buf)
+            if used == -1:
+                raise ValueError("v2 packet failed to authenticate")
+            if used == 0:
+                self._more(deadline)
+                continue
+            self.buf = self.buf[used:]
+            if contents is None:
+                continue  # decoy
+            if not contents:
+                raise ValueError("empty v2 packet")
+            if contents[0] == 0:
+                return contents[1:13].rstrip(b"\x00").decode(errors="replace"), contents[13:]
+            name = self.shortid.get(contents[0])
+            return (name.decode() if name else f"shortid-{contents[0]}"), contents[1:]
 
 
 def version_payload():
@@ -359,19 +448,65 @@ def fixture_head(args, connection, v2_attempts):
 
 def no_v1_result(args, v2_attempts):
     d = fixture_head(args, "inbound", v2_attempts)
-    d.update({"v1_after_v2": False, "version": None, "commands": [], "received": [], "sent": [],
+    d.update({"transport": None, "v1_after_v2": False, "version": None, "commands": [], "received": [], "sent": [],
               "probes": [], "closed_by_peer": None, "error": None})
     return d
 
 
-def capture(args):
+def v1_prefix(args):
+    return bytes.fromhex(MAGIC[args.network]) + b"version".ljust(12, b"\x00")
+
+
+def accept_v2(args, srv):
+    """--v2 listen: accept one connection and speak whichever transport the
+    peer opens with, as satd does."""
+    sock, _ = srv.accept()
+    deadline = time.monotonic() + 30
+    buf = b""
+    prefix = v1_prefix(args)
+    while len(buf) < 16 and buf == prefix[:len(buf)]:
+        sock.settimeout(max(0.1, deadline - time.monotonic()))
+        chunk = sock.recv(16 - len(buf))
+        if not chunk:
+            raise Closed
+        buf += chunk
+    if buf == prefix:
+        conn = Conn(sock, bytes.fromhex(MAGIC[args.network]))
+        conn.buf, conn.first = buf, False
+        return sock, conn, "v1"
+    conn = V2Conn(sock, args.network, initiating=False, prefix=buf)
+    conn.handshake(deadline)
+    return sock, conn, "v2"
+
+
+def capture(args, srv=None):
     magic = bytes.fromhex(MAGIC[args.network])
     v2_attempts = 0
-    if args.listen is not None:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", args.listen))
-        srv.listen(4)
+    transport = "v1"
+    if args.v2:
+        sys.path.insert(0, args.core_functional)
+    if args.v2 and args.listen is not None:
+        srv.settimeout(args.accept_timeout)
+        try:
+            sock, conn, transport = accept_v2(args, srv)
+        except socket.timeout:
+            sys.exit(f"no connection on port {args.listen} within {args.accept_timeout} s")
+        connection = "inbound"
+    elif args.v2:
+        host, port = args.dial.rsplit(":", 1)
+        sock = socket.create_connection((host, int(port)), timeout=10)
+        conn = V2Conn(sock, args.network, initiating=True)
+        try:
+            conn.handshake(time.monotonic() + 30)
+        except (Closed, TimeoutError, ValueError) as e:
+            d = fixture_head(args, "outbound", 0)
+            d.update({"transport": "v2", "v2_handshake": f"failed: {type(e).__name__} {e}".strip(),
+                      "version": None, "commands": [], "received": [], "sent": [], "probes": [],
+                      "closed_by_peer": None, "error": None})
+            return d
+        transport = "v2"
+        connection = "outbound"
+    elif args.listen is not None:
         srv.settimeout(args.accept_timeout)
         while True:
             try:
@@ -380,7 +515,6 @@ def capture(args):
                 if v2_attempts:
                     # The peer tried v2 and did not come back over v1: that
                     # is the whole transcript a v1-only node gets.
-                    srv.close()
                     return no_v1_result(args, v2_attempts)
                 sys.exit(f"no connection on port {args.listen} within {args.accept_timeout} s")
             conn = Conn(sock, magic)
@@ -395,7 +529,6 @@ def capture(args):
                     sys.exit("peer kept opening non-v1 connections")
             except (Closed, TimeoutError):
                 sock.close()
-        srv.close()
         connection = "inbound"
     else:
         host, port = args.dial.rsplit(":", 1)
@@ -428,6 +561,7 @@ def capture(args):
         handshake_cmds.append(m["command"])
     d = fixture_head(args, connection, v2_attempts)
     d.update({
+        "transport": transport,
         "v1_after_v2": True if v2_attempts else None,
         "version": version,
         "commands": handshake_cmds,
@@ -458,19 +592,56 @@ def main():
     ap.add_argument("--probe-wait", type=float, default=5.0, help="seconds to wait for each probe's answer (default 5)")
     ap.add_argument("--unknown-command", default="fpprobe", help="command name for the unknown-message probe")
     ap.add_argument("--accept-timeout", type=float, default=120.0)
+    ap.add_argument("--v2", action="store_true",
+                    help="speak BIP324 v2: dial with v2, or accept either transport when listening")
+    ap.add_argument("--core-functional", metavar="DIR",
+                    help="Bitcoin Core's test/functional directory; --v2 imports its test_framework.v2_p2p")
+    ap.add_argument("--sessions", type=int, default=1,
+                    help="--listen: record this many connections in turn; session N>1 goes to OUT-sN.json")
+    ap.add_argument("--next-session-wait", type=float, default=20.0,
+                    help="seconds to wait for each connection after the first (default 20)")
     ap.add_argument("--v1-retry-wait", type=float, default=30.0,
                     help="after a v2 attempt, how long to wait for the peer to retry over v1 (default 30)")
     ap.add_argument("--out", help="write the fixture here (default stdout)")
     args = ap.parse_args()
-    result = capture(args)
-    text = json.dumps(result, indent=2, sort_keys=False) + "\n"
-    if args.out:
-        with open(args.out, "w") as f:
-            f.write(text)
-    else:
-        sys.stdout.write(text)
-    if result["error"]:
-        print(f"capture error: {result['error']}", file=sys.stderr)
+    if args.v2 and not args.core_functional:
+        ap.error("--v2 needs --core-functional")
+    srv = None
+    if args.listen is not None:
+        # One listening socket for every session, so a peer's next
+        # connection queues while the previous one is still recorded.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", args.listen))
+        srv.listen(4)
+    failed = False
+    for n in range(1, args.sessions + 1):
+        if n > 1:
+            args.accept_timeout = args.next_session_wait
+        try:
+            result = capture(args, srv)
+        except SystemExit as e:
+            if n == 1:
+                raise
+            print(f"session {n}: none ({e})", file=sys.stderr)
+            break
+        result["session"] = n
+        text = json.dumps(result, indent=2, sort_keys=False) + "\n"
+        out = args.out
+        if out and n > 1:
+            base, ext = os.path.splitext(out)
+            out = f"{base}-s{n}{ext}"
+        if out:
+            with open(out, "w") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+        if result["error"]:
+            print(f"capture error (session {n}): {result['error']}", file=sys.stderr)
+            failed = True
+    if srv:
+        srv.close()
+    if failed:
         sys.exit(1)
 
 

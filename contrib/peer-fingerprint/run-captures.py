@@ -360,11 +360,23 @@ def capture(impl, direction, out, label, version, extra):
     if direction == "outbound":
         args += ["--dial", f"127.0.0.1:{NODE_P2P}"]
     else:
-        args += ["--listen", str(RECORDER)]
+        # A second session shows whether the node dials again (rbitcoin
+        # opens a short catch-up connection, then a separate one to follow
+        # the tip).
+        args += ["--listen", str(RECORDER), "--sessions", "2"]
     return subprocess.Popen(args)
 
 
 def set_state(path, impl, note):
+    """Write the node's state into the fixture and any later sessions'."""
+    base, ext = os.path.splitext(path)
+    ibd_height = set_state_one(path, impl, note)
+    if os.path.exists(f"{base}-s2{ext}"):
+        set_state_one(f"{base}-s2{ext}", impl, note)
+    return ibd_height
+
+
+def set_state_one(path, impl, note):
     try:
         ibd, height = impl.state()
     except Exception as e:  # noqa: BLE001
@@ -379,7 +391,7 @@ def set_state(path, impl, note):
     return ibd, height
 
 
-def run(impl, outdir, version, extra):
+def run(impl, outdir, version, extra, suffix=""):
     shutil.rmtree(impl.dir, ignore_errors=True)
     results = []
     note = "" if impl.can_mine else "cannot mine on regtest; never left IBD" if impl.family != "crawler" else "crawler, no chain"
@@ -392,8 +404,8 @@ def run(impl, outdir, version, extra):
             if impl.listens:
                 wait_for(lambda: __import__("socket").create_connection(("127.0.0.1", NODE_P2P), 2).close(),
                          f"{impl.name} P2P port")
-                path = os.path.join(outdir, f"{impl.name}-{version}-outbound.json")
-                rc = capture(impl, "outbound", path, f"{impl.name}-{version}-outbound", version, extra).wait()
+                path = os.path.join(outdir, f"{impl.name}-{version}-outbound{suffix}.json")
+                rc = capture(impl, "outbound", path, f"{impl.name}-{version}-outbound{suffix}", version, extra).wait()
                 results.append(("outbound", rc, set_state(path, impl, note) if rc == 0 else None))
         finally:
             impl.stop()
@@ -403,8 +415,8 @@ def run(impl, outdir, version, extra):
             wait_for(impl.ready, f"{impl.name} RPC")
             if impl.can_mine:
                 impl.mine()
-            path = os.path.join(outdir, f"{impl.name}-{version}-inbound.json")
-            cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound", version, extra)
+            path = os.path.join(outdir, f"{impl.name}-{version}-inbound{suffix}.json")
+            cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound{suffix}", version, extra)
             time.sleep(1)
             impl.connect_live(f"127.0.0.1:{RECORDER}")
             rc = cap.wait(timeout=240)
@@ -412,8 +424,8 @@ def run(impl, outdir, version, extra):
         finally:
             impl.stop()
     elif impl.dials:
-        path = os.path.join(outdir, f"{impl.name}-{version}-inbound.json")
-        cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound", version, extra)
+        path = os.path.join(outdir, f"{impl.name}-{version}-inbound{suffix}.json")
+        cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound{suffix}", version, extra)
         time.sleep(1)
         impl.start(connect=f"127.0.0.1:{RECORDER}")
         try:
@@ -442,6 +454,8 @@ def main():
     ap.add_argument("--version", action="append", default=[], metavar="NAME=VERSION",
                     help="version string recorded for an implementation (required for each one run)")
     ap.add_argument("--capture-arg", action="append", default=[], help="extra argument passed to capture.py")
+    ap.add_argument("--transport", default="v1", help="v1, v2 or v1,v2 (v2 fixtures get a -v2 suffix)")
+    ap.add_argument("--core-functional", help="Bitcoin Core's test/functional directory, needed for v2")
     args = ap.parse_args()
     versions = dict(v.split("=", 1) for v in args.version)
     only = set(args.only.split(",")) if args.only else None
@@ -455,8 +469,15 @@ def main():
             continue
         if impl.name not in versions:
             sys.exit(f"--version {impl.name}=... is required")
-        for direction, rc, state in run(impl, args.out, versions[impl.name], args.capture_arg):
-            print(f"{impl.name} {direction}: rc={rc} state={state}")
+        for transport in args.transport.split(","):
+            extra, suffix = list(args.capture_arg), ""
+            if transport == "v2":
+                if not args.core_functional:
+                    sys.exit("--transport v2 needs --core-functional")
+                extra += ["--v2", "--core-functional", args.core_functional]
+                suffix = "-v2"
+            for direction, rc, state in run(impl, args.out, versions[impl.name], extra, suffix):
+                print(f"{impl.name} {transport} {direction}: rc={rc} state={state}")
 
 
 if __name__ == "__main__":
