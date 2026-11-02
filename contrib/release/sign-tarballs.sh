@@ -260,8 +260,13 @@ check_dir() {
 
 if [[ ! -e "$work" && ! -L "$work" ]]; then
     (umask 077 && mkdir -p -- "$(dirname -- "$work")")
-    mkdir -m 700 -- "$work"
-    : > "$work/$MARKER"
+    # Build it under a temporary name and rename it into place, so a run
+    # killed before the marker is written leaves no marker-less directory
+    # at $work for every later run to refuse.
+    staging="$work.new.$$"
+    mkdir -m 700 -- "$staging"
+    : > "$staging/$MARKER"
+    mv -- "$staging" "$work"
 fi
 if [[ -L "$work" ]]; then
     echo "refusing $work: is a symlink" >&2
@@ -272,8 +277,8 @@ if [[ ! -d "$work" ]]; then
     exit 1
 fi
 check_dir "$work" "$work"
-expect="$(cd -- "$(dirname -- "$work")" && pwd -P)/$(basename -- "$work")"
-expect="${expect#/}"; expect="/$expect"
+parent="$(cd -- "$(dirname -- "$work")" && pwd -P)"
+expect="${parent%/}/$(basename -- "$work")"
 chmod 700 -- "$work"
 
 # The checks above went by name. If the parent directory is writable by
