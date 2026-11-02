@@ -38,6 +38,7 @@ full in the in-development
 - HTTP: `-rpcservertimeout` and `-esplorarequesttimeout` above a year are treated as a year, instead of failing every connection (#826).
 - Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
 - Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
+- Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
 
 ## Releases
 

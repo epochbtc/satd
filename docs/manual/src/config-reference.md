@@ -332,11 +332,11 @@ startup error.
 | `electrummaxconns` | 64 | restart | satd | Hard cap on simultaneously-open Electrum connections. |
 | `electrummaxsubsperconn` | 10000 | restart | satd | Per-connection scripthash subscription cap. |
 | `electrumrequesttimeout` | 30 | restart | satd | Per-request handler timeout (seconds). Past it the client gets a `request timed out` error and the connection is closed; the connection keeps its slot until the handler's work ends. |
-| `electrummaxbatchrequests` | 100 | restart | satd | Max requests per JSON-RPC batch line. Wallets (Sparrow) batch their whole gap-limit window of subscribes at scan time. |
+| `electrummaxbatchrequests` | 345 | restart | satd | Max requests per JSON-RPC batch line; a batch over it is refused whole. Sparrow sends up to 250 `get_merkle` calls in one batch. 345 is Fulcrum's default. |
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |
 | `electrumbanner` | `powered by satd <ver>` | restart | satd | Override for `server.banner`. |
-| `electrumservername` | `satd-electrs-compatible/<ver>` | restart | satd | Name reported by `server.version` and `server.features.server_version`. The default carries an `electrs` compatibility token because Electrum clients feature-detect by matching on this string (Cake Wallet probes silent-payment tweaks only when it contains `electrs`). Affects the Electrum surface only — the P2P user agent stays `/satd:<ver>/`. |
+| `electrumservername` | `satd-electrs-electrumx-compatible/<ver>` | restart | satd | Name reported by `server.version` and `server.features.server_version`. The default carries `electrs` and `electrumx` compatibility tokens because Electrum clients feature-detect by matching on this string (Cake Wallet probes silent-payment tweaks only when it contains `electrs`; Sparrow batches only when it contains `electrumx`). Affects the Electrum surface only — the P2P user agent stays `/satd:<ver>/`. |
 | `stratum` | off | restart | satd | Run the Stratum V1 solo-mining server. Refused on signet. See [Stratum Mining Server](stratum.md). |
 | `stratumbind` | `127.0.0.1:3333` | restart | satd | Bind the plaintext Stratum listener. A non-loopback address needs `stratumtlsbind` or `stratumallowplaintextremote=1`. |
 | `stratumtlsbind` | none (conventional port 4333) | restart | satd | Bind the Stratum TLS listener (requires cert+key). |
