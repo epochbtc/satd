@@ -9,15 +9,27 @@ under test:
   --listen PORT   wait for the node to dial us (we see an inbound peer)
   --dial H:P      dial the node (we see an outbound peer)
 
-What the recorder sends is fixed, so two captures differ only by what the
-peer does:
+A peer's opening messages partly answer what it is sent, so the recorder
+greets it the way satd does, as measured from satd 0.7.0 itself (the
+satd fixtures in this directory). The greeting differs by direction:
 
-  - version: protocol 70016, services NETWORK|WITNESS|NETWORK_LIMITED,
-    relay=1, start_height 0. When listening, sent after the peer's version.
-  - on the peer's version: wtxidrelay, sendaddrv2, verack (Core's order).
-  - on the peer's verack: sendcmpct(0, 2), ping, feefilter(1000 sat/kvB).
-  - answers: ping -> pong, getheaders -> empty headers. Nothing else is
-    answered; getaddr in particular gets no reply.
+  --dial (satd as the dialer):
+    - at once: version, wtxidrelay
+    - on the peer's version: sendaddrv2, verack
+    - on the peer's verack: sendheaders, getheaders, sendcmpct(0, 2),
+      feefilter(100 sat/kvB), getaddr, ping
+  --listen (satd accepting):
+    - on the peer's version: version, wtxidrelay, sendaddrv2, verack
+    - on the peer's verack: getheaders, sendcmpct(0, 2),
+      feefilter(100 sat/kvB), ping
+
+The version message carries protocol 70016, satd's services
+(NETWORK|WITNESS|NETWORK_LIMITED|P2P_V2), relay=1 and start_height 0, and
+getheaders carries protocol 70001 and a one-hash locator (genesis), as
+satd's do. The recorder only answers ping (pong) and getheaders (empty
+headers); getaddr gets no reply. Re-measure the greeting when satd's
+changes: capture satd against a recorder and compare its sends with
+GREETING below.
 
 Whether the node under test was in initial block download is recorded
 (--peer-ibd, --peer-height), since some clients announce less while
@@ -56,7 +68,10 @@ GENESIS = {
     "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
 }
 PROTOCOL_VERSION = 70016
-OUR_SERVICES = (1 << 0) | (1 << 3) | (1 << 10)  # NETWORK | WITNESS | NETWORK_LIMITED
+OUR_SERVICES = (1 << 0) | (1 << 3) | (1 << 10) | (1 << 11)  # NETWORK | WITNESS | NETWORK_LIMITED | P2P_V2, as satd 0.7.0
+GETHEADERS_VERSION = 70001  # what satd 0.7.0 puts in getheaders
+FEEFILTER = 100  # sat/kvB, satd 0.7.0's default on regtest
+GREETING = "satd-0.7.0"
 USER_AGENT = "/satd-fingerprint-capture:1/"
 MAX_MSG_LEN = 4 * 1000 * 1000 + 1000  # Core's MAX_PROTOCOL_MESSAGE_LENGTH, plus header slack
 CAPTURE_FORMAT = 1
@@ -230,24 +245,34 @@ class Recorder:
         self.conn.send(command, payload)
         self.sent.append({"t_ms": self.ms(), "phase": self.phase, "command": command})
 
+    def getheaders_payload(self):
+        genesis = bytes.fromhex(GENESIS[self.args.network])[::-1]
+        return struct.pack("<I", GETHEADERS_VERSION) + csize_write(1) + genesis + bytes(32)
+
     def on_message(self, command, payload):
         entry = {"t_ms": self.ms(), "phase": self.phase, "command": command, "len": len(payload)}
         fields = decode(command, payload)
         if fields is not None:
             entry["fields"] = fields
         self.received.append(entry)
+        dialer = self.args.dial is not None
         if command == "version" and not self.peer_version_seen:
             self.peer_version_seen = True
-            if self.args.listen is not None:
+            if not dialer:
                 self.send("version", version_payload())
-            self.send("wtxidrelay")
+                self.send("wtxidrelay")
             self.send("sendaddrv2")
             self.send("verack")
         elif command == "verack" and not self.peer_verack_seen:
             self.peer_verack_seen = True
+            if dialer:
+                self.send("sendheaders")
+            self.send("getheaders", self.getheaders_payload())
             self.send("sendcmpct", b"\x00" + struct.pack("<Q", 2))
+            self.send("feefilter", struct.pack("<q", FEEFILTER))
+            if dialer:
+                self.send("getaddr")
             self.send("ping", struct.pack("<Q", random.getrandbits(64)))
-            self.send("feefilter", struct.pack("<q", 1000))
         elif command == "ping":
             self.send("pong", payload[:8])
         elif command == "getheaders":
@@ -272,6 +297,7 @@ class Recorder:
     def run(self):
         if self.args.dial:
             self.send("version", version_payload())
+            self.send("wtxidrelay")
         hs_deadline = time.monotonic() + 30
         while not (self.peer_version_seen and self.peer_verack_seen):
             if self.pump(hs_deadline, lambda e: self.peer_version_seen and self.peer_verack_seen) is None:
@@ -281,12 +307,10 @@ class Recorder:
         probes = []
         if self.args.probes:
             self.phase = "probe"
-            genesis = bytes.fromhex(GENESIS[self.args.network])[::-1]
             unknown = self.args.unknown_command
             plan = [
                 ("ping", "ping", struct.pack("<Q", random.getrandbits(64)), "pong"),
-                ("getheaders", "getheaders",
-                 struct.pack("<I", PROTOCOL_VERSION) + csize_write(1) + genesis + bytes(32), "headers"),
+                ("getheaders", "getheaders", self.getheaders_payload(), "headers"),
                 ("getdata_unknown_wtx", "getdata",
                  csize_write(1) + struct.pack("<I", 0x40000001) + os.urandom(32), "notfound"),
                 ("unknown_message", unknown, b"", None),
@@ -379,7 +403,7 @@ def capture(args):
         "network": args.network,
         "connection": connection,
         "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
-        "recorder": {"protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
+        "recorder": {"greeting": GREETING, "protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
                      "user_agent": USER_AGENT, "passive_wait_s": args.wait,
                      "probe_wait_s": args.probe_wait if args.probes else None},
         "v2_attempts_before_v1": v2_attempts,
