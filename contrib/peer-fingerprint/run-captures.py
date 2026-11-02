@@ -101,12 +101,17 @@ class Impl:
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGTERM)
             try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
                 self.proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.proc.wait()
+            except ProcessLookupError:
+                pass  # the group exited between poll() and killpg()
         self.proc = None
 
 
@@ -498,9 +503,9 @@ def run(impl, outdir, version, extra, suffix=""):
     elif impl.dials:
         path = os.path.join(outdir, f"{impl.name}-{version}-inbound{suffix}.json")
         cap = capture(impl, "inbound", path, f"{impl.name}-{version}-inbound{suffix}", version, extra)
-        time.sleep(1)
-        impl.start(connect=f"127.0.0.1:{RECORDER}")
         try:
+            time.sleep(1)
+            impl.start(connect=f"127.0.0.1:{RECORDER}")
             rc = cap.wait(timeout=CAPTURE_TIMEOUT)
             state = None
             if rc == 0:
@@ -534,6 +539,7 @@ def main():
     versions = dict(v.split("=", 1) for v in args.version)
     only = set(args.only.split(",")) if args.only else None
     os.makedirs(args.out, exist_ok=True)
+    failed = False
     for cls in IMPLS:
         impl = cls(args.workdir)
         if only and impl.name not in only:
@@ -550,8 +556,17 @@ def main():
                     sys.exit("--transport v2 needs --core-functional")
                 extra += ["--v2", "--core-functional", args.core_functional]
                 suffix = "-v2"
-            for direction, rc, state in run(impl, args.out, versions[impl.name], extra, suffix):
+            try:
+                results = run(impl, args.out, versions[impl.name], extra, suffix)
+            except Exception as e:  # noqa: BLE001 -- one broken implementation must not end the sweep
+                print(f"{impl.name} {transport}: failed: {type(e).__name__}: {e}")
+                failed = True
+                continue
+            for direction, rc, state in results:
                 print(f"{impl.name} {transport} {direction}: rc={rc} state={state}")
+                failed |= rc != 0
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

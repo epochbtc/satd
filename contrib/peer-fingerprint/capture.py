@@ -515,7 +515,8 @@ def capture(args, srv=None):
         conn = V2Conn(sock, args.network, initiating=True)
         try:
             conn.handshake(time.monotonic() + 30)
-        except (Closed, TimeoutError, ValueError) as e:
+        except (Closed, TimeoutError, ValueError, OSError) as e:
+            sock.close()
             d = fixture_head(args, "outbound", 0)
             d.update({"transport": "v2", "v2_handshake": f"failed: {type(e).__name__} {e}".strip(),
                       "version": None, "commands": [], "received": [], "sent": [], "probes": [],
