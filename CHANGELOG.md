@@ -22,6 +22,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
 - RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
 - RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
+- Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).

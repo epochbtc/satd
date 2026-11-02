@@ -887,15 +887,12 @@ fn check_tip_stall_values(
     //
     // It is tempting to: during a genuine sync the tip advances in bursts and a
     // stall alert would be noise. But `is_initial_block_download` is not a sync
-    // flag — it compares the tip header's timestamp against the wall clock, so
-    // a node that is fully caught up and then *stops* re-enters it a day later,
-    // exactly when the operator most needs to hear from it.
-    //
-    // Latching on "we once saw a non-IBD tip" does not close that hole, because
-    // the latch lives in this process and restarting is an operator's first
-    // move during a stall. A node restarted while already wedged never observes
-    // a non-IBD tip, so the latch never arms and this detector goes silent
-    // permanently — at precisely the moment it should be paging.
+    // flag. It latches false for the life of the process (#1071), and that
+    // latch lives in this process, while restarting is an operator's first
+    // move during a stall. A node restarted while already wedged reads its
+    // stale tip as IBD and never leaves it, so gating here would make this
+    // detector go silent permanently — at precisely the moment it should be
+    // paging.
     //
     // `age_secs` already encodes the thing worth gating on. A node that is
     // really syncing moves its tip continuously, which keeps the age far below

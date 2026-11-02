@@ -455,6 +455,10 @@ pub struct ChainState {
     av_ancestry: Mutex<crate::chain::assumevalid::AvAncestry>,
     /// Core's `-minimumchainwork`, when set; see [`Self::minimum_chain_work`].
     minimum_chain_work_override: Option<[u8; 32]>,
+    /// Set once the node has left initial block download; never cleared for
+    /// the life of this `ChainState`. Core's `m_cached_is_ibd` latch. See
+    /// [`Self::is_initial_block_download`].
+    left_ibd: std::sync::atomic::AtomicBool,
     /// When [`Self::next_block_to_connect`] last ran its full block-index scan,
     /// and for which `(tip, height)`. The scan is O(index); the connector polls
     /// once a second. See the throttle in `next_block_to_connect`.
@@ -990,6 +994,7 @@ impl ChainState {
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     av_ancestry: Mutex::new(Default::default()),
                     minimum_chain_work_override: None,
+                    left_ibd: std::sync::atomic::AtomicBool::new(false),
                     connector_scan_last: Mutex::new(None),
                     num_threads,
                     address_index,
@@ -1130,6 +1135,7 @@ impl ChainState {
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             av_ancestry: Mutex::new(Default::default()),
             minimum_chain_work_override: None,
+            left_ibd: std::sync::atomic::AtomicBool::new(false),
             connector_scan_last: Mutex::new(None),
             num_threads,
             address_index,
@@ -2056,6 +2062,11 @@ impl ChainState {
         let mut tip = self.tip.write();
         tip.hash = hash;
         tip.height = height;
+        drop(tip);
+        // Core's `SetTip` + `UpdateIBDStatus`: judge the IBD latch against
+        // every new tip, so a tip that was recent arms it even if nothing
+        // asked before the next one went stale.
+        let _ = self.is_initial_block_download();
     }
 
     /// Open the window in which this chainstate's coins and tip may disagree.
@@ -2198,12 +2209,13 @@ impl ChainState {
         Attempt::Moved
     }
 
-    /// Initial-block-download heuristic from a tip timestamp. Matches the
-    /// `initialblockdownload` signal in `getblockchaininfo`
-    /// (`rpc::blockchain`): the node is considered to be in IBD while its
-    /// active-chain tip is more than 24h behind wall-clock time. Shared so
-    /// the RPC and the per-block flush gate use one definition.
-    pub(crate) fn tip_time_is_ibd(tip_time: u32) -> bool {
+    /// Whether a tip timestamp is older than `-maxtipage` (default 24h).
+    /// This is only the tip-age half of [`Self::is_initial_block_download`]:
+    /// it has no chain-work test and no latch, so it turns true again
+    /// whenever the tip stops advancing. The per-block coin-cache flush gate
+    /// wants exactly that, a cost decision about the block being connected
+    /// rather than a sync state.
+    pub(crate) fn tip_time_is_stale(tip_time: u32) -> bool {
         // The node clock, not the system one. `tip_time` comes from a block
         // header, and headers are now stamped from `crate::time::now_secs()`
         // (see `mining::template`), so comparing against `SystemTime::now()`
@@ -2214,33 +2226,60 @@ impl ChainState {
         // every freshly mined block look a day stale and silently disable the
         // per-block coin-cache flush at the call site below, i.e. the #262
         // mitigation, in the tests most likely to reorg.
-        Self::time_is_ibd_at(tip_time, crate::time::now_secs())
+        Self::time_is_stale_at(tip_time, crate::time::now_secs())
     }
 
-    /// [`Self::tip_time_is_ibd`] against a given clock reading: Core's
+    /// [`Self::tip_time_is_stale`] against a given clock reading: Core's
     /// `tip->Time() < Now() - max_tip_age`, with `-maxtipage` (default 24h).
     /// Signed arithmetic, because Core accepts any `int64` age and an age
     /// larger than the clock reading means no tip is ever too old.
-    pub(crate) fn time_is_ibd_at(tip_time: u32, now: u64) -> bool {
+    pub(crate) fn time_is_stale_at(tip_time: u32, now: u64) -> bool {
         let max_age = MAX_TIP_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed);
         i128::from(tip_time) < i128::from(now) - i128::from(max_age)
     }
 
-    /// Set Core's `-maxtipage`, in seconds, for the IBD predicate. Called
+    /// Set Core's `-maxtipage`, in seconds, for the tip-age test. Called
     /// once at startup; the default is [`DEFAULT_MAX_TIP_AGE_SECS`].
     pub fn set_max_tip_age(secs: i64) {
         MAX_TIP_AGE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the node is in initial block download, judged by the active
-    /// tip's timestamp. Returns `true` when the tip header is unavailable
-    /// (treated as far-behind) so callers fail safe toward "still syncing".
+    /// Whether the node is in initial block download, as Core's
+    /// `ChainstateManager::IsInitialBlockDownload` (`UpdateIBDStatus`,
+    /// `CChain::IsTipRecent`): the node is in IBD until its active tip has
+    /// at least [`Self::minimum_chain_work`] and is no older than
+    /// `-maxtipage`, and once it has left it never re-enters it for the life
+    /// of this `ChainState`. A node whose tip goes stale after that (a long
+    /// gap between blocks, a stalled peer set) stays out of IBD, so mining,
+    /// fee filters and `initialblockdownload` do not change mid-run.
+    ///
+    /// The latch cannot arm while the chainstate is in `BulkLoad` write
+    /// mode (Core's `LoadingBlocks`: satd's startup replays, and an IBD
+    /// catch-up far enough behind to run WAL-less), and a missing tip entry
+    /// counts as in IBD.
+    ///
+    /// Core judges the latch on every tip change; so does [`Self::set_tip`],
+    /// by calling this. It is also judged on read, for the tip loaded at
+    /// startup, which no `set_tip` wrote.
     pub fn is_initial_block_download(&self) -> bool {
-        let tip_time = self
-            .get_block_index(&self.tip_hash())
-            .map(|e| e.header.time)
-            .unwrap_or(0);
-        Self::tip_time_is_ibd(tip_time)
+        use std::sync::atomic::Ordering;
+        if self.left_ibd.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.bulk_load.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(tip) = self.get_block_index(&self.tip_hash()) else {
+            return true;
+        };
+        // Both big-endian, so byte order is numeric order.
+        if tip.chainwork < self.minimum_chain_work() || Self::tip_time_is_stale(tip.header.time) {
+            return true;
+        }
+        if !self.left_ibd.swap(true, Ordering::Relaxed) {
+            tracing::info!(height = tip.height, "Leaving initial block download (latching to false)");
+        }
+        false
     }
 
     /// Flush the UTXO write cache to disk. Call periodically during IBD
@@ -3770,7 +3809,7 @@ impl ChainState {
                 // Skip scripts for blocks whose header timestamp is older than the cutoff.
                 // This naturally transitions to full verification once the node catches up.
                 //
-                // The node clock, for the same reason as `tip_time_is_ibd`:
+                // The node clock, for the same reason as `tip_time_is_stale`:
                 // `block_time` is a header timestamp and headers are stamped
                 // from `crate::time::now_secs()`, so `SystemTime::now()`
                 // would put the two sides of this comparison on different
@@ -8846,7 +8885,7 @@ impl ChainState {
         // un-connect the block (it is already committed), so we log loudly
         // and continue rather than returning a misleading error — the
         // coins remain in cache for the next flush attempt.
-        if !Self::tip_time_is_ibd(block.header.time)
+        if !Self::tip_time_is_stale(block.header.time)
             && let Err(e) = self.store.flush()
         {
             tracing::error!(
@@ -10832,6 +10871,10 @@ mod ctxcheck_tests;
 #[cfg(test)]
 #[path = "state_assumevalid_tests.rs"]
 mod assumevalid_tests;
+
+#[cfg(test)]
+#[path = "state_ibdlatch_tests.rs"]
+mod ibdlatch_tests;
 
 #[cfg(test)]
 #[path = "state_ckptfork_tests.rs"]
@@ -17403,8 +17446,8 @@ pub(crate) mod tests {
     fn tip_age_boundary_matches_core() {
         let now = 1_700_000_000u64;
         let age = DEFAULT_MAX_TIP_AGE_SECS as u64;
-        assert!(!ChainState::time_is_ibd_at((now - age) as u32, now));
-        assert!(ChainState::time_is_ibd_at((now - age - 1) as u32, now));
+        assert!(!ChainState::time_is_stale_at((now - age) as u32, now));
+        assert!(ChainState::time_is_stale_at((now - age - 1) as u32, now));
     }
 
     #[test]
