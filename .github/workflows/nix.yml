@@ -22,10 +22,8 @@
 # repos) — at that point both broader PR-trigger and a hard gate
 # on the Nix repro check become reasonable.
 #
-# flake.lock note: this PR ships `flake.nix` without a committed
-# `flake.lock`. The first `workflow_dispatch` run from a maintainer
-# branch generates the lock; commit the result. Subsequent runs use
-# the committed lock.
+# flake.lock is committed. With none in the tree, the x86_64 build
+# job resolves one and uploads it as the `flake-lock` artifact.
 
 name: Nix
 
