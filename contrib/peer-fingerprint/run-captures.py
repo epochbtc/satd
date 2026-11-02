@@ -414,7 +414,10 @@ class Libbitcoin(Impl):
         s.create_connection(("127.0.0.1", NODE_P2P), 2).close()
 
     def stop(self):
-        subprocess.run(["docker", "stop", "-t", "30", self.container], capture_output=True)
+        try:
+            subprocess.run(["docker", "stop", "-t", "30", self.container], capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            pass  # stop() must not throw; killing the docker client below ends the container (--rm)
         super().stop()
 
 
@@ -474,8 +477,16 @@ def run(impl, outdir, version, extra, suffix=""):
                 wait_for(lambda: __import__("socket").create_connection(("127.0.0.1", NODE_P2P), 2).close(),
                          f"{impl.name} P2P port")
                 path = os.path.join(outdir, f"{impl.name}-{version}-outbound{suffix}.json")
-                rc = capture(impl, "outbound", path, f"{impl.name}-{version}-outbound{suffix}", version, extra).wait()
-                results.append(("outbound", rc, set_state(path, impl, note) if rc == 0 else None))
+                cap = capture(impl, "outbound", path, f"{impl.name}-{version}-outbound{suffix}", version, extra)
+                try:
+                    rc = cap.wait(timeout=CAPTURE_TIMEOUT)
+                    results.append(("outbound", rc, set_state(path, impl, note) if rc == 0 else None))
+                except subprocess.TimeoutExpired:
+                    results.append(("outbound", "timeout", None))
+                finally:
+                    if cap.poll() is None:
+                        cap.kill()
+                        cap.wait()
         finally:
             impl.stop()
     if impl.dials and hasattr(impl, "connect_live"):

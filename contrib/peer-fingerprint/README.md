@@ -46,7 +46,9 @@ dropped, and addr/addrv2 bodies are reduced to a count.
 | bitnodes | `036dc5c` | it dials only | no | `getaddr`, with `relay` 0 and services 0 |
 
 Replies to the recorder's own `getheaders` and `ping` are left out of the
-last column. The messages are the same over v1 and v2 for every
+last column. Where those replies fall among a peer's own messages depends
+on timing (two captures of satd differ only in that), so a classifier
+should compare a peer's own messages and treat replies separately. The messages are the same over v1 and v2 for every
 implementation that speaks both.
 
 - **rbitcoin** opens two connections when it dials: a catch-up connection

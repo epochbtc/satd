@@ -328,6 +328,7 @@ class Recorder:
         self.peer_version_seen = False
         self.peer_verack_seen = False
         self.closed = None
+        self.probes = []
 
     def ms(self):
         return int((time.monotonic() - self.t0) * 1000)
@@ -395,7 +396,7 @@ class Recorder:
                 raise RuntimeError("handshake did not complete in 30 s")
         self.phase = "passive"
         self.pump(time.monotonic() + self.args.wait)
-        probes = []
+        probes = self.probes  # kept on self, so a failure mid-probe keeps what ran
         if self.args.probes:
             self.phase = "probe"
             unknown = self.args.unknown_command
@@ -560,11 +561,15 @@ def capture(args, srv=None):
     try:
         probes = rec.run()
     except Closed:
-        pass
+        probes = rec.probes
     except (RuntimeError, ValueError) as e:
-        error = str(e)
+        probes, error = rec.probes, str(e)
     except NotV1:
-        error = "peer answered with a non-v1 stream"
+        probes, error = rec.probes, "peer answered with a non-v1 stream"
+    except (OSError, AssertionError) as e:
+        # A reset while we send, or a v2 packet Core's decoder rejects:
+        # a fixture with the error and everything recorded so far.
+        probes, error = rec.probes, f"{type(e).__name__} {e}".strip()
     finally:
         try:
             sock.close()
