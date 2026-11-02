@@ -13,8 +13,8 @@ const REGTEST_POWLIMIT_BITS: u32 = 0x207fffff;
 const TESTNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
 /// Signet minimum difficulty target (Core's signet `powLimit`,
 /// `00000377ae…`). The retarget clamp in [`next_bits`] and the bound in
-/// [`check_proof_of_work_bounded`] read it; signet validation does not check
-/// `nBits` against the retarget schedule (the block signature is the gate).
+/// [`check_proof_of_work_bounded`] read it, and signet `nBits` is checked
+/// against the retarget schedule like every chain's, as in Core.
 const SIGNET_POWLIMIT_BITS: u32 = 0x1e0377ae;
 /// Number of blocks between difficulty retargets.
 /// Bitcoin's difficulty adjustment interval, in blocks (Core's
@@ -114,11 +114,9 @@ where
     let height = prev.height + 1;
 
     match network {
-        // Signet consensus is enforced by block signing, which satd verifies
-        // on every signet (`check_signet_block_solution`), not PoW difficulty.
-        // Accept whatever bits are set (PoW check still validates hash <= target).
-        // Core also checks signet `nBits` against the retarget schedule (#838).
-        Network::Signet => return Ok(()),
+        // Signet retargets as mainnet does, against its own proof-of-work
+        // limit, with no minimum-difficulty exception. Core checks it like
+        // every chain, and so does satd (#838), on top of the block signature.
         // Testnet4 adds the BIP 94 timewarp guard: the first block of each
         // retarget period must not be timestamped more than MAX_TIMEWARP
         // before its parent. The seeding change lives in `next_bits`.
@@ -150,9 +148,8 @@ where
 /// `pindexLast->GetAncestor()` and `pprev` walk do, so a block on any branch
 /// is judged against its own ancestors.
 ///
-/// Signet validation does not check `nBits`, but a template still needs the
-/// right value: signet retargets with the mainnet rules against its own
-/// proof-of-work limit.
+/// Signet retargets with the mainnet rules against its own proof-of-work
+/// limit.
 pub fn next_bits<G>(
     network: Network,
     prev: &BlockIndexEntry,
@@ -1012,25 +1009,44 @@ mod tests {
         assert!(check_difficulty(&new_header, &prev, Network::Bitcoin, |h| by_hash.get(h).cloned()).is_ok());
     }
 
+    /// Signet `nBits` follows the retarget schedule, as in Core (#838): the
+    /// real retarget at signet height 290304 passes, and a header carrying its
+    /// parent's bits there, or any other value, is `bad-diffbits`.
     #[test]
-    fn test_signet_any_bits_accepted() {
-        // On Signet, any bits value should pass check_difficulty.
+    fn signet_bits_follow_the_retarget_schedule() {
         let genesis = bitcoin::constants::genesis_block(Network::Signet);
-        let prev = BlockIndexEntry {
-            header: genesis.header,
-            height: 100,
-            status: BlockStatus::Valid,
-            num_tx: 1,
-            file_number: 0,
-            data_pos: 0,
-            chainwork: [0u8; 32],
-        };
+        // Signet heights 288288 (first of the period) and 290303 (its last).
+        let mut first_header = genesis.header;
+        first_header.time = 1_769_157_340;
+        first_header.bits = CompactTarget::from_consensus(0x1d15_7c9b);
+        let mut prev_header = genesis.header;
+        prev_header.time = 1_770_338_984;
+        prev_header.bits = CompactTarget::from_consensus(0x1d15_7c9b);
+        let (prev, by_hash) = link_period(&entry(first_header, 288_288), &entry(prev_header, 290_303));
+        let by_hash = |h: &BlockHash| by_hash.get(h).cloned();
 
-        // Use an arbitrary bits value that would fail on other networks
         let mut header = genesis.header;
-        header.bits = CompactTarget::from_consensus(0x1a0fffff);
+        header.time = 1_770_339_573;
+        header.bits = CompactTarget::from_consensus(0x1d14_fd7a); // block 290304's bits
+        assert!(check_difficulty(&header, &prev, Network::Signet, by_hash).is_ok());
 
-        assert!(check_difficulty(&header, &prev, Network::Signet, |_| None).is_ok());
+        for wrong in [0x1d15_7c9b, 0x1a0f_ffff, SIGNET_POWLIMIT_BITS] {
+            header.bits = CompactTarget::from_consensus(wrong);
+            assert!(
+                matches!(check_difficulty(&header, &prev, Network::Signet, by_hash), Err(ValidationError::BadDifficulty)),
+                "bits {wrong:#x} at a signet retarget"
+            );
+        }
+
+        // Inside a period the bits must equal the parent's.
+        let mid = entry(prev_header, 290_000);
+        header.bits = prev_header.bits;
+        assert!(check_difficulty(&header, &mid, Network::Signet, |_| None).is_ok());
+        header.bits = CompactTarget::from_consensus(0x1a0f_ffff);
+        assert!(matches!(
+            check_difficulty(&header, &mid, Network::Signet, |_| None),
+            Err(ValidationError::BadDifficulty)
+        ));
     }
 
     /// Build a parent-pointer-chained run of `count` block-index entries whose
