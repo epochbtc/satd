@@ -80,8 +80,11 @@ pub struct IbdScheduler {
     /// [`Self::block_store_failed`]) once the store is done. Between the two
     /// the height stays in flight, holding its peer's slot, but the peer no
     /// longer owes it: neither the stall check nor the per-height timeouts
-    /// count it against the peer, which has done its part.
-    arrived: HashMap<u32, BlockHash>,
+    /// count it against the peer, which has done its part. The count is of
+    /// the copies recorded and not yet settled: a holder can deliver the
+    /// same block twice, and the height is owed again only once every copy
+    /// has failed to store.
+    arrived: HashMap<u32, (BlockHash, u32)>,
 
     /// How long a peer may hold blocks without delivering one before it is
     /// disconnected. Core's adaptive `m_block_stalling_timeout`: doubled,
@@ -525,7 +528,12 @@ impl IbdScheduler {
         {
             return false;
         }
-        self.arrived.insert(height, hash);
+        match self.arrived.get_mut(&height) {
+            Some((recorded, copies)) if *recorded == hash => *copies += 1,
+            _ => {
+                self.arrived.insert(height, (hash, 1));
+            }
+        }
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
             Self::credit_delivery(slots);
         }
@@ -536,14 +544,24 @@ impl IbdScheduler {
     /// is owed again: its timeouts, which kept running, apply to it once
     /// more, and release it to another peer as they would have before it
     /// arrived.
+    ///
+    /// Only once no other recorded copy is still waiting: while one is, the
+    /// block may yet be stored.
     pub fn block_store_failed(&mut self, height: u32, hash: BlockHash) {
-        self.take_arrival(height, &hash);
+        if let Some((recorded, copies)) = self.arrived.get_mut(&height)
+            && *recorded == hash
+        {
+            *copies -= 1;
+            if *copies == 0 {
+                self.arrived.remove(&height);
+            }
+        }
     }
 
-    /// Clear the arrival of `hash` at `height`, if that is the block that
-    /// arrived there. Returns whether it was.
+    /// Clear the arrival of `hash` at `height`, every copy of it, if that is
+    /// the block that arrived there: it is stored. Returns whether it was.
     fn take_arrival(&mut self, height: u32, hash: &BlockHash) -> bool {
-        if self.arrived.get(&height) == Some(hash) {
+        if self.arrived.get(&height).is_some_and(|(recorded, _)| recorded == hash) {
             self.arrived.remove(&height);
             true
         } else {
@@ -2254,6 +2272,14 @@ mod tests {
 
         assert!(sched.block_arrived(1, h, hash));
         assert!(sched.is_arrived(h));
+
+        // The holder sends it again, and the first copy fails to store: the
+        // second may still be stored, so the height is not owed yet.
+        assert!(sched.block_arrived(1, h, hash));
+        sched.block_store_failed(h, hash);
+        assert!(sched.is_arrived(h), "a second copy is still waiting");
+        sched.block_store_failed(h, hash);
+        assert!(!sched.is_arrived(h), "owed again once every copy has failed");
         assert_eq!(sched.take_stalled_peer(), None, "peer 1 has just delivered");
 
         let _ = std::fs::remove_dir_all(&dir);
