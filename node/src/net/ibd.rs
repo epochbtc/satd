@@ -514,17 +514,22 @@ impl IbdScheduler {
     /// [`Self::block_store_failed`] settles it.
     ///
     /// The same checks as `block_received`: the delivered hash must be the
-    /// one wanted at `height`, and only the holder is credited.
-    pub fn block_arrived(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) {
+    /// one wanted at `height`, and only the holder is credited. Returns
+    /// whether the arrival was recorded; only a store of a recorded arrival
+    /// may report its failure ([`Self::block_store_failed`]), so that a
+    /// failed store of another copy cannot make a height owed while the
+    /// holder's copy still waits to be stored.
+    pub fn block_arrived(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) -> bool {
         if self.height_to_hash.get(&height) != Some(&hash)
             || self.in_flight.get(&height) != Some(&peer_id)
         {
-            return;
+            return false;
         }
         self.arrived.insert(height, hash);
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
             Self::credit_delivery(slots);
         }
+        true
     }
 
     /// The block that arrived for `height` could not be stored. The height
@@ -2243,11 +2248,11 @@ mod tests {
 
         // Not the holder, and not the wanted block: no credit.
         let (h, hash) = held[0];
-        sched.block_arrived(3, h, hash);
-        sched.block_arrived(1, h, held[1].1);
+        assert!(!sched.block_arrived(3, h, hash), "not the holder");
+        assert!(!sched.block_arrived(1, h, held[1].1), "not the wanted block");
         assert!(!sched.is_arrived(h));
 
-        sched.block_arrived(1, h, hash);
+        assert!(sched.block_arrived(1, h, hash));
         assert!(sched.is_arrived(h));
         assert_eq!(sched.take_stalled_peer(), None, "peer 1 has just delivered");
 

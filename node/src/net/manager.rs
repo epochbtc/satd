@@ -8001,13 +8001,12 @@ impl PeerManager {
         }
         // Credit the delivery now: the store may wait behind the connector,
         // and the peer has done its part (see `IbdScheduler::block_arrived`).
-        let arrived_at =
-            self.chain_state.get_block_index(&block.header.prev_blockhash).map(|parent| {
-                let height = parent.height + 1;
-                if let Some(scheduler) = self.ibd.write().as_mut() {
-                    scheduler.block_arrived(id, height, hash);
-                }
-                height
+        let arrived_at = self
+            .chain_state
+            .get_block_index(&block.header.prev_blockhash)
+            .map(|parent| parent.height + 1)
+            .filter(|&height| {
+                self.ibd.write().as_mut().is_some_and(|s| s.block_arrived(id, height, hash))
             });
         let size = block.total_size();
         let job = crate::net::ibd_store::IbdStoreJob {
@@ -8037,28 +8036,68 @@ impl PeerManager {
     }
 
     /// The IBD store thread: stores the blocks `handle_block_ibd` queued,
-    /// one at a time, until shutdown. Blocks still queued at shutdown are
-    /// dropped; they are downloads, and the next start asks for them again.
+    /// one at a time, until shutdown or until the manager is gone. Blocks
+    /// still queued then are dropped; they are downloads, and the next start
+    /// asks for them again.
+    ///
+    /// However the thread ends, a panic included, the queue is closed on
+    /// the way out: later blocks are stored inline, as before the queue
+    /// existed, and the heights of the blocks it still held are owed again,
+    /// so another peer is asked for them rather than the download waiting on
+    /// stores that will never run.
     fn ibd_store_loop(
         queue: &crate::net::ibd_store::IbdStoreQueue,
         peer_manager: &std::sync::Weak<PeerManager>,
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) {
+        struct CloseOnExit<'a> {
+            queue: &'a crate::net::ibd_store::IbdStoreQueue,
+            peer_manager: &'a std::sync::Weak<PeerManager>,
+            /// The arrival of the block being stored, if one was recorded:
+            /// a panic mid-store strands it too.
+            current: std::cell::Cell<Option<(u32, bitcoin::BlockHash)>>,
+        }
+        impl Drop for CloseOnExit<'_> {
+            fn drop(&mut self) {
+                let stranded = self.queue.close();
+                if std::thread::panicking() {
+                    tracing::error!(
+                        stranded = stranded.len(),
+                        "IBD store thread panicked; storing blocks on the P2P task from now on"
+                    );
+                }
+                let Some(pm) = self.peer_manager.upgrade() else {
+                    return;
+                };
+                let mut ibd = pm.ibd.write();
+                let Some(scheduler) = ibd.as_mut() else {
+                    return;
+                };
+                let current = self.current.take();
+                for (height, hash) in stranded
+                    .iter()
+                    .filter_map(|job| job.arrived_at.map(|h| (h, job.block.block_hash())))
+                    .chain(current)
+                {
+                    scheduler.block_store_failed(height, hash);
+                }
+            }
+        }
+        let close = CloseOnExit { queue, peer_manager, current: std::cell::Cell::new(None) };
         loop {
-            if *shutdown.borrow() {
-                queue.clear();
+            if *shutdown.borrow() || peer_manager.strong_count() == 0 {
                 return;
             }
             let Some(job) = queue.pop(Duration::from_millis(500)) else {
                 continue;
             };
-            match peer_manager.upgrade() {
-                Some(pm) => pm.store_ibd_block(job),
-                None => {
-                    queue.done();
-                    return;
-                }
-            }
+            let Some(pm) = peer_manager.upgrade() else {
+                return;
+            };
+            close.current.set(job.arrived_at.map(|h| (h, job.block.block_hash())));
+            pm.store_ibd_block(job);
+            close.current.set(None);
+            drop(pm);
             queue.done();
         }
     }

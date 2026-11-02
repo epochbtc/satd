@@ -50,6 +50,8 @@ struct State {
     bytes: usize,
     /// A job has been taken and is being stored.
     busy: bool,
+    /// The store thread has gone; nothing more is queued.
+    closed: bool,
 }
 
 /// See the module docs.
@@ -71,11 +73,14 @@ impl IbdStoreQueue {
     }
 
     /// Queue `job` for the store thread, or hand it back when it would take
-    /// the queue past its bound. An empty queue takes any block, so one
-    /// larger than the bound is not stored inline for that alone.
+    /// the queue past its bound, or when the store thread has gone. An empty
+    /// queue takes any block, so one larger than the bound is not stored
+    /// inline for that alone.
     pub fn try_push(&self, job: IbdStoreJob) -> Result<(), IbdStoreJob> {
         let mut state = self.state.lock();
-        if !state.jobs.is_empty() && state.bytes.saturating_add(job.size) > self.max_bytes {
+        if state.closed
+            || (!state.jobs.is_empty() && state.bytes.saturating_add(job.size) > self.max_bytes)
+        {
             return Err(job);
         }
         state.bytes += job.size;
@@ -104,15 +109,18 @@ impl IbdStoreQueue {
         self.cvar.notify_all();
     }
 
-    /// Drop every queued job, for shutdown. Their `in_flight` guards count
-    /// the messages out as they drop.
-    pub fn clear(&self) {
-        let jobs = {
-            let mut state = self.state.lock();
-            state.bytes = 0;
-            std::mem::take(&mut state.jobs)
-        };
-        drop(jobs);
+    /// The store thread is going: refuse every later job and hand back the
+    /// ones still queued. Their `in_flight` guards count the messages out as
+    /// the caller drops them.
+    pub fn close(&self) -> Vec<IbdStoreJob> {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.busy = false;
+        state.bytes = 0;
+        let jobs = std::mem::take(&mut state.jobs).into();
+        drop(state);
+        self.cvar.notify_all();
+        jobs
     }
 
     /// Wake a store thread waiting in [`Self::pop`].
@@ -163,8 +171,21 @@ mod tests {
         assert!(q.try_push(job(60)).is_ok());
         assert!(q.try_push(job(40)).is_ok(), "exactly at the bound fits");
         assert!(q.try_push(job(1)).is_err());
-        q.clear();
+    }
+
+    /// A closed queue hands back what it held and refuses everything after,
+    /// so those blocks are stored inline.
+    #[test]
+    fn a_closed_queue_hands_back_its_jobs_and_refuses_more() {
+        let q = IbdStoreQueue::new(100);
+        assert!(q.try_push(job(10)).is_ok());
+        assert!(q.try_push(job(20)).is_ok());
+        let _taken = q.pop(Duration::ZERO).unwrap();
+        let stranded = q.close();
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].size, 20);
         assert!(q.is_idle());
         assert_eq!(q.queued_bytes(), 0);
+        assert!(q.try_push(job(1)).is_err(), "nothing is queued after close");
     }
 }
