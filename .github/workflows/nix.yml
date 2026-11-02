@@ -75,6 +75,23 @@ jobs:
       - name: Magic Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98 # main as of 2026-07-15
 
+      # With no committed lock, resolve one and keep it as an artifact,
+      # so a maintainer without Nix can commit it. A no-op once the lock
+      # is in the tree.
+      - name: Resolve flake.lock if none is committed
+        if: matrix.system == 'x86_64-linux' && hashFiles('flake.lock') == ''
+        run: |
+          nix flake lock
+          cat flake.lock
+
+      - name: Upload the resolved flake.lock
+        if: matrix.system == 'x86_64-linux' && hashFiles('flake.lock') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: flake-lock
+          path: flake.lock
+          retention-days: 14
+
       - name: Confirm flake evaluates
         run: nix flake show --no-write-lock-file
 
