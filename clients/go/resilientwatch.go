@@ -141,24 +141,24 @@ var ErrNoLoader = errors.New("satdevents: reload requires a WatchSetLoader")
 // Rust SDK has; it is spelled out here because nothing about the reconnect
 // suggests it.
 //
-// # Before the first confirmed event there is no anchor
+// # Before the first confirmed event
 //
 // The node stamps a resume cursor on a connected block and on a confirmed match
-// only. Heartbeats, mempool events and unconfirmed matches carry none, and the
-// Watch stream sends no cursor when it opens. So a watch started with no
-// [ResilientWatchConfig.FromCursor] and nothing in its [CursorStore] has no
-// anchor until its first confirmed event arrives, and
-// [ResilientWatch.ResumeCursor] returns nil until then.
+// only; heartbeats, mempool events and unconfirmed matches carry none. To cover
+// the window before the first one, satd 0.7.1 and later report the stream's head
+// cursor in the response headers ([Stream.HeadCursor]). A watch with no anchor
+// of its own (no [ResilientWatchConfig.FromCursor], nothing in its
+// [CursorStore], nothing confirmed yet) adopts it, so [ResilientWatch.ResumeCursor]
+// returns it and the next reconnect sends a SetCursor from it: a [CursorAccepted]
+// follows and what the dropped stream was about to deliver is replayed. The
+// cursor store gets it on the next commit, so a restart resumes there too.
 //
-// A reconnect in that window re-registers the watch-set and sends no SetCursor,
-// so no [CursorAccepted] follows and the outage's chain events are not
-// replayed: the stream resumes live, and an event in flight when the connection
-// dropped (the block that confirms a payment whose mempool match had just
-// arrived, say) is never delivered. Nothing reports the gap, because there is
-// no anchor to measure it from. A consumer that cannot afford that should pass
-// FromCursor. A [Cursor] with only Height set, to the height the consumer is
-// caught up to, is enough: confirmed replay does not check InstanceID, and a
-// foreign InstanceID replays the node's retained mempool window as well.
+// Against an older node, or one with no block source, there is no head cursor
+// and the window remains: a reconnect before the first confirmed event sends no
+// SetCursor and resumes live, and an event in flight at the drop is lost with
+// nothing to report it. Pass FromCursor to close it there; a [Cursor] with only
+// Height set, to the height the consumer is caught up to, is enough, since
+// confirmed replay does not check InstanceID.
 //
 // # Cancel safety
 //
@@ -1000,6 +1000,14 @@ func (w *ResilientWatch) connectOnce(ctx context.Context) (*Stream, error) {
 
 	w.mu.Lock()
 	w.handle = h
+	// With no anchor of its own (no FromCursor, an empty store, nothing
+	// confirmed yet), adopt the position this stream started from. Nothing is
+	// sent for it now - the stream already starts there - but the next
+	// reconnect re-anchors to it, so what this stream was about to deliver when
+	// it dropped is replayed rather than lost. See [Stream.HeadCursor].
+	if w.resume == nil {
+		w.resume = stream.HeadCursor()
+	}
 	w.desired = resume
 	// A re-anchor is outstanding until the node answers it; hold the high-water
 	// still until then so a live event racing the ack cannot skip the replay

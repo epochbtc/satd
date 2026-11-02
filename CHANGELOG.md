@@ -43,7 +43,7 @@ full in the in-development
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 - Consensus: `-reindex` holds every block in the block files to the header rules header sync applies (difficulty schedule, median time past, version, checkpoints), and neither replays nor indexes one that breaks them, or any block built on it (#506).
 - Operator: AssumeUTXO background validation retries a failed block connect instead of stopping, its three alerts reach the `status` stream, webhooks and `satd_alert_active` as well as `getwarnings`, and new `satd_assumeutxo_*` gauges show its progress (#557).
-- SDKs: the Go and Rust resilient-watch docs say that a watch has no replay anchor until its first confirmed event, and how to give it one (#777).
+- Streaming: `Subscribe` and `Watch` responses carry the stream's head cursor in a `satd-head-cursor` header, and the Go and Rust resilient watch and subscription resume from it, so a drop before the first confirmed event no longer loses what was in flight (#777).
 
 ## Releases
 
