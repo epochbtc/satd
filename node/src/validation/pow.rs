@@ -13,8 +13,8 @@ const REGTEST_POWLIMIT_BITS: u32 = 0x207fffff;
 const TESTNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
 /// Signet minimum difficulty target (Core's signet `powLimit`,
 /// `00000377ae…`). The retarget clamp in [`next_bits`] and the bound in
-/// [`check_proof_of_work_bounded`] read it; signet validation does not check
-/// `nBits` against the retarget schedule (the block signature is the gate).
+/// [`check_proof_of_work_bounded`] read it, and signet `nBits` is checked
+/// against the retarget schedule like every chain's, as in Core.
 const SIGNET_POWLIMIT_BITS: u32 = 0x1e0377ae;
 /// Number of blocks between difficulty retargets.
 /// Bitcoin's difficulty adjustment interval, in blocks (Core's
