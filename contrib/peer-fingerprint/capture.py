@@ -596,6 +596,8 @@ def main():
                     help="speak BIP324 v2: dial with v2, or accept either transport when listening")
     ap.add_argument("--core-functional", metavar="DIR",
                     help="Bitcoin Core's test/functional directory; --v2 imports its test_framework.v2_p2p")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="--listen address (default 127.0.0.1; a container's gateway address to reach a node in a container)")
     ap.add_argument("--sessions", type=int, default=1,
                     help="--listen: record this many connections in turn; session N>1 goes to OUT-sN.json")
     ap.add_argument("--next-session-wait", type=float, default=20.0,
@@ -612,7 +614,7 @@ def main():
         # connection queues while the previous one is still recorded.
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", args.listen))
+        srv.bind((args.bind, args.listen))
         srv.listen(4)
     failed = False
     for n in range(1, args.sessions + 1):

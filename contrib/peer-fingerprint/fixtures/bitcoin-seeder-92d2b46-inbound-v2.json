@@ -1,0 +1,168 @@
+{
+  "capture_format": 1,
+  "label": "bitcoin-seeder-92d2b46-inbound-v2",
+  "implementation": "crawler",
+  "implementation_version": "92d2b46",
+  "network": "regtest",
+  "connection": "inbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": -1,
+    "note": "crawler, no chain"
+  },
+  "recorder": {
+    "greeting": "satd-0.7.0",
+    "protocol_version": 70016,
+    "services": 3081,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 0,
+  "transport": "v1",
+  "v1_after_v2": null,
+  "version": {
+    "protocol_version": 60000,
+    "services": 0,
+    "services_hex": "0000000000000000",
+    "user_agent": "/bitcoin-seeder:0.01/",
+    "start_height": 350000,
+    "relay": false,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "verack",
+    "getaddr"
+  ],
+  "received": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version",
+      "len": 107,
+      "fields": {
+        "protocol_version": 60000,
+        "services": 0,
+        "services_hex": "0000000000000000",
+        "user_agent": "/bitcoin-seeder:0.01/",
+        "start_height": 350000,
+        "relay": false,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    },
+    {
+      "t_ms": 41,
+      "phase": "passive",
+      "command": "getaddr",
+      "len": 0
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendcmpct"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "feefilter"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "ping"
+    },
+    {
+      "t_ms": 10007,
+      "phase": "probe",
+      "command": "ping"
+    },
+    {
+      "t_ms": 15012,
+      "phase": "probe",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 20017,
+      "phase": "probe",
+      "command": "getdata"
+    },
+    {
+      "t_ms": 25022,
+      "phase": "probe",
+      "command": "fpprobe"
+    }
+  ],
+  "probes": [
+    {
+      "probe": "ping",
+      "command": "ping",
+      "expect": "pong",
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    },
+    {
+      "probe": "getheaders",
+      "command": "getheaders",
+      "expect": "headers",
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    },
+    {
+      "probe": "getdata_unknown_wtx",
+      "command": "getdata",
+      "expect": "notfound",
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    },
+    {
+      "probe": "unknown_message",
+      "command": "fpprobe",
+      "expect": null,
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    }
+  ],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

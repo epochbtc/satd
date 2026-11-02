@@ -350,10 +350,71 @@ conn.close()
         pass
 
 
-IMPLS = [Satd, Core, Knots, Btcd, Bcoin, Rbitcoin, Floresta, Seeder, Bitnodes]
+class Libbitcoin(Impl):
+    """libbitcoin-server's bs, run in a container: bs 3.8 cannot choose the
+    address it listens on, so it gets a network namespace of its own with
+    only its P2P port published to the host's loopback. bs cannot mine and
+    has no RPC that reports its chain state."""
+    family, name = "libbitcoin", "libbitcoin"
+    env = ("LIBBITCOIN_BS",)
+    can_mine = False
+    image = "ubuntu:20.04"  # what bs was built on
+    container = "fp-libbitcoin"
+
+    def gateway(self):
+        out = subprocess.run(["docker", "network", "inspect", "bridge", "--format",
+                              "{{(index .IPAM.Config 0).Gateway}}"], capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    def recorder_bind(self):
+        return self.gateway()
+
+    def write_config(self, connect):
+        lines = ["[network]", "identifier = 3669344250", f"inbound_port = {NODE_P2P}",
+                 "inbound_connections = 8", "outbound_connections = 0", "host_pool_capacity = 0", "seed = 127.0.0.1:1",
+                 "[database]", "directory = /data/blockchain", "block_table_buckets = 1000",
+                 "transaction_table_buckets = 1000", "spend_table_buckets = 1000", "history_table_buckets = 1000",
+                 "[blockchain]", "checkpoint = 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206:0",
+                 "[fork]", "retarget = false",
+                 "[log]", "archive_directory = /data/archive", "debug_file = /data/debug.log",
+                 "error_file = /data/error.log",
+                 "[server]", "query_workers = 0", "heartbeat_service_seconds = 0",
+                 "block_service_enabled = false", "transaction_service_enabled = false"]
+        if connect:
+            host, port = connect.rsplit(":", 1)
+            lines.insert(1, f"peer = {self.gateway()}:{port}")
+        with open(os.path.join(self.dir, "bs.cfg"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def docker(self, *bs_args, detach=False):
+        return ["docker", "run", "--rm", "--name", self.container, "--user", f"{os.getuid()}:{os.getgid()}",
+                "-v", f"{self.dir}:/data", "-v", f"{os.environ['LIBBITCOIN_BS']}:/bs:ro",
+                "-p", f"127.0.0.1:{NODE_P2P}:{NODE_P2P}", self.image, "/bs", "-c", "/data/bs.cfg", *bs_args]
+
+    def start(self, connect=None):
+        os.makedirs(self.dir, exist_ok=True)
+        self.write_config(connect)
+        if not os.path.exists(os.path.join(self.dir, "blockchain")):
+            subprocess.run(self.docker("-i"), check=True, capture_output=True)
+        super().start(connect)
+
+    def argv(self, connect):
+        return self.docker()
+
+    def ready(self):
+        import socket as s
+        s.create_connection(("127.0.0.1", NODE_P2P), 2).close()
+
+    def stop(self):
+        subprocess.run(["docker", "stop", "-t", "30", self.container], capture_output=True)
+        super().stop()
+
+
+IMPLS = [Satd, Core, Knots, Btcd, Bcoin, Rbitcoin, Floresta, Libbitcoin, Seeder, Bitnodes]
 
 
 def capture(impl, direction, out, label, version, extra):
+    bind = impl.recorder_bind() if hasattr(impl, "recorder_bind") else "127.0.0.1"
     args = [sys.executable, CAPTURE, "--label", label, "--implementation", impl.family,
             "--implementation-version", version, "--out", out, "--peer-ibd", "unknown", "--peer-height", "-1",
             *extra]
@@ -363,7 +424,7 @@ def capture(impl, direction, out, label, version, extra):
         # A second session shows whether the node dials again (rbitcoin
         # opens a short catch-up connection, then a separate one to follow
         # the tip).
-        args += ["--listen", str(RECORDER), "--sessions", "2"]
+        args += ["--listen", str(RECORDER), "--bind", bind, "--sessions", "2"]
     return subprocess.Popen(args)
 
 

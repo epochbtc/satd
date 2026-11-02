@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 1,
+  "transport": "v1",
   "v1_after_v2": true,
   "version": {
     "protocol_version": 70016,
@@ -63,7 +64,7 @@
       }
     },
     {
-      "t_ms": 0,
+      "t_ms": 1,
       "phase": "handshake",
       "command": "wtxidrelay",
       "len": 0
@@ -98,7 +99,7 @@
       }
     },
     {
-      "t_ms": 82,
+      "t_ms": 41,
       "phase": "passive",
       "command": "sendcmpct",
       "len": 9,
@@ -108,7 +109,7 @@
       }
     },
     {
-      "t_ms": 82,
+      "t_ms": 41,
       "phase": "passive",
       "command": "feefilter",
       "len": 8,
@@ -117,13 +118,13 @@
       }
     },
     {
-      "t_ms": 82,
+      "t_ms": 41,
       "phase": "passive",
       "command": "getaddr",
       "len": 0
     },
     {
-      "t_ms": 82,
+      "t_ms": 41,
       "phase": "passive",
       "command": "ping",
       "len": 8,
@@ -132,7 +133,7 @@
       }
     },
     {
-      "t_ms": 82,
+      "t_ms": 83,
       "phase": "passive",
       "command": "pong",
       "len": 8,
@@ -161,7 +162,7 @@
       }
     },
     {
-      "t_ms": 10042,
+      "t_ms": 10043,
       "phase": "probe",
       "command": "pong",
       "len": 8,
@@ -170,7 +171,7 @@
       }
     },
     {
-      "t_ms": 10500,
+      "t_ms": 10499,
       "phase": "probe",
       "command": "headers",
       "len": 82,
@@ -179,7 +180,7 @@
       }
     },
     {
-      "t_ms": 10500,
+      "t_ms": 10499,
       "phase": "probe",
       "command": "notfound",
       "len": 37,
@@ -238,7 +239,7 @@
       "command": "headers"
     },
     {
-      "t_ms": 82,
+      "t_ms": 41,
       "phase": "passive",
       "command": "pong"
     },
@@ -248,17 +249,17 @@
       "command": "headers"
     },
     {
-      "t_ms": 10042,
+      "t_ms": 10043,
       "phase": "probe",
       "command": "ping"
     },
     {
-      "t_ms": 10042,
+      "t_ms": 10043,
       "phase": "probe",
       "command": "getheaders"
     },
     {
-      "t_ms": 10500,
+      "t_ms": 10499,
       "phase": "probe",
       "command": "getdata"
     },
@@ -292,7 +293,7 @@
         "headers"
       ],
       "answered": true,
-      "latency_ms": 458,
+      "latency_ms": 456,
       "reply_fields": {
         "count": 1
       }
@@ -324,5 +325,6 @@
     }
   ],
   "closed_by_peer": null,
-  "error": null
+  "error": null,
+  "session": 1
 }

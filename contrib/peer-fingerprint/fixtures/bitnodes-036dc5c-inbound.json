@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 0,
+  "transport": "v1",
   "v1_after_v2": null,
   "version": {
     "protocol_version": 70016,
@@ -56,25 +57,25 @@
       }
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "sendaddrv2",
       "len": 0
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "verack",
       "len": 0
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "passive",
       "command": "getaddr",
       "len": 0
     },
     {
-      "t_ms": 1306,
+      "t_ms": 1321,
       "phase": "passive",
       "command": "headers",
       "len": 1,
@@ -83,7 +84,7 @@
       }
     },
     {
-      "t_ms": 1347,
+      "t_ms": 1362,
       "phase": "passive",
       "command": "pong",
       "len": 8,
@@ -92,7 +93,7 @@
       }
     },
     {
-      "t_ms": 11016,
+      "t_ms": 11030,
       "phase": "probe",
       "command": "pong",
       "len": 8,
@@ -101,7 +102,7 @@
       }
     },
     {
-      "t_ms": 11316,
+      "t_ms": 11331,
       "phase": "probe",
       "command": "headers",
       "len": 1,
@@ -132,42 +133,42 @@
       "command": "verack"
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "getheaders"
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "sendcmpct"
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "feefilter"
     },
     {
-      "t_ms": 1005,
+      "t_ms": 1021,
       "phase": "handshake",
       "command": "ping"
     },
     {
-      "t_ms": 11016,
+      "t_ms": 11030,
       "phase": "probe",
       "command": "ping"
     },
     {
-      "t_ms": 11016,
+      "t_ms": 11030,
       "phase": "probe",
       "command": "getheaders"
     },
     {
-      "t_ms": 11316,
+      "t_ms": 11331,
       "phase": "probe",
       "command": "getdata"
     },
     {
-      "t_ms": 16322,
+      "t_ms": 16332,
       "phase": "probe",
       "command": "fpprobe"
     }
@@ -196,7 +197,7 @@
         "headers"
       ],
       "answered": true,
-      "latency_ms": 300,
+      "latency_ms": 301,
       "reply_fields": {
         "count": 0
       }
@@ -219,5 +220,6 @@
     }
   ],
   "closed_by_peer": null,
-  "error": null
+  "error": null,
+  "session": 1
 }

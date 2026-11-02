@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 0,
+  "transport": "v1",
   "v1_after_v2": null,
   "version": {
     "protocol_version": 70015,
@@ -57,13 +58,13 @@
       }
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "verack",
       "len": 0
     },
     {
-      "t_ms": 2,
+      "t_ms": 3,
       "phase": "passive",
       "command": "addr",
       "len": 31,
@@ -72,7 +73,7 @@
       }
     },
     {
-      "t_ms": 2,
+      "t_ms": 3,
       "phase": "passive",
       "command": "sendcmpct",
       "len": 9,
@@ -88,7 +89,7 @@
       "len": 0
     },
     {
-      "t_ms": 4,
+      "t_ms": 5,
       "phase": "passive",
       "command": "headers",
       "len": 82,
@@ -97,7 +98,7 @@
       }
     },
     {
-      "t_ms": 4,
+      "t_ms": 6,
       "phase": "passive",
       "command": "pong",
       "len": 8,
@@ -112,19 +113,19 @@
       "len": 8,
       "fields": {
         "has_nonce": true
-      }
-    },
-    {
-      "t_ms": 10013,
-      "phase": "probe",
-      "command": "headers",
-      "len": 82,
-      "fields": {
-        "count": 1
       }
     },
     {
       "t_ms": 10014,
+      "phase": "probe",
+      "command": "headers",
+      "len": 82,
+      "fields": {
+        "count": 1
+      }
+    },
+    {
+      "t_ms": 10015,
       "phase": "probe",
       "command": "notfound",
       "len": 37,
@@ -158,37 +159,37 @@
       "command": "verack"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "sendheaders"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "getheaders"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "sendcmpct"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "feefilter"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "getaddr"
     },
     {
-      "t_ms": 1,
+      "t_ms": 2,
       "phase": "handshake",
       "command": "ping"
     },
     {
-      "t_ms": 10012,
+      "t_ms": 10013,
       "phase": "probe",
       "command": "ping"
     },
@@ -203,7 +204,7 @@
       "command": "getdata"
     },
     {
-      "t_ms": 10014,
+      "t_ms": 10015,
       "phase": "probe",
       "command": "fpprobe"
     }
@@ -218,7 +219,7 @@
         "pong"
       ],
       "answered": true,
-      "latency_ms": 1,
+      "latency_ms": 0,
       "reply_fields": {
         "has_nonce": true
       }
@@ -232,7 +233,7 @@
         "headers"
       ],
       "answered": true,
-      "latency_ms": 0,
+      "latency_ms": 1,
       "reply_fields": {
         "count": 1
       }
@@ -246,7 +247,7 @@
         "notfound"
       ],
       "answered": true,
-      "latency_ms": 0,
+      "latency_ms": 1,
       "reply_fields": {
         "count": 1,
         "types": {
@@ -264,5 +265,6 @@
     }
   ],
   "closed_by_peer": null,
-  "error": null
+  "error": null,
+  "session": 1
 }

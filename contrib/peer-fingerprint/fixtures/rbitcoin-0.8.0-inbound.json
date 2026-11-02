@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 1,
+  "transport": null,
   "v1_after_v2": false,
   "version": null,
   "commands": [],
@@ -26,5 +27,6 @@
   "sent": [],
   "probes": [],
   "closed_by_peer": null,
-  "error": null
+  "error": null,
+  "session": 1
 }

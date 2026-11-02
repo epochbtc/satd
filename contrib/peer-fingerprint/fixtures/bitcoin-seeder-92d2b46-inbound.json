@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 0,
+  "transport": "v1",
   "v1_after_v2": null,
   "version": {
     "protocol_version": 60000,
@@ -59,7 +60,7 @@
       "len": 0
     },
     {
-      "t_ms": 41,
+      "t_ms": 40,
       "phase": "passive",
       "command": "getaddr",
       "len": 0
@@ -107,22 +108,22 @@
       "command": "ping"
     },
     {
-      "t_ms": 10002,
+      "t_ms": 10005,
       "phase": "probe",
       "command": "ping"
     },
     {
-      "t_ms": 15007,
+      "t_ms": 15010,
       "phase": "probe",
       "command": "getheaders"
     },
     {
-      "t_ms": 20012,
+      "t_ms": 20015,
       "phase": "probe",
       "command": "getdata"
     },
     {
-      "t_ms": 25018,
+      "t_ms": 25020,
       "phase": "probe",
       "command": "fpprobe"
     }
@@ -156,13 +157,12 @@
       "probe": "unknown_message",
       "command": "fpprobe",
       "expect": null,
-      "disconnected": true,
-      "replies": []
+      "disconnected": false,
+      "replies": [],
+      "answered": false
     }
   ],
-  "closed_by_peer": {
-    "t_ms": 30023,
-    "phase": "probe"
-  },
-  "error": null
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
 }

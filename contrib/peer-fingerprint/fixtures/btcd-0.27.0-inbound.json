@@ -19,6 +19,7 @@
     "probe_wait_s": 5.0
   },
   "v2_attempts_before_v1": 0,
+  "transport": "v1",
   "v1_after_v2": null,
   "version": {
     "protocol_version": 70016,
@@ -92,7 +93,7 @@
       }
     },
     {
-      "t_ms": 10010,
+      "t_ms": 10011,
       "phase": "probe",
       "command": "pong",
       "len": 8,
@@ -101,7 +102,7 @@
       }
     },
     {
-      "t_ms": 10010,
+      "t_ms": 10011,
       "phase": "probe",
       "command": "headers",
       "len": 82,
@@ -169,7 +170,7 @@
       "command": "ping"
     },
     {
-      "t_ms": 10010,
+      "t_ms": 10011,
       "phase": "probe",
       "command": "getheaders"
     },
@@ -194,7 +195,7 @@
         "pong"
       ],
       "answered": true,
-      "latency_ms": 0,
+      "latency_ms": 1,
       "reply_fields": {
         "has_nonce": true
       }
@@ -222,7 +223,7 @@
         "notfound"
       ],
       "answered": true,
-      "latency_ms": 1,
+      "latency_ms": 0,
       "reply_fields": {
         "count": 1,
         "types": {
@@ -240,5 +241,6 @@
     }
   ],
   "closed_by_peer": null,
-  "error": null
+  "error": null,
+  "session": 1
 }
