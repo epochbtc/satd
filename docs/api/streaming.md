@@ -1154,7 +1154,7 @@ not all — parse per key rather than assuming the whole map is numeric.
 | `peer_floor` | `peers`, `peers_outbound`, `peers_inbound`, `threshold` (raise only) |
 | `deep_reorg` | `depth`, `from_height`, `to_height`, `fork_height` |
 | `template_invalid` | raise: `check` (`structural` or `full`), `origin` (`getblocktemplate`, `generate` or `stratum`), `reason` (Core's reject reason), `height`, and `txid` when the offending transaction was found |
-| `assumeutxo_catchup_stalled` | raise: `reason` (`connect_failing` or `invalid_block`), `height`, `hash`, `error`, and `failures` (attempts since the last block connected) for `connect_failing` |
+| `assumeutxo_catchup_stalled` | raise: `reason` (`connect_failing`, `invalid_block` or `cannot_connect`), `height`, `hash`, `error`, and `failures` (attempts since the last block connected) for `connect_failing` |
 | `assumeutxo_handoff_failing` | raise: `height` (the snapshot height), `attempts`, `failing_for_secs`, `error` |
 | `assumeutxo_validation_failed` | raise: `reason` (`utxo_hash_mismatch` or `base_mismatch`), `snapshot_height`, and `expected_hash_serialized_3` / `actual_hash_serialized_3` or `expected_base` / `actual_base` |
 

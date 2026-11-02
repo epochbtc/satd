@@ -163,3 +163,112 @@ fn an_invalid_block_halts_the_connector_without_retrying() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].details.get("reason").map(String::as_str), Some("invalid_block"));
 }
+
+/// Every structural refusal is permanent for the background connector, and
+/// the verdict list is the one the peer charge uses.
+///
+/// Perturbation: the old `_ => false` catch-all (only verdicts permanent)
+/// fails the structural assertions; dropping `ForkBeforeCheckpoint` from
+/// `is_verdict_on_block` fails the first.
+#[test]
+fn structural_refusals_are_not_retried_and_io_is() {
+    use crate::chain::connect::ConnectError;
+    use crate::chain::state::ChainError;
+    use crate::validation::ValidationError;
+    assert!(ChainError::ForkBeforeCheckpoint(7).is_verdict_on_block());
+    assert!(PeerManager::block_error_is_the_blocks(&ChainError::ForkBeforeCheckpoint(7)));
+    for e in [
+        ChainError::Duplicate,
+        ChainError::PrevBlockNotFound,
+        ChainError::BadPrevBlock,
+        ChainError::ParentNeverConnected,
+        ChainError::DecodeFailed,
+        ChainError::ForkBeforeCheckpoint(7),
+        ChainError::CheckpointMismatch(7),
+        ChainError::Validation(ValidationError::BadMerkleRoot),
+        ChainError::Connect(ConnectError::BadCoinbaseHeight),
+    ] {
+        assert!(e.retry_cannot_help(), "{e:?} must not be retried forever");
+    }
+    for e in [
+        ChainError::FlatFile("disk".into()),
+        ChainError::BlockDataUnreadable("gone".into()),
+        ChainError::SnapshotLoadInProgress,
+        ChainError::Validation(ValidationError::TimeTooNew),
+        ChainError::Connect(ConnectError::Interrupted),
+    ] {
+        assert!(!e.retry_cannot_help(), "{e:?} can heal and is retried");
+    }
+}
+
+/// A structural refusal stops the connector at once with
+/// `reason=cannot_connect`, rather than retrying it under `connect_failing`.
+///
+/// Perturbation: dropping the `retry_cannot_help` arm sends `bad-prevblk` down
+/// the retry path; the fault is retried away, the background validates, and
+/// the thread-exit and reason assertions fail.
+#[test]
+fn a_structural_refusal_halts_the_connector_without_retrying() {
+    let mut rig = Rig::new(5);
+    rig.cs.bg_connect_faults.2.store(1, Ordering::Relaxed);
+    rig.start();
+    let thread = rig.thread.take().unwrap();
+    rig.wait_for("the connector to stop", || thread.is_finished());
+    thread.join().unwrap();
+    assert_eq!(rig.cs.background().expect("still attached").tip_height(), 0);
+    let events = rig.status_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].details.get("reason").map(String::as_str), Some("cannot_connect"));
+}
+
+/// The retry notice goes when the background does: nothing is left to retry.
+///
+/// Perturbation: without the `warnings.clear` in the `background() == None`
+/// arm the notice stands after the detach and this times out.
+#[test]
+fn the_retry_notice_clears_when_the_background_goes_away() {
+    let mut rig = Rig::new(5);
+    rig.cs.bg_connect_faults.0.store(u32::MAX, Ordering::Relaxed);
+    let has_notice = |cs: &ChainState| {
+        cs.warnings().list().iter().any(|w| w.id == "assumeutxo.connect_retry")
+    };
+    rig.start();
+    rig.wait_for("the retry notice", || has_notice(&rig.cs));
+    rig.cs.detach_background_for_test();
+    rig.wait_for("the notice to clear", || !has_notice(&rig.cs));
+}
+
+/// A replaced snapshot starts its own count: the old one's stall clears, and
+/// the new one's is raised at its own 30th failure, not carried over.
+///
+/// Perturbation: without the reset on a changed snapshot no `cleared` follows
+/// the replacement (the old episode just keeps refreshing), and this times out.
+#[test]
+fn a_replaced_snapshot_does_not_inherit_the_old_failures() {
+    let mut rig = Rig::new(5);
+    let kind = StatusKind::AssumeutxoCatchupStalled;
+    rig.cs.bg_connect_faults.0.store(u32::MAX, Ordering::Relaxed);
+    rig.start();
+    rig.wait_for("the first stall", || rig.cs.background_alerts().is_raised(kind));
+    let first = rig.status_events();
+    assert_eq!(first.len(), 1, "{first:?}");
+
+    let tip = rig.cs.get_block_hash_by_height(4).unwrap();
+    rig.cs
+        .attach_background(rig.dir.join("chainstate_background2"), 4, tip, [7; 32], 64, -1)
+        .unwrap();
+    let mut seen: Vec<StatusEvent> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !(seen.len() >= 2 && seen[1].state == StatusState::Raised) {
+        assert!(Instant::now() < deadline, "no clear and re-raise after the replacement: {seen:?}");
+        seen.extend(rig.status_events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(seen[0].state, StatusState::Cleared, "{seen:?}");
+    assert_eq!(
+        seen[1].details.get("failures").map(String::as_str),
+        Some(CONNECT_RETRY_LIMIT.to_string().as_str()),
+        "the new snapshot's count starts at zero"
+    );
+    rig.cs.bg_connect_faults.0.store(0, Ordering::Relaxed);
+}

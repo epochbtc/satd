@@ -168,22 +168,79 @@ pub enum ChainError {
 }
 
 impl ChainError {
-    /// Whether this failure is a verdict on the block itself, so connecting
-    /// the same bytes again can only fail again.
+    /// Whether this failure is a verdict on the block itself: its contents or
+    /// a header rule (Core's `BLOCK_CONSENSUS`, `BLOCK_INVALID_HEADER`,
+    /// `BLOCK_CHECKPOINT`). The one list behind both the peer charge
+    /// (`PeerManager::block_error_is_the_blocks`) and the background
+    /// connector's `invalid_block` stop.
     ///
-    /// The background catch-up connector uses it to tell an invalid
-    /// historical block, which it must not retry forever, from a storage or
-    /// flat-file failure, which it retries. A mutation-class rejection is not
-    /// a verdict (an honest block can share the hash), and `time-too-new`
-    /// depends on the local clock rather than on the block.
+    /// A mutation-class rejection is not a verdict (an honest block can share
+    /// the hash), and `time-too-new` depends on the local clock rather than on
+    /// the block.
     pub fn is_verdict_on_block(&self) -> bool {
         match self {
             ChainError::Connect(e) => e.is_verdict_on_block(),
             ChainError::Validation(e) => {
                 !e.is_mutation_class() && !matches!(e, validation::ValidationError::TimeTooNew)
             }
-            ChainError::CheckpointMismatch(_) => true,
+            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether connecting the same stored block again can only fail the same
+    /// way, for the AssumeUTXO background connector, which connects the
+    /// canonical block at each height below the snapshot in order and has no
+    /// refetch path of its own.
+    ///
+    /// Every verdict is, and so is every structural refusal: the block does
+    /// not extend the background tip, its parent is unknown or never
+    /// connected, the bytes do not decode, it is already connected, or they
+    /// are a mutated copy. Below the snapshot nothing reorgs and the
+    /// connector itself wrote the parent's row (the background tip), so none
+    /// of those changes between attempts. What can change is the node's own
+    /// state: storage and block-file I/O, a `loadtxoutset` holding the
+    /// chainstate, the clock (`time-too-new`), an index emit or an interrupt.
+    /// Those are retried.
+    ///
+    /// Exhaustive on purpose, unlike [`Self::is_verdict_on_block`]: a new
+    /// variant has to be classified here rather than fall into "retry
+    /// forever" by default.
+    pub fn retry_cannot_help(&self) -> bool {
+        use connect::ConnectError as CE;
+        match self {
+            ChainError::Duplicate
+            | ChainError::PrevBlockNotFound
+            | ChainError::BadPrevBlock
+            | ChainError::ParentNeverConnected
+            | ChainError::DecodeFailed
+            | ChainError::CheckpointMismatch(_)
+            | ChainError::ForkBeforeCheckpoint(_) => true,
+            ChainError::Validation(e) => !matches!(e, validation::ValidationError::TimeTooNew),
+            ChainError::Connect(e) => match e {
+                #[cfg(feature = "block-filter-index")]
+                CE::FilterIndexEmit(_) => false,
+                CE::SpIndexEmit(_)
+                | CE::ChainTxGap { .. }
+                | CE::MedianTimeWindowGap { .. }
+                | CE::TxSeqOverflow
+                | CE::Interrupted => false,
+                CE::TxValidation(validation::ValidationError::TimeTooNew) => false,
+                _ => true,
+            },
+            // The node's own I/O and transient chainstate states.
+            ChainError::Storage(_)
+            | ChainError::FlatFile(_)
+            | ChainError::BlockDataUnreadable(_)
+            | ChainError::SnapshotLoadInProgress => false,
+            // Not produced by a block connect; retrying is the safe reading
+            // of an error the connector does not expect.
+            ChainError::Disconnect(_)
+            | ChainError::Snapshot(_)
+            | ChainError::BlockNotFound
+            | ChainError::InvalidArgument(_)
+            | ChainError::ReactivationFailed(_)
+            | ChainError::ReindexCannotResume(_) => false,
         }
     }
 }
@@ -594,9 +651,10 @@ pub struct ChainState {
     background_alerts: crate::chain::background_alerts::BackgroundAlerts,
     /// Test-only fault injection for the background connector: each count
     /// makes the next `background_connect_block` fail before connecting, the
-    /// first with an I/O error, the second with a verdict on the block.
+    /// first with an I/O error, the second with a verdict on the block, the
+    /// third with a structural refusal (`bad-prevblk`).
     #[cfg(test)]
-    pub(crate) bg_connect_faults: (AtomicU32, AtomicU32),
+    pub(crate) bg_connect_faults: (AtomicU32, AtomicU32, AtomicU32),
     /// Custom signet challenge script (BIP 325), set via
     /// `-signetchallenge`. When present (signet only), every accepted
     /// block's signet solution is verified against it and the P2P magic
@@ -1452,6 +1510,12 @@ impl ChainState {
         self.background.read().is_some()
     }
 
+    /// Drop the background chainstate, as a completed handoff does.
+    #[cfg(test)]
+    pub(crate) fn detach_background_for_test(&self) {
+        *self.background.write() = None;
+    }
+
     /// The AssumeUTXO background-validation alerts.
     pub fn background_alerts(&self) -> &crate::chain::background_alerts::BackgroundAlerts {
         &self.background_alerts
@@ -1479,6 +1543,9 @@ impl ChainState {
             }
             if take(&self.bg_connect_faults.1) {
                 return Err(ChainError::CheckpointMismatch(bg.tip_height() + 1));
+            }
+            if take(&self.bg_connect_faults.2) {
+                return Err(ChainError::BadPrevBlock);
             }
         }
         let outcome = bg.connect_next_block(block)?;

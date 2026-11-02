@@ -8156,14 +8156,7 @@ impl PeerManager {
     /// honest data can produce. Not `time-too-new` (`BLOCK_TIME_FUTURE`,
     /// charged nothing), and not this node's own storage failures.
     fn block_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
-        use crate::chain::state::ChainError;
-        match e {
-            ChainError::Validation(crate::validation::ValidationError::TimeTooNew) => false,
-            ChainError::Validation(v) => !v.is_mutation_class(),
-            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
-            ChainError::Connect(ce) => ce.is_verdict_on_block(),
-            _ => false,
-        }
+        e.is_verdict_on_block()
     }
 
     /// Charge the peer that sent `hash` for a block that failed a consensus
@@ -8628,6 +8621,8 @@ impl PeerManager {
         // total since the last block connected, for the report.
         let mut retry_count: u32 = 0;
         let mut connect_failures: u32 = 0;
+        // The snapshot the counters above and the stall alert describe.
+        let mut connect_snapshot: Option<(u32, bitcoin::BlockHash)> = None;
         loop {
             if *shutdown.borrow() {
                 return;
@@ -8636,7 +8631,12 @@ impl PeerManager {
                 Some(b) => b,
                 None => {
                     // Nothing attached: the handoff completed (or no snapshot
-                    // was ever loaded), so neither condition can stand.
+                    // was ever loaded), so neither condition can stand, and
+                    // nothing the counters count is left to retry.
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    retry_count = 0;
+                    connect_failures = 0;
+                    connect_snapshot = None;
                     alerts.clear(
                         warnings,
                         StatusKind::AssumeutxoCatchupStalled,
@@ -8667,6 +8667,25 @@ impl PeerManager {
                 alerts.clear(warnings, StatusKind::AssumeutxoHandoffFailing, msg);
                 warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
                 return;
+            }
+
+            // A `loadtxoutset` can replace the snapshot under us. The retry
+            // notice, the stall and the failure count are about the old one's
+            // blocks; carrying them over would report the old snapshot's
+            // failures against the new one.
+            let snapshot_id = (bg.snapshot_height(), bg.snapshot_hash());
+            if connect_snapshot != Some(snapshot_id) {
+                if connect_snapshot.is_some() {
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    alerts.clear(
+                        warnings,
+                        StatusKind::AssumeutxoCatchupStalled,
+                        "the AssumeUTXO snapshot was replaced",
+                    );
+                }
+                retry_count = 0;
+                connect_failures = 0;
+                connect_snapshot = Some(snapshot_id);
             }
 
             let next_height = bg.tip_height() + 1;
@@ -8902,6 +8921,36 @@ impl PeerManager {
                             ),
                         )
                         .with_detail("reason", "invalid_block")
+                        .with_detail("height", next_height)
+                        .with_detail("hash", hash)
+                        .with_detail("error", &e),
+                    );
+                    let _ = bg.flush();
+                    return;
+                }
+                // Not the block's fault, but just as permanent: the stored
+                // block does not extend the background tip, its parent is
+                // unknown, its bytes do not decode, or it is a mutated copy
+                // (see `ChainError::retry_cannot_help`). Retrying it forever
+                // would only hide that behind a `connect_failing` count.
+                Err(e) if e.retry_cannot_help() => {
+                    tracing::error!(
+                        height = next_height, %hash, error = %e,
+                        "AssumeUTXO: background catch-up halted — the block cannot connect"
+                    );
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    alerts.raise(
+                        warnings,
+                        StatusEvent::raised(
+                            StatusKind::AssumeutxoCatchupStalled,
+                            format!(
+                                "AssumeUTXO background validation stopped at height \
+                                 {next_height}: block {hash} cannot connect to the \
+                                 background chain ({e}). It will not resume without a \
+                                 restart; the snapshot remains unvalidated"
+                            ),
+                        )
+                        .with_detail("reason", "cannot_connect")
                         .with_detail("height", next_height)
                         .with_detail("hash", hash)
                         .with_detail("error", &e),
