@@ -562,6 +562,16 @@ jobs:
       - name: Check canary pins
         run: python3 scripts/canary/pins.py check
 
+      # The release signing script runs once per release, on a maintainer's
+      # machine, so a regression in it would otherwise surface at the worst
+      # moment. The test stubs gh and minisign; offline.
+      - name: Test the release signing script
+        run: |
+          set -euo pipefail
+          command -v shellcheck > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck -S error contrib/release/sign-tarballs.sh contrib/release/tests/sign-tarballs-test.sh
+          contrib/release/tests/sign-tarballs-test.sh
+
   # Seed the dependency cache from master so a fresh branch's FIRST CI run is
   # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
   # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a

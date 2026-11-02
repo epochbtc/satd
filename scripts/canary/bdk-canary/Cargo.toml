@@ -30,7 +30,14 @@ path = "src/main.rs"
 # Bitcoin, and many others build on it).
 bdk_wallet = "3.1"
 bdk_electrum = "0.24"
-bdk_esplora = { version = "0.22.2", features = ["blocking"] }
+# Plain-HTTP blocking client only: the canary talks to a satd on
+# 127.0.0.1. bdk_esplora's default features add `blocking-https` and
+# `async-https`, and `blocking-https` turns on minreq 2.x's rustls 0.21
+# stack, which pins rustls-webpki 0.101 and its open advisories (#370).
+# Without TLS, minreq pulls no rustls at all; bitcoincore-rpc's minreq
+# transport is plain HTTP too. The only rustls left is electrum-client's
+# 0.23. Check with `cargo tree -i rustls-webpki`.
+bdk_esplora = { version = "0.22.2", default-features = false, features = ["std", "blocking"] }
 # Used ONLY to advance the regtest chain (generatetoaddress). On
 # mainnet this is what miners do; here it is the test driver's
 # chain-advancement affordance. Every *wallet* operation (scan,
