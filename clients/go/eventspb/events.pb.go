@@ -114,29 +114,46 @@ const (
 	// working it would have found a block the node rejects. Clears when a
 	// template validates again.
 	StatusKind_STATUS_KIND_TEMPLATE_INVALID StatusKind = 7
+	// AssumeUTXO background validation is not advancing: a historical block
+	// keeps failing to connect (raised once the connector's retry budget is
+	// spent; it keeps retrying), or a block failed validation and the catch-up
+	// stopped. Clears when the next background block connects.
+	StatusKind_STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED StatusKind = 8
+	// The AssumeUTXO handoff at the snapshot height keeps failing (I/O while
+	// flushing or hashing the background UTXO set). Clears when it completes.
+	StatusKind_STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING StatusKind = 9
+	// Background validation proved the loaded AssumeUTXO snapshot invalid. Stands
+	// for the life of the process.
+	StatusKind_STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED StatusKind = 10
 )
 
 // Enum value maps for StatusKind.
 var (
 	StatusKind_name = map[int32]string{
-		0: "STATUS_KIND_UNSPECIFIED",
-		1: "STATUS_KIND_IBD_COMPLETE",
-		2: "STATUS_KIND_TIP_STALL",
-		3: "STATUS_KIND_DISK_LOW",
-		4: "STATUS_KIND_MEMPOOL_CONGESTED",
-		5: "STATUS_KIND_PEER_FLOOR",
-		6: "STATUS_KIND_DEEP_REORG",
-		7: "STATUS_KIND_TEMPLATE_INVALID",
+		0:  "STATUS_KIND_UNSPECIFIED",
+		1:  "STATUS_KIND_IBD_COMPLETE",
+		2:  "STATUS_KIND_TIP_STALL",
+		3:  "STATUS_KIND_DISK_LOW",
+		4:  "STATUS_KIND_MEMPOOL_CONGESTED",
+		5:  "STATUS_KIND_PEER_FLOOR",
+		6:  "STATUS_KIND_DEEP_REORG",
+		7:  "STATUS_KIND_TEMPLATE_INVALID",
+		8:  "STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED",
+		9:  "STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING",
+		10: "STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED",
 	}
 	StatusKind_value = map[string]int32{
-		"STATUS_KIND_UNSPECIFIED":       0,
-		"STATUS_KIND_IBD_COMPLETE":      1,
-		"STATUS_KIND_TIP_STALL":         2,
-		"STATUS_KIND_DISK_LOW":          3,
-		"STATUS_KIND_MEMPOOL_CONGESTED": 4,
-		"STATUS_KIND_PEER_FLOOR":        5,
-		"STATUS_KIND_DEEP_REORG":        6,
-		"STATUS_KIND_TEMPLATE_INVALID":  7,
+		"STATUS_KIND_UNSPECIFIED":                  0,
+		"STATUS_KIND_IBD_COMPLETE":                 1,
+		"STATUS_KIND_TIP_STALL":                    2,
+		"STATUS_KIND_DISK_LOW":                     3,
+		"STATUS_KIND_MEMPOOL_CONGESTED":            4,
+		"STATUS_KIND_PEER_FLOOR":                   5,
+		"STATUS_KIND_DEEP_REORG":                   6,
+		"STATUS_KIND_TEMPLATE_INVALID":             7,
+		"STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED":   8,
+		"STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING":   9,
+		"STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED": 10,
 	}
 )
 
@@ -6353,7 +6370,7 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x13EVICT_REASON_EXPIRY\x10\x02\x12\x1f\n" +
 	"\x1bEVICT_REASON_BLOCK_CONFLICT\x10\x03\x12\x17\n" +
 	"\x13EVICT_REASON_POLICY\x10\x04\x12\x16\n" +
-	"\x12EVICT_REASON_REORG\x10\x05*\xf9\x01\n" +
+	"\x12EVICT_REASON_REORG\x10\x05*\xff\x02\n" +
 	"\n" +
 	"StatusKind\x12\x1b\n" +
 	"\x17STATUS_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
@@ -6363,7 +6380,11 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x1dSTATUS_KIND_MEMPOOL_CONGESTED\x10\x04\x12\x1a\n" +
 	"\x16STATUS_KIND_PEER_FLOOR\x10\x05\x12\x1a\n" +
 	"\x16STATUS_KIND_DEEP_REORG\x10\x06\x12 \n" +
-	"\x1cSTATUS_KIND_TEMPLATE_INVALID\x10\a*u\n" +
+	"\x1cSTATUS_KIND_TEMPLATE_INVALID\x10\a\x12*\n" +
+	"&STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED\x10\b\x12*\n" +
+	"&STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING\x10\t\x12,\n" +
+	"(STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED\x10\n" +
+	"*u\n" +
 	"\vStatusState\x12\x1c\n" +
 	"\x18STATUS_STATE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13STATUS_STATE_RAISED\x10\x01\x12\x18\n" +

@@ -464,6 +464,9 @@ func TestEnumConstantsMatchTheProto(t *testing.T) {
 		{"StatusKindPeerFloor", int32(StatusKindPeerFloor), int32(eventspb.StatusKind_STATUS_KIND_PEER_FLOOR)},
 		{"StatusKindDeepReorg", int32(StatusKindDeepReorg), int32(eventspb.StatusKind_STATUS_KIND_DEEP_REORG)},
 		{"StatusKindTemplateInvalid", int32(StatusKindTemplateInvalid), int32(eventspb.StatusKind_STATUS_KIND_TEMPLATE_INVALID)},
+		{"StatusKindAssumeutxoCatchupStalled", int32(StatusKindAssumeutxoCatchupStalled), int32(eventspb.StatusKind_STATUS_KIND_ASSUMEUTXO_CATCHUP_STALLED)},
+		{"StatusKindAssumeutxoHandoffFailing", int32(StatusKindAssumeutxoHandoffFailing), int32(eventspb.StatusKind_STATUS_KIND_ASSUMEUTXO_HANDOFF_FAILING)},
+		{"StatusKindAssumeutxoValidationFailed", int32(StatusKindAssumeutxoValidationFailed), int32(eventspb.StatusKind_STATUS_KIND_ASSUMEUTXO_VALIDATION_FAILED)},
 
 		{"StatusStateUnspecified", int32(StatusStateUnspecified), int32(eventspb.StatusState_STATUS_STATE_UNSPECIFIED)},
 		{"StatusStateRaised", int32(StatusStateRaised), int32(eventspb.StatusState_STATUS_STATE_RAISED)},

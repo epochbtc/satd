@@ -1,6 +1,7 @@
 pub mod assumeutxo;
 pub mod assumevalid;
 pub mod background;
+pub mod background_alerts;
 pub mod checkpoints;
 pub mod connect;
 pub mod connect_phase;

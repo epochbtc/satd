@@ -688,6 +688,7 @@ impl MetricsContext {
 
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());
+        render_assumeutxo_metrics(&mut out, &self.chain_state);
         self.chain_state.template_validity().render_metrics(&mut out);
 
         // Webhook delivery counters, rendered only when a hook is configured.
@@ -1132,6 +1133,51 @@ fn render_health_metrics(out: &mut String, health: Option<&crate::health::Health
             "satd_alert_active",
             &[("kind", kind.as_str())],
             u64::from(health.is_active(kind)),
+        );
+    }
+}
+
+/// Append the AssumeUTXO background-validation gauges.
+///
+/// `satd_assumeutxo_background_attached` and `satd_assumeutxo_snapshot_rejected`
+/// render on every node, at 0 when no snapshot is loaded, so a rule can be
+/// written before one ever is. The two heights only exist while a background
+/// chainstate is attached: there is no background tip to report otherwise, and
+/// a zero would read as "validation fell back to genesis".
+fn render_assumeutxo_metrics(out: &mut String, chain_state: &ChainState) {
+    let bg = chain_state.background();
+    metric(
+        out,
+        "satd_assumeutxo_background_attached",
+        "1 while an AssumeUTXO snapshot is loaded and its history is being validated in the background.",
+        "gauge",
+        &[],
+        u64::from(bg.is_some()),
+    );
+    metric(
+        out,
+        "satd_assumeutxo_snapshot_rejected",
+        "1 once background validation has proven the loaded AssumeUTXO snapshot invalid.",
+        "gauge",
+        &[],
+        u64::from(bg.as_ref().is_some_and(|b| b.is_rejected())),
+    );
+    if let Some(bg) = bg {
+        metric(
+            out,
+            "satd_assumeutxo_background_tip_height",
+            "Height the AssumeUTXO background validation has connected up to.",
+            "gauge",
+            &[],
+            u64::from(bg.tip_height()),
+        );
+        metric(
+            out,
+            "satd_assumeutxo_snapshot_height",
+            "Base height of the loaded AssumeUTXO snapshot, where background validation hands off.",
+            "gauge",
+            &[],
+            u64::from(bg.snapshot_height()),
         );
     }
 }
@@ -2424,6 +2470,53 @@ mod tests {
         assert!(out.contains("satd_disk_free_bytes 4096"), "{out}");
         // Unrelated conditions stay at 0.
         assert!(out.contains("satd_alert_active{kind=\"tip_stall\"} 0"), "{out}");
+    }
+
+    /// The AssumeUTXO gauges: attached/rejected always, the heights only while
+    /// a background chainstate validates.
+    ///
+    /// Perturbation: emptying `render_assumeutxo_metrics` fails every
+    /// assertion here. (Dropping its call from `render_prometheus` is caught by
+    /// the regtest `/metrics` schema test, which asserts the two always-present
+    /// gauges.)
+    #[test]
+    fn assumeutxo_metrics_follow_the_background_chainstate() {
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let mut out = String::new();
+        render_assumeutxo_metrics(&mut out, &cs);
+        assert!(out.contains("satd_assumeutxo_background_attached 0"), "{out}");
+        assert!(out.contains("satd_assumeutxo_snapshot_rejected 0"), "{out}");
+        assert!(!out.contains("satd_assumeutxo_background_tip_height"), "{out}");
+        assert!(!out.contains("satd_assumeutxo_snapshot_height"), "{out}");
+
+        let blocks = crate::chain::state::tests::build_and_connect_chain(&cs, 3);
+        cs.attach_background(
+            dir.join("chainstate_background"),
+            3,
+            blocks[2].block_hash(),
+            [0x42; 32],
+            64,
+            -1,
+        )
+        .unwrap();
+        cs.background_connect_block(&blocks[0]).unwrap();
+        let mut out = String::new();
+        render_assumeutxo_metrics(&mut out, &cs);
+        assert_one_header_per_family(&out);
+        assert!(out.contains("satd_assumeutxo_background_attached 1"), "{out}");
+        assert!(out.contains("satd_assumeutxo_background_tip_height 1"), "{out}");
+        assert!(out.contains("satd_assumeutxo_snapshot_height 3"), "{out}");
+        assert!(out.contains("satd_assumeutxo_snapshot_rejected 0"), "{out}");
+
+        // The wrong anchor makes the handoff prove the snapshot invalid.
+        for b in &blocks[1..] {
+            let _ = cs.background_connect_block(b);
+        }
+        let mut out = String::new();
+        render_assumeutxo_metrics(&mut out, &cs);
+        assert!(out.contains("satd_assumeutxo_snapshot_rejected 1"), "{out}");
+        assert!(out.contains("satd_assumeutxo_background_tip_height 3"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
