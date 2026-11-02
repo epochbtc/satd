@@ -148,7 +148,11 @@ assert_core_accepted() {
     local hash="$1" cli="${2:-core_peer_cli}"
     local deadline=$(($(date +%s) + 60)) confirmations="-1"
     while [[ $(date +%s) -lt $deadline ]]; do
-        confirmations="$("$cli" getblockheader "$hash" 2>/dev/null | jq -r '.confirmations // -1')"
+        # Core may not have the block yet: bitcoin-cli then exits 5 (not found),
+        # and under `set -e -o pipefail` that would end the script here
+        # instead of letting the loop wait for it.
+        confirmations="$("$cli" getblockheader "$hash" 2>/dev/null | jq -r '.confirmations // -1' || true)"
+        confirmations="${confirmations:--1}"
         [[ "$confirmations" -ge 1 ]] && break
         sleep 1
     done
