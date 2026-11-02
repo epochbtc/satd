@@ -152,7 +152,7 @@ Installed and run on **StartOS 0.4.0.1** (x86_64), sideloaded with
 - Every exported interface answers through StartOS's reverse proxy with a
   certificate chaining to the server's root CA: Esplora
   `GET /api/blocks/tip/height` → 200, Electrum `server.version` →
-  `satd-electrs-compatible`, both verifying against that CA with
+  `satd-electrs-electrumx-compatible`, both verifying against that CA with
   `Verify return code: 0 (ok)`. MCP is 401 without a token and, once the
   **MCP Hostnames** action names the address the client uses, returns a full
   `initialize` result with the token the **MCP Token** action prints.

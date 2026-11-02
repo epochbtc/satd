@@ -42,13 +42,13 @@ pub const DEFAULT_MAX_CONNS: usize = 64;
 /// connections at this cap; the two defaults move together.
 pub const DEFAULT_MAX_SUBS_PER_CONN: usize = 10_000;
 /// Max requests in a single JSON-RPC batch. Real wallets batch far more
-/// than a handful at scan time: Sparrow sends its entire gap-limit
-/// window (~25+) of `blockchain.scripthash.subscribe` calls as one
-/// batch, and rejecting it makes the wallet scan fail outright (the
-/// whole batch is dropped with a single error). 100 clears the default
-/// gap-limit window with headroom while still bounding the work a
-/// single line can schedule.
-pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 100;
+/// than a handful at scan time, and a refused batch is dropped whole with a
+/// single error. Sparrow pages its batches at 100 requests, and its
+/// `blockchain.transaction.get_merkle` batches at 250, so a cap below 250
+/// fails transaction verification for a wallet with more than that many
+/// confirmed transactions. 345 is Fulcrum's `max_batch` default: it clears
+/// Sparrow's largest page and still bounds the work one line can schedule.
+pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 345;
 /// Max txs in a single `blockchain.transaction.broadcast_package`
 /// call. electrs accepts up to ~25 (matching Bitcoin Core's
 /// `MAX_PACKAGE_COUNT`).
@@ -70,7 +70,7 @@ pub struct ElectrumConfig {
     pub bind: SocketAddr,
     /// Server name reported by `server.version` and
     /// `server.features.server_version`. `None` reports
-    /// `satd-electrs-compatible/<version>`.
+    /// `satd-electrs-electrumx-compatible/<version>`.
     /// Configurable because Cake Wallet gates its silent-payment probe on the
     /// substring `electrs` appearing here; see the Electrum manual chapter.
     pub server_name: Option<String>,
