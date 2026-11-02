@@ -37,6 +37,7 @@ full in the in-development
 - Esplora: `-esplorarequesttimeout=0` no longer zeroes the TLS handshake budget (#826).
 - HTTP: `-rpcservertimeout` and `-esplorarequesttimeout` above a year are treated as a year, instead of failing every connection (#826).
 - Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
+- Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
 
 ## Releases
 

@@ -436,3 +436,34 @@ fn an_unrequested_block_above_the_ibd_window_is_not_stored() {
         assert_eq!(pm.chain_state.has_block_data(&hash), stored, "{what}");
     }
 }
+
+/// A block taken by the `getblockfrompeer` re-fetch path during IBD releases
+/// the IBD slot its sender held for it. That path returns before
+/// `handle_block_ibd`, which is where the slot is normally released (#547).
+#[test]
+fn a_refetched_block_releases_its_ibd_slot() {
+    let chain = blocks(5);
+    let (pm, _dir) = mk_pm();
+    for b in &chain {
+        pm.chain_state.accept_header(&b.header).unwrap();
+    }
+    *pm.ibd.write() = Some(IbdScheduler::new(5, 0, &pm.chain_state, 1024));
+    let _rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 5);
+    {
+        let mut ibd = pm.ibd.write();
+        let scheduler = ibd.as_mut().unwrap();
+        scheduler.register_peer(1);
+        scheduler.assign_blocks(1);
+        assert_eq!(scheduler.inflight_peer(3), Some(1), "fixture: peer 1 is fetching height 3");
+    }
+    // Height 3 is stored, and an operator re-fetch from peer 1 is armed.
+    let block = chain[2].clone();
+    let hash = block.block_hash();
+    pm.chain_state.store_block(&block).unwrap();
+    pm.block_refetch.write().insert((hash, 1), Instant::now());
+
+    pm.handle_block(1, block, InFlight::new(pm.peer_flow(1)));
+
+    assert!(pm.block_refetch.read().is_empty(), "fixture: the re-fetch path took the block");
+    assert_eq!(pm.ibd.read().as_ref().unwrap().inflight_peer(3), None, "the slot is released");
+}

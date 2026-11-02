@@ -371,6 +371,14 @@ impl Default for SequenceIds {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside `write_block_durable` just before its fsync, on the
+    /// writing thread. Lets a test observe what is locked at that moment.
+    static DURABLE_SYNC_PROBE: std::cell::Cell<Option<fn(&ChainState)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -4161,6 +4169,12 @@ impl ChainState {
     /// has been synced — Bitcoin Core's model — which is a larger change than
     /// this fix and is tracked separately.
     ///
+    /// The fsync runs outside the flat-file lock, through a
+    /// [`SyncHandle`](crate::storage::flatfile::SyncHandle). Every block
+    /// read (`getblock`, Esplora, Electrum, the index backfills) takes that
+    /// lock, and on slow storage a 10-50 ms fsync per block held under it
+    /// would queue them all behind each stored block (#547).
+    ///
     /// The caller holds the returned [`PendingRecord`] until the entry
     /// pointing at the record is committed, which keeps the pruner off the
     /// record's file until then.
@@ -4169,12 +4183,22 @@ impl ChainState {
         block_data: &[u8],
         height: u32,
     ) -> Result<(FlatFilePos, PendingRecord), ChainError> {
-        let mut flat = self.flat_files.lock();
-        let (pos, pending) = flat
-            .write_block_pending(block_data, network_magic(self.network), height)
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-        flat.sync_all()
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        let (pos, pending, sync) = {
+            let mut flat = self.flat_files.lock();
+            let (pos, pending) = flat
+                .write_block_pending(block_data, network_magic(self.network), height)
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            let sync = flat.sync_handle().map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            (pos, pending, sync)
+        };
+        if let Some(sync) = sync {
+            #[cfg(test)]
+            if let Some(probe) = DURABLE_SYNC_PROBE.get() {
+                probe(self);
+            }
+            sync.sync().map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            self.flat_files.lock().mark_synced(sync);
+        }
         Ok((pos, pending))
     }
 
@@ -5297,6 +5321,7 @@ impl ChainState {
         let new_height = parent.height + 1;
 
         // Structural + witness block validation
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, new_height);
         validation::block::check_block(block, self.network, new_height)?;
 
         // PoW validation, bounded by the network's limit (Core's
@@ -5572,6 +5597,7 @@ impl ChainState {
                 validation::ValidationError::BadTxDuplicate,
             ));
         }
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
         validation::block::check_block(block, self.network, height)?;
 
         // Only *now* decide whether there is anything to do. The check is
@@ -5582,6 +5608,7 @@ impl ChainState {
         // unable to repair the one corruption it can actually detect.
         // Ordering it after validation also means a peer's bad bytes can never
         // displace a good stored copy — they are rejected before we look.
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
         if let Some(stored) = self.get_block(&hash)
             && validation::block::check_block(&stored, self.network, height).is_ok()
         {
@@ -5636,6 +5663,7 @@ impl ChainState {
         // Same "canonical, not merely readable" test as above — a concurrent
         // writer may have landed a good copy while we were validating, but a
         // parse-able bad one is still a hole.
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
         if let Some(stored) = self.get_block(&hash)
             && validation::block::check_block(&stored, self.network, height).is_ok()
         {
@@ -6481,6 +6509,7 @@ impl ChainState {
         )?;
         self.require_extends_tip(&pre.block.header, pre.height)?;
         // Normally already done by the prefetch worker, off this thread.
+        crate::chain::connect::debug_assert_block_height(&*self.store, &pre.block, pre.height);
         if !pre.context_free_checked {
             validation::block::check_block_with_hashes(
                 &pre.block,
@@ -6584,6 +6613,7 @@ impl ChainState {
         // inside a transaction payload survives every check above: the 80-byte
         // header still hashes to the planned block. Only re-deriving the block
         // from its own bytes catches it (issue #505).
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
         replay.check_block(block, self.network, height)?;
         // As on the prefetched path: Core verifies a signet solution on every
         // connect from disk.
@@ -7267,6 +7297,7 @@ impl ChainState {
             // carries no checksum, and the scan read only the header and
             // checked that the length fits the file; this is what validates
             // the payload (issue #505).
+            crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
             if let Err(e) = replay.check_block(block, self.network, height) {
                 halted = Some((hash, height, format!("fails validation: {e}")));
                 break;
@@ -7691,6 +7722,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
+            crate::chain::connect::debug_assert_block_height(&*self.store, block, *height);
             if let Err(e) = replay.check_block(block, self.network, *height) {
                 tracing::warn!(
                     block = %hash,
@@ -7835,6 +7867,7 @@ impl ChainState {
         let height = parent.height + 1;
 
         // Structural + witness block validation (check_block).
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, height);
         if let Err(e) = validation::block::check_block(block, self.network, height) {
             return Ok(Some(e.to_string()));
         }
@@ -8004,6 +8037,7 @@ impl ChainState {
         // is the `HeaderOnly` row a header announcement left; a block with no
         // row yet is refused unmarked, at the cost of re-running this check if
         // it is sent again.
+        crate::chain::connect::debug_assert_block_height(&*self.store, block, new_height);
         if let Err(e) = validation::block::check_block(block, self.network, new_height) {
             if matches!(e, validation::ValidationError::OverweightBlock)
                 && self
@@ -11674,6 +11708,32 @@ pub(crate) mod tests {
              reach disk on their own via automatic memtable flushes"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-block fsync runs with the flat-file lock released, so block
+    /// reads do not wait behind it, and the record is still synced when the
+    /// write returns (#547).
+    #[test]
+    fn the_durable_block_fsync_runs_outside_the_flat_file_lock() {
+        thread_local! {
+            // 0: the probe never ran; 1: the lock was free; 2: it was held.
+            static SAW: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        }
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        cs.accept_header(&b1.header).unwrap();
+
+        DURABLE_SYNC_PROBE.set(Some(|cs| {
+            SAW.set(if cs.flat_files.try_lock().is_some() { 1 } else { 2 });
+        }));
+        let stored = cs.store_block(&b1);
+        DURABLE_SYNC_PROBE.set(None);
+        stored.unwrap();
+
+        assert_eq!(SAW.get(), 1, "the fsync must run with the flat-file lock free");
+        assert!(!cs.flat_files.lock().has_unsynced_writes(), "the record is synced on return");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
