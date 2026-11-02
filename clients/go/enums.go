@@ -94,10 +94,22 @@ const (
 	// StatusKindTemplateInvalid - a block template the node built failed its
 	// own validity check.
 	StatusKindTemplateInvalid StatusKind = 7
+	// StatusKindAssumeutxoCatchupStalled - AssumeUTXO background validation is
+	// not advancing: a historical block keeps failing to connect, or one failed
+	// validation.
+	StatusKindAssumeutxoCatchupStalled StatusKind = 8
+	// StatusKindAssumeutxoHandoffFailing - the AssumeUTXO handoff at the
+	// snapshot height keeps failing.
+	StatusKindAssumeutxoHandoffFailing StatusKind = 9
+	// StatusKindAssumeutxoValidationFailed - background validation proved the
+	// loaded AssumeUTXO snapshot invalid.
+	StatusKindAssumeutxoValidationFailed StatusKind = 10
 )
 
 // Known reports whether this build recognizes the kind.
-func (k StatusKind) Known() bool { return k >= StatusKindUnspecified && k <= StatusKindTemplateInvalid }
+func (k StatusKind) Known() bool {
+	return k >= StatusKindUnspecified && k <= StatusKindAssumeutxoValidationFailed
+}
 
 func (k StatusKind) String() string {
 	switch k {
@@ -117,6 +129,12 @@ func (k StatusKind) String() string {
 		return "deep_reorg"
 	case StatusKindTemplateInvalid:
 		return "template_invalid"
+	case StatusKindAssumeutxoCatchupStalled:
+		return "assumeutxo_catchup_stalled"
+	case StatusKindAssumeutxoHandoffFailing:
+		return "assumeutxo_handoff_failing"
+	case StatusKindAssumeutxoValidationFailed:
+		return "assumeutxo_validation_failed"
 	default:
 		return "unknown(" + strconv.FormatInt(int64(k), 10) + ")"
 	}

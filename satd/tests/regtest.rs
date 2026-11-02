@@ -8389,6 +8389,13 @@ fn test_metrics_and_health_endpoints() {
         "satd_filterindex_synced",
         "satd_filterindex_backfill_state{state=\"failed\"} 0",
         "satd_filterindex_backfill_state{state=\"idle\"} 1",
+        // AssumeUTXO background validation (#557): present at 0 on a node
+        // with no snapshot, so a rule can exist before one is loaded, and the
+        // alert kinds pre-registered like every other.
+        "satd_assumeutxo_background_attached 0",
+        "satd_assumeutxo_snapshot_rejected 0",
+        "satd_alert_active{kind=\"assumeutxo_catchup_stalled\"} 0",
+        "satd_alert_active{kind=\"assumeutxo_validation_failed\"} 0",
     ] {
         assert!(
             body.contains(required),

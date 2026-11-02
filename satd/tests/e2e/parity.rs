@@ -697,6 +697,9 @@ enum_namer!(status_kind_name, satd_events_client::StatusKind, pb::StatusKind, {
     PeerFloor => PeerFloor,
     DeepReorg => DeepReorg,
     TemplateInvalid => TemplateInvalid,
+    AssumeutxoCatchupStalled => AssumeutxoCatchupStalled,
+    AssumeutxoHandoffFailing => AssumeutxoHandoffFailing,
+    AssumeutxoValidationFailed => AssumeutxoValidationFailed,
 });
 
 enum_namer!(status_state_name, satd_events_client::StatusState, pb::StatusState, {

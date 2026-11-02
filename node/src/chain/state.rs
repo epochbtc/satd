@@ -167,6 +167,84 @@ pub enum ChainError {
     ReindexCannotResume(String),
 }
 
+impl ChainError {
+    /// Whether this failure is a verdict on the block itself: its contents or
+    /// a header rule (Core's `BLOCK_CONSENSUS`, `BLOCK_INVALID_HEADER`,
+    /// `BLOCK_CHECKPOINT`). The one list behind both the peer charge
+    /// (`PeerManager::block_error_is_the_blocks`) and the background
+    /// connector's `invalid_block` stop.
+    ///
+    /// A mutation-class rejection is not a verdict (an honest block can share
+    /// the hash), and `time-too-new` depends on the local clock rather than on
+    /// the block.
+    pub fn is_verdict_on_block(&self) -> bool {
+        match self {
+            ChainError::Connect(e) => e.is_verdict_on_block(),
+            ChainError::Validation(e) => {
+                !e.is_mutation_class() && !matches!(e, validation::ValidationError::TimeTooNew)
+            }
+            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether connecting the same stored block again can only fail the same
+    /// way, for the AssumeUTXO background connector, which connects the
+    /// canonical block at each height below the snapshot in order and has no
+    /// refetch path of its own.
+    ///
+    /// Every verdict is, and so is every structural refusal: the block does
+    /// not extend the background tip, its parent is unknown or never
+    /// connected, the bytes do not decode, it is already connected, or they
+    /// are a mutated copy. Below the snapshot nothing reorgs and the
+    /// connector itself wrote the parent's row (the background tip), so none
+    /// of those changes between attempts. What can change is the node's own
+    /// state: storage and block-file I/O, a `loadtxoutset` holding the
+    /// chainstate, the clock (`time-too-new`), an index emit or an interrupt.
+    /// Those are retried.
+    ///
+    /// Exhaustive on purpose, unlike [`Self::is_verdict_on_block`]: a new
+    /// variant has to be classified here rather than fall into "retry
+    /// forever" by default.
+    pub fn retry_cannot_help(&self) -> bool {
+        use connect::ConnectError as CE;
+        match self {
+            ChainError::Duplicate
+            | ChainError::PrevBlockNotFound
+            | ChainError::BadPrevBlock
+            | ChainError::ParentNeverConnected
+            | ChainError::DecodeFailed
+            | ChainError::CheckpointMismatch(_)
+            | ChainError::ForkBeforeCheckpoint(_) => true,
+            ChainError::Validation(e) => !matches!(e, validation::ValidationError::TimeTooNew),
+            ChainError::Connect(e) => match e {
+                #[cfg(feature = "block-filter-index")]
+                CE::FilterIndexEmit(_) => false,
+                CE::SpIndexEmit(_)
+                | CE::ChainTxGap { .. }
+                | CE::MedianTimeWindowGap { .. }
+                | CE::TxSeqOverflow
+                | CE::Interrupted => false,
+                CE::TxValidation(validation::ValidationError::TimeTooNew) => false,
+                _ => true,
+            },
+            // The node's own I/O and transient chainstate states.
+            ChainError::Storage(_)
+            | ChainError::FlatFile(_)
+            | ChainError::BlockDataUnreadable(_)
+            | ChainError::SnapshotLoadInProgress => false,
+            // Not produced by a block connect; retrying is the safe reading
+            // of an error the connector does not expect.
+            ChainError::Disconnect(_)
+            | ChainError::Snapshot(_)
+            | ChainError::BlockNotFound
+            | ChainError::InvalidArgument(_)
+            | ChainError::ReactivationFailed(_)
+            | ChainError::ReindexCannotResume(_) => false,
+        }
+    }
+}
+
 /// Outcome of [`ChainState::resume_pending_snapshot`] at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotResume {
@@ -571,6 +649,20 @@ pub struct ChainState {
     /// chainstate serving the user-facing tip; the background validates
     /// the history behind it and is dropped (its DB removed) at handoff.
     background: RwLock<Option<Arc<crate::chain::background::BackgroundChainState>>>,
+    /// The alerts background validation raises: catch-up stalled, handoff
+    /// failing, snapshot proven invalid. Routed like every other health
+    /// condition once `main` installs the sink.
+    background_alerts: crate::chain::background_alerts::BackgroundAlerts,
+    /// Test-only fault injection for the background connector: each count
+    /// makes the next `background_connect_block` fail before connecting, the
+    /// first with an I/O error, the second with a verdict on the block, the
+    /// third with a structural refusal (`bad-prevblk`).
+    #[cfg(test)]
+    pub(crate) bg_connect_faults: (AtomicU32, AtomicU32, AtomicU32),
+    /// Test-only: each count makes the next handoff attempt fail with an I/O
+    /// error before it hashes anything.
+    #[cfg(test)]
+    pub(crate) bg_handoff_faults: AtomicU32,
     /// Custom signet challenge script (BIP 325), set via
     /// `-signetchallenge`. When present (signet only), every accepted
     /// block's signet solution is verified against it and the P2P magic
@@ -1015,6 +1107,11 @@ impl ChainState {
                         crate::chain::connect_phase::ConnectPhaseTracker::new(),
                     ),
                     background: RwLock::new(None),
+                    background_alerts: Default::default(),
+                    #[cfg(test)]
+                    bg_connect_faults: Default::default(),
+                    #[cfg(test)]
+                    bg_handoff_faults: Default::default(),
                     signet_challenge: None,
                     genesis_hash,
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
@@ -1156,6 +1253,11 @@ impl ChainState {
                 crate::chain::connect_phase::ConnectPhaseTracker::new(),
             ),
             background: RwLock::new(None),
+            background_alerts: Default::default(),
+            #[cfg(test)]
+            bg_connect_faults: Default::default(),
+            #[cfg(test)]
+            bg_handoff_faults: Default::default(),
             signet_challenge: None,
             genesis_hash,
             accept_lock: std::sync::Arc::new(Mutex::new(())),
@@ -1422,6 +1524,17 @@ impl ChainState {
         self.background.read().is_some()
     }
 
+    /// Drop the background chainstate, as a completed handoff does.
+    #[cfg(test)]
+    pub(crate) fn detach_background_for_test(&self) {
+        *self.background.write() = None;
+    }
+
+    /// The AssumeUTXO background-validation alerts.
+    pub fn background_alerts(&self) -> &crate::chain::background_alerts::BackgroundAlerts {
+        &self.background_alerts
+    }
+
     /// Connect one historical block to the background chainstate (driven
     /// by the catch-up loop). When the connect reaches `snapshot_height`,
     /// runs the handoff verification. Returns `None` when no background is
@@ -1434,6 +1547,21 @@ impl ChainState {
             Some(b) => b,
             None => return Ok(None),
         };
+        #[cfg(test)]
+        {
+            let take = |c: &AtomicU32| {
+                c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok()
+            };
+            if take(&self.bg_connect_faults.0) {
+                return Err(ChainError::FlatFile("injected background write failure".into()));
+            }
+            if take(&self.bg_connect_faults.1) {
+                return Err(ChainError::CheckpointMismatch(bg.tip_height() + 1));
+            }
+            if take(&self.bg_connect_faults.2) {
+                return Err(ChainError::BadPrevBlock);
+            }
+        }
         let outcome = bg.connect_next_block(block)?;
         if outcome.reached_snapshot {
             self.run_background_handoff(&bg)?;
@@ -1485,6 +1613,14 @@ impl ChainState {
         bg: &Arc<crate::chain::background::BackgroundChainState>,
     ) -> Result<(), ChainError> {
         use crate::chain::background::HandoffOutcome;
+        #[cfg(test)]
+        if self
+            .bg_handoff_faults
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ChainError::FlatFile("injected handoff flush failure".into()));
+        }
         match bg.verify_at_snapshot()? {
             HandoffOutcome::Validated => {
                 tracing::info!(
@@ -1509,17 +1645,18 @@ impl ChainState {
                     "AssumeUTXO: background UTXO-set hash does NOT match the anchor — snapshot is invalid"
                 );
                 bg.mark_rejected();
-                self.warnings.record(
-                    "assumeutxo-validation-failed",
-                    crate::warnings::Severity::Error,
-                    "AssumeUTXO snapshot failed background validation: UTXO-set hash \
-                     mismatch at the snapshot height. The loaded snapshot is not \
-                     trustworthy; reindex or reload a valid snapshot.",
-                    serde_json::json!({
-                        "expected_hash_serialized_3": hex::encode(expected),
-                        "actual_hash_serialized_3": hex::encode(actual),
-                        "snapshot_height": bg.snapshot_height(),
-                    }),
+                self.background_alerts.raise(
+                    &self.warnings,
+                    crate::events::StatusEvent::raised(
+                        crate::events::StatusKind::AssumeutxoValidationFailed,
+                        "AssumeUTXO snapshot failed background validation: UTXO-set hash \
+                         mismatch at the snapshot height. The loaded snapshot is not \
+                         trustworthy; reindex or reload a valid snapshot.",
+                    )
+                    .with_detail("reason", "utxo_hash_mismatch")
+                    .with_detail("snapshot_height", bg.snapshot_height())
+                    .with_detail("expected_hash_serialized_3", hex::encode(expected))
+                    .with_detail("actual_hash_serialized_3", hex::encode(actual)),
                 );
                 Err(ChainError::Snapshot(format!(
                     "background validation FAILED at height {}: UTXO-set hash {} does not match \
@@ -1536,17 +1673,18 @@ impl ChainState {
                     "AssumeUTXO: background tip at snapshot height is not the anchor block"
                 );
                 bg.mark_rejected();
-                self.warnings.record(
-                    "assumeutxo-validation-failed",
-                    crate::warnings::Severity::Error,
-                    "AssumeUTXO snapshot failed background validation: the block at the \
-                     snapshot height does not match the anchor block hash; reindex or \
-                     reload a valid snapshot.",
-                    serde_json::json!({
-                        "expected_base": expected.to_string(),
-                        "actual_base": actual.to_string(),
-                        "snapshot_height": bg.snapshot_height(),
-                    }),
+                self.background_alerts.raise(
+                    &self.warnings,
+                    crate::events::StatusEvent::raised(
+                        crate::events::StatusKind::AssumeutxoValidationFailed,
+                        "AssumeUTXO snapshot failed background validation: the block at the \
+                         snapshot height does not match the anchor block hash; reindex or \
+                         reload a valid snapshot.",
+                    )
+                    .with_detail("reason", "base_mismatch")
+                    .with_detail("snapshot_height", bg.snapshot_height())
+                    .with_detail("expected_base", expected)
+                    .with_detail("actual_base", actual),
                 );
                 Err(ChainError::Snapshot(format!(
                     "background validation FAILED at height {}: base block {} does not match \
@@ -11807,7 +11945,14 @@ pub(crate) mod tests {
     /// Mine `n` regtest blocks into `cs` via the proven
     /// accept_header→store_block→connect_stored_block path, returning the
     /// connected blocks in height order.
-    fn build_and_connect_chain(cs: &ChainState, n: u32) -> Vec<Block> {
+    /// The primary's UTXO-set hash now: the anchor a background that
+    /// re-validates the same chain must reproduce for its handoff to pass.
+    pub(crate) fn utxo_anchor(cs: &ChainState) -> [u8; 32] {
+        cs.store.flush().unwrap();
+        crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap().0
+    }
+
+    pub(crate) fn build_and_connect_chain(cs: &ChainState, n: u32) -> Vec<Block> {
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let mut parent = genesis.block_hash();
         let mut blocks = Vec::new();
@@ -15234,6 +15379,65 @@ pub(crate) mod tests {
         assert!(warned, "a validation-failure warning should be recorded");
         let states = crate::rpc::blockchain::get_chain_states(&cs);
         assert_eq!(states["chainstates"][0]["assumeutxo_rejected"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot proven invalid is reported on all three alert surfaces at
+    /// once: the `status` event, the `getwarnings` entry under the alert id,
+    /// and `satd_alert_active`. It used to reach `getwarnings` alone (#557).
+    ///
+    /// Perturbation: putting back the plain
+    /// `warnings.record("assumeutxo-validation-failed", ..)` in the
+    /// hash-mismatch arm fails all three assertions.
+    #[test]
+    fn a_hash_mismatch_raises_the_validation_failed_alert_everywhere() {
+        use crate::events::{NodeEventBody, StatusKind, StatusState};
+        let (cs, dir) = make_chain_state();
+        let warnings = cs.warnings().clone();
+        let publisher = crate::events::EventPublisher::new(
+            crate::events::EdgeIdentity::new([3; 16], None).unwrap(),
+            64,
+        );
+        let mut rx = publisher.subscribe();
+        let health = Arc::new(crate::health::HealthState::new());
+        cs.background_alerts().install_sink(crate::health::AlertSink {
+            warnings: warnings.clone(),
+            publisher: publisher.clone(),
+            health: Some(health.clone()),
+        });
+
+        let blocks = build_and_connect_chain(&cs, 3);
+        cs.attach_background(
+            dir.join("chainstate_background"),
+            3,
+            cs.tip_hash(),
+            [0x42; 32],
+            64,
+            -1,
+        )
+        .unwrap();
+        for b in &blocks {
+            let _ = cs.background_connect_block(b);
+        }
+
+        let kind = StatusKind::AssumeutxoValidationFailed;
+        assert!(health.is_active(kind), "satd_alert_active{{kind=\"{}\"}} must read 1", kind.as_str());
+        let entry = warnings
+            .list()
+            .into_iter()
+            .find(|w| w.id == kind.warning_id())
+            .expect("getwarnings carries the alert under alert.<kind>");
+        assert_eq!(entry.context["reason"], "utxo_hash_mismatch");
+        let raised: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e.body {
+                NodeEventBody::Status(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!((raised[0].kind, raised[0].state), (kind, StatusState::Raised));
+        assert_eq!(raised[0].details.get("snapshot_height").map(String::as_str), Some("3"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

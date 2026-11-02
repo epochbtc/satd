@@ -214,6 +214,9 @@ fn kind_name(kind: StatusKind) -> String {
         StatusKind::PeerFloor => "peer_floor".into(),
         StatusKind::DeepReorg => "deep_reorg".into(),
         StatusKind::TemplateInvalid => "template_invalid".into(),
+        StatusKind::AssumeutxoCatchupStalled => "assumeutxo_catchup_stalled".into(),
+        StatusKind::AssumeutxoHandoffFailing => "assumeutxo_handoff_failing".into(),
+        StatusKind::AssumeutxoValidationFailed => "assumeutxo_validation_failed".into(),
         // A newer node reporting a condition this build predates. The enum is
         // non-exhaustive, so this arm also absorbs variants added later.
         StatusKind::Unknown(v) => format!("unknown({v})"),
