@@ -113,7 +113,7 @@ pub struct TxSignatureChecker<'a> {
 
 impl<'a> TxSignatureChecker<'a> {
     /// Single-input constructor: builds its own sighash cache.  Use this when
-    /// verifying a single input in isolation (e.g. via `verify_with_flags`).
+    /// verifying a single input in isolation.
     pub fn new(
         tx: &'a Transaction,
         input_index: usize,
@@ -130,7 +130,7 @@ impl<'a> TxSignatureChecker<'a> {
     }
 
     /// Shared-cache constructor: reuses an existing sighash cache across
-    /// multiple per-input checkers.  Use this inside `verify_transaction`
+    /// multiple per-input checkers.  `PrecomputedTransactionData` uses this
     /// so the expensive `hashPrevouts` / `hashSequence` / `hashOutputs`
     /// computations happen once per tx, not once per input.
     pub fn with_cache(

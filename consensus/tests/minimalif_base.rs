@@ -3,12 +3,12 @@
 
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{Amount, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use consensus::checker::NoopChecker;
 use consensus::error::ScriptError;
 use consensus::flags::{self, ALL_FLAGS, VERIFY_MINIMALIF, VERIFY_MINIMALIF_BASE};
 use consensus::verify::verify_script;
-use consensus::{Error, verify_transaction, verify_with_flags};
+use consensus::{Error, PrecomputedTransactionData, verify, verify_transaction};
 
 /// `OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF`: true for a true argument.
 const IF_SCRIPT: &[u8] = &[0x63, 0x51, 0x67, 0x00, 0x68];
@@ -99,8 +99,11 @@ fn libconsensus_entry_points_refuse_the_extension() {
         }],
         output: vec![],
     };
-    let tx_bytes = bitcoin::consensus::serialize(&spend);
-    assert_eq!(verify_with_flags(IF_SCRIPT, 0, &tx_bytes, None, 0, VERIFY_MINIMALIF_BASE), Err(Error::ErrInvalidFlags));
+    let precomputed = PrecomputedTransactionData::new(&spend, &credit.output).unwrap();
+    assert_eq!(
+        verify(Script::from_bytes(IF_SCRIPT), Amount::ZERO, &spend, 0, VERIFY_MINIMALIF_BASE, &precomputed),
+        Err(Error::ErrInvalidFlags)
+    );
     assert_eq!(
         verify_transaction(&spend, &credit.output, VERIFY_MINIMALIF_BASE),
         Err((0, Error::ErrInvalidFlags))
