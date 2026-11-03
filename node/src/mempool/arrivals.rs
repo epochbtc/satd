@@ -69,6 +69,9 @@ impl ArrivalTracker {
     /// A transaction entered the pool at `now`. It is counted later, by
     /// [`Self::promote`], if it is still there after its residence.
     pub fn note(&mut self, txid: Txid, now: u64) {
+        // Keep `pending` in time order even if the clock steps back, so
+        // promotion can stop at the first entry still waiting.
+        let now = self.pending.back().map_or(now, |&(_, last)| now.max(last));
         self.started.get_or_insert(now);
         if self.pending.len() >= MAX_PENDING {
             self.pending.pop_front();
@@ -80,6 +83,15 @@ impl ArrivalTracker {
     /// answers, for a txid, `Some((feerate sat/kvB, weight))` if it is still
     /// in the pool in the template class, else `None` (it is then dropped).
     pub fn promote(&mut self, now: u64, mut lookup: impl FnMut(&Txid) -> Option<(u64, u64)>) {
+        // The clock stepped back past the newest entry: restart the residence
+        // of everything waiting from now, rather than holding the queue until
+        // the clock catches up with entries stamped in its future.
+        if self.pending.back().is_some_and(|&(_, entered)| entered > now) {
+            for p in &mut self.pending {
+                p.1 = p.1.min(now);
+            }
+            self.updated = self.updated.min(now);
+        }
         while let Some(&(txid, entered)) = self.pending.front() {
             if now < entered + MIN_RESIDENCE_SECS {
                 break;
@@ -185,6 +197,21 @@ mod tests {
         assert!((level - 400.0).abs() < 25.0, "settles near 400 WU/s, got {level}");
         assert_eq!(r.bands[0].1, 0.0);
         assert_eq!(r.bands[2].1, 0.0);
+    }
+
+    /// A clock step back does not stall counting behind entries stamped in
+    /// the clock's future.
+    #[test]
+    fn a_clock_step_back_does_not_stall_promotion() {
+        let mut t = tracker();
+        t.note(txid(1), 10_000);
+        // The clock steps back an hour; later admissions are stamped then.
+        t.note(txid(2), 6_400);
+        t.promote(6_400, |_| Some((20_000, 400)));
+        assert_eq!(t.pending.len(), 2, "neither resident yet on the new clock");
+        t.promote(6_400 + MIN_RESIDENCE_SECS, |_| Some((20_000, 400)));
+        assert!(t.pending.is_empty(), "both counted after ten seconds of the new clock");
+        assert!(t.rates(6_400 + MIN_RESIDENCE_SECS).bands[1].1 > 0.0);
     }
 
     #[test]

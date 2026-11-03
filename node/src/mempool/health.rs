@@ -13,9 +13,11 @@
 //! active tip.
 //!
 //! One addition: a block can be reported twice (the chain's own mempool
-//! cleanup and the caller's), so a second report of the newest block, by
-//! the same hash, adds the weight it removed instead of replacing the row.
-//! The second call removes nothing, so the row keeps the first call's count.
+//! cleanup and the caller's), and another block can connect between the two
+//! reports. A report of a block already in the window, by height and hash,
+//! adds the weight it removed to that row instead of being read as a reorg.
+//! The second call removes nothing, so the row keeps the first call's count
+//! and the rows above it stay.
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +83,9 @@ pub struct HealthWindow {
     blocks: Vec<MinedBlockStats>,
     /// Hash of the newest row's block (Core's `m_mined_blocks_tip_hash`).
     tip_hash: Option<BlockHash>,
+    /// The block hash of each row, in step with `blocks`. Not persisted:
+    /// after a restart only the tip's hash is known, the rest are `None`.
+    hashes: Vec<Option<BlockHash>>,
     path: Option<PathBuf>,
 }
 
@@ -89,24 +94,32 @@ impl HealthWindow {
     /// above `height` are stale (a reorg) and dropped, and a height gap
     /// clears the window.
     pub fn record(&mut self, hash: BlockHash, stats: MinedBlockStats) {
-        if let Some(last) = self.blocks.last_mut()
-            && last.height == stats.height
-            && self.tip_hash == Some(hash)
+        if let Some(i) = self
+            .blocks
+            .iter()
+            .zip(&self.hashes)
+            .position(|(b, h)| b.height == stats.height && *h == Some(hash))
         {
-            // The same block reported again.
-            last.mempool_txs_weight = last.mempool_txs_weight.saturating_add(stats.mempool_txs_weight);
+            // A block already in the window, reported again.
+            let row = &mut self.blocks[i];
+            row.mempool_txs_weight = row.mempool_txs_weight.saturating_add(stats.mempool_txs_weight);
             return;
         }
-        self.blocks.retain(|b| b.height < stats.height);
+        let keep = self.blocks.iter().take_while(|b| b.height < stats.height).count();
+        self.blocks.truncate(keep);
+        self.hashes.truncate(keep);
         if let Some(last) = self.blocks.last()
             && last.height + 1 != stats.height
         {
             self.blocks.clear();
+            self.hashes.clear();
         }
         if self.blocks.len() == HEALTH_WINDOW_BLOCKS {
             self.blocks.remove(0);
+            self.hashes.remove(0);
         }
         self.blocks.push(stats);
+        self.hashes.push(Some(hash));
         self.tip_hash = Some(hash);
     }
 
@@ -114,6 +127,7 @@ impl HealthWindow {
     /// describe a mempool this node no longer has.
     pub fn clear(&mut self) {
         self.blocks.clear();
+        self.hashes.clear();
         self.tip_hash = None;
     }
 
@@ -151,6 +165,10 @@ impl HealthWindow {
                     let ends_at_tip = blocks.last().is_none_or(|b| b.height == tip.0 && hash == tip.1);
                     if ends_at_tip {
                         self.tip_hash = (!blocks.is_empty()).then_some(hash);
+                        self.hashes = vec![None; blocks.len()];
+                        if let Some(last) = self.hashes.last_mut() {
+                            *last = Some(hash);
+                        }
                         self.blocks = blocks;
                     } else {
                         tracing::warn!(
@@ -258,9 +276,12 @@ mod tests {
         BlockHash::from_byte_array(b)
     }
 
-    /// Core's test helper `AddRemovedBlock`: record a block and advance.
+    /// Core's test helper `AddRemovedBlock`: record a new block and advance.
+    /// Every call is a different block, so a repeated height is a reorg.
     fn add(w: &mut HealthWindow, removed: u64, block: u64, height: &mut u64) {
-        w.record(hash(*height), MinedBlockStats { height: *height, block_weight: block, mempool_txs_weight: removed });
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+        let unique = hash(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        w.record(unique, MinedBlockStats { height: *height, block_weight: block, mempool_txs_weight: removed });
         *height += 1;
     }
 
@@ -350,6 +371,20 @@ mod tests {
         assert_eq!(w.blocks()[0].mempool_txs_weight, 0);
     }
 
+    /// Another block connects between a block's two reports: the late
+    /// second report finds its own row and is not read as a reorg.
+    #[test]
+    fn a_late_second_report_keeps_the_rows_above_it() {
+        let mut w = HealthWindow::default();
+        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        let b = MinedBlockStats { height: 8, block_weight: 2000, mempool_txs_weight: 1800 };
+        w.record(hash(7), a);
+        w.record(hash(8), b);
+        w.record(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..a });
+        w.record(hash(8), MinedBlockStats { mempool_txs_weight: 0, ..b });
+        assert_eq!(w.blocks(), &[a, b]);
+    }
+
     #[test]
     fn the_window_persists_and_is_kept_only_at_the_active_tip() {
         let dir = tempfile::tempdir().unwrap();
@@ -357,7 +392,8 @@ mod tests {
         w.open(dir.path(), (0, BlockHash::all_zeros()));
         let mut height = 10;
         for _ in 0..HEALTH_WINDOW_BLOCKS {
-            add(&mut w, WEIGHT, WEIGHT, &mut height);
+            w.record(hash(height), MinedBlockStats { height, block_weight: WEIGHT, mempool_txs_weight: WEIGHT });
+            height += 1;
         }
         let (path, bytes) = w.flush_job().unwrap();
         write_flush_job(&path, &bytes);
