@@ -452,6 +452,16 @@ jobs:
           # and this step also builds the apple-darwin targets.)
           RUSTFLAGS: "-Cforce-frame-pointers=yes --remap-path-prefix=${{ github.workspace }}=/satd"
         run: |
+          # jemalloc's configure reads the build host's virtual-address
+          # width (48 or 57 bits, from cpuid) and page sizes, and sizes its
+          # radix tree from them, so an x86_64 satd built on a 5-level-paging
+          # runner differs from one built on another. Pin what nearly every
+          # x86_64 host reports, as flake.nix does (#321). Other targets are
+          # left alone: aarch64 hardcodes the width, and macOS on Apple
+          # Silicon uses 16 KiB pages.
+          if [[ "${{ matrix.target }}" == x86_64-unknown-linux-* ]]; then
+            export JEMALLOC_SYS_WITH_LG_VADDR=48 JEMALLOC_SYS_WITH_LG_PAGE=12 JEMALLOC_SYS_WITH_LG_HUGEPAGE=21
+          fi
           cargo build --release --locked \
             --bin satd --bin sat-cli --bin sat-tui \
             --target ${{ matrix.target }}
@@ -469,6 +479,13 @@ jobs:
           # mechanism). Setting LIBCLANG_PATH to a hardcoded version
           # is fragile — `libclang-dev` on ubuntu-24.04 currently
           # points to libclang-18, but that's not contractual.
+          # jemalloc's configure reads the build host's virtual-address
+          # width (48 or 57 bits, from cpuid) and page sizes, and sizes its
+          # radix tree from them, so an x86_64 satd built on a 5-level-paging
+          # runner differs from one built on another. See the cargo step above.
+          if [[ "${{ matrix.target }}" == x86_64-unknown-linux-* ]]; then
+            export JEMALLOC_SYS_WITH_LG_VADDR=48 JEMALLOC_SYS_WITH_LG_PAGE=12 JEMALLOC_SYS_WITH_LG_HUGEPAGE=21
+          fi
           cargo zigbuild --release --locked \
             --bin satd --bin sat-cli --bin sat-tui \
             --target ${{ matrix.target }}
