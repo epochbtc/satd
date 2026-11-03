@@ -55,6 +55,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `estimatesmartfee` with `fee_rate_estimator=mempool_policy` is Core 32's mempool estimator (health gate, template percentiles), and `verbosity` 2 reports the health window and a `mempool_health` verdict; opt-in, not yet the default (#1202).
 - RPC: `validateaddress` reports one `error_locations` entry, the position where the string passes the limit, for a too-long Bech32 string, as Core v32 does (#PRNUM).
 - RPC: a connection from a source address outside `-rpcallowip` is closed without a reply, as Core v32 does, instead of answered `403 Forbidden` (#PRNUM).
+- P2P: a transaction hash repeated in one `inv` is processed once, and each is logged as Core v32's `got inv:` line under `-debug=net` (#PRNUM).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

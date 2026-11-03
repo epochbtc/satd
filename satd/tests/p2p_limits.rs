@@ -219,3 +219,38 @@ fn a_large_getdata_is_served_in_full_as_the_peer_reads() {
     assert!(peer.alive());
     node.stop();
 }
+
+/// Core v32 processes each transaction hash once per `inv` message and logs
+/// `got inv: <type> <hash> <have|new> peer=<n>` for it outside initial block
+/// download (`net_processing.cpp:4397-4405` at v32.1); `MSG_WITNESS_TX` counts
+/// as a txid. An `inv` naming one txid three ways and another twice is
+/// processed, and logged, once per hash.
+#[test]
+fn a_repeated_tx_in_one_inv_is_processed_once() {
+    use bitcoin::Txid;
+    let mut node = TestNode::start(&["--debug=net"]);
+    let port = node.p2p_port.unwrap();
+    // Out of initial block download, where transaction invs are handled.
+    node.mine_blocks(1, ADDR);
+    let mut peer = Peer::connect(port);
+    let a = Txid::from_byte_array([0xa1; 32]);
+    let b = Txid::from_byte_array([0xb2; 32]);
+    peer.send(NetworkMessage::Inv(vec![
+        Inventory::Transaction(a),
+        Inventory::WitnessTransaction(a),
+        Inventory::Transaction(b),
+        Inventory::Transaction(a),
+        Inventory::Transaction(b),
+    ]));
+    assert!(peer.alive());
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert_eq!(log.matches(&format!("got inv: tx {a} new")).count(), 1, "first sight of a, as tx");
+    assert_eq!(log.matches(&format!("got inv: witness-tx {a}")).count(), 0, "a again as witness-tx is a duplicate");
+    assert_eq!(log.matches(&format!("got inv: tx {b} new")).count(), 1);
+    // The filter is per message: the next inv is processed afresh.
+    peer.send(NetworkMessage::Inv(vec![Inventory::Transaction(a), Inventory::Transaction(a)]));
+    assert!(peer.alive());
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert_eq!(log.matches(&format!("got inv: tx {a}")).count(), 2);
+    node.stop();
+}

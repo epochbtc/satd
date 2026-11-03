@@ -852,9 +852,7 @@ status = "run"
 
 [[test]]
 file = "p2p_tx_download.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L356 test_duplicate_tx_inv: assert_equal(log.count(inv_a_log), 1) is 0 == 1, a debug-log line v32 greps for"
+status = "run"
 
 [[test]]
 file = "p2p_tx_privacy.py"

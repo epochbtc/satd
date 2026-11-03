@@ -6903,6 +6903,11 @@ impl PeerManager {
         // Core's `AddKnownTx` for every transaction announced: the peer has
         // it, so it is not announced back.
         let mut known: Vec<[u8; 32]> = Vec::new();
+        // Core v32 processes each transaction hash once per `inv` message
+        // (`seen_txids` / `seen_wtxids`, `net_processing.cpp:4357-4358` and
+        // `:4397-4399` at v32.1). `MSG_WITNESS_TX` counts as a txid.
+        let mut seen_txids: HashSet<[u8; 32]> = HashSet::new();
+        let mut seen_wtxids: HashSet<[u8; 32]> = HashSet::new();
 
         for inv in inventory {
             // BIP 339: a peer that negotiated wtxid relay announces by wtxid,
@@ -6934,11 +6939,29 @@ impl PeerManager {
                     return;
                 }
             }
+            let first_sight = match &inv {
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                    seen_txids.insert(txid.to_byte_array())
+                }
+                Inventory::WTx(wtxid) => seen_wtxids.insert(wtxid.to_byte_array()),
+                _ => true,
+            };
+            if !first_sight {
+                continue;
+            }
             match &inv {
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => known.push(txid.to_byte_array()),
                 Inventory::WTx(wtxid) => known.push(wtxid.to_byte_array()),
                 _ => {}
             }
+            // Core's `CInv::ToString` (`protocol.cpp:58-80`), for its
+            // `got inv:` line below.
+            let inv_label = match &inv {
+                Inventory::Transaction(txid) => Some(format!("tx {txid}")),
+                Inventory::WitnessTransaction(txid) => Some(format!("witness-tx {txid}")),
+                Inventory::WTx(wtxid) => Some(format!("wtx {wtxid}")),
+                _ => None,
+            };
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     if self.chain_state.get_block_index(&hash).is_none() {
@@ -6952,11 +6975,13 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array())) {
+                    let have = if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array())) {
                         // Core's `AlreadyHaveTx`: an orphan without a witness,
                         // whose wtxid is its txid.
+                        true
                     } else if self.recently_rejected(txid.as_byte_array()) {
                         // Core's `AlreadyHaveTx`: refused since the tip moved.
+                        true
                     } else if self.mempool.get(&txid).is_some() {
                         // We already have it. If it's one of our pending local
                         // broadcasts, a peer announcing it back is a secondary
@@ -6964,16 +6989,21 @@ impl PeerManager {
                         // rebroadcast (the primary signal is a peer fetching it
                         // from us via `getdata`; see `handle_getdata`).
                         self.note_broadcast_witness(id, txid);
-                    } else if !self.is_ibd() && !self.blocksonly() {
-                        // Don't request transactions during IBD — we can't
-                        // validate them — nor under -blocksonly (no tx relay).
-                        txs_announced.push(GenTxid::Txid(txid));
-                    }
+                        true
+                    } else {
+                        if !self.is_ibd() && !self.blocksonly() {
+                            // Don't request transactions during IBD — we can't
+                            // validate them — nor under -blocksonly (no tx relay).
+                            txs_announced.push(GenTxid::Txid(txid));
+                        }
+                        false
+                    };
+                    log_tx_inv(self.is_ibd(), inv_label.as_deref(), have, id);
                 }
                 // Fetched as announced, by wtxid: a resident transaction with
                 // the same txid and another witness is not the one offered.
                 Inventory::WTx(wtxid) => {
-                    if self.orphanage.contains_wtxid(&wtxid) {
+                    let have = if self.orphanage.contains_wtxid(&wtxid) {
                         // Core's `AddTxAnnouncement`: a peer announcing an
                         // orphan may resolve it. An announcer already is
                         // passed over before the orphan is copied out.
@@ -6985,13 +7015,20 @@ impl PeerManager {
                         {
                             self.add_orphan_announcer(id, &orphan, &wtxid);
                         }
+                        true
                     } else if self.recently_rejected(wtxid.as_byte_array()) {
                         // Core's `AlreadyHaveTx`: refused since the tip moved.
+                        true
                     } else if let Some(txid) = self.mempool.txid_of_wtxid(&wtxid) {
                         self.note_broadcast_witness(id, txid);
-                    } else if !self.is_ibd() && !self.blocksonly() {
-                        txs_announced.push(GenTxid::Wtxid(wtxid));
-                    }
+                        true
+                    } else {
+                        if !self.is_ibd() && !self.blocksonly() {
+                            txs_announced.push(GenTxid::Wtxid(wtxid));
+                        }
+                        false
+                    };
+                    log_tx_inv(self.is_ibd(), inv_label.as_deref(), have, id);
                 }
                 _ => {}
             }
@@ -14997,6 +15034,15 @@ impl TxBroadcaster for PeerManager {
         allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError> {
         PeerManager::submit_and_announce(self, tx, source, allow_quarantined)
+    }
+}
+
+/// Core's `got inv:` debug line for a transaction announcement
+/// (`net_processing.cpp:4405` at v32.1), logged outside initial block
+/// download only, as Core does.
+fn log_tx_inv(ibd: bool, label: Option<&str>, have: bool, peer: PeerId) {
+    if !ibd && let Some(label) = label {
+        tracing::debug!("got inv: {label} {} peer={peer}", if have { "have" } else { "new" });
     }
 }
 
