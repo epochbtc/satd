@@ -42,6 +42,7 @@ It includes every fix shipped in 0.7.1:
 - Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
 - Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
 - Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
+- Packaging: the Nix build of `satd` no longer depends on the build host's CPU; jemalloc's address width, page and hugepage size are pinned on x86_64, and `flake.lock` is committed so a rebuild of a tag evaluates the same Nix inputs; the x86_64 Linux release tarballs pin the same jemalloc constants (#321).
 - Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 - Consensus: `-reindex` holds every block in the block files to the header rules header sync applies (difficulty schedule, median time past, version, checkpoints), and neither replays nor indexes one that breaks them, or any block built on it (#506).

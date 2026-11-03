@@ -215,6 +215,24 @@
             SOURCE_DATE_EPOCH = toString (self.lastModified or 1);
             CARGO_PROFILE_RELEASE_STRIP = "symbols";
             RUSTFLAGS = "-C link-arg=-Wl,--build-id=none";
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
+            # jemalloc's configure probes the BUILD host and bakes what it
+            # finds into satd (sat-cli does not link jemalloc). On x86_64 it
+            # runs `cpuid` for the virtual address width: 48 on most CPUs,
+            # 57 on those with 5-level paging, which resizes jemalloc's
+            # radix tree and changes .text, .rodata and .bss (#321). Page
+            # and hugepage size come from sysconf and /proc/meminfo the
+            # same way. Pin all three to the x86_64 Linux defaults so the
+            # binary no longer depends on which CPU built it. 48 is safe on
+            # a 5-level-paging kernel too: Linux only maps above 47 bits
+            # when a caller asks for it, and jemalloc never does.
+            #
+            # aarch64's configure hardcodes the address width; its page
+            # size is still read from the build host, but aarch64 is not
+            # in the two-replica check.
+            JEMALLOC_SYS_WITH_LG_VADDR = "48";
+            JEMALLOC_SYS_WITH_LG_PAGE = "12";
+            JEMALLOC_SYS_WITH_LG_HUGEPAGE = "21";
           };
 
           commonArgs = buildEnv // {

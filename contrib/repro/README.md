@@ -11,5 +11,6 @@ addressed, gating policy — lives in
 [`docs/manual/src/packaging.md`](../../docs/manual/src/packaging.md) §"Reproducible build via Nix".
 
 CI runs an equivalent two-runner check on every PR that touches
-`flake.nix`, `flake.lock`, `rust-toolchain.toml`, or `Cargo.lock`;
+`flake.nix`, `flake.lock`, `rust-toolchain.toml`, `contrib/repro/`, or
+the workflow itself;
 see [`.github/workflows/nix.yml`](../../.github/workflows/nix.yml).

@@ -514,6 +514,7 @@ rustup and the flake read it; there is no second place to update.
 | `cc-rs` C/C++ compiles (secp256k1, zstd, lz4) | Compiler version pinned via nixpkgs; `SOURCE_DATE_EPOCH` respected by cc-rs for any timestamped output. |
 | `libbitcoinkernel-sys` cmake build of Bitcoin Core's kernel | Compiler pinned via nixpkgs, Boost headers from nixpkgs `boost`. The vendored Core tree is not a git checkout, so Core's build-info step embeds no commit, and its `-fmacro-prefix-map` maps the source path out of `__FILE__`. |
 | `OUT_DIR` paths in generated code | crane builds inside a content-addressed `/build/source`; paths are stable across hosts. |
+| jemalloc host probes | jemalloc's `configure` (built by `tikv-jemalloc-sys`, linked into `satd` only) reads the build host's virtual-address width from `cpuid`, which is 48 on most x86_64 CPUs and 57 on CPUs with 5-level paging, plus the page and hugepage sizes. Each value changes the generated code. On x86_64 the flake pins them with `JEMALLOC_SYS_WITH_LG_VADDR=48`, `JEMALLOC_SYS_WITH_LG_PAGE=12` and `JEMALLOC_SYS_WITH_LG_HUGEPAGE=21`, so the binary no longer depends on the CPU that built it. |
 | Linker build-id | `RUSTFLAGS=-C link-arg=-Wl,--build-id=none` drops the per-build random ID. |
 | Cargo `--release` profile | `CARGO_PROFILE_RELEASE_STRIP=symbols` strips deterministically inside the derivation. |
 | `tonic_build` / proto generation | `events/proto/*.proto` files included in the source filter; protoc is vendored via `protoc-bin-vendored` so no host protoc dep. |
@@ -537,18 +538,17 @@ dependency once the repo flips public and Actions minutes are free.
 
 ### `flake.lock`
 
-The first PR that lands the flake does not commit `flake.lock`,
-because the maintainer who lands it does not have Nix on their
-workstation. The CI workflow is gated to `workflow_dispatch`, to
-flake-touching PRs, and to tag pushes. The first `workflow_dispatch`
-run by a Nix-capable maintainer, or from a CI runner, generates the
-lock. Commit the lock at that point and update the PR description.
-Subsequent PRs run against the committed lock.
+`flake.lock` is committed, so every build of a commit, including a
+rebuild of a release tag, evaluates the same nixpkgs, crane,
+rust-overlay and flake-utils revisions. The lock was resolved by the
+CI workflow: with no lock in the tree, its x86_64 build job runs
+`nix flake lock` and uploads the result as the `flake-lock` artifact,
+which is how a maintainer without Nix produced it.
 
-Renovate, or a manual cadence, bumps the lock weekly. A bump that
-changes `flake.lock` re-triggers the repro check. If reproducibility
-breaks under a new input revision, revert the bump and investigate
-the hazard.
+Renovate, or a manual cadence, bumps the lock. A bump that changes
+`flake.lock` re-triggers the repro check. If reproducibility breaks
+under a new input revision, revert the bump and investigate the
+hazard.
 
 ### What's intentionally not in this flake
 
