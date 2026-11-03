@@ -374,7 +374,7 @@ reason = "no-qt"
 file = "interface_http.py"
 status = "skip"
 reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L237 check_excessive_request_size expects 'HTTPResponse (status code: 400' in the debug log for an oversized request; not found. Core v32 rewrote this test (1,000 lines changed)"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): Core v32 rewrote this test for its new HTTP server. Run one check at a time, 17 of its 23 checks pass and 6 fail: check_excessive_request_size (L237, no 'HTTPResponse (status code: 400' logged for an oversized request), check_chunked_transfer (an oversized chunked body gets no '413 Content too large'), check_whitespace_in_headers (the connection is gone before the reply), check_connection_limit (-rpcmaxconnections, which satd does not implement), check_pipelined_data_is_throttled (no read throttling of pipelined requests) and check_slow_read_throttle (no write-side throttling). Follow-up: HTTP server parity with Core v32 (connection cap, request-size limits and their 400/413 answers, header validation, read and write throttling)"
 
 [[test]]
 file = "interface_ipc.py"
