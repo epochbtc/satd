@@ -3064,7 +3064,9 @@ fn test_e2e_jsonrpc_getblockstats() {
     assert_eq!(v["height"], 2);
     assert_eq!(v["blockhash"], h2);
     assert_eq!(v["txs"], 1, "coinbase-only block");
-    assert!(v["total_size"].as_u64().unwrap_or(0) > 0, "total_size > 0");
+    // Core's `total_size` counts the non-coinbase transactions only, so a
+    // coinbase-only block reports 0.
+    assert_eq!(v["total_size"], 0, "coinbase-only total_size");
 
     e2e.node.stop();
 }

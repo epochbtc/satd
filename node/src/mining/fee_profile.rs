@@ -148,10 +148,11 @@ fn tx_fee(tx: &Transaction, prevout_value: &mut impl FnMut(&OutPoint) -> Option<
     in_sum?.checked_sub(out_sum)
 }
 
-/// Core's per-transaction feerate in `getblockstats`: `fee * 4 / weight`,
-/// truncated (`rpc/blockchain.cpp`, `(txfee * WITNESS_SCALE_FACTOR) /
-/// weight`). Zero for a zero weight, as in Core.
-fn sat_per_vb_core(fee: u64, weight: u64) -> u64 {
+/// Core's feerate in `getblockstats`, sat/vB: `fee * 4 / weight`, truncated
+/// (v32.1 `src/rpc/blockchain.cpp:2186`, `(txfee * WITNESS_SCALE_FACTOR) /
+/// weight`, and `:2205` for `avgfeerate`). Zero for a zero weight, as in
+/// Core.
+pub fn sat_per_vb_core(fee: u64, weight: u64) -> u64 {
     if weight == 0 { 0 } else { fee.saturating_mul(4) / weight }
 }
 

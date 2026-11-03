@@ -1060,33 +1060,34 @@ fn core_block_live_differential() {
     assert!(failures.is_empty(), "Block-acceptance differential divergences:\n{}", failures.join("\n"));
 }
 
-// ── getblockstats fee-profile differential ─────────────────────────────
+// ── getblockstats differential ─────────────────────────────────────────
 //
-// `getblockstats.feerate_percentiles` and `mediantxsize` checked against a
-// live Core on identical blocks. Both nodes accept the same blocks onto the
-// same shared base, then answer `getblockstats` for each; the fee fields
-// Core and satd report in the same unit must agree exactly.
+// `getblockstats` checked against a live Core on identical blocks. Both
+// nodes accept the same blocks onto the same shared base, then answer
+// `getblockstats` for each, and every statistic Core reports must agree
+// exactly, apart from the ones `KNOWN_DIFFERENT` names.
 //
 // The blocks cover what makes these statistics easy to get wrong: a
 // coinbase-only block (Core answers zeros), a zero-fee spend, an in-block
 // CPFP pair (the child's prevout is in the same block, so only undo data
 // prices it), transactions of different weights (the percentiles are
 // weight-weighted), witness transactions (weight is not four times the
-// size, and `mediantxsize` counts witness bytes), rates that `fee * 4 /
-// weight` truncates, and both odd and even transaction counts (the median
-// of an even count averages the two middle values).
+// size, and the sizes count witness bytes), rates that `fee * 4 / weight`
+// truncates, and both odd and even transaction counts (the median of an
+// even count averages the two middle values).
 
-/// The statistics compared. Every one is in the same unit on both nodes
-/// (sat/vB or satoshis or bytes); satd's `minfeerate`, `maxfeerate` and
-/// `avgfeerate` are in sat/kvB and are not compared here.
-const FEE_STATS: &[&str] = &[
-    "feerate_percentiles",
-    "mediantxsize",
-    "medianfee",
-    "totalfee",
-    "minfee",
-    "maxfee",
-];
+/// Statistics satd still reports differently from Core, compared by
+/// neither side. A statistic missing from this list must match; one that
+/// starts to match while it is listed fails too, so the list cannot go
+/// stale.
+///
+/// - `total_out`: satd counts the coinbase's outputs; Core does not.
+/// - `utxo_size_inc`: satd charges a flat 50 bytes per output; Core sums
+///   each output's serialized size plus its overhead, minus the spent ones.
+/// - `utxo_increase_actual`, `utxo_size_inc_actual`: satd does not report
+///   them.
+const KNOWN_DIFFERENT: &[&str] =
+    &["total_out", "utxo_size_inc", "utxo_increase_actual", "utxo_size_inc_actual"];
 
 /// `OP_TRUE` as a P2WSH witness script.
 fn p2wsh_op_true() -> ScriptBuf {
@@ -1166,25 +1167,25 @@ fn fee_block(ctx: &Ctx, txs: Vec<Transaction>) -> Block {
     assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txdata, None, true)
 }
 
-/// `getblockstats <hash> FEE_STATS` from satd.
+/// Every `getblockstats` statistic from satd.
 fn satd_fee_stats(node: &TestNode, hash: &str) -> serde_json::Value {
     let resp = node
-        .rpc_call_with_params("getblockstats", vec![serde_json::json!(hash), serde_json::json!(FEE_STATS)])
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!(hash)])
         .expect("satd getblockstats RPC");
     assert!(resp["error"].is_null(), "satd getblockstats {hash}: {resp}");
     resp["result"].clone()
 }
 
-/// `getblockstats <hash> FEE_STATS` from Core.
+/// Every `getblockstats` statistic from Core.
 fn core_fee_stats(core: &CoreNode, hash: &str) -> serde_json::Value {
     use bitcoincore_rpc::RpcApi as _;
     core.rpc
-        .call::<serde_json::Value>("getblockstats", &[hash.into(), serde_json::json!(FEE_STATS)])
+        .call::<serde_json::Value>("getblockstats", &[hash.into()])
         .expect("Core getblockstats")
 }
 
 #[test]
-fn core_getblockstats_fee_profile_differential() {
+fn core_getblockstats_differential() {
     pull_core_image();
     let mut satd = TestNode::start(&[]);
     let core = CoreNode::start();
@@ -1266,23 +1267,43 @@ fn core_getblockstats_fee_profile_differential() {
     );
     submit(&mut ctx, "truncating_rates", b);
 
-    let mut report = String::from("\nLive-Core getblockstats fee-profile differential\n");
+    let mut report = String::from("\nLive-Core getblockstats differential\n");
     let mut failures: Vec<String> = Vec::new();
+    let mut still_different: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (name, block) in &blocks {
         let hash = block.block_hash().to_string();
         let s = satd_fee_stats(&satd, &hash);
         let c = core_fee_stats(&core, &hash);
-        for stat in FEE_STATS {
-            if s[*stat] != c[*stat] {
-                failures.push(format!("{name}: {stat}: satd {} != Core {}", s[*stat], c[*stat]));
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        keys.extend(c.as_object().expect("Core stats object").keys().cloned());
+        keys.extend(s.as_object().expect("satd stats object").keys().cloned());
+        let mut ok = true;
+        for key in &keys {
+            let (sv, cv) = (s.get(key), c.get(key));
+            if let Some(known) = KNOWN_DIFFERENT.iter().find(|k| **k == key.as_str()) {
+                if sv != cv {
+                    still_different.insert(known);
+                }
+                continue;
+            }
+            if sv != cv {
+                ok = false;
+                failures.push(format!("{name}: {key}: satd {sv:?} != Core {cv:?}"));
             }
         }
         report.push_str(&format!(
-            "{} {name:<20} feerate_percentiles={} mediantxsize={}\n",
-            if FEE_STATS.iter().all(|k| s[*k] == c[*k]) { "✓" } else { "✗" },
+            "{} {name:<20} feerate_percentiles={} mediantxsize={} avgfeerate={} total_size={}\n",
+            if ok { "✓" } else { "✗" },
             c["feerate_percentiles"],
             c["mediantxsize"],
+            c["avgfeerate"],
+            c["total_size"],
         ));
+    }
+    for known in KNOWN_DIFFERENT {
+        if !still_different.contains(known) {
+            failures.push(format!("{known} matches Core on every block: take it off KNOWN_DIFFERENT"));
+        }
     }
     println!("{report}");
 
@@ -1292,7 +1313,13 @@ fn core_getblockstats_fee_profile_differential() {
         let (_, b) = blocks.iter().find(|(n, _)| *n == name).expect("block by name");
         core_fee_stats(&core, &b.block_hash().to_string())
     };
-    assert_eq!(core_stats("coinbase_only")["feerate_percentiles"], serde_json::json!([0, 0, 0, 0, 0]));
+    let coinbase_only = core_stats("coinbase_only");
+    assert_eq!(coinbase_only["feerate_percentiles"], serde_json::json!([0, 0, 0, 0, 0]));
+    for zero in ["total_size", "total_weight", "avgtxsize", "mintxsize", "maxtxsize"] {
+        assert_eq!(coinbase_only[zero], serde_json::json!(0), "{zero}: {coinbase_only}");
+    }
+    let fan_out = core_stats("fan_out");
+    assert!(fan_out["avgfeerate"].as_u64().unwrap() > 0, "{fan_out}");
     let mixed = core_stats("mixed_weights_cpfp");
     let pct: Vec<u64> = mixed["feerate_percentiles"]
         .as_array()
@@ -1305,5 +1332,5 @@ fn core_getblockstats_fee_profile_differential() {
     assert!(witness["mediantxsize"].as_u64().unwrap() > 0, "{witness}");
 
     satd.stop();
-    assert!(failures.is_empty(), "getblockstats fee-profile divergences:\n{}", failures.join("\n"));
+    assert!(failures.is_empty(), "getblockstats divergences:\n{}", failures.join("\n"));
 }

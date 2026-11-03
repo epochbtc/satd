@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
-use crate::mining::fee_profile::{BlockFeeProfile, truncated_median};
+use crate::mining::fee_profile::{BlockFeeProfile, sat_per_vb_core, truncated_median};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::util::univalue_double;
 use crate::storage::{RecentHeightWindow, Store};
@@ -1390,9 +1390,6 @@ pub fn get_block_stats(
         .ok_or("Block data not available")?
         .block;
 
-    let block_bytes = serialize(&block);
-    let total_size = block_bytes.len();
-    let total_weight = block.weight().to_wu();
     let num_txs = block.txdata.len();
 
     // Prevouts come from the block's **undo** data, not the live UTXO set.
@@ -1422,11 +1419,22 @@ pub fn get_block_stats(
         }),
     };
 
+    // Every size, weight and feerate statistic is over the non-coinbase
+    // transactions, as in Core (`getblockstats`, v32.1
+    // `src/rpc/blockchain.cpp:2133-2161`): the loop `continue`s past the
+    // coinbase before it adds anything to `total_size`, `total_weight`,
+    // `mintxsize` or `maxtxsize`. satd used the whole serialized block,
+    // header and coinbase included, so a coinbase-only block reported a
+    // non-zero size and weight.
     let mut total_out: u64 = 0;
     let mut segwit_txs = 0u64;
     let mut utxo_increase: i64 = 0;
     let mut sw_total_size: usize = 0;
     let mut sw_total_weight: u64 = 0;
+    let mut total_size: u64 = 0;
+    let mut total_weight: u64 = 0;
+    let mut min_tx_size = u64::MAX;
+    let mut max_tx_size = 0u64;
     // Core's `mediantxsize` is the truncated median of the non-coinbase
     // transactions' total sizes (`CalculateTruncatedMedian(txsize_array)`).
     let mut tx_sizes: Vec<u64> = Vec::with_capacity(num_txs.saturating_sub(1));
@@ -1442,7 +1450,12 @@ pub fn get_block_stats(
 
         utxo_increase -= tx.input.len() as i64;
         let tx_size = serialize(tx).len();
+        let tx_weight = tx.weight().to_wu();
         tx_sizes.push(tx_size as u64);
+        total_size += tx_size as u64;
+        total_weight += tx_weight;
+        min_tx_size = min_tx_size.min(tx_size as u64);
+        max_tx_size = max_tx_size.max(tx_size as u64);
 
         if tx.input.iter().any(|i| !i.witness.is_empty()) {
             segwit_txs += 1;
@@ -1451,10 +1464,13 @@ pub fn get_block_stats(
             // zero, which read as "this block has no segwit data" beside a
             // non-zero `swtxs`.
             sw_total_size += tx_size;
-            sw_total_weight += tx.weight().to_wu();
+            sw_total_weight += tx_weight;
         }
     }
 
+    // Feerates are Core's unit, sat/vB, each `fee * 4 / weight` truncated
+    // (v32.1 `src/rpc/blockchain.cpp:2186`). satd reported sat/kvB under
+    // Core's field names, a thousand times Core's number.
     let mut total_fee: u64 = 0;
     let mut min_fee = u64::MAX;
     let mut max_fee = 0u64;
@@ -1466,11 +1482,9 @@ pub fn get_block_stats(
         fees.push(t.fee);
         min_fee = min_fee.min(t.fee);
         max_fee = max_fee.max(t.fee);
-        if t.weight > 0 {
-            let rate = crate::mempool::policy::fee_rate_sat_per_kvb(t.fee, t.weight);
-            min_fee_rate = min_fee_rate.min(rate);
-            max_fee_rate = max_fee_rate.max(rate);
-        }
+        let rate = sat_per_vb_core(t.fee, t.weight);
+        min_fee_rate = min_fee_rate.min(rate);
+        max_fee_rate = max_fee_rate.max(rate);
     }
 
     if min_fee == u64::MAX {
@@ -1479,17 +1493,17 @@ pub fn get_block_stats(
     if min_fee_rate == u64::MAX {
         min_fee_rate = 0;
     }
+    if min_tx_size == u64::MAX {
+        min_tx_size = 0;
+    }
 
-    let avg_fee = if num_txs > 1 {
-        total_fee / (num_txs as u64 - 1)
-    } else {
-        0
-    };
-    let avg_fee_rate = if total_weight > 0 && num_txs > 1 {
-        crate::mempool::policy::fee_rate_sat_per_kvb(total_fee, total_weight)
-    } else {
-        0
-    };
+    let non_coinbase = num_txs.saturating_sub(1) as u64;
+    let avg_fee = if non_coinbase > 0 { total_fee / non_coinbase } else { 0 };
+    // Core: `totalfee * 4 / total_weight`, over the non-coinbase weight
+    // (v32.1 `src/rpc/blockchain.cpp:2205`).
+    let avg_fee_rate = sat_per_vb_core(total_fee, total_weight);
+    // Core: `total_size / (vtx.size() - 1)` (v32.1 `:2206`).
+    let avg_tx_size = if non_coinbase > 0 { total_size / non_coinbase } else { 0 };
 
     // A real median, not the mean wearing its name. With fees now actually
     // computed the two differ sharply on any block with a fee outlier, which is
@@ -1503,20 +1517,20 @@ pub fn get_block_stats(
     Ok(json!({
         "avgfee": avg_fee,
         "avgfeerate": avg_fee_rate,
-        "avgtxsize": if num_txs > 1 { total_size / num_txs } else { 0 },
+        "avgtxsize": avg_tx_size,
         "blockhash": hash.to_string(),
         "feerate_percentiles": feerate_percentiles,
         "height": entry.height,
         "ins": block.txdata.iter().skip(1).map(|tx| tx.input.len()).sum::<usize>(),
         "maxfee": max_fee,
         "maxfeerate": max_fee_rate,
-        "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
+        "maxtxsize": max_tx_size,
         "medianfee": median_fee,
         "mediantime": block_median_time(chain_state, &entry),
         "mediantxsize": median_tx_size,
         "minfee": min_fee,
         "minfeerate": min_fee_rate,
-        "mintxsize": block.txdata.iter().map(|tx| serialize(tx).len()).min().unwrap_or(0),
+        "mintxsize": min_tx_size,
         "outs": block.txdata.iter().map(|tx| tx.output.len()).sum::<usize>(),
         "subsidy": subsidy,
         "swtotal_size": sw_total_size,
