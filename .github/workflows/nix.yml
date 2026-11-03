@@ -22,10 +22,8 @@
 # repos) — at that point both broader PR-trigger and a hard gate
 # on the Nix repro check become reasonable.
 #
-# flake.lock note: this PR ships `flake.nix` without a committed
-# `flake.lock`. The first `workflow_dispatch` run from a maintainer
-# branch generates the lock; commit the result. Subsequent runs use
-# the committed lock.
+# flake.lock is committed. With none in the tree, the x86_64 build
+# job resolves one and uploads it as the `flake-lock` artifact.
 
 name: Nix
 
@@ -74,6 +72,23 @@ jobs:
 
       - name: Magic Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98 # main as of 2026-07-15
+
+      # With no committed lock, resolve one and keep it as an artifact,
+      # so a maintainer without Nix can commit it. A no-op once the lock
+      # is in the tree.
+      - name: Resolve flake.lock if none is committed
+        if: matrix.system == 'x86_64-linux' && hashFiles('flake.lock') == ''
+        run: |
+          nix flake lock
+          cat flake.lock
+
+      - name: Upload the resolved flake.lock
+        if: matrix.system == 'x86_64-linux' && hashFiles('flake.lock') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: flake-lock
+          path: flake.lock
+          retention-days: 14
 
       - name: Confirm flake evaluates
         run: nix flake show --no-write-lock-file
@@ -148,6 +163,20 @@ jobs:
           mkdir -p hash-out
           sha256sum result/bin/satd    > hash-out/satd.sha256
           sha256sum result/bin/sat-cli > hash-out/sat-cli.sha256
+          # The binaries themselves, so a mismatch can be diffed after
+          # the fact instead of only being reported as two hashes.
+          cp result/bin/satd result/bin/sat-cli hash-out/
+          # The build host's CPU. Build scripts that probe the host
+          # (cpuid, sysconf, /proc) bake what they find into the
+          # binary, so the compare job reports this next to the hashes.
+          {
+            echo "model: $(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "address sizes: $(grep -m1 '^address sizes' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "page size: $(getconf PAGESIZE)"
+            echo "hugepage: $(grep -m1 '^Hugepagesize' /proc/meminfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "nproc: $(nproc)"
+          } > hash-out/host.txt
+          cat hash-out/host.txt
 
       - name: Upload hash artifact
         uses: actions/upload-artifact@v7
@@ -155,7 +184,7 @@ jobs:
           name: nix-repro-hashes-${{ matrix.replica }}
           path: hash-out/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
 
   reproducibility-compare:
     name: nix repro / compare
@@ -199,4 +228,64 @@ jobs:
             fi
           done
 
-          exit "$fail"
+          {
+            echo ""
+            echo "### Build hosts"
+            echo ""
+            echo "| | replica A | replica B |"
+            echo "|---|---|---|"
+            while IFS= read -r line_a && IFS= read -r line_b <&3; do
+              echo "| ${line_a%%:*} | ${line_a#*: } | ${line_b#*: } |"
+            done < a/host.txt 3< b/host.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "fail=${fail}" >> "$GITHUB_ENV"
+
+      - name: Diff divergent binaries
+        if: env.fail == '1'
+        run: |
+          set -euo pipefail
+          # Per-section hashes localise the difference (code, rodata,
+          # dynamic section, ...); the byte count says how much moved.
+          section_hashes() {
+            readelf -SW "$1" | awk '/^ *\[ *[0-9]+\]/ {
+                sub(/^ *\[ *[0-9]+\] */, ""); print $1, $2, $4, $5 }' \
+              | while read -r name type off size; do
+                  [[ "$name" == NULL ]] && continue
+                  # NOBITS sections (.bss, .tbss) take no bytes in the
+                  # file, so only their size can differ.
+                  if [[ "$type" == NOBITS ]]; then
+                    echo "$name $((16#$size)) -"
+                    continue
+                  fi
+                  h=$(dd if="$1" bs=64K iflag=skip_bytes,count_bytes \
+                        skip=$((16#$off)) count=$((16#$size)) status=none \
+                        | sha256sum | cut -c1-16)
+                  echo "$name $((16#$size)) $h"
+                done
+          }
+          {
+            echo ""
+            echo "### Section diff"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for bin in satd sat-cli; do
+            cmp -s "a/${bin}" "b/${bin}" && continue
+            section_hashes "a/${bin}" > "a/${bin}.sections"
+            section_hashes "b/${bin}" > "b/${bin}.sections"
+            {
+              echo ""
+              size_a=$(stat -c %s "a/${bin}"); size_b=$(stat -c %s "b/${bin}")
+              # cmp -l stops at the shorter file's end; the bytes past
+              # it all differ too.
+              common=$( (cmp -l "a/${bin}" "b/${bin}" 2>/dev/null || true) | wc -l)
+              extra=$(( size_a > size_b ? size_a - size_b : size_b - size_a ))
+              echo "**${bin}**: sizes ${size_a} vs ${size_b}, $((common + extra)) differing bytes (${common} within the common length)"
+              echo ""
+              echo '```'
+              diff "a/${bin}.sections" "b/${bin}.sections" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            diff "a/${bin}.sections" "b/${bin}.sections" || true
+          done
+          echo "The binaries are kept in the nix-repro-hashes-a / -b artifacts." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
