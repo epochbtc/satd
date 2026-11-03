@@ -15,7 +15,7 @@
 //!
 //! Not persisted: a restart starts cold, and a cold tracker injects nothing.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use bitcoin::Txid;
 
@@ -43,6 +43,9 @@ pub struct ArrivalTracker {
     started: Option<u64>,
     counted: u64,
     pending: VecDeque<(Txid, u64)>,
+    /// The txids in `pending`, so a transaction evicted and re-admitted
+    /// while it waits is noted once.
+    pending_ids: HashSet<Txid>,
 }
 
 /// A snapshot of the tracker's rates.
@@ -63,6 +66,7 @@ impl ArrivalTracker {
             started: None,
             counted: 0,
             pending: VecDeque::new(),
+            pending_ids: HashSet::new(),
         }
     }
 
@@ -73,8 +77,13 @@ impl ArrivalTracker {
         // promotion can stop at the first entry still waiting.
         let now = self.pending.back().map_or(now, |&(_, last)| now.max(last));
         self.started.get_or_insert(now);
-        if self.pending.len() >= MAX_PENDING {
-            self.pending.pop_front();
+        if !self.pending_ids.insert(txid) {
+            return;
+        }
+        if self.pending.len() >= MAX_PENDING
+            && let Some((old, _)) = self.pending.pop_front()
+        {
+            self.pending_ids.remove(&old);
         }
         self.pending.push_back((txid, now));
     }
@@ -97,6 +106,7 @@ impl ArrivalTracker {
                 break;
             }
             self.pending.pop_front();
+            self.pending_ids.remove(&txid);
             if let Some((rate, weight)) = lookup(&txid) {
                 self.add(entered, rate, weight);
             }
@@ -212,6 +222,21 @@ mod tests {
         t.promote(6_400 + MIN_RESIDENCE_SECS, |_| Some((20_000, 400)));
         assert!(t.pending.is_empty(), "both counted after ten seconds of the new clock");
         assert!(t.rates(6_400 + MIN_RESIDENCE_SECS).bands[1].1 > 0.0);
+    }
+
+    /// A transaction evicted and re-admitted while it waits out its
+    /// residence counts once.
+    #[test]
+    fn a_readmitted_transaction_counts_once() {
+        let mut t = tracker();
+        t.note(txid(1), 1_000);
+        t.note(txid(1), 1_003);
+        let mut looked_up = 0;
+        t.promote(1_000 + MIN_RESIDENCE_SECS + 5, |_| {
+            looked_up += 1;
+            Some((20_000, 400))
+        });
+        assert_eq!(looked_up, 1);
     }
 
     #[test]

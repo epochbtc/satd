@@ -12,12 +12,12 @@
 //! rows, and the tip they end at, discarded on load unless they end at the
 //! active tip.
 //!
-//! One addition: a block can be reported twice (the chain's own mempool
-//! cleanup and the caller's), and another block can connect between the two
-//! reports. A report of a block already in the window, by height and hash,
-//! adds the weight it removed to that row instead of being read as a reorg.
-//! The second call removes nothing, so the row keeps the first call's count
-//! and the rows above it stay.
+//! One addition: a block is reported twice, once by the chain while it
+//! holds the connect lock ([`HealthWindow::record`], Core's rule) and again by
+//! the caller that connected it, outside the lock, where other blocks may have
+//! connected or this one been reorged out in between. The caller's report
+//! ([`HealthWindow::merge`]) only adds to the block's own row, by height and
+//! hash, capped at the block's weight, and is dropped if the row is gone.
 
 use std::path::{Path, PathBuf};
 
@@ -90,21 +90,11 @@ pub struct HealthWindow {
 }
 
 impl HealthWindow {
-    /// Record a connected block. Core's `AddMinedBlockStats`: rows at or
-    /// above `height` are stale (a reorg) and dropped, and a height gap
-    /// clears the window.
+    /// Record a connected block, as the chain reports it while it holds the
+    /// connect lock. Core's `AddMinedBlockStats`: rows at or above `height`
+    /// are stale (a reorg, or the same block reconnected by
+    /// `reconsiderblock`) and dropped, and a height gap clears the window.
     pub fn record(&mut self, hash: BlockHash, stats: MinedBlockStats) {
-        if let Some(i) = self
-            .blocks
-            .iter()
-            .zip(&self.hashes)
-            .position(|(b, h)| b.height == stats.height && *h == Some(hash))
-        {
-            // A block already in the window, reported again.
-            let row = &mut self.blocks[i];
-            row.mempool_txs_weight = row.mempool_txs_weight.saturating_add(stats.mempool_txs_weight);
-            return;
-        }
         let keep = self.blocks.iter().take_while(|b| b.height < stats.height).count();
         self.blocks.truncate(keep);
         self.hashes.truncate(keep);
@@ -121,6 +111,27 @@ impl HealthWindow {
         self.blocks.push(stats);
         self.hashes.push(Some(hash));
         self.tip_hash = Some(hash);
+    }
+
+    /// A later report of a block, from a caller that cleans the mempool
+    /// again after the chain already did. It runs outside the connect lock,
+    /// so other blocks may have connected, or this one been reorged out,
+    /// since. It only adds what it removed to the block's own row, matched by
+    /// height and hash, never above the block's weight, and is otherwise
+    /// ignored.
+    pub fn merge(&mut self, hash: BlockHash, stats: MinedBlockStats) {
+        if let Some(i) = self
+            .blocks
+            .iter()
+            .zip(&self.hashes)
+            .position(|(b, h)| b.height == stats.height && *h == Some(hash))
+        {
+            let row = &mut self.blocks[i];
+            row.mempool_txs_weight = row
+                .mempool_txs_weight
+                .saturating_add(stats.mempool_txs_weight)
+                .min(row.block_weight);
+        }
     }
 
     /// Core's `MempoolLoadFailed`: the mempool did not load, so these rows
@@ -359,30 +370,59 @@ mod tests {
     }
 
     #[test]
-    fn a_block_reported_twice_keeps_its_coverage() {
+    fn a_callers_report_of_a_recorded_block_keeps_its_coverage() {
         let mut w = HealthWindow::default();
         let stats = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
         w.record(hash(7), stats);
-        // The second cleanup of the same block finds nothing left to remove.
-        w.record(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..stats });
+        // The caller's cleanup of the same block finds nothing left to remove.
+        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..stats });
         assert_eq!(w.blocks(), &[stats]);
-        // A different block at that height is a reorg and replaces the row.
-        w.record(hash(70), MinedBlockStats { mempool_txs_weight: 0, ..stats });
-        assert_eq!(w.blocks()[0].mempool_txs_weight, 0);
+        // What it does remove is added, never past the block's weight.
+        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 500, ..stats });
+        assert_eq!(w.blocks()[0].mempool_txs_weight, 1000);
     }
 
     /// Another block connects between a block's two reports: the late
-    /// second report finds its own row and is not read as a reorg.
+    /// caller's report finds its own row and leaves the rows above it.
     #[test]
-    fn a_late_second_report_keeps_the_rows_above_it() {
+    fn a_late_callers_report_keeps_the_rows_above_it() {
         let mut w = HealthWindow::default();
         let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
         let b = MinedBlockStats { height: 8, block_weight: 2000, mempool_txs_weight: 1800 };
         w.record(hash(7), a);
         w.record(hash(8), b);
-        w.record(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..a });
-        w.record(hash(8), MinedBlockStats { mempool_txs_weight: 0, ..b });
+        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..a });
+        w.merge(hash(8), MinedBlockStats { mempool_txs_weight: 0, ..b });
         assert_eq!(w.blocks(), &[a, b]);
+    }
+
+    /// A reorg between a block's two reports: the late caller's report is for
+    /// a block no longer in the window and changes nothing.
+    #[test]
+    fn a_callers_report_of_a_reorged_out_block_is_dropped() {
+        let mut w = HealthWindow::default();
+        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        w.record(hash(6), MinedBlockStats { height: 6, ..a });
+        w.record(hash(7), a);
+        // Block 7 is replaced by 7' (and 8) before the caller reports 7.
+        let a2 = MinedBlockStats { mempool_txs_weight: 100, ..a };
+        w.record(hash(70), a2);
+        w.record(hash(8), MinedBlockStats { height: 8, ..a });
+        let before = w.blocks().to_vec();
+        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 1000, ..a });
+        assert_eq!(w.blocks(), &before[..], "the dead block's report touched nothing");
+    }
+
+    /// `invalidateblock` then `reconsiderblock` reconnects the same blocks:
+    /// the chain's report replaces each row rather than adding to it, so the
+    /// block's weight is not counted twice.
+    #[test]
+    fn a_reconnected_block_is_not_counted_twice() {
+        let mut w = HealthWindow::default();
+        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        w.record(hash(7), a);
+        w.record(hash(7), a);
+        assert_eq!(w.blocks(), &[a]);
     }
 
     #[test]

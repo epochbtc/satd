@@ -4061,6 +4061,20 @@ impl Mempool {
     /// `height` is the connected block's height and is threaded into
     /// the event so subscribers can filter / correlate.
     pub fn remove_for_block(&self, block: &Block, height: u32) {
+        self.remove_for_block_reported(block, height, false);
+    }
+
+    /// [`Self::remove_for_block`] for the chain itself, which calls it for
+    /// each block it connects while holding its connect lock. Only this call
+    /// records the block in the mempool health window (Core's
+    /// `MempoolTxsRemovedForBlock`). The callers that clean the mempool again
+    /// afterwards use [`Self::remove_for_block`], outside that lock, so their
+    /// report can only add to the block's existing row.
+    pub fn remove_for_connected_block(&self, block: &Block, height: u32) {
+        self.remove_for_block_reported(block, height, true);
+    }
+
+    fn remove_for_block_reported(&self, block: &Block, height: u32, chain_report: bool) {
         let block_hash = block.block_hash();
         let mut confirmed: Vec<(Txid, u64)> = Vec::new();
         let mut evicted_conflicts: Vec<(Txid, u64)> = Vec::new();
@@ -4160,14 +4174,16 @@ impl Mempool {
             }
             self.sync_unbroadcast_len(&inner);
         }
-        self.record_block_health(
-            block_hash,
-            crate::mempool::health::MinedBlockStats {
-                height: height as u64,
-                block_weight,
-                mempool_txs_weight: removed_weight,
-            },
-        );
+        let stats = crate::mempool::health::MinedBlockStats {
+            height: height as u64,
+            block_weight,
+            mempool_txs_weight: removed_weight,
+        };
+        if chain_report {
+            self.record_block_health(block_hash, stats);
+        } else {
+            self.health.lock().merge(block_hash, stats);
+        }
 
         for (txid, seq) in &confirmed {
             self.emit(MempoolEvent::LeaveConfirmed {
@@ -10653,14 +10669,19 @@ mod tests {
         block.txdata.push(unseen.clone());
         let block_weight = held.weight().to_wu() + unseen.weight().to_wu();
 
-        mp.remove_for_block(&block, 5);
+        // A caller's cleanup alone records nothing: only the chain's does.
+        let lone = Mempool::new(300_000_000, 1_000);
+        lone.remove_for_block(&block, 5);
+        assert!(lone.health_blocks().is_empty());
+
+        mp.remove_for_connected_block(&block, 5);
         let want = crate::mempool::health::MinedBlockStats {
             height: 5,
             block_weight,
             mempool_txs_weight: held.weight().to_wu(),
         };
         assert_eq!(mp.health_blocks(), vec![want]);
-        // The chain's cleanup and the caller's both report the block.
+        // The caller then cleans up again and finds nothing left to remove.
         mp.remove_for_block(&block, 5);
         assert_eq!(mp.health_blocks(), vec![want], "the second report removed nothing");
     }
