@@ -12549,6 +12549,15 @@ impl PeerManager {
         let started = Instant::now();
         let block_hash = compact.header.block_hash();
 
+        // 0. Under -blocksonly the mempool cannot rebuild a compact block, and
+        // the node never asks for one, so Core v32 ignores every
+        // `cmpctblock`, the header included, even for a block it requested
+        // in full (`net_processing.cpp:4790-4793` at v32.1).
+        if self.blocksonly() {
+            tracing::debug!("peer={id} sent us a compact block even though we are blocksonly!");
+            return;
+        }
+
         // 1. Still syncing: take the header, leave the block to the download
         // scheduler. Core: `if (!already_in_flight && !CanDirectFetch()) return`.
         if self.ibd.read().is_some() || self.is_ibd() {

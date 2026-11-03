@@ -616,9 +616,7 @@ note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utx
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L170 assert self.ignores_cmpctblock(0, p2p_conn_blocksonly, solicited=True) fails, in the subtest v32 added for a solicited cmpctblock to a blocks-only node"
+status = "run"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"

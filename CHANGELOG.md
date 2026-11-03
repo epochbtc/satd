@@ -57,6 +57,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: a connection from a source address outside `-rpcallowip` is closed without a reply, as Core v32 does, instead of answered `403 Forbidden` (#PRNUM).
 - P2P: a transaction hash repeated in one `inv` is processed once, and each is logged as Core v32's `got inv:` line under `-debug=net` (#PRNUM).
 - P2P: a peer that asks for a filtered block (`MSG_FILTERED_BLOCK`) is disconnected, as Core v32 does without `NODE_BLOOM` (#PRNUM).
+- P2P: under `-blocksonly`, every `cmpctblock` is ignored, as in Core v32, including one for a block the node requested (#PRNUM).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,
