@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::mining::fee_profile::{BlockFeeProfile, truncated_median};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::util::univalue_double;
 use crate::storage::{RecentHeightWindow, Store};
@@ -1383,18 +1384,6 @@ pub fn get_block_stats(
     let total_weight = block.weight().to_wu();
     let num_txs = block.txdata.len();
 
-    let mut total_fee: u64 = 0;
-    let mut total_out: u64 = 0;
-    let mut min_fee = u64::MAX;
-    let mut max_fee = 0u64;
-    let mut min_fee_rate = u64::MAX;
-    let mut max_fee_rate = 0u64;
-    let mut segwit_txs = 0u64;
-    let mut utxo_increase: i64 = 0;
-    let mut fees: Vec<u64> = Vec::with_capacity(block.txdata.len());
-    let mut sw_total_size: usize = 0;
-    let mut sw_total_weight: u64 = 0;
-
     // Prevouts come from the block's **undo** data, not the live UTXO set.
     // Connecting a block removes exactly the coins its inputs spend, so a
     // `get_coin` lookup for a block that is already connected misses every
@@ -1402,10 +1391,29 @@ pub fn get_block_stats(
     // the node had connected, i.e. all of them. The filter and silent-payment
     // index runners read prevouts from undo data for precisely this reason.
     //
-    // `spent_coins` holds one coin per non-coinbase input in connect order, so
-    // a cursor over it lines up with the same traversal below.
-    let undo = chain_state.get_undo(&hash);
-    let mut spent = undo.as_ref().map(|u| u.spent_coins.iter());
+    // An undo row that disagrees with the block is corruption rather than a
+    // missing prevout, and no fee figure from the block can be trusted, so
+    // the call is refused by name rather than answered with misattributed
+    // numbers. With no undo row (a block that never connected) the live set
+    // is the only source, and it is correct for exactly that case: the coins
+    // are still there.
+    let profile = match chain_state.get_undo(&hash) {
+        Some(undo) => BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
+            format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
+        })?,
+        None => BlockFeeProfile::from_lookup(&block, |prevout| {
+            chain_state.get_coin(prevout).map(|coin| coin.amount)
+        }),
+    };
+
+    let mut total_out: u64 = 0;
+    let mut segwit_txs = 0u64;
+    let mut utxo_increase: i64 = 0;
+    let mut sw_total_size: usize = 0;
+    let mut sw_total_weight: u64 = 0;
+    // Core's `mediantxsize` is the truncated median of the non-coinbase
+    // transactions' total sizes (`CalculateTruncatedMedian(txsize_array)`).
+    let mut tx_sizes: Vec<u64> = Vec::with_capacity(num_txs.saturating_sub(1));
 
     for tx in &block.txdata {
         let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -1417,55 +1425,8 @@ pub fn get_block_stats(
         }
 
         utxo_increase -= tx.input.len() as i64;
-
-        // Fee from the coins this transaction spent.
-        let mut in_sum: u64 = 0;
-        let mut inputs_found = true;
-        for input in &tx.input {
-            let coin = match spent.as_mut() {
-                // Undo data present: take the next coin in connect order. It
-                // runs out only if the undo row disagrees with the block, which
-                // is corruption rather than a missing prevout — and the
-                // misalignment is only detectable here, after earlier inputs
-                // may already have been paired with the wrong coins. No fee
-                // figure from this block can be trusted, so refuse the call
-                // by name rather than answer with misattributed numbers.
-                Some(it) => match it.next() {
-                    Some(coin) => Some(coin.clone()),
-                    None => {
-                        return Err(format!(
-                            "undo data for block {hash} is inconsistent with the block;                              fee statistics unavailable"
-                        ));
-                    }
-                },
-                // No undo row (a block that never connected, or pruned undo).
-                // The live set is then the only source, and it is correct for
-                // exactly that case: the coins are still there.
-                None => chain_state.get_coin(&input.previous_output),
-            };
-            match coin {
-                Some(coin) => in_sum += coin.amount,
-                None => {
-                    inputs_found = false;
-                    break;
-                }
-            }
-        }
-
-        if inputs_found && in_sum >= out_sum {
-            let fee = in_sum - out_sum;
-            total_fee += fee;
-            fees.push(fee);
-            min_fee = min_fee.min(fee);
-            max_fee = max_fee.max(fee);
-
-            let w = tx.weight().to_wu();
-            if w > 0 {
-                let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, w);
-                min_fee_rate = min_fee_rate.min(rate);
-                max_fee_rate = max_fee_rate.max(rate);
-            }
-        }
+        let tx_size = serialize(tx).len();
+        tx_sizes.push(tx_size as u64);
 
         if tx.input.iter().any(|i| !i.witness.is_empty()) {
             segwit_txs += 1;
@@ -1473,8 +1434,26 @@ pub fn get_block_stats(
             // contribute, not just how many there are. These were hardcoded to
             // zero, which read as "this block has no segwit data" beside a
             // non-zero `swtxs`.
-            sw_total_size += serialize(tx).len();
+            sw_total_size += tx_size;
             sw_total_weight += tx.weight().to_wu();
+        }
+    }
+
+    let mut total_fee: u64 = 0;
+    let mut min_fee = u64::MAX;
+    let mut max_fee = 0u64;
+    let mut min_fee_rate = u64::MAX;
+    let mut max_fee_rate = 0u64;
+    let mut fees: Vec<u64> = Vec::with_capacity(profile.txs.len());
+    for t in &profile.txs {
+        total_fee += t.fee;
+        fees.push(t.fee);
+        min_fee = min_fee.min(t.fee);
+        max_fee = max_fee.max(t.fee);
+        if t.weight > 0 {
+            let rate = crate::mempool::policy::fee_rate_sat_per_kvb(t.fee, t.weight);
+            min_fee_rate = min_fee_rate.min(rate);
+            max_fee_rate = max_fee_rate.max(rate);
         }
     }
 
@@ -1498,16 +1477,10 @@ pub fn get_block_stats(
 
     // A real median, not the mean wearing its name. With fees now actually
     // computed the two differ sharply on any block with a fee outlier, which is
-    // most of them.
-    fees.sort_unstable();
-    let median_fee = if fees.is_empty() {
-        0
-    } else if fees.len() % 2 == 1 {
-        fees[fees.len() / 2]
-    } else {
-        // Core averages the two middle elements.
-        (fees[fees.len() / 2 - 1] + fees[fees.len() / 2]) / 2
-    };
+    // most of them. Core averages the two middle elements of an even count.
+    let median_fee = truncated_median(&mut fees);
+    let median_tx_size = truncated_median(&mut tx_sizes);
+    let feerate_percentiles = profile.feerate_percentiles();
 
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, entry.height);
 
@@ -1516,6 +1489,7 @@ pub fn get_block_stats(
         "avgfeerate": avg_fee_rate,
         "avgtxsize": if num_txs > 1 { total_size / num_txs } else { 0 },
         "blockhash": hash.to_string(),
+        "feerate_percentiles": feerate_percentiles,
         "height": entry.height,
         "ins": block.txdata.iter().skip(1).map(|tx| tx.input.len()).sum::<usize>(),
         "maxfee": max_fee,
@@ -1523,7 +1497,7 @@ pub fn get_block_stats(
         "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
         "medianfee": median_fee,
         "mediantime": block_median_time(chain_state, &entry),
-        "mediantxsize": if num_txs > 0 { total_size / num_txs } else { 0 },
+        "mediantxsize": median_tx_size,
         "minfee": min_fee,
         "minfeerate": min_fee_rate,
         "mintxsize": block.txdata.iter().map(|tx| serialize(tx).len()).min().unwrap_or(0),
