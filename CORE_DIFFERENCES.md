@@ -494,7 +494,7 @@ preserved; the satd extension is opt-in per request or per flag.
   `confidence: low|medium|high` field. Closes Core's
   [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
 
-- **`estimatesmartfee` in Core 32.1's shape, with three departures.** The
+- **`estimatesmartfee` in Core 32.1's shape, with three departures, and an interim `auto`.** The
   arguments, the `options` type checks (`fee_rate_estimator` a string,
   `verbosity` a number), `blocks` (target 1 answered for 2, `mempool_policy`
   always 2), the floors and the no-data `errors` answer follow Core 32.1.
@@ -515,6 +515,11 @@ preserved; the satd extension is opt-in per request or per flag.
   The numbers come from satd's estimators, not Core's: `block_policy` is the
   history estimator and `mempool_policy` the mempool simulator, and
   `mempool_health_statistics` (`verbosity` 2) is an empty list for now.
+  `auto` does not yet combine the two as Core's does (Core answers the lower
+  of the two estimates, falling back to block policy). Until satd's estimator
+  rework sets the combination, `auto` with Core's estimate modes is the
+  history estimator alone. It can therefore quote higher than a Core node,
+  never lower, and under `auto` `estimator` is never `mempool_policy`.
   satd's own `estimate_mode` values `historical`, `mempool` and `blend` are
   still accepted, and select the source under `auto`.
 
