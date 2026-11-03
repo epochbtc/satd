@@ -54,6 +54,7 @@ It includes every fix shipped in 0.7.1:
 - Config: Core v31 and v32.1's new options (`prevoutfetchthreads`, `inboundrelaypercent`, `rpcmaxconnections`, `txsendrate`) load with a warning instead of being refused as typos; `privatebroadcast`, which satd does not implement, is refused. The node creates `<datadir>/fees/` as Core v32 does. `converttopsbt` takes Core v32's `psbt_version` argument and refuses a version it cannot produce (#1203).
 - RPC: `estimatesmartfee` with `fee_rate_estimator=mempool_policy` is Core 32's mempool estimator (health gate, template percentiles), and `verbosity` 2 reports the health window and a `mempool_health` verdict; opt-in, not yet the default (#1202).
 - RPC: `validateaddress` reports one `error_locations` entry, the position where the string passes the limit, for a too-long Bech32 string, as Core v32 does (#PRNUM).
+- RPC: a connection from a source address outside `-rpcallowip` is closed without a reply, as Core v32 does, instead of answered `403 Forbidden` (#PRNUM).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

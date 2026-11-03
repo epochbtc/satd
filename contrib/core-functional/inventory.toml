@@ -890,9 +890,7 @@ status = "run"
 
 [[test]]
 file = "rpc_bind.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1; --ipv4 and --ipv6 pass): --nonloopback L177 expects a disallowed source IP to get a connection error; satd answers 403 Forbidden, which is what v31.1 asserted. Core v32 drops the connection instead"
+status = "run"
 
 [[test]]
 file = "rpc_blockchain.py"
