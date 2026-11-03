@@ -488,11 +488,35 @@ preserved; the satd extension is opt-in per request or per flag.
   `STABILITY_POLICY.md` Tier 2.
 
 - **`estimatefees` mempool-aware mode** — alongside the historical
-  Core-shape `estimatesmartfee` (preserved unchanged), the
+  Core-shape `estimatesmartfee`, the
   `estimatefees` RPC simulates next-N block templates from the current
   mempool with CPFP-aware sorting, and never errors — always returns a
   `confidence: low|medium|high` field. Closes Core's
   [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
+
+- **`estimatesmartfee` in Core 32.1's shape, with three departures.** The
+  arguments, the `options` type checks (`fee_rate_estimator` a string,
+  `verbosity` a number), `blocks` (target 1 answered for 2, `mempool_policy`
+  always 2), the floors and the no-data `errors` answer follow Core 32.1.
+  Three things do not:
+  - An unknown `fee_rate_estimator` value, `none` and the empty string
+    included, means `auto`. Core refuses it with `-8 Invalid
+    fee_rate_estimator parameter`. A client written against another
+    vocabulary gets the default answer rather than no answer.
+  - An unknown key in `options` is ignored, and the keys beside it still
+    apply. Core refuses it with `-3 Unexpected key`. The reason is the same
+    as for unknown values.
+  - `estimator` accompanies every `feerate`, not only under `auto`, and can
+    be `floor`: the estimate was below the floor (the rolling mempool
+    minimum, `-minrelaytxfee`, and 1 sat/vB, which Core does not have), so
+    the floor set the number. Core names only `block_policy` or
+    `mempool_policy`.
+
+  The numbers come from satd's estimators, not Core's: `block_policy` is the
+  history estimator and `mempool_policy` the mempool simulator, and
+  `mempool_health_statistics` (`verbosity` 2) is an empty list for now.
+  satd's own `estimate_mode` values `historical`, `mempool` and `blend` are
+  still accepted, and select the source under `auto`.
 
 - **Structured-JSON logs** — `--log-format=json|text`. Default text for
   humans, json for production. Stable field schema, trace IDs on the

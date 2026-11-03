@@ -108,7 +108,8 @@ const SATD_SLOT_ALIASES: &[&str] = &["allowquarantined"];
 /// Only the test reads it — the table below is the shipped artefact, and this
 /// is the statement of what the table must satisfy.
 #[cfg(test)]
-const SATD_EXTRA_ARGS: &[(&str, &str)] = &[("createpsbt", "psbt_version")];
+const SATD_EXTRA_ARGS: &[(&str, &str)] =
+    &[("createpsbt", "psbt_version"), ("estimatesmartfee", "options")];
 
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
@@ -140,7 +141,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "echojson" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
         "estimatefees" => &[("targets", false), ("mode", false)],
         "estimaterawfee" => &[("conf_target", false), ("threshold", false)],
-        "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false)],
+        "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false), ("options", false)],
         // SATD_ONLY: exportnapsnapshot
         "exportnapsnapshot" => &[("path", false)],
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
@@ -305,7 +306,7 @@ fn positional_arity(specs: &[ArgSpec]) -> usize {
 /// runs before the `MatchesType` loop and throws the method's help text, so a
 /// surplus argument outranks a type error and never reaches the handler.
 /// Without it satd quietly ignored the extras -- `getblockcount 1 2 3`
-/// succeeded, and `estimatesmartfee 1 "ECONOMICAL" 1` answered a feerate where
+/// succeeded, and `estimatesmartfee 1 "ECONOMICAL" {} 1` answered a feerate where
 /// Core answers `-1`.
 ///
 /// **Knowing divergence in the message.** Core's is the full `RPCHelpMan`

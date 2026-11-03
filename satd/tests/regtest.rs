@@ -2007,6 +2007,20 @@ fn test_gettxout() {
     node.stop();
 }
 
+/// The keys of an `estimatesmartfee` result object.
+fn smartfee_keys(result: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    result.as_object().unwrap().keys().cloned().collect()
+}
+
+fn keyset(keys: &[&str]) -> std::collections::BTreeSet<String> {
+    keys.iter().map(|k| k.to_string()).collect()
+}
+
+/// A node with no fee history answers as a Core node with no fee data does
+/// (Core 32.1 `rpc/fees.cpp` `estimatesmartfee`; `block_policy_estimator.cpp`
+/// `EstimateFeeRate`): `errors` naming the gap and `blocks: 0`, no `feerate`
+/// and no `estimator`. satd used to quote the relay floor here, with an
+/// always-empty `errors`.
 #[test]
 fn test_estimatesmartfee() {
     let mut node = TestNode::start(&[]);
@@ -2014,37 +2028,180 @@ fn test_estimatesmartfee() {
         .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
         .unwrap();
     let result = &response["result"];
-    assert!(result["feerate"].as_f64().unwrap() > 0.0);
-    assert_eq!(result["blocks"], 6);
+    assert_eq!(smartfee_keys(result), keyset(&["errors", "blocks"]), "{result}");
+    assert_eq!(
+        result["errors"],
+        serde_json::json!(["Insufficient data or no feerate found"])
+    );
+    assert_eq!(result["blocks"], 0);
     node.stop();
 }
 
+/// The result shape, pinned against Core 32.1's `estimatesmartfee` help
+/// (`src/rpc/fees.cpp` at v32.1, lines 69-91): `feerate` and `errors` are
+/// each present only when they apply, `blocks` always, and
+/// `mempool_health_statistics` only at `verbosity >= 2`. satd differs in one
+/// field: `estimator` accompanies every `feerate`, and may be `floor`.
 #[test]
-fn test_estimatesmartfee_core_compat_shape_unchanged() {
-    // The default (no mode param) response must contain exactly the Core-
-    // compatible keys: `feerate`, `blocks`, `errors`. Nothing else.
-    // Regression guard: adding mempool-based estimation must not break
-    // Bitcoin Core clients.
+fn estimatesmartfee_has_cores_32_1_shape() {
+    use serde_json::json;
     let mut node = TestNode::start(&[]);
-    let response = node
-        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+    let call = |node: &mut TestNode, params: Vec<serde_json::Value>| {
+        let resp = node.rpc_call_with_params("estimatesmartfee", params).unwrap();
+        assert!(resp["error"].is_null(), "{resp}");
+        resp["result"].clone()
+    };
+
+    // mempool_policy: answers for 2 blocks whatever the target, as Core's
+    // mempool estimator does; an empty pool leaves the floor to set it.
+    for target in [1, 6, 1008] {
+        let r = call(&mut node, vec![json!(target), json!("economical"), json!({"fee_rate_estimator": "mempool_policy"})]);
+        assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
+        assert_eq!(r["blocks"], 2, "{r}");
+        assert_eq!(r["estimator"], "floor", "{r}");
+        assert!(r["feerate"].as_f64().unwrap() >= 0.00001, "floored at 1 sat/vB: {r}");
+    }
+
+    // block_policy with no history: Core's no-data answer.
+    let r = call(&mut node, vec![json!(6), json!("conservative"), json!({"fee_rate_estimator": "block_policy"})]);
+    assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
+
+    // verbosity 2 adds the (for now empty) health statistics, on either kind
+    // of answer; verbosity 1 does not.
+    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2})]);
+    assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks", "mempool_health_statistics"]));
+    assert_eq!(r["mempool_health_statistics"], json!([]));
+    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2, "fee_rate_estimator": "mempool_policy"})]);
+    assert_eq!(
+        smartfee_keys(&r),
+        keyset(&["feerate", "estimator", "blocks", "mempool_health_statistics"])
+    );
+    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 1})]);
+    assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]));
+
+    // `options` by name, as Core's named-parameter table has it.
+    let resp = node
+        .rpc_call_with_named_params(
+            "estimatesmartfee",
+            json!({"conf_target": 3, "options": {"fee_rate_estimator": "mempool_policy"}}),
+        )
         .unwrap();
-    let result = response["result"].as_object().unwrap();
-    let keys: std::collections::BTreeSet<&str> = result.keys().map(|k| k.as_str()).collect();
-    let expected: std::collections::BTreeSet<&str> =
-        ["feerate", "blocks", "errors"].into_iter().collect();
-    assert_eq!(keys, expected, "estimatesmartfee default shape drifted");
-    assert!(result["feerate"].as_f64().unwrap() > 0.0);
-    assert_eq!(result["blocks"], 6);
-    // `errors` is always an empty list.
-    assert!(result["errors"].as_array().unwrap().is_empty());
+    assert_eq!(resp["result"]["estimator"], "floor", "{resp}");
+    node.stop();
+}
+
+/// An unknown `fee_rate_estimator` means `auto`, where Core 32.1 refuses it
+/// with `-8` (a departure recorded in CORE_DIFFERENCES.md). `auto` follows
+/// the estimate mode, so with satd's `mempool` mode an unknown value answers
+/// from the simulator, which `block_policy` (no history here) cannot.
+#[test]
+fn estimatesmartfee_unknown_fee_rate_estimator_means_auto() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    for v in ["none", "", "foo", "AUTO", "auto"] {
+        let resp = node
+            .rpc_call_with_params(
+                "estimatesmartfee",
+                vec![json!(6), json!("mempool"), json!({"fee_rate_estimator": v})],
+            )
+            .unwrap();
+        assert!(resp["error"].is_null(), "{v:?}: {resp}");
+        assert!(resp["result"]["feerate"].is_number(), "{v:?} answered as auto: {resp}");
+        assert_eq!(resp["result"]["blocks"], 6, "{v:?}: {resp}");
+    }
+    let resp = node
+        .rpc_call_with_params(
+            "estimatesmartfee",
+            vec![json!(6), json!("mempool"), json!({"fee_rate_estimator": "block_policy"})],
+        )
+        .unwrap();
+    assert!(resp["result"]["feerate"].is_null(), "block_policy has no history: {resp}");
+    node.stop();
+}
+
+/// `options` is type-checked as Core 32.1 checks it (`rpc/fees.cpp:109-114`,
+/// and `test/functional/rpc_estimatefee.py`): an object, and each of its two
+/// keys of its type. Unknown keys are the exception; see the next test.
+#[test]
+fn estimatesmartfee_checks_its_options_as_core_does() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    for (params, code, msg) in [
+        (vec![json!(1), json!("ECONOMICAL"), json!(1)], -3, "JSON value of type number is not of expected type object"),
+        (vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": 1})], -3, "JSON value of type number for field fee_rate_estimator is not of expected type string"),
+        (vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": "foo"})], -3, "JSON value of type string for field verbosity is not of expected type number"),
+    ] {
+        let resp = node.rpc_call_with_params("estimatesmartfee", params.clone()).unwrap();
+        assert_eq!(resp["error"]["code"].as_i64(), Some(code), "{params:?}: {resp}");
+        assert_eq!(resp["error"]["message"].as_str(), Some(msg), "{params:?}: {resp}");
+    }
+    // A fourth argument is surplus, and Core answers its help (-1).
+    for extra in [json!({}), json!({"verbosity": 1})] {
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), extra, json!(1)])
+            .unwrap();
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-1), "{resp}");
+    }
+    // The option keys are not top-level named parameters.
+    let resp = node
+        .rpc_call_with_named_params("estimatesmartfee", json!({"conf_target": 1, "fee_rate_estimator": true}))
+        .unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "{resp}");
+    assert_eq!(
+        resp["error"]["message"].as_str(),
+        Some("Unknown named parameter fee_rate_estimator")
+    );
+    // Core's valid calls all answer.
+    for params in [
+        vec![json!(1)],
+        vec![json!(1), json!("ECONOMICAL")],
+        vec![json!(1), json!("unset")],
+        vec![json!(1), json!("conservative")],
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "block_policy"})],
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "mempool_policy"})],
+        vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": 1, "fee_rate_estimator": "auto"})],
+    ] {
+        let resp = node.rpc_call_with_params("estimatesmartfee", params.clone()).unwrap();
+        assert!(resp["error"].is_null(), "{params:?}: {resp}");
+    }
+    node.stop();
+}
+
+/// An unknown key in `options` is ignored and the call answers, where Core
+/// 32.1 refuses it with `-3 Unexpected key` (CORE_DIFFERENCES.md). The known
+/// keys beside it still take effect.
+#[test]
+fn estimatesmartfee_ignores_an_unknown_options_key() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    let resp = node
+        .rpc_call_with_params(
+            "estimatesmartfee",
+            vec![
+                json!(1),
+                json!("ECONOMICAL"),
+                json!({"block_policy_only": true, "fee_rate_estimator": "mempool_policy", "verbosity": 2}),
+            ],
+        )
+        .unwrap();
+    assert!(resp["error"].is_null(), "an unknown key must not refuse the call: {resp}");
+    let r = &resp["result"];
+    assert!(r["feerate"].is_number(), "{r}");
+    assert_eq!(r["blocks"], 2, "fee_rate_estimator beside it still applies: {r}");
+    assert_eq!(r["mempool_health_statistics"], json!([]), "verbosity beside it still applies: {r}");
+    // On its own, an unknown key leaves the default answer.
+    let resp = node
+        .rpc_call_with_params("estimatesmartfee", vec![json!(6), json!(null), json!({"foo": 1})])
+        .unwrap();
+    assert!(resp["error"].is_null(), "{resp}");
+    assert_eq!(smartfee_keys(&resp["result"]), keyset(&["errors", "blocks"]), "{resp}");
     node.stop();
 }
 
 #[test]
 fn test_estimatesmartfee_accepts_mode_param() {
-    // mode=mempool is accepted and returns the same shape. With an empty
-    // mempool the feerate falls back to the min-relay floor.
+    // satd's own mode=mempool answers from the simulator. With an empty
+    // mempool the floor sets the number, and `estimator` says so.
     let mut node = TestNode::start(&[]);
     let response = node
         .rpc_call_with_params(
@@ -2055,14 +2212,8 @@ fn test_estimatesmartfee_accepts_mode_param() {
     let result = &response["result"];
     assert!(result["feerate"].as_f64().unwrap() > 0.0);
     assert_eq!(result["blocks"], 6);
-    // Same keys as Core-compat default — only the source differs.
-    let keys: std::collections::BTreeSet<&str> = result
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(|k| k.as_str())
-        .collect();
-    assert_eq!(keys, ["feerate", "blocks", "errors"].into_iter().collect());
+    assert_eq!(result["estimator"], "floor");
+    assert_eq!(smartfee_keys(result), keyset(&["feerate", "estimator", "blocks"]));
     node.stop();
 }
 
@@ -7972,8 +8123,16 @@ fn test_rpc_default_units_sats_emits_integers() {
         "with rpcdefaultunits=sats, mempoolminfee should be integer sat/kvB, got: {}",
         fee
     );
+    // `mempool_policy` answers on a node with no fee history.
     let est = node
-        .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
+        .rpc_call_with_params(
+            "estimatesmartfee",
+            vec![
+                serde_json::json!(6),
+                serde_json::Value::Null,
+                serde_json::json!({"fee_rate_estimator": "mempool_policy"}),
+            ],
+        )
         .unwrap();
     let feerate = &est["result"]["feerate"];
     assert!(
@@ -20274,9 +20433,9 @@ fn a_surplus_positional_argument_is_refused_before_the_handler_runs() {
         ),
         // None declared: every argument is surplus.
         ("getblockcount", vec![json!(1), json!(2), json!(3)]),
-        // Core's own suite asserts this one: rpc_estimatefee.py drives
-        // `estimatesmartfee(1, 'ECONOMICAL', 1)` and expects -1.
-        ("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!(1)]),
+        // Core's own suite asserts this one: rpc_estimatefee.py (v32.1)
+        // drives `estimatesmartfee(1, 'ECONOMICAL', {}, 1)` and expects -1.
+        ("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!({}), json!(1)]),
         // ... and rpc_blockchain.py drives this one.
         ("getchaintxstats", vec![json!(0), json!(""), json!(0)]),
     ] {

@@ -852,7 +852,9 @@ note = "measured 2026-09-15: L50 txoutset_hash disagrees with Core: satd's hash_
 
 [[test]]
 file = "rpc_estimatefee.py"
-status = "run"
+status = "skip"
+reason = "harness"
+note = "measured 2026-11-03: L36 asserts estimatesmartfee(1, 'ECONOMICAL', 1) is a surplus argument (-1). satd takes Core 32.1's third argument, options, and answers -3 as Core 32.1 does; v32.1's version of the test passes 1 as options only in a type check. Follow-up: the pin bump to v32.1 brings it back, except L39-41 and L43 (an unknown fee_rate_estimator is -8 and an unknown options key -3 in Core; satd answers both; CORE_DIFFERENCES.md)"
 
 [[test]]
 file = "rpc_generate.py"

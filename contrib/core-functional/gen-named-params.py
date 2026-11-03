@@ -265,6 +265,10 @@ SATD_EXTRA_ARGS = {
     # payment recipient needs. Core has no version 2 at all, so there is no
     # slot to share: it goes after `replaceable` and `version`.
     "createpsbt": [["psbt_version", False]],
+    # Core 32.1's `options` slot (`fee_rate_estimator`, `verbosity`). The pin is
+    # older than the release that added it; drop this row when the pin reaches
+    # v32.1, where the generator finds the slot in Core itself.
+    "estimatesmartfee": [["options", False]],
 }
 
 SATD_ONLY = {

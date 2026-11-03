@@ -60,12 +60,26 @@ header is a planned follow-up.
 
 ## Fee estimation
 
-Core's `estimatesmartfee conf_target [estimate_mode]` is kept with its
-exact response shape (`{feerate, blocks, errors}`) and is Core-compatible
-by default. The optional mode argument accepts Core's `economical` /
-`conservative` / `unset` vocabulary, all treated as the historical
-estimator. It also accepts satd's own `historical` / `mempool` / `blend`
-values.
+`estimatesmartfee conf_target ( "estimate_mode" options )` has Bitcoin
+Core 32.1's shape: `{feerate, estimator, blocks}` on success and
+`{errors, blocks}` when there is nothing to answer from, with `errors` present
+only then. `options` takes Core's `fee_rate_estimator` (`auto`, the default;
+`block_policy`, the history estimator; `mempool_policy`, the mempool
+simulator) and `verbosity` (2 adds `mempool_health_statistics`, an empty list
+for now). `blocks` is the target the answer was found at: a request for 1 block
+is answered for 2, and `mempool_policy` always answers for 2.
+
+Every answer is floored at the rolling mempool minimum, `-minrelaytxfee` and 1
+sat/vB, whichever is highest. Three things differ from Core: an unknown
+`fee_rate_estimator` value means `auto` rather than an error, an unknown key in
+`options` is ignored rather than refused, and `estimator` is on every answer
+and can be `floor`, meaning the floor set the number. See
+`CORE_DIFFERENCES.md`.
+
+The mode argument accepts Core's `economical` / `conservative` / `unset`
+vocabulary, all of which use the history estimator. It also accepts satd's
+own `historical` / `mempool` / `blend` values, which select the source when
+`fee_rate_estimator` is `auto`.
 
 satd also adds an `estimatefees [targets] [mode]` method (default mode
 `blend`, default targets `[1, 3, 6, 12, 24]`). It simulates the next N
