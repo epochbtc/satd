@@ -94,11 +94,21 @@ fn in_44_1(addr: &SocketAddr) -> bool {
     matches!(addr.ip(), IpAddr::V4(v4) if v4.octets()[..2] == [44, 1])
 }
 
+/// Put `addrs` in the address book, which the automatic dials draw from,
+/// as new where the book does not hold them yet.
 fn learn(pm: &PeerManager, addrs: &[SocketAddr]) {
-    let mut learned = pm.learned_addrs.write();
+    let now = now_unix_secs();
+    let mut book = pm.addrman.write();
     for a in addrs {
-        learned.push(*a);
+        if !book.contains(a) {
+            assert!(book.add(*a, now), "fixture: the book takes {a}");
+        }
     }
+}
+
+/// The whole order [`PeerManager::automatic_dial_order`] draws.
+fn dial_order(pm: &PeerManager, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
+    pm.automatic_dial_order(rng).map(|c| c.addr).collect()
 }
 
 fn dialled(pm: &Arc<PeerManager>) -> Vec<SocketAddr> {
@@ -475,14 +485,14 @@ fn automatic_dials_draw_tried_and_new_at_even_odds() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(7);
     let mut tried_first = 0;
     for _ in 0..400 {
-        let order = pm.automatic_dial_order(&mut rng);
+        let order = dial_order(&pm, &mut rng);
         assert_eq!(order.len(), tried.len() + new.len());
         if tried.contains(&order[0]) {
             tried_first += 1;
         }
     }
     assert!((140..=260).contains(&tried_first), "tried first in {tried_first} of 400");
-    let mut order = pm.automatic_dial_order(&mut rng);
+    let mut order = dial_order(&pm, &mut rng);
     order.sort();
     let mut all: Vec<SocketAddr> = tried.iter().chain(&new).copied().collect();
     all.sort();
@@ -556,7 +566,7 @@ fn tried_dials_draw_a_bucket_before_an_entry() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(11);
     let mut big_first = 0;
     for _ in 0..1000 {
-        if tried_big.contains(&pm.automatic_dial_order(&mut rng)[0]) {
+        if tried_big.contains(&dial_order(&pm, &mut rng)[0]) {
             big_first += 1;
         }
     }
@@ -591,7 +601,7 @@ fn a_tried_collision_tests_the_incumbent() {
     };
     learn(&pm, &[new]);
     let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-    assert_eq!(pm.automatic_dial_order(&mut rng)[0], old, "the incumbent is tested first");
+    assert_eq!(dial_order(&pm, &mut rng)[0], old, "the incumbent is tested first");
 
     add_peer(&pm, outbound(1, old, ConnType::OutboundFullRelay));
     pm.resolve_tried_collisions();
@@ -599,4 +609,122 @@ fn a_tried_collision_tests_the_incumbent() {
     assert!(book.is_tried(&old) && book.tried_bucket(&old) == Some(slot));
     assert!(!book.is_tried(&new), "a connected incumbent keeps its slot");
     assert_eq!(book.select_tried_collision(), None);
+}
+
+// ---- A1: the dial pool is the whole address book ----
+
+/// #1148: the automatic dials draw from the whole book. satd put 256 of
+/// the entries in `peers.dat` on its dial list at startup (tried by last
+/// success, then new by last seen), and the rest were never dialled until
+/// gossip named them again. Three hundred new entries, the one seen longest
+/// ago last in the old order: it is a candidate now.
+#[test]
+fn an_address_from_peers_dat_outside_the_old_top_256_is_a_dial_candidate() {
+    use rand::SeedableRng as _;
+    let (pm, dir) = mk_pm();
+    let path = dir.path().join("peers.dat");
+    let addrs: Vec<SocketAddr> = (0..300).map(own_group).collect();
+    let now = now_unix_secs();
+    {
+        let mut book = crate::net::addrman::AddrMan::new();
+        for (i, a) in addrs.iter().enumerate() {
+            assert!(book.add(*a, now - 1000 + i as u64), "fixture: {a}");
+        }
+        book.dump(&path).expect("dump");
+    }
+    pm.load_addrman(&path);
+    assert_eq!(pm.addrman.read().len(), 300);
+    let oldest = addrs[0];
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+    let order = dial_order(&pm, &mut rng);
+    assert_eq!(order.len(), 300, "every entry of the book is drawn");
+    assert!(order.contains(&oldest), "including the one the old preload left out");
+
+    // And it is dialled: alone dialable, it takes a slot.
+    leave_ibd(&pm);
+    for a in &addrs[1..] {
+        pm.reconnect_backoff.write().insert(
+            *a,
+            ReconnectState { attempts: 1, next_attempt: Instant::now() + Duration::from_secs(600), last_try: None },
+        );
+    }
+    assert_eq!(dialled(&pm), vec![oldest]);
+}
+
+/// #1148: an entry is taken with Core's `GetChance` odds. One that failed
+/// eight times is drawn about 1/28th as often as a fresh one (a little more,
+/// as each refusal raises the odds of the next draw by 1.2, as in Core).
+/// satd drew both alike.
+#[test]
+fn an_address_with_eight_failed_attempts_is_drawn_about_a_28th_as_often() {
+    use rand::SeedableRng as _;
+    let (pm, _dir) = mk_pm();
+    let now = now_unix_secs();
+    let fresh: Vec<SocketAddr> = (0..50).map(own_group).collect();
+    let failed: Vec<SocketAddr> = (50..100).map(own_group).collect();
+    {
+        let mut book = pm.addrman.write();
+        for a in fresh.iter().chain(&failed) {
+            assert!(book.add(*a, now));
+        }
+        // An hour ago, outside the ten minutes that cut the odds further.
+        for a in &failed {
+            for _ in 0..8 {
+                book.mark_attempt(*a, now - 3600);
+            }
+        }
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+    let (mut fresh_first, mut failed_first) = (0u32, 0u32);
+    for _ in 0..20_000 {
+        let first = pm.automatic_dial_order(&mut rng).next().expect("a candidate").addr;
+        if failed.contains(&first) {
+            failed_first += 1;
+        } else {
+            fresh_first += 1;
+        }
+    }
+    let ratio = f64::from(failed_first) / f64::from(fresh_first);
+    assert!((1.0 / 40.0..1.0 / 18.0).contains(&ratio), "failed:fresh = {failed_first}:{fresh_first}");
+}
+
+/// #1148: a candidate whose stored services lack the desirable ones is
+/// skipped before it is dialled (Core's `HasAllDesirableServiceFlags`
+/// before `OpenNetworkConnection`). satd dialled it and turned it away in
+/// the handshake. The test tip is old, so a pruned peer does not qualify.
+#[test]
+fn a_candidate_without_the_desirable_services_is_not_dialled() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let now = now_unix_secs();
+    let limited = own_group(1);
+    let full = own_group(2);
+    let source = IpAddr::from([198, 51, 100, 1]);
+    {
+        let mut book = pm.addrman.write();
+        let network_limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        assert!(book.add_from(limited, now, network_limited.to_u64(), source));
+        let network = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        assert!(book.add_from(full, now, network.to_u64(), source));
+    }
+    assert_eq!(dialled(&pm), vec![full]);
+}
+
+/// #1148: a candidate on a bad port is skipped until 50 candidates have
+/// been looked at since the last dial (Core's `IsBadPort` and `nTries <
+/// 50`). Fifty candidates on port 22: only the fiftieth is dialled.
+#[test]
+fn a_candidate_on_a_bad_port_waits_for_fifty_tries() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    assert!(crate::net::is_bad_port(22) && !crate::net::is_bad_port(8333));
+    let ssh: Vec<SocketAddr> =
+        (0..BAD_PORT_SKIPS).map(|i| SocketAddr::new(own_group(i).ip(), 22)).collect();
+    learn(&pm, &ssh);
+    assert_eq!(dialled(&pm).len(), 1, "one dial, at the fiftieth candidate");
+
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, &ssh[..BAD_PORT_SKIPS - 1]);
+    assert!(dialled(&pm).is_empty(), "forty-nine are not enough");
 }

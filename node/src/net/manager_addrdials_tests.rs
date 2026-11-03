@@ -191,7 +191,7 @@ async fn settle(pm: &PeerManager) {
 /// Core gives each peer a token bucket for the addresses it announces: one
 /// token to start, 0.1 a second after that. satd took every entry of every
 /// `addr`, so one peer could put a thousand addresses into the address book
-/// and onto the dial list per message. A peer with the `addr` permission is
+/// per message. A peer with the `addr` permission is
 /// not limited, as in Core.
 #[test]
 fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
@@ -201,7 +201,6 @@ fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
     pm.handle_message(1, addr_msg(&spread(1, 1000)), InFlight::adopt(None));
     assert_eq!(addr_counts(&pm, 1), (1, 999), "one token: one address processed, the rest rate-limited");
     assert_eq!(pm.addrman.read().len(), 1, "one address reached the address book");
-    assert_eq!(pm.learned_addrs.read().iter().count(), 1, "and the dial list");
 
     let mut exempt = peer(2, SocketAddr::from(([127, 0, 0, 1], 40002)), Direction::Inbound);
     exempt.permissions.addr = true;
@@ -248,44 +247,11 @@ fn addrv2_is_rate_limited_too() {
     assert_eq!(addr_counts(&pm, 1), (1, 499));
 }
 
-// ---- The automatic dial list ----
+// ---- The automatic dial candidates ----
 
-/// Only an address the address book holds goes on the dial list. The book
-/// keeps at most 64 new addresses per network group; satd put every
-/// gossiped address on the dial list whether the book took it or not.
-#[test]
-fn an_address_the_book_has_no_room_for_is_not_dialled() {
-    let (pm, _dir) = mk_pm();
-    let source = IpAddr::from([198, 51, 100, 1]);
-    let one_group: Vec<SocketAddr> =
-        (0..100).map(|i| SocketAddr::from(([44, 1, (i / 250) as u8, (i % 250) as u8 + 1], 8333))).collect();
-    for a in &one_group {
-        pm.add_learned_addr_from(*a, 9, source);
-    }
-    let book = pm.addrman.read().len();
-    assert_eq!(book, 64, "fixture: the book's per-group limit");
-    assert_eq!(pm.learned_addrs.read().iter().count(), 64, "the dial list holds what the book holds");
-    for a in &one_group[..64] {
-        assert!(pm.learned_addrs.read().contains(a));
-    }
-    // An address the book already holds, announced again, stays listed once.
-    pm.add_learned_addr_from(one_group[0], 9, source);
-    assert_eq!(pm.learned_addrs.read().iter().count(), 64);
-}
-
-/// The list holds each address once and stops at its cap.
-#[test]
-fn the_dial_list_stops_at_its_cap() {
-    let mut list = LearnedAddrs::default();
-    let all: Vec<SocketAddr> = (0..=MAX_LEARNED_ADDRS as u32)
-        .map(|i| SocketAddr::from((std::net::Ipv4Addr::from(0x0b00_0000 + i), 8333)))
-        .collect();
-    for a in &all[..MAX_LEARNED_ADDRS] {
-        assert!(list.push(*a));
-    }
-    assert!(!list.push(all[0]), "a duplicate is refused");
-    assert!(!list.push(all[MAX_LEARNED_ADDRS]), "past the cap is refused");
-    assert_eq!(list.iter().count(), MAX_LEARNED_ADDRS);
+/// Put `addr` in the address book, which the automatic dials draw from.
+fn learn(pm: &PeerManager, addr: SocketAddr) {
+    assert!(pm.addrman.write().add(addr, now_unix_secs()), "fixture: the book takes {addr}");
 }
 
 // ---- Outbound dials ----
@@ -301,7 +267,7 @@ async fn a_reconnect_tick_starts_no_more_automatic_dials_than_free_slots() {
     fill_automatic(&pm, 3);
     let ls = listeners(20).await;
     for l in &ls {
-        pm.learned_addrs.write().push(l.addr);
+        learn(&pm, l.addr);
     }
 
     pm.reconnect_tick();
@@ -489,7 +455,7 @@ async fn a_dial_that_connects_clears_its_backoff() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
     let l = Listener::bind().await;
-    pm.learned_addrs.write().push(l.addr);
+    learn(&pm, l.addr);
     {
         let mut backoff = pm.reconnect_backoff.write();
         let state = backoff.entry(l.addr).or_insert_with(ReconnectState::new);
@@ -520,7 +486,7 @@ async fn a_banned_manual_peer_is_dialled_and_a_banned_learned_one_is_not() {
     let manual = Listener::bind().await;
     let learned = Listener::bind().await;
     assert!(pm.addnode_add(&manual.addr.to_string(), PeerAddr::Socket(manual.addr)));
-    pm.learned_addrs.write().push(learned.addr);
+    learn(&pm, learned.addr);
     ban(&pm, crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([127, 0, 0, 1]))));
 
     pm.reconnect_tick();
@@ -632,8 +598,6 @@ fn a_full_book_replaces_a_terrible_entry() {
     assert!(pm.addrman.read().contains(&fresh), "the new address takes the terrible one's place");
     assert!(!pm.addrman.read().contains(&stale));
     assert_eq!(pm.addrman.read().len(), full);
-    assert!(pm.learned_addrs.read().contains(&fresh), "and is dialled");
-    assert!(!pm.learned_addrs.read().contains(&stale), "the dropped one is not");
 }
 
 /// A failed redial counts as an attempt in the address book: what makes an
@@ -676,8 +640,6 @@ fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
     pm.add_learned_addr_from(fresh, 9, source);
     assert!(pm.addrman.read().contains(&fresh));
     assert!(!pm.addrman.read().contains(&stale));
-    assert!(pm.learned_addrs.read().contains(&fresh));
-    assert!(!pm.learned_addrs.read().contains(&stale));
     assert!(!pm.reconnect_backoff.read().contains_key(&stale), "its backoff is dropped");
 }
 
@@ -703,7 +665,6 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, IpAddr::from([198, 51, 100, 1]));
     assert!(pm.addrman.read().contains(&fresh));
-    assert!(pm.learned_addrs.read().contains(&fresh));
     assert_eq!(pm.addrman.read().len(), full);
 }
 
@@ -723,9 +684,8 @@ fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
 
     pm.add_learned_addr_from(v4, 9, source);
     pm.add_learned_addr_from(v6, 9, source);
-    assert!(pm.learned_addrs.read().contains(&v4));
-    assert!(!pm.learned_addrs.read().contains(&v6), "an unreachable network's address is not kept");
-    assert!(!pm.addrman.read().contains(&v6));
+    assert!(pm.addrman.read().contains(&v4));
+    assert!(!pm.addrman.read().contains(&v6), "an unreachable network's address is not kept");
 
     assert!(pm.may_dial(&v4));
     assert!(!pm.may_dial(&v6), "no automatic dial to an unreachable network");
@@ -735,7 +695,7 @@ fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
     // Seeds go through the same gate, and onion candidates need onion.
     let v6b: SocketAddr = "[2001:4860::8]:8333".parse().unwrap();
     pm.add_learned_peer_addr(&PeerAddr::Socket(v6b));
-    assert!(!pm.learned_addrs.read().contains(&v6b));
+    assert!(!pm.addrman.read().contains(&v6b));
     pm.add_learned_peer_addr(&PeerAddr::Onion { host: "a".repeat(56) + ".onion", port: 8333 });
     assert!(pm.connect_peer_addrs.read().is_empty(), "onion is not reachable");
 }
