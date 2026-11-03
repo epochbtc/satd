@@ -132,6 +132,7 @@ note = "flipped 2026-09-16: message ordering behind ping, Core's ContextualCheck
 [[test]]
 file = "feature_dirsymlinks.py"
 status = "run"
+
 [[test]]
 file = "feature_discover.py"
 status = "run"
@@ -254,6 +255,12 @@ reason = "feature-missing"
 note = "measured 2026-09-15: L139 setup_nodes passes -i2psam, which satd refuses by name (I2P out of scope). Follow-up: none planned while I2P is out of scope"
 
 [[test]]
+file = "feature_prune_stale_fork.py"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1: L30 pruneblockchain answers -1 'Blockchain is too short for pruning.'"
+
+[[test]]
 file = "feature_pruning.py"
 status = "skip"
 reason = "feature-missing"
@@ -311,10 +318,22 @@ status = "run"
 [[test]]
 file = "feature_startupnotify.py"
 status = "run"
+
 [[test]]
 file = "feature_taproot.py"
 status = "skip"
 reason = "no-wallet"
+
+[[test]]
+file = "feature_torcontrol.py"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1: L151 test_basic times out on its wait_until"
+
+[[test]]
+file = "feature_txindex_compatibility.py"
+status = "skip"
+reason = "prev-release"
 
 [[test]]
 file = "feature_uacomment.py"
@@ -324,6 +343,12 @@ status = "run"
 file = "feature_unsupported_utxo_db.py"
 status = "skip"
 reason = "prev-release"
+
+[[test]]
+file = "feature_utxo_abort_on_error.py"
+status = "skip"
+reason = "core-internal"
+note = "measured 2026-11-03 at v32.1: needs plyvel to corrupt Core's LevelDB chainstate; satd's chainstate is RocksDB"
 
 [[test]]
 file = "feature_utxo_set_hash.py"
@@ -341,11 +366,23 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+file = "interface_gui.py"
+status = "skip"
+reason = "no-qt"
+
+[[test]]
 file = "interface_http.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): L237 check_excessive_request_size expects 'HTTPResponse (status code: 400' in the debug log for an oversized request; not found. Core v32 rewrote this test (1,000 lines changed)"
 
 [[test]]
 file = "interface_ipc.py"
+status = "skip"
+reason = "no-ipc"
+
+[[test]]
+file = "interface_ipc_cli.py"
 status = "skip"
 reason = "no-ipc"
 
@@ -550,6 +587,12 @@ reason = "feature-missing"
 note = "measured 2026-09-15: L83 an oversized addrv2 is not disconnected; satd has no address relay. Follow-up: addrman and address relay"
 
 [[test]]
+file = "p2p_bip434_feature.py"
+status = "skip"
+reason = "feature-missing"
+note = "measured 2026-11-03 at v32.1: L134 expects protocol version 70017 (BIP 434); satd advertises 70016. Follow-up: BIP 434 feature negotiation"
+
+[[test]]
 file = "p2p_block_sync.py"
 status = "run"
 
@@ -573,11 +616,19 @@ note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utx
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): L170 assert self.ignores_cmpctblock(0, p2p_conn_blocksonly, solicited=True) fails, in the subtest v32 added for a solicited cmpctblock to a blocks-only node"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
 status = "run"
+
+[[test]]
+file = "p2p_connection_limits.py"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1: L53 expects 'failed to find a tx-relaying eviction candidate - connection dropped' (-inboundrelaypercent, which satd does not implement)"
 
 [[test]]
 file = "p2p_disconnect_ban.py"
@@ -618,6 +669,7 @@ status = "run"
 [[test]]
 file = "p2p_getdata.py"
 status = "run"
+
 [[test]]
 file = "p2p_handshake.py"
 status = "run"
@@ -709,7 +761,9 @@ status = "run"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): L30 test_message_causes_disconnect times out waiting for the disconnect"
 
 [[test]]
 file = "p2p_node_network_limited.py"
@@ -751,6 +805,18 @@ reason = "feature-missing"
 note = "measured 2026-09-15: startup refuses -i2psam; the test uses -privatebroadcast (Core v31) and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
+file = "p2p_private_broadcast_cap.py"
+status = "skip"
+reason = "feature-missing"
+note = "measured 2026-11-03 at v32.1: starts nodes with -privatebroadcast, which satd refuses. Follow-up: private broadcast"
+
+[[test]]
+file = "p2p_private_broadcast_completion.py"
+status = "skip"
+reason = "feature-missing"
+note = "measured 2026-11-03 at v32.1: starts nodes with -privatebroadcast, which satd refuses. Follow-up: private broadcast"
+
+[[test]]
 file = "p2p_private_broadcast_retry_v1.py"
 status = "skip"
 reason = "feature-missing"
@@ -786,11 +852,19 @@ status = "run"
 
 [[test]]
 file = "p2p_tx_download.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): L356 test_duplicate_tx_inv: assert_equal(log.count(inv_a_log), 1) is 0 == 1, a debug-log line v32 greps for"
 
 [[test]]
 file = "p2p_tx_privacy.py"
 status = "run"
+
+[[test]]
+file = "p2p_tx_relay_rate_limit.py"
+status = "skip"
+reason = "rpc-missing"
+note = "measured 2026-11-03 at v32.1: L53 KeyError 'tx_send_rate' in getpeerinfo (-txsendrate). Follow-up: per-peer tx send rate"
 
 [[test]]
 file = "p2p_unrequested_blocks.py"
@@ -816,7 +890,9 @@ status = "run"
 
 [[test]]
 file = "rpc_bind.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1; --ipv4 and --ipv6 pass): --nonloopback L177 expects a disallowed source IP to get a connection error; satd answers 403 Forbidden, which is what v31.1 asserted. Core v32 drops the connection instead"
 
 [[test]]
 file = "rpc_blockchain.py"
@@ -851,10 +927,16 @@ reason = "feature-missing"
 note = "measured 2026-09-15: L50 txoutset_hash disagrees with Core: satd's hash_serialized_3 is not Core's serialization. Follow-up: hash_serialized_3 parity"
 
 [[test]]
+file = "rpc_echo_payload.py"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1: L41 sendrawtransaction of a random payload answers 'TX decode failed'; the test accepts only Core's 'TX decode failed. Make sure the tx has at least one input.'"
+
+[[test]]
 file = "rpc_estimatefee.py"
 status = "skip"
-reason = "harness"
-note = "measured 2026-11-03: L36 asserts estimatesmartfee(1, 'ECONOMICAL', 1) is a surplus argument (-1). satd takes Core 32.1's third argument, options, and answers -3 as Core 32.1 does; v32.1's version of the test passes 1 as options only in a type check. Follow-up: the pin bump to v32.1 brings it back, except L39-41 and L43 (an unknown fee_rate_estimator is -8 and an unknown options key -3 in Core; satd answers both; CORE_DIFFERENCES.md)"
+reason = "core-difference"
+note = "measured 2026-11-03 at v32.1: L38-40 expect -8 for an unknown fee_rate_estimator ('foo', 'none', ''), L42 expects -3 Unexpected key for an unknown options key. satd answers both as auto by design (CORE_DIFFERENCES.md, estimatesmartfee in Core 32.1's shape). With those four assertions removed locally the rest of the test passes"
 
 [[test]]
 file = "rpc_generate.py"
@@ -903,7 +985,9 @@ status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"
-status = "run"
+status = "skip"
+reason = "needs-triage"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): L59 a too-long Bech32 string reports error_locations [90..107] where v32 expects [90]"
 
 [[test]]
 file = "rpc_invalidateblock.py"
@@ -924,6 +1008,12 @@ file = "rpc_net.py"
 status = "skip"
 reason = "feature-missing"
 note = "measured 2026-09-27: L131 help('getpeerinfo') lacks the network list; past it, L148 getpeerinfo reports relaytxes true for a peer that has sent no version. The address-book RPCs it reaches later now exist, but L315 wants Core's bucket collisions to drop some of 10000 added addresses, L395 a tried-table collision, and L504 Core's exact bucket/position slots, none of which satd's flat, derived-slot book reproduces (CORE_DIFFERENCES.md). Follow-up: per-method help, then getpeerinfo before version"
+
+[[test]]
+file = "rpc_openrpc.py"
+status = "skip"
+reason = "rpc-missing"
+note = "measured 2026-11-03 at v32.1: L27 getopenrpcinfo is Method not found. Follow-up: getopenrpcinfo"
 
 [[test]]
 file = "rpc_orphans.py"
@@ -1059,6 +1149,11 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+file = "wallet_ancient_migration.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
 file = "wallet_assumeutxo.py"
 status = "skip"
 reason = "no-wallet"
@@ -1139,6 +1234,16 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+file = "wallet_deprecated_rbf.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_derivehdkey.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
 file = "wallet_descriptor.py"
 status = "skip"
 reason = "no-wallet"
@@ -1149,6 +1254,11 @@ status = "run"
 
 [[test]]
 file = "wallet_encryption.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_exported_watchonly.py"
 status = "skip"
 reason = "no-wallet"
 

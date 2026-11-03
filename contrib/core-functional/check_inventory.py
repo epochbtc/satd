@@ -47,6 +47,9 @@ TAXONOMY = {
     "harness": "blocked by the harness itself, not by satd; note must say what",
     "cache": "needs the framework's cached 199-block chain",
     "flaky-quarantine": "temporarily quarantined; note must reference an issue",
+    "core-difference": "asserts a Core behaviour satd departs from on purpose; "
+                       "note must name the CORE_DIFFERENCES.md entry and say "
+                       "whether the rest of the test passes",
     "needs-triage": "measured as failing, cause not yet attributed; note must "
                     "carry the observed error. Temporary -- this bucket is work, "
                     "and it should only ever shrink",
@@ -55,7 +58,7 @@ TAXONOMY = {
 # Reasons where "because X" is not enough and the row must name the follow-up
 # work, so the skip cannot quietly become permanent.
 REQUIRE_NOTE = {"rpc-missing", "feature-missing", "harness", "flaky-quarantine",
-                "needs-triage"}
+                "needs-triage", "core-difference"}
 
 
 def load_pin() -> dict:

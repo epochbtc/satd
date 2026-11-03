@@ -4824,6 +4824,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         });
     }
 
+    // `<net datadir>/fees/`, where Core v32 keeps its fee estimator files
+    // (`fee_estimates.dat` moved there) and where satd keeps its own. Core's
+    // test framework removes it from every cached datadir, so it is expected
+    // to exist on any node that has run.
+    if let Err(e) = std::fs::create_dir_all(net_datadir.join("fees")) {
+        tracing::warn!(error = %e, "cannot create the fees directory");
+    }
+
     // -persistmempool: re-admit the mempool persisted at the previous
     // clean shutdown. Done here — after the address-index task is live
     // (so re-admission Enter events are observed) and before the P2P

@@ -44,6 +44,7 @@ feature_port.py
 feature_posix_fs_permissions.py
 feature_presegwit_node_upgrade.py
 feature_proxy.py
+feature_prune_stale_fork.py
 feature_pruning.py
 feature_rbf.py
 feature_reindex.py
@@ -56,13 +57,18 @@ feature_shutdown.py
 feature_signet.py
 feature_startupnotify.py
 feature_taproot.py
+feature_torcontrol.py
+feature_txindex_compatibility.py
 feature_uacomment.py
 feature_unsupported_utxo_db.py
+feature_utxo_abort_on_error.py
 feature_utxo_set_hash.py
 feature_versionbits_warning.py
 interface_bitcoin_cli.py
+interface_gui.py
 interface_http.py
 interface_ipc.py
+interface_ipc_cli.py
 interface_ipc_mining.py
 interface_rest.py
 interface_rpc.py
@@ -103,12 +109,14 @@ p2p_addr_relay.py
 p2p_addr_selfannouncement.py
 p2p_addrfetch.py
 p2p_addrv2_relay.py
+p2p_bip434_feature.py
 p2p_block_sync.py
 p2p_blockfilters.py
 p2p_blocksonly.py
 p2p_compactblocks.py
 p2p_compactblocks_blocksonly.py
 p2p_compactblocks_hb.py
+p2p_connection_limits.py
 p2p_disconnect_ban.py
 p2p_dns_seeds.py
 p2p_eviction.py
@@ -141,6 +149,8 @@ p2p_outbound_eviction.py
 p2p_permissions.py
 p2p_ping.py
 p2p_private_broadcast.py
+p2p_private_broadcast_cap.py
+p2p_private_broadcast_completion.py
 p2p_private_broadcast_retry_v1.py
 p2p_seednode.py
 p2p_segwit.py
@@ -149,6 +159,7 @@ p2p_sendtxrcncl.py
 p2p_timeouts.py
 p2p_tx_download.py
 p2p_tx_privacy.py
+p2p_tx_relay_rate_limit.py
 p2p_unrequested_blocks.py
 p2p_v2_encrypted.py
 p2p_v2_misbehaving.py
@@ -160,6 +171,7 @@ rpc_decodescript.py
 rpc_deprecated.py
 rpc_deriveaddresses.py
 rpc_dumptxoutset.py
+rpc_echo_payload.py
 rpc_estimatefee.py
 rpc_generate.py
 rpc_getblockfilter.py
@@ -175,6 +187,7 @@ rpc_invalidateblock.py
 rpc_misc.py
 rpc_named_arguments.py
 rpc_net.py
+rpc_openrpc.py
 rpc_orphans.py
 rpc_packages.py
 rpc_preciousblock.py
@@ -202,6 +215,7 @@ tool_wallet.py
 wallet_abandonconflict.py
 wallet_address_types.py
 wallet_anchor.py
+wallet_ancient_migration.py
 wallet_assumeutxo.py
 wallet_avoid_mixing_output_types.py
 wallet_avoidreuse.py
@@ -218,9 +232,12 @@ wallet_create_tx.py
 wallet_createwallet.py
 wallet_createwalletdescriptor.py
 wallet_crosschain.py
+wallet_deprecated_rbf.py
+wallet_derivehdkey.py
 wallet_descriptor.py
 wallet_disable.py
 wallet_encryption.py
+wallet_exported_watchonly.py
 wallet_fallbackfee.py
 wallet_fast_rescan.py
 wallet_fundrawtransaction.py

@@ -5530,6 +5530,48 @@ fn test_converttopsbt() {
     node.stop();
 }
 
+/// The node creates `<net datadir>/fees/`, where Core v32 keeps its fee
+/// estimator files. Core v32.1's test framework removes that directory from
+/// every cached datadir and fails if it is missing.
+#[test]
+fn the_node_creates_the_fees_directory() {
+    let mut node = TestNode::start(&[]);
+    assert!(node.datadir.join("regtest").join("fees").is_dir());
+    node.stop();
+}
+
+/// Core v32 added `converttopsbt`'s fourth argument, `psbt_version`
+/// (default 2). satd converts to version 0 only, so it takes 0 and refuses 2
+/// by name instead of answering a version 2 request with a version 0 PSBT.
+#[test]
+fn converttopsbt_refuses_a_psbt_version_it_cannot_produce() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    let raw_resp = node
+        .rpc_call_with_params(
+            "createrawtransaction",
+            vec![
+                json!([{"txid": "00".repeat(32), "vout": 0}]),
+                json!({"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01}),
+            ],
+        )
+        .unwrap();
+    let hex_tx = raw_resp["result"].as_str().unwrap().to_string();
+    let call = |node: &mut TestNode, v: serde_json::Value| {
+        node.rpc_call_with_params("converttopsbt", vec![json!(hex_tx), json!(false), json!(null), v]).unwrap()
+    };
+    let ok = call(&mut node, json!(0));
+    assert!(ok["result"].as_str().unwrap().starts_with("cHNidP8"), "{ok}");
+    let two = call(&mut node, json!(2));
+    assert_eq!(two["error"]["code"], -8, "{two}");
+    let named = node
+        .rpc_call_with_named_params("converttopsbt", json!({"hexstring": hex_tx, "psbt_version": 3}))
+        .unwrap();
+    assert_eq!(named["error"]["code"], -8, "{named}");
+    assert_eq!(named["error"]["message"], "psbt_version must be 0 or 2, not 3");
+    node.stop();
+}
+
 #[test]
 fn test_validateaddress() {
     let mut node = TestNode::start(&[]);
