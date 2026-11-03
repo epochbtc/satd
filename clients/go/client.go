@@ -556,6 +556,8 @@ func (o SubscribeOptions) toProto() *eventspb.SubscribeRequest {
 type Stream struct {
 	recv       func() (*eventspb.NodeEvent, error)
 	lastCursor *Cursor
+	// head is the position the stream started from, from the response headers.
+	head *Cursor
 	// cancel releases the stream's context once Recv has seen the end.
 	cancel context.CancelFunc
 	// schemaChecked is set once the first event's schema_version was checked.
@@ -600,6 +602,20 @@ func (s *Stream) Cursor() *Cursor {
 		return nil
 	}
 	c := *s.lastCursor
+	return &c
+}
+
+// HeadCursor is the position the stream started from, as the node reported it
+// when the stream opened: every event after it is delivered on this stream, and
+// presenting it as a resume cursor replays what a dropped stream would have
+// delivered next. It is the anchor to persist before any confirmed event has
+// arrived, when [Stream.Cursor] is still nil. nil when the node sent none (a
+// node without a block source, or one older than 0.7.1).
+func (s *Stream) HeadCursor() *Cursor {
+	if s.head == nil {
+		return nil
+	}
+	c := *s.head
 	return &c
 }
 
@@ -661,7 +677,7 @@ func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream,
 		cancel()
 		return nil, err
 	}
-	return &Stream{recv: sc.Recv, cancel: cancel}, nil
+	return &Stream{recv: sc.Recv, cancel: cancel, head: headCursorFromMD(md)}, nil
 }
 
 // splitScheme accepts a bare gRPC target or one carrying an http:// or https://

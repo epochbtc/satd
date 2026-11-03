@@ -228,11 +228,103 @@ func TestE2EWatchSetLoaderRebuildsFromTruthOnReconnect(t *testing.T) {
 				break
 			}
 			// Wait for the CONFIRMED match, as primeRW does: only it carries
-			// a cursor. Stopping at the mempool match cut the transport, most
-			// runs, before the confirmed one reached the pump. The reconnect
-			// then had no resume cursor, sent no SetCursor, and the wait for
-			// CursorAccepted below saw only heartbeats until it timed out.
+			// a cursor. Cutting earlier is the case
+			// TestE2EWatchReAnchorsWhenCutBeforeAnyConfirmedEvent covers.
 			if m, ok := ev.(*satdevents.ScriptMatched); ok && m.Confirmed && satdevents.DisplayHex(m.Txid) == txid {
+				registered = true
+				break
+			}
+		}
+		cancel()
+	}
+	if !registered {
+		t.Fatal("the loader's initial watch-set never matched")
+	}
+
+	// The truth gains wallet C while the stream is down. No in-process call
+	// registers it - only the loader knows about it.
+	mu.Lock()
+	truth = append(truth, walletC)
+	before := loads
+	mu.Unlock()
+	proxy.cutAll()
+
+	awaitRW(t, w, 60, func(ev satdevents.Event) bool {
+		_, ok := ev.(*satdevents.CursorAccepted)
+		return ok
+	})
+	txid := src.payTo(t, walletC)
+	awaitRW(t, w, 120, func(ev satdevents.Event) bool {
+		m, ok := ev.(*satdevents.ScriptMatched)
+		return ok && matchesWallet(m, walletC) && satdevents.DisplayHex(m.Txid) == txid
+	})
+
+	mu.Lock()
+	after := loads
+	mu.Unlock()
+	if after <= before {
+		t.Errorf("the loader ran %d times before the reconnect and %d after; "+
+			"it must run on every connect", before, after)
+	}
+}
+
+// TestE2EWatchReAnchorsWhenCutBeforeAnyConfirmedEvent (#777): the loader test
+// above, cut on the unconfirmed match, before the watch has seen any event that
+// carries a cursor. The watch re-anchors to the head cursor the node sent when
+// the stream opened, so the reconnect still gets a CursorAccepted and the block
+// that was in flight is replayed.
+//
+// Perturbation: without the HeadCursor seeding in ResilientWatch.connectOnce
+// the reconnect sends no SetCursor and the wait for CursorAccepted sees only
+// heartbeats: 2 of 3 runs failed that way (the third cut after the confirmed
+// match had arrived). The unit tests TestReconnectBeforeAnyCursorReAnchorsToTheHead
+// and TestResilientSubscribeResumesFromTheHeadBeforeAnyCursor pin it
+// deterministically.
+func TestE2EWatchReAnchorsWhenCutBeforeAnyConfirmedEvent(t *testing.T) {
+	n := startNode(t)
+	src := newCoinbaseSource(t, n)
+	proxy := startProxy(t, n.grpcTarget())
+	client, err := satdevents.Dial(context.Background(), proxy.addr())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	// The "durable truth": wallet B to start with.
+	var mu sync.Mutex
+	truth := []wallet{walletB}
+	loads := 0
+
+	w := client.ResilientWatch(context.Background(), satdevents.ResilientWatchConfig{
+		Backoff: satdevents.Backoff{
+			Initial: 50 * time.Millisecond, Max: time.Second, Multiplier: 2,
+		},
+		WatchSetLoader: func(_ context.Context, set *satdevents.WatchSet) error {
+			mu.Lock()
+			defer mu.Unlock()
+			loads++
+			for _, wal := range truth {
+				set.AddScripts(satdevents.ScriptWatch{Scripthash: wal.scripthash()})
+			}
+			return nil
+		},
+	})
+	defer func() { _ = w.Close() }()
+
+	// Confirm the first load really is registered.
+	deadline := time.Now().Add(timeout(90))
+	registered := false
+	for !registered && time.Now().Before(deadline) {
+		txid := src.payTo(t, walletB)
+		short, cancel := context.WithTimeout(context.Background(), timeout(5))
+		for {
+			ev, err := w.Next(short)
+			if err != nil {
+				break
+			}
+			// Stop at the first match, the unconfirmed one, so the cut lands
+			// before any cursor-bearing event has reached the pump.
+			if m, ok := ev.(*satdevents.ScriptMatched); ok && satdevents.DisplayHex(m.Txid) == txid {
 				registered = true
 				break
 			}

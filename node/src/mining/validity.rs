@@ -182,11 +182,7 @@ fn offending_transaction(chain_state: &ChainState, block: &Block, height: u32, c
 /// Where the `template_invalid` alert goes. Installed at startup, once the
 /// event publisher and the health state exist; until then, and in tests that
 /// install none, a failure is still logged and counted.
-pub struct AlertSink {
-    pub warnings: Arc<crate::warnings::NodeWarnings>,
-    pub publisher: Arc<crate::events::EventPublisher>,
-    pub health: Option<Arc<crate::health::HealthState>>,
-}
+pub use crate::health::AlertSink;
 
 /// The node's record of template checks: counts for the metrics, and whether
 /// the `template_invalid` alert stands.
@@ -328,7 +324,7 @@ impl TemplateValidity {
 
     fn emit(&self, event: crate::events::StatusEvent) {
         if let Some(sink) = self.sink.get() {
-            crate::health::report_external(sink.health.as_deref(), &sink.warnings, &sink.publisher, event);
+            sink.report(event);
         }
     }
 }

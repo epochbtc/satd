@@ -106,6 +106,34 @@ func nodeVersionFromMD(md metadata.MD) (string, version) {
 	return raw, headerlessNode
 }
 
+// headCursorHeader is the response metadata key carrying the stream's head
+// cursor, "<height>:<tx_index>:<mempool_seq>:<instance_id>" in decimal (see
+// docs/api/streaming.md).
+const headCursorHeader = "satd-head-cursor"
+
+// headCursorFromMD parses the head cursor. nil when the node sent none (no
+// block source, or a node that predates the header) or one that does not
+// parse: a malformed anchor must never be presented back to the node.
+func headCursorFromMD(md metadata.MD) *Cursor {
+	vals := md.Get(headCursorHeader)
+	if len(vals) == 0 {
+		return nil
+	}
+	parts := strings.Split(strings.TrimSpace(vals[0]), ":")
+	if len(parts) != 4 {
+		return nil
+	}
+	var n [4]uint64
+	for i, bits := range []int{32, 32, 64, 64} {
+		v, err := strconv.ParseUint(parts[i], 10, bits)
+		if err != nil {
+			return nil
+		}
+		n[i] = v
+	}
+	return &Cursor{Height: uint32(n[0]), TxIndex: uint32(n[1]), MempoolSeq: n[2], InstanceID: n[3]}
+}
+
 // schemaFromMD returns the node's schema version from the satd-events-schema
 // header. A node without the header predates it and speaks schema 1. A header
 // that is present but not a number is reported as 0, which never matches.

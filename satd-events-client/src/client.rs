@@ -252,6 +252,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub struct EventStream {
     inner: tonic::Streaming<pb::NodeEvent>,
     last_cursor: Option<Cursor>,
+    /// The position the stream started from, from the response headers.
+    head: Option<Cursor>,
     /// Set once the first event's `schema_version` has been checked.
     schema_checked: bool,
 }
@@ -290,8 +292,19 @@ impl EventStream {
         self.last_cursor.as_ref()
     }
 
-    fn new(inner: tonic::Streaming<pb::NodeEvent>) -> Self {
-        EventStream { inner, last_cursor: None, schema_checked: false }
+    /// The position the stream started from, as the node reported it when the
+    /// stream opened: every event after it is delivered on this stream, and
+    /// presenting it as a resume cursor replays what a dropped stream would
+    /// have delivered next. It is the anchor to persist before any confirmed
+    /// event has arrived, while [`cursor`](Self::cursor) is still `None`.
+    /// `None` when the node sent none (a node without a block source, or one
+    /// older than 0.7.1).
+    pub fn head_cursor(&self) -> Option<&Cursor> {
+        self.head.as_ref()
+    }
+
+    fn new(inner: tonic::Streaming<pb::NodeEvent>, head: Option<Cursor>) -> Self {
+        EventStream { inner, last_cursor: None, head, schema_checked: false }
     }
 }
 
@@ -1209,7 +1222,8 @@ impl StreamClient {
         let req = self.authed(opts.into_request());
         let resp = self.inner.subscribe(req).await?;
         self.check_compat(resp.metadata())?;
-        Ok(EventStream::new(resp.into_inner()))
+        let head = crate::compat::head_cursor_from(resp.metadata());
+        Ok(EventStream::new(resp.into_inner(), head))
     }
 
     /// Open a reconnect-and-replay-aware firehose. Unlike [`subscribe`](Self::subscribe),
@@ -1242,7 +1256,8 @@ impl StreamClient {
         let req = self.authed(ReceiverStream::new(rx));
         let resp = self.inner.watch(req).await?;
         self.check_compat(resp.metadata())?;
-        Ok((WatchHandle { tx }, EventStream::new(resp.into_inner())))
+        let head = crate::compat::head_cursor_from(resp.metadata());
+        Ok((WatchHandle { tx }, EventStream::new(resp.into_inner(), head)))
     }
 }
 
@@ -2068,5 +2083,183 @@ mod version_check_tests {
             .expect_err("refused");
         assert!(matches!(err, StreamError::NodeTooOld { .. }), "{err:?}");
         assert_eq!(fake.opens.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// The head cursor (`satd-head-cursor`): parsed from the response headers and
+/// adopted as the resume anchor by both resilient types when they have none,
+/// so a drop before the first confirmed event still re-anchors (#777).
+#[cfg(test)]
+mod head_cursor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use satd_events_proto::v1::node_event_stream_server::{
+        NodeEventStream, NodeEventStreamServer,
+    };
+    use tokio_stream::Stream;
+
+    use crate::resilience::Backoff;
+    use crate::{ResilientConfig, ResilientWatchConfig};
+
+    type EventResult = Result<pb::NodeEvent, tonic::Status>;
+    type BoxStream = std::pin::Pin<Box<dyn Stream<Item = EventResult> + Send>>;
+
+    /// A node whose first stream delivers one cursor-less heartbeat and then
+    /// drops; later streams park. It records what each reconnect asked for.
+    #[derive(Clone, Default)]
+    struct DroppingNode {
+        head: Option<&'static str>,
+        opens: Arc<AtomicUsize>,
+        from_cursors: Arc<Mutex<Vec<Option<Cursor>>>>,
+        set_cursors: Arc<Mutex<Vec<Cursor>>>,
+    }
+
+    impl DroppingNode {
+        fn respond(&self) -> tonic::Response<BoxStream> {
+            let first = self.opens.fetch_add(1, Ordering::SeqCst) == 0;
+            let stream: BoxStream = if first {
+                Box::pin(tokio_stream::iter(vec![
+                    Ok(pb::NodeEvent {
+                        schema_version: satd_events_proto::SCHEMA_VERSION,
+                        body: Some(pb::node_event::Body::Heartbeat(pb::Heartbeat { uptime_ns: 1 })),
+                        ..Default::default()
+                    }),
+                    Err(tonic::Status::unavailable("dropped")),
+                ]))
+            } else {
+                Box::pin(tokio_stream::pending())
+            };
+            let mut resp = tonic::Response::new(stream);
+            let md = resp.metadata_mut();
+            md.insert(compat::VERSION_HEADER, compat::SDK_VERSION.parse().unwrap());
+            md.insert(compat::SCHEMA_HEADER, "1".parse().unwrap());
+            if let Some(h) = self.head {
+                md.insert(compat::HEAD_CURSOR_HEADER, h.parse().unwrap());
+            }
+            resp
+        }
+    }
+
+    #[tonic::async_trait]
+    impl NodeEventStream for DroppingNode {
+        type SubscribeStream = BoxStream;
+        type WatchStream = BoxStream;
+
+        async fn subscribe(
+            &self,
+            req: tonic::Request<pb::SubscribeRequest>,
+        ) -> Result<tonic::Response<BoxStream>, tonic::Status> {
+            self.from_cursors.lock().unwrap().push(req.into_inner().from_cursor);
+            Ok(self.respond())
+        }
+
+        async fn watch(
+            &self,
+            req: tonic::Request<tonic::Streaming<pb::SubscribeControl>>,
+        ) -> Result<tonic::Response<BoxStream>, tonic::Status> {
+            let mut inbound = req.into_inner();
+            let set_cursors = self.set_cursors.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(m)) = inbound.message().await {
+                    if let Some(pb::subscribe_control::Msg::SetCursor(sc)) = m.msg
+                        && let Some(c) = sc.cursor
+                    {
+                        set_cursors.lock().unwrap().push(c);
+                    }
+                }
+            });
+            Ok(self.respond())
+        }
+    }
+
+    async fn client_for(node: &DroppingNode) -> StreamClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeEventStreamServer::new(node.clone()))
+                .serve_with_incoming(incoming),
+        );
+        StreamClient::builder(format!("http://{addr}")).connect().await.expect("connect")
+    }
+
+    fn fast() -> Backoff {
+        Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            multiplier: 2.0,
+            max_retries: None,
+        }
+    }
+
+    const HEAD: Cursor = Cursor { height: 7, tx_index: 0, mempool_seq: 3, instance_id: 99 };
+
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[test]
+    fn the_header_parses_or_is_ignored() {
+        let mut md = MetadataMap::new();
+        assert_eq!(compat::head_cursor_from(&md), None, "a node without the header");
+        md.insert(compat::HEAD_CURSOR_HEADER, "7:0:3:99".parse().unwrap());
+        assert_eq!(compat::head_cursor_from(&md), Some(HEAD));
+        for bad in ["7:0:3", "7:0:3:99:1", "x:0:3:99", "7:0:-3:99", ""] {
+            md.insert(compat::HEAD_CURSOR_HEADER, bad.parse().unwrap());
+            assert_eq!(compat::head_cursor_from(&md), None, "{bad:?}");
+        }
+    }
+
+    /// Perturbation: removing the `head_cursor` seeding in
+    /// `ResilientWatch::connect` leaves the reconnect with no `set_cursor` and
+    /// this times out.
+    #[tokio::test]
+    async fn a_watch_dropped_before_any_cursor_re_anchors_to_the_head() {
+        let node = DroppingNode { head: Some("7:0:3:99"), ..Default::default() };
+        let client = client_for(&node).await;
+        let mut watch = client.resilient_watch(ResilientWatchConfig::new().backoff(fast()));
+        assert!(matches!(watch.next().await, Ok(Event::Heartbeat { .. })));
+        // Drive the reconnect; the parked second stream yields nothing.
+        let _ = tokio::time::timeout(Duration::from_millis(200), watch.next()).await;
+        wait_until("the reconnect's set_cursor", || !node.set_cursors.lock().unwrap().is_empty())
+            .await;
+        assert_eq!(node.set_cursors.lock().unwrap()[0], HEAD);
+    }
+
+    /// A node that sends no head keeps the old behaviour: no anchor, no
+    /// `set_cursor`.
+    #[tokio::test]
+    async fn without_a_head_the_reconnect_sends_no_set_cursor() {
+        let node = DroppingNode::default();
+        let client = client_for(&node).await;
+        let mut watch = client.resilient_watch(ResilientWatchConfig::new().backoff(fast()));
+        assert!(matches!(watch.next().await, Ok(Event::Heartbeat { .. })));
+        let _ = tokio::time::timeout(Duration::from_millis(200), watch.next()).await;
+        wait_until("the reconnect", || node.opens.load(Ordering::SeqCst) >= 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(node.set_cursors.lock().unwrap().is_empty());
+    }
+
+    /// Perturbation: removing the `head_cursor` seeding in
+    /// `ResilientSubscription::connect_once` sends the second request with no
+    /// `from_cursor` and this fails.
+    #[tokio::test]
+    async fn a_subscription_dropped_before_any_cursor_resumes_from_the_head() {
+        let node = DroppingNode { head: Some("7:0:3:99"), ..Default::default() };
+        let client = client_for(&node).await;
+        let mut sub = client
+            .resilient_subscribe(SubscribeOptions::default(), ResilientConfig::new().backoff(fast()));
+        assert!(matches!(sub.next().await, Ok(Event::Heartbeat { .. })));
+        let _ = tokio::time::timeout(Duration::from_millis(200), sub.next()).await;
+        wait_until("the reconnect", || node.from_cursors.lock().unwrap().len() >= 2).await;
+        let asked = node.from_cursors.lock().unwrap().clone();
+        assert_eq!(asked, vec![None, Some(HEAD)]);
     }
 }

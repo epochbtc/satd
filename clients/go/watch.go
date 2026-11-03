@@ -101,7 +101,7 @@ func (c *Client) Watch(ctx context.Context) (*WatchHandle, *Stream, error) {
 		return nil, nil, err
 	}
 	h := &WatchHandle{stream: sc, sendLock: make(chan struct{}, 1)}
-	return h, &Stream{recv: sc.Recv, cancel: cancel}, nil
+	return h, &Stream{recv: sc.Recv, cancel: cancel, head: headCursorFromMD(md)}, nil
 }
 
 // Close stops sending on the watch stream. The server tears the stream (and its

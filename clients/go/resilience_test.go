@@ -805,3 +805,30 @@ func TestCommitRetryAfterStoreFailureActuallyWrites(t *testing.T) {
 		t.Fatalf("store holds %v after a retried Commit, want block 10", c)
 	}
 }
+
+// TestResilientSubscribeResumesFromTheHeadBeforeAnyCursor: the firehose twin of
+// TestReconnectBeforeAnyCursorReAnchorsToTheHead. A drop before the first
+// block resumes from the head cursor the node reported, not from nowhere.
+//
+// Perturbation: removing the HeadCursor seeding in connectOnce sends the
+// second request with no from_cursor and this fails.
+func TestResilientSubscribeResumesFromTheHeadBeforeAnyCursor(t *testing.T) {
+	srv := &scriptedServer{legs: []func(eventspb.NodeEventStream_SubscribeServer) error{
+		sendAll(&eventspb.NodeEvent{Body: &eventspb.NodeEvent_Heartbeat{Heartbeat: &eventspb.Heartbeat{UptimeNs: 1}}}),
+	}}
+	client := startServerAs(t, srv, headNode("12:0:5:77"))
+	sub := client.ResilientSubscribe(context.Background(), SubscribeOptions{}, ResilientConfig{
+		Backoff: Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Multiplier: 2},
+	})
+	defer func() { _ = sub.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := sub.Next(ctx); err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	waitFor(t, func() bool { return srv.requestCount() >= 2 })
+	from := srv.request(1).GetFromCursor()
+	if from == nil || from.GetHeight() != 12 || from.GetMempoolSeq() != 5 || from.GetInstanceId() != 77 {
+		t.Fatalf("the reconnect resumed from %v, want the head 12:0:5:77", from)
+	}
+}

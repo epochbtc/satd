@@ -75,6 +75,9 @@ func startServer(t *testing.T, impl eventspb.NodeEventStreamServer) *Client {
 type nodeHeaders struct {
 	version string
 	schema  string
+	// head is the satd-head-cursor value; empty sends none, like a node with
+	// no block source or one older than 0.7.1.
+	head string
 }
 
 func sameVersionNode() nodeHeaders {
@@ -94,6 +97,9 @@ func asNode(headers func() nodeHeaders) grpc.StreamServerInterceptor {
 		}
 		if h.schema != "" {
 			md.Set(schemaHeader, h.schema)
+		}
+		if h.head != "" {
+			md.Set(headCursorHeader, h.head)
 		}
 		if err := ss.SendHeader(md); err != nil {
 			return err

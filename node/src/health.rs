@@ -594,8 +594,28 @@ async fn run_detectors(
 /// An `edge` event pages but records nothing — see the note at the call site.
 /// The registry is for conditions that are true *now* and that something will
 /// later clear; a deep reorg is history, and history has its own log.
+/// Where an alert raised outside the detector task goes: the warnings registry,
+/// the event bus, and the `satd_alert_active` flags.
+///
+/// Installed at startup once the event publisher and the health state exist.
+/// `health` is `None` when the detector task did not start, in which case there
+/// is no gauge to set, exactly as for the detectors' own kinds.
+pub struct AlertSink {
+    pub warnings: Arc<NodeWarnings>,
+    pub publisher: Arc<EventPublisher>,
+    pub health: Option<Arc<HealthState>>,
+}
+
+impl AlertSink {
+    /// [`report_external`] through this sink.
+    pub fn report(&self, event: StatusEvent) {
+        report_external(self.health.as_deref(), &self.warnings, &self.publisher, event);
+    }
+}
+
 /// Raise or clear a standing condition that is detected outside the detector
-/// task — `template_invalid`, which the template check itself sees. Goes out
+/// task — `template_invalid`, which the template check itself sees, and the
+/// AssumeUTXO background-validation conditions. Goes out
 /// exactly as a detector's would: a standing warning (`getwarnings`,
 /// `-alertnotify`), the `satd_alert_active` flag, and the `status` event for
 /// webhooks and stream subscribers. The caller deduplicates; this emits.
@@ -612,6 +632,27 @@ pub fn report_external(
 }
 
 fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent) {
+    mirror_into_warnings(warnings, &event);
+    tracing::info!(
+        target: "health",
+        kind = event.kind.as_str(),
+        state = ?event.state,
+        severity = event.severity.as_str(),
+        "{}",
+        event.message,
+    );
+    publisher.publish_status(event);
+}
+
+/// The `getwarnings` half of [`emit`]: record a raised condition, clear a
+/// cleared one, page an edge one.
+///
+/// Public for the one caller that has to reach the registry without the rest:
+/// a standing condition that is raised again while already raised refreshes its
+/// entry (count, `last_seen`, the latest numbers) without a second `status`
+/// event, and a condition raised before the event bus exists still has to show
+/// in `getwarnings`.
+pub fn mirror_into_warnings(warnings: &NodeWarnings, event: &StatusEvent) {
     let id = event.kind.warning_id();
     match event.state {
         StatusState::Cleared => warnings.clear(&id),
@@ -639,7 +680,7 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
                         &id,
                         severity,
                         event.message.clone(),
-                        edge_magnitude(&event),
+                        edge_magnitude(event),
                     );
                 } else {
                     let context = serde_json::to_value(&event.details)
@@ -649,15 +690,6 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
             }
         }
     }
-    tracing::info!(
-        target: "health",
-        kind = event.kind.as_str(),
-        state = ?event.state,
-        severity = event.severity.as_str(),
-        "{}",
-        event.message,
-    );
-    publisher.publish_status(event);
 }
 
 /// How bad *this* occurrence of an edge event is, on a per-kind scale.

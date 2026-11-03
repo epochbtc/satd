@@ -487,6 +487,80 @@ enum BlockRefusal {
 /// tip: `NODE_NETWORK_LIMITED_MIN_BLOCKS` (288) less Core's two-block margin
 /// (`net_processing.cpp:154`, `:1533`).
 const LIMITED_PEER_BLOCK_DEPTH: u32 = 288 - 2;
+/// Attempts a connector makes at one height before it reports the failure as
+/// persistent. Shared by the IBD connector and the AssumeUTXO background
+/// connector, which both wait [`CONNECT_RETRY_WAIT`] between attempts.
+const CONNECT_RETRY_LIMIT: u32 = 30;
+/// Every this many failed attempts at one height, a connector records a
+/// retry notice in `getwarnings` before the failure counts as persistent.
+const CONNECT_RETRY_WARN_EVERY: u32 = 10;
+/// Wait between two connect attempts of one height.
+const CONNECT_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// The clocks of the AssumeUTXO background connector
+/// (`PeerManager::bg_catchup_connect_loop`). Production uses
+/// [`Self::PRODUCTION`]; tests shrink them.
+#[derive(Clone, Copy)]
+struct BgCatchupTiming {
+    /// Wait between two connect attempts of one height.
+    connect_retry_wait: Duration,
+    /// How long the handoff must keep failing before the condition is
+    /// escalated to an alert. Long enough that a brief disk hiccup resolves
+    /// without paging anyone, short enough that a real stall is reported in
+    /// well under a minute.
+    ///
+    /// Measured in elapsed time rather than in attempts, because an attempt
+    /// count is not a clock here: the wait between attempts is a timeout, not a
+    /// period, and `note_bg_block_stored` wakes it on every stored background
+    /// block, duplicates included, which a peer can send at will. Counting
+    /// attempts would let a peer turn a 200ms hiccup into a page by feeding us
+    /// blocks we already have.
+    handoff_warn_after: Duration,
+    /// Floor between two handoff attempts, doubling up to
+    /// `handoff_max_backoff` while the failure persists. Without it those same
+    /// peer-driven wakeups spin `retry_background_handoff` as fast as blocks
+    /// arrive, and that call flushes the coin cache and can rehash the whole
+    /// background UTXO set.
+    handoff_min_backoff: Duration,
+    handoff_max_backoff: Duration,
+    /// The longest the handoff branch sleeps before it looks again.
+    handoff_poll: Duration,
+}
+
+impl BgCatchupTiming {
+    const PRODUCTION: Self = Self {
+        connect_retry_wait: CONNECT_RETRY_WAIT,
+        handoff_warn_after: Duration::from_secs(10),
+        handoff_min_backoff: Duration::from_secs(1),
+        handoff_max_backoff: Duration::from_secs(30),
+        handoff_poll: Duration::from_secs(1),
+    };
+}
+
+/// Record (or refresh) a connector's retry notice: the block it cannot connect
+/// and how many times it has tried. Both connectors use it, each under its own
+/// id, and clear that id when a block connects.
+fn record_connect_retry(
+    warnings: &crate::warnings::NodeWarnings,
+    id: &str,
+    height: u32,
+    hash: &bitcoin::BlockHash,
+    retries: u32,
+    err: &dyn std::fmt::Display,
+) {
+    warnings.record(
+        id,
+        crate::warnings::Severity::Warn,
+        format!("block {height} ({hash}) connect retry {retries}: {err}"),
+        serde_json::json!({
+            "height": height,
+            "hash": hash.to_string(),
+            "retries": retries,
+            "error": err.to_string(),
+        }),
+    );
+}
+
 /// Flush the background coin cache to disk every N connected blocks so a
 /// crash resumes from a recent private tip instead of redoing the whole
 /// genesis→snapshot validation.
@@ -898,6 +972,10 @@ mod ibdwindow_tests;
 #[cfg(test)]
 #[path = "manager_hdrsync_tests.rs"]
 mod hdrsync_tests;
+
+#[cfg(test)]
+#[path = "manager_bgcatchup_tests.rs"]
+mod bgcatchup_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -8269,14 +8347,7 @@ impl PeerManager {
     /// honest data can produce. Not `time-too-new` (`BLOCK_TIME_FUTURE`,
     /// charged nothing), and not this node's own storage failures.
     fn block_error_is_the_blocks(e: &crate::chain::state::ChainError) -> bool {
-        use crate::chain::state::ChainError;
-        match e {
-            ChainError::Validation(crate::validation::ValidationError::TimeTooNew) => false,
-            ChainError::Validation(v) => !v.is_mutation_class(),
-            ChainError::CheckpointMismatch(_) | ChainError::ForkBeforeCheckpoint(_) => true,
-            ChainError::Connect(ce) => ce.is_verdict_on_block(),
-            _ => false,
-        }
+        e.is_verdict_on_block()
     }
 
     /// Charge the peer that sent `hash` for a block that failed a consensus
@@ -8685,34 +8756,57 @@ impl PeerManager {
         bg_connect_signal: &Arc<(parking_lot::Mutex<bool>, Condvar)>,
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) {
+        Self::bg_catchup_connect_loop_with(
+            chain_state,
+            bg_connect_signal,
+            shutdown,
+            BgCatchupTiming::PRODUCTION,
+        );
+    }
+
+    /// [`Self::bg_catchup_connect_loop`] with its clocks as a parameter, so a
+    /// test can run the retry budget and the handoff escalation without
+    /// waiting them out.
+    fn bg_catchup_connect_loop_with(
+        chain_state: &Arc<ChainState>,
+        bg_connect_signal: &Arc<(parking_lot::Mutex<bool>, Condvar)>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+        timing: BgCatchupTiming,
+    ) {
+        use crate::events::{StatusEvent, StatusKind};
         let mut since_flush: u64 = 0;
-        /// How long the handoff must keep failing before the condition is
-        /// escalated to a warning. Long enough that a brief disk hiccup
-        /// resolves without paging anyone, short enough that a real stall is
-        /// reported in well under a minute.
-        ///
-        /// Measured in elapsed time rather than in attempts, because an attempt
-        /// count is not a clock here: the wait below is a 1s *timeout*, not a
-        /// period, and `note_bg_block_stored` wakes it on every stored
-        /// background block — including duplicates, which a peer can send at
-        /// will. Counting attempts would let a peer turn a 200ms hiccup into a
-        /// page by feeding us blocks we already have.
-        const HANDOFF_RETRY_WARN_AFTER: Duration = Duration::from_secs(10);
-        /// Floor between two handoff attempts, doubling up to a ceiling while
-        /// the failure persists. Without it those same peer-driven wakeups spin
-        /// `retry_background_handoff` as fast as blocks arrive — and that call
-        /// flushes the coin cache and can rehash the whole background UTXO set,
-        /// which is not something to run in a hot loop on a node that is
-        /// already failing its I/O.
-        const HANDOFF_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(1);
-        const HANDOFF_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
-        const HANDOFF_WARNING_ID: &str = "assumeutxo.handoff_failing";
+        /// The `getwarnings` id of the every-tenth-retry notice, kept apart
+        /// from the IBD connector's `connect.retry`: the two connectors run at
+        /// the same time, and each clears its own id on progress.
+        const BG_CONNECT_RETRY_WARNING_ID: &str = "assumeutxo.connect_retry";
+        let alerts = chain_state.background_alerts();
+        let warnings = chain_state.warnings();
+        // Per-snapshot episode state, for the connect retries and the handoff
+        // retries alike. Both are about one snapshot's blocks, so both start
+        // over together whenever the snapshot changes or goes away.
+        //
+        // `retry_count` counts failed connect attempts toward the next report
+        // and starts over after each one, like the IBD connector's (whose
+        // restart does the same); `connect_failures` is the total since the
+        // last block connected, for the report.
+        let mut retry_count: u32 = 0;
+        let mut connect_failures: u32 = 0;
         let mut handoff_retry_failures: u32 = 0;
         let mut handoff_first_failure: Option<Instant> = None;
         let mut handoff_last_attempt: Option<Instant> = None;
-        let mut handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
-        let mut handoff_warned = false;
-        let mut handoff_snapshot: Option<u32> = None;
+        let mut handoff_backoff = timing.handoff_min_backoff;
+        // The snapshot the state above and the two alerts describe.
+        let mut episode_snapshot: Option<(u32, bitcoin::BlockHash)> = None;
+        macro_rules! reset_episode {
+            () => {
+                retry_count = 0;
+                connect_failures = 0;
+                handoff_retry_failures = 0;
+                handoff_first_failure = None;
+                handoff_last_attempt = None;
+                handoff_backoff = timing.handoff_min_backoff;
+            };
+        }
         loop {
             if *shutdown.borrow() {
                 return;
@@ -8720,6 +8814,22 @@ impl PeerManager {
             let bg = match chain_state.background() {
                 Some(b) => b,
                 None => {
+                    // Nothing attached: the handoff completed (or no snapshot
+                    // was ever loaded), so neither condition can stand, and
+                    // nothing the counters count is left to retry.
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    reset_episode!();
+                    episode_snapshot = None;
+                    alerts.clear(
+                        warnings,
+                        StatusKind::AssumeutxoCatchupStalled,
+                        "AssumeUTXO background validation is no longer running",
+                    );
+                    alerts.clear(
+                        warnings,
+                        StatusKind::AssumeutxoHandoffFailing,
+                        "AssumeUTXO background validation is no longer running",
+                    );
                     // No snapshot loaded — sleep until woken (loadtxoutset /
                     // startup resume pokes the signal) or a 1s timeout.
                     let (lock, cvar) = &**bg_connect_signal;
@@ -8731,9 +8841,36 @@ impl PeerManager {
             };
 
             // A snapshot proven invalid at handoff stays attached with a
-            // durable rejected marker; stop trying to advance it.
+            // durable rejected marker; stop trying to advance it. The
+            // `assumeutxo_validation_failed` alert says what happened, and the
+            // weaker "not advancing" ones would only contradict it.
             if bg.is_rejected() {
+                let msg = "AssumeUTXO snapshot was proven invalid; background validation stopped";
+                alerts.clear(warnings, StatusKind::AssumeutxoCatchupStalled, msg);
+                alerts.clear(warnings, StatusKind::AssumeutxoHandoffFailing, msg);
+                warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
                 return;
+            }
+
+            // A `loadtxoutset` can replace the snapshot under us, at the same
+            // height or another. The retry notice, both alerts and every
+            // counter and clock are about the old one; carrying them over
+            // would report the old snapshot's failures, and its failing-since
+            // clock, against the new one. Keyed on the anchor hash as well as
+            // the height, so a same-height replacement counts.
+            let snapshot_id = (bg.snapshot_height(), bg.snapshot_hash());
+            if episode_snapshot != Some(snapshot_id) {
+                if episode_snapshot.is_some() {
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    for kind in [
+                        StatusKind::AssumeutxoCatchupStalled,
+                        StatusKind::AssumeutxoHandoffFailing,
+                    ] {
+                        alerts.clear(warnings, kind, "the AssumeUTXO snapshot was replaced");
+                    }
+                }
+                reset_episode!();
+                episode_snapshot = Some(snapshot_id);
             }
 
             let next_height = bg.tip_height() + 1;
@@ -8751,43 +8888,36 @@ impl PeerManager {
                 // retrying and nothing reported. That is issue #545's "halts
                 // silently and permanently", reached without any connect ever
                 // failing.
-                // A `loadtxoutset` can replace the snapshot under us. Counting
-                // the new one's failures on top of the old one's would report
-                // the wrong total for the wrong height, so start clean.
-                if handoff_snapshot != Some(bg.snapshot_height()) {
-                    if handoff_warned {
-                        chain_state.warnings().clear(HANDOFF_WARNING_ID);
-                    }
-                    handoff_snapshot = Some(bg.snapshot_height());
-                    handoff_retry_failures = 0;
-                    handoff_first_failure = None;
-                    handoff_last_attempt = None;
-                    handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
-                    handoff_warned = false;
-                }
-
+                // A replaced snapshot starts its own handoff episode: see the
+                // snapshot check above.
                 let due = handoff_last_attempt.is_none_or(|at| at.elapsed() >= handoff_backoff);
                 if due {
                     handoff_last_attempt = Some(Instant::now());
                     match chain_state.retry_background_handoff() {
                         Ok(_) => {
                             // The condition resolved: the snapshot is validated
-                            // (or condemned), so the standing warning is now a
+                            // (or condemned), so the standing alert is now a
                             // false statement. Clearing it is what keeps
                             // `has_errors()` — and the TUI's blocking modal —
                             // from latching for the life of the process.
-                            if handoff_warned {
+                            if alerts.is_raised(StatusKind::AssumeutxoHandoffFailing) {
                                 tracing::info!(
                                     height = bg.snapshot_height(),
                                     attempts = handoff_retry_failures,
-                                    "AssumeUTXO: handoff succeeded; clearing the standing warning"
+                                    "AssumeUTXO: handoff succeeded; clearing the standing alert"
                                 );
-                                chain_state.warnings().clear(HANDOFF_WARNING_ID);
-                                handoff_warned = false;
                             }
+                            alerts.clear(
+                                warnings,
+                                StatusKind::AssumeutxoHandoffFailing,
+                                format!(
+                                    "AssumeUTXO handoff at height {} completed",
+                                    bg.snapshot_height()
+                                ),
+                            );
                             handoff_retry_failures = 0;
                             handoff_first_failure = None;
-                            handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
+                            handoff_backoff = timing.handoff_min_backoff;
                         }
                         Err(e) => {
                             // Transient by assumption (disk full, a failed
@@ -8800,40 +8930,40 @@ impl PeerManager {
                             let failing_since =
                                 *handoff_first_failure.get_or_insert_with(Instant::now);
                             handoff_backoff =
-                                (handoff_backoff * 2).min(HANDOFF_RETRY_MAX_BACKOFF);
-                            if failing_since.elapsed() >= HANDOFF_RETRY_WARN_AFTER {
-                                // Re-recorded on every failure, not only the
-                                // first: `record` bumps `count` and refreshes
-                                // `last_seen`, while `-alertnotify` still fires
-                                // once. Recording once would leave an operator
-                                // reading `count: 1` with an hours-old
-                                // `last_seen` for a condition that is failing
-                                // right now.
+                                (handoff_backoff * 2).min(timing.handoff_max_backoff);
+                            if failing_since.elapsed() >= timing.handoff_warn_after {
+                                // Raised again on every failure, not only the
+                                // first: a repeat raise refreshes the
+                                // `getwarnings` entry's `count`, `last_seen`
+                                // and numbers while the `status` event,
+                                // `-alertnotify` and the gauge fire once.
+                                // Raising once would leave an operator reading
+                                // `count: 1` with an hours-old `last_seen` for a
+                                // condition that is failing right now.
                                 tracing::error!(
                                     height = bg.snapshot_height(),
                                     error = %e,
                                     attempts = handoff_retry_failures,
                                     "AssumeUTXO: handoff keeps failing; the snapshot stays unvalidated"
                                 );
-                                chain_state.warnings().record(
-                                    HANDOFF_WARNING_ID,
-                                    crate::warnings::Severity::Error,
-                                    format!(
-                                        "AssumeUTXO handoff at height {} has been failing for {}s \
-                                         over {} attempts ({e}); the snapshot remains unvalidated \
-                                         until it succeeds",
-                                        bg.snapshot_height(),
-                                        failing_since.elapsed().as_secs(),
-                                        handoff_retry_failures
-                                    ),
-                                    serde_json::json!({
-                                        "height": bg.snapshot_height(),
-                                        "attempts": handoff_retry_failures,
-                                        "failing_for_secs": failing_since.elapsed().as_secs(),
-                                        "error": e.to_string(),
-                                    }),
+                                alerts.raise(
+                                    warnings,
+                                    StatusEvent::raised(
+                                        StatusKind::AssumeutxoHandoffFailing,
+                                        format!(
+                                            "AssumeUTXO handoff at height {} has been failing for {}s \
+                                             over {} attempts ({e}); the snapshot remains unvalidated \
+                                             until it succeeds",
+                                            bg.snapshot_height(),
+                                            failing_since.elapsed().as_secs(),
+                                            handoff_retry_failures
+                                        ),
+                                    )
+                                    .with_detail("height", bg.snapshot_height())
+                                    .with_detail("attempts", handoff_retry_failures)
+                                    .with_detail("failing_for_secs", failing_since.elapsed().as_secs())
+                                    .with_detail("error", &e),
                                 );
-                                handoff_warned = true;
                             }
                         }
                     }
@@ -8841,7 +8971,7 @@ impl PeerManager {
                 let (lock, cvar) = &**bg_connect_signal;
                 let mut ready = lock.lock();
                 *ready = false;
-                let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                let _ = cvar.wait_for(&mut ready, timing.handoff_poll);
                 continue;
             }
 
@@ -8880,6 +9010,25 @@ impl PeerManager {
 
             match chain_state.background_connect_block(&block) {
                 Ok(Some(outcome)) => {
+                    // Progress: whatever stalled it is gone.
+                    if connect_failures > 0 {
+                        tracing::info!(
+                            height = outcome.height,
+                            failures = connect_failures,
+                            "AssumeUTXO: background block connected after failed attempts"
+                        );
+                        warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                        alerts.clear(
+                            warnings,
+                            StatusKind::AssumeutxoCatchupStalled,
+                            format!(
+                                "AssumeUTXO background validation advanced to height {}",
+                                outcome.height
+                            ),
+                        );
+                    }
+                    retry_count = 0;
+                    connect_failures = 0;
                     since_flush += 1;
                     if outcome.reached_snapshot {
                         // Handoff ran inside background_connect_block. On a
@@ -8904,61 +9053,143 @@ impl PeerManager {
                     // Background detached between the guard and here.
                     continue;
                 }
-                Err(e) => {
-                    // Either a validation failure on a historical block or a
-                    // handoff mismatch (which already marked the snapshot
-                    // rejected). Either way we cannot make forward progress;
-                    // log once and stop the loop. The operator must reindex
-                    // or reload a valid snapshot.
-                    tracing::error!(
-                        height = next_height,
+                // A handoff mismatch: the snapshot is proven invalid, marked
+                // rejected, and `assumeutxo_validation_failed` is raised. The
+                // top of the loop stops on the marker.
+                Err(_) if bg.is_rejected() => continue,
+                // The block connected and the handoff that followed failed on
+                // I/O. The tip is at the snapshot height now, so the next pass
+                // takes the handoff-retry branch above, which owns that
+                // failure; it is not a failed connect.
+                Err(e) if bg.tip_height() >= bg.snapshot_height() => {
+                    tracing::warn!(
+                        height = bg.snapshot_height(),
                         error = %e,
-                        "AssumeUTXO: background catch-up halted — connect failed"
+                        "AssumeUTXO: handoff failed after the snapshot-height block connected; retrying"
                     );
-                    // Returning here ends the only thread that advances the
-                    // background chainstate, permanently for this process.
-                    // That has to reach the operator: without it the only
-                    // trace is the log line above — a background tip frozen
-                    // forever with no surfaced reason (#545).
-                    //
-                    // Two different failures arrive here, and they must not be
-                    // described the same way. `background_connect_block` runs
-                    // the handoff via `?`, so a *proven invalid* snapshot —
-                    // hash mismatch at the snapshot height — lands in this arm
-                    // having already been marked rejected and warned about
-                    // upstream as `assumeutxo-validation-failed`. Telling that
-                    // operator the snapshot "remains unvalidated" would be the
-                    // weaker of two truths at the moment the stronger one
-                    // applies, so the rejected case is left to the warning
-                    // that already describes it exactly.
-                    //
-                    // Deliberately NOT `bg.mark_rejected()` here. That marker
-                    // is a durable "this snapshot is invalid" verdict and only
-                    // the handoff comparison proves it. What actually reaches
-                    // this arm otherwise is storage and flat-file I/O failure
-                    // — a full disk must not condemn a good snapshot. (A bad
-                    // *block* cannot reach it: while a background is attached
-                    // only the canonical block for a historical height is
-                    // storable, `store_block` validates it before it lands,
-                    // and `get_block` re-derives the hash and reports
-                    // corruption rather than returning foreign bytes.)
-                    if !bg.is_rejected() {
-                        chain_state.warnings().record(
-                            "assumeutxo.catchup_halted",
-                            crate::warnings::Severity::Error,
+                    continue;
+                }
+                // The block itself is invalid. The bytes are the canonical
+                // block for this height (`store_block` validated them and
+                // `get_block` re-derives the hash), so connecting them again
+                // can only fail again: stop, and say why. Not
+                // `bg.mark_rejected()`: that durable verdict is the handoff
+                // comparison's alone.
+                Err(e) if e.is_verdict_on_block() => {
+                    tracing::error!(
+                        height = next_height, %hash, error = %e,
+                        "AssumeUTXO: background catch-up halted — the block failed validation"
+                    );
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    alerts.raise(
+                        warnings,
+                        StatusEvent::raised(
+                            StatusKind::AssumeutxoCatchupStalled,
                             format!(
                                 "AssumeUTXO background validation stopped at height \
-                                 {next_height} ({e}) and will not resume without a restart; \
-                                 the snapshot remains unvalidated"
+                                 {next_height}: block {hash} failed validation ({e}). It will \
+                                 not resume without a restart; the snapshot remains unvalidated"
                             ),
-                            serde_json::json!({
-                                "height": next_height,
-                                "error": e.to_string(),
-                            }),
-                        );
-                    }
+                        )
+                        .with_detail("reason", "invalid_block")
+                        .with_detail("height", next_height)
+                        .with_detail("hash", hash)
+                        .with_detail("error", &e),
+                    );
                     let _ = bg.flush();
                     return;
+                }
+                // Not the block's fault, but just as permanent: the stored
+                // block does not extend the background tip, its parent is
+                // unknown, its bytes do not decode, or it is a mutated copy
+                // (see `ChainError::retry_cannot_help`). Retrying it forever
+                // would only hide that behind a `connect_failing` count.
+                Err(e) if e.retry_cannot_help() => {
+                    tracing::error!(
+                        height = next_height, %hash, error = %e,
+                        "AssumeUTXO: background catch-up halted — the block cannot connect"
+                    );
+                    warnings.clear(BG_CONNECT_RETRY_WARNING_ID);
+                    alerts.raise(
+                        warnings,
+                        StatusEvent::raised(
+                            StatusKind::AssumeutxoCatchupStalled,
+                            format!(
+                                "AssumeUTXO background validation stopped at height \
+                                 {next_height}: block {hash} cannot connect to the \
+                                 background chain ({e}). It will not resume without a \
+                                 restart; the snapshot remains unvalidated"
+                            ),
+                        )
+                        .with_detail("reason", "cannot_connect")
+                        .with_detail("height", next_height)
+                        .with_detail("hash", hash)
+                        .with_detail("error", &e),
+                    );
+                    let _ = bg.flush();
+                    return;
+                }
+                // Anything else is the node's own I/O — a RocksDB or
+                // flat-file write — and is retried, as the IBD connector
+                // retries it: a 200ms hiccup must not end background
+                // validation for the life of the process.
+                Err(e) => {
+                    retry_count += 1;
+                    connect_failures = connect_failures.saturating_add(1);
+                    if retry_count >= CONNECT_RETRY_LIMIT {
+                        tracing::error!(
+                            height = next_height, %hash, failures = connect_failures,
+                            "AssumeUTXO: background block keeps failing to connect; \
+                             still retrying: {e}"
+                        );
+                        // Raised once per episode; every later report only
+                        // refreshes the entry. Retrying goes on after this,
+                        // as the IBD connector's restart does, and the alert
+                        // clears on the first block that connects.
+                        alerts.raise(
+                            warnings,
+                            StatusEvent::raised(
+                                StatusKind::AssumeutxoCatchupStalled,
+                                format!(
+                                    "AssumeUTXO background validation is stuck at height \
+                                     {next_height}: block {hash} failed to connect \
+                                     {connect_failures} times ({e}). Still retrying; the \
+                                     snapshot remains unvalidated until it advances"
+                                ),
+                            )
+                            .with_detail("reason", "connect_failing")
+                            .with_detail("height", next_height)
+                            .with_detail("hash", hash)
+                            .with_detail("failures", connect_failures)
+                            .with_detail("error", &e),
+                        );
+                        retry_count = 0;
+                    } else if retry_count.is_multiple_of(CONNECT_RETRY_WARN_EVERY) {
+                        tracing::warn!(
+                            height = next_height, %hash, retries = retry_count,
+                            "AssumeUTXO: background block connect failed (retrying): {e}"
+                        );
+                        record_connect_retry(
+                            warnings,
+                            BG_CONNECT_RETRY_WARNING_ID,
+                            next_height,
+                            &hash,
+                            connect_failures,
+                            &e,
+                        );
+                    }
+                    // A plain sleep, not a wait on `bg_connect_signal`: that
+                    // is poked by every stored background block, duplicates
+                    // included, and the retry budget is meant to be a clock.
+                    let until = Instant::now() + timing.connect_retry_wait;
+                    while Instant::now() < until && !*shutdown.borrow() {
+                        std::thread::sleep(
+                            until
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(100)),
+                        );
+                    }
+                    continue;
                 }
             }
         }
@@ -9903,7 +10134,7 @@ impl PeerManager {
                         {
                             pm.refetch_unreadable_block(hash, next_height);
                         }
-                        if retry_count >= 30 {
+                        if retry_count >= CONNECT_RETRY_LIMIT {
                             // The block at tip+1 can't connect because its
                             // parent isn't the active tip. If a competing
                             // higher-work header chain exists, this is a reorg
@@ -9995,31 +10226,25 @@ impl PeerManager {
                             // be giving up.
                             break;
                         }
-                        if retry_count.is_multiple_of(10) {
+                        if retry_count.is_multiple_of(CONNECT_RETRY_WARN_EVERY) {
                             tracing::warn!(
                                 height = next_height, %hash, retries = retry_count,
                                 "Connect stored block failed (retrying): {}", e
                             );
-                            chain_state.warnings().record(
+                            record_connect_retry(
+                                chain_state.warnings(),
                                 "connect.retry",
-                                crate::warnings::Severity::Warn,
-                                format!(
-                                    "block {} ({}) connect retry {}: {}",
-                                    next_height, hash, retry_count, e
-                                ),
-                                serde_json::json!({
-                                    "height": next_height,
-                                    "hash": hash.to_string(),
-                                    "retries": retry_count,
-                                    "error": e.to_string(),
-                                }),
+                                next_height,
+                                &hash,
+                                retry_count,
+                                &e,
                             );
                         }
                         chain_state.connect_phases().enter(ConnectPhase::CondvarWait);
                         let (lock, cvar) = &**connect_signal;
                         let mut ready = lock.lock();
                         *ready = false;
-                        let _ = cvar.wait_for(&mut ready, Duration::from_secs(1));
+                        let _ = cvar.wait_for(&mut ready, CONNECT_RETRY_WAIT);
                         chain_state.connect_phases().enter(ConnectPhase::Idle);
                         continue;
                     }

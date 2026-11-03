@@ -851,6 +851,50 @@ pub const VERSION_METADATA_KEY: &str = "satd-version";
 /// string. Same contract as [`VERSION_METADATA_KEY`].
 pub const SCHEMA_METADATA_KEY: &str = "satd-events-schema";
 
+/// Response metadata key carrying the stream's head cursor: the position the
+/// stream starts from, `<height>:<tx_index>:<mempool_seq>:<instance_id>` in
+/// decimal. Every event after it is delivered on this stream, and a
+/// `SetCursor` / `from_cursor` presenting it replays exactly what a dropped
+/// stream would have delivered next. An SDK with no anchor of its own (no
+/// persisted cursor, nothing confirmed yet) re-anchors to it on reconnect.
+/// Absent when the node has no block source, where a re-anchor cannot replay
+/// anyway, and on a node that predates it.
+pub const HEAD_CURSOR_METADATA_KEY: &str = "satd-head-cursor";
+
+/// The head cursor for a stream that has just subscribed to the live bus.
+///
+/// Must be called AFTER the stream's `publisher.subscribe()`: the receiver
+/// already holds every envelope published from that point on, so an envelope
+/// stamped after the mempool sequence read here, and every block above the tip
+/// read here, is either in the receiver or (for a block whose connect raced
+/// this read) both in the receiver and replayable. Nothing after the cursor
+/// can fall between the two; the worst case is a block delivered live and
+/// replayed again, which the SDKs' monotonic high-water absorbs. Read in the
+/// other order, a block connecting between the two reads would be in neither.
+///
+/// Built as `derive_cursor` builds a connected block's: the tip height,
+/// `tx_index` 0, the publisher's sequence as the mempool watermark, and its
+/// instance id.
+fn head_cursor(
+    publisher: &node::events::EventPublisher,
+    block_source: Option<&Arc<dyn node::events::BlockCursorSource>>,
+) -> Option<node::events::Cursor> {
+    let seq = publisher.published();
+    block_source.map(|s| publisher.resume_cursor(s.current_tip_height(), seq))
+}
+
+/// Stamp the head cursor ([`HEAD_CURSOR_METADATA_KEY`]) onto a stream-opening
+/// response, when there is one.
+fn stamp_head<T>(mut resp: Response<T>, head: Option<node::events::Cursor>) -> Response<T> {
+    if let Some(c) = head {
+        let v = format!("{}:{}:{}:{}", c.height, c.tx_index, c.mempool_seq, c.instance_id);
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
+            resp.metadata_mut().insert(HEAD_CURSOR_METADATA_KEY, v);
+        }
+    }
+    resp
+}
+
 /// Stamp the version headers onto a stream-opening response.
 fn stamp_version<T>(mut resp: Response<T>) -> Response<T> {
     let md = resp.metadata_mut();
@@ -1062,6 +1106,8 @@ impl NodeEventStream for NodeEventStreamSvc {
         // (a forward-only dedup filter, not durable replay) and the live
         // tail both anchor here.
         let rx = self.publisher.subscribe();
+        // After the subscribe, so it is consistent with `rx`; see `head_cursor`.
+        let head = head_cursor(&self.publisher, self.block_source.as_ref());
 
         // Durable cursor replay (snapshot→live handoff). When the client
         // sends `from_cursor` and we have a block source, replay confirmed
@@ -1290,7 +1336,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             None => Box::pin(live),
         };
 
-        Ok(stamp_version(Response::new(stream)))
+        Ok(stamp_head(stamp_version(Response::new(stream)), head))
     }
 
     async fn watch(
@@ -1341,6 +1387,9 @@ impl NodeEventStream for NodeEventStreamSvc {
         let include_raw_tx = Arc::new(AtomicBool::new(false));
         let edge = *self.publisher.edge();
         let rx_live = self.publisher.subscribe();
+        // After the subscribe, so it is consistent with `rx_live`; see
+        // `head_cursor`.
+        let head = head_cursor(&self.publisher, self.block_source.as_ref());
 
         // The watch-set (and the per-item quota leases inside it) is owned by
         // the SUBSCRIPTION, not the inbound control reader. gRPC/HTTP-2 lets a
@@ -2078,7 +2127,10 @@ impl NodeEventStream for NodeEventStreamSvc {
             }
         });
 
-        Ok(stamp_version(Response::new(Box::pin(ReceiverStream::new(rx_out)))))
+        Ok(stamp_head(
+            stamp_version(Response::new(Box::pin(ReceiverStream::new(rx_out)))),
+            head,
+        ))
     }
 }
 
@@ -3443,6 +3495,9 @@ fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
         K::PeerFloor => pb::StatusKind::PeerFloor,
         K::DeepReorg => pb::StatusKind::DeepReorg,
         K::TemplateInvalid => pb::StatusKind::TemplateInvalid,
+        K::AssumeutxoCatchupStalled => pb::StatusKind::AssumeutxoCatchupStalled,
+        K::AssumeutxoHandoffFailing => pb::StatusKind::AssumeutxoHandoffFailing,
+        K::AssumeutxoValidationFailed => pb::StatusKind::AssumeutxoValidationFailed,
     };
     let state = match ev.state {
         St::Raised => pb::StatusState::Raised,
@@ -4125,6 +4180,19 @@ mod tests {
         pb::node_event_stream_client::NodeEventStreamClient<tonic::transport::Channel>,
         watch::Sender<bool>,
     ) {
+        let (client, shutdown_tx, _) = metadata_fixture(None).await;
+        (client, shutdown_tx)
+    }
+
+    /// [`version_metadata_fixture`] with a block source, returning the
+    /// publisher too.
+    async fn metadata_fixture(
+        block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
+    ) -> (
+        pb::node_event_stream_client::NodeEventStreamClient<tonic::transport::Channel>,
+        watch::Sender<bool>,
+        Arc<EventPublisher>,
+    ) {
         let publisher = EventPublisher::new(edge(), 16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry = Arc::new(node::events::WatchRegistry::new());
@@ -4134,7 +4202,7 @@ mod tests {
             publisher.clone(),
             GrpcLimits::default(),
             None,
-            None,
+            block_source,
             None,
             Some(registry),
             None,
@@ -4150,7 +4218,7 @@ mod tests {
         ))
         .await
         .expect("connect");
-        (client, shutdown_tx)
+        (client, shutdown_tx, publisher)
     }
 
     #[tokio::test]
@@ -4178,6 +4246,42 @@ mod tests {
         .expect("watch headers must not wait for an event")
         .expect("watch");
         assert_version_metadata(resp.metadata());
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// Both stream-opening responses carry the head cursor, built as a
+    /// connected block's cursor at the tip: `tip:0:<publisher seq>:<instance>`.
+    /// A node with no block source sends none, since a re-anchor there cannot
+    /// replay.
+    ///
+    /// Perturbation: dropping the `Watch` `stamp_head` call fails the `Watch`
+    /// assertion (the `Subscribe` one is symmetric); a cursor built with
+    /// `mempool_seq` 0 fails both.
+    #[tokio::test]
+    async fn stream_responses_carry_the_head_cursor() {
+        let (mut client, shutdown_tx, publisher) =
+            metadata_fixture(Some(Arc::new(MockBlocks { tip: 5 }))).await;
+        for _ in 0..3 {
+            publisher.publish_status(node::events::StatusEvent::edge(
+                node::events::StatusKind::IbdComplete,
+                "x",
+            ));
+        }
+        let want = format!("5:0:3:{}", publisher.instance_id());
+        let head = |md: &tonic::metadata::MetadataMap| {
+            md.get(HEAD_CURSOR_METADATA_KEY).and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+
+        let resp = client.subscribe(pb::SubscribeRequest::default()).await.expect("subscribe");
+        assert_eq!(head(resp.metadata()), Some(want.clone()), "Subscribe");
+        let (_ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(1);
+        let resp = client.watch(ReceiverStream::new(ctrl_rx)).await.expect("watch");
+        assert_eq!(head(resp.metadata()), Some(want), "Watch");
+        let _ = shutdown_tx.send(true);
+
+        let (mut client, shutdown_tx) = version_metadata_fixture().await;
+        let resp = client.subscribe(pb::SubscribeRequest::default()).await.expect("subscribe");
+        assert_eq!(head(resp.metadata()), None, "no block source, no head");
         let _ = shutdown_tx.send(true);
     }
 

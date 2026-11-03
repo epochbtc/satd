@@ -28,9 +28,23 @@
 #
 # Optional env:
 #   SATD_MINISIGN_KEY    path to encrypted minisign secret key file
-#                        (default: ~/devel/epoch/.keys/satd-primary.key)
+#                        (default: ~/.minisign/minisign.key, minisign's own default)
 #   SATD_MINISIGN_PUBKEY base64 pubkey string for verification round-trip
 #                        (default: primary pubkey from SECURITY.md)
+#   SATD_SIGN_DIR        working directory for the tarball path
+#                        (default: ${XDG_CACHE_HOME:-~/.cache}/satd-sign/<tag>)
+#
+# Working directory (tarball path):
+#   Downloads go to a fixed per-tag directory, created mode 0700, which is
+#   kept when a run fails and removed after a successful upload or
+#   --dry-run. A rerun after a failure (wrong passphrase, failed upload)
+#   reuses the tarballs and SBOMs already there when their SHA-256 matches
+#   both the release's fresh SHA256SUMS and the asset digest GitHub reports,
+#   and keeps every .minisig that still verifies. The script refuses a
+#   directory it does not own, a symlink, or one that group or others can
+#   write to, and it uses (and later deletes) only a directory it created
+#   itself: an existing directory without its marker file is refused, never
+#   chmod'd or removed. --images uses a temporary directory, as before.
 
 set -euo pipefail
 
@@ -55,7 +69,7 @@ if [[ -z "$TAG" ]]; then
     exit 64
 fi
 
-KEY="${SATD_MINISIGN_KEY:-${HOME}/devel/epoch/.keys/satd-primary.key}"
+KEY="${SATD_MINISIGN_KEY:-${HOME}/.minisign/minisign.key}"
 PUBKEY="${SATD_MINISIGN_PUBKEY:-RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3}"
 
 if [[ ! -f "$KEY" ]]; then
@@ -64,11 +78,13 @@ if [[ ! -f "$KEY" ]]; then
     exit 1
 fi
 
-work=$(mktemp -d -t satd-sign-XXXXXX)
-trap 'unset -v MINISIGN_PASSPHRASE 2>/dev/null; rm -rf "$work"' EXIT
-cd "$work"
+REPO="epochbtc/satd"
 
 if [[ -n "$IMAGES_DIR" ]]; then
+    work=$(mktemp -d -t satd-sign-XXXXXX)
+    trap 'unset -v MINISIGN_PASSPHRASE 2>/dev/null; rm -rf "$work"' EXIT
+    cd "$work"
+
     # --- appliance images -------------------------------------------------
     # Each image is signed in its own right, exactly as a tarball is, because
     # the images are ordinary release assets. This script used to sign a
@@ -119,7 +135,7 @@ if [[ -n "$IMAGES_DIR" ]]; then
     if [[ "$DRY_RUN" -eq 0 ]]; then
         sumsdir="$work/published-sums"
         mkdir -p "$sumsdir"
-        gh release download "$TAG" --repo epochbtc/satd \
+        gh release download "$TAG" --repo "$REPO" \
             --pattern '*.SHA256SUMS' --dir "$sumsdir" > /dev/null 2>&1 || true
         declare -A published_sha=()
         for f in "$sumsdir"/*.SHA256SUMS; do
@@ -132,7 +148,7 @@ if [[ -n "$IMAGES_DIR" ]]; then
         declare -A present=()
         while read -r aname; do
             [[ -n "$aname" ]] && present["$aname"]=1
-        done < <(gh release view "$TAG" --repo epochbtc/satd \
+        done < <(gh release view "$TAG" --repo "$REPO" \
                      --json assets --jq '.assets[].name')
 
         for img in "${images[@]}"; do
@@ -191,7 +207,7 @@ if [[ -n "$IMAGES_DIR" ]]; then
 
     assets=( "${upload[@]}" "${sigs[@]}" )
     echo ">> Uploading ${#upload[@]} image(s) and ${#sigs[@]} signature(s) to release $TAG"
-    gh release upload "$TAG" --repo epochbtc/satd --clobber -- "${assets[@]}"
+    gh release upload "$TAG" --repo "$REPO" --clobber -- "${assets[@]}"
 
     echo
     echo "Done. Operators verify an image with:"
@@ -199,50 +215,197 @@ if [[ -n "$IMAGES_DIR" ]]; then
     exit 0
 fi
 
-echo ">> Downloading release artifacts for $TAG"
-# Re-download every time. --skip-existing was considered but rejected:
-# if a tarball was tampered with after a previous sign-tarballs run,
-# --skip-existing would silently keep the bad copy. The SHA256SUMS
-# step below catches that, but only if we actually fetched fresh
-# bytes. Tarballs are small; the re-download cost is trivial.
+# --- tarballs and SBOMs ----------------------------------------------------
+# The tag becomes a path component, so it must not be able to climb out of
+# the cache directory.
+if [[ ! "$TAG" =~ ^[A-Za-z0-9._+-]+$ || "$TAG" == "." || "$TAG" == ".." ]]; then
+    echo "refusing tag with unexpected characters: $TAG" >&2
+    exit 64
+fi
+
+work="${SATD_SIGN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/satd-sign/$TAG}"
+# "/path/link/" would make every test below look through the symlink.
+while [[ "$work" == */ && "$work" != / ]]; do work="${work%/}"; done
+
+# The script deletes this directory after a successful run, so it must only
+# ever use one it made. It drops this marker in a directory when it creates
+# it; an existing directory without the marker (an operator's own directory
+# named by SATD_SIGN_DIR, say) is refused, and is never chmod'd or removed.
+MARKER=".sign-tarballs-workdir"
+
+# The default path is predictable, and so is anything an operator points
+# SATD_SIGN_DIR at under /tmp. Another local user who pre-creates it could
+# swap a tarball between the hash check and the signature. Only a directory
+# this user owns, that is not a symlink, and that nobody else can write to is
+# used.
+check_dir() {
+    # $1: the path to test, $2: the name to report it under.
+    local owner mode
+    owner="$(stat -c %u -- "$1")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "refusing $2: owned by uid $owner, not $(id -u)" >&2
+        exit 1
+    fi
+    mode="$(stat -c %a -- "$1")"
+    if (( 8#$mode & 8#022 )); then
+        echo "refusing $2: mode $mode lets group or others write to it" >&2
+        exit 1
+    fi
+    if [[ ! -f "$1/$MARKER" || -L "$1/$MARKER" ]]; then
+        echo "refusing $2: it exists but this script did not create it (no $MARKER)." >&2
+        echo "Point SATD_SIGN_DIR at a path that does not exist yet; the script creates it." >&2
+        exit 1
+    fi
+}
+
+if [[ ! -e "$work" && ! -L "$work" ]]; then
+    (umask 077 && mkdir -p -- "$(dirname -- "$work")")
+    # Build it under a temporary name and rename it into place, so a run
+    # killed before the marker is written leaves no marker-less directory
+    # at $work for every later run to refuse.
+    staging="$work.new.$$"
+    mkdir -m 700 -- "$staging"
+    : > "$staging/$MARKER"
+    mv -- "$staging" "$work"
+fi
+if [[ -L "$work" ]]; then
+    echo "refusing $work: is a symlink" >&2
+    exit 1
+fi
+if [[ ! -d "$work" ]]; then
+    echo "refusing $work: not a directory" >&2
+    exit 1
+fi
+check_dir "$work" "$work"
+parent="$(cd -- "$(dirname -- "$work")" && pwd -P)"
+expect="${parent%/}/$(basename -- "$work")"
+chmod 700 -- "$work"
+
+# The checks above went by name. If the parent directory is writable by
+# someone else, the name can be pointed somewhere else before the cd, so
+# check again where the cd actually landed.
+cd -- "$work"
+if [[ "$(pwd -P)" != "$expect" ]]; then
+    echo "refusing $work: it changed between the check and the cd (now $(pwd -P))" >&2
+    exit 1
+fi
+check_dir . "$work"
+work="$expect"
+
+finished=0
+on_exit() {
+    unset -v MINISIGN_PASSPHRASE 2>/dev/null
+    if [[ "$finished" -eq 1 ]]; then
+        cd / && rm -rf -- "$work"
+        echo "Removed working directory $work"
+    else
+        echo "Kept working directory $work; a rerun reuses what still matches." >&2
+    fi
+}
+trap on_exit EXIT
+echo ">> Working directory: $work"
+
+# Both tarballs (*.tar.zst) and CycloneDX SBOMs (*.cdx.json) are signed with
+# the same minisign primary key. Operators verify both with the same recipe
+# (`minisign -Vm <file> -P <pubkey>`).
 #
-# Both tarballs (*.tar.zst) and CycloneDX SBOMs (*.cdx.json) are
-# signed with the same minisign primary key. Operators verify both
-# with the same recipe (`minisign -Vm <file> -P <pubkey>`).
+# The small files (SHA256SUMS and the per-file .sha256) are fetched fresh on
+# every run. A tarball or SBOM left by an earlier run is kept only if its
+# SHA-256 matches both the fresh SHA256SUMS and the digest GitHub reports for
+# the release asset; anything missing or different is downloaded again. A
+# file that was replaced on the release, or changed on disk, after an earlier
+# run is therefore never signed from the stale copy.
+echo ">> Fetching SHA256SUMS and per-file sums for $TAG"
+rm -f -- SHA256SUMS ./*.tar.zst.sha256 ./*.cdx.json.sha256
 gh release download "$TAG" \
-    --repo epochbtc/satd \
-    --pattern '*.tar.zst' \
-    --pattern '*.tar.zst.sha256' \
-    --pattern '*.cdx.json' \
-    --pattern '*.cdx.json.sha256' \
+    --repo "$REPO" \
     --pattern 'SHA256SUMS' \
+    --pattern '*.tar.zst.sha256' \
+    --pattern '*.cdx.json.sha256' \
     --clobber
 
-echo ">> Confirming SHA256SUMS"
-sha256sum -c SHA256SUMS
+declare -A sums_sha=()
+while read -r sha sname; do
+    [[ -n "${sname:-}" ]] && sums_sha["${sname#\*}"]="$sha"
+done < SHA256SUMS
 
-# Collect everything we'll sign: tarballs + SBOMs.
-shopt -s nullglob
-to_sign=( *.tar.zst *.cdx.json )
-shopt -u nullglob
+# Asset names and digests ("sha256:<hex>", or empty for assets uploaded
+# before GitHub recorded digests).
+declare -A asset_sha=()
+to_sign=()
+while IFS=$'\t' read -r aname adigest; do
+    case "$aname" in
+        *.tar.zst|*.cdx.json) ;;
+        *) continue ;;
+    esac
+    [[ "$aname" == */* ]] && { echo "unexpected asset name: $aname" >&2; exit 1; }
+    to_sign+=( "$aname" )
+    asset_sha["$aname"]="${adigest#sha256:}"
+done < <(gh api "repos/$REPO/releases/tags/$TAG" \
+             --jq '.assets[] | [.name, (.digest // "")] | @tsv')
 
 if [[ ${#to_sign[@]} -eq 0 ]]; then
     echo "no artifacts found to sign for tag $TAG" >&2
     exit 1
 fi
 
+fetch=()
+reused=0
+for f in "${to_sign[@]}"; do
+    if [[ -f "$f" ]]; then
+        have="$(sha256sum -- "$f" | cut -d' ' -f1)"
+        if [[ -n "${sums_sha[$f]:-}" && -n "${asset_sha[$f]}" \
+              && "$have" == "${sums_sha[$f]}" && "$have" == "${asset_sha[$f]}" ]]; then
+            reused=$((reused + 1))
+            continue
+        fi
+        echo "   stale or unverifiable local copy, fetching again: $f"
+    fi
+    rm -f -- "$f" "$f.minisig"
+    fetch+=( "$f" )
+done
+
+echo ">> Downloading ${#fetch[@]} artifact(s) for $TAG (${reused} already here and matching)"
+if [[ ${#fetch[@]} -gt 0 ]]; then
+    patterns=()
+    for f in "${fetch[@]}"; do
+        # gh takes glob patterns; escape glob characters so each one names
+        # exactly one asset.
+        patterns+=( --pattern "$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')" )
+    done
+    gh release download "$TAG" --repo "$REPO" "${patterns[@]}" --clobber
+fi
+
+echo ">> Confirming SHA256SUMS"
+sha256sum -c SHA256SUMS
+for f in "${to_sign[@]}"; do
+    if [[ -z "${sums_sha[$f]:-}" ]]; then
+        echo "$f is on $TAG but SHA256SUMS does not list it" >&2
+        exit 1
+    fi
+    want="${asset_sha[$f]}"
+    if [[ -n "$want" && "$(sha256sum -- "$f" | cut -d' ' -f1)" != "$want" ]]; then
+        echo "$f does not match the digest GitHub reports for the asset" >&2
+        exit 1
+    fi
+done
+
+# A .minisig left by an earlier run counts only if it verifies against the
+# current bytes and the published key. Anything else is removed and signed
+# again, so a run that fails partway keeps the signatures it already made.
 already_signed=()
 to_do=()
 for f in "${to_sign[@]}"; do
-    if [[ -f "${f}.minisig" ]]; then
+    if [[ -f "${f}.minisig" ]] && minisign -Vm "$f" -P "$PUBKEY" >/dev/null 2>&1; then
         already_signed+=("$f")
     else
+        rm -f -- "${f}.minisig"
         to_do+=("$f")
     fi
 done
 
 if [[ ${#to_do[@]} -eq 0 ]]; then
-    echo ">> All ${#to_sign[@]} artifact(s) already signed, nothing to do"
+    echo ">> All ${#to_sign[@]} artifact(s) already signed, nothing to sign"
 else
     echo ">> Signing ${#to_do[@]} artifact(s) (${#already_signed[@]} already signed, skipping those)"
     read -rs -p "   minisign passphrase for $KEY (entered once, reused for every artifact): " MINISIGN_PASSPHRASE
@@ -261,25 +424,29 @@ else
 fi
 
 echo ">> Round-trip verifying every signature against the published pubkey"
+sigs=()
 for f in "${to_sign[@]}"; do
     minisign -Vm "$f" -P "$PUBKEY" >/dev/null
     echo "   ok: ${f}.minisig"
+    sigs+=( "${f}.minisig" )
 done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo
     echo "[dry-run] Skipping upload. Generated signatures:"
-    ls -1 *.minisig
+    printf '%s\n' "${sigs[@]}"
     echo "[dry-run] Re-run without --dry-run to publish to the release."
+    finished=1
     exit 0
 fi
 
 echo ">> Uploading .minisig files to release $TAG"
 gh release upload "$TAG" \
-    --repo epochbtc/satd \
+    --repo "$REPO" \
     --clobber \
-    -- *.minisig
+    -- "${sigs[@]}"
 
+finished=1
 echo
 echo "Done. Operators can now verify with:"
 echo "  minisign -Vm <tarball> -P '${PUBKEY}'"

@@ -153,6 +153,13 @@ pub enum StatusKind {
     DeepReorg,
     /// A block template the node built failed its own validity check.
     TemplateInvalid,
+    /// AssumeUTXO background validation is not advancing: a historical block
+    /// keeps failing to connect, or one failed validation.
+    AssumeutxoCatchupStalled,
+    /// The AssumeUTXO handoff at the snapshot height keeps failing.
+    AssumeutxoHandoffFailing,
+    /// Background validation proved the loaded AssumeUTXO snapshot invalid.
+    AssumeutxoValidationFailed,
     /// A condition this client build does not recognize.
     Unknown(i32),
 }
@@ -168,6 +175,11 @@ impl StatusKind {
             Ok(pb::StatusKind::PeerFloor) => StatusKind::PeerFloor,
             Ok(pb::StatusKind::DeepReorg) => StatusKind::DeepReorg,
             Ok(pb::StatusKind::TemplateInvalid) => StatusKind::TemplateInvalid,
+            Ok(pb::StatusKind::AssumeutxoCatchupStalled) => StatusKind::AssumeutxoCatchupStalled,
+            Ok(pb::StatusKind::AssumeutxoHandoffFailing) => StatusKind::AssumeutxoHandoffFailing,
+            Ok(pb::StatusKind::AssumeutxoValidationFailed) => {
+                StatusKind::AssumeutxoValidationFailed
+            }
             _ => StatusKind::Unknown(v),
         }
     }
