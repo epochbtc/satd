@@ -2007,6 +2007,9 @@ fn test_gettxout() {
     node.stop();
 }
 
+/// Any regtest address, for mining the blocks a test needs.
+const HEALTH_ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
 /// The keys of an `estimatesmartfee` result object.
 fn smartfee_keys(result: &serde_json::Value) -> std::collections::BTreeSet<String> {
     result.as_object().unwrap().keys().cloned().collect()
@@ -2040,8 +2043,9 @@ fn test_estimatesmartfee() {
 /// The result shape, pinned against Core 32.1's `estimatesmartfee` help
 /// (`src/rpc/fees.cpp` at v32.1, lines 69-91): `feerate` and `errors` are
 /// each present only when they apply, `blocks` always, and
-/// `mempool_health_statistics` only at `verbosity >= 2`. satd differs in one
-/// field: `estimator` accompanies every `feerate`, and may be `floor`.
+/// `mempool_health_statistics` only at `verbosity >= 2`. satd differs in two
+/// fields: `estimator` accompanies every `feerate` and may be `floor`, and
+/// `mempool_health` gives the verdict beside the statistics.
 #[test]
 fn estimatesmartfee_has_cores_32_1_shape() {
     use serde_json::json;
@@ -2052,8 +2056,17 @@ fn estimatesmartfee_has_cores_32_1_shape() {
         resp["result"].clone()
     };
 
-    // mempool_policy: answers for 2 blocks whatever the target, as Core's
-    // mempool estimator does; an empty pool leaves the floor to set it.
+    // mempool_policy on a node that has connected no blocks: Core's refusal,
+    // for 2 blocks.
+    let r = call(&mut node, vec![json!(6), json!("economical"), json!({"fee_rate_estimator": "mempool_policy"})]);
+    assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
+    assert_eq!(r["errors"], json!(["mempool_policy: Not enough recent block data for fee rate estimation"]));
+    assert_eq!(r["blocks"], 2, "{r}");
+
+    // Six blocks fill the health window (empty blocks are low activity,
+    // which Core counts as healthy). Then mempool_policy answers for 2
+    // blocks whatever the target; an empty pool leaves the floor to set it.
+    node.mine_blocks(6, HEALTH_ADDR);
     for target in [1, 6, 1008] {
         let r = call(&mut node, vec![json!(target), json!("economical"), json!({"fee_rate_estimator": "mempool_policy"})]);
         assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
@@ -2066,15 +2079,26 @@ fn estimatesmartfee_has_cores_32_1_shape() {
     let r = call(&mut node, vec![json!(6), json!("conservative"), json!({"fee_rate_estimator": "block_policy"})]);
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
 
-    // verbosity 2 adds the (for now empty) health statistics, on either kind
-    // of answer; verbosity 1 does not.
+    // verbosity 2 adds Core's health statistics, newest first, and satd's
+    // verdict over them, on either kind of answer; verbosity 1 does not.
     let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2})]);
-    assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks", "mempool_health_statistics"]));
-    assert_eq!(r["mempool_health_statistics"], json!([]));
+    assert_eq!(
+        smartfee_keys(&r),
+        keyset(&["errors", "blocks", "mempool_health_statistics", "mempool_health"])
+    );
+    let stats = r["mempool_health_statistics"].as_array().unwrap();
+    assert_eq!(stats.len(), 6, "{r}");
+    assert_eq!(stats[0]["block_height"], 6, "newest first: {r}");
+    assert_eq!(stats[5]["block_height"], 1, "{r}");
+    for row in stats {
+        assert_eq!(smartfee_keys(row), keyset(&["block_height", "block_weight", "mempool_txs_weight"]));
+        assert_eq!(row["block_weight"], 0, "coinbase-only blocks: {r}");
+    }
+    assert_eq!(r["mempool_health"], "healthy", "{r}");
     let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2, "fee_rate_estimator": "mempool_policy"})]);
     assert_eq!(
         smartfee_keys(&r),
-        keyset(&["feerate", "estimator", "blocks", "mempool_health_statistics"])
+        keyset(&["feerate", "estimator", "blocks", "mempool_health_statistics", "mempool_health"])
     );
     let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 1})]);
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]));
@@ -2174,6 +2198,8 @@ fn estimatesmartfee_checks_its_options_as_core_does() {
 fn estimatesmartfee_ignores_an_unknown_options_key() {
     use serde_json::json;
     let mut node = TestNode::start(&[]);
+    // A full health window, so mempool_policy answers.
+    node.mine_blocks(6, HEALTH_ADDR);
     let resp = node
         .rpc_call_with_params(
             "estimatesmartfee",
@@ -2188,13 +2214,52 @@ fn estimatesmartfee_ignores_an_unknown_options_key() {
     let r = &resp["result"];
     assert!(r["feerate"].is_number(), "{r}");
     assert_eq!(r["blocks"], 2, "fee_rate_estimator beside it still applies: {r}");
-    assert_eq!(r["mempool_health_statistics"], json!([]), "verbosity beside it still applies: {r}");
+    assert_eq!(
+        r["mempool_health_statistics"].as_array().map(|a| a.len()),
+        Some(6),
+        "verbosity beside it still applies: {r}"
+    );
     // On its own, an unknown key leaves the default answer.
     let resp = node
         .rpc_call_with_params("estimatesmartfee", vec![json!(6), json!(null), json!({"foo": 1})])
         .unwrap();
     assert!(resp["error"].is_null(), "{resp}");
     assert_eq!(smartfee_keys(&resp["result"]), keyset(&["errors", "blocks"]), "{resp}");
+    node.stop();
+}
+
+/// The health window survives a clean restart that brings the mempool back
+/// (`fees/mempool_health.dat`, kept because it ends at the tip). A restart
+/// without `-persistmempool` brings no mempool back, so the window is
+/// cleared and `mempool_policy` waits for six new blocks, as in Core
+/// (`MempoolLoadFailed`).
+#[test]
+fn the_mempool_health_window_persists_and_clears_without_the_mempool() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    let mempool_policy = |node: &mut TestNode| {
+        node.rpc_call_with_params(
+            "estimatesmartfee",
+            vec![json!(2), json!(null), json!({"fee_rate_estimator": "mempool_policy"})],
+        )
+        .unwrap()["result"]
+            .clone()
+    };
+    node.mine_blocks(6, HEALTH_ADDR);
+    assert!(mempool_policy(&mut node)["feerate"].is_number());
+
+    node.restart_preserving_datadir(&[]);
+    let r = mempool_policy(&mut node);
+    assert!(r["feerate"].is_number(), "the window came back with the mempool: {r}");
+    assert!(node.datadir.join("regtest/fees/mempool_health.dat").exists());
+
+    node.restart_preserving_datadir(&["--persistmempool=0"]);
+    let r = mempool_policy(&mut node);
+    assert_eq!(
+        r["errors"],
+        json!(["mempool_policy: Not enough recent block data for fee rate estimation"]),
+        "no mempool came back, so the window was cleared: {r}"
+    );
     node.stop();
 }
 
@@ -8169,14 +8234,14 @@ fn test_rpc_default_units_sats_emits_integers() {
         "with rpcdefaultunits=sats, mempoolminfee should be integer sat/kvB, got: {}",
         fee
     );
-    // `mempool_policy` answers on a node with no fee history.
+    // satd's ungated `mempool` mode answers on a node with no fee history.
     let est = node
         .rpc_call_with_params(
             "estimatesmartfee",
             vec![
                 serde_json::json!(6),
-                serde_json::Value::Null,
-                serde_json::json!({"fee_rate_estimator": "mempool_policy"}),
+                serde_json::json!("mempool"),
+                serde_json::json!({}),
             ],
         )
         .unwrap();

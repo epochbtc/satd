@@ -64,16 +64,29 @@ header is a planned follow-up.
 Core 32.1's shape: `{feerate, estimator, blocks}` on success and
 `{errors, blocks}` when there is nothing to answer from, with `errors` present
 only then. `options` takes Core's `fee_rate_estimator` (`auto`, the default;
-`block_policy`, the history estimator; `mempool_policy`, the mempool
-simulator) and `verbosity` (2 adds `mempool_health_statistics`, an empty list
-for now). `blocks` is the target the answer was found at: a request for 1 block
-is answered for 2, and `mempool_policy` always answers for 2.
+`block_policy`, the history estimator; `mempool_policy`, Bitcoin Core 32's
+mempool estimator) and `verbosity` (2 adds Core's `mempool_health_statistics`,
+the last six blocks newest first, and satd's `mempool_health` verdict over
+them). `blocks` is the target the answer was found at: a request for 1 block is
+answered for 2, and `mempool_policy` always answers for 2.
+
+`mempool_policy` answers as a Core 32.1 node does. It is refused, with Core's
+error text, until the startup mempool load is over and while the mempool is not
+representative: fewer than 75% of the last six blocks' non-coinbase weight was
+in it before they arrived (a window lighter than one full block passes). It
+then answers with the feerate at which the next block template, best packages
+first, reaches 50% of a block's weight (`conservative`) or 75%
+(`economical`), floored where the template does not reach that far. The
+six-block window is kept in `fees/mempool_health.dat` across restarts, and
+cleared when no mempool comes back at startup (`-persistmempool=0`, or no
+`mempool.dat`), so the estimator waits for six new blocks, as Core's does.
 
 Every answer is floored at the rolling mempool minimum, `-minrelaytxfee` and 1
-sat/vB, whichever is highest. Three things differ from Core: an unknown
+sat/vB, whichever is highest. Four things differ from Core: an unknown
 `fee_rate_estimator` value means `auto` rather than an error, an unknown key in
-`options` is ignored rather than refused, and `estimator` is on every answer
-and can be `floor`, meaning the floor set the number. See
+`options` is ignored rather than refused, `estimator` is on every answer and
+can be `floor`, meaning the floor set the number, and `mempool_health` reports
+the health verdict. See
 `CORE_DIFFERENCES.md`.
 
 The mode argument accepts Core's `economical` / `conservative` / `unset`
