@@ -4840,10 +4840,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // have since confirmed or become invalid are silently dropped.
     // Core 32's mempool health window (`fees/mempool_health.dat`), kept only
     // if it ends at the active tip.
-    mempool.open_health(
-        &net_datadir,
-        (chain_state.tip_height() as u64, chain_state.tip_hash()),
-    );
+    {
+        // One read, so the height and hash are of the same tip.
+        let (tip_hash, tip_height) = chain_state.tip_snapshot();
+        mempool.open_health(&net_datadir, (tip_height as u64, tip_hash));
+    }
     let mut mempool_file_read = false;
     if config.persistmempool {
         match node::mempool::persist::load_mempool(
