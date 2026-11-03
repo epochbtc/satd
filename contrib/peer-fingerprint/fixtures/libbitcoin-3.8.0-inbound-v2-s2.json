@@ -1,0 +1,111 @@
+{
+  "capture_format": 1,
+  "label": "libbitcoin-3.8.0-inbound-v2",
+  "implementation": "libbitcoin",
+  "implementation_version": "3.8.0",
+  "network": "regtest",
+  "connection": "inbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": -1,
+    "note": "cannot mine on regtest; never left IBD"
+  },
+  "recorder": {
+    "greeting": "satd-0.7.0",
+    "protocol_version": 70016,
+    "services": 3081,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 0,
+  "transport": "v1",
+  "v1_after_v2": null,
+  "version": {
+    "protocol_version": 70013,
+    "services": 9,
+    "services_hex": "0000000000000009",
+    "user_agent": "/libbitcoin:3.8.0/",
+    "start_height": 0,
+    "relay": false,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "verack"
+  ],
+  "received": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version",
+      "len": 104,
+      "fields": {
+        "protocol_version": 70013,
+        "services": 9,
+        "services_hex": "0000000000000009",
+        "user_agent": "/libbitcoin:3.8.0/",
+        "start_height": 0,
+        "relay": false,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendcmpct"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "feefilter"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "ping"
+    }
+  ],
+  "probes": [],
+  "closed_by_peer": {
+    "t_ms": 0,
+    "phase": "passive"
+  },
+  "error": null,
+  "session": 2
+}

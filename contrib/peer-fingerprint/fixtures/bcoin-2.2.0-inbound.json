@@ -1,0 +1,272 @@
+{
+  "capture_format": 1,
+  "label": "bcoin-2.2.0-inbound",
+  "implementation": "bcoin",
+  "implementation_version": "2.2.0",
+  "network": "regtest",
+  "connection": "inbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": 1,
+    "note": "RPC reports no IBD state; its tip was mined seconds before the capture"
+  },
+  "recorder": {
+    "greeting": "satd-0.7.0",
+    "protocol_version": 70016,
+    "services": 3081,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 0,
+  "transport": "v1",
+  "v1_after_v2": null,
+  "version": {
+    "protocol_version": 70015,
+    "services": 9,
+    "services_hex": "0000000000000009",
+    "user_agent": "/bcoin:2.2.0/",
+    "start_height": 1,
+    "relay": true,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "verack",
+    "addr",
+    "sendcmpct",
+    "getaddr",
+    "getblocks",
+    "headers",
+    "pong"
+  ],
+  "received": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version",
+      "len": 99,
+      "fields": {
+        "protocol_version": 70015,
+        "services": 9,
+        "services_hex": "0000000000000009",
+        "user_agent": "/bcoin:2.2.0/",
+        "start_height": 1,
+        "relay": true,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    },
+    {
+      "t_ms": 2,
+      "phase": "passive",
+      "command": "addr",
+      "len": 31,
+      "fields": {
+        "count": 1
+      }
+    },
+    {
+      "t_ms": 2,
+      "phase": "passive",
+      "command": "sendcmpct",
+      "len": 9,
+      "fields": {
+        "announce": false,
+        "cmpct_version": 2
+      }
+    },
+    {
+      "t_ms": 3,
+      "phase": "passive",
+      "command": "getaddr",
+      "len": 0
+    },
+    {
+      "t_ms": 3,
+      "phase": "passive",
+      "command": "getblocks",
+      "len": 101,
+      "fields": {
+        "version": 70015,
+        "locator_len": 2,
+        "stop_zero": true
+      }
+    },
+    {
+      "t_ms": 4,
+      "phase": "passive",
+      "command": "headers",
+      "len": 82,
+      "fields": {
+        "count": 1
+      }
+    },
+    {
+      "t_ms": 5,
+      "phase": "passive",
+      "command": "pong",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "t_ms": 10012,
+      "phase": "probe",
+      "command": "pong",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "t_ms": 10014,
+      "phase": "probe",
+      "command": "headers",
+      "len": 82,
+      "fields": {
+        "count": 1
+      }
+    },
+    {
+      "t_ms": 10015,
+      "phase": "probe",
+      "command": "notfound",
+      "len": 37,
+      "fields": {
+        "count": 1,
+        "types": {
+          "witness_tx": 1
+        }
+      }
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "sendcmpct"
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "feefilter"
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "ping"
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "ping"
+    },
+    {
+      "t_ms": 10013,
+      "phase": "probe",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 10014,
+      "phase": "probe",
+      "command": "getdata"
+    },
+    {
+      "t_ms": 10015,
+      "phase": "probe",
+      "command": "fpprobe"
+    }
+  ],
+  "probes": [
+    {
+      "probe": "ping",
+      "command": "ping",
+      "expect": "pong",
+      "disconnected": false,
+      "replies": [
+        "pong"
+      ],
+      "answered": true,
+      "latency_ms": 1,
+      "reply_fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "probe": "getheaders",
+      "command": "getheaders",
+      "expect": "headers",
+      "disconnected": false,
+      "replies": [
+        "headers"
+      ],
+      "answered": true,
+      "latency_ms": 2,
+      "reply_fields": {
+        "count": 1
+      }
+    },
+    {
+      "probe": "getdata_unknown_tx",
+      "command": "getdata",
+      "expect": "notfound",
+      "disconnected": false,
+      "replies": [
+        "notfound"
+      ],
+      "answered": true,
+      "latency_ms": 1,
+      "reply_fields": {
+        "count": 1,
+        "types": {
+          "witness_tx": 1
+        }
+      }
+    },
+    {
+      "probe": "unknown_message",
+      "command": "fpprobe",
+      "expect": null,
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    }
+  ],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

@@ -1,0 +1,32 @@
+{
+  "capture_format": 1,
+  "label": "rbitcoin-0.8.0-inbound",
+  "implementation": "rbitcoin",
+  "implementation_version": "0.8.0",
+  "network": "regtest",
+  "connection": "inbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": -1,
+    "note": "state not readable: <urlopen error [Errno 111] Connection refused>"
+  },
+  "recorder": {
+    "greeting": "satd-0.7.0",
+    "protocol_version": 70016,
+    "services": 3081,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 1,
+  "transport": null,
+  "v1_after_v2": false,
+  "version": null,
+  "commands": [],
+  "received": [],
+  "sent": [],
+  "probes": [],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

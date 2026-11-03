@@ -1,0 +1,32 @@
+{
+  "capture_format": 1,
+  "label": "libbitcoin-3.8.0-outbound-v2",
+  "implementation": "libbitcoin",
+  "implementation_version": "3.8.0",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": -1,
+    "note": "cannot mine on regtest; never left IBD"
+  },
+  "recorder": {
+    "greeting": "satd-0.7.0",
+    "protocol_version": 70016,
+    "services": 3081,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 0,
+  "transport": "v2",
+  "v2_handshake": "failed: Closed",
+  "version": null,
+  "commands": [],
+  "received": [],
+  "sent": [],
+  "probes": [],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}
