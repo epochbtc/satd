@@ -200,6 +200,30 @@ fn unreadable_undo_data_is_an_internal_error() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `getblockstats` refuses a block whose undo row is there but unreadable,
+/// as Core does (`RPC_MISC_ERROR`), instead of pricing it from the live
+/// UTXO set: the coins the block spent are gone from it, so every fee
+/// statistic would come out zero.
+#[test]
+fn unreadable_undo_data_refuses_getblockstats() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = mine_a_spend(&cs);
+    let hash = blocks[101].block_hash().to_string();
+    let before = blockchain::get_block_stats(&cs, &hash).unwrap();
+    assert!(before["totalfee"].as_u64().unwrap() > 0, "premise: the block pays a fee: {before}");
+    cs.store_ref().flush().expect("flush");
+    cs.store_ref().drop_read_overlays();
+    controls.set_undo_unreadable(true);
+
+    let err = blockchain::get_block_stats(&cs, &hash).unwrap_err();
+    assert_eq!(err, blockchain::UNDO_READ_FAILED);
+    assert_eq!(blockchain::get_block_stats_error_code(&err), -1);
+    assert_eq!(blockchain::get_block_stats_error_code("Block not found"), -5);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Without a transaction index the fee and prevouts still come from undo
 /// data: satd looked the spent coins up in the UTXO set and the index.
 #[test]

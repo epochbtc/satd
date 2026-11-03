@@ -1352,6 +1352,17 @@ pub fn get_difficulty(chain_state: &ChainState) -> Value {
     }
 }
 
+/// Core's `getblockstats` error for undo data it cannot read
+/// (`GetUndoChecked`, `src/rpc/blockchain.cpp`), `RPC_MISC_ERROR`.
+pub const UNDO_READ_FAILED: &str = "Can't read undo data from disk";
+
+/// The JSON-RPC error code for a `getblockstats` error message: Core's
+/// `RPC_MISC_ERROR` (-1) for unreadable undo data, else
+/// `RPC_INVALID_ADDRESS_OR_KEY` (-5).
+pub fn get_block_stats_error_code(message: &str) -> i32 {
+    if message == UNDO_READ_FAILED { -1 } else { -5 }
+}
+
 /// `getblockstats` — return per-block statistics.
 pub fn get_block_stats(
     chain_state: &ChainState,
@@ -1391,13 +1402,18 @@ pub fn get_block_stats(
     // the node had connected, i.e. all of them. The filter and silent-payment
     // index runners read prevouts from undo data for precisely this reason.
     //
-    // An undo row that disagrees with the block is corruption rather than a
-    // missing prevout, and no fee figure from the block can be trusted, so
-    // the call is refused by name rather than answered with misattributed
-    // numbers. With no undo row (a block that never connected) the live set
-    // is the only source, and it is correct for exactly that case: the coins
-    // are still there.
-    let profile = match chain_state.get_undo(&hash) {
+    // An undo row that disagrees with the block, or that is there but does
+    // not decode, is corruption rather than a missing prevout, and no fee
+    // figure from the block can be trusted, so the call is refused by name
+    // rather than answered with misattributed numbers. (`get_undo` answers
+    // `None` for an unreadable row, which would send it to the live set
+    // below and report every fee as zero.) With no undo row (a block that
+    // never connected) the live set is the only source, and it is correct
+    // for exactly that case: the coins are still there.
+    let undo = chain_state
+        .read_undo(&hash)
+        .map_err(|_| UNDO_READ_FAILED.to_string())?;
+    let profile = match undo {
         Some(undo) => BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
             format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
         })?,
