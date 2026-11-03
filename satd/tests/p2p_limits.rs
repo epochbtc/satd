@@ -247,6 +247,12 @@ fn a_repeated_tx_in_one_inv_is_processed_once() {
     assert_eq!(log.matches(&format!("got inv: tx {a} new")).count(), 1, "first sight of a, as tx");
     assert_eq!(log.matches(&format!("got inv: witness-tx {a}")).count(), 0, "a again as witness-tx is a duplicate");
     assert_eq!(log.matches(&format!("got inv: tx {b} new")).count(), 1);
+    // A block inv is logged as well, as Core does.
+    let tip: BlockHash = node.rpc_call("getbestblockhash").unwrap()["result"].as_str().unwrap().parse().unwrap();
+    peer.send(NetworkMessage::Inv(vec![Inventory::Block(tip)]));
+    assert!(peer.alive());
+    let log = std::fs::read_to_string(&node.stderr_log).unwrap();
+    assert_eq!(log.matches(&format!("got inv: block {tip} have")).count(), 1);
     // The filter is per message: the next inv is processed afresh.
     peer.send(NetworkMessage::Inv(vec![Inventory::Transaction(a), Inventory::Transaction(a)]));
     assert!(peer.alive());
@@ -256,20 +262,20 @@ fn a_repeated_tx_in_one_inv_is_processed_once() {
 }
 
 /// A node without `NODE_BLOOM` disconnects a peer that asks for a filtered
-/// block, plain or witness, as Core v32 does (`ProcessGetBlockData`,
+/// block, as Core v32 does (`ProcessGetBlockData`,
 /// `net_processing.cpp:2566-2572` at v32.1). satd never offers `NODE_BLOOM`.
+/// The witness form is reserved and unused in Core (`protocol.h:507-509`),
+/// an unknown type that is dropped without a disconnect.
 #[test]
 fn a_filtered_block_request_disconnects_the_peer() {
     let mut node = TestNode::start(&[]);
     let port = node.p2p_port.unwrap();
     node.mine_blocks(1, ADDR);
-    for inv_type in [3u32, 3 | (1 << 30)] {
-        let mut peer = Peer::connect(port);
-        peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type, hash: [0x11; 32] }]));
-        assert!(peer.closed_within(Duration::from_secs(10)), "type {inv_type:#x} must disconnect");
-    }
-    // An ordinary block request on a fresh connection is still answered.
     let mut peer = Peer::connect(port);
-    assert!(peer.alive());
+    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type: 3, hash: [0x11; 32] }]));
+    assert!(peer.closed_within(Duration::from_secs(10)), "MSG_FILTERED_BLOCK must disconnect");
+    let mut peer = Peer::connect(port);
+    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type: 3 | (1 << 30), hash: [0x11; 32] }]));
+    assert!(peer.alive(), "the reserved witness form is an unknown type, not a violation");
     node.stop();
 }

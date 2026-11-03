@@ -5380,8 +5380,8 @@ where
 /// serve task is spawned, and held for the whole connection, so a flood of
 /// idle connections can't exhaust fds/tasks. At capacity the socket is
 /// dropped. A denied peer never draws on that pool: the allowlist is
-/// decided first, and the `403` is written from a small pool of its own
-/// ([`DENIED_IN_FLIGHT`]) under a fixed deadline, so peers outside the
+/// decided first, and a denied connection is closed without a reply under a
+/// small pool of its own ([`DENIED_IN_FLIGHT`]), so peers outside the
 /// allowlist cannot fill the slots allowlisted clients and `sat-cli` need.
 ///
 /// `max_connections` MUST match `server_cfg`'s connection cap; callers

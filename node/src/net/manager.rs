@@ -967,9 +967,6 @@ fn tx_announcement(wtxid_relay: bool, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid
 /// Core's `MSG_FILTERED_BLOCK` (`protocol.h`), an inventory type
 /// `rust-bitcoin` reads as [`Inventory::Unknown`].
 const MSG_FILTERED_BLOCK: u32 = 3;
-/// Core's `MSG_FILTERED_WITNESS_BLOCK`: `MSG_FILTERED_BLOCK` with the
-/// witness flag.
-const MSG_FILTERED_WITNESS_BLOCK: u32 = MSG_FILTERED_BLOCK | (1 << 30);
 
 /// Core's `CInv::ToString`: the inventory type's name and the hash.
 fn inv_to_string(inv: &Inventory) -> String {
@@ -6971,6 +6968,15 @@ impl PeerManager {
             };
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                    // Core logs a block inv whatever the sync state
+                    // (`net_processing.cpp:4377-4379` at v32.1).
+                    if matches!(inv, Inventory::Block(_)) {
+                        let have = self.chain_state.get_block_index(&hash).is_some();
+                        tracing::debug!(
+                            "got inv: block {hash} {} peer={id}",
+                            if have { "have" } else { "new" }
+                        );
+                    }
                     if self.chain_state.get_block_index(&hash).is_none() {
                         blocks_to_get.push(hash);
                     } else {
@@ -12075,8 +12081,11 @@ impl PeerManager {
         // (`net_processing.cpp:2566-2572` at v32.1): a filtered block can only
         // be asked of a node offering `NODE_BLOOM`, which satd never does, so
         // the request is a protocol violation and the peer is disconnected.
+        // Only `MSG_FILTERED_BLOCK` (`IsMsgFilteredBlk`, `protocol.h:530`):
+        // the witness form is reserved and unused (`protocol.h:507-509`), an
+        // unknown type that Core drops without disconnecting.
         if let Inventory::Unknown { inv_type, .. } = inv
-            && (inv_type == MSG_FILTERED_BLOCK || inv_type == MSG_FILTERED_WITNESS_BLOCK)
+            && inv_type == MSG_FILTERED_BLOCK
         {
             tracing::debug!(
                 "filtered block request received when NODE_BLOOM service disabled, disconnecting peer={id}"
