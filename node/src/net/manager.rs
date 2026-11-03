@@ -964,6 +964,13 @@ fn tx_announcement(wtxid_relay: bool, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid
     }
 }
 
+/// Core's `MSG_FILTERED_BLOCK` (`protocol.h`), an inventory type
+/// `rust-bitcoin` reads as [`Inventory::Unknown`].
+const MSG_FILTERED_BLOCK: u32 = 3;
+/// Core's `MSG_FILTERED_WITNESS_BLOCK`: `MSG_FILTERED_BLOCK` with the
+/// witness flag.
+const MSG_FILTERED_WITNESS_BLOCK: u32 = MSG_FILTERED_BLOCK | (1 << 30);
+
 /// Core's `CInv::ToString`: the inventory type's name and the hash.
 fn inv_to_string(inv: &Inventory) -> String {
     match inv {
@@ -12064,6 +12071,19 @@ impl PeerManager {
         inv: Inventory,
         not_found: &mut Vec<Inventory>,
     ) -> bool {
+        // Core's first stateless check in `ProcessGetBlockData`
+        // (`net_processing.cpp:2566-2572` at v32.1): a filtered block can only
+        // be asked of a node offering `NODE_BLOOM`, which satd never does, so
+        // the request is a protocol violation and the peer is disconnected.
+        if let Inventory::Unknown { inv_type, .. } = inv
+            && (inv_type == MSG_FILTERED_BLOCK || inv_type == MSG_FILTERED_WITNESS_BLOCK)
+        {
+            tracing::debug!(
+                "filtered block request received when NODE_BLOOM service disabled, disconnecting peer={id}"
+            );
+            self.disconnect_by_id(id);
+            return false;
+        }
         match inv {
             // `MSG_CMPCT_BLOCK` (BIP 152). A block within
             // `MAX_CMPCTBLOCK_DEPTH` of the tip is answered with a

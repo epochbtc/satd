@@ -254,3 +254,22 @@ fn a_repeated_tx_in_one_inv_is_processed_once() {
     assert_eq!(log.matches(&format!("got inv: tx {a}")).count(), 2);
     node.stop();
 }
+
+/// A node without `NODE_BLOOM` disconnects a peer that asks for a filtered
+/// block, plain or witness, as Core v32 does (`ProcessGetBlockData`,
+/// `net_processing.cpp:2566-2572` at v32.1). satd never offers `NODE_BLOOM`.
+#[test]
+fn a_filtered_block_request_disconnects_the_peer() {
+    let mut node = TestNode::start(&[]);
+    let port = node.p2p_port.unwrap();
+    node.mine_blocks(1, ADDR);
+    for inv_type in [3u32, 3 | (1 << 30)] {
+        let mut peer = Peer::connect(port);
+        peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type, hash: [0x11; 32] }]));
+        assert!(peer.closed_within(Duration::from_secs(10)), "type {inv_type:#x} must disconnect");
+    }
+    // An ordinary block request on a fresh connection is still answered.
+    let mut peer = Peer::connect(port);
+    assert!(peer.alive());
+    node.stop();
+}

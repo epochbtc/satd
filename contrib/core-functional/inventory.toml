@@ -761,9 +761,7 @@ status = "run"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L30 test_message_causes_disconnect times out waiting for the disconnect"
+status = "run"
 
 [[test]]
 file = "p2p_node_network_limited.py"
