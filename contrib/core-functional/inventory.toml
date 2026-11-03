@@ -985,9 +985,7 @@ status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L59 a too-long Bech32 string reports error_locations [90..107] where v32 expects [90]"
+status = "run"
 
 [[test]]
 file = "rpc_invalidateblock.py"
