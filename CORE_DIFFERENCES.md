@@ -605,20 +605,20 @@ preserved; the satd extension is opt-in per request or per flag.
   `CCheckQueue` but not across blocks.
 
 - **PSBT version 2 (BIP 370) and the BIP 375 silent payment fields** —
-  every PSBT method accepts a version 2 PSBT and answers with one. Core
-  does not: `PSBT_HIGHEST_VERSION` is 0 in its 2026-03 tree and the
-  version 2 pull request (#21283) is still open, so Core rejects any
-  PSBT whose `PSBT_GLOBAL_VERSION` is above zero. This is a superset,
-  not a divergence: the version 0 path is byte-identical to what it was,
-  error text included, and is guarded by a snapshot test. Four notes for
-  anyone comparing against Core.
+  every PSBT method accepts a version 2 PSBT and answers with one, as
+  Core does since v32 (up to v31 Core rejected any PSBT whose
+  `PSBT_GLOBAL_VERSION` was above zero). The version 0 path is
+  byte-identical to what it was, error text included, and is guarded by
+  a snapshot test. `createpsbt` and `converttopsbt` default to version 0
+  where Core v32 defaults to 2 (see `converttopsbt psbt_version` below).
+  The BIP 375 silent payment fields are satd's own. Four notes for anyone
+  comparing against Core.
 
   - `decodepsbt` on a version 2 PSBT returns a different shape, with
     `psbt_version`, `tx_version`, `fallback_locktime`, per-input
     `previous_txid` / `previous_vout` / `sequence`, per-output `amount`
     and `script`, a `silent_payments` object, and an `unknown` object
-    per map. Field names follow Core's own version 2 pull request where
-    it has one. `tx` and `tx_hex` appear only once every output has a
+    per map. Field names follow Core v32's where it has one. `tx` and `tx_hex` appear only once every output has a
     script: a silent payment output whose script has not been computed
     yet describes no transaction, and emitting an empty script instead
     would read as an output paying nobody.
