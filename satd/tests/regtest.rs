@@ -5564,6 +5564,10 @@ fn converttopsbt_refuses_a_psbt_version_it_cannot_produce() {
     assert!(ok["result"].as_str().unwrap().starts_with("cHNidP8"), "{ok}");
     let two = call(&mut node, json!(2));
     assert_eq!(two["error"]["code"], -8, "{two}");
+    assert_eq!(
+        two["error"]["message"],
+        "converttopsbt does not create version 2 PSBTs; use createpsbt psbt_version=2"
+    );
     let named = node
         .rpc_call_with_named_params("converttopsbt", json!({"hexstring": hex_tx, "psbt_version": 3}))
         .unwrap();
