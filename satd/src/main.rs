@@ -2802,6 +2802,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         peer_manager.set_external_addrs(config.externalip.clone());
     }
 
+    // -discover: announce the address outbound peers report seeing us at.
+    peer_manager.set_discover(config.discover_port());
+
     // -whitelist: per-subnet net permissions (noban, relay, ...).
     if !config.whitelist.is_empty() {
         peer_manager.set_whitelist(config.whitelist.clone());

@@ -59,6 +59,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: a peer that asks for a filtered block (`MSG_FILTERED_BLOCK`) is disconnected, as Core v32 does without `NODE_BLOOM` (#1204).
 - P2P: under `-blocksonly`, every `cmpctblock` is ignored, as in Core v32, including one for a block the node requested (#1204).
 - P2P: the node's onion address is announced only to peers that cannot see its IP (in on the onion listener, or out through the proxy), `-externalip` is no longer sent beside it or in the version message's `addr_from`, and `getaddr` replies never carry the node's own addresses (#1209).
+- P2P: `-discover` announces to outbound clearnet peers the address they report seeing the node at, off by default (Core's is on) (#1209).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

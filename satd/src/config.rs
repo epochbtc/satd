@@ -1060,6 +1060,9 @@ pub struct Config {
     /// addresses. Default true. satd gates DNS seeding on both `dns`
     /// and `dnsseed`, so either set to false disables it.
     pub dnsseed: bool,
+    /// Bitcoin Core's `-discover`: announce to an outbound peer the address
+    /// it reports seeing us at. Off by default, where Core's is on.
+    pub discover: bool,
     /// Bitcoin Core's `-forcednsseed`: query DNS seeds even when the
     /// address book already has entries. Default false.
     pub forcednsseed: bool,
@@ -4435,6 +4438,10 @@ impl Config {
                 .or_else(|| file_get("dns").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
             dnsseed,
+            discover: cli
+                .discover
+                .or_else(|| file_get("discover").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
             forcednsseed: cli
                 .forcednsseed
                 .or_else(|| file_get("forcednsseed").and_then(|v| parse_bool(&v)))
@@ -4917,6 +4924,7 @@ impl Config {
                 "bind": self.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "dns": self.dns,
                 "dnsseed": self.dnsseed,
+                "discover": self.discover,
                 "forcednsseed": self.forcednsseed,
                 "fixedseeds": self.fixedseeds,
                 "connect": self.connect,
@@ -6297,6 +6305,19 @@ pub struct CliArgs {
         help = "Query DNS seeds for peer addresses (default: true; requires -dns)"
     )]
     pub dnsseed: Option<bool>,
+
+    /// Bitcoin Core's `-discover`: announce to an outbound clearnet peer the
+    /// address it reports seeing us at, when no `-externalip` covers that IP
+    /// family. Off by default (Core's is on).
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Announce the address outbound peers report seeing us at (default: false)"
+    )]
+    pub discover: Option<bool>,
 
     /// Bitcoin Core's `-forcednsseed`: always query DNS seeds, even when
     /// the address book is already populated.
@@ -8633,6 +8654,14 @@ fn parse_onion_externalip(s: &str, default_port: u16) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+impl Config {
+    /// The listen port `-discover` announces with, or `None` when discovery
+    /// is off or the node does not listen (Core's `fListen` gate).
+    pub fn discover_port(&self) -> Option<u16> {
+        (self.discover && self.listen).then_some(self.port)
+    }
+}
+
 /// Boolean options Core negates with a `-no` prefix, which [`normalize_args`]
 /// rewrites to an explicit value.
 const NEGATABLE_BOOL_FLAGS: &[&str] = &[
@@ -8647,6 +8676,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "v2transport",
     "v2only",
     "dns",
+    "discover",
     "dnsseed",
     "forcednsseed",
     "fixedseeds",
@@ -8968,6 +8998,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "addnode",
         "seednode",
         "dns",
+        "discover",
         "dnsseed",
         "forcednsseed",
         "fixedseeds",
@@ -9650,6 +9681,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cmpctblockprefillbytes",
     "maxuploadtarget",
     "dns",
+    "discover",
     "dnsseed",
     "forcednsseed",
     "fixedseeds",
@@ -9912,7 +9944,6 @@ const FATAL_UNSUPPORTED_KEYS: &[(&str, &str)] = &[
 const SKIP_GUIDANCE: &[(&str, &str)] = &[
     ("rest", "satd ships a native Esplora REST API instead of Core's /rest/ surface; enable it with -esplora (on by default)."),
     ("peerbloomfilters", "BIP37 bloom filters are intentionally unsupported (privacy / DoS); use BIP157/158 compact filters via -blockfilterindex / -peerblockfilters."),
-    ("discover", "external-IP auto-discovery is not supported; advertise your address explicitly with -externalip."),
     ("maxorphantx", "this option was removed in Bitcoin Core v30 as well."),
     ("natpmp", "satd does not implement PCP/NAT-PMP port mapping; configure port forwarding externally."),
     ("debuglogfile", "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime."),
@@ -12745,6 +12776,7 @@ testactivationheight=bip34@2
             seednode: vec![],
             dns: None,
             dnsseed: None,
+            discover: None,
             forcednsseed: None,
             fixedseeds: None,
             bantime: None,
@@ -13066,6 +13098,7 @@ testactivationheight=bip34@2
             seednode: vec![],
             dns: None,
             dnsseed: None,
+            discover: None,
             forcednsseed: None,
             fixedseeds: None,
             bantime: None,
@@ -15739,6 +15772,32 @@ mcpallowedhost=node.local
         assert_eq!(classify_unsupported_key("forcednsseed"), None);
         assert_eq!(classify_unsupported_key("fixedseeds"), None);
         assert!(is_known_config_key("forcednsseed") && is_known_config_key("fixedseeds"));
+    }
+
+    // ---- discover ----
+
+    /// `-discover` is off unless asked for (Core's is on), Core's spellings
+    /// all turn it on, and a node that does not listen announces nothing.
+    #[test]
+    fn discover_is_off_by_default_and_needs_a_listener() {
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
+        assert!(!cfg.discover && cfg.discover_port().is_none(), "discover defaults off");
+        for argv in [vec!["satd", "--regtest", "-discover"], vec!["satd", "--regtest", "-discover=1"]] {
+            let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
+            let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
+            assert_eq!(cfg.discover_port(), Some(cfg.port));
+        }
+        let argv = normalize_args(
+            ["satd", "--regtest", "-discover", "-nodiscover"].iter().map(|s| s.to_string()).collect(),
+        );
+        assert!(!Config::from_cli(parse_cli(argv).unwrap()).unwrap().discover);
+        let argv = normalize_args(
+            ["satd", "--regtest", "-discover", "-listen=0"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
+        assert!(cfg.discover && cfg.discover_port().is_none(), "no listener, nothing to announce");
+        assert!(is_known_config_key("discover"));
+        assert_eq!(classify_unsupported_key("discover"), None);
     }
 
     // ---- asmap ----

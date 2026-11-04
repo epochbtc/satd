@@ -1276,6 +1276,12 @@ pub struct PeerManager {
     /// `-externalip` onion, advertised or not. `getaddr` replies never
     /// carry one.
     own_onions: RwLock<std::collections::HashSet<String>>,
+    /// `-discover`: the listen port to announce with the address an outbound
+    /// peer says it sees us at, or 0 when discovery is off (the default).
+    discover_port: std::sync::atomic::AtomicU16,
+    /// Every IP this node announced as its own after a peer reported it
+    /// (`-discover`). `getaddr` replies never carry one, as for `-externalip`.
+    discovered_ips: RwLock<std::collections::HashSet<IpAddr>>,
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
@@ -1677,6 +1683,8 @@ impl PeerManager {
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             own_onions: RwLock::new(std::collections::HashSet::new()),
+            discover_port: std::sync::atomic::AtomicU16::new(0),
+            discovered_ips: RwLock::new(std::collections::HashSet::new()),
             whitelist: RwLock::new(Vec::new()),
             // Core's rule off regtest: routable addresses only. Regtest keeps
             // private ones, which lab networks run on.
@@ -2089,6 +2097,28 @@ impl PeerManager {
         self.own_onions.write().extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
     }
 
+    /// Core's `-discover`: announce, to an outbound peer, the address it
+    /// reports seeing us at, with our listen `port`. `None` turns it off.
+    /// satd's default is off, where Core's is on: the operator chooses
+    /// whether the clearnet IP is announced.
+    pub fn set_discover(&self, port: Option<u16>) {
+        self.discover_port.store(port.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Core's `IsPeerAddrLocalGood` with `GetLocalAddrForPeer`'s outbound
+    /// port rule: the address `info`'s peer reports seeing us at, with our
+    /// listen port, when `-discover` is on and both ends are routable.
+    /// Never on a link that hides our IP: a proxied peer sees the proxy's
+    /// exit, and announcing anything there ties the link to an IP.
+    fn peer_reported_local(&self, info: &PeerInfo) -> Option<SocketAddr> {
+        let port = self.discover_port.load(Ordering::Relaxed);
+        if port == 0 || self.link_hides_our_ip(info) || !crate::net::is_routable(info.addr.ip()) {
+            return None;
+        }
+        let ip = info.version.as_ref()?.receiver.socket_addr().ok()?.ip().to_canonical();
+        crate::net::is_routable(ip).then(|| SocketAddr::new(ip, port))
+    }
+
     /// Stop advertising an onion address: the hidden service is gone (#973).
     pub fn clear_advertised_onion(&self) {
         if self.advertised_onion.write().take().is_some() {
@@ -2250,7 +2280,8 @@ impl PeerManager {
     }
 
     /// Whether `addr` is one of ours: an onion of ours (any port; see
-    /// `own_onions`), or the IP of an `-externalip` address. A `getaddr`
+    /// `own_onions`), or the IP of an `-externalip` address or of one
+    /// `-discover` announced. A `getaddr`
     /// reply never carries one: our onion arriving from our clearnet IP, or
     /// the other way round, would link the two.
     fn is_own_address(&self, addr: &PeerAddr) -> bool {
@@ -2259,6 +2290,7 @@ impl PeerManager {
             PeerAddr::Socket(sa) => {
                 let ip = sa.ip().to_canonical();
                 self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
+                    || self.discovered_ips.read().contains(&ip)
             }
         }
     }
@@ -2266,7 +2298,8 @@ impl PeerManager {
     /// The self-advertisement of our `-externalip` addresses to peer `id`:
     /// those on the peer's IP family (IPv4 with IPv4-mapped included), as
     /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
-    /// are none, or the peer is an onion peer.
+    /// are none, or the peer is an onion peer. With none on the peer's
+    /// family, `-discover` sends the address the peer reports seeing us at.
     #[cfg(test)]
     fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
         let onion = self.advertised_onion.read().clone();
@@ -2277,14 +2310,20 @@ impl PeerManager {
     /// the handshake read once for both self-advertisements: read twice, a
     /// registration between the reads would send a hidden link both.
     fn self_advertise_externals_given(&self, id: PeerId, our_onion: Option<&PeerAddr>) -> Option<NetworkMessage> {
-        let (peer_v4, wants_v2, onion, hidden) = {
+        let (peer_v4, wants_v2, onion, hidden, reported) = {
             let peers = self.peers.read();
             let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
             let v4 = match h.info.addr.ip() {
                 IpAddr::V4(_) => true,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
             };
-            (v4, h.info.wants_addrv2, h.info.onion_host.is_some(), self.link_hides_our_ip(&h.info))
+            (
+                v4,
+                h.info.wants_addrv2,
+                h.info.onion_host.is_some(),
+                self.link_hides_our_ip(&h.info),
+                self.peer_reported_local(&h.info),
+            )
         };
         // A link that hides our IP is told our onion (`self_advertise_addrv2`)
         // when we have one; our IP beside it would link the two. With no
@@ -2307,6 +2346,19 @@ impl PeerManager {
             })
             .map(|a| GetAddrEntry { addr: PeerAddr::Socket(*a), time, services })
             .collect();
+        // `-externalip` is the operator's word and wins; Core instead swaps
+        // in the peer's report one time in two (or eight). A report on
+        // another family than the link's is not one this peer can check.
+        let mine = if mine.is_empty()
+            && let Some(sa) = reported
+            && sa.is_ipv4() == peer_v4
+        {
+            self.discovered_ips.write().insert(sa.ip());
+            tracing::debug!("Advertising address {sa} to peer={id}");
+            vec![GetAddrEntry { addr: PeerAddr::Socket(sa), time, services }]
+        } else {
+            mine
+        };
         if mine.is_empty() {
             return None;
         }
