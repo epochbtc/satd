@@ -2217,6 +2217,42 @@ impl PeerManager {
         Some((token.clone(), token))
     }
 
+    /// Whether a connection keeps our own IP from the peer: it came in on
+    /// the onion listener, or went out through the proxy (to an onion, to a
+    /// name the proxy resolved, or to a routable address under `-proxy`).
+    /// Only such a link is told our onion.
+    fn link_hides_our_ip(&self, info: &PeerInfo) -> bool {
+        info.inbound_onion
+            || (info.direction == Direction::Outbound
+                && (info.onion_host.is_some()
+                    || info.addr_name.is_some()
+                    || self.dials_through_proxy(info.addr)))
+    }
+
+    /// Whether a direct dial to `addr` goes through `-proxy`: only a routable
+    /// address does (see [`Self::dial_direct`]).
+    fn dials_through_proxy(&self, addr: SocketAddr) -> bool {
+        self.proxy.is_some() && crate::net::is_routable(addr.ip())
+    }
+
+    /// Whether `addr` is one of ours: the onion we advertise (any port), or
+    /// the IP of an `-externalip` address. A `getaddr` reply never carries
+    /// one: our onion arriving from our clearnet IP, or the other way round,
+    /// would link the two.
+    fn is_own_address(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Onion { host, .. } => self
+                .advertised_onion
+                .read()
+                .as_ref()
+                .is_some_and(|ours| matches!(ours, PeerAddr::Onion { host: h, .. } if h.eq_ignore_ascii_case(host))),
+            PeerAddr::Socket(sa) => {
+                let ip = sa.ip().to_canonical();
+                self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
+            }
+        }
+    }
+
     /// The self-advertisement of our `-externalip` addresses to peer `id`:
     /// those on the peer's IP family (IPv4 with IPv4-mapped included), as
     /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
@@ -2265,8 +2301,14 @@ impl PeerManager {
     /// infallible in practice.
     fn self_advertise_addrv2(&self, id: PeerId) -> Option<bitcoin::p2p::address::AddrV2Message> {
         // A block-relay-only link carries no address traffic (Core's
-        // `SetupAddressRelay`); our onion on one would link the two.
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2 && h.info.relays_addrs()) {
+        // `SetupAddressRelay`); our onion on one would link the two. Nor
+        // does it go on a link that shows the peer our own IP: the onion
+        // arriving from that IP would tie the hidden service to it. Core
+        // has no such rule (`GetReachabilityFrom` ranks an onion local
+        // address `REACH_DEFAULT` for an IPv4 peer).
+        if !self.peers.read().get(&id).is_some_and(|h| {
+            h.info.wants_addrv2 && h.info.relays_addrs() && self.link_hides_our_ip(&h.info)
+        }) {
             return None;
         }
         let onion = self.advertised_onion.read().clone()?;
@@ -2300,6 +2342,15 @@ impl PeerManager {
     /// Core's `GetTime` does; Core's `p2p_getaddr_caching.py` moves the mock
     /// past it to see the answers change.
     fn getaddr_reply(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
+        let mut reply = self.getaddr_sample(listener, uncached);
+        // Applied to the cached answer too: our onion may have been
+        // registered, or gossiped back to us, after the sample was taken.
+        reply.retain(|e| !self.is_own_address(&e.addr));
+        reply
+    }
+
+    /// The cached or fresh sample behind [`Self::getaddr_reply`].
+    fn getaddr_sample(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
         let now = crate::time::now_secs();
         if !uncached
             && let Some((expiry, cached)) = self.addr_response_cache.lock().get(&listener)
@@ -13579,7 +13630,7 @@ impl PeerManager {
     /// placeholder proxy that never accepts.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
-        let use_proxy = self.proxy.is_some() && crate::net::is_routable(addr.ip());
+        let use_proxy = self.dials_through_proxy(addr);
         if let Some(ref proxy_addr) = self.proxy {
             if use_proxy {
                 // Per-dial random SOCKS credentials isolate this peer on its own Tor
@@ -13900,10 +13951,11 @@ impl PeerManager {
         // Proactively advertise our own hidden service to this peer so the
         // network can discover and dial us inbound. A v3 onion only rides on
         // addrv2, so this fires only for peers that sent `sendaddrv2` (captured
-        // during the handshake). Sent to both inbound and outbound peers — they
-        // relay it onward, which is the actual propagation seed; without it a
-        // listenonion node is reachable only by peers handed the address out of
-        // band.
+        // during the handshake), and only on a link that keeps our IP from
+        // the peer (see `self_advertise_addrv2`), in either direction. Those
+        // peers relay it onward, which is the actual propagation seed; without
+        // it a listenonion node is reachable only by peers handed the address
+        // out of band.
         //
         // Before it, our `-externalip` addresses, to an outbound peer on the
         // same IP family: Core pushes its local address for the peer's network
