@@ -11,45 +11,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-On `release/0.7.x`, bound for **0.7.1**. This is an index: every item below is written up in
-full in the in-development
-[`docs/release-notes/0.7.1-pre.md`](docs/release-notes/0.7.1-pre.md).
-
-- RPC: any request `Content-Type` is read as JSON, as in Core (#824).
-- RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
-- RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
-- RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
-- P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
-- P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
-- Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
-- Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
-- RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
-- RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
-- Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
-- Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
-- Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
-- P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
-- P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
-- HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).
-- HTTP: shutdown closes streamws WebSockets with `1001 Going Away` and ends SSE streams on streamws and Esplora (#822).
-- Operator: TLS handshake timeouts and accept errors are logged under a per-listener budget, and Stratum's V1, V1-TLS and V2 listeners report at-capacity refusals separately (#825).
-- RPC: a bearer token without a method's capability gets `-32004` before the method's parameters are checked (#826).
-- Esplora: `-esplorarequesttimeout=0` no longer zeroes the TLS handshake budget (#826).
-- HTTP: `-rpcservertimeout` and `-esplorarequesttimeout` above a year are treated as a year, instead of failing every connection (#826).
-- Operator: the plain metrics listener holds at most 64 connections and closes one that sends no request within 30 s (#826).
-- Storage: block reads no longer wait behind each stored block's fsync; a block file never grows past its cap; a re-fetched block frees its IBD slot (#547).
-- Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
-- Packaging: the Nix build of `satd` no longer depends on the build host's CPU; jemalloc's address width, page and hugepage size are pinned on x86_64, and `flake.lock` is committed so a rebuild of a tag evaluates the same Nix inputs; the x86_64 Linux release tarballs pin the same jemalloc constants (#321).
-- Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
-- Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
-- Consensus: `-reindex` holds every block in the block files to the header rules header sync applies (difficulty schedule, median time past, version, checkpoints), and neither replays nor indexes one that breaks them, or any block built on it (#506).
-- Operator: AssumeUTXO background validation retries a failed block connect instead of stopping, its three alerts reach the `status` stream, webhooks and `satd_alert_active` as well as `getwarnings`, and new `satd_assumeutxo_*` gauges show its progress (#557).
-- Streaming: `Subscribe` and `Watch` responses carry the stream's head cursor in a `satd-head-cursor` header, and the Go and Rust resilient watch and subscription resume from it, so a drop before the first confirmed event no longer loses what was in flight (#777).
+Nothing yet — 0.7.1 was cut on 2026-11-03. On `release/0.7.x`, add a one-line bullet
+here for every user-facing change, and the full write-up to the next
+`docs/release-notes/<version>-pre.md` (bound for 0.7.2).
 
 ## Releases
 
 | Version | Date | Notes |
 |---|---|---|
+| [0.7.1](docs/release-notes/0.7.1.md) | 2026-11-03 | Bug fixes for 0.7.0. **Signet blocks must carry the scheduled difficulty**, and **`-reindex` holds every stored block to the header rules header sync applies**. RPC as Core reads it: any request `Content-Type`, `warnings` always an array (`-deprecatedrpc=warnings` keeps the string), `getnetworkinfo` reachability from `-onlynet`, and `testmempoolaccept` agreeing with `sendrawtransaction` under an `allow` rule. RPC and P2P no longer freeze together on a 1-CPU host; a client that stops reading is disconnected; shutdown closes WebSockets and SSE streams; the metrics listener is capped. AssumeUTXO background validation retries a failed connect, and its alerts, under new ids, reach every surface. Sparrow batches against the Electrum server. Block reads no longer wait behind fsync, and a pruned node prunes during IBD. `reindex=1` in `bitcoin.conf` is honoured. The Go and Rust SDKs resume a watch from the stream's head cursor. The Nix build is reproducible across x86_64 CPUs. No reindex. |
 | [0.7.0](docs/release-notes/0.7.0.md) | 2026-10-30 | Bitcoin Core parity across mempool, relay and P2P, and OP_RETURN pruning. **Bitcoin Core's ZMQ notifications**, byte for byte, so LND's `bitcoind` backend and Umbrel's apps run against satd unchanged. The mempool follows Core v31: **package CPFP and package RBF in `submitpackage`**, **TRUC (version 3) transactions**, cluster limits and cluster-diagram replacements, Core's script policy and sigop-adjusted sizes; transactions relay on Core's schedule, with 1-parent-1-child package relay, Core v30's orphanage and one download per announcement. **OP_RETURN data pruning** (`-pruneopreturn`, off by default) strips large OP_RETURN payloads from deep blocks while txids and every API keep working, and `-restoreopreturns` downloads them again. Node attestations (`-nap`, `-napaggregator`, off by default), `verifybip322`, `gettxspendingprevout`, Esplora and Electrum answers that name their chain tip and take `asof`, and Core's rules for headers (contextual checks on every path, no forks below the last checkpoint), `-assumevalid`, `-onlynet`, address relay, block serving and P2P message parsing (`bitcoin` 0.32.102). No reindex. Defaults that change to Core's: `-proxy` turns listening off, the mempool refuses non-standard scripts and clusters over 64, transactions reach peers a few seconds later, `getblock` and `getrawtransaction` drop the fields Core lacks, pruned nodes advertise `NODE_NETWORK_LIMITED`, list options merge `bitcoin.conf` and the command line, and new datadir files are 0600. A datadir that has used `-pruneopreturn` does not open in 0.6.x. |
 | [0.6.3](docs/release-notes/0.6.3.md) | 2026-10-21 | Security release. With `-rpctls`, `sat-cli` and `sat-tui` trust only the CA named by `-rpccacert` instead of adding it to the public roots, so no public CA can stand in for the node and receive the RPC credentials. A `-rpccacert` that does not name the node certificate's issuer is now refused. The node is unchanged from 0.6.2. No reindex. |
 | [0.6.2](docs/release-notes/0.6.2.md) | 2026-10-20 | Security release. Certificates that chain through the eMudhra (emSign) intermediate CAs, whose private keys were disclosed, are refused wherever satd, `sat-cli` and `sat-tui` check a server against the public roots: alert webhooks, TLS JSON-RPC clients, `satd-events-client` without a pinned CA, and the `--fast-start` download. `rustls-webpki` 0.103.16, `webpki-roots` 1.0.10 (RUSTSEC-2026-0381 to 0383). The 0.6.0 appliance images are superseded. No reindex. |
@@ -66,4 +36,4 @@ full in the in-development
 | [0.2.0](docs/release-notes/0.2.0.md) | 2026-05-27 | BIP 324 v2 transport, native TLS, client-side PSBT signing, Core CLI/config-compat gap closed, AssumeUTXO fast-start. **Breaking storage cleanup** — see notes. |
 | [0.1.0](docs/release-notes/0.1.0.md) | 2026-05-08 | First public release: mainnet-validated node, native Esplora/Electrum/cfilters, Core-compatible RPC/CLI, signed reproducible builds. |
 
-[Unreleased]: https://github.com/epochbtc/satd/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/epochbtc/satd/compare/v0.7.1...HEAD
