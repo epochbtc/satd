@@ -154,7 +154,8 @@ impl HeadersQueue {
     }
 
     /// The headers thread is going: later pushes are handed back, with
-    /// whatever is still queued ahead of them.
+    /// whatever is still queued ahead of them, and [`Self::take_stranded`]
+    /// hands back the rest.
     pub fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -163,9 +164,25 @@ impl HeadersQueue {
         self.cvar.notify_all();
     }
 
+    /// Once the thread has gone, the jobs it left, in order, for the caller
+    /// to handle inline. Nothing while it is running.
+    pub fn take_stranded(&self) -> Vec<HeadersJob> {
+        let mut state = self.state.lock();
+        if !state.closed {
+            return Vec::new();
+        }
+        state.bytes = 0;
+        std::mem::take(&mut state.jobs).into()
+    }
+
     /// Wake a headers thread waiting in [`Self::pop`].
     pub fn wake(&self) {
         self.cvar.notify_all();
+    }
+
+    /// The headers thread has gone.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().closed
     }
 
     /// Nothing queued and nothing being handled.
@@ -253,6 +270,21 @@ mod tests {
         assert!(q.pop(Duration::ZERO).is_none(), "a closed queue gives the thread nothing");
         let back = q.push(job(3, 10)).expect_err("a closed queue hands jobs back");
         assert_eq!(back.iter().map(|j| j.peer).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(q.is_idle());
+        assert_eq!(q.queued_bytes(), 0);
+    }
+
+    /// A running queue strands nothing; a closed one hands back what it held,
+    /// in order, once.
+    #[test]
+    fn a_closed_queue_gives_up_its_stranded_jobs_once() {
+        let q = HeadersQueue::new(1000);
+        assert!(q.push(job(1, 10)).is_ok());
+        assert!(q.take_stranded().is_empty(), "the thread still owns them");
+        assert!(q.push(job(2, 10)).is_ok());
+        q.close();
+        assert_eq!(q.take_stranded().iter().map(|j| j.peer).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(q.take_stranded().is_empty());
         assert!(q.is_idle());
         assert_eq!(q.queued_bytes(), 0);
     }

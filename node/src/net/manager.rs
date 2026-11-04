@@ -5874,6 +5874,11 @@ impl PeerManager {
                 AfterDrain::Maintain => pacer.maintained(now),
             }
 
+            // Messages a headers thread that has gone left queued: handled
+            // here, so they wait at most a tick rather than for the next
+            // header batch, which after IBD is a block interval away.
+            self.drain_stranded_headers();
+
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
             self.refresh_headers_tip();
@@ -8339,6 +8344,14 @@ impl PeerManager {
         }
     }
 
+    /// Handle, here and in order, the messages a headers thread that has
+    /// gone left queued. Nothing while the thread is running.
+    fn drain_stranded_headers(&self) {
+        for job in self.headers_queue.take_stranded() {
+            self.handle_message_now(job.peer, job.msg, job.in_flight);
+        }
+    }
+
     /// Wait, up to 10 s, for the headers thread to handle everything queued.
     /// Panics at the deadline.
     #[cfg(test)]
@@ -8378,6 +8391,9 @@ impl PeerManager {
                 return;
             }
             let Some(job) = queue.pop(Duration::from_millis(500)) else {
+                if queue.is_closed() {
+                    return;
+                }
                 continue;
             };
             let Some(pm) = peer_manager.upgrade() else {
@@ -19610,6 +19626,40 @@ mod tests {
             "the inv was handled before the batch it followed: {msgs:?}"
         );
         assert_eq!(block_requests(&msgs, h2), vec![true], "the block is asked for once: {msgs:?}");
+    }
+
+    /// Messages a headers thread that has gone left queued are handled by
+    /// the run loop's next tick, not left until the next header batch, which
+    /// after IBD is a block interval away: a pong behind them would wait that
+    /// long.
+    ///
+    /// Fails if the drain hands back nothing: the queued `inv` stays
+    /// unhandled and its in-flight count held.
+    #[test]
+    fn messages_a_gone_headers_thread_left_are_handled_by_the_next_tick() {
+        let f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let flow = f.pm.peer_flow(1).expect("peer 1 is connected");
+
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Inv(vec![Inventory::Block(h2)]), "a block inv");
+        // The thread goes once it has finished the batch in hand, leaving the
+        // `inv` queued behind it.
+        f.pm.headers_queue.close();
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f.pm.connector_threads.lock().iter().any(|(n, t)| *n == "headers" && t.is_finished()) {
+            assert!(Instant::now() < deadline, "the headers thread did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "fixture: the batch in hand was handled");
+        assert!(!flow.is_idle(), "fixture: the inv is stranded, its count held");
+
+        f.pm.drain_stranded_headers();
+        assert!(flow.is_idle(), "the stranded inv is handled and counted out");
+        assert!(f.pm.headers_queue.is_idle());
     }
 
     /// A transaction `inv` does not depend on headers and is not held behind
