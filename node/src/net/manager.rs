@@ -13976,6 +13976,11 @@ impl PeerManager {
             // otherwise-healthy peer we just spent a full Tor rendezvous
             // establishing. Log and continue (unlike the session-setup sends
             // above, this is optional and the last step).
+            if let bitcoin::p2p::address::AddrV2::TorV3(pubkey) = &addr_msg.addr {
+                // Core's `GetLocalAddrForPeer` line, under `-debug=net`.
+                let host = crate::net::peer::torv3_to_onion_host(pubkey);
+                tracing::debug!("Advertising address {host}:{} to peer={id}", addr_msg.port);
+            }
             if let Err(e) = writer.send(NetworkMessage::AddrV2(vec![addr_msg])).await {
                 tracing::debug!(id, "self-advertise addrv2 send failed: {}", e);
             }
