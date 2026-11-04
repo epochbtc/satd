@@ -2779,10 +2779,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
-    // Load the persistent address book (peers.dat) and seed the dial pool
-    // with learned peers so we don't have to re-bootstrap from DNS seeds
-    // on every restart.
-    peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
+    // Load the persistent address book (peers.dat), which the automatic
+    // dials draw from, so we don't have to re-bootstrap from DNS seeds on
+    // every restart.
+    peer_manager.load_addrman(&net_datadir.join("peers.dat"));
 
     // Load the persistent ban list (banlist.json). A file that cannot be read
     // or parsed is recreated, as Core's `BanMan::LoadBanlist` does — never a

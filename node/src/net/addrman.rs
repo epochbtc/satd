@@ -145,7 +145,28 @@ impl AddrEntry {
     pub fn is_terrible(&self, now: u64) -> bool {
         is_terrible(self.last_seen, self.last_success, self.last_try, self.attempts, now)
     }
+
+    /// Core's `AddrInfo::GetChance` (v31.1 `src/addrman.cpp:94`): the
+    /// relative odds of the entry being taken when it is drawn for a dial.
+    /// ×0.01 if it was dialled in the last ten minutes, and ×0.66 for each
+    /// failed attempt, up to eight (at most 1/28th).
+    pub fn chance(&self, now: u64) -> f64 {
+        let mut chance = 1.0;
+        if self.last_try != 0 && now.saturating_sub(self.last_try) < RECENT_TRY_SECS {
+            chance *= 0.01;
+        }
+        chance * 0.66f64.powi(self.attempts.min(MAX_CHANCE_ATTEMPTS) as i32)
+    }
 }
+
+/// The window in which [`AddrEntry::chance`] treats a dial as recent: Core's
+/// ten minutes.
+const RECENT_TRY_SECS: u64 = 10 * 60;
+
+/// Failed attempts past which [`AddrEntry::chance`] lowers the odds no
+/// further (Core: "at most 1/28th to avoid the search taking forever or
+/// overly penalizing outages").
+const MAX_CHANCE_ATTEMPTS: u32 = 8;
 
 /// [`AddrEntry::is_terrible`] over the fields it reads, for an address the
 /// book does not hold as well (the onion candidates).
@@ -691,22 +712,6 @@ impl AddrMan {
         }
         let idx = (rand::random::<u64>() as usize) % pool.len();
         Some(pool[idx].addr)
-    }
-
-    /// Return up to `n` distinct addresses for seeding the dial pool at
-    /// startup (tried first, then new).
-    pub fn select_n(&self, n: usize) -> Vec<SocketAddr> {
-        let mut tried: Vec<&AddrEntry> = self.entries.values().filter(|e| e.tried).collect();
-        let mut new: Vec<&AddrEntry> = self.entries.values().filter(|e| !e.tried).collect();
-        // Most-recently-successful tried first; most-recently-seen new.
-        tried.sort_by(|a, b| b.last_success.cmp(&a.last_success));
-        new.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-        tried
-            .into_iter()
-            .chain(new)
-            .take(n)
-            .map(|e| e.addr)
-            .collect()
     }
 
     /// Every entry, in no particular order.
@@ -1772,7 +1777,7 @@ mod tests {
         b.load(&path).unwrap();
         assert_eq!(b.len(), 1, "only the valid entry loads");
         assert!(b.entries.contains_key(&kept));
-        assert_eq!(b.select_n(10), vec![kept]);
+        assert_eq!(b.iter().map(|e| e.addr).collect::<Vec<_>>(), vec![kept]);
     }
 
     /// Off regtest the book takes Core's rule: routable addresses only, on
