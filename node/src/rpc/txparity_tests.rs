@@ -200,6 +200,85 @@ fn unreadable_undo_data_is_an_internal_error() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The one non-coinbase transaction of `mine_a_spend`'s spending block, and
+/// that block's `getblockstats`.
+fn spend_block_stats() -> (bitcoin::Transaction, u64, Value, Value) {
+    let (cs, dir) = make_chain_state();
+    let blocks = mine_a_spend(&cs);
+    let b = &blocks[101];
+    assert_eq!(b.txdata.len(), 2, "premise: one spend beside the coinbase");
+    let tx = b.txdata[1].clone();
+    let funding = blocks[0].txdata[0].output[0].value.to_sat();
+    let fee = funding - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+    let stats = blockchain::get_block_stats(&cs, &b.block_hash().to_string()).unwrap();
+    let coinbase_only = blockchain::get_block_stats(&cs, &blocks[0].block_hash().to_string()).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    (tx, fee, stats, coinbase_only)
+}
+
+/// `minfeerate`, `maxfeerate` and `avgfeerate` are Core's sat/vB, `fee * 4
+/// / weight` truncated (v32.1 `src/rpc/blockchain.cpp:2186`, `:2205`).
+/// satd reported sat/kvB, a thousand times Core's number.
+#[test]
+fn getblockstats_feerates_are_sat_per_vbyte() {
+    let (tx, fee, stats, _) = spend_block_stats();
+    let rate = fee * 4 / tx.weight().to_wu();
+    assert!(rate > 0, "premise: the spend pays a fee rate of at least 1 sat/vB");
+    assert_eq!(stats["minfeerate"], json!(rate), "{stats}");
+    assert_eq!(stats["maxfeerate"], json!(rate), "{stats}");
+}
+
+/// `avgfeerate` divides the fees by the non-coinbase weight, as Core does
+/// (v32.1 `:2205`), not by the whole block's weight: with one transaction
+/// it is that transaction's own rate.
+#[test]
+fn getblockstats_avgfeerate_is_over_the_non_coinbase_weight() {
+    let (tx, fee, stats, coinbase_only) = spend_block_stats();
+    assert_eq!(stats["avgfeerate"], json!(fee * 4 / tx.weight().to_wu()), "{stats}");
+    assert_eq!(coinbase_only["avgfeerate"], json!(0), "{coinbase_only}");
+}
+
+/// `total_size`, `total_weight`, `avgtxsize`, `mintxsize` and `maxtxsize`
+/// count the non-coinbase transactions only, as Core's loop does (v32.1
+/// `:2133-2155`, `:2206`): no header, no coinbase. A coinbase-only block
+/// reports zeros.
+#[test]
+fn getblockstats_sizes_leave_out_the_header_and_coinbase() {
+    let (tx, _, stats, coinbase_only) = spend_block_stats();
+    let size = bitcoin::consensus::serialize(&tx).len() as u64;
+    for key in ["total_size", "avgtxsize", "mintxsize", "maxtxsize"] {
+        assert_eq!(stats[key], json!(size), "{key}: {stats}");
+    }
+    assert_eq!(stats["total_weight"], json!(tx.weight().to_wu()), "{stats}");
+    for key in ["total_size", "total_weight", "avgtxsize", "mintxsize", "maxtxsize"] {
+        assert_eq!(coinbase_only[key], json!(0), "{key}: {coinbase_only}");
+    }
+}
+
+/// `getblockstats` refuses a block whose undo row is there but unreadable,
+/// as Core does (`RPC_MISC_ERROR`), instead of pricing it from the live
+/// UTXO set: the coins the block spent are gone from it, so every fee
+/// statistic would come out zero.
+#[test]
+fn unreadable_undo_data_refuses_getblockstats() {
+    let store = ControllableStore::new();
+    let controls = store.controls();
+    let (cs, dir) = make_chain_state_with_store(Box::new(store));
+    let blocks = mine_a_spend(&cs);
+    let hash = blocks[101].block_hash().to_string();
+    let before = blockchain::get_block_stats(&cs, &hash).unwrap();
+    assert!(before["totalfee"].as_u64().unwrap() > 0, "premise: the block pays a fee: {before}");
+    cs.store_ref().flush().expect("flush");
+    cs.store_ref().drop_read_overlays();
+    controls.set_undo_unreadable(true);
+
+    let err = blockchain::get_block_stats(&cs, &hash).unwrap_err();
+    assert_eq!(err, blockchain::UNDO_READ_FAILED);
+    assert_eq!(blockchain::get_block_stats_error_code(&err), -1);
+    assert_eq!(blockchain::get_block_stats_error_code("Block not found"), -5);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Without a transaction index the fee and prevouts still come from undo
 /// data: satd looked the spent coins up in the UTXO set and the index.
 #[test]

@@ -1059,3 +1059,278 @@ fn core_block_live_differential() {
     satd.stop();
     assert!(failures.is_empty(), "Block-acceptance differential divergences:\n{}", failures.join("\n"));
 }
+
+// ── getblockstats differential ─────────────────────────────────────────
+//
+// `getblockstats` checked against a live Core on identical blocks. Both
+// nodes accept the same blocks onto the same shared base, then answer
+// `getblockstats` for each, and every statistic Core reports must agree
+// exactly, apart from the ones `KNOWN_DIFFERENT` names.
+//
+// The blocks cover what makes these statistics easy to get wrong: a
+// coinbase-only block (Core answers zeros), a zero-fee spend, an in-block
+// CPFP pair (the child's prevout is in the same block, so only undo data
+// prices it), transactions of different weights (the percentiles are
+// weight-weighted), witness transactions (weight is not four times the
+// size, and the sizes count witness bytes), rates that `fee * 4 / weight`
+// truncates, and both odd and even transaction counts (the median of an
+// even count averages the two middle values).
+
+/// Statistics satd still reports differently from Core, compared by
+/// neither side. A statistic missing from this list must match; one that
+/// starts to match while it is listed fails too, so the list cannot go
+/// stale.
+///
+/// - `total_out`: satd counts the coinbase's outputs; Core does not.
+/// - `utxo_size_inc`: satd charges a flat 50 bytes per output; Core sums
+///   each output's serialized size plus its overhead, minus the spent ones.
+/// - `utxo_increase_actual`, `utxo_size_inc_actual`: satd does not report
+///   them.
+const KNOWN_DIFFERENT: &[&str] =
+    &["total_out", "utxo_size_inc", "utxo_increase_actual", "utxo_size_inc_actual"];
+
+/// `OP_TRUE` as a P2WSH witness script.
+fn p2wsh_op_true() -> ScriptBuf {
+    ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(op_true().as_bytes()))
+}
+
+/// The witness that spends [`p2wsh_op_true`]: just the script.
+fn p2wsh_op_true_witness() -> Witness {
+    let mut w = Witness::new();
+    w.push(op_true().as_bytes());
+    w
+}
+
+/// A spendable output the fee-profile blocks track: where it is, what it
+/// holds, and whether it is the P2WSH form.
+#[derive(Clone, Copy)]
+struct Utxo {
+    outpoint: OutPoint,
+    value: u64,
+    witness: bool,
+}
+
+/// Spend `inputs`, pay `fee`, and split the rest over `outs` (any remainder
+/// to the first output).
+fn pay(inputs: &[Utxo], fee: u64, outs: &[ScriptBuf]) -> Transaction {
+    let in_value: u64 = inputs.iter().map(|u| u.value).sum();
+    let spendable = in_value - fee;
+    let each = spendable / outs.len() as u64;
+    let mut output: Vec<TxOut> = outs
+        .iter()
+        .map(|spk| TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() })
+        .collect();
+    output[0].value = Amount::from_sat(each + spendable % outs.len() as u64);
+    Transaction {
+        version: TxVersion(2),
+        lock_time: LockTime::ZERO,
+        input: inputs
+            .iter()
+            .map(|u| TxIn {
+                previous_output: u.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: if u.witness { p2wsh_op_true_witness() } else { Witness::new() },
+            })
+            .collect(),
+        output,
+    }
+}
+
+/// Output `vout` of `tx` as a [`Utxo`].
+fn out_of(tx: &Transaction, vout: u32) -> Utxo {
+    let o = &tx.output[vout as usize];
+    Utxo {
+        outpoint: OutPoint { txid: tx.compute_txid(), vout },
+        value: o.value.to_sat(),
+        witness: o.script_pubkey == p2wsh_op_true(),
+    }
+}
+
+/// A valid block on the shared tip carrying `txs`, with a BIP 141
+/// commitment whenever any of them carries witness data.
+fn fee_block(ctx: &Ctx, txs: Vec<Transaction>) -> Block {
+    let h = ctx.candidate_height();
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
+    let has_witness = txs.iter().any(|t| t.input.iter().any(|i| !i.witness.is_empty()));
+    let mut txdata = vec![cb.clone()];
+    txdata.extend(txs);
+    if has_witness {
+        // The coinbase's wtxid counts as zero in the witness root, so the
+        // root does not depend on the commitment about to be added to it.
+        let probe = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txdata.clone(), None, false);
+        let root = probe.witness_root().expect("a block with a coinbase has a witness root");
+        cb.output.push(commitment_output(root.to_byte_array(), [0u8; 32]));
+        cb.input[0].witness.push([0u8; 32]);
+        txdata[0] = cb;
+    }
+    assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txdata, None, true)
+}
+
+/// Every `getblockstats` statistic from satd.
+fn satd_fee_stats(node: &TestNode, hash: &str) -> serde_json::Value {
+    let resp = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!(hash)])
+        .expect("satd getblockstats RPC");
+    assert!(resp["error"].is_null(), "satd getblockstats {hash}: {resp}");
+    resp["result"].clone()
+}
+
+/// Every `getblockstats` statistic from Core.
+fn core_fee_stats(core: &CoreNode, hash: &str) -> serde_json::Value {
+    use bitcoincore_rpc::RpcApi as _;
+    core.rpc
+        .call::<serde_json::Value>("getblockstats", &[hash.into()])
+        .expect("Core getblockstats")
+}
+
+#[test]
+fn core_getblockstats_differential() {
+    pull_core_image();
+    let mut satd = TestNode::start(&[]);
+    let core = CoreNode::start();
+    let mut ctx = build_shared_base(&satd, &core);
+    // Index 0 (coinbase at height 1) was consumed by the funding block.
+    let mut used: Vec<usize> = vec![0];
+
+    let mut blocks: Vec<(&'static str, Block)> = Vec::new();
+    let mut submit = |ctx: &mut Ctx, name: &'static str, block: Block| {
+        let hex = hex::encode(serialize(&block));
+        let s = satd_submit_block(&satd, &hex);
+        let c = core.submit_block(&hex);
+        assert_eq!(s, Outcome::Accept, "satd rejected fee-profile block `{name}`: {s:?}");
+        assert_eq!(c, Outcome::Accept, "Core rejected fee-profile block `{name}`: {c:?}");
+        ctx.advance_to(&block);
+        blocks.push((name, block));
+    };
+
+    // 1. Coinbase only: no priced transaction, so Core answers zeros.
+    let b = fee_block(&ctx, vec![]);
+    submit(&mut ctx, "coinbase_only", b);
+
+    // 2. One zero-fee spend.
+    let cb = ctx.take_mature_coinbase(&mut used);
+    let zero = pay(&[Utxo { outpoint: cb.outpoint, value: cb.amount, witness: false }], 0, &[op_true()]);
+    let b = fee_block(&ctx, vec![zero]);
+    submit(&mut ctx, "single_zero_fee", b);
+
+    // 3. Fan-out: one coinbase into ten bare and six P2WSH outputs, the
+    //    coins for the blocks below.
+    let cb = ctx.take_mature_coinbase(&mut used);
+    let mut outs: Vec<ScriptBuf> = (0..10).map(|_| op_true()).collect();
+    outs.extend((0..6).map(|_| p2wsh_op_true()));
+    let fan = pay(&[Utxo { outpoint: cb.outpoint, value: cb.amount, witness: false }], 10_000, &outs);
+    let bare: Vec<Utxo> = (0..10).map(|v| out_of(&fan, v)).collect();
+    let wsh: Vec<Utxo> = (10..16).map(|v| out_of(&fan, v)).collect();
+    let b = fee_block(&ctx, vec![fan]);
+    submit(&mut ctx, "fan_out", b);
+
+    // 4. Mixed weights and an in-block CPFP pair, seven transactions (odd).
+    let parent = pay(&[bare[4]], 0, &[op_true()]);
+    let child = pay(&[out_of(&parent, 0)], 50_000, &[op_true()]);
+    let five_outs: Vec<ScriptBuf> = (0..5).map(|_| op_true()).collect();
+    let b = fee_block(
+        &ctx,
+        vec![
+            pay(&[bare[0]], 0, &[op_true()]),
+            pay(&[bare[1]], 1_000, &[op_true()]),
+            pay(&[bare[2]], 7_777, &five_outs),
+            pay(&[bare[3]], 123, &[op_true(), op_true(), op_true()]),
+            parent,
+            child,
+            pay(&[bare[5]], 333, &[op_true(), op_true()]),
+        ],
+    );
+    submit(&mut ctx, "mixed_weights_cpfp", b);
+
+    // 5. Witness spends, a chain of them, one mixed-input transaction and a
+    //    legacy one: six transactions (even).
+    let w1 = pay(&[wsh[0]], 501, &[op_true()]);
+    let w2 = pay(&[wsh[1]], 2_049, &[p2wsh_op_true(), op_true()]);
+    let w3 = pay(&[out_of(&w2, 0)], 0, &[p2wsh_op_true()]);
+    let w4 = pay(&[out_of(&w3, 0), bare[7]], 12_345, &[op_true()]);
+    let b = fee_block(
+        &ctx,
+        vec![w1, w2, w3, w4, pay(&[bare[6]], 999, &[op_true()]), pay(&[wsh[2]], 77, &[op_true()])],
+    );
+    submit(&mut ctx, "witness_even_count", b);
+
+    // 6. Small fees whose `fee * 4 / weight` truncates, witness and legacy.
+    let b = fee_block(
+        &ctx,
+        vec![
+            pay(&[wsh[3]], 7, &[op_true()]),
+            pay(&[bare[8]], 3, &[op_true()]),
+            pay(&[bare[9]], 263, &[op_true()]),
+            pay(&[wsh[4], wsh[5]], 1_111, &[p2wsh_op_true(), p2wsh_op_true()]),
+        ],
+    );
+    submit(&mut ctx, "truncating_rates", b);
+
+    let mut report = String::from("\nLive-Core getblockstats differential\n");
+    let mut failures: Vec<String> = Vec::new();
+    let mut still_different: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (name, block) in &blocks {
+        let hash = block.block_hash().to_string();
+        let s = satd_fee_stats(&satd, &hash);
+        let c = core_fee_stats(&core, &hash);
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        keys.extend(c.as_object().expect("Core stats object").keys().cloned());
+        keys.extend(s.as_object().expect("satd stats object").keys().cloned());
+        let mut ok = true;
+        for key in &keys {
+            let (sv, cv) = (s.get(key), c.get(key));
+            if let Some(known) = KNOWN_DIFFERENT.iter().find(|k| **k == key.as_str()) {
+                if sv != cv {
+                    still_different.insert(known);
+                }
+                continue;
+            }
+            if sv != cv {
+                ok = false;
+                failures.push(format!("{name}: {key}: satd {sv:?} != Core {cv:?}"));
+            }
+        }
+        report.push_str(&format!(
+            "{} {name:<20} feerate_percentiles={} mediantxsize={} avgfeerate={} total_size={}\n",
+            if ok { "✓" } else { "✗" },
+            c["feerate_percentiles"],
+            c["mediantxsize"],
+            c["avgfeerate"],
+            c["total_size"],
+        ));
+    }
+    for known in KNOWN_DIFFERENT {
+        if !still_different.contains(known) {
+            failures.push(format!("{known} matches Core on every block: take it off KNOWN_DIFFERENT"));
+        }
+    }
+    println!("{report}");
+
+    // Non-vacuity: the blocks must exercise what they are there for, or a
+    // statistic both nodes answer with a constant would pass.
+    let core_stats = |name: &str| {
+        let (_, b) = blocks.iter().find(|(n, _)| *n == name).expect("block by name");
+        core_fee_stats(&core, &b.block_hash().to_string())
+    };
+    let coinbase_only = core_stats("coinbase_only");
+    assert_eq!(coinbase_only["feerate_percentiles"], serde_json::json!([0, 0, 0, 0, 0]));
+    for zero in ["total_size", "total_weight", "avgtxsize", "mintxsize", "maxtxsize"] {
+        assert_eq!(coinbase_only[zero], serde_json::json!(0), "{zero}: {coinbase_only}");
+    }
+    let fan_out = core_stats("fan_out");
+    assert!(fan_out["avgfeerate"].as_u64().unwrap() > 0, "{fan_out}");
+    let mixed = core_stats("mixed_weights_cpfp");
+    let pct: Vec<u64> = mixed["feerate_percentiles"]
+        .as_array()
+        .expect("percentiles array")
+        .iter()
+        .map(|v| v.as_u64().expect("integer percentile"))
+        .collect();
+    assert!(pct[0] < pct[4], "the mixed block must spread its percentiles: {pct:?}");
+    let witness = core_stats("witness_even_count");
+    assert!(witness["mediantxsize"].as_u64().unwrap() > 0, "{witness}");
+
+    satd.stop();
+    assert!(failures.is_empty(), "getblockstats divergences:\n{}", failures.join("\n"));
+}

@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
+use crate::mining::fee_profile::{BlockFeeProfile, sat_per_vb_core, truncated_median};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::util::univalue_double;
 use crate::storage::{RecentHeightWindow, Store};
@@ -1351,6 +1352,17 @@ pub fn get_difficulty(chain_state: &ChainState) -> Value {
     }
 }
 
+/// Core's `getblockstats` error for undo data it cannot read
+/// (`GetUndoChecked`, `src/rpc/blockchain.cpp`), `RPC_MISC_ERROR`.
+pub const UNDO_READ_FAILED: &str = "Can't read undo data from disk";
+
+/// The JSON-RPC error code for a `getblockstats` error message: Core's
+/// `RPC_MISC_ERROR` (-1) for unreadable undo data, else
+/// `RPC_INVALID_ADDRESS_OR_KEY` (-5).
+pub fn get_block_stats_error_code(message: &str) -> i32 {
+    if message == UNDO_READ_FAILED { -1 } else { -5 }
+}
+
 /// `getblockstats` — return per-block statistics.
 pub fn get_block_stats(
     chain_state: &ChainState,
@@ -1378,22 +1390,7 @@ pub fn get_block_stats(
         .ok_or("Block data not available")?
         .block;
 
-    let block_bytes = serialize(&block);
-    let total_size = block_bytes.len();
-    let total_weight = block.weight().to_wu();
     let num_txs = block.txdata.len();
-
-    let mut total_fee: u64 = 0;
-    let mut total_out: u64 = 0;
-    let mut min_fee = u64::MAX;
-    let mut max_fee = 0u64;
-    let mut min_fee_rate = u64::MAX;
-    let mut max_fee_rate = 0u64;
-    let mut segwit_txs = 0u64;
-    let mut utxo_increase: i64 = 0;
-    let mut fees: Vec<u64> = Vec::with_capacity(block.txdata.len());
-    let mut sw_total_size: usize = 0;
-    let mut sw_total_weight: u64 = 0;
 
     // Prevouts come from the block's **undo** data, not the live UTXO set.
     // Connecting a block removes exactly the coins its inputs spend, so a
@@ -1402,10 +1399,45 @@ pub fn get_block_stats(
     // the node had connected, i.e. all of them. The filter and silent-payment
     // index runners read prevouts from undo data for precisely this reason.
     //
-    // `spent_coins` holds one coin per non-coinbase input in connect order, so
-    // a cursor over it lines up with the same traversal below.
-    let undo = chain_state.get_undo(&hash);
-    let mut spent = undo.as_ref().map(|u| u.spent_coins.iter());
+    // An undo row that disagrees with the block, or that is there but does
+    // not decode, is corruption rather than a missing prevout, and no fee
+    // figure from the block can be trusted, so the call is refused by name
+    // rather than answered with misattributed numbers. (`get_undo` answers
+    // `None` for an unreadable row, which would send it to the live set
+    // below and report every fee as zero.) With no undo row (a block that
+    // never connected) the live set is the only source, and it is correct
+    // for exactly that case: the coins are still there.
+    let undo = chain_state
+        .read_undo(&hash)
+        .map_err(|_| UNDO_READ_FAILED.to_string())?;
+    let profile = match undo {
+        Some(undo) => BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
+            format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
+        })?,
+        None => BlockFeeProfile::from_lookup(&block, |prevout| {
+            chain_state.get_coin(prevout).map(|coin| coin.amount)
+        }),
+    };
+
+    // Every size, weight and feerate statistic is over the non-coinbase
+    // transactions, as in Core (`getblockstats`, v32.1
+    // `src/rpc/blockchain.cpp:2133-2161`): the loop `continue`s past the
+    // coinbase before it adds anything to `total_size`, `total_weight`,
+    // `mintxsize` or `maxtxsize`. satd used the whole serialized block,
+    // header and coinbase included, so a coinbase-only block reported a
+    // non-zero size and weight.
+    let mut total_out: u64 = 0;
+    let mut segwit_txs = 0u64;
+    let mut utxo_increase: i64 = 0;
+    let mut sw_total_size: usize = 0;
+    let mut sw_total_weight: u64 = 0;
+    let mut total_size: u64 = 0;
+    let mut total_weight: u64 = 0;
+    let mut min_tx_size = u64::MAX;
+    let mut max_tx_size = 0u64;
+    // Core's `mediantxsize` is the truncated median of the non-coinbase
+    // transactions' total sizes (`CalculateTruncatedMedian(txsize_array)`).
+    let mut tx_sizes: Vec<u64> = Vec::with_capacity(num_txs.saturating_sub(1));
 
     for tx in &block.txdata {
         let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -1417,55 +1449,13 @@ pub fn get_block_stats(
         }
 
         utxo_increase -= tx.input.len() as i64;
-
-        // Fee from the coins this transaction spent.
-        let mut in_sum: u64 = 0;
-        let mut inputs_found = true;
-        for input in &tx.input {
-            let coin = match spent.as_mut() {
-                // Undo data present: take the next coin in connect order. It
-                // runs out only if the undo row disagrees with the block, which
-                // is corruption rather than a missing prevout — and the
-                // misalignment is only detectable here, after earlier inputs
-                // may already have been paired with the wrong coins. No fee
-                // figure from this block can be trusted, so refuse the call
-                // by name rather than answer with misattributed numbers.
-                Some(it) => match it.next() {
-                    Some(coin) => Some(coin.clone()),
-                    None => {
-                        return Err(format!(
-                            "undo data for block {hash} is inconsistent with the block;                              fee statistics unavailable"
-                        ));
-                    }
-                },
-                // No undo row (a block that never connected, or pruned undo).
-                // The live set is then the only source, and it is correct for
-                // exactly that case: the coins are still there.
-                None => chain_state.get_coin(&input.previous_output),
-            };
-            match coin {
-                Some(coin) => in_sum += coin.amount,
-                None => {
-                    inputs_found = false;
-                    break;
-                }
-            }
-        }
-
-        if inputs_found && in_sum >= out_sum {
-            let fee = in_sum - out_sum;
-            total_fee += fee;
-            fees.push(fee);
-            min_fee = min_fee.min(fee);
-            max_fee = max_fee.max(fee);
-
-            let w = tx.weight().to_wu();
-            if w > 0 {
-                let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, w);
-                min_fee_rate = min_fee_rate.min(rate);
-                max_fee_rate = max_fee_rate.max(rate);
-            }
-        }
+        let tx_size = serialize(tx).len();
+        let tx_weight = tx.weight().to_wu();
+        tx_sizes.push(tx_size as u64);
+        total_size += tx_size as u64;
+        total_weight += tx_weight;
+        min_tx_size = min_tx_size.min(tx_size as u64);
+        max_tx_size = max_tx_size.max(tx_size as u64);
 
         if tx.input.iter().any(|i| !i.witness.is_empty()) {
             segwit_txs += 1;
@@ -1473,9 +1463,28 @@ pub fn get_block_stats(
             // contribute, not just how many there are. These were hardcoded to
             // zero, which read as "this block has no segwit data" beside a
             // non-zero `swtxs`.
-            sw_total_size += serialize(tx).len();
-            sw_total_weight += tx.weight().to_wu();
+            sw_total_size += tx_size;
+            sw_total_weight += tx_weight;
         }
+    }
+
+    // Feerates are Core's unit, sat/vB, each `fee * 4 / weight` truncated
+    // (v32.1 `src/rpc/blockchain.cpp:2186`). satd reported sat/kvB under
+    // Core's field names, a thousand times Core's number.
+    let mut total_fee: u64 = 0;
+    let mut min_fee = u64::MAX;
+    let mut max_fee = 0u64;
+    let mut min_fee_rate = u64::MAX;
+    let mut max_fee_rate = 0u64;
+    let mut fees: Vec<u64> = Vec::with_capacity(profile.txs.len());
+    for t in &profile.txs {
+        total_fee += t.fee;
+        fees.push(t.fee);
+        min_fee = min_fee.min(t.fee);
+        max_fee = max_fee.max(t.fee);
+        let rate = sat_per_vb_core(t.fee, t.weight);
+        min_fee_rate = min_fee_rate.min(rate);
+        max_fee_rate = max_fee_rate.max(rate);
     }
 
     if min_fee == u64::MAX {
@@ -1484,49 +1493,44 @@ pub fn get_block_stats(
     if min_fee_rate == u64::MAX {
         min_fee_rate = 0;
     }
+    if min_tx_size == u64::MAX {
+        min_tx_size = 0;
+    }
 
-    let avg_fee = if num_txs > 1 {
-        total_fee / (num_txs as u64 - 1)
-    } else {
-        0
-    };
-    let avg_fee_rate = if total_weight > 0 && num_txs > 1 {
-        crate::mempool::policy::fee_rate_sat_per_kvb(total_fee, total_weight)
-    } else {
-        0
-    };
+    let non_coinbase = num_txs.saturating_sub(1) as u64;
+    let avg_fee = if non_coinbase > 0 { total_fee / non_coinbase } else { 0 };
+    // Core: `totalfee * 4 / total_weight`, over the non-coinbase weight
+    // (v32.1 `src/rpc/blockchain.cpp:2205`).
+    let avg_fee_rate = sat_per_vb_core(total_fee, total_weight);
+    // Core: `total_size / (vtx.size() - 1)` (v32.1 `:2206`).
+    let avg_tx_size = if non_coinbase > 0 { total_size / non_coinbase } else { 0 };
 
     // A real median, not the mean wearing its name. With fees now actually
     // computed the two differ sharply on any block with a fee outlier, which is
-    // most of them.
-    fees.sort_unstable();
-    let median_fee = if fees.is_empty() {
-        0
-    } else if fees.len() % 2 == 1 {
-        fees[fees.len() / 2]
-    } else {
-        // Core averages the two middle elements.
-        (fees[fees.len() / 2 - 1] + fees[fees.len() / 2]) / 2
-    };
+    // most of them. Core averages the two middle elements of an even count.
+    let median_fee = truncated_median(&mut fees);
+    let median_tx_size = truncated_median(&mut tx_sizes);
+    let feerate_percentiles = profile.feerate_percentiles();
 
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, entry.height);
 
     Ok(json!({
         "avgfee": avg_fee,
         "avgfeerate": avg_fee_rate,
-        "avgtxsize": if num_txs > 1 { total_size / num_txs } else { 0 },
+        "avgtxsize": avg_tx_size,
         "blockhash": hash.to_string(),
+        "feerate_percentiles": feerate_percentiles,
         "height": entry.height,
         "ins": block.txdata.iter().skip(1).map(|tx| tx.input.len()).sum::<usize>(),
         "maxfee": max_fee,
         "maxfeerate": max_fee_rate,
-        "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
+        "maxtxsize": max_tx_size,
         "medianfee": median_fee,
         "mediantime": block_median_time(chain_state, &entry),
-        "mediantxsize": if num_txs > 0 { total_size / num_txs } else { 0 },
+        "mediantxsize": median_tx_size,
         "minfee": min_fee,
         "minfeerate": min_fee_rate,
-        "mintxsize": block.txdata.iter().map(|tx| serialize(tx).len()).min().unwrap_or(0),
+        "mintxsize": min_tx_size,
         "outs": block.txdata.iter().map(|tx| tx.output.len()).sum::<usize>(),
         "subsidy": subsidy,
         "swtotal_size": sw_total_size,

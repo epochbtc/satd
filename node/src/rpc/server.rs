@@ -1131,8 +1131,9 @@ pub async fn start(
         let stats: Option<Vec<String>> = args.optional("stats")?;
         args.check()?;
 
-        let all = blockchain::get_block_stats(&ctx.chain_state, &hash_or_height)
-            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))?;
+        let all = blockchain::get_block_stats(&ctx.chain_state, &hash_or_height).map_err(|e| {
+            ErrorObjectOwned::owned(blockchain::get_block_stats_error_code(&e), e, None::<()>)
+        })?;
         // Core returns only the selected statistics, and names an unknown one
         // rather than quietly omitting it. An *empty* selection is not "no
         // statistics" but the default: Core computes `do_all = stats.size()
