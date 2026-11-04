@@ -1271,6 +1271,11 @@ pub struct PeerManager {
     /// without this the service exists but is reachable only by peers handed
     /// the address out of band. Set once at startup.
     advertised_onion: RwLock<Option<PeerAddr>>,
+    /// Every onion host of ours: each one ever advertised this run (kept
+    /// while the service is withdrawn during a Tor restart) and every
+    /// `-externalip` onion, advertised or not. `getaddr` replies never
+    /// carry one.
+    own_onions: RwLock<std::collections::HashSet<String>>,
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
@@ -1671,6 +1676,7 @@ impl PeerManager {
             test_resolver: RwLock::new(None),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
+            own_onions: RwLock::new(std::collections::HashSet::new()),
             whitelist: RwLock::new(Vec::new()),
             // Core's rule off regtest: routable addresses only. Regtest keeps
             // private ones, which lab networks run on.
@@ -2072,7 +2078,15 @@ impl PeerManager {
             return;
         }
         tracing::info!(onion = %host, port, "Advertising hidden service to peers");
+        self.own_onions.write().insert(host.to_ascii_lowercase());
         *self.advertised_onion.write() = Some(PeerAddr::Onion { host, port });
+    }
+
+    /// Record onion hosts of ours that are not advertised (the
+    /// `-externalip` onions after the first), so `getaddr` never hands one
+    /// out.
+    pub fn add_own_onions(&self, hosts: impl IntoIterator<Item = String>) {
+        self.own_onions.write().extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
     }
 
     /// Stop advertising an onion address: the hidden service is gone (#973).
@@ -2217,21 +2231,66 @@ impl PeerManager {
         Some((token.clone(), token))
     }
 
+    /// Whether a connection keeps our own IP from the peer: it came in on
+    /// the onion listener, or went out through the proxy (to an onion, to a
+    /// name the proxy resolved, or to a routable address under `-proxy`).
+    /// Only such a link is told our onion.
+    fn link_hides_our_ip(&self, info: &PeerInfo) -> bool {
+        info.inbound_onion
+            || (info.direction == Direction::Outbound
+                && (info.onion_host.is_some()
+                    || info.addr_name.is_some()
+                    || self.dials_through_proxy(info.addr)))
+    }
+
+    /// Whether a direct dial to `addr` goes through `-proxy`: only a routable
+    /// address does (see [`Self::dial_direct`]).
+    fn dials_through_proxy(&self, addr: SocketAddr) -> bool {
+        self.proxy.is_some() && crate::net::is_routable(addr.ip())
+    }
+
+    /// Whether `addr` is one of ours: an onion of ours (any port; see
+    /// `own_onions`), or the IP of an `-externalip` address. A `getaddr`
+    /// reply never carries one: our onion arriving from our clearnet IP, or
+    /// the other way round, would link the two.
+    fn is_own_address(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Onion { host, .. } => self.own_onions.read().contains(&host.to_ascii_lowercase()),
+            PeerAddr::Socket(sa) => {
+                let ip = sa.ip().to_canonical();
+                self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
+            }
+        }
+    }
+
     /// The self-advertisement of our `-externalip` addresses to peer `id`:
     /// those on the peer's IP family (IPv4 with IPv4-mapped included), as
     /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
     /// are none, or the peer is an onion peer.
+    #[cfg(test)]
     fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
-        let (peer_v4, wants_v2, onion) = {
+        let onion = self.advertised_onion.read().clone();
+        self.self_advertise_externals_given(id, onion.as_ref())
+    }
+
+    /// [`Self::self_advertise_externals`] against `our_onion`, the onion
+    /// the handshake read once for both self-advertisements: read twice, a
+    /// registration between the reads would send a hidden link both.
+    fn self_advertise_externals_given(&self, id: PeerId, our_onion: Option<&PeerAddr>) -> Option<NetworkMessage> {
+        let (peer_v4, wants_v2, onion, hidden) = {
             let peers = self.peers.read();
             let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
             let v4 = match h.info.addr.ip() {
                 IpAddr::V4(_) => true,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
             };
-            (v4, h.info.wants_addrv2, h.info.onion_host.is_some())
+            (v4, h.info.wants_addrv2, h.info.onion_host.is_some(), self.link_hides_our_ip(&h.info))
         };
-        if onion {
+        // A link that hides our IP is told our onion (`self_advertise_addrv2`)
+        // when we have one; our IP beside it would link the two. With no
+        // onion to announce, a proxied peer still learns `-externalip`, as
+        // Core's would.
+        if onion || (hidden && our_onion.is_some()) {
             return None;
         }
         let services = self.local_services();
@@ -2263,13 +2322,31 @@ impl PeerManager {
     /// or the peer didn't opt into addrv2. The pubkey is recovered from the
     /// stored host; it was validated when the onion was registered, so this is
     /// infallible in practice.
+    #[cfg(test)]
     fn self_advertise_addrv2(&self, id: PeerId) -> Option<bitcoin::p2p::address::AddrV2Message> {
+        let onion = self.advertised_onion.read().clone();
+        self.self_advertise_addrv2_given(id, onion)
+    }
+
+    /// [`Self::self_advertise_addrv2`] against the handshake's one read of
+    /// our onion (see [`Self::self_advertise_externals_given`]).
+    fn self_advertise_addrv2_given(
+        &self,
+        id: PeerId,
+        our_onion: Option<PeerAddr>,
+    ) -> Option<bitcoin::p2p::address::AddrV2Message> {
         // A block-relay-only link carries no address traffic (Core's
-        // `SetupAddressRelay`); our onion on one would link the two.
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.wants_addrv2 && h.info.relays_addrs()) {
+        // `SetupAddressRelay`); our onion on one would link the two. Nor
+        // does it go on a link that shows the peer our own IP: the onion
+        // arriving from that IP would tie the hidden service to it. Core
+        // has no such rule (`GetReachabilityFrom` ranks an onion local
+        // address `REACH_DEFAULT` for an IPv4 peer).
+        if !self.peers.read().get(&id).is_some_and(|h| {
+            h.info.wants_addrv2 && h.info.relays_addrs() && self.link_hides_our_ip(&h.info)
+        }) {
             return None;
         }
-        let onion = self.advertised_onion.read().clone()?;
+        let onion = our_onion?;
         let PeerAddr::Onion { host, port } = onion else {
             return None;
         };
@@ -2300,6 +2377,15 @@ impl PeerManager {
     /// Core's `GetTime` does; Core's `p2p_getaddr_caching.py` moves the mock
     /// past it to see the answers change.
     fn getaddr_reply(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
+        let mut reply = self.getaddr_sample(listener, uncached);
+        // Applied to the cached answer too: our onion may have been
+        // registered, or gossiped back to us, after the sample was taken.
+        reply.retain(|e| !self.is_own_address(&e.addr));
+        reply
+    }
+
+    /// The cached or fresh sample behind [`Self::getaddr_reply`].
+    fn getaddr_sample(&self, listener: GetAddrCacheKey, uncached: bool) -> Vec<GetAddrEntry> {
         let now = crate::time::now_secs();
         if !uncached
             && let Some((expiry, cached)) = self.addr_response_cache.lock().get(&listener)
@@ -13579,7 +13665,7 @@ impl PeerManager {
     /// placeholder proxy that never accepts.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
-        let use_proxy = self.proxy.is_some() && crate::net::is_routable(addr.ip());
+        let use_proxy = self.dials_through_proxy(addr);
         if let Some(ref proxy_addr) = self.proxy {
             if use_proxy {
                 // Per-dial random SOCKS credentials isolate this peer on its own Tor
@@ -13897,13 +13983,19 @@ impl PeerManager {
                 .map_err(|e| format!("send getaddr: {}", e))?;
         }
 
+        // One read of our onion for both self-advertisements below, so a
+        // hidden service registered between them cannot send a link that
+        // hides our IP both the onion and `-externalip`.
+        let our_onion = self.advertised_onion.read().clone();
+
         // Proactively advertise our own hidden service to this peer so the
         // network can discover and dial us inbound. A v3 onion only rides on
         // addrv2, so this fires only for peers that sent `sendaddrv2` (captured
-        // during the handshake). Sent to both inbound and outbound peers — they
-        // relay it onward, which is the actual propagation seed; without it a
-        // listenonion node is reachable only by peers handed the address out of
-        // band.
+        // during the handshake), and only on a link that keeps our IP from
+        // the peer (see `self_advertise_addrv2`), in either direction. Those
+        // peers relay it onward, which is the actual propagation seed; without
+        // it a listenonion node is reachable only by peers handed the address
+        // out of band.
         //
         // Before it, our `-externalip` addresses, to an outbound peer on the
         // same IP family: Core pushes its local address for the peer's network
@@ -13913,17 +14005,22 @@ impl PeerManager {
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
             && !quiet
-            && let Some(msg) = self.self_advertise_externals(id)
+            && let Some(msg) = self.self_advertise_externals_given(id, our_onion.as_ref())
             && let Err(e) = writer.send(msg).await
         {
             tracing::debug!(id, "self-advertise addr send failed: {}", e);
         }
 
-        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2(id) {
+        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2_given(id, our_onion.clone()) {
             // Best-effort gossip: a failed advertisement must NOT tear down an
             // otherwise-healthy peer we just spent a full Tor rendezvous
             // establishing. Log and continue (unlike the session-setup sends
             // above, this is optional and the last step).
+            if let bitcoin::p2p::address::AddrV2::TorV3(pubkey) = &addr_msg.addr {
+                // Core's `GetLocalAddrForPeer` line, under `-debug=net`.
+                let host = crate::net::peer::torv3_to_onion_host(pubkey);
+                tracing::debug!("Advertising address {host}:{} to peer={id}", addr_msg.port);
+            }
             if let Err(e) = writer.send(NetworkMessage::AddrV2(vec![addr_msg])).await {
                 tracing::debug!(id, "self-advertise addrv2 send failed: {}", e);
             }
@@ -14823,13 +14920,12 @@ impl PeerManager {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Advertise our first declared external address (`-externalip`)
-        // as addr_from; fall back to the unspecified address otherwise.
-        let sender = self
-            .advertisable_external_addrs()
-            .first()
-            .copied()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        // `addr_from` is a dummy, as Core's `PushNodeVersion` sends
+        // (`CService{}`): our addresses go out in `addr`/`addrv2`, where
+        // the link decides which one (`self_advertise_*`). Sending
+        // `-externalip` here told every peer, onion and proxied ones
+        // included, our clearnet IP.
+        let sender = SocketAddr::from(([0, 0, 0, 0], 0));
 
         VersionMessage {
             version: PROTOCOL_VERSION,
