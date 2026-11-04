@@ -829,6 +829,11 @@ silently returning an empty or wrong answer.
   `threshold` is range-checked as Core does but does not select a confidence
   level, there being no bucket distribution to select from.
 
+- **`converttopsbt psbt_version`** — Core v32 converts to a version 2 PSBT
+  by default and takes `psbt_version` to choose. satd converts to version 0
+  only: it accepts `psbt_version=0`, refuses any other value with `-8`, and
+  defaults to 0. `createpsbt psbt_version=2` builds a version 2 PSBT.
+
 - **`getmemoryinfo`** — Core's `locked` object describes the secure-allocator
   arena (`LockedPoolManager`), the mlock'd pool the wallet keeps private keys
   in. satd has no secure allocator and no wallet, so the pool is empty and

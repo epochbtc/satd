@@ -145,7 +145,8 @@ def parse_file(path):
     for a,b in spans:
         for k in range(a,b+1): instr[k]=True
     res={}
-    for m in re.finditer(r'RPCHelpMan\{', clean):
+    # `RPCHelpMan` was renamed `RPCMethod` in Core v32; accept both.
+    for m in re.finditer(r'\b(?:RPCHelpMan|RPCMethod)\{', clean):
         p=m.end()
         # first string literal = method name
         name_span=next(((a,b) for a,b in spans if a>=p), None)
@@ -262,13 +263,11 @@ SATD_SLOT_ALIASES = {
 # adds one Core does not have at all.
 SATD_EXTRA_ARGS = {
     # `psbt_version` selects a BIP 370 version 2 PSBT, which is what a silent
-    # payment recipient needs. Core has no version 2 at all, so there is no
-    # slot to share: it goes after `replaceable` and `version`.
+    # payment recipient needs. It goes after `replaceable` and `version`.
+    # Core v32 declares the same argument in the same slot, through
+    # `AppendArgs(CreateTxDoc(), ...)`, which this parser does not follow; the
+    # row supplies it, and the two agree.
     "createpsbt": [["psbt_version", False]],
-    # Core 32.1's `options` slot (`fee_rate_estimator`, `verbosity`). The pin is
-    # older than the release that added it; drop this row when the pin reaches
-    # v32.1, where the generator finds the slot in Core itself.
-    "estimatesmartfee": [["options", False]],
 }
 
 SATD_ONLY = {

@@ -2589,7 +2589,28 @@ pub async fn start(
         // conversion.
         let permit_sigdata: bool = args.optional_or("permitsigdata", false)?;
         let iswitness: Option<bool> = args.optional("iswitness")?;
+        // Core v32 added `psbt_version` here, defaulting to 2. satd converts
+        // to a version 0 PSBT only, so it refuses any other version by name
+        // rather than answering a version 2 request with a version 0 PSBT.
+        let psbt_version: Option<u32> = args.optional("psbt_version")?;
         args.check()?;
+        match psbt_version {
+            None | Some(0) => {}
+            Some(2) => {
+                return Err(ErrorObjectOwned::owned(
+                    -8,
+                    "converttopsbt does not create version 2 PSBTs; use createpsbt psbt_version=2",
+                    None::<()>,
+                ));
+            }
+            Some(other) => {
+                return Err(ErrorObjectOwned::owned(
+                    -8,
+                    format!("psbt_version must be 0 or 2, not {other}"),
+                    None::<()>,
+                ));
+            }
+        }
         psbt::convert_to_psbt(&hex_tx, permit_sigdata, iswitness)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;

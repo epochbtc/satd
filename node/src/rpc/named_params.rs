@@ -108,8 +108,7 @@ const SATD_SLOT_ALIASES: &[&str] = &["allowquarantined"];
 /// Only the test reads it — the table below is the shipped artefact, and this
 /// is the statement of what the table must satisfy.
 #[cfg(test)]
-const SATD_EXTRA_ARGS: &[(&str, &str)] =
-    &[("createpsbt", "psbt_version"), ("estimatesmartfee", "options")];
+const SATD_EXTRA_ARGS: &[(&str, &str)] = &[("createpsbt", "psbt_version")];
 
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
@@ -122,7 +121,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "clearbanned" => &[],
         "combinepsbt" => &[("txs", false)],
         "combinerawtransaction" => &[("txs", false)],
-        "converttopsbt" => &[("hexstring", false), ("permitsigdata", false), ("iswitness", false)],
+        "converttopsbt" => &[("hexstring", false), ("permitsigdata", false), ("iswitness", false), ("psbt_version", false)],
         // SATD_ONLY trailing argument: `psbt_version`. It sits after Core's
         // own, so a positional call written against Core is unaffected.
         // SATD_ONLY: createnapattestation
@@ -135,7 +134,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         // SATD_ONLY: deriveaddresses, getdescriptorinfo
         "deriveaddresses" => &[("descriptor", false), ("range", false)],
         "disconnectnode" => &[("address", false), ("nodeid", false)],
-        "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("options", false)],
+        "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("in_memory", true), ("options", false)],
         "echo" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
         "echoipc" => &[("arg", false)],
         "echojson" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],

@@ -9903,6 +9903,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 const FATAL_UNSUPPORTED_KEYS: &[(&str, &str)] = &[
     ("i2psam", "I2P is out of scope; Tor is satd's supported anonymity network (-proxy / -onion / -torcontrol). Leaving this in place would route traffic over clearnet instead of the privacy network you configured."),
     ("i2pacceptincoming", "I2P is out of scope (see i2psam); Tor is satd's supported anonymity network."),
+    ("privatebroadcast", "satd does not implement Bitcoin Core's private broadcast. Leaving this in place would announce transactions submitted by sendrawtransaction to every peer instead of only through short-lived Tor or I2P connections."),
 ];
 
 /// Optional, richer guidance appended to the warning when a *skipped* Core key
@@ -9942,8 +9943,9 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
 /// `shrinkdebugfile`, `log*`, …) lives in `src/init/common.cpp`, and many AddArg
 /// calls wrap the option name onto a second line — hence the slurp-mode perl
 /// rather than a line-oriented `grep`.
-/// Compatibility is pinned to v30: keys Core adds in later releases are not
-/// listed here and would be treated as typos until this list is bumped.
+/// Compatibility is pinned to v30, plus the keys Core v31 and v32.1 added
+/// (the same extraction at `v32.1`, listed last). Keys Core adds in later
+/// releases are treated as typos until this list is bumped.
 const CORE_V30_KEYS: &[&str] = &[
     "acceptnonstdtxn", "acceptstalefeeestimates", "addnode", "addresstype", "alertnotify", "allowignoredconf",
     "asmap", "assumevalid", "avoidpartialspends", "bantime", "bind", "blockfilterindex",
@@ -9978,6 +9980,9 @@ const CORE_V30_KEYS: &[&str] = &[
     "walletrejectlongchains", "whitebind", "whitelist", "whitelistforcerelay", "whitelistrelay", "zmqpubhashblock",
     "zmqpubhashblockhwm", "zmqpubhashtx", "zmqpubhashtxhwm", "zmqpubrawblock", "zmqpubrawblockhwm", "zmqpubrawtx",
     "zmqpubrawtxhwm", "zmqpubsequence", "zmqpubsequencehwm",
+    // Added by Core v31 and v32.1.
+    "inboundrelaypercent", "limitclustercount", "limitclustersize", "prevoutfetchthreads",
+    "privatebroadcast", "rpcmaxconnections", "txsendrate",
 ];
 
 /// Is the given config-file key recognised? Returns true for any
@@ -16413,6 +16418,21 @@ notarealkey=1
             "expected a skip warning naming the wallet key, got: {:?}",
             cf.ignored
         );
+    }
+
+    /// Core v32.1's own test framework writes `prevoutfetchthreads=1` into
+    /// every node's `bitcoin.conf`, so a Core v31/v32.1 key must load (warned
+    /// and skipped), not be refused as a typo. `privatebroadcast` is the
+    /// exception: skipping it would broadcast publicly, so it is fatal.
+    #[test]
+    fn core_v32_keys_load_with_a_warning() {
+        for k in ["prevoutfetchthreads", "inboundrelaypercent", "rpcmaxconnections", "txsendrate"] {
+            let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
+                .unwrap_or_else(|e| panic!("{k} must load: {e}"));
+            assert!(cf.ignored.iter().any(|m| m.contains(k)), "{k}: {:?}", cf.ignored);
+        }
+        let err = ConfigFile::parse("privatebroadcast=1\n").unwrap_err();
+        assert!(err.contains("privatebroadcast") && err.contains("Remove this line"), "{err}");
     }
 
     #[test]
