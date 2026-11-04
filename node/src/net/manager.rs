@@ -1451,6 +1451,10 @@ pub struct PeerManager {
     /// (`ibd-store`), so that a store waiting behind the connector does not
     /// hold up the P2P task (#875).
     ibd_store_queue: Arc<crate::net::ibd_store::IbdStoreQueue>,
+    /// `headers` messages, and the block-relay messages behind them, waiting
+    /// for the headers thread, so that a header batch waiting behind a
+    /// connect does not hold up the P2P task (#1187).
+    headers_queue: Arc<crate::net::headers_queue::HeadersQueue>,
     /// AssumeUTXO background catch-up download tracker. Drives downloading
     /// historical block data (genesis→`snapshot_height`) for the
     /// background validator. Idle (empty) unless a snapshot is loaded.
@@ -1463,7 +1467,7 @@ pub struct PeerManager {
     opreturn_restore_loaded: Arc<parking_lot::Mutex<Option<RestoreWork>>>,
     /// Wakes the background connect loop when a historical block is stored.
     bg_connect_signal: Arc<(parking_lot::Mutex<bool>, Condvar)>,
-    /// The block processor, background catch-up and IBD store threads,
+    /// The block processor, background catch-up, IBD store and headers threads,
     /// named. All exit once shutdown is signalled; [`Self::join_connectors`]
     /// waits for them.
     connector_threads: parking_lot::Mutex<Vec<(&'static str, std::thread::JoinHandle<()>)>>,
@@ -1620,6 +1624,7 @@ impl PeerManager {
         let bg_shutdown = shutdown.clone();
         let connect_shutdown = shutdown.clone();
         let store_shutdown = shutdown.clone();
+        let headers_shutdown = shutdown.clone();
 
         // Check for IBD resume: if headers are ahead of tip, create scheduler
         let tip_height = chain_state.tip_height();
@@ -1727,6 +1732,7 @@ impl PeerManager {
             ibd: ibd.clone(),
             connect_signal: connect_signal.clone(),
             ibd_store_queue: Arc::new(crate::net::ibd_store::IbdStoreQueue::default()),
+            headers_queue: Arc::new(crate::net::headers_queue::HeadersQueue::default()),
             bg_downloader: RwLock::new(BgDownloader::new(
                 BG_CATCHUP_WINDOW,
                 Duration::from_secs(BG_CATCHUP_STALE_SECS),
@@ -1820,10 +1826,25 @@ impl PeerManager {
             .name("ibd-store".into())
             .spawn(move || Self::ibd_store_loop(&store_queue, &pm_for_store, &store_shutdown))
             .expect("failed to spawn the IBD store thread");
+        // Header acceptance, off the P2P task (#1187). It enters the
+        // runtime the manager was built in, if any: a relay message queued
+        // behind a header batch is handled there, and its handler may send
+        // through a tokio channel or spawn.
+        let headers_queue = mgr.headers_queue.clone();
+        let pm_for_headers = Arc::downgrade(&mgr);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let headers = std::thread::Builder::new()
+            .name("headers".into())
+            .spawn(move || {
+                let _entered = runtime.as_ref().map(|rt| rt.enter());
+                Self::headers_loop(&headers_queue, &pm_for_headers, &headers_shutdown)
+            })
+            .expect("failed to spawn the headers thread");
         *mgr.connector_threads.lock() = vec![
             ("block-processor", block_processor),
             ("bg-catchup", bg_catchup),
             ("ibd-store", ibd_store),
+            ("headers", headers),
         ];
 
         mgr
@@ -1878,6 +1899,7 @@ impl PeerManager {
             cvar.notify_all();
         }
         self.ibd_store_queue.wake();
+        self.headers_queue.wake();
         let mut threads = self.connector_threads.lock();
         let running = crate::shutdown::join_within(std::mem::take(&mut *threads), timeout);
         if running.is_empty() {
@@ -5852,6 +5874,11 @@ impl PeerManager {
                 AfterDrain::Maintain => pacer.maintained(now),
             }
 
+            // Messages a headers thread that has gone left queued: handled
+            // here, so they wait at most a tick rather than for the next
+            // header batch, which after IBD is a block interval away.
+            self.drain_stranded_headers();
+
             // Check sync progress and request more blocks
             let tip = self.chain_state.tip_height();
             self.refresh_headers_tip();
@@ -6234,6 +6261,60 @@ impl PeerManager {
         if self.conn_type_of(id) == ConnType::NapPull {
             return;
         }
+        // A `headers` message goes to the headers thread, and so does a
+        // block-relay message behind one, so that a batch waiting on
+        // `accept_lock` does not hold up this task and the messages after it
+        // still see its result (#1187; see `headers_queue`).
+        if self.headers_queue_takes(&msg) {
+            let job = crate::net::headers_queue::HeadersJob::new(id, msg, in_flight);
+            if let Err(jobs) = self.headers_queue.push(job) {
+                // The headers thread has gone: handle what it left, then this
+                // message, here and in order.
+                for job in jobs {
+                    self.handle_message_now(job.peer, job.msg, job.in_flight);
+                }
+            }
+            return;
+        }
+        self.handle_message_now(id, msg, in_flight);
+    }
+
+    /// Whether `msg` goes to the headers thread rather than being handled on
+    /// the P2P task.
+    ///
+    /// A `headers` message always does. A block-relay message does while the
+    /// queue holds work, so it is handled after the header batches that
+    /// arrived before it, as Core handles a connection's messages in order:
+    /// an `inv` naming a block, a `cmpctblock` or `blocktxn`, and a `block`
+    /// outside initial block download. An IBD `block` is one the scheduler
+    /// asked for after its header was committed, and is stored through its
+    /// own queue (#875); holding it here would leave its arrival uncredited
+    /// and its peer looking stalled. Only this task pushes, so when the queue
+    /// is idle nothing is running on the headers thread either.
+    fn headers_queue_takes(&self, msg: &NetworkMessage) -> bool {
+        match msg {
+            NetworkMessage::Headers(_) => true,
+            NetworkMessage::Inv(inv) => {
+                inv.iter().any(|i| {
+                    matches!(
+                        i,
+                        Inventory::Block(_) | Inventory::WitnessBlock(_) | Inventory::CompactBlock(_)
+                    )
+                }) && !self.headers_queue.is_idle()
+            }
+            NetworkMessage::CmpctBlock(_) | NetworkMessage::BlockTxn(_) => !self.headers_queue.is_idle(),
+            NetworkMessage::Block(_) => !self.headers_queue.is_idle() && self.ibd.read().is_none(),
+            _ => false,
+        }
+    }
+
+    /// Handle `msg` from `id` here and now.
+    fn handle_message_now(
+        &self,
+        id: PeerId,
+        msg: NetworkMessage,
+        in_flight: crate::net::flow::InFlight,
+    ) {
         match msg {
             // Neither `Ping` nor `Pong` reaches here: the peer's write loop
             // answers the one and matches the other against that peer's
@@ -8260,6 +8341,67 @@ impl PeerManager {
         while !self.ibd_store_queue.is_idle() {
             assert!(Instant::now() < deadline, "the IBD store queue did not drain");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Handle, here and in order, the messages a headers thread that has
+    /// gone left queued. Nothing while the thread is running.
+    fn drain_stranded_headers(&self) {
+        for job in self.headers_queue.take_stranded() {
+            self.handle_message_now(job.peer, job.msg, job.in_flight);
+        }
+    }
+
+    /// Wait, up to 10 s, for the headers thread to handle everything queued.
+    /// Panics at the deadline.
+    #[cfg(test)]
+    pub(crate) fn wait_for_headers(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.headers_queue.is_idle() {
+            assert!(Instant::now() < deadline, "the headers queue did not drain");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The headers thread: handles the messages `handle_message` queued, one
+    /// at a time and in the order they arrived, until shutdown or until the
+    /// manager is gone (#1187).
+    ///
+    /// However the thread ends, a panic included, the queue is closed on the
+    /// way out. The next push hands back what it still held, and the P2P
+    /// task handles those messages inline, in order, as before the queue
+    /// existed.
+    fn headers_loop(
+        queue: &crate::net::headers_queue::HeadersQueue,
+        peer_manager: &std::sync::Weak<PeerManager>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) {
+        struct CloseOnExit<'a>(&'a crate::net::headers_queue::HeadersQueue);
+        impl Drop for CloseOnExit<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    tracing::error!("headers thread panicked; handling headers on the P2P task from now on");
+                }
+                self.0.close();
+            }
+        }
+        let _close = CloseOnExit(queue);
+        loop {
+            if *shutdown.borrow() || peer_manager.strong_count() == 0 {
+                return;
+            }
+            let Some(job) = queue.pop(Duration::from_millis(500)) else {
+                if queue.is_closed() {
+                    return;
+                }
+                continue;
+            };
+            let Some(pm) = peer_manager.upgrade() else {
+                return;
+            };
+            pm.handle_message_now(job.peer, job.msg, job.in_flight);
+            drop(pm);
+            queue.done();
         }
     }
 
@@ -17087,7 +17229,7 @@ mod tests {
             !pm.join_connectors(Duration::from_millis(200)),
             "without a shutdown signal the connectors keep running"
         );
-        assert_eq!(pm.connector_threads.lock().len(), 3, "all three threads must be kept");
+        assert_eq!(pm.connector_threads.lock().len(), 4, "all four threads must be kept");
 
         shutdown_tx.send_replace(true);
         assert!(pm.join_connectors(Duration::from_secs(10)));
@@ -19338,6 +19480,7 @@ mod tests {
     /// Hand `msg` to the real message handler as if `id` had sent it.
     fn deliver(pm: &PeerManager, id: PeerId, msg: NetworkMessage) {
         pm.handle_message(id, msg, crate::net::flow::InFlight::new(pm.peer_flow(id)));
+        pm.wait_for_headers();
     }
 
     fn drain(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
@@ -19408,6 +19551,136 @@ mod tests {
             assert!(Instant::now() < deadline, "block {hash} never connected");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    // ---- Header acceptance off the P2P task (#1187) ----
+
+    /// Hand `msg` to the message handler on another thread, as the P2P task
+    /// would, and wait up to 5 s for the handler to return. Panics if it
+    /// does not: it is parked, which is what #1187 was.
+    fn handle_returns_promptly(pm: &Arc<PeerManager>, id: PeerId, msg: NetworkMessage, what: &str) {
+        let pm = pm.clone();
+        let t = std::thread::spawn(move || {
+            let in_flight = crate::net::flow::InFlight::new(pm.peer_flow(id));
+            pm.handle_message(id, msg, in_flight);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.is_finished() {
+            assert!(Instant::now() < deadline, "{what} held up the P2P task while accept_lock was held");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        t.join().unwrap();
+    }
+
+    /// A `headers` message that arrives while a connect holds `accept_lock`
+    /// is handed to the headers thread, and the P2P task goes on. A pong
+    /// behind it still waits for it, and once the lock is free the batch is
+    /// committed and its block asked for, as it was inline.
+    ///
+    /// Fails without the fix: the handler took `accept_lock` on the P2P task
+    /// and stayed parked until the connect let go.
+    #[test]
+    fn a_headers_message_waiting_on_accept_lock_leaves_the_p2p_task_free() {
+        let mut f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let flow = f.pm.peer_flow(1).expect("peer 1 is connected");
+        drain(&mut f.rx);
+
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
+        assert!(!flow.is_idle(), "a pong behind the queued batch must still wait for it");
+        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "nothing is committed under a held lock");
+
+        drop(held);
+        f.pm.wait_for_headers();
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "the batch is committed once the lock is free");
+        assert!(flow.is_idle(), "and its message is counted out");
+        assert_eq!(block_requests(&drain(&mut f.rx), h2), vec![true], "and its block is asked for");
+    }
+
+    /// An `inv` for a block, arriving behind a `headers` batch still waiting
+    /// for `accept_lock`, is handled after the batch, as Core handles a
+    /// connection's messages in order: the header is known by then, so the
+    /// block is asked for once and no `getheaders` goes out for it.
+    ///
+    /// Fails if a block `inv` is not queued behind the batch: handled first,
+    /// the header is unknown and the node sends `getheaders`.
+    #[test]
+    fn a_block_inv_behind_a_queued_headers_batch_sees_its_result() {
+        let mut f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        drain(&mut f.rx);
+
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Inv(vec![Inventory::Block(h2)]), "a block inv");
+        assert!(drain(&mut f.rx).is_empty(), "nothing is answered while the batch waits");
+        drop(held);
+        f.pm.wait_for_headers();
+
+        let msgs = drain(&mut f.rx);
+        assert!(
+            !msgs.iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+            "the inv was handled before the batch it followed: {msgs:?}"
+        );
+        assert_eq!(block_requests(&msgs, h2), vec![true], "the block is asked for once: {msgs:?}");
+    }
+
+    /// Messages a headers thread that has gone left queued are handled by
+    /// the run loop's next tick, not left until the next header batch, which
+    /// after IBD is a block interval away: a pong behind them would wait that
+    /// long.
+    ///
+    /// Fails if the drain hands back nothing: the queued `inv` stays
+    /// unhandled and its in-flight count held.
+    #[test]
+    fn messages_a_gone_headers_thread_left_are_handled_by_the_next_tick() {
+        let f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let flow = f.pm.peer_flow(1).expect("peer 1 is connected");
+
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Inv(vec![Inventory::Block(h2)]), "a block inv");
+        // The thread goes once it has finished the batch in hand, leaving the
+        // `inv` queued behind it.
+        f.pm.headers_queue.close();
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f.pm.connector_threads.lock().iter().any(|(n, t)| *n == "headers" && t.is_finished()) {
+            assert!(Instant::now() < deadline, "the headers thread did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "fixture: the batch in hand was handled");
+        assert!(!flow.is_idle(), "fixture: the inv is stranded, its count held");
+
+        f.pm.drain_stranded_headers();
+        assert!(flow.is_idle(), "the stranded inv is handled and counted out");
+        assert!(f.pm.headers_queue.is_idle());
+    }
+
+    /// A transaction `inv` does not depend on headers and is not held behind
+    /// a waiting batch: it is handled on the P2P task at once.
+    #[test]
+    fn a_transaction_inv_is_not_held_behind_a_queued_headers_batch() {
+        use bitcoin::hashes::Hash;
+        let f = compact_fetch_fixture();
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let held = f.pm.chain_state.hold_accept_lock_for_test();
+        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
+        assert!(!f.pm.headers_queue.is_idle(), "fixture: the batch is waiting");
+        let txid = bitcoin::Txid::from_byte_array([0x5a; 32]);
+        assert!(!f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)])));
+        assert!(f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(b2.block_hash())])));
+        drop(held);
+        f.pm.wait_for_headers();
+        assert!(
+            !f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(b2.block_hash())])),
+            "an idle queue holds nothing back"
+        );
     }
 
     /// Core's headers direct fetch (`HeadersDirectFetchBlocks`): a peer that
